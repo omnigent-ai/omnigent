@@ -723,15 +723,23 @@ async def bridge_tmux_pty_to_websocket(
         # client tears the whole session and runner down.
         with contextlib.suppress(RuntimeError):
             if pty_ended_first:
-                if await _tmux_session_alive(socket_path, tmux_target):
-                    await websocket.close(
-                        code=WS_CLOSE_TERMINAL_DETACHED,
-                        reason="terminal detached",
-                    )
-                else:
+                # Use the tri-state probe so a dead pane (session alive but
+                # pane_dead=1) is treated as NOT_FOUND rather than DETACHED.
+                # With remain-on-exit the session outlives the inner CLI, so
+                # _tmux_session_alive alone would wrongly signal a detach and
+                # the reconnect loop would re-attach to the dead pane forever.
+                pane_dead = await _check_pane_dead_definitive(socket_path, tmux_target)
+                if pane_dead is True or (
+                    pane_dead is None and not await _tmux_session_alive(socket_path, tmux_target)
+                ):
                     await websocket.close(
                         code=WS_CLOSE_TERMINAL_NOT_FOUND,
                         reason="terminal session ended",
+                    )
+                else:
+                    await websocket.close(
+                        code=WS_CLOSE_TERMINAL_DETACHED,
+                        reason="terminal detached",
                     )
             else:
                 await websocket.close()
