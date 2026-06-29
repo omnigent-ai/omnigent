@@ -6412,3 +6412,75 @@ async def test_post_external_session_status_attaches_failure_reason() -> None:
         "output": "transcript item item-1 rejected",
     }
     assert captured[1]["data"] == {"status": "idle"}
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    forwarder._reset_forward_health()
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
+        forwarder._note_forward_failure("item:source-1")
+    # Below threshold: not yet degraded.
+    assert forwarder._forward_health.degraded_logged is False
+
+    forwarder._note_forward_failure("item:source-1")  # crosses threshold
+    assert forwarder._forward_health.degraded_logged is True
+    assert forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    forwarder._note_forward_failure("item:source-1")
+    assert forwarder._forward_health.degraded_logged is True
+    assert (
+        forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD + 1
+    )
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    forwarder._reset_forward_health()
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        forwarder._note_forward_failure("status:idle")
+    assert forwarder._forward_health.degraded_logged is True
+
+    forwarder._note_forward_success()
+
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False
+
+
+def test_retry_tracker_transient_failures_escalate_degraded() -> None:
+    """
+    Transient failures escalate via the retry tracker boundary (#1120).
+
+    The claude forwarder retries transient errors (connect timeouts, 503s)
+    forever, so they never reach the permanent-drop ``exhausted`` path. This
+    proves the degraded indicator still fires for that case — the exact
+    503/connect-timeout outage #1120 is about — because every
+    ``record_failure`` counts, not just exhausted give-ups. A later
+    ``clear`` (a post that got through) re-arms the indicator.
+    """
+    forwarder._reset_forward_health()
+    tracker = forwarder._PostRetryTracker()
+    transient = httpx.ConnectError("connect timeout")
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        decision = tracker.record_failure("item:source-1", transient)
+        # Transient failures are retried, never dropped.
+        assert decision.exhausted is False
+        assert decision.permanent is False
+
+    assert forwarder._forward_health.degraded_logged is True
+
+    tracker.clear("item:source-1")
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False
