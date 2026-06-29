@@ -78,6 +78,20 @@ def _require_auth(
     return user_id
 
 
+async def _refresh_scheduler(request: Request) -> None:
+    """Re-arm the live scheduler after a mutation, if one is running.
+
+    The scheduler is started in the server lifespan and stashed on
+    ``app.state`` (absent in minimal/test apps, hence the ``getattr``).
+    :meth:`SchedulerService.refresh` reconciles armed cron tasks with the
+    persisted enabled loops, so a freshly created/enabled loop arms at once and
+    a deleted/disabled one is cancelled — without a server restart.
+    """
+    svc = getattr(request.app.state, "scheduler_service", None)
+    if svc is not None:
+        await svc.refresh()
+
+
 def create_schedules_router(
     store: ScheduleStore,
     auth_provider: AuthProvider | None = None,
@@ -120,6 +134,7 @@ def create_schedules_router(
                 f"A schedule named '{body.name}' already exists in this conversation",
                 code=ErrorCode.CONFLICT,
             ) from exc
+        await _refresh_scheduler(request)
         return _to_response(sched)
 
     @router.patch("/schedules/{schedule_id}")
@@ -138,12 +153,15 @@ def create_schedules_router(
         )
         if sched is None:
             raise OmnigentError("Schedule not found", code=ErrorCode.NOT_FOUND)
+        await _refresh_scheduler(request)
         return _to_response(sched)
 
     @router.delete("/schedules/{schedule_id}")
     async def delete_schedule(request: Request, schedule_id: str) -> dict[str, Any]:
         """Delete a schedule. Idempotent."""
         _require_auth(request, auth_provider, permission_store)
-        return {"deleted": store.delete(schedule_id)}
+        deleted = store.delete(schedule_id)
+        await _refresh_scheduler(request)
+        return {"deleted": deleted}
 
     return router

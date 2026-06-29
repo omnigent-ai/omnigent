@@ -1278,6 +1278,34 @@ def create_app(
 
         load_registry(extra_modules=policy_modules)
 
+        # Scheduler (B2): arm enabled cron ``loop`` schedules and fire each as
+        # a real turn via the in-process events endpoint. It lives on the app's
+        # event loop so it dispatches into the very request path it shares.
+        # Held on app.state so the schedules router can refresh() it after CRUD
+        # and the finally block can stop it cleanly.
+        from omnigent.runtime import get_schedule_store
+        from omnigent.runtime.schedule_dispatch import build_inprocess_fire
+        from omnigent.runtime.scheduler import SchedulerService
+        from omnigent.server.auth import RESERVED_USER_LOCAL, resolve_auth_header
+
+        scheduler_service: SchedulerService | None = None
+        _schedule_store = get_schedule_store()
+        if _schedule_store is not None:
+            scheduler_service = SchedulerService(
+                _schedule_store,
+                build_inprocess_fire(
+                    app_inst,
+                    identity_header=resolve_auth_header(),
+                    reserved_identities=frozenset({RESERVED_USER_LOCAL}),
+                ),
+            )
+            await scheduler_service.start()
+            app_inst.state.scheduler_service = scheduler_service
+            _logger.info(
+                "scheduler: started with %d armed loop(s)",
+                len(scheduler_service.armed_ids),
+            )
+
         # Accounts first-run: open the browser after uvicorn has bound
         # the port. bootstrap_admin sets open_url to the loopback base
         # URL on a needs-setup boot so the browser lands on the
@@ -1312,6 +1340,10 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            # Stop the scheduler before tearing down the runner plumbing it
+            # dispatches into, so an in-flight fire can't hit a half-closed app.
+            if scheduler_service is not None:
+                await scheduler_service.stop()
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the

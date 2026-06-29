@@ -62,6 +62,11 @@ class SchedulerService:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._started = False
 
+    @property
+    def armed_ids(self) -> frozenset[str]:
+        """:returns: Ids of the loop schedules currently armed with a task."""
+        return frozenset(self._tasks)
+
     async def start(self) -> None:
         """Arm all currently-enabled loop schedules. Idempotent."""
         if self._started:
