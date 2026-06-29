@@ -31,7 +31,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -54,6 +56,22 @@ _EVENTS_FILE = "qwen_out.ndjson"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
+
+#: Token config the shared Omnigent MCP relay (``serve-mcp``) reads from the
+#: bridge dir. Mirrors cursor-/claude-native (``cursor_native_bridge.py``).
+_BRIDGE_CONFIG_FILE = "bridge.json"
+#: Name qwen lists the Omnigent MCP server under (shows in ``/mcp``).
+_MCP_SERVER_NAME = "omnigent"
+#: qwen reads MCP servers from ``<workspace>/.qwen/settings.json`` (project
+#: scope) — the per-workspace analog of cursor's ``.cursor/mcp.json``.
+_QWEN_SETTINGS_DIR = ".qwen"
+_QWEN_SETTINGS_FILE = "settings.json"
+#: Env var qwen reads to locate its MCP-approvals store, overriding the default
+#: ``~/.qwen/mcpApprovals.json``. We point it at a per-session file in the bridge
+#: dir so approvals don't pollute the user's home and concurrent same-workspace
+#: sessions don't fight over a single (workspace, server) approval entry.
+MCP_APPROVALS_ENV_VAR = "QWEN_CODE_MCP_APPROVALS_PATH"
+_MCP_APPROVALS_FILE = "mcpApprovals.json"
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -183,6 +201,164 @@ def build_qwen_native_spawn_env(session_id: str) -> dict[str, str]:
     bridge_dir = bridge_dir_for_session_id(session_id)
     _ensure_dir(bridge_dir)
     return {BRIDGE_DIR_ENV_VAR: str(bridge_dir)}
+
+
+# ---------------------------------------------------------------------------
+# Omnigent MCP server config — expose Omnigent's builtin tools (sys_*,
+# load_skill, web_fetch, …) to the qwen TUI so it can call them and ``/mcp``
+# lists them. Reuses the shared stdio relay implemented in
+# ``omnigent.claude_native_bridge serve-mcp`` (same server cursor-/claude-/
+# opencode-native point at); only the *registration* surface differs per CLI.
+# ---------------------------------------------------------------------------
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config the shared Omnigent MCP relay reads at startup.
+
+    The ``serve-mcp`` relay (spawned by qwen) reads ``bridge.json`` for a bearer
+    token and exits if it's missing, so this must exist *before* qwen launches.
+    The server connection (URL, session, workspace) is added to this same file
+    by the runner's comment relay (``ensure_comment_relay``) when it starts.
+    Mirrors :func:`omnigent.cursor_native_bridge.write_mcp_bridge_config`.
+    """
+    _ensure_dir(bridge_dir)
+    config_path = bridge_dir / _BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
+
+
+def build_mcp_server_entry(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build qwen's ``mcpServers.omnigent`` entry for the Omnigent relay.
+
+    ``trust: true`` auto-approves the qwen-side MCP tool gate so the TUI doesn't
+    add a second in-terminal prompt: Omnigent already gates these calls through
+    its own policy/elicitation engine (surfaced as web cards by the approval
+    mirror), so qwen's prompt would only be a hidden duplicate. Same rationale
+    as cursor's ``autoApprove`` (see ``cursor_native_bridge.build_mcp_config``).
+    """
+    python = python_executable or sys.executable
+    return {
+        "command": python,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.claude_native_bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        "env": {
+            "PYTHONUNBUFFERED": "1",
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        },
+        "trust": True,
+    }
+
+
+def write_mcp_config(
+    workspace: Path,
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Register the Omnigent MCP server in ``<workspace>/.qwen/settings.json``.
+
+    Merges (does not overwrite) into any existing project settings so unrelated
+    keys — and other ``mcpServers`` — are preserved; only the ``omnigent`` entry
+    is (re)written. Project scope (not ``~/.qwen/settings.json``) keeps the
+    user's home config — including auth/gateway settings whose precedence the
+    qwen-native design deliberately avoids touching — untouched. Also writes the
+    relay token (:func:`write_mcp_bridge_config`). Mirrors
+    :func:`omnigent.cursor_native_bridge.write_mcp_config`.
+
+    :returns: Path to the written ``settings.json``.
+    """
+    write_mcp_bridge_config(bridge_dir)
+    settings_dir = workspace / _QWEN_SETTINGS_DIR
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    path = settings_dir / _QWEN_SETTINGS_FILE
+
+    data: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                data = existing
+        except (OSError, ValueError):
+            # Malformed/unreadable settings: fall back to a fresh file rather
+            # than crash the launch (worst case the user loses stray edits we
+            # couldn't parse — the omnigent server is what matters here).
+            data = {}
+
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[_MCP_SERVER_NAME] = build_mcp_server_entry(
+        bridge_dir, python_executable=python_executable
+    )
+    data["mcpServers"] = servers
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def mcp_approvals_path(bridge_dir: Path) -> Path:
+    """Return the per-session MCP-approvals store path (see :data:`MCP_APPROVALS_ENV_VAR`)."""
+    return bridge_dir / _MCP_APPROVALS_FILE
+
+
+def mcp_launch_env(bridge_dir: Path) -> dict[str, str]:
+    """Env the qwen TUI launch needs so it reads the per-session approvals store."""
+    return {MCP_APPROVALS_ENV_VAR: str(mcp_approvals_path(bridge_dir))}
+
+
+def approve_mcp_server(
+    workspace: Path,
+    bridge_dir: Path,
+    *,
+    qwen_command: str,
+) -> bool:
+    """Pre-approve the Omnigent MCP server so qwen skips its startup trust prompt.
+
+    A project ``.qwen/settings.json`` MCP server is *gated*: on launch qwen shows
+    an "Untrusted MCP server" prompt and won't start the server until approved,
+    blocking the relay (and ``/mcp`` listing) behind a manual in-terminal step.
+    ``qwen mcp approve`` is qwen's own non-interactive approval command — it
+    computes the config hash exactly (version-proof, unlike replicating the hash
+    ourselves) and records ``{status: approved}`` keyed by ``(workspace, name)``
+    in the approvals store. Run with the SAME cwd and :data:`MCP_APPROVALS_ENV_VAR`
+    the TUI will launch with, so the approval the TUI reads matches. The analog of
+    cursor's ``cursor mcp enable`` (``cursor_native_bridge``).
+
+    Best-effort: on failure we log and return ``False``; the launch proceeds and
+    qwen falls back to its in-terminal trust prompt (no worse than before).
+
+    :returns: ``True`` if the approve command succeeded.
+    """
+    env = {**os.environ, **mcp_launch_env(bridge_dir)}
+    try:
+        proc = subprocess.run(
+            [qwen_command, "mcp", "approve", _MCP_SERVER_NAME],
+            cwd=str(workspace),
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_READY_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
 
 
 def _append_command(bridge_dir: Path, command: dict[str, Any]) -> None:

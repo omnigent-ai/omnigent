@@ -245,9 +245,20 @@ comments; this is the *what*, not the *how*.)
   - *Full route:* spec with `executor.profile: <db-profile>` (or a
     `databricks-*` model), then `omni run`; confirm the runner log's
     `qwen gateway routing:` line shows the Databricks base URL + profile.
-- [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
-  defined by Omnigent aren't exposed to it (so they can't be invoked or
-  recorded). Permission gating on qwen's *own* tool calls already works.
+- [x] **Omnigent tools.** Qwen-native now registers the shared Omnigent MCP
+  relay (`omnigent.claude_native_bridge serve-mcp`) in
+  `<workspace>/.qwen/settings.json` (`mcpServers.omnigent`, `trust: true`) before
+  launch, so qwen connects to it on boot, `/mcp` lists it, and the model can call
+  Omnigent's builtin tools (`sys_*`, `load_skill`, `web_fetch`, …). The token is
+  written via `qwen_native_bridge.write_mcp_config`; the server connection is
+  added to `bridge.json` by `ensure_comment_relay`. Mirrors cursor-/claude-native.
+  A project-scoped MCP server is gated behind qwen's "Untrusted MCP server"
+  startup prompt, so the runner pre-approves it non-interactively via
+  `qwen mcp approve omnigent` (`qwen_native_bridge.approve_mcp_server`, qwen's own
+  hash-exact command — the analog of cursor's `cursor mcp enable`), writing to a
+  per-session approvals store isolated via `QWEN_CODE_MCP_APPROVALS_PATH` (avoids
+  polluting `~/.qwen` and a same-workspace concurrency race). Permission gating on
+  qwen's *own* tool calls already works.
 - [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
   file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
   What works today), so the bytes flow through Omnigent and the sandbox roots are

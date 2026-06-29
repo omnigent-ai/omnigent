@@ -2796,12 +2796,15 @@ async def _auto_create_qwen_terminal(
     # drop the prior terminal's stale forward cursor + queued input.
     await _cancel_auto_forwarder_task(session_id)
     from omnigent.qwen_native_bridge import (
+        approve_mcp_server,
         bridge_dir_for_session_id,
         events_file_path,
         input_file_path,
+        mcp_launch_env,
         prepare_bridge_files,
         qwen_session_id_for_conversation,
         qwen_session_recording_exists,
+        write_mcp_config,
         write_tmux_target,
     )
     from omnigent.qwen_native_forwarder import clear_qwen_bridge_state
@@ -2853,6 +2856,29 @@ async def _auto_create_qwen_terminal(
         # First launch (or a prior persist that didn't land): record the id so the
         # next resume reads it from the snapshot and forks can carry history.
         await _persist_qwen_external_session_id(server_client, session_id, qwen_session_id)
+    # Expose Omnigent's builtin tools (sys_*, load_skill, web_fetch, …) to qwen
+    # by registering the shared MCP relay in ``<workspace>/.qwen/settings.json``
+    # so qwen connects to it on boot and ``/mcp`` lists it. Written before launch
+    # so the relay's ``bridge.json`` token exists when qwen spawns ``serve-mcp``;
+    # the server connection is added to that file by ``ensure_comment_relay``
+    # below. Only when the relay will actually start (``ensure_comment_relay``
+    # present), else the registered tools would be dead (serve-mcp with nothing
+    # to route calls back to) — mirrors the opencode-native gating.
+    mcp_enabled = server_client is not None and ensure_comment_relay is not None
+    if mcp_enabled:
+        write_mcp_config(Path(workspace), bridge_dir)
+        # A project-scoped MCP server is gated behind qwen's "Untrusted MCP
+        # server" startup prompt; pre-approve it non-interactively (qwen's own
+        # ``mcp approve``, hash-exact) so the relay starts and ``/mcp`` lists it
+        # without a manual in-terminal step. Run with the SAME cwd + approvals
+        # env the TUI launches with (see ``mcp_launch_env`` in the spec below).
+        if not approve_mcp_server(Path(workspace), bridge_dir, qwen_command=qwen_command):
+            _logger.warning(
+                "qwen-native: could not pre-approve the omnigent MCP server for "
+                "session %s; qwen will show its in-terminal trust prompt.",
+                session_id,
+            )
+
     # The dual-output + input-file flags wire qwen to the bridge; any user
     # ``terminal_launch_args`` (e.g. ``-m <model>``) precede them. Approval stays
     # the default in-terminal prompt (the embedded pane shows it) — Omnigent-side
@@ -2874,6 +2900,9 @@ async def _auto_create_qwen_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=qwen_command,
             args=qwen_args,
+            # Point qwen at the per-session MCP-approvals store the pre-approval
+            # above wrote, so the TUI reads our approval (not ~/.qwen's).
+            env=mcp_launch_env(bridge_dir) if mcp_enabled else {},
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
