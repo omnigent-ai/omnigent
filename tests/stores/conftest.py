@@ -11,6 +11,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.canvas_store.sqlalchemy_store import SqlAlchemyCanvasStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 
@@ -44,3 +45,11 @@ def artifact_store(tmp_path: Path) -> LocalArtifactStore:
     :returns: A LocalArtifactStore in a temp directory.
     """
     return LocalArtifactStore(str(tmp_path / "artifacts"))
+
+
+@pytest.fixture()
+def canvas_store(db_uri: str) -> SqlAlchemyCanvasStore:
+    """
+    :returns: A SqlAlchemyCanvasStore backed by the test database.
+    """
+    return SqlAlchemyCanvasStore(db_uri)

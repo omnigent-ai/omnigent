@@ -3004,6 +3004,7 @@ def server(
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
 
+    from omnigent.stores.canvas_store.sqlalchemy_store import SqlAlchemyCanvasStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -3012,6 +3013,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    canvas_store = SqlAlchemyCanvasStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3064,6 +3066,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        canvas_store=canvas_store,
         caps=caps,
     )
 
@@ -3148,6 +3151,8 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.routes.canvas import create_canvas_router
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3165,6 +3170,15 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        # Canvas REST API (#2). Mounted via the generic extra_routers
+        # seam so create_app's signature stays untouched.
+        extra_routers=[
+            (
+                create_canvas_router(canvas_store, auth_provider, permission_store),
+                "/v1",
+                ["canvas"],
+            ),
+        ],
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
