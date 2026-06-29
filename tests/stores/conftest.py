@@ -12,6 +12,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleStore
 from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemStore
 
 
@@ -53,3 +54,11 @@ def work_item_store(db_uri: str) -> SqlAlchemyWorkItemStore:
     :returns: A SqlAlchemyWorkItemStore backed by the test database.
     """
     return SqlAlchemyWorkItemStore(db_uri)
+
+
+@pytest.fixture()
+def schedule_store(db_uri: str) -> SqlAlchemyScheduleStore:
+    """
+    :returns: A SqlAlchemyScheduleStore backed by the test database.
+    """
+    return SqlAlchemyScheduleStore(db_uri)

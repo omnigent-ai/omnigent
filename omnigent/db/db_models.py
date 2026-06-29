@@ -740,6 +740,62 @@ class SqlWorkItem(Base):
     )
 
 
+class SqlSchedule(Base):
+    """
+    SQLAlchemy model for the ``schedules`` table.
+
+    A schedule drives recurring agent work within a conversation: a
+    ``"loop"`` fires ``prompt`` on a ``cron`` cadence, a ``"monitor"``
+    streams ``command`` and fires ``prompt`` per output line. The
+    scheduler service reads enabled rows to arm jobs.
+
+    :param id: Opaque PK, e.g. ``"sch_a1b2c3..."``.
+    :param conversation_id: FK to ``conversations.id`` the schedule fires
+        into. ``ON DELETE CASCADE`` so removing a conversation drops its
+        schedules.
+    :param created_by_user_id: Creating user id, or ``None``.
+    :param name: Name, UNIQUE per ``(conversation_id, name)``.
+    :param kind: ``"loop"`` or ``"monitor"``.
+    :param prompt: Prompt (or monitor template) fired on each tick.
+    :param cron: Cron expression for loops, else ``None``.
+    :param command: Shell command to stream for monitors, else ``None``.
+    :param enabled: Whether the scheduler runs it. Defaults to true.
+    :param status: Lifecycle/health state (``"idle"`` / ``"running"`` /
+        ``"errored"``). Defaults to ``"idle"``.
+    :param last_fired_at: Unix epoch seconds of the last fire, or ``None``.
+    :param last_run_id: Id of the run from the last fire, or ``None``.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, ``None`` if
+        never updated.
+    """
+
+    __tablename__ = "schedules"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+    )
+    created_by_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    name: Mapped[str] = mapped_column(String(256))
+    kind: Mapped[str] = mapped_column(String(16))
+    prompt: Mapped[str] = mapped_column(Text)
+    cron: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    command: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, server_default=true())
+    status: Mapped[str] = mapped_column(String(16), server_default=text("'idle'"))
+    last_fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "name", name="uq_schedules_conversation_id_name"),
+        Index("ix_schedules_conversation_id", "conversation_id"),
+        Index("ix_schedules_enabled", "enabled"),
+    )
+
+
 class SqlHost(Base):
     """
     SQLAlchemy model for the ``hosts`` table.

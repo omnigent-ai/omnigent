@@ -27,6 +27,7 @@ from omnigent.entities.file import StoredFile
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
+from omnigent.entities.schedule import SCHEDULE_KINDS, Schedule
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -43,6 +44,7 @@ from omnigent.entities.work_item import (
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
     "NON_CONTENT_ITEM_TYPES",
+    "SCHEDULE_KINDS",
     "WORK_ITEM_SOURCES",
     "WORK_ITEM_STATUSES",
     "Account",
@@ -67,6 +69,7 @@ __all__ = [
     "ResolvedAccess",
     "ResourceEventData",
     "RoutingDecisionData",
+    "Schedule",
     "SessionPermission",
     "SessionResourceView",
     "SlashCommandData",
