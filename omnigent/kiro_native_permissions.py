@@ -278,7 +278,7 @@ async def _run_one_permission(
         "agent": "Kiro",
         "policy_name": "kiro_native_permission",
         "operation_type": "tool",
-        "message": f"Kiro wants approval for {permission.title}",
+        "message": f"Kiro wants approval for {permission.preview}",
         "content_preview": permission.preview,
     }
     try:
