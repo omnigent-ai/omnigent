@@ -1016,6 +1016,15 @@
   animation: otto-blink 3.4s ease-in-out infinite;
 }
 
+@keyframes compaction-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(200%);
+  }
+}
+
 /* Global reduced-motion gate. The two scoped blocks above keep their
  * static-state declarations (class specificity beats * for those visible
  * properties); this universal rule collapses every other transition-* and

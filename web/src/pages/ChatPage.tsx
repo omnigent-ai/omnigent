@@ -2633,6 +2633,37 @@ function isSystemBubble(bubble: Bubble): boolean {
   return parseSystemMessage(extractUserText(bubble.content)) !== null;
 }
 
+function CompactionLoadingIndicator() {
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef(performance.now());
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setElapsed(Math.round((performance.now() - startRef.current) / 1000));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <Message from="assistant" data-testid="compacting-indicator">
+      <MessageContent>
+        <div className="flex items-center gap-2 text-xs font-mono">
+          <Shimmer as="span" duration={1.5}>
+            Compacting conversation…
+          </Shimmer>
+          {elapsed > 0 && <span className="text-muted-foreground">({elapsed}s)</span>}
+        </div>
+        <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full w-1/3 rounded-full bg-muted-foreground/40"
+            style={{ animation: "compaction-slide 1.5s ease-in-out infinite alternate" }}
+          />
+        </div>
+      </MessageContent>
+    </Message>
+  );
+}
+
 // Memoized so a streaming delta (which rebuilds the whole bubble array) only
 // re-renders the bubble that actually changed, not every prior message's
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
@@ -2641,15 +2672,7 @@ export const BubbleView = memo(
   function BubbleView({ bubble }: { bubble: Bubble }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
-      return (
-        <Message from="assistant" data-testid="compacting-indicator">
-          <MessageContent>
-            <Shimmer className="text-xs font-mono" duration={1.5}>
-              Compacting conversation…
-            </Shimmer>
-          </MessageContent>
-        </Message>
-      );
+      return <CompactionLoadingIndicator />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {

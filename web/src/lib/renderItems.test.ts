@@ -258,6 +258,27 @@ describe("buildBubbles — bubble grouping", () => {
     expect((bubbles[2] as Extract<Bubble, { kind: "compaction" }>).itemId).toBe("comp_1");
   });
 
+  it("compaction_loading bubble is removed even when separated from compaction by assistant blocks", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "compaction_loading",
+        ctx: ctx({ itemId: "cl_1", responseId: "resp_compact" }),
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_compact" }),
+        fullText: "Summarised",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "compaction",
+        ctx: ctx({ itemId: "comp_1", responseId: "resp_compact" }),
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "compaction"]);
+  });
+
   it("UserMessageBlock with mixed content preserves attachments", () => {
     const blocks: AnyBlock[] = [
       {
