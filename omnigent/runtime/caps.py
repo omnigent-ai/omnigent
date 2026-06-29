@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from omnigent.runtime.tokenmaxx import TokenmaxxConfig
     from omnigent.server.smart_routing import RoutingClient
     from omnigent.spec.types import LLMConfig, PolicySpec
 
@@ -75,3 +76,6 @@ class RuntimeCaps:
     # Managed deployments can supply a different implementation (e.g.
     # a rules engine or remote service).  ``None`` disables routing.
     routing_client: RoutingClient | None = None
+    # Tokenmaxx off-hours orchestrator (#11). ``None`` (the default) or a
+    # config with ``enabled=False`` means the service never starts.
+    tokenmaxx: TokenmaxxConfig | None = None

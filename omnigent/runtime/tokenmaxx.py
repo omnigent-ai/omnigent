@@ -22,6 +22,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from omnigent.entities.work_item import WorkItem
 from omnigent.stores.work_item_store import WorkItemStore
@@ -63,6 +64,26 @@ class TokenmaxxConfig:
     off_hours_end: int = 6
     max_items_per_tick: int = 3
     tick_seconds: int = 900
+
+
+def parse_tokenmaxx_config(raw: dict[str, Any] | None) -> TokenmaxxConfig:
+    """Parse the server-config ``tokenmaxx:`` mapping into a TokenmaxxConfig.
+
+    An absent block (or ``None``) yields the disabled default — zero behaviour
+    change. Missing keys fall back to per-field defaults.
+
+    :param raw: The ``tokenmaxx:`` value from the server config, or ``None``.
+    :returns: A :class:`TokenmaxxConfig`.
+    """
+    if not raw:
+        return TokenmaxxConfig()
+    return TokenmaxxConfig(
+        enabled=bool(raw.get("enabled", False)),
+        off_hours_start=int(raw.get("off_hours_start", 22)),
+        off_hours_end=int(raw.get("off_hours_end", 6)),
+        max_items_per_tick=int(raw.get("max_items_per_tick", 3)),
+        tick_seconds=int(raw.get("tick_seconds", 900)),
+    )
 
 
 def is_off_hours(now: datetime, start_hour: int, end_hour: int) -> bool:

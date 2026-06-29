@@ -3058,11 +3058,15 @@ def server(
 
             routing_client = LLMRoutingClient(_policy_client)
 
+    # Tokenmaxx off-hours orchestrator (#11): parse the optional config block.
+    from omnigent.runtime.tokenmaxx import parse_tokenmaxx_config
+
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
+        tokenmaxx=parse_tokenmaxx_config(cfg.get("tokenmaxx")),
     )
     init_runtime(
         conversation_store=conversation_store,

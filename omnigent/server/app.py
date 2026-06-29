@@ -1306,6 +1306,37 @@ def create_app(
                 len(scheduler_service.armed_ids),
             )
 
+        # Tokenmaxx (#11): off-hours orchestrator that dispatches the
+        # work-items backlog during the configured window. Off by default;
+        # started only when configured + enabled. Held on app.state for the
+        # finally block to stop.
+        from omnigent.runtime import get_caps, get_work_item_store
+        from omnigent.runtime.tokenmaxx import TokenmaxxService
+        from omnigent.runtime.tokenmaxx_dispatch import build_work_item_dispatch
+
+        tokenmaxx_service: TokenmaxxService | None = None
+        _tm_config = get_caps().tokenmaxx
+        _work_item_store = get_work_item_store()
+        if _work_item_store is not None and _tm_config is not None and _tm_config.enabled:
+            tokenmaxx_service = TokenmaxxService(
+                _work_item_store,
+                build_work_item_dispatch(
+                    app_inst,
+                    identity_header=resolve_auth_header(),
+                    reserved_identities=frozenset({RESERVED_USER_LOCAL}),
+                ),
+                _tm_config,
+            )
+            await tokenmaxx_service.start()
+            app_inst.state.tokenmaxx_service = tokenmaxx_service
+            _logger.info(
+                "tokenmaxx: started (off-hours %02d:00-%02d:00, max %d/tick, every %ds)",
+                _tm_config.off_hours_start,
+                _tm_config.off_hours_end,
+                _tm_config.max_items_per_tick,
+                _tm_config.tick_seconds,
+            )
+
         # Accounts first-run: open the browser after uvicorn has bound
         # the port. bootstrap_admin sets open_url to the loopback base
         # URL on a needs-setup boot so the browser lands on the
@@ -1344,6 +1375,8 @@ def create_app(
             # dispatches into, so an in-flight fire can't hit a half-closed app.
             if scheduler_service is not None:
                 await scheduler_service.stop()
+            if tokenmaxx_service is not None:
+                await tokenmaxx_service.stop()
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the
