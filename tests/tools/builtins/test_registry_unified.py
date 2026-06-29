@@ -123,6 +123,10 @@ def test_builtin_names_size_matches_registry() -> None:
                 "create_work_item",
                 "list_tasks",
                 "update_work_item",
+                "create_loop",
+                "create_monitor",
+                "list_schedules",
+                "delete_schedule",
                 # Framework-owned (need runtime context, not
                 # user-instantiable). Policy ASKs surface as
                 # MCP-shape elicitations on the SSE stream and

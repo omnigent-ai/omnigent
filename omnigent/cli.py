@@ -3009,6 +3009,7 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleStore
     from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -3017,6 +3018,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    schedule_store = SqlAlchemyScheduleStore(db_uri)
     work_item_store = SqlAlchemyWorkItemStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
@@ -3070,6 +3072,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        schedule_store=schedule_store,
         work_item_store=work_item_store,
         caps=caps,
     )
