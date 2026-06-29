@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
-from omnigent.runtime.credentials import resolve_user_secret
+from omnigent.runtime.credentials import resolve_user_credential_env, resolve_user_secret
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes.credentials import create_credentials_router
@@ -190,6 +190,36 @@ async def test_resolve_user_secret_is_per_acting_user(client: httpx.AsyncClient)
     # An identity with no such secret resolves to None (caller falls back to
     # ambient creds) — never to another user's value.
     assert resolve_user_secret("carol@example.com", "github") is None
+
+
+async def test_resolve_credential_env_maps_per_acting_user(client: httpx.AsyncClient) -> None:
+    """Server-side resolve+map (pushed to the runner) is per-user and mapped.
+
+    This is what the turn dispatch attaches as ``credential_env`` for the
+    actor: Alice's github token becomes GITHUB_TOKEN/GH_TOKEN; Bob's aws keys
+    become AWS_*; neither leaks into the other.
+    """
+    await client.put("/v1/credentials/github", json={"secret": "ghp_alice"}, headers=_hdr(ALICE))
+    await client.put(
+        "/v1/credentials/aws_access_key_id", json={"secret": "AKIA_bob"}, headers=_hdr(BOB)
+    )
+    await client.put(
+        "/v1/credentials/aws_secret_access_key", json={"secret": "bobsecret"}, headers=_hdr(BOB)
+    )
+
+    alice_env = resolve_user_credential_env(ALICE)
+    bob_env = resolve_user_credential_env(BOB)
+
+    assert alice_env == {"GITHUB_TOKEN": "ghp_alice", "GH_TOKEN": "ghp_alice"}
+    assert bob_env == {"AWS_ACCESS_KEY_ID": "AKIA_bob", "AWS_SECRET_ACCESS_KEY": "bobsecret"}
+    # No cross-contamination between collaborators.
+    assert "GITHUB_TOKEN" not in bob_env
+    assert "AWS_ACCESS_KEY_ID" not in alice_env
+
+
+async def test_resolve_credential_env_empty_for_unknown_user(client: httpx.AsyncClient) -> None:
+    """A user with nothing stored yields an empty overlay (the common case)."""
+    assert resolve_user_credential_env("nobody@example.com") == {}
 
 
 async def test_secret_is_encrypted_at_rest(

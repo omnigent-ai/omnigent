@@ -8466,6 +8466,23 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    # Per-user identity + credentials for #5. Tag the turn with its acting
+    # collaborator so the runner can act under their identity, and push that
+    # actor's resolved vault secrets (already mapped to env-var names) so the
+    # runner can run their git/aws/etc. under their own credentials rather than
+    # the session owner's. The server resolves here — it owns the vault and has
+    # authenticated the sender — so the runner never pulls secrets and no
+    # "resolve arbitrary user" endpoint is exposed. credential_env is attached
+    # only when non-empty (the common credential-less turn adds nothing); both
+    # ride the existing trusted runner channel, which already carries
+    # spec/MCP/executor secrets, and runner_body is never logged.
+    if created_by:
+        runner_body["created_by"] = created_by
+        from omnigent.runtime.credentials import resolve_user_credential_env
+
+        credential_env = await asyncio.to_thread(resolve_user_credential_env, created_by)
+        if credential_env:
+            runner_body["credential_env"] = credential_env
     # Forward request-supplied client-side tool schemas so non-native
     # harnesses can emit (and tunnel) the caller's tools — the runner
     # merges these into the harness tool list (_merge_request_client_tools).
