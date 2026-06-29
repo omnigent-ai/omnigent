@@ -521,3 +521,114 @@ def test_instrument_fastapi_app_calls_instrumentor_when_enabled(
     telemetry.instrument_fastapi_app(app)
 
     assert calls == [app]
+
+
+def test_record_llm_retry_adds_event_with_expected_attributes(
+    _otel_in_memory_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``record_llm_retry`` adds a ``gen_ai.retry`` event whose
+    attributes carry the attempt counters, error class, error
+    message (when content capture is on), and backoff duration.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    # _capture_content is module-level cached. Force ON so error.message
+    # is included in the assertion below.
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+        telemetry.record_llm_retry(
+            attempt=1,
+            max_attempts=3,
+            error_type="TimeoutException",
+            error_message="LLM request timed out",
+            backoff_seconds=0.25,
+        )
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    assert len(spans) == 1
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 1
+    attrs = dict(events[0].attributes or {})
+    assert attrs == {
+        "attempt": 1,
+        "max_attempts": 3,
+        "error.type": "TimeoutException",
+        "error.message": "LLM request timed out",
+        "backoff_seconds": 0.25,
+    }
+
+
+def test_record_llm_retry_omits_backoff_when_none(
+    _otel_in_memory_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``backoff_seconds=None`` results in the key being absent on the
+    event, not zero.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+        telemetry.record_llm_retry(
+            attempt=3,
+            max_attempts=3,
+            error_type="HTTPStatusError",
+            error_message="HTTP 503",
+        )
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    attrs = dict(events[0].attributes or {})
+    assert "backoff_seconds" not in attrs
+
+
+def test_record_llm_retry_gates_error_message_on_content_capture(
+    _otel_in_memory_exporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When ``OMNIGENT_OTEL_CAPTURE_CONTENT`` is off (the default), the
+    error.message is NOT included on the event. error.type still is.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
+
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+        telemetry.record_llm_retry(
+            attempt=1,
+            max_attempts=3,
+            error_type="TimeoutException",
+            error_message="LLM request timed out with PII: user@example.com",
+            backoff_seconds=0.5,
+        )
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    attrs = dict(events[0].attributes or {})
+    assert attrs["error.type"] == "TimeoutException"
+    assert "error.message" not in attrs
+    for v in attrs.values():
+        assert "user@example.com" not in str(v)
+
+
+def test_record_llm_retry_no_op_when_no_active_span() -> None:
+    """
+    No active OTel span context means ``get_current_span()`` returns
+    a non-recording span and the call is a silent no-op.
+    """
+    telemetry.record_llm_retry(
+        attempt=1,
+        max_attempts=3,
+        error_type="TimeoutException",
+        error_message="timed out",
+        backoff_seconds=0.5,
+    )

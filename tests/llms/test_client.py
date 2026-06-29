@@ -10,6 +10,7 @@ methods are async.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
@@ -923,3 +924,174 @@ async def test_text_without_json_schema_not_translated(
     # (popped from extra but no response_format injected).
     assert "response_format" not in extra
     assert "text" not in extra
+
+
+@pytest.mark.asyncio
+async def test_create_with_retry_records_gen_ai_retry_on_active_span(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+    _otel_in_memory_exporter,
+) -> None:
+    """
+    Production path: ``Client().responses.create(retry=...)`` records
+    ``gen_ai.retry`` events on whatever span is active in the OTel
+    current context. Verifies the async retry path is actually
+    instrumented.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    mock_adapter = _MockAdapter(
+        side_effect=[
+            httpx.TimeoutException("first timeout"),
+            httpx.TimeoutException("second timeout"),
+            {"id": "test"},
+        ],
+    )
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with mlflow.start_span("agent_turn", span_type=SpanType.CHAIN):
+        result = await Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    assert isinstance(result, Response)
+    assert mock_adapter.call_count == 3
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    agent_spans = [s for s in spans if s.name == "agent_turn"]
+    assert len(agent_spans) == 1
+    events = [e for e in agent_spans[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 2
+    attrs_by_attempt = {int(e.attributes["attempt"]): dict(e.attributes or {}) for e in events}
+    assert set(attrs_by_attempt.keys()) == {1, 2}
+    for _attempt, attrs in attrs_by_attempt.items():
+        assert attrs["max_attempts"] == retry_config.max_retries + 1
+        assert attrs["error.type"] == "RetryableLLMError"
+        assert "timed out" in attrs["error.message"]
+        assert attrs["backoff_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_create_with_retry_async_path_gates_error_message_on_content_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+    _otel_in_memory_exporter,
+) -> None:
+    """
+    Async production path with content-capture OFF: gen_ai.retry events
+    land but error.message is NOT captured even when the upstream
+    error body contains PII. error.type still is.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
+
+    mock_adapter = _MockAdapter(
+        side_effect=[
+            httpx.TimeoutException("upstream PII: pii@example.com"),
+            {"id": "test"},
+        ],
+    )
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    with mlflow.start_span("agent_turn", span_type=SpanType.CHAIN):
+        result = await Client().responses.create(
+            **_default_create_kwargs(),
+            retry=retry_config,
+        )
+
+    assert isinstance(result, Response)
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    agent_spans = [s for s in spans if s.name == "agent_turn"]
+    events = [e for e in agent_spans[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 1
+    attrs = dict(events[0].attributes or {})
+    assert attrs["error.type"] == "RetryableLLMError"
+    assert "error.message" not in attrs
+    for v in attrs.values():
+        assert "pii@example.com" not in str(v)
+
+
+@pytest.mark.asyncio
+async def test_create_with_retry_no_active_span_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    When no OTel span is active, the retry instrumentation no-ops
+    silently. The retry itself still works.
+    """
+    mock_adapter = _MockAdapter(
+        side_effect=[
+            httpx.TimeoutException("timeout"),
+            {"id": "test"},
+        ],
+    )
+    _patch_client_deps(monkeypatch, mock_adapter)
+
+    result = await Client().responses.create(
+        **_default_create_kwargs(),
+        retry=retry_config,
+    )
+    assert isinstance(result, Response)
+    assert mock_adapter.call_count == 2
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_NETWORK_TESTS") != "1",
+    reason="E2E network test, opt in with OMNIGENT_E2E_NETWORK_TESTS=1",
+)
+@pytest.mark.asyncio
+async def test_create_with_retry_e2e_real_network_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+    _otel_in_memory_exporter,
+) -> None:
+    """
+    End-to-end check on a real network path. Points the client at
+    TEST-NET-1 (192.0.2.1, RFC 5737 unreachable), so every attempt
+    times out on the wire. Verifies the gen_ai.retry events emit on
+    the active span via the real Client retry loop, the real OTel
+    pipeline, and the unified telemetry.record_llm_retry helper.
+
+    No adapter mocks. No patched timeouts. Real connect attempts,
+    real exceptions, real instrumentation.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    retry = RetryPolicy(max_retries=2, backoff_base_s=0.01, backoff_max_s=0.05)
+
+    with mlflow.start_span("agent_turn", span_type=SpanType.CHAIN):
+        with pytest.raises(RetryableLLMError):
+            await Client().responses.create(
+                input=[{"role": "user", "content": "hello"}],
+                model="anthropic/claude-3-5-haiku-20241022",
+                connection_params={
+                    "base_url": "http://192.0.2.1:9999",
+                    "api_key": "dummy-unreachable",
+                },
+                timeout=1,
+                retry=retry,
+            )
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    parent = [s for s in spans if s.name == "agent_turn"]
+    assert len(parent) == 1
+
+    events = [e for e in parent[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 2
+    attrs_by_attempt = {int(e.attributes["attempt"]): dict(e.attributes or {}) for e in events}
+    assert set(attrs_by_attempt.keys()) == {1, 2}
+    for _attempt, attrs in attrs_by_attempt.items():
+        assert attrs["max_attempts"] == 3
+        assert attrs["error.type"] == "RetryableLLMError"
+        assert attrs["backoff_seconds"] > 0
+        assert "error.message" in attrs

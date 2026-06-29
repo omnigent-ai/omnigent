@@ -23,6 +23,7 @@ from omnigent.llms.errors import (
     PermanentLLMError,
     RetryableLLMError,
 )
+from omnigent.runtime import telemetry
 from omnigent.spec.types import RetryPolicy
 
 _logger = logging.getLogger(__name__)
@@ -353,6 +354,13 @@ def _emit_retry_and_sleep(
         },
     }
     on_retry(event)
+    telemetry.record_llm_retry(
+        attempt=attempt + 1,
+        max_attempts=total_tries,
+        error_type=type(error).__name__,
+        error_message=str(error),
+        backoff_seconds=delay,
+    )
     _logger.info(
         "LLM retry %d/%d after %.1fs: %s",
         attempt + 2,

@@ -460,3 +460,83 @@ def test_detail_to_dict_with_empty_detail() -> None:
     # All fields are None → empty dict → collapsed to None.
     # Failure would mean empty dicts leak into the SSE event payload.
     assert result is None
+
+
+def test_execute_with_retry_records_gen_ai_retry_events_on_active_span(
+    retry_config_fast: RetryPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+    _otel_in_memory_exporter,
+) -> None:
+    """
+    Each failed attempt that triggers a retry lands as a gen_ai.retry
+    event on the active OTel span via the production
+    telemetry.record_llm_retry helper.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    monkeypatch.setattr("omnigent.runtime.llm_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    call_fn = MagicMock(
+        side_effect=[
+            httpx.TimeoutException("first timeout"),
+            httpx.TimeoutException("second timeout"),
+            "recovered",
+        ]
+    )
+    on_retry = MagicMock()
+
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+        result = execute_with_retry(call_fn, retry_config_fast, on_retry)
+
+    assert result == "recovered"
+    assert call_fn.call_count == 3
+    assert on_retry.call_count == 2
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 2
+    attrs_by_attempt = {int(e.attributes["attempt"]): dict(e.attributes or {}) for e in events}
+    assert set(attrs_by_attempt.keys()) == {1, 2}
+    for _attempt, attrs in attrs_by_attempt.items():
+        assert attrs["max_attempts"] == retry_config_fast.max_retries + 1
+        assert attrs["error.type"] == "RetryableLLMError"
+        assert "timed out" in attrs["error.message"]
+        assert attrs["backoff_seconds"] > 0
+
+
+def test_execute_with_retry_omits_error_message_when_content_capture_off(
+    retry_config_fast: RetryPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+    _otel_in_memory_exporter,
+) -> None:
+    """
+    With ``OMNIGENT_OTEL_CAPTURE_CONTENT`` off (the default),
+    error.message is NOT captured on the gen_ai.retry events even
+    when the upstream error body contains PII.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    monkeypatch.setattr("omnigent.runtime.llm_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
+
+    call_fn = MagicMock(
+        side_effect=[
+            httpx.TimeoutException("upstream PII: user@example.com"),
+            "recovered",
+        ]
+    )
+
+    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+        execute_with_retry(call_fn, retry_config_fast, MagicMock())
+
+    spans = _otel_in_memory_exporter.get_finished_spans()
+    events = [e for e in spans[0].events if e.name == "gen_ai.retry"]
+    assert len(events) == 1
+    attrs = dict(events[0].attributes or {})
+    assert attrs["error.type"] == "RetryableLLMError"
+    assert "error.message" not in attrs
+    for v in attrs.values():
+        assert "user@example.com" not in str(v)

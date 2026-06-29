@@ -389,3 +389,78 @@ def lowered_idle_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(terminal_module, "_IDLE_POLL_INTERVAL_SECONDS", 0.1)
     monkeypatch.setattr(terminal_module, "_IDLE_MARKER_SUBSTRINGS", [])
     monkeypatch.setattr(terminal_module, "_IDLE_MARKER_THRESHOLD_SECONDS", 0.4)
+
+@pytest.fixture
+def _otel_in_memory_exporter():
+    """
+    Production-path fixture for asserting OTel span events.
+
+    Installs a fresh OTel TracerProvider with an in-memory exporter,
+    yields it, then restores every global it mutated. OTel only
+    allows the TracerProvider to be set once per process, so leaving
+    a test-installed provider in place silently misroutes spans for
+    every later test in the same process.
+
+    Use in tests that need to assert on `gen_ai.retry` events or other
+    OTel-emitted span events across the production call path.
+    """
+    import os
+
+    import mlflow
+    import mlflow.tracing
+    from mlflow.tracing.provider import provider as mlflow_provider_wrapper
+    from mlflow.tracing.trace_manager import InMemoryTraceManager
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    from omnigent.runtime import telemetry as runtime_telemetry
+
+    original_provider = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    original_set_once_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    original_mlflow_once_done = mlflow_provider_wrapper._global_provider_init_once._done  # type: ignore[attr-defined]
+    original_telemetry_initialized = runtime_telemetry._initialized  # type: ignore[attr-defined]
+    original_env_value = os.environ.get("MLFLOW_USE_DEFAULT_TRACER_PROVIDER")
+
+    os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = "false"
+    runtime_telemetry._initialized = False  # type: ignore[attr-defined]
+
+    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
+    if trace_manager_instance is not None:
+        trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
+        trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    mlflow_provider_wrapper._global_provider_init_once._done = False  # type: ignore[attr-defined]
+    mlflow.tracing.enable()
+
+    try:
+        yield exporter
+    finally:
+        # Process-serial only: the OTel and mlflow `Once` synchronization
+        # primitive mutations below are not safe under pytest-xdist
+        # parallel test workers in the same interpreter. omnigent's test
+        # suite runs single-process so this is fine; flag if that changes.
+        exporter.clear()
+        try:
+            provider.shutdown()
+        except Exception:
+            pass
+        otel_trace._TRACER_PROVIDER = original_provider  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = original_set_once_done  # type: ignore[attr-defined]
+        mlflow_provider_wrapper._global_provider_init_once._done = original_mlflow_once_done  # type: ignore[attr-defined]
+        runtime_telemetry._initialized = original_telemetry_initialized  # type: ignore[attr-defined]
+        if original_env_value is None:
+            os.environ.pop("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", None)
+        else:
+            os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = original_env_value
+        if trace_manager_instance is not None:
+            trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
+            trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
