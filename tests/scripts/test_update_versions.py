@@ -9,13 +9,30 @@ fails here.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
 
-from scripts import update_versions
-
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# ``scripts`` is a namespace package (no ``__init__.py``), so a bare
+# ``from scripts import update_versions`` is shadowed by the regular
+# ``tests/scripts`` package when both resolve as a top-level ``scripts`` during
+# a full-suite collection (pytest's default "prepend" import mode), failing with
+# ``ImportError: cannot import name 'update_versions' from 'scripts'``. Load the
+# module by its repo-root file path instead, which is immune to the collision.
+# See https://github.com/omnigent-ai/omnigent/issues/1311.
+_UPDATE_VERSIONS_SPEC = importlib.util.spec_from_file_location(
+    "_update_versions_under_test", _REPO_ROOT / "scripts" / "update_versions.py"
+)
+assert _UPDATE_VERSIONS_SPEC is not None and _UPDATE_VERSIONS_SPEC.loader is not None
+update_versions = importlib.util.module_from_spec(_UPDATE_VERSIONS_SPEC)
+# Register before exec so dataclasses defined in the module can resolve their
+# defining module via ``sys.modules`` during class creation.
+sys.modules[_UPDATE_VERSIONS_SPEC.name] = update_versions
+_UPDATE_VERSIONS_SPEC.loader.exec_module(update_versions)
 _PYPROJECTS = [
     "pyproject.toml",
     "sdks/python-client/pyproject.toml",
