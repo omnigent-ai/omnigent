@@ -2802,6 +2802,7 @@ async def _auto_create_qwen_terminal(
         prepare_bridge_files,
         qwen_session_id_for_conversation,
         qwen_session_recording_exists,
+        write_mcp_config,
         write_tmux_target,
     )
     from omnigent.qwen_native_forwarder import clear_qwen_bridge_state
@@ -2853,6 +2854,38 @@ async def _auto_create_qwen_terminal(
         # First launch (or a prior persist that didn't land): record the id so the
         # next resume reads it from the snapshot and forks can carry history.
         await _persist_qwen_external_session_id(server_client, session_id, qwen_session_id)
+    # Expose Omnigent's builtin tools (sys_*, load_skill, web_fetch, …) to qwen
+    # via the shared MCP relay, passed through qwen's ``--mcp-config`` flag (the
+    # claude-native model). The config lives in the bridge dir — never the
+    # workspace — so we drop no file in the user's repo and concurrent
+    # same-workspace sessions can't collide; CLI-provided servers are also ungated
+    # (no "Untrusted MCP server" prompt), so no pre-approval step is needed.
+    # Written before launch so the relay's ``bridge.json`` token exists when qwen
+    # spawns ``serve-mcp``; the live tool surface is advertised by the
+    # ``tool_relay.json`` that ``ensure_comment_relay`` writes below. Only when the
+    # relay will actually start (``ensure_comment_relay`` present), else the
+    # registered tools would be dead (serve-mcp with nothing to route calls back
+    # to) — mirrors the opencode-native gating.
+    mcp_enabled = server_client is not None and ensure_comment_relay is not None
+    mcp_args: list[str] = []
+    if mcp_enabled:
+        try:
+            mcp_config = write_mcp_config(bridge_dir)
+        except RuntimeError:
+            # The bridge dir failed owner-only validation (e.g. a redirected
+            # ancestor on a shared host) — don't write the relay token there.
+            # Degrade to no MCP rather than crash the session; the relay's own
+            # secure-dir check would reject it later too.
+            mcp_enabled = False
+            _logger.warning(
+                "qwen-native: bridge dir failed secure validation; skipping "
+                "Omnigent MCP wiring for session %s.",
+                session_id,
+                exc_info=True,
+            )
+        else:
+            mcp_args = ["--mcp-config", str(mcp_config)]
+
     # The dual-output + input-file flags wire qwen to the bridge; any user
     # ``terminal_launch_args`` (e.g. ``-m <model>``) precede them. Approval stays
     # the default in-terminal prompt (the embedded pane shows it) — Omnigent-side
@@ -2860,6 +2893,7 @@ async def _auto_create_qwen_terminal(
     qwen_args = [
         *(launch_config.terminal_launch_args or []),
         *resume_args,
+        *mcp_args,
         "--input-file",
         str(in_path),
         "--json-file",
