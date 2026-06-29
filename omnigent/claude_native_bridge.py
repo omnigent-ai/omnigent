@@ -384,6 +384,9 @@ class ClaudeHookRecord:
         ``TaskCompleted`` (``"completed"``), or
         ``PostToolUse``/``TaskUpdate`` event (``"in_progress"`` or
         ``"completed"``). ``None`` for all other events.
+    :param background_task_count: Number of background tasks still running
+        when a ``Stop`` hook fires (parsed from ``background_tasks`` array
+        in the hook payload). ``0`` for all other events or when absent.
     """
 
     event_cursor: int
@@ -402,6 +405,7 @@ class ClaudeHookRecord:
     task_id: str | None = None
     task_subject: str | None = None
     task_status: str | None = None
+    background_task_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -2190,6 +2194,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_task_id, str) and raw_task_id:
             task_id = raw_task_id
         task_status = "completed"
+    background_task_count = 0
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_bg = payload.get("background_tasks")
+        if isinstance(raw_bg, list):
+            background_task_count = len(raw_bg)
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -2231,6 +2240,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_id=task_id,
         task_subject=task_subject,
         task_status=task_status,
+        background_task_count=background_task_count,
     )
 
 

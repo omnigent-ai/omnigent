@@ -5169,3 +5169,67 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     assert "did not become ready" in message
     assert "Last terminal output:" in message
     assert "JSON Parse error: Unrecognized token '<'" in message
+
+
+# ── _hook_record_from_jsonl_record: background_task_count ────────────────────
+
+
+def test_hook_record_parses_stop_background_tasks() -> None:
+    """
+    ``Stop`` with ``background_tasks`` → ``background_task_count`` is set.
+
+    Claude Code fires the Stop hook with a ``background_tasks`` array when
+    shells are still running. The forwarder uses the count to decide whether
+    to publish ``waiting`` instead of ``idle``.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "abc123",
+                        "type": "shell",
+                        "status": "running",
+                        "description": "Wait for CI",
+                        "command": "sleep 120",
+                    },
+                    {
+                        "id": "def456",
+                        "type": "shell",
+                        "status": "running",
+                        "description": "Build check",
+                        "command": "make build",
+                    },
+                ],
+            }
+        )
+    )
+    assert record.event_name == "Stop"
+    assert record.background_task_count == 2
+
+
+def test_hook_record_stop_without_background_tasks() -> None:
+    """
+    ``Stop`` without ``background_tasks`` → ``background_task_count`` is 0.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "Stop"})
+    )
+    assert record.event_name == "Stop"
+    assert record.background_task_count == 0
+
+
+def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
+    """
+    Non-Stop events always have ``background_task_count == 0``.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+            }
+        )
+    )
+    assert record.background_task_count == 0

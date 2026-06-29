@@ -2694,11 +2694,14 @@ async def _forward_available_status_events(
         retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
+        effective_status = status
+        if status == "idle" and record.background_task_count > 0:
+            effective_status = "waiting"
         try:
             await _post_external_session_status(
                 client,
                 session_id=session_id,
-                status=status,
+                status=effective_status,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
