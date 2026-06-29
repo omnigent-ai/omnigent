@@ -420,11 +420,15 @@ function walkBubbles(
     }
 
     if (b.type === "compaction") {
-      // If the immediately preceding bubble is a loading spinner for
-      // this same compaction, replace it with the done marker so the
-      // user sees a single entry transition from spinner → checkmark.
-      if (bubbles.length > 0 && bubbles[bubbles.length - 1]?.kind === "compaction_loading") {
-        bubbles.pop();
+      // Remove the loading spinner for this compaction so the user sees
+      // a single transition from spinner → checkmark.  The spinner may
+      // not be the immediately preceding bubble when assistant blocks
+      // (text, tool calls) were streamed during compaction.
+      for (let j = bubbles.length - 1; j >= 0; j--) {
+        if (bubbles[j]?.kind === "compaction_loading") {
+          bubbles.splice(j, 1);
+          break;
+        }
       }
       lastBubbleStart = i;
       bubbles.push({
