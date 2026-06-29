@@ -10846,6 +10846,34 @@ def create_runner_app(
         _wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
+    async def _handle_kiro_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight kiro turn by sending ``Escape`` to its TUI pane.
+
+        kiro-native turns run inside the ``kiro-cli`` TUI; the runner harness
+        task returns right after the tmux paste, so the in-process cancel floor
+        has nothing to cancel. ``Escape`` stops a running kiro turn. Mirrors the
+        goose-native interrupt.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.kiro_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
     async def _handle_kimi_native_interrupt(conv_id: str) -> Response:
         """Cancel the in-flight kimi turn by sending ``Escape`` to its TUI pane.
 
@@ -10910,6 +10938,49 @@ def create_runner_app(
         ):
             _logger.warning(
                 "Goose-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _handle_kiro_native_stop(conv_id: str) -> Response:
+        """Hard-stop a kiro-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_goose_native_stop`: kill the pane (ends
+        ``kiro-cli``), tear the terminal resource down, cancel the forwarder,
+        publish ``idle``, and reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.kiro_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "Kiro-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
@@ -14493,6 +14564,9 @@ def create_runner_app(
             if _harness == "goose-native":
                 # goose turn lives in the goose session TUI; send Escape to stop it.
                 return await _handle_goose_native_interrupt(conversation_id)
+            if _harness == "kiro-native":
+                # kiro turn lives in the kiro-cli TUI; send Escape to stop it.
+                return await _handle_kiro_native_interrupt(conversation_id)
             if _harness == "hermes-native":
                 # hermes turn lives in the hermes TUI; send Escape to stop it.
                 return await _handle_hermes_native_interrupt(conversation_id)
@@ -14576,6 +14650,9 @@ def create_runner_app(
             if _harness == "goose-native":
                 # Hard-kill the goose session tmux pane (the TUI is the runtime).
                 return await _handle_goose_native_stop(conversation_id)
+            if _harness == "kiro-native":
+                # Hard-kill the kiro-cli tmux pane (the TUI is the runtime).
+                return await _handle_kiro_native_stop(conversation_id)
             if _harness == "hermes-native":
                 # Hard-kill the hermes tmux pane (the TUI is the runtime).
                 return await _handle_hermes_native_stop(conversation_id)
