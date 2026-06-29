@@ -932,12 +932,21 @@ async def test_rescan_skips_auto_allowed_step_and_surfaces_next_gate(
 async def test_resurface_pending_interaction_swallows_poll_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A re-scan whose steps re-read fails is logged and swallowed, not raised."""
+    """A re-scan whose steps re-read fails on EVERY bounded attempt is logged and
+    swallowed, not raised — and the read is retried, not given up after one shot
+    (#1472 review: the re-scan is the sole backstop on the healthy-stream path)."""
+    calls = 0
 
     def _boom(_port: int, _cascade_id: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
         raise httpx.ConnectError("refused")
 
+    async def _noop_sleep(_seconds: float) -> None:
+        return None
+
     monkeypatch.setattr(reader, "get_trajectory_steps", _boom)
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)  # no real backoff in the test
     state = reader._ReaderState(
         allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
@@ -949,15 +958,60 @@ async def test_resurface_pending_interaction_swallows_poll_error(
     async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
         fired.append(pending["step_index"])
 
-    # Must not raise despite the read failing.
+    # Must not raise despite the read failing on every attempt.
     await reader._resurface_pending_interaction(
         cascade_id=_CASCADE_ID,
         state=state,
         on_pending_interaction=cast(Any, _quick),
     )
 
+    assert calls == reader._INTERACTION_RESCAN_POLL_ATTEMPTS  # retried, not one-shot
     assert fired == []  # no gate surfaced
     assert state.interaction_task is None  # no bridge spawned
+
+
+@pytest.mark.asyncio
+async def test_resurface_pending_interaction_retries_transient_poll_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TRANSIENT re-scan poll error is retried and the deferred gate STILL surfaces
+    on a later attempt (#1472 review): the re-scan is the only backstop on the
+    healthy-stream path, so it must not abandon the gate after one failed read."""
+    gate = _load("run_command_waiting")  # stepIndex 6 — the deferred gate
+    failed_once = False
+
+    def _flaky(_port: int, _cascade_id: str) -> list[dict[str, Any]]:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise httpx.ConnectError("refused")  # transient blip on the first read
+        return [gate]
+
+    async def _noop_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _flaky)
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)  # no real backoff in the test
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    await reader._resurface_pending_interaction(
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    await _drain_interactions(state)
+
+    assert failed_once  # the first read raised and was retried, not abandoned
+    assert fired == [6]  # the gate surfaced despite the transient blip
 
 
 @pytest.mark.asyncio

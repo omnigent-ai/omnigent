@@ -129,6 +129,15 @@ _STREAM_REENTRY_BACKOFF_S = 0.5
 # slack without risking an unbounded loop.
 _INTERACTION_DRAIN_PASSES = 4
 
+# The bridge-clear re-scan (#1472) is the SOLE backstop that surfaces a deferred gate
+# on the healthy-stream path: agy emits no frame while parked on that gate and the
+# poll loop only runs as the stream's failure fallback, so a one-shot re-scan that
+# swallows a transient poll error would strand the gate forever (the original bug).
+# Retry the snapshot read a bounded number of times before giving up so a momentary
+# loopback RPC blip does not re-introduce the permanent hang (#1472 review).
+_INTERACTION_RESCAN_POLL_ATTEMPTS = 3
+_INTERACTION_RESCAN_POLL_BACKOFF_S = 0.2
+
 # POST retry policy, kept identical to the transcript forwarder's so mirrored
 # items are delivered with the same transient-retry semantics. Conversation
 # items persist with a random primary key and are NOT deduped server-side, so an
@@ -1877,9 +1886,14 @@ async def _resurface_pending_interaction(
     through :func:`_maybe_handle_interaction`. ``state.interacted`` makes any
     already-surfaced step a no-op, so at most the one not-yet-seen WAITING gate is
     surfaced — which spawns the next bridge, whose own clear re-scans again, draining
-    a chain of sequential gates one at a time. A poll failure is logged and swallowed
-    (mirrors :func:`_poll_loop`): the poll fallback or a later frame still catches the
-    gate, so a transient read error must not crash the re-scan.
+    a chain of sequential gates one at a time. The snapshot read is RETRIED a bounded
+    number of times on a transient poll error (:data:`_INTERACTION_RESCAN_POLL_ATTEMPTS`)
+    because this re-scan is the SOLE backstop on the healthy-stream path — agy emits no
+    frame while parked on the deferred gate and the poll loop runs only as the stream's
+    failure fallback — so swallowing a one-shot read error would strand the gate forever
+    (the original #1472 bug). Only after the bounded retries are exhausted is the error
+    logged and swallowed (the task must never crash); a still-pending gate then relies on
+    the poll fallback or a later frame, and never blocks the event loop.
 
     :param cascade_id: agy cascade id (equal to the conversation id).
     :param state: Per-run reader state — ``port`` is read; ``interacted`` and the
@@ -1887,16 +1901,28 @@ async def _resurface_pending_interaction(
     :param on_pending_interaction: Async callback for a distinct interaction.
     :returns: None.
     """
-    try:
-        steps = await asyncio.to_thread(get_trajectory_steps, state.port, cascade_id)
-    except (httpx.HTTPError, ValueError) as exc:
-        _logger.warning(
-            "agy interaction re-scan poll failed (cascade=%s, port=%s); the poll "
-            "fallback or a later frame will catch the deferred gate: %r",
-            cascade_id,
-            state.port,
-            exc,
-        )
+    steps: list[dict[str, object]] | None = None
+    for attempt in range(_INTERACTION_RESCAN_POLL_ATTEMPTS):
+        try:
+            steps = await asyncio.to_thread(get_trajectory_steps, state.port, cascade_id)
+            break
+        except (httpx.HTTPError, ValueError) as exc:
+            last = attempt == _INTERACTION_RESCAN_POLL_ATTEMPTS - 1
+            _logger.warning(
+                "agy interaction re-scan poll failed (cascade=%s, port=%s, attempt=%d/%d)%s: %r",
+                cascade_id,
+                state.port,
+                attempt + 1,
+                _INTERACTION_RESCAN_POLL_ATTEMPTS,
+                "; giving up — the poll fallback or a later frame must catch the deferred gate"
+                if last
+                else "; retrying",
+                exc,
+            )
+            if last:
+                return
+            await _sleep(_INTERACTION_RESCAN_POLL_BACKOFF_S)
+    if steps is None:  # pragma: no cover - the loop returns on the last failure
         return
     for step in steps:
         _maybe_handle_interaction(
