@@ -75,10 +75,7 @@ function AddDefaultPolicyDialog({
       }
     | null
     | undefined;
-  const modelIds = useMemo(
-    () => CLAUDE_NATIVE_MODELS.map((m) => m.id),
-    [],
-  );
+  const modelIds = useMemo(() => CLAUDE_NATIVE_MODELS.map((m) => m.id), []);
   const properties = useMemo(() => {
     const props = rawSchema?.properties ?? {};
     if (!modelIds.length) return props;
