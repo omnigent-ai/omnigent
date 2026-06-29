@@ -23,7 +23,7 @@ from omnigent.spec.types import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
-from omnigent.tools.client_specified import ClientSideToolSpec
+from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
@@ -326,6 +326,45 @@ def test_schemas_isolate_a_failing_tool(
     names = {s["function"]["name"] for s in schemas}
     assert "boom" not in names
     assert names == healthy  # every healthy tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
+
+
+def test_client_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A client-side tool whose ``get_schema`` raises is skipped, not
+    allowed to drop the entire client toolset: every other client tool's
+    schema is still returned and a warning names the offending tool.
+
+    Mirrors ``test_schemas_isolate_a_failing_tool`` for the
+    ``get_client_tool_schemas`` path that ``SpawnTool`` uses to propagate
+    client tools to sub-agents (#378).
+    """
+
+    class _BoomClientTool(ClientSideTool):
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy_tool = ClientSideTool(
+        ClientSideToolSpec(
+            name="weather",
+            schema={"type": "function", "function": {"name": "weather"}},
+        )
+    )
+    mgr._tools["weather"] = healthy_tool
+    healthy = {s["function"]["name"] for s in mgr.get_client_tool_schemas()}
+    assert healthy == {"weather"}  # sanity: the good client tool is advertised
+
+    mgr._tools["boom"] = _BoomClientTool(ClientSideToolSpec(name="boom", schema={}))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_client_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # the healthy client tool survived the bad one
     assert any("boom" in record.getMessage() for record in caplog.records)
 
 
