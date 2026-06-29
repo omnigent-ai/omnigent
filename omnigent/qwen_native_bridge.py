@@ -221,8 +221,12 @@ def qwen_session_records_from_session_items(
     - user ``message`` → ``{"type":"user","message":{"role":"user","parts":[{"text"}]}}``
     - assistant ``message`` → ``{"type":"assistant","message":{"role":"model",...}}``
 
-    Interrupted assistant turns (and their whole response group) are skipped so a
-    cancelled turn isn't restored as completed history.
+    Cancelled turns aren't restored as completed history: an interrupted
+    assistant turn and its whole response group are skipped when the source
+    tags them and shares a ``response_id`` across the turn (claude/codex/pi),
+    and a trailing unanswered user prompt is dropped at the end (covers a
+    qwen-native source, whose per-event ``response_id`` doesn't group a turn and
+    which never sets ``interrupted``).
 
     :param items: Flat Omnigent item dicts in chronological order.
     :param qwen_session_id: qwen session id stamped on every record.
@@ -299,6 +303,16 @@ def qwen_session_records_from_session_items(
                 }
             )
             parent_uuid = rec_uuid
+    # Drop a trailing unanswered user prompt — a turn that was cancelled before
+    # any assistant reply. The response-group skip above only catches sources
+    # that tag the interrupted assistant *and* share a response_id across the
+    # turn (claude/codex/pi); a qwen-native SOURCE stamps a distinct per-event
+    # ``response_id`` (``qwen:<uuid>``) and never sets ``interrupted``, so a
+    # cancelled qwen turn would otherwise leave its user prompt dangling. A
+    # committed transcript normally ends on a completed assistant turn, so a
+    # trailing user record means an unanswered prompt either way.
+    while records and records[-1]["type"] == "user":
+        records.pop()
     return records
 
 

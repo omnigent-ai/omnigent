@@ -832,8 +832,8 @@ async def test_fork_switch_404_unknown_target() -> None:
         ),
         # qwen-native CAN carry fork history: the runner rebuilds qwen's on-disk
         # chat recording (+ runtime/meta sidecars) from the copied Omnigent items
-        # (see write_qwen_session_recording). Cross-family from a claude SDK source
-        # (qwen has no single provider family), so model settings reset and the
+        # (see write_qwen_session_recording). Cross-family here (claude SDK source
+        # is anthropic, qwen is openai-family), so model settings reset and the
         # source's native session id is NOT stamped — same shape as the pi-native
         # cross-family case.
         (

@@ -94,12 +94,38 @@ def test_records_skip_empty_and_non_message_items() -> None:
         {"type": "function_call", "name": "ls", "call_id": "c1", "arguments": "{}"},
         _user_item(""),  # empty text → dropped
         _user_item("real"),
+        _assistant_item("reply"),  # so "real" isn't a trailing unanswered prompt
     ]
     records = qnb.qwen_session_records_from_session_items(
         items, qwen_session_id="sess-3", cwd="/tmp/x"
     )
-    assert len(records) == 1
-    assert records[0]["message"]["parts"][0]["text"] == "real"
+    assert [r["message"]["parts"][0]["text"] for r in records] == ["real", "reply"]
+
+
+def test_records_drop_trailing_unanswered_user_prompt() -> None:
+    # A qwen-native source stamps a distinct per-event response_id and never sets
+    # `interrupted`, so a cancelled last turn leaves a dangling user prompt the
+    # response-group skip can't catch. It must be dropped from the rebuild.
+    items = [
+        _user_item("q1", response_id="qwen:a"),
+        _assistant_item("a1", response_id="qwen:b"),
+        _user_item("cancelled prompt", response_id="qwen:c"),  # no assistant reply
+    ]
+    records = qnb.qwen_session_records_from_session_items(items, qwen_session_id="s", cwd="/tmp/x")
+    texts = [r["message"]["parts"][0]["text"] for r in records]
+    assert texts == ["q1", "a1"]
+
+
+def test_records_drop_all_trailing_user_prompts() -> None:
+    # Multiple consecutive dangling user messages all get dropped.
+    items = [
+        _user_item("q1"),
+        _assistant_item("a1"),
+        _user_item("dangling 1"),
+        _user_item("dangling 2"),
+    ]
+    records = qnb.qwen_session_records_from_session_items(items, qwen_session_id="s", cwd="/tmp/x")
+    assert [r["type"] for r in records] == ["user", "assistant"]
 
 
 def test_records_default_model_used_when_item_has_none() -> None:
