@@ -35,9 +35,11 @@ from typing import Any
 import pytest
 
 from omnigent.antigravity_native_interactions import (
+    _freshest_pending,
     _freshest_waiting,
     agy_elicitation_id,
     bridge_interaction,
+    deny_pending_interaction,
 )
 from omnigent.antigravity_native_rpc import AntigravityRpcError
 from omnigent.antigravity_native_steps import PendingInteraction
@@ -675,3 +677,86 @@ def test_elicitation_id_is_deterministic_and_index_sensitive() -> None:
     assert a == b
     assert a != c
     assert a.startswith("elicit_agy_")
+
+
+# ---------------------------------------------------------------------------
+# deny_pending_interaction (interrupt DENY of a WAITING step)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deny_pending_interaction_denies_freshest_waiting_question() -> None:
+    """A WAITING ask_question is refused with an EMPTY responses payload."""
+    deliver = _DeliverRecorder()
+    denied = await deny_pending_interaction(
+        _CASCADE,
+        port=52548,
+        get_steps=_steps_returner([_question_step(step_index=2), _question_step(step_index=5)]),
+        deliver=deliver,
+    )
+    assert denied is True
+    assert len(deliver.calls) == 1
+    call = deliver.calls[0]
+    # Freshest (highest index) WAITING step is targeted.
+    assert call["step_index"] == 5
+    assert call["cascade_id"] == _CASCADE
+    # A decline yields an empty askQuestion responses list (no option selected).
+    assert call["payload"]["askQuestion"]["responses"] == []
+
+
+@pytest.mark.asyncio
+async def test_deny_pending_interaction_denies_permission_with_allow_false() -> None:
+    """A WAITING command-permission is refused with ``allow=False``."""
+    deliver = _DeliverRecorder()
+    denied = await deny_pending_interaction(
+        _CASCADE,
+        port=52548,
+        get_steps=_steps_returner([_permission_step(step_index=4)]),
+        deliver=deliver,
+    )
+    assert denied is True
+    assert deliver.calls[0]["payload"]["permission"]["allow"] is False
+    assert deliver.calls[0]["step_index"] == 4
+
+
+@pytest.mark.asyncio
+async def test_deny_pending_interaction_noop_when_no_waiting_step() -> None:
+    """No WAITING step → no delivery and a ``False`` return (cancel path runs)."""
+    deliver = _DeliverRecorder()
+    denied = await deny_pending_interaction(
+        _CASCADE,
+        port=52548,
+        # A DONE step carries an interaction block but is not WAITING.
+        get_steps=_steps_returner(
+            [_question_step(step_index=1, status="CORTEX_STEP_STATUS_DONE")]
+        ),
+        deliver=deliver,
+    )
+    assert denied is False
+    assert deliver.calls == []
+
+
+@pytest.mark.asyncio
+async def test_deny_pending_interaction_swallows_rpc_error() -> None:
+    """A delivery RPC error is logged and swallowed (returns ``False``)."""
+    deliver = _DeliverRecorder(errors=[AntigravityRpcError("boom")])
+    denied = await deny_pending_interaction(
+        _CASCADE,
+        port=52548,
+        get_steps=_steps_returner([_question_step(step_index=3)]),
+        deliver=deliver,
+    )
+    assert denied is False
+    assert len(deliver.calls) == 1
+
+
+def test_freshest_pending_picks_highest_index_any_kind() -> None:
+    """``_freshest_pending`` returns the highest-index WAITING step of any kind."""
+    fresh = _freshest_pending([_question_step(step_index=2), _permission_step(step_index=7)])
+    assert fresh is not None
+    assert fresh["step_index"] == 7
+    assert fresh["kind"] == "permission"
+    # No WAITING step → None.
+    assert (
+        _freshest_pending([_question_step(step_index=1, status="CORTEX_STEP_STATUS_DONE")]) is None
+    )
