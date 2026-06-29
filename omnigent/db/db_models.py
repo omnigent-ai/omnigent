@@ -796,6 +796,41 @@ class SqlSchedule(Base):
     )
 
 
+class SqlCanvas(Base):
+    """
+    SQLAlchemy model for the ``canvases`` table.
+
+    One agent-authored canvas artifact per conversation (Cursor-style): the
+    ``set_canvas`` tool upserts HTML/Markdown content, and the web UI renders
+    it in a right-rail Canvas tab.
+
+    :param id: Opaque PK, e.g. ``"cnv_a1b2c3..."``.
+    :param conversation_id: FK to ``conversations.id``; UNIQUE (one canvas per
+        conversation). ``ON DELETE CASCADE`` drops it with the conversation.
+    :param title: Tab title.
+    :param content: Artifact body — HTML or Markdown source.
+    :param content_type: ``"html"`` or ``"markdown"``. Defaults to ``"html"``.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, ``None`` if never
+        updated since creation.
+    """
+
+    __tablename__ = "canvases"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+    )
+    title: Mapped[str] = mapped_column(String(256))
+    content: Mapped[str] = mapped_column(Text)
+    content_type: Mapped[str] = mapped_column(String(16), server_default=text("'html'"))
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (UniqueConstraint("conversation_id", name="uq_canvases_conversation_id"),)
+
+
 class SqlHost(Base):
     """
     SQLAlchemy model for the ``hosts`` table.

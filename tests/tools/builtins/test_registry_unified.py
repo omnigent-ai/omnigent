@@ -127,6 +127,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 "create_monitor",
                 "list_schedules",
                 "delete_schedule",
+                "set_canvas",
                 # Framework-owned (need runtime context, not
                 # user-instantiable). Policy ASKs surface as
                 # MCP-shape elicitations on the SSE stream and

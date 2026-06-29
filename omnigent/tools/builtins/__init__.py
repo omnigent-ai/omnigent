@@ -34,6 +34,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.canvas import SetCanvasTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
@@ -85,6 +86,7 @@ __all__ = [
     "ListWorkItemsTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
+    "SetCanvasTool",
     "SysAgentDownloadTool",
     "SysAgentGetTool",
     "SysAgentListTool",
@@ -261,6 +263,17 @@ def _create_delete_schedule(config: dict[str, str]) -> Tool:
     return DeleteScheduleTool()
 
 
+def _create_set_canvas(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for SetCanvasTool.
+
+    :param config: Tool config (unused).
+    :returns: A SetCanvasTool instance.
+    """
+    del config
+    return SetCanvasTool()
+
+
 # Unified registry for every reserved builtin name. The value
 # is either a factory callable (for user-enablable tools) or
 # ``None`` for framework-owned names that occupy the name-space
@@ -292,6 +305,8 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "create_monitor": _create_monitor,
     "list_schedules": _create_list_schedules,
     "delete_schedule": _create_delete_schedule,
+    # Canvas (#2) — agent-authored artifact rendered in the right pane.
+    "set_canvas": _create_set_canvas,
     # Framework-owned: need runtime context. ``web_fetch`` is
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by

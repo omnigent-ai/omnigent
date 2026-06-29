@@ -3,6 +3,7 @@
 from omnigent.db.db_models import (
     Base,
     SqlAgent,
+    SqlCanvas,
     SqlConversation,
     SqlConversationItem,
     SqlFile,
@@ -15,6 +16,7 @@ from omnigent.db.db_models import (
 __all__ = [
     "Base",
     "SqlAgent",
+    "SqlCanvas",
     "SqlConversation",
     "SqlConversationItem",
     "SqlFile",

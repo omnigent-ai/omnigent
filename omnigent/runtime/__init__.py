@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         ConversationStore,
         FileStore,
     )
+    from omnigent.stores.canvas_store import CanvasStore
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
     from omnigent.stores.schedule_store import ScheduleStore
@@ -41,6 +42,7 @@ def init(
     policy_store: PolicyStore | None = None,
     schedule_store: ScheduleStore | None = None,
     work_item_store: WorkItemStore | None = None,
+    canvas_store: CanvasStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -78,6 +80,7 @@ def init(
         policy_store=policy_store,
         schedule_store=schedule_store,
         work_item_store=work_item_store,
+        canvas_store=canvas_store,
         caps=caps,
     )
 
@@ -186,6 +189,18 @@ def get_schedule_store() -> ScheduleStore | None:
     :returns: The ScheduleStore set during :func:`init`, or ``None``.
     """
     return _globals._schedule_store
+
+
+def get_canvas_store() -> CanvasStore | None:
+    """
+    Return the CanvasStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because canvas_store is optional —
+    the ``set_canvas`` tool surfaces a clear error when invoked without it.
+
+    :returns: The CanvasStore set during :func:`init`, or ``None``.
+    """
+    return _globals._canvas_store
 
 
 def get_agent_cache() -> AgentCache:

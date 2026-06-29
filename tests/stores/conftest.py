@@ -11,6 +11,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.canvas_store.sqlalchemy_store import SqlAlchemyCanvasStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleStore
 from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemStore
@@ -62,3 +63,11 @@ def schedule_store(db_uri: str) -> SqlAlchemyScheduleStore:
     :returns: A SqlAlchemyScheduleStore backed by the test database.
     """
     return SqlAlchemyScheduleStore(db_uri)
+
+
+@pytest.fixture()
+def canvas_store(db_uri: str) -> SqlAlchemyCanvasStore:
+    """
+    :returns: A SqlAlchemyCanvasStore backed by the test database.
+    """
+    return SqlAlchemyCanvasStore(db_uri)

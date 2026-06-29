@@ -643,6 +643,16 @@ def generate_schedule_id() -> str:
     return f"sch_{uuid.uuid4().hex}"
 
 
+def generate_canvas_id() -> str:
+    """
+    Generate a unique canvas identifier.
+
+    :returns: A string of the form ``"cnv_<32-char hex>"``,
+        e.g. ``"cnv_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    """
+    return f"cnv_{uuid.uuid4().hex}"
+
+
 def generate_task_id() -> str:
     """
     Generate a unique task (response) identifier.
