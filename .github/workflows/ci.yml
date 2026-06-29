@@ -10,7 +10,7 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore: ['web/**', 'tests/e2e_ui/**']
   push:
     branches:
