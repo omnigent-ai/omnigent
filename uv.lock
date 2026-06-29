@@ -2845,7 +2845,6 @@ cwsandbox = [
 databricks = [
     { name = "databricks-mcp" },
     { name = "databricks-sdk" },
-    { name = "mlflow" },
     { name = "opentelemetry-distro" },
     { name = "psycopg", extra = ["binary"] },
 ]
@@ -2855,7 +2854,6 @@ daytona = [
 dev = [
     { name = "boto3" },
     { name = "filelock" },
-    { name = "mlflow" },
     { name = "moto", extra = ["s3"] },
     { name = "mypy" },
     { name = "pathspec" },
@@ -2889,9 +2887,6 @@ openshell = [
 s3 = [
     { name = "boto3" },
     { name = "botocore" },
-]
-tracing = [
-    { name = "mlflow" },
 ]
 vertex = [
     { name = "google-auth" },
@@ -2929,9 +2924,6 @@ requires-dist = [
     { name = "keyring", specifier = ">=24,<26" },
     { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = ">=36,<37" },
     { name = "mcp", specifier = ">=1.0,<2" },
-    { name = "mlflow", marker = "extra == 'databricks'", specifier = ">=3,<4" },
-    { name = "mlflow", marker = "extra == 'dev'", specifier = ">=3,<4" },
-    { name = "mlflow", marker = "extra == 'tracing'", specifier = ">=3,<4" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=5,<6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },

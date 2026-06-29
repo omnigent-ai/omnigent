@@ -879,16 +879,13 @@ async def _run_tunnel_from_env() -> None:
     parent_pid = _runner_parent_pid_from_env()
     runner_id = get_stable_runner_id()
 
-    # Initialize MLflow tracing in the runner process so the
-    # ExecutorAdapter can emit spans for agent turns, tool calls,
-    # and LLM interactions. No-op when OTEL_EXPORTER_OTLP_ENDPOINT
-    # is unset or mlflow is not installed.
+    # Initialize OTel tracing in the runner process so the ExecutorAdapter
+    # can emit spans for agent turns, tool calls, and LLM interactions.
+    # No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
     try:
         from omnigent.runtime import telemetry
 
         telemetry.init()
-    except ImportError:
-        _logger.debug("telemetry init skipped in runner (mlflow not installed)")
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
         _logger.debug("telemetry init failed in runner", exc_info=True)
 
