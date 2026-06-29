@@ -1,8 +1,9 @@
-import { BotIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
+import { BotIcon, ClockIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FilesPanel } from "./FilesPanel";
+import { SchedulesPanel } from "./SchedulesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -142,6 +143,8 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files tab is available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
+  /** Whether the Schedules tab is available (the conversation has schedules). */
+  showSchedulesTab: boolean;
   /** Count of changed files, shown as the Files tab badge. */
   changedCount: number;
   /**
@@ -226,6 +229,7 @@ export function WorkspacePanel({
   rightRailTab,
   onRightRailTabChange,
   showFilesPanel,
+  showSchedulesTab,
   changedCount,
   showShellsTab,
   terminalsLength,
@@ -370,6 +374,15 @@ export function WorkspacePanel({
                 </span>
               </TabsTrigger>
             )}
+            {showSchedulesTab && (
+              <TabsTrigger
+                value="schedules"
+                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+              >
+                <ClockIcon className="size-4" />
+                Schedules
+              </TabsTrigger>
+            )}
           </TabsList>
         </Tabs>
         {openFiles.length > 0 && (
@@ -423,6 +436,8 @@ export function WorkspacePanel({
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
           />
+        ) : rightRailTab === "schedules" && showSchedulesTab ? (
+          <SchedulesPanel conversationId={conversationId} />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
         ) : rightRailTab === "todos" && isClaudeNative ? (
