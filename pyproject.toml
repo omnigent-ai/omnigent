@@ -34,7 +34,7 @@ dependencies = [
     "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
-    "starlette>=0.27,<1",
+    "starlette>=1.0.1,<2",
     "uvicorn[standard]>=0.30,<1",
     # websockets >=15 asyncio client hangs on macOS before emitting any handshake
     # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
