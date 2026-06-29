@@ -184,8 +184,10 @@ def harness_is_configured(harness: str) -> bool:
         ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``, ``"pi"``,
         ``"pi-native"``, ``"qwen"``, or ``"qwen-code"``.
     :returns: ``True`` when launchable (CLI installed, or a harness the
-        daemon doesn't gate); ``False`` only when a CLI-wrapping
-        harness's binary is missing from ``PATH``.
+        daemon doesn't gate); ``False`` when a CLI-wrapping harness's binary
+        is missing from ``PATH``, or — for credential-gated harnesses
+        (hermes, opencode) — when the binary is present but no provider is
+        configured.
     """
     canonical = _canonical_harness(harness)
     if canonical in _SDK_HARNESSES:

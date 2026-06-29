@@ -335,8 +335,12 @@ def test_native_harness_requires_credentials_not_just_binary(
         "opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
     )
-    assert harness_is_configured("hermes") is False
-    assert harness_is_configured("opencode-native") is False
+    # Alias spellings canonicalize to the same harness, so they route to the
+    # same credential probe and read the same verdict.
+    for hermes_spelling in ("hermes", "hermes-native", "native-hermes"):
+        assert harness_is_configured(hermes_spelling) is False
+    for opencode_spelling in ("opencode-native", "opencode", "native-opencode"):
+        assert harness_is_configured(opencode_spelling) is False
     # binary present + provider configured -> available.
     monkeypatch.setattr(
         ha,
@@ -350,8 +354,10 @@ def test_native_harness_requires_credentials_not_just_binary(
             installed=True, stored_providers=("anthropic",), env_providers=()
         ),
     )
-    assert harness_is_configured("hermes") is True
-    assert harness_is_configured("opencode-native") is True
+    for hermes_spelling in ("hermes", "hermes-native", "native-hermes"):
+        assert harness_is_configured(hermes_spelling) is True
+    for opencode_spelling in ("opencode-native", "opencode", "native-opencode"):
+        assert harness_is_configured(opencode_spelling) is True
 
 
 def test_cursor_readiness_keys_off_api_key(
