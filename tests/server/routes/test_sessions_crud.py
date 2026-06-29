@@ -249,3 +249,25 @@ async def test_patch_session_empty_project_removes_label(
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
     assert "omni_project" not in conv.labels
+
+
+async def test_patch_session_permission_mode(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """PATCH with ``permission_mode`` updates the field on the session."""
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"permission_mode": "auto"},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["permission_mode"] == "auto"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "--permission-mode" in conv.terminal_launch_args
+    idx = conv.terminal_launch_args.index("--permission-mode")
+    assert conv.terminal_launch_args[idx + 1] == "auto"

@@ -4415,6 +4415,17 @@
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
           },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -5569,6 +5580,17 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
           },
           "reasoning_effort": {
             "anyOf": [

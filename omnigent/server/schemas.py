@@ -1717,6 +1717,7 @@ class SessionResponse(BaseModel):
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
+    permission_mode: str | None = None
     pending_elicitations: list[dict[str, Any]] = Field(default_factory=list)
     # Un-consumed web-composer user messages on native-terminal
     # sessions at snapshot time, each ``{"pending_id", "content"}``.
@@ -1814,6 +1815,7 @@ class UpdateSessionRequest(BaseModel):
     cost_control_mode_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
+    permission_mode: str | None = None
     archived: bool | None = None
     silent: bool = False
 

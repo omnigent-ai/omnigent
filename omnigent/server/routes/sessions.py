@@ -2348,6 +2348,14 @@ def _build_session_response(
     labels = labels_with_closed_status(conv.labels, conv.title)
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
+    permission_mode = "default"
+    if conv.terminal_launch_args:
+        try:
+            idx = conv.terminal_launch_args.index("--permission-mode")
+            if idx + 1 < len(conv.terminal_launch_args):
+                permission_mode = conv.terminal_launch_args[idx + 1]
+        except ValueError:
+            pass
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2364,6 +2372,7 @@ def _build_session_response(
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
+        permission_mode=permission_mode,
         sub_agent_name=conv.sub_agent_name,
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
@@ -14456,9 +14465,15 @@ def create_sessions_router(
                     allowed_tunnel_tokens=runner_tunnel_tokens,
                     multi_user=permission_store is not None,
                 )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError(
+                "Session not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+
         collaboration_mode_requested = "collaboration_mode" in body.model_fields_set
         requested_codex_collaboration_mode: str | None = None
-        conv_for_collaboration_mode: Conversation | None = None
         if collaboration_mode_requested:
             if body.collaboration_mode is None:
                 raise OmnigentError(
@@ -14471,17 +14486,8 @@ def create_sessions_router(
                     f"{sorted(_CODEX_NATIVE_COLLABORATION_MODES)}",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            conv_for_collaboration_mode = await asyncio.to_thread(
-                conversation_store.get_conversation,
-                session_id,
-            )
-            if conv_for_collaboration_mode is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
             if (
-                conv_for_collaboration_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
                 != _CODEX_NATIVE_WRAPPER_LABEL_VALUE
             ):
                 raise OmnigentError(
@@ -14548,18 +14554,52 @@ def create_sessions_router(
             body.cost_control_mode_override
         )
 
-        # Native-terminal pass-through args: ``None`` leaves them
-        # unchanged; a provided list (including ``[]``) replaces the
-        # stored value wholesale (resume is last-write-wins, never an
-        # append). Bounds are validated here so a malformed list fails
-        # loud at the route rather than at the DB.
         try:
-            terminal_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
+            if body.terminal_launch_args is not None:
+                resolved_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
+            else:
+                resolved_launch_args = list(conv.terminal_launch_args or [])
         except ValueError as exc:
             raise OmnigentError(
                 f"invalid terminal_launch_args: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+
+        permission_mode = body.permission_mode
+        if permission_mode is not None:
+            valid_modes = {
+                "default",
+                "auto",
+                "acceptEdits",
+                "plan",
+                "dontAsk",
+                "bypassPermissions",
+            }
+            if permission_mode not in valid_modes:
+                raise OmnigentError(
+                    f"invalid permission_mode: must be one of {sorted(valid_modes)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # Find and remove any existing --permission-mode argument
+            new_args = []
+            skip_next = False
+            for arg in resolved_launch_args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == "--permission-mode":
+                    skip_next = True
+                    continue
+                new_args.append(arg)
+            # If the mode is not "default", append it
+            if permission_mode != "default":
+                new_args.extend(["--permission-mode", permission_mode])
+            resolved_launch_args = new_args
+            terminal_launch_args = resolved_launch_args
+        else:
+            terminal_launch_args = (
+                resolved_launch_args if body.terminal_launch_args is not None else None
+            )
 
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);
@@ -14634,14 +14674,6 @@ def create_sessions_router(
                     conversation_store,
                 )
         else:
-            conv = conv_for_collaboration_mode
-            if conv is None:
-                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise OmnigentError(
-                    "Session not found",
-                    code=ErrorCode.NOT_FOUND,
-                )
             if conv.agent_id is None:
                 raise OmnigentError(
                     "Not a session (no agent binding)",
@@ -14705,6 +14737,12 @@ def create_sessions_router(
                     updated.model_override,
                     conversation_store,
                 )
+        if live_forward and permission_mode is not None:
+            await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {"type": "permission_mode_change", "permission_mode": permission_mode},
+            )
         if requested_codex_collaboration_mode is not None and live_forward:
             _codex_plan_enabled = _codex_plan_mode_enabled(requested_codex_collaboration_mode)
             _runner_result = await _forward_session_change_to_runner(
