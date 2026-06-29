@@ -6,7 +6,11 @@ import asyncio
 
 import pytest
 
-from omnigent.runtime.acting_user import acting_user_scope, get_acting_user
+from omnigent.runtime.acting_user import (
+    acting_user_scope,
+    get_acting_credential_env,
+    get_acting_user,
+)
 
 
 def test_defaults_to_none() -> None:
@@ -35,6 +39,24 @@ def test_explicit_none_scope_clears() -> None:
         with acting_user_scope(None):
             assert get_acting_user() is None
         assert get_acting_user() == "alice@example.com"
+
+
+def test_credential_env_defaults_empty() -> None:
+    assert get_acting_credential_env() == {}
+
+
+def test_scope_binds_credential_env_alongside_user() -> None:
+    with acting_user_scope("bob@example.com", {"GITHUB_TOKEN": "ghp_bob"}):
+        assert get_acting_user() == "bob@example.com"
+        assert get_acting_credential_env() == {"GITHUB_TOKEN": "ghp_bob"}
+    # Both restored on exit.
+    assert get_acting_user() is None
+    assert get_acting_credential_env() == {}
+
+
+def test_scope_without_credential_env_yields_empty() -> None:
+    with acting_user_scope("bob@example.com"):
+        assert get_acting_credential_env() == {}
 
 
 @pytest.mark.asyncio

@@ -320,6 +320,7 @@ class _HelperProcessClient:
         start_in_scratch: bool = False,
         egress_rules: list[str] | None = None,
         egress_allow_private_destinations: bool = False,
+        credential_env: dict[str, str] | None = None,
     ) -> None:
         self.cwd = cwd
         self.shell_path = shell_path
@@ -327,6 +328,11 @@ class _HelperProcessClient:
         self.start_in_scratch = start_in_scratch
         self._egress_rules = egress_rules
         self._egress_allow_private_destinations = egress_allow_private_destinations
+        # Per-user credential overlay (#5): ``{ENV_VAR: value}`` for the acting
+        # collaborator, merged last into the helper subprocess env so their
+        # git/aws/etc. runs under their own credentials, not the owner's. Empty
+        # ``{}`` = no injection (single-user / credential-less actor).
+        self._credential_env = credential_env or {}
         # S4 (security): per-helper Proxy-Authorization token,
         # generated in :meth:`_start_egress_proxy_locked` and read by
         # the config-FD writer in :meth:`_start_locked`. ``None``
@@ -540,6 +546,13 @@ class _HelperProcessClient:
         # in the child, which is why we can pass it as a plain ``--config-fd``
         # argv arg. On Windows the config came via ``--config-file`` instead,
         # so there is no fd to inherit.
+        # Per-user credentials (#5): overlay the acting collaborator's resolved
+        # secrets last so they take final precedence and their git/aws/etc.
+        # runs under their own credentials. Applied after sandbox env-filtering
+        # by design — these are the actor's own secrets, explicitly provisioned
+        # for injection — and (like all env here) never logged.
+        if self._credential_env:
+            env.update(self._credential_env)
         popen_kwargs: dict[str, Any] = {}
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
@@ -784,6 +797,9 @@ class CallerProcessOSEnvironment(OSEnvironment):
     _start_in_scratch: bool = False
     _egress_rules: list[str] | None = None
     _egress_allow_private_destinations: bool = False
+    # Per-user credential overlay (#5): the acting collaborator's resolved
+    # secrets, threaded down to the helper subprocess env. ``None`` = none.
+    _credential_env: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         self._helper = _HelperProcessClient(
@@ -793,6 +809,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             start_in_scratch=self._start_in_scratch,
             egress_rules=self._egress_rules,
             egress_allow_private_destinations=self._egress_allow_private_destinations,
+            credential_env=self._credential_env,
         )
 
     async def read(
@@ -880,8 +897,18 @@ class CallerProcessOSEnvironment(OSEnvironment):
         self.close()
 
 
-def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
-    """Instantiate the configured OS environment."""
+def create_os_environment(
+    spec: OSEnvSpec | None,
+    credential_env: dict[str, str] | None = None,
+) -> OSEnvironment | None:
+    """Instantiate the configured OS environment.
+
+    :param spec: The resolved OS-env spec, or ``None`` (→ ``None``).
+    :param credential_env: Optional per-user credential overlay (#5) —
+        ``{ENV_VAR: value}`` for the acting collaborator — merged last into the
+        helper subprocess env so their git/aws/etc. runs under their own
+        credentials. ``None``/empty injects nothing.
+    """
     if spec is None:
         return None
     if spec.type != "caller_process":
@@ -918,6 +945,7 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
         _start_in_scratch=spec.start_in_scratch,
         _egress_rules=egress_rules,
         _egress_allow_private_destinations=egress_allow_private,
+        _credential_env=credential_env,
     )
 
 

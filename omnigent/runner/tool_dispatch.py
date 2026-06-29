@@ -48,6 +48,7 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.runtime import pending_elicitations
+from omnigent.runtime.acting_user import get_acting_credential_env, get_acting_user
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -553,6 +554,7 @@ async def _execute_local_python_tool(
             agent_id=agent_id or getattr(agent_spec, "name", "runner-agent") or "runner-agent",
             workspace=workspace,
             conversation_id=conversation_id,
+            user_id=get_acting_user(),
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
     except Exception as exc:
@@ -2318,6 +2320,7 @@ async def _execute_web_search_tool(
         task_id=task_id or "web_search",
         agent_id=agent_id or "web_search",
         conversation_id=conversation_id,
+        user_id=get_acting_user(),
     )
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
@@ -4688,8 +4691,12 @@ async def _execute_os_env_tool(
 
     os_env = None
     try:
+        # Inject the acting collaborator's resolved credentials (#5) so their
+        # shell/git/aws runs under their own secrets, not the session owner's.
+        # Empty {} for single-user / credential-less actors → no change.
         os_env = create_os_environment(
-            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+            _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace),
+            credential_env=get_acting_credential_env(),
         )
         if os_env is None:
             return "Error: unable to create OSEnvironment"
@@ -5010,6 +5017,7 @@ async def _execute_terminal_tool(
         agent_id=agent_id or "unknown",
         workspace=runner_workspace,
         conversation_id=conversation_id,
+        user_id=get_acting_user(),
     )
 
     del session_inbox

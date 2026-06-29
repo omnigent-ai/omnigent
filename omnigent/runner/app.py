@@ -13250,8 +13250,23 @@ def create_runner_app(
         # during the stale debounce window and strand the result until the
         # human manually nudges the parent.
         _subagent_wake_pending.discard(conv)
+        # Bind the acting collaborator (#5) for the whole turn: the server tags
+        # the dispatch with created_by and the actor's resolved credential env
+        # (see sessions.py). _run_turn_bg drives the turn inline through
+        # _stream_message_to_harness, so the scope is live at tool dispatch.
+        # Both initial and continuation (buffered) turns flow through here, and
+        # each carries its own sender. Missing/older payloads → None → today's
+        # ambient behavior (graceful, no regression).
+        from omnigent.runtime.acting_user import acting_user_scope
+
+        _acting_user = msg_body.get("created_by")
+        _acting_cred_env = msg_body.get("credential_env")
         try:
-            await _run_turn_bg_setup_and_stream(msg_body, conv)
+            with acting_user_scope(
+                _acting_user if isinstance(_acting_user, str) else None,
+                _acting_cred_env if isinstance(_acting_cred_env, dict) else None,
+            ):
+                await _run_turn_bg_setup_and_stream(msg_body, conv)
         except asyncio.CancelledError as exc:
             # Task cancellation (e.g. event-loop teardown) must still
             # publish a terminal ``failed`` status so the session never

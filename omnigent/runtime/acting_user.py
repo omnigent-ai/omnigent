@@ -29,6 +29,15 @@ _ACTING_USER: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "omnigent_acting_user", default=None
 )
 
+# The acting user's vault secrets for this turn, already resolved + mapped to
+# env-var names by the server (see
+# :func:`omnigent.runtime.credentials.resolve_user_credential_env`) and pushed
+# on the turn dispatch. ``None`` = nothing to inject. Kept alongside the actor
+# id because it shares the same turn lifetime and threading constraints.
+_ACTING_CREDENTIAL_ENV: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "omnigent_acting_credential_env", default=None
+)
+
 
 def get_acting_user() -> str | None:
     """Return the acting user for the current turn, or ``None``.
@@ -40,18 +49,32 @@ def get_acting_user() -> str | None:
     return _ACTING_USER.get()
 
 
+def get_acting_credential_env() -> dict[str, str]:
+    """Return the acting user's credential env overlay for this turn.
+
+    :returns: ``{ENV_VAR: value}`` to overlay onto that user's tool
+        subprocesses, or ``{}`` when there is nothing to inject.
+    """
+    return _ACTING_CREDENTIAL_ENV.get() or {}
+
+
 @contextmanager
-def acting_user_scope(user_id: str | None) -> Iterator[None]:
-    """Bind the acting user for the duration of a ``with`` block.
+def acting_user_scope(
+    user_id: str | None, credential_env: dict[str, str] | None = None
+) -> Iterator[None]:
+    """Bind the acting user (and their credential env) for a ``with`` block.
 
     Used by the runner at turn entry so every tool dispatched while processing
-    that turn observes the actor. The previous value is restored on exit, so
-    nested/sequential turns don't leak identity into one another.
+    that turn observes the actor and their credentials. Previous values are
+    restored on exit, so nested/sequential turns don't leak into one another.
 
     :param user_id: The acting user to bind, or ``None`` to explicitly clear.
+    :param credential_env: The actor's resolved env overlay, or ``None``.
     """
-    token = _ACTING_USER.set(user_id)
+    user_token = _ACTING_USER.set(user_id)
+    cred_token = _ACTING_CREDENTIAL_ENV.set(credential_env)
     try:
         yield
     finally:
-        _ACTING_USER.reset(token)
+        _ACTING_CREDENTIAL_ENV.reset(cred_token)
+        _ACTING_USER.reset(user_token)
