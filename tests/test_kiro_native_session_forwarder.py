@@ -127,6 +127,42 @@ def test_discover_kiro_session_jsonl_returns_none_when_multiple_candidates(
     assert discovered is None
 
 
+def test_discover_kiro_session_jsonl_skips_session_with_unparseable_created_at(
+    tmp_path: Path,
+) -> None:
+    """An undateable same-workspace session can't poison the unique-bind count.
+
+    A session whose ``created_at`` won't parse can't be confirmed in-window, so it
+    is dropped rather than counted as a second candidate — otherwise a single
+    garbage straggler would make discovery permanently ambiguous and bind nothing.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="undateable",
+        cwd=workspace,
+        created_at="garbage",
+        updated_at="2026-06-21T01:41:00Z",
+    )
+    expected = _write_kiro_session(
+        sessions_dir,
+        session_id="current",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:40:10Z",
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered == ("current", expected)
+
+
 def test_read_new_kiro_messages_returns_user_and_assistant_text(tmp_path: Path) -> None:
     """The JSONL reader mirrors Kiro prompt and assistant message text."""
     jsonl_path = tmp_path / "session.jsonl"
