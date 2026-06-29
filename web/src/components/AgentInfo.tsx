@@ -382,7 +382,7 @@ function AddPolicyDialog({
     | null
     | undefined;
   const modelIds = useMemo(() => {
-    const ids = CLAUDE_NATIVE_MODELS.map((m) => m.id);
+    const ids: string[] = CLAUDE_NATIVE_MODELS.map((m) => m.id);
     for (const opt of codexModelOptions) {
       if (opt.id && !ids.includes(opt.id)) ids.push(opt.id);
     }
