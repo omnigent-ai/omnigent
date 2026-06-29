@@ -14,8 +14,12 @@ The cloud runtime deliberately drops the local harness's machinery:
   ``tool_call`` stream events surface as *informational* ExecutorEvents.
 - **No ``preToolUse`` policy hook / native approval** — there is no local
   process to gate.
-- **No persistent agent across turns (v1)** — each turn launches a fresh cloud
-  run seeded with the conversation so far; follow-up / cancel are deferred.
+- **Persistent agent across turns** — within one Omnigent session the same
+  cloud ``AsyncAgent`` is reused, so follow-up messages continue on the same
+  branch / PR without opening a second one. The first turn seeds the agent with
+  the full conversation history; subsequent turns send only the latest user
+  message. Cancel (``interrupt_session``) calls ``run.cancel()`` on the
+  in-flight cloud run so the user can stop a runaway agent.
 
 What it shares with the local executor (imported, not reimplemented): the
 ``SDKMessage`` → ExecutorEvent mapping, model-id resolution drop logic, usage
@@ -27,8 +31,10 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import AsyncIterator
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, TypeAlias
 
+from omnigent.cursor_cloud_repo import CursorCloudRepo
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 from .cursor_executor import (
@@ -36,6 +42,7 @@ from .cursor_executor import (
     _normalize_cursor_usage,
     _safe_close,
     _sdk_message_to_events,
+    _session_key,
 )
 from .datamodel import OSEnvSpec
 from .executor import (
@@ -61,6 +68,10 @@ _DEFAULT_CLOUD_MODEL = "composer-2.5"
 # has no programmatic equivalent, so a never-onboarded repo fails to launch —
 # we point the user here (see ``_onboarding_hint``).
 _ONBOARD_URL = "https://cursor.com/onboard?repository={url}"
+
+_SDKClient: TypeAlias = Any  # type: ignore[explicit-any]  # cursor_sdk.AsyncClient
+_SDKAgent: TypeAlias = Any  # type: ignore[explicit-any]  # cursor_sdk.AsyncAgent
+_SDKRun: TypeAlias = Any  # type: ignore[explicit-any]  # cursor_sdk.AsyncRun
 
 
 def _resolve_cloud_model(model: str | None) -> str:
@@ -102,6 +113,16 @@ def _onboarding_hint(repo_url: str, error: str) -> str:
     return error
 
 
+@dataclass
+class _CloudSessionState:
+    """Per-Omnigent-conversation cloud SDK session state."""
+
+    client: _SDKClient = None
+    agent: _SDKAgent = None
+    active_run: _SDKRun = None
+    has_sent_prompt: bool = False
+
+
 class CursorCloudExecutor(Executor):
     """Execute agent turns as Cursor Cloud / Background Agent runs."""
 
@@ -116,6 +137,7 @@ class CursorCloudExecutor(Executor):
         ref: str | None = None,
         agent_name: str | None = None,
         auto_create_pr: bool = True,
+        extra_repos: list[CursorCloudRepo] | None = None,
     ) -> None:
         self._cwd = cwd or (os_env.cwd if os_env else None)
         self._model_override = model
@@ -124,6 +146,8 @@ class CursorCloudExecutor(Executor):
         self._ref = ref
         self._agent_name = agent_name
         self._auto_create_pr = auto_create_pr
+        self._extra_repos: list[CursorCloudRepo] = extra_repos or []
+        self._session_states: dict[str, _CloudSessionState] = {}
 
     # ── capability flags ──────────────────────────────────────────────
     def supports_streaming(self) -> bool:
@@ -139,10 +163,33 @@ class CursorCloudExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return False
 
-    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — cancel deferred (v1)
-        # Cancel of a live cloud run is deferred (KTD7); the run continues
-        # server-side. Report unsupported so the runner doesn't assume a stop.
-        return False
+    async def interrupt_session(self, session_key: str) -> bool:
+        """Cancel the in-flight cloud run, if any.
+
+        The runtime adapter passes the same session key that is attached to the
+        messages, so cancel can target the per-session active run.
+        """
+        state = self._session_states.get(session_key)
+        if state is None:
+            return False
+        run = state.active_run
+        if run is None:
+            return False
+        try:
+            await run.cancel()
+            return True
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            try:
+                from cursor_sdk.errors import (  # lazy: optional dep
+                    UnsupportedRunOperationError,
+                )
+
+                if isinstance(exc, UnsupportedRunOperationError):
+                    return False  # already terminal — nothing to cancel
+            except ImportError:
+                pass
+            logger.debug("CursorCloudExecutor: run cancel failed: %s", exc)
+            return False
 
     def _format_result(self, response_text: str, result: Any) -> str | None:  # type: ignore[explicit-any]
         """Compose the final turn text: streamed summary + branch/PR links.
@@ -187,9 +234,12 @@ class CursorCloudExecutor(Executor):
             return
 
         model = _resolve_cloud_model((config.model if config else None) or self._model_override)
-        # Each turn is a fresh cloud run seeded with the conversation so far
-        # (v1: no persistent agent / follow-up), so always serialize history.
-        prompt = _build_cursor_prompt(messages, is_first_turn=True, system_prompt=system_prompt)
+        session_key = _session_key(messages)
+        state = self._session_states.setdefault(session_key, _CloudSessionState())
+        is_first_turn = not state.has_sent_prompt
+        prompt = _build_cursor_prompt(
+            messages, is_first_turn=is_first_turn, system_prompt=system_prompt
+        )
         if not prompt:
             yield TurnComplete(response=None)
             return
@@ -210,35 +260,34 @@ class CursorCloudExecutor(Executor):
             logger.debug("cursor-sdk import failed: %s", exc)
             return
 
-        # Cloud runs route through the SDK's bundled bridge — the SAME entry the
-        # local cursor harness uses. A direct ``AsyncClient(base_url=...)`` hits
-        # the wrong RPC route (404). The bridge authenticates from
-        # ``CURSOR_API_KEY``; mirror our resolved key into the env for the bridge
-        # subprocess (this is a dedicated harness process) and also pass it to
-        # ``create_agent``.
-        if self._api_key:
-            os.environ["CURSOR_API_KEY"] = self._api_key
-
-        client: Any = None
-        try:
-            client = await AsyncClient.launch_bridge()
-            cloud = CloudAgentOptions(
-                repos=[CloudRepository(url=self._repo_url, starting_ref=self._ref)],
-                auto_create_pr=self._auto_create_pr,
-            )
+        if state.agent is None:
             try:
-                agent = await client.create_agent(
+                # Cloud runs route through the SDK's bundled bridge — the SAME
+                # entry the local cursor harness uses. A direct
+                # ``AsyncClient(base_url=...)`` hits the wrong RPC route (404).
+                # The bridge authenticates from ``CURSOR_API_KEY``; mirror our
+                # resolved key into the env before launching it and also pass
+                # it to ``create_agent``.
+                if self._api_key:
+                    os.environ["CURSOR_API_KEY"] = self._api_key
+                state.client = await AsyncClient.launch_bridge()
+                repos = [CloudRepository(url=self._repo_url, starting_ref=self._ref)]
+                repos += [
+                    CloudRepository(url=r.url, starting_ref=r.ref) for r in self._extra_repos
+                ]
+                cloud = CloudAgentOptions(repos=repos, auto_create_pr=self._auto_create_pr)
+                state.agent = await state.client.create_agent(
                     model=model,
                     api_key=self._api_key,
                     name=self._agent_name,
                     cloud=cloud,
                 )
-                run = await agent.send(prompt)
             except Exception as exc:  # noqa: BLE001 — launch failure surfaced w/ onboarding hint
-                # A launch/send failure on cloud is most often the repo not
+                # A launch/create failure on cloud is most often the repo not
                 # having had its one-time Cursor environment set up (the API can
                 # return a bare ``internal error`` in that case), so always point
-                # the user at the dashboard onboarding step.
+                # the user at the dashboard onboarding step. Drop the half-built
+                # state so the next turn retries a fresh bridge.
                 yield ExecutorError(
                     message=(
                         f"cursor-cloud launch failed: {exc}\n\nIf this repository "
@@ -249,10 +298,14 @@ class CursorCloudExecutor(Executor):
                     ),
                     retryable=False,
                 )
+                await self.close_session(session_key)
                 return
 
-            response_text = ""
-            turn_usage: dict[str, Any] | None = None
+        response_text = ""
+        turn_usage: dict[str, Any] | None = None  # type: ignore[explicit-any]  # SDK usage dict
+        try:
+            run = await state.agent.send(prompt)
+            state.active_run = run
             async for stream_event in run.events():
                 sdk_message = getattr(stream_event, "sdk_message", None)
                 if sdk_message is not None:
@@ -266,12 +319,17 @@ class CursorCloudExecutor(Executor):
                     if isinstance(raw_usage, dict) and raw_usage:
                         turn_usage = _normalize_cursor_usage(raw_usage, model)
             result = await run.wait()
+            # Mark success only after the run completes cleanly so that a
+            # mid-run failure (events/wait raises) leaves is_first_turn intact
+            # and the retry re-seeds full history into a fresh agent.
+            state.has_sent_prompt = True
         except Exception as exc:  # noqa: BLE001 — mid-run SDK failure surfaced as retryable
             yield ExecutorError(message=f"cursor-cloud run failed: {exc}", retryable=True)
+            if not state.has_sent_prompt:
+                await self.close_session(session_key)
             return
         finally:
-            if client is not None:
-                await _safe_close(client)
+            state.active_run = None
 
         status = str(getattr(result, "status", "") or "").lower()
         if status == "error":
@@ -300,6 +358,17 @@ class CursorCloudExecutor(Executor):
             _notify_usage_from_dict(model=model, usage=turn_usage)
         yield TurnComplete(response=self._format_result(response_text, result), usage=turn_usage)
 
+    async def _close_state(self, state: _CloudSessionState) -> None:
+        await _safe_close(state.agent)
+        state.agent = None
+        await _safe_close(state.client)
+        state.client = None
+
+    async def close_session(self, session_key: str) -> None:
+        state = self._session_states.pop(session_key, None)
+        if state is not None:
+            await self._close_state(state)
+
     async def close(self) -> None:
-        # No persistent per-session state in v1 (fresh run per turn).
-        return
+        for key in list(self._session_states.keys()):
+            await self.close_session(key)

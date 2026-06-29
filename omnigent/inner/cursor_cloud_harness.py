@@ -38,6 +38,7 @@ import os
 
 from fastapi import FastAPI
 
+from omnigent.cursor_cloud_repo import CursorCloudRepo
 from omnigent.inner.cursor_cloud_executor import CursorCloudExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
@@ -95,13 +96,22 @@ def _build_cursor_cloud_executor() -> Executor:
     missing ``cursor-sdk`` install surfaces as a request-time error rather than
     an app-boot crash.
     """
+    # HARNESS_CURSOR_CLOUD_REPO may be a comma-separated list of URLs (set by the
+    # spawn-env builder when OMNIGENT_CURSOR_CLOUD_REPO contains multiple URLs).
+    # The first URL is the primary repo; the rest become extra_repos.
+    raw_repo = os.environ.get(_ENV_REPO) or ""
+    urls = [u.strip() for u in raw_repo.split(",") if u.strip()]
+    repo_url = urls[0] if urls else None
+    ref = os.environ.get(_ENV_REF) or None
+    extra = [CursorCloudRepo(url=u, ref=ref) for u in urls[1:]]
     return CursorCloudExecutor(
         cwd=os.environ.get(_ENV_CWD) or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL) or None,
         api_key=os.environ.get(_ENV_API_KEY) or None,
-        repo_url=os.environ.get(_ENV_REPO) or None,
-        ref=os.environ.get(_ENV_REF) or None,
+        repo_url=repo_url,
+        ref=ref,
+        extra_repos=extra or None,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
     )
 

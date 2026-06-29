@@ -26,7 +26,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["CursorCloudRepo", "RepoResolutionError", "resolve_cursor_cloud_repo"]
+__all__ = [
+    "CursorCloudRepo",
+    "RepoResolutionError",
+    "resolve_cursor_cloud_repo",
+    "resolve_cursor_cloud_repos",
+]
 
 
 class RepoResolutionError(RuntimeError):
@@ -164,3 +169,32 @@ def resolve_cursor_cloud_repo(
         if ref == "HEAD":
             ref = _git(cwd_path, "rev-parse", "HEAD")
     return CursorCloudRepo(url=url, ref=ref)
+
+
+def resolve_cursor_cloud_repos(
+    cwd: str | Path | None,
+    *,
+    repo_override: str | None = None,
+    ref_override: str | None = None,
+) -> list[CursorCloudRepo]:
+    """Resolve one or more cloud-agent repo targets.
+
+    *repo_override* may be a **comma-separated** list of repo URLs; each URL is
+    normalized and all share *ref_override*. When *repo_override* is absent,
+    delegates to :func:`resolve_cursor_cloud_repo` (cwd-origin path), returning
+    a single-element list.
+
+    :param cwd: Session working directory — only consulted when *repo_override*
+        is absent.
+    :param repo_override: Explicit repo URL or comma-separated list of URLs.
+    :param ref_override: Shared starting ref applied to all resolved repos.
+    :returns: Non-empty list of :class:`CursorCloudRepo`.
+    :raises RepoResolutionError: When no *repo_override* is given and *cwd* has
+        no ``origin`` remote (or is ``None``).
+    """
+    if repo_override and repo_override.strip():
+        ref = ref_override.strip() if ref_override and ref_override.strip() else None
+        urls = [u for u in (raw.strip() for raw in repo_override.split(",")) if u]
+        return [CursorCloudRepo(url=normalize_remote_url(u), ref=ref) for u in urls]
+    # No override: delegate to the single cwd-origin resolver (may raise).
+    return [resolve_cursor_cloud_repo(cwd, ref_override=ref_override)]

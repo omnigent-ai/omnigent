@@ -1676,20 +1676,20 @@ def _build_cursor_cloud_spawn_env(
                 env["HARNESS_CURSOR_CLOUD_API_KEY"] = ambient_key.strip()
 
     # Repo/ref: cwd origin remote by default, explicit override via env.
-    from omnigent.cursor_cloud_repo import RepoResolutionError, resolve_cursor_cloud_repo
+    from omnigent.cursor_cloud_repo import RepoResolutionError, resolve_cursor_cloud_repos
 
     try:
-        resolved = resolve_cursor_cloud_repo(
+        resolved = resolve_cursor_cloud_repos(
             cwd,
             repo_override=os.environ.get("OMNIGENT_CURSOR_CLOUD_REPO"),
             ref_override=os.environ.get("OMNIGENT_CURSOR_CLOUD_REF"),
         )
     except RepoResolutionError:
-        resolved = None
-    if resolved is not None:
-        env["HARNESS_CURSOR_CLOUD_REPO"] = resolved.url
-        if resolved.ref:
-            env["HARNESS_CURSOR_CLOUD_REF"] = resolved.ref
+        resolved = []
+    if resolved:
+        env["HARNESS_CURSOR_CLOUD_REPO"] = ",".join(r.url for r in resolved)
+        if resolved[0].ref:
+            env["HARNESS_CURSOR_CLOUD_REF"] = resolved[0].ref
 
     if cwd is not None:
         env["HARNESS_CURSOR_CLOUD_CWD"] = str(cwd)

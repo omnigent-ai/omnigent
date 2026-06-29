@@ -247,6 +247,17 @@ def _build_cursor_prompt(
     return body
 
 
+def _session_key(messages: list[Message]) -> str:
+    if messages:
+        last = messages[-1]
+        if last.get("session_id"):
+            return str(last["session_id"])
+        meta = last.get("metadata", {})
+        if isinstance(meta, dict) and meta.get("session_id"):
+            return str(meta["session_id"])
+    return "__default__"
+
+
 # ---------------------------------------------------------------------------
 # SDKMessage → ExecutorEvent
 # ---------------------------------------------------------------------------
@@ -510,16 +521,6 @@ class CursorExecutor(Executor):
         # injected into a running turn.
         return False
 
-    def _session_key(self, messages: list[Message]) -> str:
-        if messages:
-            last = messages[-1]
-            if last.get("session_id"):
-                return str(last["session_id"])
-            meta = last.get("metadata", {})
-            if isinstance(meta, dict) and meta.get("session_id"):
-                return str(meta["session_id"])
-        return "__default__"
-
     # -- native-tool policy gate --------------------------------------------
 
     async def _evaluate_native_tool_policy(
@@ -717,7 +718,7 @@ class CursorExecutor(Executor):
         system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
-        session_key = self._session_key(messages)
+        session_key = _session_key(messages)
         model = _resolve_model((config.model if config else None) or self._model_override)
         tools_fp = _tools_fingerprint(tools)
         state = self._session_states.setdefault(session_key, _CursorSessionState())

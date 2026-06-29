@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import collections.abc
 import contextlib
 import copy
@@ -1178,6 +1179,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "codex",
         "config",
         "cursor",
+        "cursor-cloud",
         "debby",
         "debug",
         "goose",
@@ -12446,6 +12448,131 @@ def _strip_one_shot_flags(argv: list[str]) -> list[str]:
                 continue
         out.append(token)
     return out
+
+
+# ---------------------------------------------------------------------------
+# cursor-cloud management group
+# ---------------------------------------------------------------------------
+
+
+@cli.group("cursor-cloud")
+def cursor_cloud_group() -> None:
+    """Manage Cursor Cloud background agents (list, archive, unarchive)."""
+
+
+def _cursor_cloud_install_hint() -> str:
+    from omnigent.onboarding.cursor_auth import cursor_install_command
+
+    return " ".join(cursor_install_command())
+
+
+def _resolve_cursor_cloud_api_key() -> str:
+    from omnigent.onboarding.cursor_auth import resolve_cursor_api_key
+
+    api_key = resolve_cursor_api_key()
+    if not api_key:
+        ambient_key = os.environ.get("CURSOR_API_KEY")
+        api_key = ambient_key.strip() if ambient_key else None
+    if not api_key:
+        raise click.ClickException(
+            "No API key found. Set CURSOR_API_KEY or run `omnigent setup` to store one."
+        )
+    os.environ["CURSOR_API_KEY"] = api_key
+    return api_key
+
+
+def _run_cursor_cloud(
+    coro_factory: Callable[[types.ModuleType], collections.abc.Coroutine[Any, Any, None]],
+) -> None:
+    try:
+        import cursor_sdk
+    except ImportError as exc:
+        raise click.ClickException(
+            f"cursor-sdk is not installed. Install it with: {_cursor_cloud_install_hint()}"
+        ) from exc
+
+    _resolve_cursor_cloud_api_key()
+    try:
+        asyncio.run(coro_factory(cursor_sdk))
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"error: {type(exc).__name__}: {exc}", err=True)
+        sys.exit(1)
+
+
+@cursor_cloud_group.command("list")
+@click.option(
+    "--all",
+    "include_archived",
+    is_flag=True,
+    default=False,
+    help="Include archived agents.",
+)
+def cursor_cloud_list(include_archived: bool) -> None:
+    """List Cursor Cloud background agents."""
+
+    async def _run(cursor_sdk: types.ModuleType) -> None:
+        client = await cursor_sdk.AsyncClient.launch_bridge()
+        try:
+            result = await client.list_agents(runtime="cloud", include_archived=include_archived)
+            console = Console()
+            table = Table(box=box.SIMPLE_HEAD)
+            table.add_column("AGENT_ID")
+            table.add_column("STATUS")
+            table.add_column("ARCHIVED")
+            table.add_column("NAME")
+            table.add_column("REPOS")
+            table.add_column("LAST MODIFIED")
+            saw_any = False
+            async for info in result.auto_paging_iter():
+                saw_any = True
+                table.add_row(
+                    info.agent_id,
+                    info.status or "",
+                    "yes" if info.archived else "no",
+                    info.name,
+                    ", ".join(info.repos),
+                    info.last_modified or "",
+                )
+        finally:
+            await client.aclose()
+
+        if not saw_any:
+            click.echo("No cloud agents found.")
+            return
+
+        console.print(table)
+
+    _run_cursor_cloud(_run)
+
+
+def _cursor_cloud_archive_action(agent_id: str, *, archive: bool) -> None:
+    async def _run(cursor_sdk: types.ModuleType) -> None:
+        client = await cursor_sdk.AsyncClient.launch_bridge()
+        try:
+            if archive:
+                await cursor_sdk.AsyncAgent.archive(agent_id, client=client)
+            else:
+                await cursor_sdk.AsyncAgent.unarchive(agent_id, client=client)
+        finally:
+            await client.aclose()
+
+    _run_cursor_cloud(_run)
+    verb = "archived" if archive else "unarchived"
+    click.echo(f"Agent {agent_id} {verb}.")
+
+
+@cursor_cloud_group.command("archive")
+@click.argument("agent_id")
+def cursor_cloud_archive(agent_id: str) -> None:
+    """Archive a Cursor Cloud agent by AGENT_ID."""
+    _cursor_cloud_archive_action(agent_id, archive=True)
+
+
+@cursor_cloud_group.command("unarchive")
+@click.argument("agent_id")
+def cursor_cloud_unarchive(agent_id: str) -> None:
+    """Unarchive a Cursor Cloud agent by AGENT_ID."""
+    _cursor_cloud_archive_action(agent_id, archive=False)
 
 
 if __name__ == "__main__":

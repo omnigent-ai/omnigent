@@ -180,3 +180,32 @@ def test_spec_api_key_wins_over_ambient(monkeypatch: pytest.MonkeyPatch) -> None
 def test_name_threads_into_agent_name_env_var() -> None:
     env = _build_cursor_cloud_spawn_env(_make_spec(name="polly"))
     assert env["HARNESS_CURSOR_CLOUD_AGENT_NAME"] == "polly"
+
+
+# ---------------------------------------------------------------------------
+# Multi-repo: comma-separated OMNIGENT_CURSOR_CLOUD_REPO
+# ---------------------------------------------------------------------------
+
+
+def test_multi_repo_override_comma_joins_normalized_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A comma-separated OMNIGENT_CURSOR_CLOUD_REPO produces a comma-joined
+    HARNESS_CURSOR_CLOUD_REPO with each URL normalized to https form."""
+    monkeypatch.setenv(
+        "OMNIGENT_CURSOR_CLOUD_REPO",
+        "git@github.com:o/a.git,https://github.com/o/b",
+    )
+    monkeypatch.setenv("OMNIGENT_CURSOR_CLOUD_REF", "v2")
+    env = _build_cursor_cloud_spawn_env(_make_spec())
+    assert env["HARNESS_CURSOR_CLOUD_REPO"] == "https://github.com/o/a,https://github.com/o/b"
+    assert env["HARNESS_CURSOR_CLOUD_REF"] == "v2"
+
+
+def test_single_repo_override_still_works_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single-URL override is backward compatible: produces an un-comma'd value."""
+    monkeypatch.setenv("OMNIGENT_CURSOR_CLOUD_REPO", "https://github.com/org/repo")
+    env = _build_cursor_cloud_spawn_env(_make_spec())
+    assert env["HARNESS_CURSOR_CLOUD_REPO"] == "https://github.com/org/repo"

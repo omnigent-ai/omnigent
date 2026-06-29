@@ -18,6 +18,7 @@ from omnigent.cursor_cloud_repo import (
     RepoResolutionError,
     normalize_remote_url,
     resolve_cursor_cloud_repo,
+    resolve_cursor_cloud_repos,
 )
 
 # ---------------------------------------------------------------------------
@@ -152,3 +153,49 @@ def test_cwd_without_origin_remote_raises(tmp_path: Path) -> None:
 def test_non_git_cwd_raises(tmp_path: Path) -> None:
     with pytest.raises(RepoResolutionError):
         resolve_cursor_cloud_repo(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# resolve_cursor_cloud_repos
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cursor_cloud_repos_single_url_returns_one_element() -> None:
+    result = resolve_cursor_cloud_repos(
+        None, repo_override="git@github.com:org/repo.git", ref_override="main"
+    )
+    assert len(result) == 1
+    assert result[0] == CursorCloudRepo(url="https://github.com/org/repo", ref="main")
+
+
+def test_resolve_cursor_cloud_repos_multiple_urls_all_share_ref() -> None:
+    result = resolve_cursor_cloud_repos(
+        None,
+        repo_override="https://github.com/o/a,git@github.com:o/b.git,https://github.com/o/c",
+        ref_override="v2",
+    )
+    assert len(result) == 3
+    assert result[0] == CursorCloudRepo(url="https://github.com/o/a", ref="v2")
+    assert result[1] == CursorCloudRepo(url="https://github.com/o/b", ref="v2")
+    assert result[2] == CursorCloudRepo(url="https://github.com/o/c", ref="v2")
+
+
+def test_resolve_cursor_cloud_repos_no_ref_override_yields_none_refs() -> None:
+    result = resolve_cursor_cloud_repos(
+        None, repo_override="https://github.com/o/a,https://github.com/o/b"
+    )
+    assert all(r.ref is None for r in result)
+
+
+def test_resolve_cursor_cloud_repos_no_override_delegates_to_cwd(tmp_path: Path) -> None:
+    _init_repo(tmp_path, remote="git@github.com:org/repo.git", branch="feat")
+    result = resolve_cursor_cloud_repos(tmp_path)
+    assert len(result) == 1
+    assert result[0].url == "https://github.com/org/repo"
+    assert result[0].ref == "feat"
+
+
+def test_resolve_cursor_cloud_repos_no_override_no_remote_raises(tmp_path: Path) -> None:
+    _init_repo(tmp_path, remote=None, branch="main")
+    with pytest.raises(RepoResolutionError):
+        resolve_cursor_cloud_repos(tmp_path)
