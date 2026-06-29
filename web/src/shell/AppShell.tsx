@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
+import { useCanvas } from "@/hooks/useCanvas";
 import { useConversations } from "@/hooks/useConversations";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
@@ -122,6 +123,8 @@ export function AppShell() {
   // Read early: the conversationId scopes the per-session workspace state
   // (rail open/width/tab/open files) used throughout this component.
   const { conversationId } = useParams<{ conversationId: string }>();
+  // Canvas (#2): drives the right-rail Canvas tab; null until the agent sets one.
+  const canvasQuery = useCanvas(conversationId);
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
@@ -446,6 +449,8 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
+        // Canvas tab appears once the agent has set a canvas for this session.
+        canvas: !!canvasQuery.data,
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
@@ -463,6 +468,7 @@ export function AppShell() {
       }) as const,
     [
       showFilesPanel,
+      canvasQuery.data,
       hideTerminalsTab,
       railTerminals.length,
       agentSupportsShells,
@@ -483,7 +489,7 @@ export function AppShell() {
   // convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "subagents", "terminals", "todos"] as const).find(
+    const next = (["files", "canvas", "subagents", "terminals", "todos"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -1165,6 +1171,7 @@ export function AppShell() {
                       rightRailTab={rightRailTab}
                       onRightRailTabChange={handleRightRailTabChange}
                       showFilesPanel={showFilesPanel}
+                      showCanvasTab={railTabsAvailable.canvas}
                       changedCount={changedCount}
                       showShellsTab={railTabsAvailable.terminals}
                       terminalsLength={railTerminals.length}
