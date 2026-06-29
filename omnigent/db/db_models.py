@@ -831,6 +831,36 @@ class SqlCanvas(Base):
     __table_args__ = (UniqueConstraint("conversation_id", name="uq_canvases_conversation_id"),)
 
 
+class SqlPushSubscription(Base):
+    """
+    SQLAlchemy model for the ``push_subscriptions`` table.
+
+    A browser Web Push registration (#8): one row per (user, endpoint). The
+    endpoint is UNIQUE so re-subscribing the same browser upserts in place
+    rather than duplicating. Not FK'd to a conversation — subscriptions are
+    user-scoped and outlive any single session.
+
+    :param id: Opaque PK, e.g. ``"push_a1b2c3..."``.
+    :param user_id: The owning user's identity (indexed for the sender's
+        per-user lookup).
+    :param endpoint: Push-service URL to POST encrypted payloads to; UNIQUE.
+    :param p256dh: Client public key (base64url, uncompressed P-256 point).
+    :param auth: Client auth secret (base64url, 16 bytes).
+    :param created_at: Unix epoch seconds at row creation.
+    """
+
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(256), index=True)
+    endpoint: Mapped[str] = mapped_column(String(512))
+    p256dh: Mapped[str] = mapped_column(String(256))
+    auth: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (UniqueConstraint("endpoint", name="uq_push_subscriptions_endpoint"),)
+
+
 class SqlHost(Base):
     """
     SQLAlchemy model for the ``hosts`` table.

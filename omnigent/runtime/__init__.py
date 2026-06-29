@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from omnigent.stores.canvas_store import CanvasStore
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
+    from omnigent.stores.push_subscription_store import PushSubscriptionStore
     from omnigent.stores.schedule_store import ScheduleStore
     from omnigent.stores.work_item_store import WorkItemStore
     from omnigent.terminals import TerminalRegistry
@@ -43,6 +44,7 @@ def init(
     schedule_store: ScheduleStore | None = None,
     work_item_store: WorkItemStore | None = None,
     canvas_store: CanvasStore | None = None,
+    push_subscription_store: PushSubscriptionStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -81,6 +83,7 @@ def init(
         schedule_store=schedule_store,
         work_item_store=work_item_store,
         canvas_store=canvas_store,
+        push_subscription_store=push_subscription_store,
         caps=caps,
     )
 
@@ -201,6 +204,18 @@ def get_canvas_store() -> CanvasStore | None:
     :returns: The CanvasStore set during :func:`init`, or ``None``.
     """
     return _globals._canvas_store
+
+
+def get_push_subscription_store() -> PushSubscriptionStore | None:
+    """
+    Return the PushSubscriptionStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because Web Push is optional — the
+    sender no-ops and the REST endpoints 401/404 when it's absent.
+
+    :returns: The PushSubscriptionStore set during :func:`init`, or ``None``.
+    """
+    return _globals._push_subscription_store
 
 
 def get_agent_cache() -> AgentCache:

@@ -3010,6 +3010,9 @@ def server(
 
     from omnigent.stores.canvas_store.sqlalchemy_store import SqlAlchemyCanvasStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.push_subscription_store.sqlalchemy_store import (
+        SqlAlchemyPushSubscriptionStore,
+    )
     from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleStore
     from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemStore
 
@@ -3022,6 +3025,7 @@ def server(
     schedule_store = SqlAlchemyScheduleStore(db_uri)
     work_item_store = SqlAlchemyWorkItemStore(db_uri)
     canvas_store = SqlAlchemyCanvasStore(db_uri)
+    push_subscription_store = SqlAlchemyPushSubscriptionStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3062,6 +3066,14 @@ def server(
 
     # Tokenmaxx off-hours orchestrator (#11): parse the optional config block.
     from omnigent.runtime.tokenmaxx import parse_tokenmaxx_config
+    # Web Push (#8): load/persist the server's stable VAPID key so a browser's
+    # subscription survives restarts. The `vapid.subject` config is the JWT
+    # contact (some push services require a real mailto/URL).
+    from omnigent.server.vapid_keys import load_or_create_vapid_key
+
+    _vapid_cfg = cfg.get("vapid") or {}
+    vapid_private_key = load_or_create_vapid_key(Path(art_loc) / "vapid_private_key.pem")
+    vapid_subject = str(_vapid_cfg.get("subject") or "mailto:admin@localhost")
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
@@ -3069,6 +3081,8 @@ def server(
         llm=server_llm,
         routing_client=routing_client,
         tokenmaxx=parse_tokenmaxx_config(cfg.get("tokenmaxx")),
+        vapid_private_key=vapid_private_key,
+        vapid_subject=vapid_subject,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -3081,6 +3095,7 @@ def server(
         schedule_store=schedule_store,
         work_item_store=work_item_store,
         canvas_store=canvas_store,
+        push_subscription_store=push_subscription_store,
         caps=caps,
     )
 
@@ -3166,6 +3181,7 @@ def server(
         account_store = SqlAlchemyAccountStore(db_uri)
 
     from omnigent.server.routes.canvas import create_canvas_router
+    from omnigent.server.routes.push import create_push_router
     from omnigent.server.routes.schedules import create_schedules_router
     from omnigent.server.routes.usage import create_usage_router
     from omnigent.server.routes.work_items import create_work_items_router
@@ -3209,6 +3225,11 @@ def server(
                 create_canvas_router(canvas_store, auth_provider, permission_store),
                 "/v1",
                 ["canvas"],
+            ),
+            (
+                create_push_router(push_subscription_store, auth_provider, permission_store),
+                "/v1",
+                ["push"],
             ),
         ],
     )

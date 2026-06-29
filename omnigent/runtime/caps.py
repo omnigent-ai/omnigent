@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from omnigent.runtime.tokenmaxx import TokenmaxxConfig
+    from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+
     from omnigent.server.smart_routing import RoutingClient
     from omnigent.spec.types import LLMConfig, PolicySpec
 
@@ -79,3 +81,8 @@ class RuntimeCaps:
     # Tokenmaxx off-hours orchestrator (#11). ``None`` (the default) or a
     # config with ``enabled=False`` means the service never starts.
     tokenmaxx: TokenmaxxConfig | None = None
+    # Web Push (#8). The server's stable VAPID signing key (loaded/persisted at
+    # startup) and the operator contact for the JWT ``sub`` claim. ``None`` key
+    # disables push (the endpoints 503 and the sender no-ops).
+    vapid_private_key: EllipticCurvePrivateKey | None = None
+    vapid_subject: str = "mailto:admin@localhost"
