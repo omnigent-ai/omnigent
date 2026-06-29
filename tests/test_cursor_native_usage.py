@@ -294,7 +294,11 @@ class TestForwardLoop:
     ) -> None:
         usage.record_usage_payload(tmp_path, _TURN1)
         usage.record_usage_payload(tmp_path, _TURN2)
-        client = await _run_loop_until(monkeypatch, tmp_path, lambda c: len(c.posts) >= 1)
+        client = await _run_loop_until(
+            monkeypatch,
+            tmp_path,
+            lambda c: len(c.posts) >= 1 and usage._read_usage_state(tmp_path).seen == {"g1", "g2"},
+        )
         url, body = client.posts[0]
         assert url == "/v1/sessions/conv_1/events"
         assert body["type"] == "external_session_usage"
