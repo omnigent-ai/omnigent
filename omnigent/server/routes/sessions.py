@@ -3364,7 +3364,19 @@ async def _persist_external_model_change(
             "external_model_change requires data.model to be a non-empty string",
             code=ErrorCode.INVALID_INPUT,
         )
-    model = raw_model.strip()
+    # This value is persisted into ``model_override`` and later crosses the
+    # spawn boundary as a ``--model`` argv element (codex ``config.toml`` /
+    # agy ``--model``), so reject anything shell- or flag-shaped — and, in
+    # particular, the human displayName an external harness might mistakenly
+    # report (``"Gemini 2.5 Flash"`` has spaces, which the model-id charset
+    # rejects). Mirrors the runner's defense-in-depth re-validation at spawn.
+    try:
+        model = validate_model_override(raw_model)
+    except ValueError as exc:
+        raise OmnigentError(
+            f"external_model_change data.model is not a valid model id: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
     if conv.model_override == model:
         return
     await asyncio.to_thread(

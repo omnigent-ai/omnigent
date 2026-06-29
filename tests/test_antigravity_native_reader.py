@@ -2073,7 +2073,9 @@ async def test_planner_done_emits_session_usage(
     - cumulative_input_tokens = inputTokens (int)
     - cumulative_output_tokens = outputTokens (int)
     - cumulative_cache_read_input_tokens = cacheReadTokens (int)
-    - model = the displayName from the catalog (not the raw enum)
+    - model = a PRICING-RESOLVABLE ``databricks-gemini-*`` id derived from the
+      catalog displayName (NOT the raw enum and NOT the human displayName) — the
+      server keys ``fetch_model_pricing`` on it, so it must be a priceable id.
     """
     planner = _planner_with_model_usage(
         input_tokens="1000",
@@ -2099,7 +2101,13 @@ async def test_planner_done_emits_session_usage(
     assert usage_data["cumulative_input_tokens"] == 1000
     assert usage_data["cumulative_output_tokens"] == 100
     assert usage_data["cumulative_cache_read_input_tokens"] == 200
-    assert usage_data["model"] == "Gemini 2.5 Flash"
+    # "Gemini 2.5 Flash" (M20's displayName) maps to the priceable id, NOT the
+    # raw enum or the human displayName. Membership in the curated priceable set
+    # is the offline-safe proxy for "fetch_model_pricing resolves it" (every id
+    # in the set is a databricks.json entry; verified non-None at fix time).
+    assert usage_data["model"] == "databricks-gemini-2-5-flash"
+    assert usage_data["model"] in reader._PRICEABLE_GEMINI_IDS
+    assert " " not in usage_data["model"]  # never the human displayName
 
 
 @pytest.mark.asyncio
@@ -2172,7 +2180,9 @@ async def test_first_turn_emits_model_change(
 ) -> None:
     """The first USER_INPUT step with a new model enum emits external_model_change.
 
-    The event data must carry the resolved displayName, NOT the raw enum.
+    The event data must carry a PRICING-RESOLVABLE ``databricks-gemini-*`` id
+    (the value the server persists into ``model_override`` and later passes to
+    ``agy --model`` on resume), NOT the raw enum and NOT the human displayName.
     """
     user = _user_input_with_model("MODEL_PLACEHOLDER_M20")
     frames = [_frame([user])]
@@ -2192,7 +2202,14 @@ async def test_first_turn_emits_model_change(
         f"expected 1 model_change event, got {len(model_change_events)}"
     )
     _, mc_data = model_change_events[0]
-    assert mc_data["model"] == "Gemini 2.5 Flash"
+    assert mc_data["model"] == "databricks-gemini-2-5-flash"
+    assert mc_data["model"] in reader._PRICEABLE_GEMINI_IDS
+    # The persisted model_override must survive validate_model_override (the
+    # human displayName "Gemini 2.5 Flash" has spaces and would NOT) so it can
+    # cross the spawn boundary to ``agy --model`` faithfully on resume.
+    from omnigent.model_override import validate_model_override
+
+    assert validate_model_override(mc_data["model"]) == mc_data["model"]
 
 
 @pytest.mark.asyncio
@@ -2249,8 +2266,8 @@ async def test_model_switch_mid_session_emits_new_model_change(
     assert len(model_change_events) == 2, (
         f"expected 2 model_change events (one per distinct model), got {len(model_change_events)}"
     )
-    assert model_change_events[0][1]["model"] == "Gemini 2.5 Flash"
-    assert model_change_events[1][1]["model"] == "Gemini 2.5 Pro"
+    assert model_change_events[0][1]["model"] == "databricks-gemini-2-5-flash"
+    assert model_change_events[1][1]["model"] == "databricks-gemini-2-5-pro"
 
 
 @pytest.mark.asyncio
@@ -2319,6 +2336,70 @@ def test_requested_model_enum_from_step_falls_back_to_requested_model() -> None:
         },
     }
     assert reader._requested_model_enum_from_step(legacy_step) == "MODEL_PLACEHOLDER_M20"
+
+
+def test_resolve_pricing_id_maps_gemini_displayname_to_priceable_id() -> None:
+    """A Gemini enum resolves to a priceable ``databricks-gemini-*`` id.
+
+    The catalog maps the enum to a human displayName ("Gemini 2.5 Flash"), which
+    the resolver normalizes to the gateway-prefixed id the server can price with
+    ``fetch_model_pricing``. Every mapped id must be in the curated priceable
+    set (the offline-safe proxy for "fetch_model_pricing resolves it").
+    """
+    assert (
+        reader._resolve_pricing_id("MODEL_PLACEHOLDER_M20", _FAKE_CATALOG)
+        == "databricks-gemini-2-5-flash"
+    )
+    assert (
+        reader._resolve_pricing_id("MODEL_PLACEHOLDER_M132", _FAKE_CATALOG)
+        == "databricks-gemini-2-5-pro"
+    )
+    assert reader._resolve_pricing_id("MODEL_PLACEHOLDER_M20", _FAKE_CATALOG) in (
+        reader._PRICEABLE_GEMINI_IDS
+    )
+
+
+def test_resolve_pricing_id_handles_effort_suffix_and_other_gemini_versions() -> None:
+    """The resolver drops a trailing effort parenthetical and maps newer Geminis.
+
+    The RPC catalog displayName is clean ("Gemini 3.5 Flash"), but the ``agy
+    models`` listing suffixes effort ("Gemini 3.5 Flash (Medium)"); both must map
+    to the same priceable id so a future agy that includes the suffix still
+    prices. Covers the 3.x family that exists in databricks.json.
+    """
+    catalog: dict[str, object] = {
+        "models": {
+            "a": {"model": "ENUM_FLASH35", "displayName": "Gemini 3.5 Flash (Medium)"},
+            "b": {"model": "ENUM_PRO31", "displayName": "Gemini 3.1 Pro"},
+            "c": {"model": "ENUM_FLASHLITE", "displayName": "Gemini 3.1 Flash Lite"},
+        }
+    }
+    assert reader._resolve_pricing_id("ENUM_FLASH35", catalog) == "databricks-gemini-3-5-flash"
+    assert reader._resolve_pricing_id("ENUM_PRO31", catalog) == "databricks-gemini-3-1-pro"
+    assert (
+        reader._resolve_pricing_id("ENUM_FLASHLITE", catalog) == "databricks-gemini-3-1-flash-lite"
+    )
+
+
+def test_resolve_pricing_id_falls_back_to_displayname_for_non_gemini() -> None:
+    """A non-Gemini / unknown model falls back to the displayname (or raw enum).
+
+    The agy catalog can surface Claude / GPT-OSS models that have no
+    ``databricks-gemini-*`` counterpart; the resolver must not invent one. It
+    returns the human displayName (a sensible dropdown label), and an enum
+    absent from the catalog returns the raw enum unchanged — preserving the
+    existing "unknown enum is reported, never dropped" behavior.
+    """
+    catalog: dict[str, object] = {
+        "models": {
+            "x": {"model": "ENUM_CLAUDE", "displayName": "Claude Sonnet 4.6 (Thinking)"},
+        }
+    }
+    assert reader._resolve_pricing_id("ENUM_CLAUDE", catalog) == "Claude Sonnet 4.6 (Thinking)"
+    # Absent from the catalog → raw enum (matches _resolve_display_name fallback).
+    assert reader._resolve_pricing_id("MODEL_PLACEHOLDER_M999", _FAKE_CATALOG) == (
+        "MODEL_PLACEHOLDER_M999"
+    )
 
 
 @pytest.mark.asyncio
