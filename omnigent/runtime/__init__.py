@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     )
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
+    from omnigent.stores.work_item_store import WorkItemStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
 
@@ -37,6 +38,7 @@ def init(
     artifact_store: ArtifactStore | None = None,
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
+    work_item_store: WorkItemStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -72,6 +74,7 @@ def init(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        work_item_store=work_item_store,
         caps=caps,
     )
 
@@ -154,6 +157,19 @@ def get_policy_store() -> PolicyStore | None:
     :returns: The PolicyStore set during :func:`init`, or ``None``.
     """
     return _globals._policy_store
+
+
+def get_work_item_store() -> WorkItemStore | None:
+    """
+    Return the WorkItemStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because work_item_store is
+    optional — the work-item tools surface a clear error to the agent
+    when invoked without a configured store.
+
+    :returns: The WorkItemStore set during :func:`init`, or ``None``.
+    """
+    return _globals._work_item_store
 
 
 def get_agent_cache() -> AgentCache:
