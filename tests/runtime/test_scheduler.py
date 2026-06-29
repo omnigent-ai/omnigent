@@ -42,12 +42,17 @@ class _FakeStore:
     def __init__(self, schedules: list[Schedule]) -> None:
         self._schedules = schedules
         self.updates: list[tuple[str, dict[str, Any]]] = []
+        # Set on every update so a test can await the *recorded* fire instead
+        # of the fire callback (which the scheduler runs strictly before the
+        # last_fired_at write — waiting on the callback races the write).
+        self.updated = asyncio.Event()
 
     def list_enabled(self) -> list[Schedule]:
         return list(self._schedules)
 
     def update(self, schedule_id: str, **kwargs: Any) -> None:
         self.updates.append((schedule_id, kwargs))
+        self.updated.set()
 
 
 def _fire_recorder() -> tuple[Callable[[Schedule], Awaitable[None]], list[str], asyncio.Event]:
@@ -85,10 +90,13 @@ async def test_fires_loop_and_records_last_fired() -> None:
     svc = SchedulerService(store, fire, now=lambda: _FIXED, sleep=_fire_once_then_park())
     await svc.start()
     try:
-        await asyncio.wait_for(fired.wait(), timeout=2)
+        # Wait on the store write (which the scheduler does *after* firing), so
+        # both the fire and its last_fired_at record are guaranteed visible.
+        await asyncio.wait_for(store.updated.wait(), timeout=2)
     finally:
         await svc.stop()
 
+    assert fired.is_set()
     assert calls == ["s1"]
     assert store.updates[0][0] == "s1"
     assert store.updates[0][1]["last_fired_at"] == int(_FIXED.timestamp())
