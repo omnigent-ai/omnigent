@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import click
 import pytest
 
@@ -197,14 +199,18 @@ class _FakeResp:
 class _FakeAsyncClient:
     def __init__(self, resp: _FakeResp) -> None:
         self._resp = resp
+        self.posts: list[tuple[tuple, dict]] = []
+        self.patches: list[tuple[tuple, dict]] = []
 
-    async def post(self, *_a, **_k):
+    async def post(self, *args, **kwargs):
+        self.posts.append((args, kwargs))
         return self._resp
 
     async def get(self, *_a, **_k):
         return self._resp
 
-    async def patch(self, *_a, **_k):
+    async def patch(self, *args, **kwargs):
+        self.patches.append((args, kwargs))
         return self._resp
 
 
@@ -215,6 +221,17 @@ async def test_create_hermes_session_returns_id_or_raises() -> None:
         await hn._create_hermes_session(_FakeAsyncClient(_FakeResp(500, {})), b"bundle")
     with pytest.raises(click.ClickException, match="session_id"):
         await hn._create_hermes_session(_FakeAsyncClient(_FakeResp(200, {})), b"bundle")
+
+
+async def test_create_hermes_session_persists_state_mode_metadata() -> None:
+    client = _FakeAsyncClient(_FakeResp(200, {"session_id": "conv_x"}))
+
+    assert await hn._create_hermes_session(client, b"bundle", state_mode="ambient") == "conv_x"
+
+    assert client.posts
+    _args, kwargs = client.posts[0]
+    metadata = json.loads(kwargs["data"]["metadata"])
+    assert metadata["labels"]["omnigent.hermes_native.state_mode"] == "ambient"
 
 
 async def test_fetch_hermes_session_handles_status() -> None:

@@ -36,6 +36,11 @@ from omnigent._wrapper_labels import HERMES_NATIVE_WRAPPER_VALUE as _WRAPPER_LAB
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.hermes_native_bridge import (
+    STATE_MODE_LABEL_KEY,
+    STATE_MODE_MANAGED,
+    normalize_hermes_native_state_mode,
+)
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
@@ -154,6 +159,7 @@ def run_hermes_native(
     hermes_args: tuple[str, ...],
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
+    state_mode: str = STATE_MODE_MANAGED,
 ) -> None:
     """
     Launch the Hermes TUI in an Omnigent terminal.
@@ -166,6 +172,7 @@ def run_hermes_native(
         URL after launch.
     :returns: None after the terminal attach session ends.
     """
+    state_mode = normalize_hermes_native_state_mode(state_mode)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -181,6 +188,7 @@ def run_hermes_native(
             resume_picker=resume_picker,
             hermes_args=hermes_args,
             auto_open_conversation=auto_open_conversation,
+            state_mode=state_mode,
         )
 
 
@@ -228,6 +236,7 @@ def _run_with_remote_server(
     resume_picker: bool,
     hermes_args: tuple[str, ...],
     auto_open_conversation: bool = False,
+    state_mode: str = STATE_MODE_MANAGED,
 ) -> None:
     """
     Launch Hermes on an Omnigent server via a daemon-spawned runner.
@@ -269,6 +278,7 @@ def _run_with_remote_server(
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
+                    state_mode=state_mode,
                 )
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
@@ -306,6 +316,7 @@ async def _prepare_hermes_terminal_via_daemon(
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
+    state_mode: str = STATE_MODE_MANAGED,
 ) -> PreparedHermesTerminal:
     """
     Create or resume a hermes-native session through a daemon runner.
@@ -325,6 +336,7 @@ async def _prepare_hermes_terminal_via_daemon(
                 client,
                 session_bundle,
                 terminal_launch_args=persist_args or None,
+                state_mode=state_mode,
             )
         else:
             _update_startup_progress(startup_progress, "Loading Hermes session...")
@@ -401,9 +413,13 @@ async def _create_hermes_session(
     bundle: bytes,
     *,
     terminal_launch_args: list[str] | None = None,
+    state_mode: str = STATE_MODE_MANAGED,
 ) -> str:
     """Create a bundled terminal-first hermes-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    state_mode = normalize_hermes_native_state_mode(state_mode)
+    labels = dict(_SESSION_LABELS)
+    labels[STATE_MODE_LABEL_KEY] = state_mode
+    metadata: dict[str, Any] = {"labels": labels}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
