@@ -311,6 +311,7 @@ _WORK_MANAGEMENT_TOOLS = frozenset(
         "create_monitor",
         "list_schedules",
         "delete_schedule",
+        "set_canvas",
     }
 )
 
@@ -2581,14 +2582,14 @@ async def _execute_work_management_tool(
     server_client: httpx.AsyncClient | None,
 ) -> str:
     """
-    Runner-local handler for the work-item / schedule builtins (#12).
+    Runner-local handler for the work-item / schedule / canvas builtins (#12).
 
-    The runner has no in-process WorkItem / Schedule store, so — like the
-    comment tools — these proxy to the Omnigent server's REST API over
-    ``server_client``: ``/v1/work-items`` (POST/GET/PATCH) and ``/v1/schedules``
-    (POST/GET/DELETE). Conversation-scoped tools (create_loop, create_monitor,
-    list_schedules) default to the current ``conversation_id`` when the arg is
-    omitted.
+    The runner has no in-process WorkItem / Schedule / Canvas store, so — like
+    the comment tools — these proxy to the Omnigent server's REST API over
+    ``server_client``: ``/v1/work-items`` (POST/GET/PATCH), ``/v1/schedules``
+    (POST/GET/DELETE), and ``/v1/canvas/{id}`` (PUT). Conversation-scoped tools
+    (create_loop, create_monitor, list_schedules, set_canvas) default to the
+    current ``conversation_id`` when the arg is omitted.
 
     :param tool_name: One of :data:`_WORK_MANAGEMENT_TOOLS`.
     :param arguments: JSON-encoded args from the LLM.
@@ -2637,7 +2638,9 @@ async def _execute_work_management_tool(
                 for k in ("status", "conversation_id", "limit")
                 if args.get(k) is not None
             }
-            return _result(await server_client.get("/v1/work-items", params=params, timeout=30.0))
+            return _result(
+                await server_client.get("/v1/work-items", params=params, timeout=30.0)
+            )
 
         if tool_name == "update_work_item":
             work_item_id = args.get("work_item_id")
@@ -2695,6 +2698,18 @@ async def _execute_work_management_tool(
                 return json.dumps({"error": "missing required argument: schedule_id"})
             return _result(
                 await server_client.delete(f"/v1/schedules/{schedule_id}", timeout=30.0)
+            )
+
+        if tool_name == "set_canvas":
+            if not scoped_conv:
+                return json.dumps({"error": "set_canvas requires a session id"})
+            body = {
+                "title": args.get("title"),
+                "content": args.get("content"),
+                "content_type": args.get("content_type", "html"),
+            }
+            return _result(
+                await server_client.put(f"/v1/canvas/{scoped_conv}", json=body, timeout=30.0)
             )
 
         return json.dumps({"error": f"unknown work-management tool: {tool_name}"})

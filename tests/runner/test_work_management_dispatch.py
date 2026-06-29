@@ -43,10 +43,7 @@ async def test_list_work_items_passes_filters_as_query() -> None:
     reqs: list[httpx.Request] = []
     client = _recording_client(reqs)
     await _execute_work_management_tool(
-        "list_work_items",
-        json.dumps({"status": "new"}),
-        conversation_id="conv_1",
-        server_client=client,
+        "list_work_items", json.dumps({"status": "new"}), conversation_id="conv_1", server_client=client
     )
     await client.aclose()
     assert reqs[0].method == "GET"
@@ -114,6 +111,25 @@ async def test_delete_schedule_deletes_by_id() -> None:
     await client.aclose()
     assert reqs[0].method == "DELETE"
     assert reqs[0].url.path == "/v1/schedules/sch_1"
+
+
+async def test_set_canvas_puts_to_conversation() -> None:
+    reqs: list[httpx.Request] = []
+    client = _recording_client(reqs)
+    await _execute_work_management_tool(
+        "set_canvas",
+        json.dumps({"title": "C", "content": "<h1>x</h1>"}),
+        conversation_id="conv_Y",
+        server_client=client,
+    )
+    await client.aclose()
+    assert reqs[0].method == "PUT"
+    assert reqs[0].url.path == "/v1/canvas/conv_Y"
+    assert json.loads(reqs[0].content) == {
+        "title": "C",
+        "content": "<h1>x</h1>",
+        "content_type": "html",
+    }
 
 
 async def test_guards() -> None:

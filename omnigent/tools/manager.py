@@ -497,7 +497,7 @@ class ToolManager:
         agent: any dispatched handle's system message references
         it — that promise only holds if it's always in the schema.
 
-        ``list_tasks`` has been removed (the tasks table was removed;
+        ``list_work_items`` has been removed (the tasks table was removed;
         it always returned an empty list in production). ``check_task``
         was dropped per design step 11 in favour of the inbox-based
         pattern (``sys_call_async`` + ``sys_read_inbox`` + auto-delivery).
@@ -526,16 +526,17 @@ class ToolManager:
 
     def _register_work_management_tools(self) -> None:
         """
-        Auto-register the work-item / schedule builtins (#12).
+        Auto-register the work-item / schedule / canvas builtins (#12).
 
-        These (#3 work items, #6 loops & monitors) are framework-owned and
-        always available so an agent — and the Omnigent MCP surface — can
-        create and track work items and manage schedules without the spec
-        opting in. They're instantiated straight from the builtin registry
-        (like the comment tools) rather than declared in ``tools.builtins``,
-        which avoids the declared-builtin function-tool callable-recovery
-        path. Each tool returns a clear error at invoke time when its backing
-        store isn't configured, so registering them unconditionally is safe.
+        These (#3 work items, #6 loops & monitors, #2 canvas) are
+        framework-owned and always available so an agent — and the Omnigent
+        MCP surface — can create and track work items, manage schedules, and
+        set the conversation canvas without the spec opting in. They're
+        instantiated straight from the builtin registry (like the comment
+        tools) rather than declared in ``tools.builtins``, which avoids the
+        declared-builtin function-tool callable-recovery path. Each tool
+        returns a clear error at invoke time when its backing store isn't
+        configured, so registering them unconditionally is safe.
         """
         for name in (
             "create_work_item",
@@ -545,6 +546,7 @@ class ToolManager:
             "create_monitor",
             "list_schedules",
             "delete_schedule",
+            "set_canvas",
         ):
             tool = get_builtin_tool(name)
             if tool is not None:
