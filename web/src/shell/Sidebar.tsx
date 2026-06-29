@@ -23,6 +23,7 @@ import {
   FolderInputIcon,
   FolderMinusIcon,
   FolderOpenIcon,
+  GaugeIcon,
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
@@ -180,15 +181,18 @@ function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
   isTasksPage: boolean;
+  isDashboardPage: boolean;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const lastSegment = useLocation().pathname.split("/").filter(Boolean).at(-1);
   const isInboxPage = lastSegment === "inbox";
   const isTasksPage = lastSegment === "tasks";
-  // Exclude inbox/tasks: they also have no `:conversationId`, so they'd
-  // otherwise light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage && !isTasksPage;
-  return { isNewChatPage, isInboxPage, isTasksPage };
+  const isDashboardPage = lastSegment === "dashboard";
+  // Exclude inbox/tasks/dashboard: they also have no `:conversationId`, so
+  // they'd otherwise light up the "New session" button.
+  const isNewChatPage =
+    activeConversationId == null && !isInboxPage && !isTasksPage && !isDashboardPage;
+  return { isNewChatPage, isInboxPage, isTasksPage, isDashboardPage };
 }
 
 /**
@@ -317,7 +321,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage, isDashboardPage } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -479,6 +483,24 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Tasks</TooltipContent>
+              </Tooltip>
+              {/* Usage dashboard — per-model token/cost totals (#10). */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Usage"
+                    className={cn("relative rounded-full", isDashboardPage && "bg-muted")}
+                    data-testid="usage-button"
+                  >
+                    <Link to="/dashboard" onClick={onNavClick}>
+                      <GaugeIcon className="size-4" />
+                    </Link>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Usage</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
