@@ -20,8 +20,11 @@ import pytest
 
 import omnigent.inner.antigravity_native_executor as executor_mod
 from omnigent.antigravity_native_bridge import (
+    FORK_HISTORY_OPEN_TAG,
     AntigravityNativeBridgeState,
+    read_fork_preamble,
     write_bridge_state,
+    write_fork_preamble,
 )
 from omnigent.inner.antigravity_native_executor import AntigravityNativeExecutor
 from omnigent.inner.executor import ExecutorError, ExecutorEvent, TurnComplete
@@ -375,6 +378,97 @@ def test_run_turn_tui_inject_error_surfaces(tmp_path: Path, injected: dict[str, 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "the agy TUI" in events[0].message
+
+
+# ---------------------------------------------------------------------------
+# run_turn — fork history (text-preamble replay)
+# ---------------------------------------------------------------------------
+
+
+def test_run_turn_first_fork_turn_injects_preamble_then_consumes_it(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """
+    A fork's FIRST turn prepends the fenced preamble; the second is plain text.
+
+    agy owns its conversation store and exposes no history-rebuild API, so a fork
+    carries history as a text preamble replayed onto the first typed turn
+    (text-prefix replay). The runner stashed it in the bridge dir; the executor
+    fences it in the fork-history sentinel ahead of the user's real text and
+    consumes it only after a successful inject, so a later turn types plain text.
+    """
+    _seed_state(tmp_path)
+    write_fork_preamble(tmp_path, "You: earlier")
+    executor = _executor(tmp_path)
+
+    asyncio.run(_run(executor, "first"))
+    first = _injected(injected)[0]["content"]
+    assert isinstance(first, str)
+    assert FORK_HISTORY_OPEN_TAG in first
+    assert "You: earlier" in first
+    assert first.endswith("first")
+    # Consumed on success.
+    assert read_fork_preamble(tmp_path) is None
+
+    asyncio.run(_run(executor, "second"))
+    assert _injected(injected)[1]["content"] == "second"
+
+
+def test_run_turn_failed_fork_injection_preserves_preamble_for_retry(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """
+    A failed first fork inject must NOT consume the preamble (retry keeps history).
+
+    Consuming on read would lose the forked history permanently if the first
+    inject fails (e.g. the agy pane exited); the executor reads but only clears
+    after a successful inject, so a retried first turn still replays the history.
+    """
+    _seed_state(tmp_path)
+    write_fork_preamble(tmp_path, "You: earlier")
+    executor = _executor(tmp_path)
+
+    injected["raise"] = RuntimeError("the agy terminal is no longer running")
+    events = asyncio.run(_run(executor, "first"))
+    assert any(isinstance(e, ExecutorError) for e in events)
+    # Preamble survives the failed inject for a retry.
+    assert read_fork_preamble(tmp_path) == "You: earlier"
+
+    injected["raise"] = None
+    asyncio.run(_run(executor, "first"))
+    retried = _injected(injected)[1]["content"]
+    assert isinstance(retried, str)
+    assert "You: earlier" in retried
+    assert read_fork_preamble(tmp_path) is None
+
+
+def test_run_turn_no_fork_preamble_injects_plain_text(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """A non-fork session (no preamble file) injects the plain user text."""
+    _seed_state(tmp_path)
+    asyncio.run(_run(_executor(tmp_path), "hello"))
+    assert _injected(injected)[0]["content"] == "hello"
+
+
+def test_enqueue_steer_does_not_carry_fork_preamble(
+    tmp_path: Path, injected: dict[str, object]
+) -> None:
+    """
+    Mid-turn steering does NOT prepend the fork preamble (only the initiating turn does).
+
+    ``enqueue_session_message`` is the steering path; the fork preamble rides
+    only ``run_turn`` (the initiating turn), so a steer delivers plain text and
+    leaves the preamble untouched for the still-pending first turn.
+    """
+    _seed_state(tmp_path)
+    write_fork_preamble(tmp_path, "You: earlier")
+    result = asyncio.run(_executor(tmp_path).enqueue_session_message("main", "steer"))
+    assert result is True
+    assert _injected(injected)[0]["content"] == "steer"
+    assert FORK_HISTORY_OPEN_TAG not in str(_injected(injected)[0]["content"])
+    # The initiating turn still owns the preamble.
+    assert read_fork_preamble(tmp_path) == "You: earlier"
 
 
 # ---------------------------------------------------------------------------

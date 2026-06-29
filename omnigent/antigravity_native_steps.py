@@ -43,6 +43,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
+from omnigent.antigravity_native_bridge import strip_fork_history
+
 _logger = logging.getLogger(__name__)
 
 # Omnigent ``agent`` label stamped on mirrored assistant/function-call items so
@@ -602,6 +604,15 @@ def _user_input_text(user_input: object) -> str:
     :func:`omnigent.antigravity_native_rpc.send_user_cascade_message` sends).
     Prefer ``userResponse``; fall back to joining the item texts.
 
+    On a forked session the first typed turn carries the replayed prior
+    transcript fenced in fork-history sentinels (text-preamble replay, see
+    :func:`omnigent.antigravity_native_bridge.wrap_fork_preamble`). agy records
+    that whole text as the USER_INPUT step, so the block is stripped here
+    (:func:`omnigent.antigravity_native_bridge.strip_fork_history`) — otherwise
+    the copied prior conversation would be DUPLICATED in the mirrored timeline
+    (it already lives there as the source conversation's items). A no-op on the
+    common case (no sentinel).
+
     :param user_input: The step's ``userInput`` value (expected ``dict``).
     :returns: The user's text, or ``""`` when absent/unparseable.
     """
@@ -609,7 +620,7 @@ def _user_input_text(user_input: object) -> str:
         return ""
     response = user_input.get("userResponse")
     if isinstance(response, str) and response.strip():
-        return response
+        return strip_fork_history(response)
     items = user_input.get("items")
     if isinstance(items, list):
         parts = [
@@ -619,7 +630,7 @@ def _user_input_text(user_input: object) -> str:
         ]
         joined = "\n".join(part for part in parts if part)
         if joined.strip():
-            return joined
+            return strip_fork_history(joined)
     return ""
 
 

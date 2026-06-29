@@ -817,6 +817,20 @@ async def test_fork_switch_404_unknown_target() -> None:
             False,
             {"omnigent.ui": "terminal", "omnigent.wrapper": "cursor-native-ui"},
         ),
+        # antigravity target carries history via a text preamble too: agy owns
+        # its conversation store and exposes no transcript-export / history-
+        # rebuild API, so the runner can't seed a native transcript — it replays
+        # the prior turns on the first typed turn. So carry_history_into_native
+        # IS stamped, model settings reset (cross-family), and the source's
+        # native session id is NOT stamped (no clone — it carries via preamble).
+        (
+            "claude_sdk",
+            "antigravity-native",
+            False,
+            True,
+            False,
+            {"omnigent.ui": "terminal", "omnigent.wrapper": "antigravity-native-ui"},
+        ),
         # pi-native CAN carry fork history: the runner rebuilds Pi's JSONL
         # session file from the copied Omnigent items. Cross-family from a
         # claude SDK source, so model settings reset and the source's native
@@ -977,6 +991,10 @@ async def test_fork_no_switch_native_source_carries_history(
         # (it is in _FORK_HISTORY_NATIVE_HARNESSES), so a same-agent fork marks
         # native carry — parity with claude/codex.
         ("pi-native", True),
+        # antigravity carries history via a text preamble too: agy owns its
+        # conversation store and exposes no transcript-export API, so a fork
+        # replays prior turns on the first typed turn (parity with cursor).
+        ("antigravity-native", True),
     ],
 )
 @pytest.mark.asyncio
@@ -1025,6 +1043,9 @@ async def test_fork_cursor_pi_native_carry_gating(
         ("native-codex", True),
         ("native-cursor", True),
         ("native-pi", True),
+        # native-antigravity is NOT aliased to antigravity-native, so it passes
+        # through unchanged — the carry gate lists both spellings explicitly.
+        ("native-antigravity", True),
     ],
 )
 @pytest.mark.asyncio

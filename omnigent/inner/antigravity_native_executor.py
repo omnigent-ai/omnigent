@@ -73,9 +73,12 @@ from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     AntigravityNativeBridgeState,
+    clear_fork_preamble,
     inject_user_message_via_tui,
     is_placeholder_conversation_id,
     read_bridge_state,
+    read_fork_preamble,
+    wrap_fork_preamble,
 )
 from omnigent.antigravity_native_rpc import (
     cancel_cascade_steps,
@@ -255,11 +258,31 @@ class AntigravityNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Antigravity native turn had no user text to send")
             return
+        # A fork into agy carries history as a text preamble: agy owns its
+        # conversation store and exposes no history-import / transcript-rebuild
+        # API (unlike claude/codex/pi/qwen native, which seed a resumable
+        # session file), so the runner stashed the prior turns and we prepend
+        # them to the FIRST typed turn (text-prefix replay ONLY — NO native
+        # conversation reconstruction). We READ the preamble here but only CLEAR
+        # it after a successful deliver (below): consuming it up front would lose
+        # the forked history permanently if delivery fails (e.g. the agy TUI
+        # exited) and the turn is retried. The RPC reader strips the sentinel
+        # block when mirroring this turn back, so the copied history isn't
+        # duplicated in the Omnigent timeline (antigravity_native_steps). Only
+        # the initiating turn carries it; mid-turn steering
+        # (enqueue_session_message) deliberately does not.
+        preamble = await asyncio.to_thread(read_fork_preamble, self._bridge_dir)
+        if preamble:
+            text = wrap_fork_preamble(preamble, text)
         outcome = await self._deliver(text)
         if outcome is not None:
             yield ExecutorError(message=outcome)
-        else:
-            yield TurnComplete(response=None)
+            return
+        # Delivery landed — now it's safe to consume the preamble so later turns
+        # type the plain user text.
+        if preamble:
+            await asyncio.to_thread(clear_fork_preamble, self._bridge_dir)
+        yield TurnComplete(response=None)
 
     async def _deliver(self, text: str) -> str | None:
         """

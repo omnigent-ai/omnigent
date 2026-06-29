@@ -115,6 +115,42 @@ class TestUserInputCommitted:
         assert events == []
 
 
+class TestUserInputForkHistoryStripped:
+    """A fork's first turn carries the fenced preamble; the mirror strips it.
+
+    On a fork, the executor types the prior transcript fenced in fork-history
+    sentinels ahead of the user's text (text-prefix replay). agy records that
+    whole text as the USER_INPUT step, so the read path must strip the fenced
+    block before mirroring the user bubble — else the copied prior conversation
+    would be DUPLICATED in the timeline (it already lives there as the source
+    conversation's items).
+    """
+
+    def test_fork_preamble_is_stripped_from_mirrored_user_bubble(self) -> None:
+        from omnigent.antigravity_native_bridge import wrap_fork_preamble
+
+        wrapped = wrap_fork_preamble("You: earlier\n\nAssistant: ok", "now continue")
+        step = {
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "userInput": {"userResponse": wrapped},
+        }
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert len(events) == 1
+        content = events[0].data["item_data"]["content"]
+        # Only the user's real text is mirrored — the fenced history is gone.
+        assert content == [{"type": "input_text", "text": "now continue"}]
+
+    def test_plain_user_turn_unchanged(self) -> None:
+        step = {
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "userInput": {"userResponse": "a normal turn"},
+        }
+        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        assert events[0].data["item_data"]["content"] == [
+            {"type": "input_text", "text": "a normal turn"}
+        ]
+
+
 # ---------------------------------------------------------------------------
 # PLANNER_RESPONSE (text only) → one message, NO delta
 # ---------------------------------------------------------------------------
