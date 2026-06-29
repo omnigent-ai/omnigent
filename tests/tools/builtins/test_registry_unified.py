@@ -120,6 +120,11 @@ def test_builtin_names_size_matches_registry() -> None:
                 "download_file",
                 "search_conversations",
                 "export_agent",
+                # Hindsight long-term memory tools (optional `memory`
+                # extra; factories probe for hindsight-client).
+                "memory_retain",
+                "memory_recall",
+                "memory_reflect",
                 # Framework-owned (need runtime context, not
                 # user-instantiable). Policy ASKs surface as
                 # MCP-shape elicitations on the SSE stream and

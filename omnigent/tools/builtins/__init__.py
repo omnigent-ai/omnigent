@@ -166,6 +166,66 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
+def _require_memory_backend() -> None:
+    """
+    Validate that the Hindsight client SDK is installed.
+
+    ``hindsight-client`` is an optional dependency (the ``memory`` extra),
+    so the memory tools probe for it at construction time and fail with an
+    actionable message rather than an opaque ImportError mid-run. Mirrors the
+    Modal sandbox launcher's ``_ensure_sdk``.
+
+    :raises ImportError: When ``hindsight-client`` is not installed.
+    """
+    try:
+        import hindsight_client  # noqa: F401  # presence probe only
+    except ImportError as exc:
+        raise ImportError(
+            "The 'hindsight-client' SDK is required for the Hindsight memory "
+            "tools (memory_retain / memory_recall / memory_reflect). "
+            "Install it with `pip install 'omnigent[memory]'`."
+        ) from exc
+
+
+def _create_memory_retain(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for MemoryRetainTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A MemoryRetainTool instance.
+    """
+    _require_memory_backend()
+    from omnigent.tools.builtins.memory import MemoryRetainTool
+
+    return MemoryRetainTool(config=config)
+
+
+def _create_memory_recall(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for MemoryRecallTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A MemoryRecallTool instance.
+    """
+    _require_memory_backend()
+    from omnigent.tools.builtins.memory import MemoryRecallTool
+
+    return MemoryRecallTool(config=config)
+
+
+def _create_memory_reflect(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for MemoryReflectTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A MemoryReflectTool instance.
+    """
+    _require_memory_backend()
+    from omnigent.tools.builtins.memory import MemoryReflectTool
+
+    return MemoryReflectTool(config=config)
+
+
 # Unified registry for every reserved builtin name. The value
 # is either a factory callable (for user-enablable tools) or
 # ``None`` for framework-owned names that occupy the name-space
@@ -188,6 +248,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
+    # Hindsight long-term memory (optional ``memory`` extra). Each factory
+    # probes for ``hindsight-client`` and fails with an install hint if absent.
+    "memory_retain": _create_memory_retain,
+    "memory_recall": _create_memory_recall,
+    "memory_reflect": _create_memory_reflect,
     # Framework-owned: need runtime context. ``web_fetch`` is
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by
