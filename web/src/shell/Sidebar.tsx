@@ -176,13 +176,19 @@ interface SidebarProps {
  * which is `inbox` in both standalone and embedded modes. Conversation ids are
  * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
  */
-function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
+function useActiveNavItem(): {
+  isNewChatPage: boolean;
+  isInboxPage: boolean;
+  isTasksPage: boolean;
+} {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
-  const isInboxPage = useLocation().pathname.split("/").filter(Boolean).at(-1) === "inbox";
-  // Exclude inbox: it also has no `:conversationId`, so it would otherwise
-  // light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage;
-  return { isNewChatPage, isInboxPage };
+  const lastSegment = useLocation().pathname.split("/").filter(Boolean).at(-1);
+  const isInboxPage = lastSegment === "inbox";
+  const isTasksPage = lastSegment === "tasks";
+  // Exclude inbox/tasks: they also have no `:conversationId`, so they'd
+  // otherwise light up the "New session" button.
+  const isNewChatPage = activeConversationId == null && !isInboxPage && !isTasksPage;
+  return { isNewChatPage, isInboxPage, isTasksPage };
 }
 
 /**
@@ -311,7 +317,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -455,6 +461,24 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Inbox</TooltipContent>
+              </Tooltip>
+              {/* Tasks lives just below Inbox — the work-items list (#3). */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Tasks"
+                    className={cn("relative rounded-full", isTasksPage && "bg-muted")}
+                    data-testid="tasks-button"
+                  >
+                    <Link to="/tasks" onClick={onNavClick}>
+                      <ListChecksIcon className="size-4" />
+                    </Link>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Tasks</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
