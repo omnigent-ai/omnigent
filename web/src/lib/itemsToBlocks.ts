@@ -79,6 +79,13 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
     return null;
   }
   if (isMessageItem(item) && item.role === "user") {
+    // Hide the compaction summary message injected by Claude Code
+    // after /compact. It starts with a distinctive prefix and is
+    // part of the model's context (needed for resume) but should
+    // not be shown as a chat bubble in the web UI.
+    if (isCompactionSummaryMessage(item)) {
+      return null;
+    }
     return userMessageToBlock(item);
   }
   if (isMessageItem(item) && item.role === "assistant") {
@@ -110,6 +117,23 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   }
   // Unknown future item types — skip silently so the page still renders.
   return null;
+}
+
+/**
+ * Detect the compaction summary message injected by Claude Code after
+ * `/compact`. The message carries the conversation summary for the
+ * model's context but should not render as a user chat bubble.
+ */
+function isCompactionSummaryMessage(item: MessageItem): boolean {
+  const prefix = "This session is being continued from a previous conversation";
+  for (const block of item.content) {
+    if (block.type === "input_text" && typeof block.text === "string") {
+      if (block.text.startsWith(prefix)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function userMessageToBlock(item: MessageItem): UserMessageBlock {

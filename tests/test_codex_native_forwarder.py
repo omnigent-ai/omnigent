@@ -1355,3 +1355,59 @@ async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
     body = kwargs["json"]
     assert body["data"]["last_item_id"].startswith("compact_boundary_")
     assert "compacted_messages" not in body["data"]
+
+
+def test_read_compacted_history_extracts_replacement_history_and_window_id(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns replacement_history and window_id."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    lines = [
+        _json.dumps({"type": "session_meta", "payload": {"id": "abc"}}),
+        _json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user"}}),
+        _json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "summary",
+                    "replacement_history": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        },
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "gAAAA_test_token",
+                        },
+                    ],
+                    "window_id": 2,
+                },
+            }
+        ),
+    ]
+    rollout.write_text("\n".join(lines) + "\n")
+
+    result = fwd._read_compacted_history(rollout)
+
+    assert result is not None
+    assert result["window_id"] == 2
+    assert len(result["replacement_history"]) == 2
+    assert result["replacement_history"][0]["type"] == "message"
+    assert result["replacement_history"][0]["role"] == "user"
+    assert result["replacement_history"][1]["type"] == "compaction"
+    assert result["replacement_history"][1]["encrypted_content"] == "gAAAA_test_token"
+
+
+def test_read_compacted_history_returns_none_for_no_compacted_entry(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns None when no Compacted entry exists."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(_json.dumps({"type": "session_meta", "payload": {"id": "abc"}}) + "\n")
+
+    assert fwd._read_compacted_history(rollout) is None

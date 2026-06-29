@@ -492,4 +492,27 @@ describe("itemsToBlocks — edge cases", () => {
     // The unknown item is dropped; only user_message + text_done survive.
     expect(blocks.map((b) => b.type)).toEqual(["user_message", "text_done"]);
   });
+
+  it("hides the compaction summary message injected after /compact", () => {
+    const items: ConversationItem[] = [
+      userMessage("r1", "hello", "msg_1"),
+      assistantMessage("r1", "hi there", "msg_2"),
+      // Compaction summary message — should be hidden
+      userMessage(
+        "r2",
+        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. User asked hello.",
+        "msg_compact_summary",
+      ),
+      // Normal message after compaction — should be visible
+      userMessage("r3", "what next?", "msg_3"),
+    ];
+    const blocks = itemsToBlocks(items);
+    const userBlocks = blocks.filter((b) => b.type === "user_message") as UserMessageBlock[];
+    // The compaction summary should be hidden; only "hello" and "what next?" remain
+    expect(userBlocks).toHaveLength(2);
+    const texts = userBlocks.map((b) => b.content.map((c) => ("text" in c ? c.text : "")).join(""));
+    expect(texts).toContain("hello");
+    expect(texts).toContain("what next?");
+    expect(texts.some((t) => t.includes("continued from a previous conversation"))).toBe(false);
+  });
 });

@@ -737,6 +737,17 @@
             "description": "Approximate token count of the summary text, for budget tracking, e.g. `342`.",
             "title": "Token Count",
             "type": "integer"
+          },
+          "window_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Id"
           }
         },
         "required": [
