@@ -4,6 +4,7 @@ import {
   harnessFamily,
   isNativeHarness,
   forkTargetCarriesHistory,
+  switchTargetCarriesHistory,
 } from "./forkHarness";
 
 describe("harnessFamily", () => {
@@ -93,10 +94,16 @@ describe("forkTargetCarriesHistory", () => {
     ["native-claude"],
     ["codex-native"],
     ["native-codex"],
-    // Cursor is native but server-backed: a fork carries history as a text
-    // preamble (text-prefix replay), so it must be offered in the picker too.
+    // Hermes is a native-rebuild harness (in _FORK_HISTORY_NATIVE_HARNESSES).
+    ["hermes-native"],
+    ["native-hermes"],
+    // Cursor / OpenCode are native but server-backed: a FORK carries history
+    // as a text preamble (text-prefix replay), so both must be offered in the
+    // fork picker (switch differs — see switchTargetCarriesHistory).
     ["cursor-native"],
     ["native-cursor"],
+    ["opencode-native"],
+    ["native-opencode"],
     // Pi is native but multi-family (no single harnessFamily) — it must
     // still be offered, or the fork/switch-agent pickers silently drop it.
     ["pi-native"],
@@ -106,9 +113,20 @@ describe("forkTargetCarriesHistory", () => {
     // qwen-native rebuilds qwen's on-disk recording from the copied items.
     ["qwen-native"],
     ["native-qwen"],
-  ])("native target %s carries history", (target) => {
+  ])("native fork target %s carries history", (target) => {
     expect(forkTargetCarriesHistory(target)).toBe(true);
   });
+
+  // Native harnesses with NO carry path on the server (neither rebuild nor
+  // preamble) and no single provider family — forking into them would start
+  // fresh, so the fork picker must not offer them. (qwen-native DOES carry —
+  // it rebuilds from items — so it is intentionally absent here.)
+  it.each([["kiro-native"], ["kimi-native"], ["goose-native"]])(
+    "native target %s without a carry path does NOT carry on fork",
+    (target) => {
+      expect(forkTargetCarriesHistory(target)).toBe(false);
+    },
+  );
 
   it("does NOT offer a target whose harness is unknown (conservative; see TODO)", () => {
     // We can't classify an unrecognised harness (the catalog may report
@@ -117,6 +135,57 @@ describe("forkTargetCarriesHistory", () => {
     expect(forkTargetCarriesHistory("mystery")).toBe(false);
     expect(forkTargetCarriesHistory(null)).toBe(false);
     expect(forkTargetCarriesHistory(undefined)).toBe(false);
+  });
+});
+
+describe("switchTargetCarriesHistory", () => {
+  // Switch carries for native-rebuild targets (rebuilt from items) and SDK
+  // targets (replayed as context) — same as fork for these.
+  it.each([
+    ["claude-native"],
+    ["native-claude"],
+    ["codex-native"],
+    ["native-codex"],
+    ["pi-native"],
+    ["native-pi"],
+    ["hermes-native"],
+    ["native-hermes"],
+    // qwen-native rebuilds its on-disk recording, so it carries on switch too.
+    ["qwen-native"],
+    ["native-qwen"],
+    ["claude-sdk"],
+    ["openai-agents"],
+    ["antigravity"],
+    // antigravity-native currently carries via the family proxy (see the
+    // forkTargetCarriesHistory NOTE); kept offered until verified.
+    ["antigravity-native"],
+  ])("switch target %s carries history", (target) => {
+    expect(switchTargetCarriesHistory(target)).toBe(true);
+  });
+
+  // The preamble path (cursor/opencode) is FORK-ONLY: an in-place switch has
+  // no first-message injection point, so switching into one starts fresh and
+  // must NOT be offered — even though forkTargetCarriesHistory returns true.
+  it.each([["cursor-native"], ["native-cursor"], ["opencode-native"], ["native-opencode"]])(
+    "preamble target %s carries on fork but NOT on switch",
+    (target) => {
+      expect(forkTargetCarriesHistory(target)).toBe(true);
+      expect(switchTargetCarriesHistory(target)).toBe(false);
+    },
+  );
+
+  // Native harnesses with no carry path are offered by neither picker.
+  it.each([["kiro-native"], ["kimi-native"], ["goose-native"]])(
+    "native target %s without a carry path does NOT carry on switch",
+    (target) => {
+      expect(switchTargetCarriesHistory(target)).toBe(false);
+    },
+  );
+
+  it("does NOT offer an unknown/absent harness", () => {
+    expect(switchTargetCarriesHistory("mystery")).toBe(false);
+    expect(switchTargetCarriesHistory(null)).toBe(false);
+    expect(switchTargetCarriesHistory(undefined)).toBe(false);
   });
 });
 

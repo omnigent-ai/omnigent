@@ -398,6 +398,36 @@ describe("ForkSessionDialog", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("offers fork-only preamble (opencode) and rebuild (hermes) native targets", () => {
+    // OpenCode carries fork history as a text preamble; Hermes via native
+    // rebuild. Both must appear in the FORK picker — unlike the switch picker,
+    // where the fork-only preamble target (opencode) is hidden.
+    setAgents(
+      [
+        {
+          id: "ag_opencode",
+          name: "opencode-native-ui",
+          display_name: "OpenCode",
+          description: null,
+          harness: "opencode-native",
+        },
+        {
+          id: "ag_hermes",
+          name: "hermes-native-ui",
+          display_name: "Hermes",
+          description: null,
+          harness: "hermes-native",
+        },
+      ],
+      "claude-sdk",
+    );
+    renderDialog();
+    openAgentSelect();
+
+    expect(screen.getByTestId("fork-session-agent-option-ag_opencode")).toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-agent-option-ag_hermes")).toBeInTheDocument();
+  });
+
   it("passes the chosen agent_id when switching agent", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
