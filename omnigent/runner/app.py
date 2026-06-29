@@ -2869,8 +2869,22 @@ async def _auto_create_qwen_terminal(
     mcp_enabled = server_client is not None and ensure_comment_relay is not None
     mcp_args: list[str] = []
     if mcp_enabled:
-        mcp_config = write_mcp_config(bridge_dir)
-        mcp_args = ["--mcp-config", str(mcp_config)]
+        try:
+            mcp_config = write_mcp_config(bridge_dir)
+        except RuntimeError:
+            # The bridge dir failed owner-only validation (e.g. a redirected
+            # ancestor on a shared host) — don't write the relay token there.
+            # Degrade to no MCP rather than crash the session; the relay's own
+            # secure-dir check would reject it later too.
+            mcp_enabled = False
+            _logger.warning(
+                "qwen-native: bridge dir failed secure validation; skipping "
+                "Omnigent MCP wiring for session %s.",
+                session_id,
+                exc_info=True,
+            )
+        else:
+            mcp_args = ["--mcp-config", str(mcp_config)]
 
     # The dual-output + input-file flags wire qwen to the bridge; any user
     # ``terminal_launch_args`` (e.g. ``-m <model>``) precede them. Approval stays

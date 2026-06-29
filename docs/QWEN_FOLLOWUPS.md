@@ -255,14 +255,10 @@ comments; this is the *what*, not the *how*.)
   collide, and CLI-provided servers are ungated (no "Untrusted MCP server"
   prompt → no pre-approval step). The token + config are written by
   `qwen_native_bridge.write_mcp_config`; the live tool surface is advertised by
-  the `tool_relay.json` that `ensure_comment_relay` writes.
-  A project-scoped MCP server is gated behind qwen's "Untrusted MCP server"
-  startup prompt, so the runner pre-approves it non-interactively via
-  `qwen mcp approve omnigent` (`qwen_native_bridge.approve_mcp_server`, qwen's own
-  hash-exact command — the analog of cursor's `cursor mcp enable`), writing to a
-  per-session approvals store isolated via `QWEN_CODE_MCP_APPROVALS_PATH` (avoids
-  polluting `~/.qwen` and a same-workspace concurrency race). Permission gating on
-  qwen's *own* tool calls already works.
+  the `tool_relay.json` that `ensure_comment_relay` writes. The `bridge.json`
+  bearer token is written through `_ensure_secure_bridge_dir` (the same
+  owner-only ancestor validation the shared relay applies to token-bearing
+  trees). Permission gating on qwen's *own* tool calls already works.
 - [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
   file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
   What works today), so the bytes flow through Omnigent and the sandbox roots are
