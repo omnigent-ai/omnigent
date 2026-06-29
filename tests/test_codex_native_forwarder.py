@@ -1433,7 +1433,9 @@ async def test_post_session_event_dead_letters_durable_event_on_permanent_failur
     fwd._reset_forward_health()
 
     async def _failing_inner(client, session_id, *, event_type, data):
-        return httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
     token = fwd._dead_letter_dir.set(tmp_path)
@@ -1471,7 +1473,9 @@ async def test_post_session_event_does_not_dead_letter_ephemeral_event(
     fwd._reset_forward_health()
 
     async def _failing_inner(client, session_id, *, event_type, data):
-        return httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
     token = fwd._dead_letter_dir.set(tmp_path)
@@ -1507,7 +1511,9 @@ async def test_post_session_event_dead_letters_usage_on_permanent_failure(
     fwd._reset_forward_health()
 
     async def _failing_inner(client, session_id, *, event_type, data):
-        return httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
 
     monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
     token = fwd._dead_letter_dir.set(tmp_path)
@@ -1530,3 +1536,212 @@ async def test_post_session_event_dead_letters_usage_on_permanent_failure(
     assert record["session_id"] == "conv_codex_usage"
     assert record["event_type"] == "external_session_usage"
     assert record["payload"] == data
+
+
+class _RaisingPostClient:
+    """Async client stub whose ``post`` always raises a fixed transport error."""
+
+    def __init__(self, exc: httpx.HTTPError) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    async def post(self, url: str, json: object) -> httpx.Response:
+        self.calls += 1
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_classifies_ambiguous_skip() -> None:
+    """
+    An ambiguous conversation-item transport failure surfaces as ambiguous (#1579).
+
+    The inner used to conflate this with a proven-undelivered failure (both
+    returned ``None``); replay must be able to tell them apart.
+    """
+    client = _RaisingPostClient(
+        httpx.ReadTimeout("response lost", request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+    )
+    assert result.response is None
+    assert result.delivered_ambiguous is True
+    assert result.transport_error == "ReadTimeout"
+    # Ambiguous items are abandoned immediately — no retries.
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_classifies_proven_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A connect failure exhausted after retries is proven-undelivered, not ambiguous.
+    """
+    monkeypatch.setattr(fwd, "_sleep", AsyncMock())
+    client = _RaisingPostClient(
+        httpx.ConnectError("refused", request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+    )
+    assert result.response is None
+    assert result.delivered_ambiguous is False
+    assert result.transport_error == "ConnectError"
+    # Connect failures are safe to retry, so all attempts are spent.
+    assert client.calls == fwd._POST_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_ambiguous_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ambiguous-skip drop is dead-lettered with ``delivered_ambiguous=True`` (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _ambiguous_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=None, delivered_ambiguous=True, transport_error="ReadTimeout"
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _ambiguous_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data={"item_type": "message"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert record["delivered_ambiguous"] is True
+    assert record["http_status"] is None
+    assert record["transport_error"] == "ReadTimeout"
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_records_http_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A status-bearing failure records ``http_status`` and is not ambiguous (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(503, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data={"item_type": "message"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert record["http_status"] == 503
+    assert record["delivered_ambiguous"] is False
+    assert record["transport_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    On startup, a proven-undelivered record is re-POSTed and removed (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="proven-undelivered transport failure after retries",
+        delivered_ambiguous=False,
+        http_status=None,
+        transport_error="ConnectError",
+    )
+
+    posted: list[tuple[str, str, dict]] = []
+
+    async def _ok_inner(client, session_id, *, event_type, data):
+        posted.append((session_id, event_type, data))
+        return fwd._PostResult(
+            response=httpx.Response(200, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _ok_inner)
+    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+
+    assert posted == [("conv_codex1", "external_conversation_item", {"item_type": "message"})]
+    # Delivered → record removed.
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_skips_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    On startup, an ambiguous record is never re-POSTed and is retained (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="ambiguous transport failure (may already be committed)",
+        delivered_ambiguous=True,
+    )
+
+    called = False
+
+    async def _inner(client, session_id, *, event_type, data):
+        nonlocal called
+        called = True
+        return fwd._PostResult(
+            response=httpx.Response(200, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _inner)
+    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+
+    assert called is False
+    # Ambiguous record retained as a forensic record.
+    assert (tmp_path / "dead_letter.jsonl").exists()
