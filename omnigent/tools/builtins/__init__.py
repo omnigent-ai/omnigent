@@ -47,6 +47,12 @@ from omnigent.tools.builtins.load_skill import (
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
+from omnigent.tools.builtins.schedules import (
+    CreateLoopTool,
+    CreateMonitorTool,
+    DeleteScheduleTool,
+    ListSchedulesTool,
+)
 from omnigent.tools.builtins.spawn import (
     SysSessionCloseTool,
     SysSessionCreateTool,
@@ -66,7 +72,11 @@ from omnigent.tools.builtins.web_search import WebSearchTool
 __all__ = [
     "BUILTIN_NAMES",
     "INSTANTIABLE_BUILTINS",
+    "CreateLoopTool",
+    "CreateMonitorTool",
+    "DeleteScheduleTool",
     "ListCommentsTool",
+    "ListSchedulesTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
     "SysAdviseModelsTool",
@@ -168,6 +178,50 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
+def _create_loop(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for CreateLoopTool.
+
+    :param config: Tool config (unused).
+    :returns: A CreateLoopTool instance.
+    """
+    del config
+    return CreateLoopTool()
+
+
+def _create_monitor(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for CreateMonitorTool.
+
+    :param config: Tool config (unused).
+    :returns: A CreateMonitorTool instance.
+    """
+    del config
+    return CreateMonitorTool()
+
+
+def _create_list_schedules(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for ListSchedulesTool.
+
+    :param config: Tool config (unused).
+    :returns: A ListSchedulesTool instance.
+    """
+    del config
+    return ListSchedulesTool()
+
+
+def _create_delete_schedule(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for DeleteScheduleTool.
+
+    :param config: Tool config (unused).
+    :returns: A DeleteScheduleTool instance.
+    """
+    del config
+    return DeleteScheduleTool()
+
+
 # Unified registry for every reserved builtin name. The value
 # is either a factory callable (for user-enablable tools) or
 # ``None`` for framework-owned names that occupy the name-space
@@ -190,6 +244,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
+    # Schedules (#6, #12) — loops & monitors, backed by the ScheduleStore.
+    "create_loop": _create_loop,
+    "create_monitor": _create_monitor,
+    "list_schedules": _create_list_schedules,
+    "delete_schedule": _create_delete_schedule,
     # Framework-owned: need runtime context. ``web_fetch`` is
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by
