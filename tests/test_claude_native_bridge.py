@@ -5213,9 +5213,7 @@ def test_hook_record_stop_without_background_tasks() -> None:
     """
     ``Stop`` without ``background_tasks`` → ``background_task_count`` is 0.
     """
-    record = _hook_record_from_jsonl_record(
-        _make_jsonl_record({"hook_event_name": "Stop"})
-    )
+    record = _hook_record_from_jsonl_record(_make_jsonl_record({"hook_event_name": "Stop"}))
     assert record.event_name == "Stop"
     assert record.background_task_count == 0
 
