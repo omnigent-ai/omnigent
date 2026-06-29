@@ -675,6 +675,71 @@ class SqlPolicy(Base):
     )
 
 
+class SqlWorkItem(Base):
+    """
+    SQLAlchemy model for the ``work_items`` table.
+
+    A work item is a tracked unit of work — created by hand or ingested
+    from Slack / email / GitHub / Jira — that an agent processes in a
+    linked conversation. It is a thin layer over conversations (the
+    conversation tree already provides each item's sub-session/thread,
+    plan, and history); it deliberately does NOT revive the removed
+    ``tasks`` table.
+
+    :param id: Opaque PK, e.g. ``"wi_a1b2c3..."``.
+    :param source: Intake source: ``"manual"``, ``"slack"``, ``"email"``,
+        ``"github"``, or ``"jira"``.
+    :param external_id: Source-native id (issue/PR number, message ts),
+        or ``None`` for manual items.
+    :param dedup_key: Globally-UNIQUE idempotency key, e.g.
+        ``"github:acme/app#123"`` — a repeated intake of the same event
+        resolves to the existing row instead of inserting a duplicate.
+    :param title: Short human-readable title.
+    :param body: Optional longer description / original payload text.
+    :param status: Lifecycle state: ``"new"``, ``"planned"``,
+        ``"in_progress"``, ``"blocked"``, ``"needs_review"``, ``"done"``.
+        Defaults to ``"new"``.
+    :param pr_url: Optional pull-request URL once produced.
+    :param conversation_id: FK to ``conversations.id`` for the
+        conversation/sub-session doing the work. ``ON DELETE SET NULL`` so
+        deleting that conversation keeps the work-item record.
+    :param assignee_user_id: Assigned user id, or ``None``.
+    :param created_by: Creating user id, or ``None`` (service-ingested).
+    :param plan: Optional free-text/JSON plan recorded by the agent.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, ``None`` if
+        never updated.
+    """
+
+    __tablename__ = "work_items"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source: Mapped[str] = mapped_column(String(16))
+    external_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    dedup_key: Mapped[str] = mapped_column(String(512))
+    title: Mapped[str] = mapped_column(Text)
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), server_default=text("'new'"))
+    pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assignee_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    plan: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("dedup_key", name="uq_work_items_dedup_key"),
+        Index("ix_work_items_status", "status"),
+        Index("ix_work_items_conversation_id", "conversation_id"),
+        Index("ix_work_items_created_at", "created_at"),
+    )
+
+
 class SqlHost(Base):
     """
     SQLAlchemy model for the ``hosts`` table.

@@ -623,6 +623,16 @@ def generate_conversation_id() -> str:
     return f"conv_{uuid.uuid4().hex}"
 
 
+def generate_work_item_id() -> str:
+    """
+    Generate a unique work-item identifier.
+
+    :returns: A string of the form ``"wi_<32-char hex>"``,
+        e.g. ``"wi_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    """
+    return f"wi_{uuid.uuid4().hex}"
+
+
 def generate_task_id() -> str:
     """
     Generate a unique task (response) identifier.
