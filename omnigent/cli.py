@@ -3159,6 +3159,7 @@ def server(
         account_store = SqlAlchemyAccountStore(db_uri)
 
     from omnigent.server.routes.schedules import create_schedules_router
+    from omnigent.server.routes.usage import create_usage_router
     from omnigent.server.routes.work_items import create_work_items_router
 
     app = create_app(
@@ -3190,6 +3191,11 @@ def server(
                 create_schedules_router(schedule_store, auth_provider, permission_store),
                 "/v1",
                 ["schedules"],
+            ),
+            (
+                create_usage_router(conversation_store, auth_provider, permission_store),
+                "/v1",
+                ["usage"],
             ),
         ],
     )
