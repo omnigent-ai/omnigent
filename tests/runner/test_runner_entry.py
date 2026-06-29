@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+# Import before any test monkeypatches httpx.AsyncClient: the MCP SDK evaluates
+# `httpx.AsyncClient | None` eagerly at import, which breaks if AsyncClient has
+# been replaced by a stub. Importing here resolves + caches it with the real type.
+import mcp.client.streamable_http  # noqa: F401
 import pytest
 
 from omnigent.runner._entry import (
@@ -895,8 +900,9 @@ async def test_runner_shutdown_closes_terminal_registry(
     )
 
     app = entry_mod.create_app()
-    await app.router.startup()
-    await app.router.shutdown()
+    # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
+    async with app.router.lifespan_context(app):
+        pass
 
     assert process_managers and process_managers[0].shutdown_called
     assert terminal_registries and terminal_registries[0].shutdown_called
