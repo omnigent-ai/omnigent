@@ -531,7 +531,7 @@ def _askquestion_payload(args: dict[str, object]) -> dict[str, object]:
     """Translate cursor ``AskQuestion`` args into the web ``AskUserQuestion`` shape.
 
     The web UI renders the multiple-choice form from a ``{"questions": [...]}``
-    structure (see ``ap-web`` ``askUserQuestion`` lib). cursor's field names
+    structure (see ``web`` ``askUserQuestion`` lib). cursor's field names
     differ — its question text is ``prompt`` (vs ``question``) and it has no
     ``multiSelect`` — so map them across, preserving each question ``id`` we'll
     need to interpret the answer.

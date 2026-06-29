@@ -1,4 +1,4 @@
-"""Fixtures for browser-driven e2e tests of the ap-web SPA.
+"""Fixtures for browser-driven e2e tests of the web SPA.
 
 The suite spawns a real ``omnigent server --agent`` subprocess against
 ``examples/hello_world.yaml`` and drives the rendered SPA with
@@ -17,7 +17,7 @@ Local usage::
     uv run pytest tests/e2e_ui -v
 
     # iterate against an already-running server (dev hosts/ports need opt-in)
-    cd ap-web && npm run dev &
+    cd web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
     OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
       uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
@@ -95,7 +95,7 @@ def open_right_rail(page: Page) -> None:
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
 _server_state: dict[str, int | str] = {}
-_AP_WEB_DIR = _REPO_ROOT / "ap-web"
+_WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
 # ``omnigent server --agent`` runs the spec through the strict
@@ -582,12 +582,12 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
-    Build the ap-web SPA into ``omnigent/server/static/web-ui/``.
+    Build the web SPA into ``omnigent/server/static/web-ui/``.
 
-    Vite's ``emptyOutDir: true`` (see ``ap-web/vite.config.ts``)
+    Vite's ``emptyOutDir: true`` (see ``web/vite.config.ts``)
     nukes the output directory before writing, so concurrent
     pytest sessions or worktrees would clobber each other. A
-    cross-process file lock at ``ap-web/.build.lock`` serializes
+    cross-process file lock at ``web/.build.lock`` serializes
     builds; the second caller waits for the first to finish and
     then no-ops past its own build (npm is idempotent enough that
     double-building is harmless, but the lock keeps the static
@@ -603,11 +603,11 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         if not (_BUILD_OUTPUT / "index.html").is_file():
             pytest.fail(
                 f"--ui-skip-build was passed but no SPA build exists at "
-                f"{_BUILD_OUTPUT}. Run `cd ap-web && npm run build` first."
+                f"{_BUILD_OUTPUT}. Run `cd web && npm run build` first."
             )
         return
 
-    lock_path = _AP_WEB_DIR / ".build.lock"
+    lock_path = _WEB_DIR / ".build.lock"
     with filelock.FileLock(str(lock_path), timeout=600):
         # --legacy-peer-deps: package-lock.json already pins the tree;
         # without this flag npm spends the full job re-resolving the
@@ -616,10 +616,10 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         # where conftest installs override CI's build.
         subprocess.run(
             ["npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-            cwd=_AP_WEB_DIR,
+            cwd=_WEB_DIR,
             check=True,
         )
-        subprocess.run(["npm", "run", "build"], cwd=_AP_WEB_DIR, check=True)
+        subprocess.run(["npm", "run", "build"], cwd=_WEB_DIR, check=True)
 
 
 def _spawn_runner_against_external_server(

@@ -21,10 +21,10 @@ ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
 USER 0
-WORKDIR /web/ap-web
-COPY ap-web/package.json ap-web/package-lock.json ./
+WORKDIR /web/web
+COPY web/package.json web/package-lock.json ./
 RUN npm install --no-audit --no-fund
-COPY ap-web/ ./
+COPY web/ ./
 RUN npm run build
 
 # ── Python builder (shared: server + host) ──────────────
@@ -63,7 +63,7 @@ ARG PYPI_INDEX_URL=https://pypi.org/simple
 
 COPY --from=web-builder /web/omnigent/server/static/web-ui ./omnigent/server/static/web-ui
 RUN test -f ./omnigent/server/static/web-ui/index.html \
-    || (echo "ERROR: SPA bundle missing after web-builder stage — check the ap-web build." && exit 1)
+    || (echo "ERROR: SPA bundle missing after web-builder stage — check the web build." && exit 1)
 
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 

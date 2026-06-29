@@ -37,34 +37,48 @@ from pathlib import Path
 # The canonical public index the committed lockfile must always use.
 _CANONICAL_INDEX = "https://pypi.org/simple"
 
+# The canonical file host for wheel/sdist direct URLs.
+_CANONICAL_FILES_HOST = "https://files.pythonhosted.org"
+
 # Matches a uv.lock registry source, capturing the surrounding literal so
 # only the URL between the quotes is replaced, e.g.
 #   source = { registry = "https://pypi-proxy.example.com/simple" }
 _REGISTRY_RE = re.compile(r'(registry = ")[^"]*(")')
 
+# Matches any non-pypi.org host in a direct wheel/sdist url = "..." entry so
+# proxy-resolved URLs (e.g. pypi-proxy.cloud.databricks.com) can be rewritten
+# to files.pythonhosted.org.  The path component (/packages/…) is identical
+# between the proxy and the canonical host.
+_DIRECT_URL_RE = re.compile(
+    r'(url = ")(https?://(?!files\.pythonhosted\.org)[^"]+?/packages/)([^"]*")'
+)
+
 
 def non_canonical_registries(text: str) -> list[str]:
-    """Return the registry URLs in *text* that are not public PyPI.
+    """Return the registry URLs and direct-URL hosts in *text* that are not canonical.
 
     :param text: Full contents of a ``uv.lock`` file.
-    :returns: Each non-canonical ``registry`` URL, in order, with
-        duplicates preserved (one per offending entry).
+    :returns: Each non-canonical URL, in order, with duplicates preserved.
     """
-    return [
+    bad: list[str] = [
         m.group(1)
         for m in re.finditer(r'registry = "([^"]*)"', text)
         if m.group(1) != _CANONICAL_INDEX
     ]
+    bad += [m.group(2) for m in _DIRECT_URL_RE.finditer(text)]
+    return bad
 
 
 def normalize_text(text: str) -> str:
-    """Return *text* with every registry URL rewritten to public PyPI.
+    """Return *text* with every registry and direct wheel/sdist URL rewritten to canonical hosts.
 
     :param text: Full contents of a ``uv.lock`` file.
-    :returns: The same text with each ``registry = "<url>"`` URL replaced
-        by :data:`_CANONICAL_INDEX`.
+    :returns: The normalized text.
     """
-    return _REGISTRY_RE.sub(rf"\g<1>{_CANONICAL_INDEX}\g<2>", text)
+    return _DIRECT_URL_RE.sub(
+        rf"\g<1>{_CANONICAL_FILES_HOST}/packages/\g<3>",
+        _REGISTRY_RE.sub(rf"\g<1>{_CANONICAL_INDEX}\g<2>", text),
+    )
 
 
 def main(argv: list[str]) -> int:

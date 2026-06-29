@@ -69,7 +69,10 @@ id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
 The `kiro-native` harness is the native Kiro CLI terminal path used by
 `omnigent kiro`. It requires `kiro-cli` on `PATH` and Kiro's own login/auth; it
 does not use Databricks, OpenAI, or Anthropic provider credentials. Plain
-`harness: kiro` is not a generic Omnigent harness id.
+`harness: kiro` is not a generic Omnigent harness id. Kiro's TUI remains the
+authoritative approval surface; supported one-time tool approvals can also be
+mirrored into Chat cards, while persistent trust choices remain explicit Kiro
+TUI/flag actions. See `kiro-native-elicitation.md`.
 
 ### Antigravity (Gemini)
 

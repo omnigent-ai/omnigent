@@ -61,7 +61,7 @@ permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync`: this job never serves the bundle
+  # No web SPA build during `uv sync`: this job never serves the bundle
   # and the build hits public npm with no registry mirror (mirrors e2e.yml).
   OMNIGENT_SKIP_WEB_UI: "true"
   # Pin the PyPI index for uv/pip resolution (same as flake-stress.yml).

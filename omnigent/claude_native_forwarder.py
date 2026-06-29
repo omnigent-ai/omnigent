@@ -251,6 +251,88 @@ _HOOK_EVENT_TO_STATUS: dict[str, str] = {
 _logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent transcript/usage forwarding (#1120).
+
+    Network trouble (connect timeouts, 503s, resets) makes the forwarder's
+    event posts fail. Transient failures are retried indefinitely and
+    permanent ones are eventually dropped, but either way a sustained
+    outage previously surfaced only as scattered per-item warnings. This
+    tracks consecutive post failures so a real outage escalates to a
+    single loud signal instead of staying effectively silent.
+
+    Unlike the codex forwarder (which counts only its bounded-retry give-ups),
+    the claude forwarder retries transient failures forever, so every failed
+    post is counted here — that is what makes the indicator fire for the
+    503/connect-timeout outages #1120 is about, not just permanent 4xx drops.
+
+    :param consecutive_failures: Post failures since the last success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive post failures, sync is treated as degraded and
+# escalated once to ERROR. Small enough to fire during a real outage, large
+# enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful (or ambiguously-delivered) forward, clearing any
+    degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "claude-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(retry_key: str) -> None:
+    """
+    Record a forward post failure; escalate once when sync degrades.
+
+    :param retry_key: Stable retry key of the failed post, e.g.
+        ``"item:source-1"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "claude-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest key=%s)",
+            _forward_health.consecutive_failures,
+            retry_key,
+        )
+        _forward_health.degraded_logged = True
+
+
 @dataclass(frozen=True)
 class HookForwardState:
     """
@@ -550,6 +632,9 @@ class _PostRetryTracker:
         :returns: None.
         """
         self._entries.pop(key, None)
+        # A cleared key means the post got through (or was ambiguously
+        # delivered); reset process-level forward-sync health (#1120).
+        _note_forward_success()
 
     def record_failure(self, key: str, exc: httpx.HTTPError) -> _PostRetryDecision:
         """
@@ -559,6 +644,9 @@ class _PostRetryTracker:
         :param exc: HTTP exception raised while posting the event.
         :returns: Retry decision for this failure.
         """
+        # Count every failed post (transient or permanent) so a sustained
+        # outage escalates once to a degraded-sync signal (#1120).
+        _note_forward_failure(key)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
@@ -3536,6 +3624,7 @@ async def _post_external_session_status(
     *,
     session_id: str,
     status: str,
+    output: str | None = None,
 ) -> None:
     """
     Post one ``external_session_status`` event to the Sessions API.
@@ -3544,14 +3633,21 @@ async def _post_external_session_status(
     :param session_id: Omnigent session/conversation id.
     :param status: Session status value, e.g. ``"idle"`` or
         ``"failed"``.
+    :param output: Optional text attached to the event ``data``. On a
+        ``"failed"`` edge the server surfaces it as the session's failure
+        reason (``last_task_error``) so the UI renders a detail instead of
+        a bare "failed" (#1113). Ignored when falsy.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, Any] = {"status": status}
+    if output:
+        data["output"] = output
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": status},
+            "data": data,
         },
     )
     resp.raise_for_status()
@@ -3758,7 +3854,9 @@ async def _post_forwarder_failed_status(
     :returns: None.
     """
     try:
-        await _post_external_session_status(client, session_id=session_id, status="failed")
+        await _post_external_session_status(
+            client, session_id=session_id, status="failed", output=reason
+        )
     except httpx.HTTPError:
         _logger.warning(
             "Failed to publish Claude forwarder failure status; "

@@ -2290,6 +2290,7 @@ async def _handle_event(
             params=params,
             delta_coalescer=delta_coalescer if not is_child else None,
             forwarder_state=forwarder_state,
+            bridge_dir=bridge_dir,
         )
 
 
@@ -2743,6 +2744,7 @@ async def _handle_completed_event(
     params: dict[str, Any],
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     forwarder_state: _CodexForwarderState | None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -2760,7 +2762,9 @@ async def _handle_completed_event(
         await delta_coalescer.flush()
     if forwarder_state is not None:
         forwarder_state.record_completed_plan(params)
-    await _handle_completed_item(client, session_id, params, forwarder_state=forwarder_state)
+    await _handle_completed_item(
+        client, session_id, params, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+    )
 
 
 async def _handle_terminal_turn_boundary(
@@ -3608,6 +3612,7 @@ async def _handle_completed_item(
     params: dict[str, Any],
     *,
     forwarder_state: _CodexForwarderState | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -3653,7 +3658,9 @@ async def _handle_completed_item(
         )
         if forwarder_state is None or not forwarder_state.compaction_item_persisted:
             try:
-                await _persist_codex_compaction_item(client, session_id=session_id)
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
             except Exception:  # noqa: BLE001
                 _logger.warning(
                     "Failed to persist codex compaction item for %s", session_id, exc_info=True
@@ -5057,7 +5064,7 @@ async def _persist_codex_compaction_item(
     items = resp.json().get("data", [])
     last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
 
-    compacted_messages = None
+    compacted = None
     if bridge_dir is not None:
         try:
             state = read_bridge_state(bridge_dir)
@@ -5065,12 +5072,12 @@ async def _persist_codex_compaction_item(
                 codex_home = Path(state.codex_home)
                 thread_id = state.thread_id
                 rollout_files = sorted(
-                    codex_home.glob(f"sessions/*/*rollout-*{thread_id}.jsonl"),
+                    codex_home.glob(f"sessions/**/*rollout-*{thread_id}.jsonl"),
                     key=lambda p: p.stat().st_mtime,
                     reverse=True,
                 )
                 if rollout_files:
-                    compacted_messages = _read_compacted_history(rollout_files[0])
+                    compacted = _read_compacted_history(rollout_files[0])
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Failed to read codex rollout for compaction persist",
@@ -5083,8 +5090,11 @@ async def _persist_codex_compaction_item(
         "model": "unknown",
         "token_count": 0,
     }
-    if compacted_messages:
-        data["compacted_messages"] = compacted_messages
+    if compacted is not None:
+        if compacted.get("replacement_history"):
+            data["compacted_messages"] = compacted["replacement_history"]
+        if compacted.get("window_id") is not None:
+            data["window_id"] = compacted["window_id"]
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
@@ -5093,15 +5103,15 @@ async def _persist_codex_compaction_item(
     resp.raise_for_status()
 
 
-def _read_compacted_history(rollout_path: Path) -> list[dict[str, object]] | None:
-    """Read ``replacement_history`` from the last ``Compacted`` entry in a rollout.
+def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
+    """Read the last ``Compacted`` entry from a rollout JSONL.
 
-    Codex appends a ``{type: "compacted", payload: {replacement_history: [...]}}``
-    entry to the JSONL after compaction. The ``replacement_history`` contains the
-    post-compaction ``ResponseItem`` list — the actual context the model sees.
+    Codex appends a ``{type: "compacted", payload: {replacement_history: [...],
+    window_id: N}}`` entry after compaction. Returns a dict with
+    ``replacement_history`` and ``window_id`` for persistence, or ``None``.
 
     :param rollout_path: Path to the rollout JSONL.
-    :returns: List of message dicts from ``replacement_history``, or ``None``.
+    :returns: Dict with ``replacement_history`` and ``window_id``, or ``None``.
     """
     last_compacted = None
     with rollout_path.open() as f:
@@ -5120,42 +5130,15 @@ def _read_compacted_history(rollout_path: Path) -> list[dict[str, object]] | Non
     history = payload.get("replacement_history")
     if not isinstance(history, list) or not history:
         return None
-    # Convert ResponseItems to the harness input format.
-    msgs: list[dict[str, object]] = []
-    for item in history:
-        if not isinstance(item, dict):
-            continue
-        # ResponseItem shapes: {type: "message", role, content},
-        # {type: "function_call", ...}, {type: "function_call_output", ...}
-        item_type = item.get("type")
-        if item_type == "message":
-            role = item.get("role")
-            if role in ("user", "assistant"):
-                msgs.append(
-                    {
-                        "type": "message",
-                        "role": role,
-                        "content": item.get("content", []),
-                    }
-                )
-        elif item_type == "function_call":
-            msgs.append(
-                {
-                    "type": "function_call",
-                    "call_id": item.get("call_id"),
-                    "name": item.get("name"),
-                    "arguments": item.get("arguments"),
-                }
-            )
-        elif item_type == "function_call_output":
-            msgs.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": item.get("call_id"),
-                    "output": item.get("output"),
-                }
-            )
-    return msgs if msgs else None
+    # Store the full replacement_history — messages + compaction
+    # tokens. Although the messages duplicate pre-compaction items
+    # in the conversation store, they are needed for rollout
+    # reconstruction (e.g. sandbox recovery where the rollout file
+    # is lost).
+    return {
+        "replacement_history": [item for item in history if isinstance(item, dict)],
+        "window_id": payload.get("window_id"),
+    }
 
 
 async def _handle_reasoning_delta(

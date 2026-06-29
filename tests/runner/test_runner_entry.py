@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import io
 import logging
 import os
@@ -31,6 +32,13 @@ from omnigent.runner._entry import (
     main,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+
+# Force-load the MCP streamable-http client before any test monkeypatches
+# httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
+# import, which TypeErrors if AsyncClient has been swapped for a stub. Loading it
+# here (via import_module, so there is no bound-but-unused import) resolves and
+# caches it with the real type.
+importlib.import_module("mcp.client.streamable_http")
 
 
 class _TrackingTerminalRegistry:
@@ -895,8 +903,9 @@ async def test_runner_shutdown_closes_terminal_registry(
     )
 
     app = entry_mod.create_app()
-    await app.router.startup()
-    await app.router.shutdown()
+    # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
+    async with app.router.lifespan_context(app):
+        pass
 
     assert process_managers and process_managers[0].shutdown_called
     assert terminal_registries and terminal_registries[0].shutdown_called

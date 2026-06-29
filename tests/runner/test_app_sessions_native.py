@@ -552,7 +552,7 @@ class _FakeFileServerClient:
 
 @pytest.mark.asyncio
 async def test_sessions_native_resolves_file_id_before_harness() -> None:
-    """Remote runner resolves raw AP-web ``file_id`` blocks before harness input."""
+    """Remote runner resolves raw web ``file_id`` blocks before harness input."""
     harness_client = _ScriptedHarnessClient(
         [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
     )
@@ -11688,6 +11688,428 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
     ], f"Expected in_progress then failed (no completed); got {compaction_types!r}."
 
 
+# ── opencode-native compact (POST /session/{id}/summarize) ─────────────
+
+
+class _FakeOpenCodeCompactClient:
+    """OpenCode client stub recording ``summarize`` calls for compact tests.
+
+    Stands in for :class:`omnigent.opencode_native_client.OpenCodeClient` so
+    the opencode-native compact handler's model-resolution + ``/summarize``
+    call is observable without a live ``opencode serve``.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: Any,
+        messages: list[dict[str, Any]],
+        summarize_error: BaseException | None = None,
+    ) -> None:
+        """
+        Initialize with the session/messages the handler will resolve from.
+
+        :param session: The :class:`OpenCodeSession` ``get_session`` returns
+            (or ``None``).
+        :param messages: The list ``list_messages`` returns.
+        :param summarize_error: When set, ``summarize`` raises it instead of
+            recording the call (drives the 503 path).
+        :returns: None.
+        """
+        self._session = session
+        self._messages = messages
+        self._summarize_error = summarize_error
+        self.summarize_calls: list[tuple[str, str, str]] = []
+        self.closed = False
+
+    async def get_session(self, session_id: str) -> Any:
+        """Return the scripted session."""
+        del session_id
+        return self._session
+
+    async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the scripted messages."""
+        del session_id
+        return self._messages
+
+    async def summarize(self, session_id: str, *, provider_id: str, model_id: str) -> bool:
+        """Record the compaction call (or raise the scripted error)."""
+        if self._summarize_error is not None:
+            raise self._summarize_error
+        self.summarize_calls.append((session_id, provider_id, model_id))
+        return True
+
+    async def aclose(self) -> None:
+        """Mark the client closed (the handler always closes in ``finally``)."""
+        self.closed = True
+
+
+class _FakeOpenCodeCompactServer:
+    """``OpenCodeNativeServer`` stub whose ``client()`` returns a fixed stub."""
+
+    def __init__(self, client: _FakeOpenCodeCompactClient) -> None:
+        """Wrap *client* so :meth:`client` returns it."""
+        self._client = client
+
+    def client(self, *, directory: str | None = None) -> _FakeOpenCodeCompactClient:
+        """Return the fixed compact client."""
+        del directory
+        return self._client
+
+
+async def _drive_opencode_native_compact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    conv_id: str,
+    session_payload: dict[str, Any] | None,
+    messages: list[dict[str, Any]],
+    model_override: str | None,
+    summarize_error: BaseException | None = None,
+) -> tuple[httpx.Response, _FakeOpenCodeCompactClient]:
+    """
+    Build an opencode-native runner app and POST a ``compact`` control event.
+
+    Registers a pre-built opencode terminal so session creation skips the real
+    ``_auto_create_opencode_terminal`` launch, injects a live fake server into
+    ``_AUTO_OPENCODE_SERVERS``, and stubs ``read_bridge_state`` so the handler
+    resolves an ``opencode_session_id`` (+ optional ``model_override``).
+
+    :param conv_id: Conversation id to create and compact.
+    :param session_payload: Payload for the :class:`OpenCodeSession`
+        ``get_session`` returns, or ``None`` for no session.
+    :param messages: Messages ``list_messages`` returns.
+    :param model_override: Bridge-state ``model_override`` (qualified
+        ``provider/model``), or ``None``.
+    :param summarize_error: When set, ``summarize`` raises it (503 path).
+    :returns: ``(response, fake_client)`` for the compact POST.
+    """
+    from omnigent import opencode_native_bridge
+    from omnigent.opencode_native_bridge import OpenCodeNativeBridgeState
+    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.runner.app import _AUTO_OPENCODE_SERVERS, _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+    from tests.runner.helpers import make_test_terminal_instance
+
+    opencode_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the opencode-native spec for any agent_id."""
+        del agent_id, session_id
+        return opencode_native_spec
+
+    # A pre-registered opencode terminal makes the create path's auto-launch a
+    # no-op (the per-session ensure-lock sees a live terminal and skips it).
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("opencode", "main")] = instance
+
+    session = (
+        OpenCodeSession.from_payload(session_payload) if session_payload is not None else None
+    )
+    client = _FakeOpenCodeCompactClient(
+        session=session, messages=messages, summarize_error=summarize_error
+    )
+    server = _FakeOpenCodeCompactServer(client)
+
+    state = OpenCodeNativeBridgeState(
+        session_id=conv_id,
+        server_base_url="http://127.0.0.1:1",
+        opencode_session_id="ses_x",
+        model_override=model_override,
+    )
+    monkeypatch.setattr(opencode_native_bridge, "read_bridge_state", lambda _dir: state)
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    try:
+        async with _runner_client(app) as http_client:
+            create_resp = await http_client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": "ag_1"},
+            )
+            assert create_resp.status_code == 201, create_resp.text
+            _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            # Inject AFTER create so the create flow's cleanup cannot evict it.
+            _AUTO_OPENCODE_SERVERS[conv_id] = server
+            resp = await http_client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "compact"},
+            )
+        return resp, client
+    finally:
+        _AUTO_OPENCODE_SERVERS.pop(conv_id, None)
+        _session_event_queues_ref.pop(conv_id, None)
+
+
+def test_resolve_opencode_compact_model_prefers_latest_assistant_message() -> None:
+    """
+    The latest assistant message's live model wins over session/override.
+
+    On a MESSAGE the model keys are ``providerID`` + ``modelID``. The chain
+    must iterate in reverse and ignore user-role messages, picking the live
+    model even when a session ``model`` and a ``model_override`` also resolve.
+    """
+    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.runner.app import _resolve_opencode_compact_model
+
+    session = OpenCodeSession.from_payload(
+        {"id": "ses_x", "model": {"providerID": "stale", "id": "stale-model"}}
+    )
+    messages = [
+        {"info": {"role": "user"}, "parts": []},
+        {"info": {"role": "assistant", "providerID": "openai", "modelID": "gpt-old"}, "parts": []},
+        {"info": {"role": "user"}, "parts": []},
+        {
+            "info": {
+                "role": "assistant",
+                "providerID": "anthropic",
+                "modelID": "claude-sonnet-4-5",
+            },
+            "parts": [],
+        },
+    ]
+
+    provider_id, model_id = _resolve_opencode_compact_model(
+        session, messages, "override-prov/override-model"
+    )
+
+    assert (provider_id, model_id) == ("anthropic", "claude-sonnet-4-5")
+
+
+def test_resolve_opencode_compact_model_falls_back_to_session_model() -> None:
+    """
+    With no usable assistant message, the session ``model`` field resolves.
+
+    On the SESSION object the keys are ``providerID`` + ``id`` (NOT
+    ``modelID``). An assistant message missing ``modelID`` must be skipped so
+    the session field is used.
+    """
+    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.runner.app import _resolve_opencode_compact_model
+
+    session = OpenCodeSession.from_payload(
+        {"id": "ses_x", "model": {"providerID": "anthropic", "id": "claude-opus-4"}}
+    )
+    # Assistant message without a modelID is not usable → fall through.
+    messages = [{"info": {"role": "assistant", "providerID": "anthropic"}, "parts": []}]
+
+    provider_id, model_id = _resolve_opencode_compact_model(session, messages, None)
+
+    assert (provider_id, model_id) == ("anthropic", "claude-opus-4")
+
+
+def test_resolve_opencode_compact_model_falls_back_to_model_override() -> None:
+    """
+    With no message/session model, ``model_override`` splits on the first ``/``.
+
+    A model id may itself contain ``/`` (e.g. an OpenRouter slug), so only the
+    FIRST separator delimits provider from model.
+    """
+    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.runner.app import _resolve_opencode_compact_model
+
+    session = OpenCodeSession.from_payload({"id": "ses_x"})
+
+    provider_id, model_id = _resolve_opencode_compact_model(
+        session, [], "openrouter/anthropic/claude-3.5"
+    )
+
+    assert (provider_id, model_id) == ("openrouter", "anthropic/claude-3.5")
+
+
+def test_resolve_opencode_compact_model_returns_none_when_unresolvable() -> None:
+    """
+    Nothing resolvable → ``(None, None)`` so the handler 204s to AP-side.
+
+    Covers the live Omnigent flow: the session is created without a model and
+    has no assistant turn yet, and no override is set.
+    """
+    from omnigent.opencode_native_client import OpenCodeSession
+    from omnigent.runner.app import _resolve_opencode_compact_model
+
+    session = OpenCodeSession.from_payload({"id": "ses_x"})
+
+    assert _resolve_opencode_compact_model(session, [], None) == (None, None)
+    # A bare token without ``/`` is not a qualified override.
+    assert _resolve_opencode_compact_model(None, [], "not-qualified") == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_opencode_native_summarizes_from_assistant_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    opencode-native compact resolves the live model and calls ``/summarize``.
+
+    The model comes from the latest assistant message (``providerID`` +
+    ``modelID``) because Omnigent creates the session without a model. A 200
+    return is load-bearing: the Omnigent server reads it to skip its AP-side
+    compaction (the native ``/summarize`` path was previously dead, always
+    204ing because ``session.raw["model"]`` is empty).
+    """
+    resp, client = await _drive_opencode_native_compact(
+        monkeypatch,
+        tmp_path,
+        conv_id="conv_opencode_compact_msg",
+        session_payload={"id": "ses_x"},
+        messages=[
+            {
+                "info": {
+                    "role": "assistant",
+                    "providerID": "anthropic",
+                    "modelID": "claude-sonnet-4-5",
+                },
+                "parts": [],
+            }
+        ],
+        model_override=None,
+    )
+
+    assert resp.status_code == 200, (
+        f"opencode-native compact must 200 once /summarize is accepted; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert client.summarize_calls == [("ses_x", "anthropic", "claude-sonnet-4-5")], (
+        f"summarize must run with the assistant message's model; got {client.summarize_calls!r}."
+    )
+    assert client.closed, "the handler must close the client in its finally block."
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_opencode_native_summarizes_from_session_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    With no assistant message, the session ``model`` field drives ``/summarize``.
+
+    Covers create-with-model / TUI ``switchModel`` sessions: the SESSION keys
+    are ``providerID`` + ``id``.
+    """
+    resp, client = await _drive_opencode_native_compact(
+        monkeypatch,
+        tmp_path,
+        conv_id="conv_opencode_compact_session",
+        session_payload={
+            "id": "ses_x",
+            "model": {"providerID": "anthropic", "id": "claude-opus-4"},
+        },
+        messages=[],
+        model_override=None,
+    )
+
+    assert resp.status_code == 200, f"got {resp.status_code}: {resp.text}"
+    assert client.summarize_calls == [("ses_x", "anthropic", "claude-opus-4")], (
+        f"summarize must run with the session model; got {client.summarize_calls!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_opencode_native_summarizes_from_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    With no message/session model, bridge-state ``model_override`` resolves it.
+
+    The override is a qualified ``provider/model`` string split on the first
+    ``/``.
+    """
+    resp, client = await _drive_opencode_native_compact(
+        monkeypatch,
+        tmp_path,
+        conv_id="conv_opencode_compact_override",
+        session_payload={"id": "ses_x"},
+        messages=[],
+        model_override="openai/gpt-5",
+    )
+
+    assert resp.status_code == 200, f"got {resp.status_code}: {resp.text}"
+    assert client.summarize_calls == [("ses_x", "openai", "gpt-5")], (
+        f"summarize must run with the override model; got {client.summarize_calls!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    No resolvable model → 204 and ``/summarize`` is never called.
+
+    The 204 tells the Omnigent server to run its own AP-side compaction.
+    """
+    resp, client = await _drive_opencode_native_compact(
+        monkeypatch,
+        tmp_path,
+        conv_id="conv_opencode_compact_none",
+        session_payload={"id": "ses_x"},
+        messages=[],
+        model_override=None,
+    )
+
+    assert resp.status_code == 204, (
+        f"opencode-native compact must 204 when no model resolves; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert client.summarize_calls == [], (
+        f"summarize must NOT run when no model resolves; got {client.summarize_calls!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_opencode_native_503_when_summarize_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A failing ``/summarize`` surfaces 503 with the opencode error code.
+
+    The Omnigent server must see the failure (rather than a silent fallback)
+    so it does not run a duplicate compaction.
+    """
+    from omnigent.opencode_native_client import OpenCodeClientError
+
+    resp, client = await _drive_opencode_native_compact(
+        monkeypatch,
+        tmp_path,
+        conv_id="conv_opencode_compact_fail",
+        session_payload={"id": "ses_x"},
+        messages=[
+            {
+                "info": {
+                    "role": "assistant",
+                    "providerID": "anthropic",
+                    "modelID": "claude-sonnet-4-5",
+                },
+                "parts": [],
+            }
+        ],
+        model_override=None,
+        summarize_error=OpenCodeClientError("summarize failed: 500"),
+    )
+
+    assert resp.status_code == 503, (
+        f"opencode-native compact must 503 on a failed /summarize; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert resp.json().get("error") == "opencode_native_compact_failed"
+    assert client.closed, "the handler must close the client even on failure."
+
+
 @pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
@@ -12631,13 +13053,21 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
         lambda **_kwargs: "/usr/bin/kiro-cli",
     )
     forwarder_calls: list[dict[str, Any]] = []
+    permission_mirror_calls: list[dict[str, Any]] = []
 
     async def _fake_supervise_kiro_session_forwarder(**kwargs: Any) -> None:
         forwarder_calls.append(kwargs)
 
+    async def _fake_supervise_kiro_permission_mirror(**kwargs: Any) -> None:
+        permission_mirror_calls.append(kwargs)
+
     monkeypatch.setattr(
         "omnigent.kiro_native_session_forwarder.supervise_kiro_session_forwarder",
         _fake_supervise_kiro_session_forwarder,
+    )
+    monkeypatch.setattr(
+        "omnigent.kiro_native_permissions.supervise_kiro_permission_mirror",
+        _fake_supervise_kiro_permission_mirror,
     )
 
     async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
@@ -12687,7 +13117,10 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    await asyncio.sleep(0)
+    for _ in range(20):
+        if forwarder_calls and permission_mirror_calls:
+            break
+        await asyncio.sleep(0)
 
     spec = captured["spec"]
     assert captured["terminal_name"] == "kiro"
@@ -12711,12 +13144,20 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
     assert spec.env[kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] == str(
         kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
     )
+    assert spec.env[kiro_native_bridge.KIRO_ACP_RECORD_PATH_ENV_VAR] == str(
+        kiro_native_bridge.acp_record_path(
+            kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+        )
+    )
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     assert forwarder_calls
     assert forwarder_calls[0]["base_url"] == "http://127.0.0.1:6767"
     assert forwarder_calls[0]["session_id"] == "conv_kiro"
     assert forwarder_calls[0]["agent_name"] == "kiro-native-ui"
     assert forwarder_calls[0]["workspace"] == str(tmp_path)
+    assert permission_mirror_calls
+    assert permission_mirror_calls[0]["base_url"] == "http://127.0.0.1:6767"
+    assert permission_mirror_calls[0]["session_id"] == "conv_kiro"
 
 
 @pytest.mark.asyncio
@@ -16638,3 +17079,273 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+async def test_events_interrupt_on_kiro_native_routes_to_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interrupt on a kiro-native session sends Escape via the kiro bridge.
+
+    Regression for #1137: kiro-native had no entry in the interrupt dispatch
+    ladder, so the web Stop button fell through to the in-process cancel floor —
+    a no-op for a TUI turn the harness task already returned from — and silently
+    did nothing. This pins that the dispatch routes kiro-native to
+    ``kiro_native_bridge.inject_interrupt`` with the snappy 1.0s timeout.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        kiro_native_bridge,
+        "inject_interrupt",
+        lambda bridge_dir, *, timeout_s: captured.append((bridge_dir, timeout_s)),
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_int", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        int_resp = await client.post(
+            "/v1/sessions/conv_kiro_int/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, int_resp.text
+    # 0 = the dispatch fell through to the generic path (the silent no-op bug);
+    # 2+ = the handler ran twice.
+    assert len(captured) == 1, (
+        f"Expected one inject_interrupt call, got {len(captured)}. If 0, the "
+        f"kiro-native interrupt dispatch entry is missing."
+    )
+    bridge_dir, timeout_s = captured[0]
+    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id("conv_kiro_int")
+    assert timeout_s == 1.0
+
+
+async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop_session on a kiro-native session kills the tmux pane and clears the spinner.
+
+    Mirrors the goose/claude-native stop path: route to
+    ``kiro_native_bridge.kill_session`` and enqueue exactly one
+    ``session.status: idle`` (kiro-cli has no Stop hook on a hard kill).
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        kiro_native_bridge,
+        "kill_session",
+        lambda bridge_dir, *, timeout_s: captured.append((bridge_dir, timeout_s)),
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_stop", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        stop_resp = await client.post(
+            "/v1/sessions/conv_kiro_stop/events",
+            json={"type": "stop_session"},
+        )
+        queue = _session_event_queues_ref.get("conv_kiro_stop")
+        queued_events: list[dict[str, Any]] = []
+        while queue is not None and not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict):
+                queued_events.append(item)
+
+    assert stop_resp.status_code == 204, stop_resp.text
+    assert len(captured) == 1, (
+        f"Expected one kill_session call, got {len(captured)}. If 0, the "
+        f"kiro-native stop dispatch entry is missing."
+    )
+    bridge_dir, timeout_s = captured[0]
+    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id("conv_kiro_stop")
+    assert timeout_s == 1.0
+    idle_events = [
+        e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert len(idle_events) == 1, f"stop must publish exactly one idle; got {queued_events!r}"
+
+
+async def test_events_interrupt_on_kiro_native_503_skips_idle_when_inject_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interrupt returns 503 and publishes no idle when Escape can't reach tmux.
+
+    Failure-path parity with the sibling harnesses (e.g.
+    ``..._interrupt_on_native_session_503_skips_cleanup_when_inject_fails``): if
+    the bridge can't deliver Escape (pane gone, bridge dir not advertised), the
+    runner must surface a 503 and must NOT publish ``session.status: idle`` — idle
+    would clear the web-UI spinner while the kiro turn keeps generating. Guards
+    against a reorder that moves the idle publish ahead of the ``try``.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(bridge_dir: Any, *, timeout_s: float) -> None:
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(kiro_native_bridge, "inject_interrupt", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_int_fail", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        int_resp = await client.post(
+            "/v1/sessions/conv_kiro_int_fail/events",
+            json={"type": "interrupt"},
+        )
+        queue = _session_event_queues_ref.get("conv_kiro_int_fail")
+        queued_events: list[dict[str, Any]] = []
+        while queue is not None and not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict):
+                queued_events.append(item)
+
+    assert int_resp.status_code == 503, (
+        f"kiro-native interrupt with inject_interrupt failure must return 503; "
+        f"got {int_resp.status_code}: {int_resp.text}"
+    )
+    body = int_resp.json()
+    assert body.get("error") == "kiro_native_interrupt_failed", (
+        f"503 body must carry the bridge-failure error code; got {body!r}"
+    )
+    status_idle = [
+        e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert status_idle == [], (
+        f"No session.status: idle should be enqueued when Escape injection "
+        f"failed; got {status_idle!r}."
+    )
+
+
+async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop_session returns 503 and publishes no idle when the kill can't reach tmux.
+
+    Failure-path parity with ``..._stop_session_on_native_returns_503_when_kill_fails``:
+    a failed kill must surface 503 rather than lie to the web UI with 204 + idle
+    while the ``kiro-cli`` process may still be alive.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(kiro_native_bridge, "kill_session", _fake_kill)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_stop_fail", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        stop_resp = await client.post(
+            "/v1/sessions/conv_kiro_stop_fail/events",
+            json={"type": "stop_session"},
+        )
+        queue = _session_event_queues_ref.get("conv_kiro_stop_fail")
+        queued_events: list[dict[str, Any]] = []
+        while queue is not None and not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict):
+                queued_events.append(item)
+
+    assert stop_resp.status_code == 503, (
+        f"kiro-native stop_session with kill failure must return 503; "
+        f"got {stop_resp.status_code}: {stop_resp.text}"
+    )
+    body = stop_resp.json()
+    assert body.get("error") == "kiro_native_stop_failed", (
+        f"503 body must carry the stop-failure error code; got {body!r}"
+    )
+    status_idle = [
+        e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert status_idle == [], (
+        f"No session.status: idle should be enqueued when kill_session failed; "
+        f"got {status_idle!r}."
+    )

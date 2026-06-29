@@ -1,6 +1,6 @@
 """E2E: Cmd/Ctrl+Enter accepts the pending in-chat approval prompt.
 
-Covers ``useApproveHotkey`` (``ap-web/src/hooks/useApproveHotkey.ts``), bound
+Covers ``useApproveHotkey`` (``web/src/hooks/useApproveHotkey.ts``), bound
 once at the app shell: when a tool call trips a policy that returns ASK, the
 chat renders a pending ``ApprovalCard``, and Cmd+Enter (Ctrl+Enter on
 Win/Linux) is the keyboard equivalent of clicking **Approve** on that card.

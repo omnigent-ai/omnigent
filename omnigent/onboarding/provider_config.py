@@ -166,8 +166,11 @@ _HARNESS_FAMILY: dict[str, str] = {
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
     # and is managed out-of-band via ``kimi provider add``.
-    # Qwen Code uses an OpenAI-compatible provider.
+    # Qwen Code is OpenAI-compatible; the native TUI keys both spellings (mirroring
+    # codex-native) so a same-agent qwen→qwen fork/switch reads as same-family.
     "qwen": OPENAI_FAMILY,
+    "qwen-native": OPENAI_FAMILY,
+    "native-qwen": OPENAI_FAMILY,
     # The native agy TUI bridge authenticates via the Gemini OAuth credential
     # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
     # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the

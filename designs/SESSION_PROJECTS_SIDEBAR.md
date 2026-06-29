@@ -127,7 +127,7 @@ rather than racing a follow-up PATCH. If the
 create path already threads `labels`, reuse it; otherwise PATCH immediately after
 create (acceptable fallback).
 
-## 6. Frontend (`ap-web`)
+## 6. Frontend (`web`)
 
 ### 6.1 Hooks (`hooks/useConversations.ts`) — from #869, renamed
 - `useProjects()` → `GET /v1/sessions/projects`, `queryKey: ["projects"]`,

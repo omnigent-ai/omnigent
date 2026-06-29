@@ -108,8 +108,8 @@ scraper POSTs `external_elicitation_resolved` to un-park the card.
 - `omnigent/server/routes/sessions.py`: `_publish_and_wait_for_harness_elicitation` (publishes
   `response.elicitation_request` and parks for the web verdict) and the
   `external_elicitation_resolved` event handling (un-park).
-- `ap-web/src/lib/blockStream.ts` (`elicitation_request`) and
-  `ap-web/src/components/blocks/BlockRenderer.tsx` (`ApprovalCard`) — render the card, post the
+- `web/src/lib/blockStream.ts` (`elicitation_request`) and
+  `web/src/components/blocks/BlockRenderer.tsx` (`ApprovalCard`) — render the card, post the
   verdict. **No frontend change.**
 
 ## Build (new, relative to `origin/main`)

@@ -2895,7 +2895,13 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         "external_conversation_item",
         "external_session_status",
     ]
-    assert requests[-1]["data"] == {"status": "failed"}
+    # The failed edge carries the drop reason as ``output`` so the server
+    # surfaces it as the session's failure detail instead of a bare
+    # "failed" badge (#1113).
+    assert requests[-1]["data"] == {
+        "status": "failed",
+        "output": "transcript item poison-item:0:message rejected",
+    }
     assert first.byte_offset == 0
     assert second.byte_offset == transcript_path.stat().st_size
     assert second.line_cursor == 1
@@ -6371,3 +6377,110 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_external_session_status_attaches_failure_reason() -> None:
+    """A failed status carries its reason as ``output`` in the payload (#1113).
+
+    The server's ``external_session_status`` handler surfaces a failed edge's
+    ``output`` as the session's failure detail, so threading the forwarder's
+    drop reason there makes the UI render it instead of a bare "failed".
+    """
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_x/events":
+            captured.append(json.loads(request.content))
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._post_external_session_status(
+            client,
+            session_id="conv_x",
+            status="failed",
+            output="transcript item item-1 rejected",
+        )
+        # No reason → no output field (e.g. a normal idle edge).
+        await forwarder._post_external_session_status(client, session_id="conv_x", status="idle")
+
+    assert captured[0]["type"] == "external_session_status"
+    assert captured[0]["data"] == {
+        "status": "failed",
+        "output": "transcript item item-1 rejected",
+    }
+    assert captured[1]["data"] == {"status": "idle"}
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    forwarder._reset_forward_health()
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
+        forwarder._note_forward_failure("item:source-1")
+    # Below threshold: not yet degraded.
+    assert forwarder._forward_health.degraded_logged is False
+
+    forwarder._note_forward_failure("item:source-1")  # crosses threshold
+    assert forwarder._forward_health.degraded_logged is True
+    assert forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    forwarder._note_forward_failure("item:source-1")
+    assert forwarder._forward_health.degraded_logged is True
+    assert (
+        forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD + 1
+    )
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    forwarder._reset_forward_health()
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        forwarder._note_forward_failure("status:idle")
+    assert forwarder._forward_health.degraded_logged is True
+
+    forwarder._note_forward_success()
+
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False
+
+
+def test_retry_tracker_transient_failures_escalate_degraded() -> None:
+    """
+    Transient failures escalate via the retry tracker boundary (#1120).
+
+    The claude forwarder retries transient errors (connect timeouts, 503s)
+    forever, so they never reach the permanent-drop ``exhausted`` path. This
+    proves the degraded indicator still fires for that case — the exact
+    503/connect-timeout outage #1120 is about — because every
+    ``record_failure`` counts, not just exhausted give-ups. A later
+    ``clear`` (a post that got through) re-arms the indicator.
+    """
+    forwarder._reset_forward_health()
+    tracker = forwarder._PostRetryTracker()
+    transient = httpx.ConnectError("connect timeout")
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        decision = tracker.record_failure("item:source-1", transient)
+        # Transient failures are retried, never dropped.
+        assert decision.exhausted is False
+        assert decision.permanent is False
+
+    assert forwarder._forward_health.degraded_logged is True
+
+    tracker.clear("item:source-1")
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False

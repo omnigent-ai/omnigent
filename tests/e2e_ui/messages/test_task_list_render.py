@@ -5,7 +5,7 @@ editor). Chat bubbles render markdown via Streamdown + remark-gfm: remark-gfm
 tags each task item ``task-list-item`` with a disabled ``<input type="checkbox">``
 but Streamdown also applies Tailwind ``list-disc``, so without the task-list CSS
 a disc renders right next to the checkbox. This pins the
-``[data-streamdown="list-item"].task-list-item`` rule in ``ap-web/src/index.css``:
+``[data-streamdown="list-item"].task-list-item`` rule in ``web/src/index.css``:
 the marker is dropped per task item, while a plain list item keeps its ``disc``.
 
 User messages render through the SAME Streamdown path as assistant replies

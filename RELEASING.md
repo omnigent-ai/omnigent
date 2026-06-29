@@ -4,7 +4,7 @@ omnigent ships **three PyPI packages that version-lock together**:
 
 | Package | What it is |
 | --- | --- |
-| `omnigent` | core wheel (bundles the `ap-web` web UI) |
+| `omnigent` | core wheel (bundles the `web` web UI) |
 | `omnigent-client` | Python client SDK |
 | `omnigent-ui-sdk` | terminal UI SDK |
 

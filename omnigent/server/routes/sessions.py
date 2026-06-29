@@ -491,7 +491,7 @@ def _publish_collaboration_mode(session_id: str, mode: str) -> None:
 
 # Display name fallback when neither nickname nor role is available.
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
-# Labels read by ``_get_session_snapshot`` to seed the ap-web ring on
+# Labels read by ``_get_session_snapshot`` to seed the web ring on
 # reload for sessions where no Omnigent task carries usage (claude-native).
 _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
@@ -3558,7 +3558,7 @@ def _handle_external_session_todos(
     Updates the in-memory ``_session_todos_cache`` so subsequent
     ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
     field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected ap-web clients update their todo panel immediately.
+    so connected web clients update their todo panel immediately.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -4310,7 +4310,7 @@ def _publish_session_created(
     """
     Emit ``session.created`` on the parent's stream for a child session.
 
-    Clients watching the parent (e.g. the ap-web Subagents rail tab)
+    Clients watching the parent (e.g. the web Subagents rail tab)
     invalidate their ``child_sessions`` cache and re-fetch on this
     event.
 
@@ -4476,7 +4476,7 @@ async def _persist_external_subagent_start(
             raise
         await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
         # The POST that created this orphan died before reaching the
-        # ``session.created`` publish below, so live clients (the ap-web
+        # ``session.created`` publish below, so live clients (the web
         # Subagents rail) have never heard about the child — emit it now.
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
@@ -9124,7 +9124,7 @@ async def _flush_relay_text(
     text has already been closed/committed client-side (by the
     function_call item or interleaved reasoning) before this publish
     arrives. The web stamps the id onto the matching streamed
-    ``text_done`` block in place (ap-web ``chatStore.ts``
+    ``text_done`` block in place (web ``chatStore.ts``
     ``pumpStreamEvents``); the TUI consumes a byte-equal committed
     segment (``_repl.py`` ``_TurnProseTracker``).
 
@@ -9992,6 +9992,11 @@ _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
         "hermes-native",
         "native-hermes",
         "pi-native",
+        # qwen-native rebuilds qwen's on-disk chat recording (+ runtime/meta
+        # sidecars) from the copied items, so a fork carries history into the
+        # qwen TUI (see _build_qwen_fork_recording / write_qwen_session_recording).
+        # Only the canonical id is needed — "native-qwen" is aliased to it.
+        "qwen-native",
     }
 )
 
@@ -11623,7 +11628,7 @@ def _native_subagent_wrapper_labels(
     render with the Chat/Terminal pill in the web UI, exactly like a
     top-level ``claude-native-ui`` / ``codex-native-ui`` wrapper session.
     The pill is gated on the conversation's ``omnigent.wrapper`` +
-    ``omnigent.ui`` labels (see ``ap-web`` ``TerminalFirstContext``), but
+    ``omnigent.ui`` labels (see ``web`` ``TerminalFirstContext``), but
     the sub-agent create path never stamps them. This resolves the child
     sub-agent's spec from the parent bundle and returns the labels to stamp,
     or an empty dict when the sub-agent is not native (e.g. ``claude-sdk``).
