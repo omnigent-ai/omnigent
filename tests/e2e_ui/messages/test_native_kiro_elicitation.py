@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import time
-import uuid
 
 import httpx
 import pytest
@@ -56,19 +55,15 @@ def test_native_kiro_tool_approval_card_approves(
 ) -> None:
     """Kiro TUI permission prompt -> Chat card -> web approve -> Kiro continues."""
     base_url, session_id = native_kiro_session
-    # Keep the completion token benign. A token like ``kiro-approval-*`` asked
-    # for in the middle of a tool-approval flow reads to the model as an attempt
-    # to make it emit a tool-approval signal, so it refuses to echo it and the
-    # turn-complete assertion fails even though the approval loop succeeded.
-    marker = f"kiro-pwd-done-{uuid.uuid4().hex[:8]}"
 
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
-    _send(
-        page,
-        "Use the shell tool to run `pwd`. After the command completes, reply "
-        f"with the text {marker} so the run is easy to confirm.",
-    )
+    # Do not ask the model to echo a confirmation token. A safety-conscious model
+    # reads "after the approved command, output this exact token" as an attempt to
+    # forge an approval signal and refuses, which fails the turn even though the
+    # approval loop worked. Prove continuation structurally instead: once the gate
+    # is released the turn runs the tool, replies, and finishes.
+    _send(page, "Use the shell tool to run `pwd`, then briefly report the result.")
 
     card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
     expect(card).to_be_visible(timeout=_NATIVE_TURN_TIMEOUT_MS)
@@ -82,7 +77,7 @@ def test_native_kiro_tool_approval_card_approves(
     expect(responded).to_be_visible(timeout=30_000)
     expect(responded.get_by_text("Approved", exact=False).first).to_be_visible()
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
-    expect(page.locator(_ASSISTANT, has_text=marker).first).to_be_visible(
-        timeout=_NATIVE_TURN_TIMEOUT_MS
-    )
+    # Approval released the gate: Kiro produces an assistant reply and the turn
+    # ends (no lingering working indicator).
+    expect(page.locator(_ASSISTANT).last).to_be_visible(timeout=_NATIVE_TURN_TIMEOUT_MS)
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_NATIVE_TURN_TIMEOUT_MS)
