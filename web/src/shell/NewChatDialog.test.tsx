@@ -1837,3 +1837,99 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Mobile agent picker
+//
+// Touch devices can't hover, so the desktop knob flyout (a Radix sub-menu
+// opened on hover) is unreachable there. Below the `md` breakpoint the picker
+// instead swaps its contents in place: tapping anywhere on a configurable row
+// drills into that agent's knobs on the same surface (and selects it), with a
+// Back row to return. jsdom's matchMedia mock always reports `false`, so these tests
+// force the mobile branch by stubbing it to match the `max-width` query that
+// `useIsMobileViewport()` reads.
+// ---------------------------------------------------------------------------
+
+/**
+ * Make `useIsMobileViewport()` report a mobile (max-md) viewport. Returns a
+ * restore fn. Only the `max-width` query matches, so `min-width` consumers
+ * (e.g. desktop checks) keep reading false.
+ */
+function forceMobileViewport(): () => void {
+  const real = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: /max-width/.test(query),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = real;
+  };
+}
+
+describe("NewChatLandingScreen agent picker (mobile)", () => {
+  let restoreViewport: () => void;
+  beforeEach(() => {
+    setupLandingMocks();
+    restoreViewport = forceMobileViewport();
+  });
+  afterEach(() => {
+    restoreViewport();
+    cleanup();
+    localStorage.clear();
+  });
+
+  /** Open the picker (Radix opens on pointerdown). */
+  function openPicker(): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  }
+
+  it("drills into an agent's knobs in place when the row is tapped (no hover flyout) and selects it", () => {
+    renderLanding();
+    openPicker();
+    // The list is showing and the knobs are not — there's no hover flyout.
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
+    // Tap anywhere on a2 (Codex)'s row — its approval-mode knobs replace the
+    // list in place, and the tap also commits the pick.
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    expect(screen.getByTestId("new-chat-landing-agent-config-page")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-approval-full-access")).toBeTruthy();
+    // The list was replaced (not flown out alongside), so the OTHER agent
+    // row is gone while the knobs page is up.
+    expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
+    // Tapping the row selected the agent too — the trigger reflects the pick.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Codex");
+  });
+
+  it("returns to the agent list via Back without closing the menu", () => {
+    renderLanding();
+    openPicker();
+    // a1 (Claude Code) is configurable — tapping it drills into its knobs.
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
+    expect(screen.getByTestId("new-chat-landing-permission-plan")).toBeTruthy();
+    // Back steps to the list rather than closing: both agents reappear and
+    // the knobs are gone.
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-back"));
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
+  });
+
+  it("reopening after a drill-in lands back on the agent list", () => {
+    renderLanding();
+    openPicker();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
+    expect(screen.getByTestId("new-chat-landing-agent-config-page")).toBeTruthy();
+    // Close, then reopen — the menu resets to the list, never a stale page.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    openPicker();
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-config-page")).toBeNull();
+  });
+});

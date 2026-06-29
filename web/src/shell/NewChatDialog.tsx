@@ -7,6 +7,8 @@ import {
   CheckIcon,
   CircleHelpIcon,
   ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   GitBranchIcon,
   ArrowUpIcon,
   FileTextIcon,
@@ -45,6 +47,7 @@ import { sandboxOptionLabel } from "@/lib/capabilities";
 import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { getCliServerUrl } from "@/lib/host";
@@ -1250,11 +1253,44 @@ function AgentHarnessPicker({
   // menu (see the sub-trigger onClick below) without diving into the submenu.
   const [open, setOpen] = useState(false);
 
+  // Touch devices can't hover, so the desktop knob flyout (a Radix sub-menu
+  // that opens on hover) is unreachable there. On mobile we instead swap the
+  // dropdown's contents in place: tapping anywhere on a configurable row
+  // drills into that agent's knobs on the same surface, with a Back row to
+  // return. `mobileKnobsAgentId` is the agent whose knobs are showing (null =
+  // the agent list). Inert on desktop, which keeps the hover flyout.
+  const isMobile = useIsMobileViewport();
+  const [mobileKnobsAgentId, setMobileKnobsAgentId] = useState<string | null>(null);
+
+  // Pin the open direction on mobile. The agent list is tall and often opens
+  // upward (Radix flips it above the trigger when it won't fit below); the
+  // shorter knobs page would fit below and snap back down, so the menu would
+  // jump across the trigger on every drill-in. We instead measure at open
+  // time which side has more room and force it for the whole session
+  // (`avoidCollisions` off), so the in-place swap can't change the direction.
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [mobileSide, setMobileSide] = useState<"top" | "bottom">("bottom");
+
   const hasKnobs = (agent: AvailableAgent): boolean =>
     nativeAgentHasCapability(agent, "permissionMode") ||
     nativeAgentHasCapability(agent, "approvalMode") ||
     nativeAgentHasCapability(agent, "cursorMode") ||
     (agent.harness != null && agent.harness in BRAIN_HARNESS_LABELS);
+
+  // The agent whose knobs page is open, resolved from the live entry lists so
+  // it tracks renames / removals. `showMobileKnobs` gates the page: false on
+  // desktop, or if the agent vanished or lost its knobs (e.g. the list
+  // refreshed) — in which case the effect below clears the id so a reopened
+  // menu lands back on the agent list instead of an empty page.
+  const mobileKnobsAgent =
+    mobileKnobsAgentId != null
+      ? ([...harnessEntries, ...agentEntries].find((a) => a.id === mobileKnobsAgentId) ?? null)
+      : null;
+  const showMobileKnobs = isMobile && mobileKnobsAgent != null && hasKnobs(mobileKnobsAgent);
+
+  useEffect(() => {
+    if (mobileKnobsAgentId != null && !showMobileKnobs) setMobileKnobsAgentId(null);
+  }, [mobileKnobsAgentId, showMobileKnobs]);
 
   // The agent name + optional short blurb, shared by leaf rows and
   // submenu sub-triggers. The hover flyout (full spec description) is kept
@@ -1408,6 +1444,34 @@ function AgentHarnessPicker({
         </DropdownMenuItem>
       );
     }
+    if (isMobile) {
+      // Mobile has no hover, so there's no flyout to reveal the knobs. Tapping
+      // anywhere on a configurable row drills into this agent's knobs page on
+      // the same surface (the trailing chevron signals the drill-in); a Back
+      // row returns to the list. One tap target — the whole row — so no part
+      // of the row behaves differently from the rest.
+      return (
+        <DropdownMenuItem
+          key={agent.id}
+          data-testid={`new-chat-landing-agent-${agent.id}`}
+          data-active={active ? "true" : undefined}
+          onSelect={(e) => {
+            // Keep the menu open and swap to this agent's knobs page instead
+            // of closing. Commit the pick too, mirroring the desktop flyout
+            // where touching a knob selects the entry — so closing from the
+            // knobs page (tap-away / Back-then-elsewhere) lands on this agent.
+            e.preventDefault();
+            onSelectAgent(agent);
+            setMobileKnobsAgentId(agent.id);
+          }}
+          className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+        >
+          {renderRowInner(agent, false)}
+          {renderBadge(agent)}
+          <ChevronRightIcon className="ml-1 size-4 shrink-0 self-center text-muted-foreground/70" />
+        </DropdownMenuItem>
+      );
+    }
     return (
       <DropdownMenuSub key={agent.id}>
         <DropdownMenuSubTrigger
@@ -1436,9 +1500,25 @@ function AgentHarnessPicker({
   };
 
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
+    <DropdownMenu
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) {
+          // Lock the open direction to whichever side has more room for the
+          // tall list, so the later drill-in (shorter page) can't flip it.
+          const rect = triggerRef.current?.getBoundingClientRect();
+          if (rect) setMobileSide(window.innerHeight - rect.bottom >= rect.top ? "bottom" : "top");
+        } else {
+          // Closing resets the in-place page so the menu always reopens on the
+          // agent list, never a stale knobs page.
+          setMobileKnobsAgentId(null);
+        }
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <Button
+          ref={triggerRef}
           type="button"
           variant="ghost"
           size="sm"
@@ -1456,44 +1536,77 @@ function AgentHarnessPicker({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
-        side="bottom"
+        // Desktop keeps the default collision handling (the content never
+        // resizes there — knobs live in hover flyouts). On mobile we force the
+        // measured side and disable flipping so the in-place page swap holds
+        // its direction; `--radix-..-available-height` still caps + scrolls it.
+        side={isMobile ? mobileSide : "bottom"}
+        avoidCollisions={!isMobile}
         className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
       >
-        {/* Harnesses group first — the native terminal CLIs (Claude Code is
-            the default), so the most-used picks lead. */}
-        {harnessEntries.length > 0 && (
-          <>
-            <PickerSectionHeader>Harnesses</PickerSectionHeader>
-            {harnessEntries.map(renderEntry)}
+        {showMobileKnobs && mobileKnobsAgent ? (
+          // Mobile knobs page: the selected agent's run-config knobs shown in
+          // place of the list, led by a Back row that returns to it. The
+          // slide-in keeps the drill-in feel without the fragile
+          // height-measuring the reverted flyout-fold needed (#393).
+          <div
+            data-testid="new-chat-landing-agent-config-page"
+            className="animate-in fade-in-0 slide-in-from-right-2 duration-150"
+          >
+            <DropdownMenuItem
+              data-testid="new-chat-landing-agent-config-back"
+              onSelect={(e) => {
+                // Step back to the list instead of closing the menu.
+                e.preventDefault();
+                setMobileKnobsAgentId(null);
+              }}
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-13 font-medium"
+            >
+              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+              <span className="truncate">{mobileKnobsAgent.display_name}</span>
+            </DropdownMenuItem>
             <DropdownMenuSeparator />
+            {knobSectionsFor(mobileKnobsAgent)}
+          </div>
+        ) : (
+          <>
+            {/* Harnesses group first — the native terminal CLIs (Claude Code is
+            the default), so the most-used picks lead. */}
+            {harnessEntries.length > 0 && (
+              <>
+                <PickerSectionHeader>Harnesses</PickerSectionHeader>
+                {harnessEntries.map(renderEntry)}
+                <DropdownMenuSeparator />
+              </>
+            )}
+            {/* Agents group — SDK / bundle + custom agents. Always rendered so the
+            "Create custom agent" action is reachable even with no bundle agents. */}
+            <PickerSectionHeader>Agents</PickerSectionHeader>
+            {agentEntries.map(renderEntry)}
+            {pendingAgent && (
+              <DropdownMenuItem
+                key={pendingAgentId}
+                data-testid="new-chat-landing-agent-pending"
+                data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
+                onSelect={onSelectPending}
+                className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+              >
+                <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+                  <span className="truncate">{pendingAgent.name}</span>
+                  <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
+                </div>
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem
+              data-testid="new-chat-landing-create-agent"
+              onSelect={onCreateCustomAgent}
+              className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+            >
+              <PlusIcon className="size-3.5" />
+              Create custom agent
+            </DropdownMenuItem>
           </>
         )}
-        {/* Agents group — SDK / bundle + custom agents. Always rendered so the
-            "Create custom agent" action is reachable even with no bundle agents. */}
-        <PickerSectionHeader>Agents</PickerSectionHeader>
-        {agentEntries.map(renderEntry)}
-        {pendingAgent && (
-          <DropdownMenuItem
-            key={pendingAgentId}
-            data-testid="new-chat-landing-agent-pending"
-            data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
-            onSelect={onSelectPending}
-            className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
-          >
-            <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
-              <span className="truncate">{pendingAgent.name}</span>
-              <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
-            </div>
-          </DropdownMenuItem>
-        )}
-        <DropdownMenuItem
-          data-testid="new-chat-landing-create-agent"
-          onSelect={onCreateCustomAgent}
-          className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
-        >
-          <PlusIcon className="size-3.5" />
-          Create custom agent
-        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
