@@ -2227,7 +2227,7 @@ export function NewChatLandingScreen() {
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
           <OttoEyes className="h-18 w-auto shrink-0" />
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
+            What should we cook today 🧑‍🍳?
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
