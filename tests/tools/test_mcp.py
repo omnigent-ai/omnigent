@@ -1406,10 +1406,15 @@ async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
     would fail to connect. If ``streamablehttp_client`` is not
     tried first, Streamable HTTP servers (e.g. Databricks MCP
     gateways) would get the wrong transport.
+
+    A non-``/sse`` URL is used on purpose: an ``…/sse`` URL is routed
+    straight to the SSE client by ``_is_sse_endpoint`` and would bypass
+    Streamable HTTP entirely, so it would not exercise the fallback this
+    test guards.
     """
     config = MCPServerConfig(
         name="test-sse-fallback",
-        url="http://legacy-mcp.example.com/sse",
+        url="http://legacy-mcp.example.com/mcp",
         headers={"Authorization": "Bearer tok"},
     )
 
@@ -1442,7 +1447,7 @@ async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
     with patch(
         "omnigent.tools.mcp.streamablehttp_client",
         side_effect=RuntimeError("server returned text/html, not application/json"),
-    ):
+    ) as mock_streamable:
         with patch(
             "omnigent.tools.mcp.sse_client",
             side_effect=_capturing_sse,
@@ -1454,8 +1459,13 @@ async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
                 conn = McpServerConnection(config=config)
                 tools = await conn.connect()
 
+    # Streamable HTTP was tried first and failed, so the fallback ran.
+    assert mock_streamable.called, (
+        "Streamable HTTP must be tried first for a non-/sse URL; if it was "
+        "skipped, the SSE fallback this test guards was never exercised"
+    )
     # Fallback reached sse_client with the correct URL and headers.
-    assert captured_sse_kwargs["url"] == "http://legacy-mcp.example.com/sse", (
+    assert captured_sse_kwargs["url"] == "http://legacy-mcp.example.com/mcp", (
         "SSE fallback must receive the same URL as the original config"
     )
     assert captured_sse_kwargs["headers"] == {"Authorization": "Bearer tok"}, (

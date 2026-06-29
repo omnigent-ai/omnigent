@@ -873,10 +873,13 @@ class McpServerConnection:
         """
         Open an HTTP MCP transport — Streamable HTTP or legacy SSE.
 
-        Tries the Streamable HTTP transport first (the current MCP
-        spec default, used by Databricks MCP gateways and newer
-        servers). Falls back to legacy SSE if the Streamable HTTP
-        handshake fails, so older servers still work.
+        URLs whose path ends in ``/sse`` are routed straight to the
+        legacy SSE client (see :func:`_is_sse_endpoint`), since the
+        Streamable HTTP client hangs in teardown against SSE-only
+        servers. Otherwise tries the Streamable HTTP transport first
+        (the current MCP spec default, used by Databricks MCP gateways
+        and newer servers) and falls back to legacy SSE if the
+        Streamable HTTP handshake fails, so older servers still work.
 
         :param stack: The lifecycle task's exit stack.
         :returns: A ``(read_stream, write_stream)`` tuple of
