@@ -726,7 +726,7 @@ function LandingProjectPicker({
           <TagIcon className="size-4 shrink-0" />
           {/* Label collapses to icon-only on narrow viewports (mobile),
               matching the host/workspace/worktree chips. */}
-          <span className={`hidden max-w-16 truncate sm:block ${value ? "text-foreground" : ""}`}>
+          <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
             {value || "No project"}
           </span>
           <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
@@ -2203,7 +2203,7 @@ export function NewChatLandingScreen() {
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
       <span
-        className={`hidden max-w-20 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
+        className={`hidden max-w-40 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
       >
         {workspaceLabel}
       </span>
@@ -2520,7 +2520,7 @@ export function NewChatLandingScreen() {
                       <MonitorIcon className="size-4 shrink-0" />
                     )}
                     <span
-                      className={`hidden max-w-24 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
+                      className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
                     >
                       {hostLabel}
                     </span>
@@ -2679,7 +2679,7 @@ export function NewChatLandingScreen() {
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
                       <span
-                        className={`hidden max-w-20 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
+                        className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
                       >
                         {sandboxRepoLabel}
                       </span>
@@ -2776,10 +2776,6 @@ export function NewChatLandingScreen() {
                 </Popover>
               )}
 
-              {/* Project chip — files the session under a named project on
-                create. Sits between the working-directory and worktree chips. */}
-              <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
-
               {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}
               {!sandboxSelected && (
@@ -2792,7 +2788,7 @@ export function NewChatLandingScreen() {
                     >
                       <GitBranchIcon className="size-4 shrink-0" />
                       <span
-                        className={`hidden max-w-16 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
+                        className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
                       >
                         {worktreeLabel}
                       </span>
@@ -2835,11 +2831,15 @@ export function NewChatLandingScreen() {
                   </PopoverContent>
                 </Popover>
               )}
+
+              {/* Project chip — files the session under a named project on
+                create. Sits after the worktree chip. */}
+              <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
             </div>
             {/* The agent / harness picker moved out of the tray and into the
                 composer's right action cluster (next to Send) — see
                 AgentHarnessPicker above. The tray now holds only the
-                host / working-directory / worktree chips. */}
+                host / working-directory / worktree / project chips. */}
           </div>
 
           {/* Warn (don't block) when the selected agent's harness isn't
