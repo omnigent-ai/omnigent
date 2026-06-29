@@ -1,6 +1,6 @@
-import { BotIcon, ClockIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
 import {
   BotIcon,
+  ClockIcon,
   FileIcon,
   LayoutTemplateIcon,
   ListTodoIcon,

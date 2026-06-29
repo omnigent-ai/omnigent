@@ -43,7 +43,10 @@ async def test_list_work_items_passes_filters_as_query() -> None:
     reqs: list[httpx.Request] = []
     client = _recording_client(reqs)
     await _execute_work_management_tool(
-        "list_work_items", json.dumps({"status": "new"}), conversation_id="conv_1", server_client=client
+        "list_work_items",
+        json.dumps({"status": "new"}),
+        conversation_id="conv_1",
+        server_client=client,
     )
     await client.aclose()
     assert reqs[0].method == "GET"

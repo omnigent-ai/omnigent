@@ -2638,9 +2638,7 @@ async def _execute_work_management_tool(
                 for k in ("status", "conversation_id", "limit")
                 if args.get(k) is not None
             }
-            return _result(
-                await server_client.get("/v1/work-items", params=params, timeout=30.0)
-            )
+            return _result(await server_client.get("/v1/work-items", params=params, timeout=30.0))
 
         if tool_name == "update_work_item":
             work_item_id = args.get("work_item_id")

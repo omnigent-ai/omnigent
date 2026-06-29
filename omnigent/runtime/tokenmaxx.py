@@ -190,9 +190,7 @@ class TokenmaxxService:
         """
         if not self._config.enabled:
             return 0
-        if not is_off_hours(
-            self._now(), self._config.off_hours_start, self._config.off_hours_end
-        ):
+        if not is_off_hours(self._now(), self._config.off_hours_start, self._config.off_hours_end):
             return 0
 
         cap = self._config.max_items_per_tick
@@ -205,9 +203,7 @@ class TokenmaxxService:
         # Fetch enough of each dispatchable status to fill the cap.
         candidates: list[WorkItem] = []
         for status in _DISPATCHABLE_ORDER:
-            candidates.extend(
-                await asyncio.to_thread(self._store.list, status=status, limit=cap)
-            )
+            candidates.extend(await asyncio.to_thread(self._store.list, status=status, limit=cap))
         selected = select_for_dispatch(candidates, cap)
         if not selected:
             return 0
