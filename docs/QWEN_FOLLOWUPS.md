@@ -245,17 +245,17 @@ comments; this is the *what*, not the *how*.)
   - *Full route:* spec with `executor.profile: <db-profile>` (or a
     `databricks-*` model), then `omni run`; confirm the runner log's
     `qwen gateway routing:` line shows the Databricks base URL + profile.
-- [x] **Omnigent tools.** Qwen-native now registers the shared Omnigent MCP
-  relay (`omnigent.claude_native_bridge serve-mcp`) in `<workspace>/.mcp.json`
-  (qwen's dedicated project-MCP file — `mcpServers.omnigent`, `trust: true`)
-  before launch, so qwen connects to it on boot, `/mcp` lists it, and the model
-  can call Omnigent's builtin tools (`sys_*`, `load_skill`, `web_fetch`, …). A
-  dedicated file (not the shared `.qwen/settings.json`) avoids touching the
-  user's auth/theme config; the merge is JSONC-aware and fail-safe (an
-  unparseable existing `.mcp.json` is left untouched and MCP wiring is skipped).
-  The token is written via `qwen_native_bridge.write_mcp_config`; the live tool
-  surface is advertised by the `tool_relay.json` that `ensure_comment_relay`
-  writes. Mirrors cursor-/claude-native.
+- [x] **Omnigent tools.** Qwen-native now exposes the shared Omnigent MCP relay
+  (`omnigent.claude_native_bridge serve-mcp`, `mcpServers.omnigent`,
+  `trust: true`) to qwen via the `--mcp-config <path>` launch flag (the
+  claude-native model). qwen connects to it on boot, `/mcp` lists it, and the
+  model can call Omnigent's builtin tools (`sys_*`, `load_skill`, `web_fetch`, …).
+  The config lives in the per-session bridge dir, **not** the workspace, so we
+  drop no file in the user's repo, concurrent same-workspace sessions can't
+  collide, and CLI-provided servers are ungated (no "Untrusted MCP server"
+  prompt → no pre-approval step). The token + config are written by
+  `qwen_native_bridge.write_mcp_config`; the live tool surface is advertised by
+  the `tool_relay.json` that `ensure_comment_relay` writes.
   A project-scoped MCP server is gated behind qwen's "Untrusted MCP server"
   startup prompt, so the runner pre-approves it non-interactively via
   `qwen mcp approve omnigent` (`qwen_native_bridge.approve_mcp_server`, qwen's own

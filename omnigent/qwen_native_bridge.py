@@ -62,18 +62,13 @@ _POLL_INTERVAL_S = 0.2
 _BRIDGE_CONFIG_FILE = "bridge.json"
 #: Name qwen lists the Omnigent MCP server under (shows in ``/mcp``).
 _MCP_SERVER_NAME = "omnigent"
-#: qwen reads project-scoped MCP servers from ``<workspace>/.mcp.json`` (its
-#: ``loadProjectMcpServers`` path) — a dedicated MCP file we own wholesale, the
-#: true analog of cursor's ``.cursor/mcp.json``. Deliberately NOT the shared
-#: ``.qwen/settings.json`` (which also holds auth/theme/gateway config), so we
-#: never risk clobbering unrelated user settings.
-_PROJECT_MCP_FILE = ".mcp.json"
-#: Env var qwen reads to locate its MCP-approvals store, overriding the default
-#: ``~/.qwen/mcpApprovals.json``. We point it at a per-session file in the bridge
-#: dir so approvals don't pollute the user's home and concurrent same-workspace
-#: sessions don't fight over a single (workspace, server) approval entry.
-MCP_APPROVALS_ENV_VAR = "QWEN_CODE_MCP_APPROVALS_PATH"
-_MCP_APPROVALS_FILE = "mcpApprovals.json"
+#: Per-session MCP config passed to qwen via ``--mcp-config <path>``. Lives in
+#: the bridge dir (NOT the workspace), so we never drop a file in the user's repo
+#: and concurrent same-workspace sessions can't collide. CLI-provided MCP servers
+#: are also ungated (no "Untrusted MCP server" prompt), unlike a project
+#: ``.mcp.json`` / ``.qwen/settings.json``. The claude-native ``--mcp-config``
+#: model (it writes no workspace file either).
+_MCP_CONFIG_FILE = "mcp_config.json"
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -267,179 +262,48 @@ def build_mcp_server_entry(
     }
 
 
-def _strip_json_comments(text: str) -> str:
-    """Replace ``//`` and ``/* */`` comments with spaces, preserving strings.
-
-    qwen's ``settings.json`` is JSONC — qwen parses it with
-    ``JSON.parse(stripJsonComments(content))`` — so a user's file legitimately
-    contains comments that plain :func:`json.loads` rejects. This mirrors the
-    ``strip-json-comments`` behaviour qwen uses (blank out comment characters in
-    place, leaving lengths/positions intact) while never touching characters
-    inside string literals. Trailing commas are *not* handled — qwen doesn't
-    accept them either (its final ``JSON.parse`` would reject them).
-    """
-    out: list[str] = []
-    in_string = False
-    escaped = False
-    in_line_comment = False
-    in_block_comment = False
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-                out.append(ch)
-            else:
-                out.append(" ")
-            i += 1
-        elif in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                out.append("  ")
-                i += 2
-            else:
-                out.append("\n" if ch == "\n" else " ")
-                i += 1
-        elif in_string:
-            out.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            i += 1
-        elif ch == '"':
-            in_string = True
-            out.append(ch)
-            i += 1
-        elif ch == "/" and nxt == "/":
-            in_line_comment = True
-            out.append("  ")
-            i += 2
-        elif ch == "/" and nxt == "*":
-            in_block_comment = True
-            out.append("  ")
-            i += 2
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
+def mcp_config_path(bridge_dir: Path) -> Path:
+    """Return the per-session ``--mcp-config`` file path inside the bridge dir."""
+    return bridge_dir / _MCP_CONFIG_FILE
 
 
 def write_mcp_config(
-    workspace: Path,
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
-) -> Path | None:
-    """Register the Omnigent MCP server in ``<workspace>/.mcp.json``.
+) -> Path:
+    """Write the per-session Omnigent MCP config for qwen's ``--mcp-config`` flag.
 
-    Writes qwen's dedicated project-MCP file (its ``loadProjectMcpServers`` path)
-    rather than the shared ``.qwen/settings.json``, so we never touch the user's
-    auth/theme/gateway config. Merges (does not overwrite) into an existing
-    ``.mcp.json`` so a user's own ``mcpServers`` are preserved; only the
-    ``omnigent`` entry is (re)written. Also writes the relay token
-    (:func:`write_mcp_bridge_config`). The analog of
-    :func:`omnigent.cursor_native_bridge.write_mcp_config`.
+    Writes ``{"mcpServers": {"omnigent": ...}}`` to a file *inside the bridge dir*
+    (never the workspace) and the relay token (:func:`write_mcp_bridge_config`).
+    The runner passes the returned path to qwen via ``--mcp-config <path>``. Unlike
+    a project ``.mcp.json`` / ``.qwen/settings.json``, a CLI-provided MCP server:
 
-    qwen parses ``.mcp.json`` as JSONC, so an existing file is read through
-    :func:`_strip_json_comments` before parsing. **Fail-safe:** if a non-empty
-    existing file cannot be parsed even as JSONC (or doesn't decode to a JSON
-    object, or can't be read), the merge is aborted and the file is left
-    untouched — overwriting it would silently destroy real user config we simply
-    failed to understand. The caller skips MCP wiring in that case.
+    - drops no file in the user's (often git) workspace — nothing to accidentally
+      commit, nothing left behind pointing at a dead bridge dir;
+    - is per-session by construction (the file and its ``--bridge-dir`` live in
+      this session's bridge dir), so concurrent same-workspace sessions can't
+      collide on a shared file;
+    - is **not** gated behind qwen's "Untrusted MCP server" prompt (CLI servers
+      carry no project/workspace scope), so no pre-approval step is needed.
 
-    :returns: Path to the written ``.mcp.json``, or ``None`` if the merge was
-        aborted to avoid clobbering an unparseable existing file.
+    The claude-native ``--mcp-config`` model (it writes no workspace file either).
+
+    :returns: Path to the written ``--mcp-config`` file.
     """
-    path = workspace / _PROJECT_MCP_FILE
-
-    data: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            return None
-        if raw.strip():
-            try:
-                parsed = json.loads(_strip_json_comments(raw))
-            except ValueError:
-                # Non-empty file we can't parse even as JSONC — may be valid qwen
-                # config we don't understand. Refuse to overwrite it.
-                return None
-            if not isinstance(parsed, dict):
-                return None
-            data = parsed
-
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-    servers[_MCP_SERVER_NAME] = build_mcp_server_entry(
-        bridge_dir, python_executable=python_executable
-    )
-    data["mcpServers"] = servers
-
     write_mcp_bridge_config(bridge_dir)
-    workspace.mkdir(parents=True, exist_ok=True)
-    # Unique temp name so concurrent writers (same-workspace co-tenant sessions)
-    # don't race on a shared ``.mcp.json.tmp`` before the atomic replace.
-    tmp = path.with_name(f"{_PROJECT_MCP_FILE}.{secrets.token_hex(8)}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path = mcp_config_path(bridge_dir)
+    payload = {
+        "mcpServers": {
+            _MCP_SERVER_NAME: build_mcp_server_entry(
+                bridge_dir, python_executable=python_executable
+            )
+        }
+    }
+    tmp = path.with_name(f"{_MCP_CONFIG_FILE}.{secrets.token_hex(8)}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
-
-
-def mcp_approvals_path(bridge_dir: Path) -> Path:
-    """Return the per-session MCP-approvals store path (see :data:`MCP_APPROVALS_ENV_VAR`)."""
-    return bridge_dir / _MCP_APPROVALS_FILE
-
-
-def mcp_launch_env(bridge_dir: Path) -> dict[str, str]:
-    """Env the qwen TUI launch needs so it reads the per-session approvals store."""
-    return {MCP_APPROVALS_ENV_VAR: str(mcp_approvals_path(bridge_dir))}
-
-
-def approve_mcp_server(
-    workspace: Path,
-    bridge_dir: Path,
-    *,
-    qwen_command: str,
-) -> bool:
-    """Pre-approve the Omnigent MCP server so qwen skips its startup trust prompt.
-
-    A project ``.qwen/settings.json`` MCP server is *gated*: on launch qwen shows
-    an "Untrusted MCP server" prompt and won't start the server until approved,
-    blocking the relay (and ``/mcp`` listing) behind a manual in-terminal step.
-    ``qwen mcp approve`` is qwen's own non-interactive approval command — it
-    computes the config hash exactly (version-proof, unlike replicating the hash
-    ourselves) and records ``{status: approved}`` keyed by ``(workspace, name)``
-    in the approvals store. Run with the SAME cwd and :data:`MCP_APPROVALS_ENV_VAR`
-    the TUI will launch with, so the approval the TUI reads matches. The analog of
-    cursor's ``cursor mcp enable`` (``cursor_native_bridge``).
-
-    Best-effort: on failure we log and return ``False``; the launch proceeds and
-    qwen falls back to its in-terminal trust prompt (no worse than before).
-
-    :returns: ``True`` if the approve command succeeded.
-    """
-    env = {**os.environ, **mcp_launch_env(bridge_dir)}
-    try:
-        proc = subprocess.run(
-            [qwen_command, "mcp", "approve", _MCP_SERVER_NAME],
-            cwd=str(workspace),
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_TMUX_READY_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
 
 
 def _append_command(bridge_dir: Path, command: dict[str, Any]) -> None:
