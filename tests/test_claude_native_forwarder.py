@@ -2895,7 +2895,13 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         "external_conversation_item",
         "external_session_status",
     ]
-    assert requests[-1]["data"] == {"status": "failed"}
+    # The failed edge carries the drop reason as ``output`` so the server
+    # surfaces it as the session's failure detail instead of a bare
+    # "failed" badge (#1113).
+    assert requests[-1]["data"] == {
+        "status": "failed",
+        "output": "transcript item poison-item:0:message rejected",
+    }
     assert first.byte_offset == 0
     assert second.byte_offset == transcript_path.stat().st_size
     assert second.line_cursor == 1
@@ -6371,3 +6377,38 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_external_session_status_attaches_failure_reason() -> None:
+    """A failed status carries its reason as ``output`` in the payload (#1113).
+
+    The server's ``external_session_status`` handler surfaces a failed edge's
+    ``output`` as the session's failure detail, so threading the forwarder's
+    drop reason there makes the UI render it instead of a bare "failed".
+    """
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_x/events":
+            captured.append(json.loads(request.content))
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._post_external_session_status(
+            client,
+            session_id="conv_x",
+            status="failed",
+            output="transcript item item-1 rejected",
+        )
+        # No reason → no output field (e.g. a normal idle edge).
+        await forwarder._post_external_session_status(client, session_id="conv_x", status="idle")
+
+    assert captured[0]["type"] == "external_session_status"
+    assert captured[0]["data"] == {
+        "status": "failed",
+        "output": "transcript item item-1 rejected",
+    }
+    assert captured[1]["data"] == {"status": "idle"}
