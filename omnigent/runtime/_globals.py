@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from omnigent.stores.policy_store import PolicyStore
     from omnigent.stores.push_subscription_store import PushSubscriptionStore
     from omnigent.stores.schedule_store import ScheduleStore
+    from omnigent.stores.user_credential_store import UserCredentialStore
     from omnigent.stores.work_item_store import WorkItemStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
@@ -44,6 +45,7 @@ _schedule_store: ScheduleStore | None = None
 _work_item_store: WorkItemStore | None = None
 _canvas_store: CanvasStore | None = None
 _push_subscription_store: PushSubscriptionStore | None = None
+_user_credential_store: UserCredentialStore | None = None
 _caps: RuntimeCaps = RuntimeCaps()
 
 # Server-resident tmux terminal registry. Initialized in
@@ -181,6 +183,7 @@ def init(
     work_item_store: WorkItemStore | None = None,
     canvas_store: CanvasStore | None = None,
     push_subscription_store: PushSubscriptionStore | None = None,
+    user_credential_store: UserCredentialStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -219,6 +222,7 @@ def init(
     global _agent_cache, _file_store, _artifact_store, _caps
     global _terminal_registry, _comment_store, _policy_store
     global _schedule_store, _work_item_store, _canvas_store, _push_subscription_store
+    global _user_credential_store
     _conversation_store = conversation_store
     _agent_store = agent_store
     _agent_cache = agent_cache
@@ -230,6 +234,7 @@ def init(
     _work_item_store = work_item_store
     _canvas_store = canvas_store
     _push_subscription_store = push_subscription_store
+    _user_credential_store = user_credential_store
     _caps = caps if caps is not None else RuntimeCaps()
     # Tmux terminal registry: server-resident, conversation-scoped
     # ``inner.terminal.TerminalInstance`` map. See

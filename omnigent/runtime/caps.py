@@ -86,3 +86,7 @@ class RuntimeCaps:
     # disables push (the endpoints 503 and the sender no-ops).
     vapid_private_key: EllipticCurvePrivateKey | None = None
     vapid_subject: str = "mailto:admin@localhost"
+    # Per-user secret vault key (#5): server-held Fernet key that
+    # encrypts/decrypts vault secrets at rest. ``None`` disables the vault
+    # (the REST endpoints 404 and the resolver returns nothing).
+    vault_key: bytes | None = None

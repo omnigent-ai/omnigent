@@ -861,6 +861,37 @@ class SqlPushSubscription(Base):
     __table_args__ = (UniqueConstraint("endpoint", name="uq_push_subscriptions_endpoint"),)
 
 
+class SqlUserCredential(Base):
+    """
+    SQLAlchemy model for the ``user_credentials`` table (#5).
+
+    One encrypted secret per (user, name) in the per-user vault.
+    ``secret_encrypted`` holds a Fernet token (AES-128-CBC + HMAC), never
+    plaintext. UNIQUE(user_id, name) so re-storing a named secret upserts. Not
+    FK'd to a conversation — credentials are user-scoped and outlive sessions.
+
+    :param id: Opaque PK, e.g. ``"cred_a1b2c3..."``.
+    :param user_id: The owning user (indexed; only they can read/use it).
+    :param name: Logical name, e.g. ``"github"`` / ``"databricks:prod"``.
+    :param secret_encrypted: Fernet ciphertext of the secret value.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, ``None`` if never.
+    """
+
+    __tablename__ = "user_credentials"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(256), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    secret_encrypted: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_user_credentials_user_name"),
+    )
+
+
 class SqlHost(Base):
     """
     SQLAlchemy model for the ``hosts`` table.

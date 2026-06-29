@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from omnigent.stores.policy_store import PolicyStore
     from omnigent.stores.push_subscription_store import PushSubscriptionStore
     from omnigent.stores.schedule_store import ScheduleStore
+    from omnigent.stores.user_credential_store import UserCredentialStore
     from omnigent.stores.work_item_store import WorkItemStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
@@ -45,6 +46,7 @@ def init(
     work_item_store: WorkItemStore | None = None,
     canvas_store: CanvasStore | None = None,
     push_subscription_store: PushSubscriptionStore | None = None,
+    user_credential_store: UserCredentialStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -84,6 +86,7 @@ def init(
         work_item_store=work_item_store,
         canvas_store=canvas_store,
         push_subscription_store=push_subscription_store,
+        user_credential_store=user_credential_store,
         caps=caps,
     )
 
@@ -216,6 +219,19 @@ def get_push_subscription_store() -> PushSubscriptionStore | None:
     :returns: The PushSubscriptionStore set during :func:`init`, or ``None``.
     """
     return _globals._push_subscription_store
+
+
+def get_user_credential_store() -> UserCredentialStore | None:
+    """
+    Return the UserCredentialStore (per-user secret vault), or ``None``.
+
+    Returns ``None`` (rather than raising) because the vault is optional — the
+    REST endpoints 404 and :func:`resolve_user_secret` returns ``None`` when
+    it's absent.
+
+    :returns: The UserCredentialStore set during :func:`init`, or ``None``.
+    """
+    return _globals._user_credential_store
 
 
 def get_agent_cache() -> AgentCache:

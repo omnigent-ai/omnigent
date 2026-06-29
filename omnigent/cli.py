@@ -3014,6 +3014,9 @@ def server(
         SqlAlchemyPushSubscriptionStore,
     )
     from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleStore
+    from omnigent.stores.user_credential_store.sqlalchemy_store import (
+        SqlAlchemyUserCredentialStore,
+    )
     from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -3026,6 +3029,7 @@ def server(
     work_item_store = SqlAlchemyWorkItemStore(db_uri)
     canvas_store = SqlAlchemyCanvasStore(db_uri)
     push_subscription_store = SqlAlchemyPushSubscriptionStore(db_uri)
+    user_credential_store = SqlAlchemyUserCredentialStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3070,11 +3074,15 @@ def server(
     # Web Push (#8): load/persist the server's stable VAPID key so a browser's
     # subscription survives restarts. The `vapid.subject` config is the JWT
     # contact (some push services require a real mailto/URL).
+    from omnigent.server.secret_vault import load_or_create_vault_key
     from omnigent.server.vapid_keys import load_or_create_vapid_key
 
     _vapid_cfg = cfg.get("vapid") or {}
     vapid_private_key = load_or_create_vapid_key(Path(art_loc) / "vapid_private_key.pem")
     vapid_subject = str(_vapid_cfg.get("subject") or "mailto:admin@localhost")
+    # Per-user secret vault (#5): a stable server-held Fernet key, persisted
+    # next to the data so stored secrets survive restarts.
+    vault_key = load_or_create_vault_key(Path(art_loc) / "secret_vault.key")
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
@@ -3084,6 +3092,7 @@ def server(
         tokenmaxx=parse_tokenmaxx_config(cfg.get("tokenmaxx")),
         vapid_private_key=vapid_private_key,
         vapid_subject=vapid_subject,
+        vault_key=vault_key,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -3097,6 +3106,7 @@ def server(
         work_item_store=work_item_store,
         canvas_store=canvas_store,
         push_subscription_store=push_subscription_store,
+        user_credential_store=user_credential_store,
         caps=caps,
     )
 
@@ -3182,6 +3192,7 @@ def server(
         account_store = SqlAlchemyAccountStore(db_uri)
 
     from omnigent.server.routes.canvas import create_canvas_router
+    from omnigent.server.routes.credentials import create_credentials_router
     from omnigent.server.routes.push import create_push_router
     from omnigent.server.routes.schedules import create_schedules_router
     from omnigent.server.routes.usage import create_usage_router
@@ -3231,6 +3242,13 @@ def server(
                 create_push_router(push_subscription_store, auth_provider, permission_store),
                 "/v1",
                 ["push"],
+            ),
+            (
+                create_credentials_router(
+                    user_credential_store, auth_provider, permission_store
+                ),
+                "/v1",
+                ["credentials"],
             ),
         ],
     )
