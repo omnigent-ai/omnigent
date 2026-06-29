@@ -56,14 +56,18 @@ def test_native_kiro_tool_approval_card_approves(
 ) -> None:
     """Kiro TUI permission prompt -> Chat card -> web approve -> Kiro continues."""
     base_url, session_id = native_kiro_session
-    marker = f"kiro-approval-{uuid.uuid4().hex[:8]}"
+    # Keep the completion token benign. A token like ``kiro-approval-*`` asked
+    # for in the middle of a tool-approval flow reads to the model as an attempt
+    # to make it emit a tool-approval signal, so it refuses to echo it and the
+    # turn-complete assertion fails even though the approval loop succeeded.
+    marker = f"kiro-pwd-done-{uuid.uuid4().hex[:8]}"
 
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
     _send(
         page,
-        "Use the shell tool to run `pwd`, then reply with "
-        f"the exact marker `{marker}` after the command completes.",
+        "Use the shell tool to run `pwd`. After the command completes, reply "
+        f"with the text {marker} so the run is easy to confirm.",
     )
 
     card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
