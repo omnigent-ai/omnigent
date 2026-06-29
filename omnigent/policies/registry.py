@@ -56,6 +56,7 @@ class PolicyRegistryEntry:
     name: str
     description: str
     params_schema: dict[str, Any] | None = None
+    internal_only: bool = False
 
 
 # Module-level singleton. Populated by load_registry().

@@ -842,7 +842,42 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
             "required": ["max_cost_usd"],
         },
     },
-    # NOTE: subagent_cost_budget is NOT registered here. It is for internal
-    # use only, attached by sys_session_send at spawn time. Users should not
-    # discover or manually attach it via the policy registry.
+    {
+        "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+        "kind": "factory",
+        "name": "Subagent Cost Budget",
+        "description": "Gates a sub-agent on its own subtree LLM spend (USD): once a hard limit "
+        "is reached DENY (the whole turn at the request phase, or each tool call) while still on "
+        "an expensive model (prompting a /model downgrade), and ASK for approval at each soft "
+        "warning checkpoint (request + tool-call phases). Reads "
+        "event.context.subtree_usage.total_cost_usd and event.context.model. Intended to be "
+        "attached to a child session via sys_session_send's cost_budget argument.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "max_cost_usd": {
+                    "type": "number",
+                    "description": "Hard limit in USD for the subtree; once cumulative subtree "
+                    "cost reaches it, tool calls are blocked while on an expensive model.",
+                },
+                "ask_thresholds_usd": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Optional soft warning checkpoints in USD; the subagent asks "
+                    "for approval the first time subtree spend crosses each (every value must "
+                    "be < max_cost_usd).",
+                },
+                "expensive_models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional case-insensitive substring tokens for the model "
+                    "tiers blocked once over budget (default: Fable + Opus + GPT-5, excluding "
+                    "the cheap -mini/-nano variants). An empty list disables the hard limit, "
+                    "leaving only the soft thresholds.",
+                },
+            },
+            "required": ["max_cost_usd"],
+        },
+        "internal_only": True,
+    },
 ]
