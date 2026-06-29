@@ -2,20 +2,51 @@
 
 from __future__ import annotations
 
-import sys
-import types
+import importlib.metadata
 
 import pytest
 
-from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR, resolve_claude_launch
+from omnigent.claude_launcher import (
+    CLAUDE_LAUNCHER_ENTRY_POINT_GROUP,
+    CLAUDE_LAUNCHER_ENV_VAR,
+    ClaudeLauncher,
+    resolve_claude_launch,
+)
 
 
-def _register_plugin(monkeypatch, value, *, attr="launch", module="fake_launcher_mod"):
-    """Inject a fake plugin module and point the env var at it."""
-    mod = types.ModuleType(module)
-    setattr(mod, attr, value)
-    monkeypatch.setitem(sys.modules, module, mod)
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, f"{module}:{attr}")
+class _FakeEntryPoint:
+    """Minimal stand-in for :class:`importlib.metadata.EntryPoint`."""
+
+    def __init__(self, name, value):
+        self.name = name
+        self._value = value
+
+    def load(self):
+        if isinstance(self._value, BaseException):
+            raise self._value
+        return self._value
+
+
+def _register(monkeypatch, *entry_points, raise_on_enumerate=None):
+    """Make ``importlib.metadata.entry_points(group=...)`` return *entry_points*."""
+
+    def fake_entry_points(*, group):
+        assert group == CLAUDE_LAUNCHER_ENTRY_POINT_GROUP
+        if raise_on_enumerate is not None:
+            raise raise_on_enumerate
+        return list(entry_points)
+
+    monkeypatch.setattr(importlib.metadata, "entry_points", fake_entry_points)
+
+
+def _launcher_cls(fn):
+    """Build a :class:`ClaudeLauncher` subclass whose ``launch`` delegates to *fn*."""
+
+    class _Launcher(ClaudeLauncher):
+        def launch(self, command, args):
+            return fn(command, args)
+
+    return _Launcher
 
 
 def test_identity_when_env_unset(monkeypatch):
@@ -32,47 +63,77 @@ def test_identity_returns_fresh_list(monkeypatch):
 
 
 def test_plugin_wraps_command(monkeypatch):
-    def wrap(command, args):
-        return "isaac", ["claude", "--omni-internal", "--", *args]
-
-    _register_plugin(monkeypatch, wrap)
+    cls = _launcher_cls(lambda command, args: ("isaac", ["claude", "--omni", "--", *args]))
+    _register(monkeypatch, _FakeEntryPoint("isaac", cls))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
     command, args = resolve_claude_launch("claude", ["--mcp-config", "{}"])
     assert command == "isaac"
-    assert args == ["claude", "--omni-internal", "--", "--mcp-config", "{}"]
+    assert args == ["claude", "--omni", "--", "--mcp-config", "{}"]
+
+
+def test_plugin_selected_by_name_among_several(monkeypatch):
+    _register(
+        monkeypatch,
+        _FakeEntryPoint("other", _launcher_cls(lambda command, args: ("nope", []))),
+        _FakeEntryPoint("isaac", _launcher_cls(lambda command, args: ("isaac", ["--", *args]))),
+    )
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    command, args = resolve_claude_launch("claude", ["--x"])
+    assert command == "isaac"
+    assert args == ["--", "--x"]
 
 
 def test_plugin_receives_default_command_and_args(monkeypatch):
     seen = {}
 
-    def wrap(command, args):
+    def record(command, args):
         seen["command"], seen["args"] = command, args
         return command, args
 
-    _register_plugin(monkeypatch, wrap)
+    _register(monkeypatch, _FakeEntryPoint("isaac", _launcher_cls(record)))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
     resolve_claude_launch("claude", ["--x"])
     assert seen == {"command": "claude", "args": ["--x"]}
 
 
-@pytest.mark.parametrize("spec", ["nocolon", ":nomod", "mod:", "", "   "])
-def test_malformed_spec_falls_back(monkeypatch, spec):
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, spec)
+def test_unknown_name_falls_back(monkeypatch):
+    _register(
+        monkeypatch,
+        _FakeEntryPoint("isaac", _launcher_cls(lambda command, args: ("isaac", []))),
+    )
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "nonexistent")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
-def test_import_error_falls_back(monkeypatch):
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "no_such_module_xyz:launch")
+def test_enumerate_error_falls_back(monkeypatch):
+    _register(monkeypatch, raise_on_enumerate=RuntimeError("boom"))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
-def test_missing_attr_falls_back(monkeypatch):
-    mod = types.ModuleType("fake_launcher_mod2")
-    monkeypatch.setitem(sys.modules, "fake_launcher_mod2", mod)
-    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "fake_launcher_mod2:missing")
+def test_load_error_falls_back(monkeypatch):
+    _register(monkeypatch, _FakeEntryPoint("isaac", ImportError("missing dep")))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
-def test_not_callable_falls_back(monkeypatch):
-    _register_plugin(monkeypatch, "not-callable")
+def test_instantiate_error_falls_back(monkeypatch):
+    class _Bad(ClaudeLauncher):
+        def __init__(self):
+            raise RuntimeError("ctor boom")
+
+        def launch(self, command, args):
+            return "isaac", ["--", *args]
+
+    _register(monkeypatch, _FakeEntryPoint("isaac", _Bad))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
+    assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
+
+
+def test_not_a_claude_launcher_falls_back(monkeypatch):
+    # A class that does NOT implement ClaudeLauncher must be rejected.
+    _register(monkeypatch, _FakeEntryPoint("isaac", object))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
@@ -80,7 +141,8 @@ def test_plugin_raises_falls_back(monkeypatch):
     def boom(command, args):
         raise RuntimeError("boom")
 
-    _register_plugin(monkeypatch, boom)
+    _register(monkeypatch, _FakeEntryPoint("isaac", _launcher_cls(boom)))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])
 
 
@@ -96,5 +158,6 @@ def test_plugin_raises_falls_back(monkeypatch):
     ],
 )
 def test_malformed_return_falls_back(monkeypatch, bad):
-    _register_plugin(monkeypatch, lambda command, args: bad)
+    _register(monkeypatch, _FakeEntryPoint("isaac", _launcher_cls(lambda command, args: bad)))
+    monkeypatch.setenv(CLAUDE_LAUNCHER_ENV_VAR, "isaac")
     assert resolve_claude_launch("claude", ["--x"]) == ("claude", ["--x"])

@@ -1,7 +1,7 @@
 """E2E: auth-aware Codex availability in the New Chat landing screen.
 
 The landing composer (``NewChatLandingScreen`` in
-``ap-web/src/shell/NewChatDialog.tsx``) warns — but does not block — when the
+``web/src/shell/NewChatDialog.tsx``) warns — but does not block — when the
 selected agent's harness is not ready on the selected host. For Codex the
 readiness signal is structured: the host's ``host.hello`` readiness map flows
 through ``host_store`` and ``GET /v1/hosts`` as a per-harness

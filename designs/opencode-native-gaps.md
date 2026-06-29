@@ -109,9 +109,9 @@ Key surfaces discovered (all confirmed present in 1.17.7):
 
 **1. "The compact button" = the `/compact` slash command.** There is no separate
 button. `/compact` is a built-in slash command in both the web composer
-(`ap-web` `BUILTIN_SLASH_COMMANDS["/compact"]`) and the REPL
+(`web` `BUILTIN_SLASH_COMMANDS["/compact"]`) and the REPL
 (`omnigent/repl/_repl.py` `@_cmd("/compact")`). The web sends it as
-`postEvent({type:"compact"})` (`ap-web/src/store/chatStore.ts:1253`) →
+`postEvent({type:"compact"})` (`web/src/store/chatStore.ts:1253`) →
 server `_COMPACT_TYPE` (`sessions.py`) → runner control dispatch
 (`runner/app.py` ~11523). The runner dispatch only branches on
 claude-native/codex-native; **opencode falls to a 204 no-op, so the server then

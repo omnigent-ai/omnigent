@@ -34,8 +34,11 @@ dependencies = [
     "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
-    "starlette>=0.27,<1",
+    "starlette>=1.0.1,<2",
     "uvicorn[standard]>=0.30,<1",
+    # websockets >=15 asyncio client hangs on macOS before emitting any handshake
+    # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
+    "websockets>=10.4,<15",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
@@ -139,12 +142,11 @@ openshell = ["openshell>=0.0.7,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<37"]
-# MLflow tracing is opt-in: tracing is disabled by default and the
-# server degrades gracefully when mlflow is absent, so the (heavy) mlflow
-# dependency only installs for users who want it (`omnigent[tracing]`).
-# Full `mlflow` (not the skinny `mlflow-tracing`) is required because the
-# default export path resolves a tracking store.
-tracing = ["mlflow>=3,<4"]
+# The tracing extra is now a no-op shim kept for backwards compatibility.
+# Tracing is built on OpenTelemetry directly (opentelemetry-exporter-otlp-*
+# are in the default install). `omnigent[tracing]` still works — it just
+# no longer pulls in the heavy mlflow dependency.
+tracing = []
 agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
@@ -170,18 +172,11 @@ databricks = [
     "opentelemetry-distro>=0,<1",
     "psycopg[binary]>=3.1,<4",
     # Databricks-specific MCP servers. Not imported by core Omnigent
-    # code, so it is opt-in here rather than a default dependency — this
-    # also keeps its heavy transitive `mlflow` out of bare OSS installs.
+    # code, so it is opt-in here rather than a default dependency.
     "databricks-mcp>=0.1.0",
-    # Managed Databricks deployments export traces, so they keep mlflow
-    # (bare OSS installs get it via the `tracing` extra instead).
-    "mlflow>=3,<4",
 ]
 dev = [
     "pytest>=7.0",
-    # mlflow is now opt-in (the `tracing` / `databricks` extras), but the
-    # telemetry + tracing test suites need it, so keep it in the dev set.
-    "mlflow>=3,<4",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -309,7 +304,7 @@ pythonpath = [".", "sdks/python-client", "sdks/ui"]
 markers = [
     "live: end-to-end tests requiring real LLM API key (run with --llm-api-key)",
     "live_app: end-to-end tests requiring a deployed Databricks App server",
-    "databricks: requires the `databricks` extra (psycopg / databricks-sdk / mlflow). Deselected on the standard lanes via -m 'not databricks'; runs only in the Pytest (databricks) lane, which installs the extra. Use for tests that build a postgresql+psycopg engine or call the Databricks SDK.",
+    "databricks: requires the `databricks` extra (psycopg / databricks-sdk). Deselected on the standard lanes via -m 'not databricks'; runs only in the Pytest (databricks) lane, which installs the extra. Use for tests that build a postgresql+psycopg engine or call the Databricks SDK.",
     "model(name, ...): one arg pins this test to that model overriding the suite-wide --model CLI default; multiple args fan the test out across all listed models via indirect parametrize.",
     "model_pinned: opt out of tests/_model_pools.py spreading and retry rotation; literal model strings are used as written.",
     "flaky(reruns=2, reruns_delay=0): rerun a nondeterministic test on failure (pytest-rerunfailures). Use for tests flaky due to timing/scheduling races (e.g. PTY drain timing), NOT real-LLM nondeterminism — those use llm_flaky, which rotates models per attempt.",
@@ -484,10 +479,6 @@ exclude = ["^omnigent/inner/databricks_mcps/google/", "^setup\\.py$"]
 # Incremental rollout: load imported modules for type info but don't
 # report their errors. Remove once every omnigent/ module is clean.
 follow_imports = "silent"
-
-[[tool.mypy.overrides]]
-module = "mlflow.*"
-ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "mcp.*"

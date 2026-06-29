@@ -3,7 +3,7 @@
 The right rail's Shells tab shows by default whenever the session agent
 declares a non-empty ``terminals:`` block — its empty state carries a
 virtual "+ New shell" row (``NewTerminalButton`` in
-``ap-web/src/shell/NewTerminalButton.tsx``). With a single declared
+``web/src/shell/NewTerminalButton.tsx``). With a single declared
 terminal name the row creates the shell directly on click (no dropdown),
 POSTing ``/resources/terminals`` and handing the new terminal's tab key
 to ``onExpand``, which opens it in the main column via

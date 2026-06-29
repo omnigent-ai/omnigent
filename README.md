@@ -100,8 +100,13 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
   harness CLI you pick.
   https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- **Kiro CLI** (optional), for `omnigent kiro`: install with
+  `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
+  Kiro tool approvals stay answerable in the embedded Terminal; supported
+  one-time approvals also appear as Chat cards. See
+  `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `hermes`, `pi`)
+  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`

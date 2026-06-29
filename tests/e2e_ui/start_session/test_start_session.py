@@ -1,7 +1,7 @@
 """E2E: starting a new session from the home composer ("/").
 
 The landing composer (``NewChatLandingScreen`` in
-``ap-web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
+``web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
 the textarea is the new session's first message and the footer chips —
 host, working directory, git worktree — plus the unified agent/harness
 picker supply every create parameter. The picker is a single dropdown
@@ -574,11 +574,12 @@ def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) 
     """Picking a model + reasoning effort rides along to the create call.
 
     For the Claude-native agent the config submenu shows a model/effort
-    picker that defaults to Claude Code's own "Sonnet / Medium". Selecting
-    "Opus" and "High" must (a) check those radios as immediate feedback and
-    (b) reach ``POST /v1/sessions`` as ``model_override: "opus"`` +
-    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
-    ``--effort`` at terminal launch).
+    picker that starts with NOTHING selected — no model/effort default is
+    forced, so an untouched picker omits the override and Claude Code keeps its
+    own configured model. Explicitly selecting "Opus" and "High" must (a) check
+    those radios as immediate feedback and (b) reach ``POST /v1/sessions`` as
+    ``model_override: "opus"`` + ``reasoning_effort: "high"`` (the runner reads
+    them as ``--model`` / ``--effort`` at terminal launch).
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
@@ -621,14 +622,16 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Claude Code auto-selects; open its config submenu, which carries the
-            # model + effort radio groups defaulting to Claude Code's effective
-            # defaults (Sonnet / Medium).
+            # model + effort radio groups. No default is forced, so both groups
+            # start with NOTHING checked — an untouched picker omits the override
+            # and Claude Code uses its own configured model. Verify the unselected
+            # default, then make an explicit pick.
             await _open_entry_config(page, "ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-model-sonnet")).to_have_attribute(
-                "aria-checked", "true"
+            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
+                "aria-checked", "false"
             )
             await expect(page.get_by_test_id("new-chat-landing-effort-medium")).to_have_attribute(
-                "aria-checked", "true"
+                "aria-checked", "false"
             )
 
             # Pick model and effort in SEPARATE submenu visits. Picking a knob

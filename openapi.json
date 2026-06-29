@@ -737,6 +737,17 @@
             "description": "Approximate token count of the summary text, for budget tracking, e.g. `342`.",
             "title": "Token Count",
             "type": "integer"
+          },
+          "window_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Id"
           }
         },
         "required": [
@@ -4370,7 +4381,7 @@
                 "type": "null"
               }
             ],
-            "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the ap-web UI and the TUI stay in sync.",
+            "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the web UI and the TUI stay in sync.",
             "title": "Model Override"
           },
           "parent_session_id": {
@@ -4867,7 +4878,7 @@
         "type": "object"
       },
       "SessionTerminalPendingEvent": {
-        "description": "Terminal spin-up status for a terminal-first session.\n\nTwo sources emit this event:\n\n1. The Omnigent server at `POST /v1/sessions` for host-launched\n   terminal-first sessions \u2014 the earliest possible point, before\n   the runner even starts, so the spinner appears immediately on\n   session create rather than after the runner boots.\n2. The Omnigent relay when the runner's `session.terminal_pending` frame\n   arrives \u2014 covers non-host-launched sessions (e.g. server-dispatched\n   sub-agents) and carries the authoritative `pending=False` clear\n   emitted by the runner's `finally` block.\n\nTogether they allow ap-web to show a spinner on the Terminal pill\nwhile the backend boots the terminal instead of a silent greyed-out\nbutton, and to distinguish \"still starting up\" from \"no terminal\"\n(killed or never created).",
+        "description": "Terminal spin-up status for a terminal-first session.\n\nTwo sources emit this event:\n\n1. The Omnigent server at `POST /v1/sessions` for host-launched\n   terminal-first sessions \u2014 the earliest possible point, before\n   the runner even starts, so the spinner appears immediately on\n   session create rather than after the runner boots.\n2. The Omnigent relay when the runner's `session.terminal_pending` frame\n   arrives \u2014 covers non-host-launched sessions (e.g. server-dispatched\n   sub-agents) and carries the authoritative `pending=False` clear\n   emitted by the runner's `finally` block.\n\nTogether they allow web to show a spinner on the Terminal pill\nwhile the backend boots the terminal instead of a silent greyed-out\nbutton, and to distinguish \"still starting up\" from \"no terminal\"\n(killed or never created).",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -4907,7 +4918,7 @@
         "type": "object"
       },
       "SessionTodosEvent": {
-        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets ap-web render a\nlive todo panel in the right column without polling.",
+        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -5596,7 +5607,7 @@
           },
           "silent": {
             "default": false,
-            "description": "When `True`, persist metadata changes but skip the runner-side side effects \u2014 specifically the native `/effort` / `/model` / Codex collaboration-mode forwards into the live runtime. Used by automatic bind-time handoffs (ap-web's sticky-pref apply on session switch, the REPL's pre-create `/model` snapshot) where injecting a visible slash command into a freshly-spawned pane would render as an unexpected \"Command model X\" item before the user has sent anything. Default `False` preserves the user-driven picker / `/model` behaviour where the live forward IS the desired feedback.",
+            "description": "When `True`, persist metadata changes but skip the runner-side side effects \u2014 specifically the native `/effort` / `/model` / Codex collaboration-mode forwards into the live runtime. Used by automatic bind-time handoffs (web's sticky-pref apply on session switch, the REPL's pre-create `/model` snapshot) where injecting a visible slash command into a freshly-spawned pane would render as an unexpected \"Command model X\" item before the user has sent anything. Default `False` preserves the user-driven picker / `/model` behaviour where the live forward IS the desired feedback.",
             "title": "Silent",
             "type": "boolean"
           },

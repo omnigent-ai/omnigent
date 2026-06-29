@@ -4,7 +4,7 @@
 **Supersedes:** [`cursor-native-tui-mirror-plan.md`](./cursor-native-tui-mirror-plan.md) (pane-scrape design)
 **Code:** `omnigent/cursor_native_permissions.py`, the `cursor-permission-request` hook in
 `omnigent/server/routes/sessions.py`, runner wiring in `omnigent/runner/app.py`,
-`ap-web/.../ApprovalCard.tsx`.
+`web/.../ApprovalCard.tsx`.
 
 ## Goal / behavior
 
