@@ -642,7 +642,7 @@ describe("Sidebar project sections", () => {
     expect(within(recentSection).getByText("conv_filed")).toBeInTheDocument();
   });
 
-  it("collapses all project folders at once and reopens the previously-open set", () => {
+  it("expands all project folders at once and reverts to the previously-open set", () => {
     projectsMock.push("Alpha", "Beta");
     mockConversations([
       conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
@@ -650,28 +650,89 @@ describe("Sidebar project sections", () => {
     ]);
     renderSidebar();
 
-    // No collapse-all control until at least one folder is open.
-    expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
-
-    // Open both folders.
-    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
-    fireEvent.click(screen.getByRole("button", { name: /^Beta/ }));
-    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "true");
-
-    // Collapse all → every folder folds, and the control flips to "reopen".
-    fireEvent.click(screen.getByTestId("collapse-all-projects"));
+    // Folders default collapsed, so "expand all" is offered up front.
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("collapse-all-projects")).toBeNull();
 
-    // Reopen previous → restores exactly the set that was open.
-    fireEvent.click(screen.getByTestId("reopen-previous-projects"));
+    // Open just one folder, then expand all → every folder opens and the
+    // control flips to "revert".
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    fireEvent.click(screen.getByTestId("expand-all-projects"));
     expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByTestId("expand-all-projects")).toBeNull();
+
+    // Revert to last state → restores exactly the set that was open before
+    // (only Alpha), not collapse-everything.
+    fireEvent.click(screen.getByTestId("revert-projects"));
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("reverts to a collapse-all when folders are all opened by hand (no last state)", () => {
+    // When every folder is open the control is "Revert to last state". If that
+    // full-expansion happened by hand (no "Expand all" click → no real last
+    // state), reverting collapses everything rather than restoring a stale set.
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([
+      conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_b", "Claude Code", { labels: { omni_project: "Beta" } }),
+    ]);
+    renderSidebar();
+
+    // Open every folder by hand → the control is revert (not expand-all).
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Beta/ }));
+    expect(screen.queryByTestId("expand-all-projects")).toBeNull();
+    expect(screen.getByTestId("revert-projects")).toBeInTheDocument();
+
+    // Revert with no remembered state → collapse all; expand-all returns.
+    fireEvent.click(screen.getByTestId("revert-projects"));
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+
+    // After expand-all, a manual collapse of one folder retires the snapshot, so
+    // the next full manual expansion reverts to collapse-all (not the stale set).
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    fireEvent.click(screen.getByTestId("expand-all-projects")); // snapshot = [Alpha]
+    fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // manual toggle clears it
+    fireEvent.click(screen.getByRole("button", { name: /^Beta/ })); // back to all open by hand
+    fireEvent.click(screen.getByTestId("revert-projects"));
+    expect(screen.getByRole("button", { name: /^Alpha/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: /^Beta/ })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("hides the expand-all control while the Projects group is collapsed", () => {
+    // With the whole "Projects" group folded, its folders aren't rendered, so
+    // expand-all / revert would be a no-op — the control must not show.
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([
+      conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_b", "Claude Code", { labels: { omni_project: "Beta" } }),
+    ]);
+    renderSidebar();
+
+    // Offered while the group is expanded (default).
+    expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
+
+    // Collapse the "Projects" group → control disappears.
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    expect(screen.queryByTestId("expand-all-projects")).toBeNull();
+    expect(screen.queryByTestId("revert-projects")).toBeNull();
+
+    // Re-expanding the group brings it back.
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    expect(screen.getByTestId("expand-all-projects")).toBeInTheDocument();
   });
 
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {

@@ -925,7 +925,14 @@ function ConversationList({
   // user has expanded — persisted across reloads. A project shows its rows only
   // while its name is in this set.
   const [expandedProjects, setExpandedProjects] = useState<string[]>(readExpandedProjectSections);
+  // True only while the open set was produced by "Expand all" and hasn't been
+  // touched since. This — not "do all folders happen to be open" — is what gates
+  // the revert affordance, so a user who opens every folder by hand (forced with
+  // a single project) never sees a "Revert to last state" button backed by an
+  // empty snapshot that would destructively collapse everything.
+  const [expandedViaButton, setExpandedViaButton] = useState(false);
   const toggleProjectExpanded = useCallback((projectName: string) => {
+    setExpandedViaButton(false);
     setExpandedProjects((prev) => {
       const next = prev.includes(projectName)
         ? prev.filter((n) => n !== projectName)
@@ -940,6 +947,7 @@ function ConversationList({
   const expandProject = useCallback((projectName: string) => {
     setExpandedProjects((prev) => {
       if (prev.includes(projectName)) return prev;
+      setExpandedViaButton(false);
       const next = [...prev, projectName];
       writeExpandedProjectSections(next);
       return next;
@@ -1042,23 +1050,31 @@ function ConversationList({
     [activeDrag, moveToProject, expandProject, onTogglePinned],
   );
 
-  // "Collapse all" folds every open project folder at once and remembers the
-  // set, so a follow-up "Reopen previous" restores exactly what was open
-  // (not every folder). The snapshot is session-only — not persisted.
-  const [reopenSnapshot, setReopenSnapshot] = useState<string[]>([]);
-  const collapseAllProjects = useCallback(() => {
+  // "Expand all" opens every project folder at once and remembers the set that
+  // was open beforehand, so a follow-up "Revert to last state" restores exactly
+  // what was open (not collapse-everything). The snapshot is session-only — not
+  // persisted.
+  const [revertSnapshot, setRevertSnapshot] = useState<string[]>([]);
+  const expandAllProjects = useCallback((allNames: string[]) => {
     setExpandedProjects((prev) => {
-      setReopenSnapshot(prev);
-      writeExpandedProjectSections([]);
-      return [];
+      setRevertSnapshot(prev);
+      setExpandedViaButton(true);
+      writeExpandedProjectSections(allNames);
+      return allNames;
     });
   }, []);
-  const reopenPreviousProjects = useCallback(() => {
+  // "Revert to last state" restores the set that was open before "Expand all".
+  // When there's no real last state — folders were opened by hand, not via the
+  // button (expandedViaButton is false, so any leftover snapshot is stale) — it
+  // collapses everything instead.
+  const revertProjects = useCallback(() => {
     setExpandedProjects(() => {
-      writeExpandedProjectSections(reopenSnapshot);
-      return reopenSnapshot;
+      const target = expandedViaButton ? revertSnapshot : [];
+      setExpandedViaButton(false);
+      writeExpandedProjectSections(target);
+      return target;
     });
-  }, [reopenSnapshot]);
+  }, [expandedViaButton, revertSnapshot]);
 
   // The project the currently-selected session is filed under, if any. Derived
   // as a primitive so the auto-expand effect below only fires when the
@@ -1205,37 +1221,60 @@ function ConversationList({
                 title="Projects"
                 collapsed={effectiveCollapsedSections.includes("Projects")}
                 onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                headerAction={
-                  expandedProjects.length > 0 ? (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Collapse all projects"
-                      data-testid="collapse-all-projects"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        collapseAllProjects();
-                      }}
-                    >
-                      <Minimize2Icon className="size-3.5" />
-                    </Button>
-                  ) : reopenSnapshot.length > 0 ? (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Reopen previous projects"
-                      data-testid="reopen-previous-projects"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        reopenPreviousProjects();
-                      }}
-                    >
-                      <Maximize2Icon className="size-3.5" />
-                    </Button>
-                  ) : null
-                }
+                headerAction={(() => {
+                  // The "Projects" group itself is collapsed: its folders aren't
+                  // rendered, so expand-all / revert would be a no-op — show no
+                  // control at all.
+                  if (effectiveCollapsedSections.includes("Projects")) return null;
+                  const allNames = sections.projectGroups.map((g) => g.name);
+                  // Once every folder is open the only useful move is to undo it,
+                  // so the control flips to "revert" — which restores the set open
+                  // before "Expand all", or collapses everything when there's no
+                  // real last state (folders opened by hand). Otherwise it expands.
+                  const allExpanded = allNames.every((n) => expandedProjects.includes(n));
+                  if (allExpanded) {
+                    return (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label="Collapse to previous"
+                            data-testid="revert-projects"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              revertProjects();
+                            }}
+                          >
+                            <Minimize2Icon className="size-3.5" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent side="bottom">Collapse to previous</TooltipContent>
+                      </Tooltip>
+                    );
+                  }
+                  return (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label="Expand all"
+                          data-testid="expand-all-projects"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            expandAllProjects(allNames);
+                          }}
+                        >
+                          <Maximize2Icon className="size-3.5" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom">Expand all</TooltipContent>
+                    </Tooltip>
+                  );
+                })()}
               >
                 {sections.projectGroups.map((group) => (
                   <ProjectFolder
@@ -1559,11 +1598,14 @@ function SectionGroup({
           onToggleCollapsed={onToggleCollapsed}
         />
         {headerAction && (
-          // Desktop-only, hover/focus-revealed: a group-level bulk control
-          // (e.g. "collapse all projects") is a pointer convenience, so it
-          // stays hidden until the header is hovered and never floats on
-          // touch viewports where there's no hover.
-          <div className="absolute top-0.5 right-1 hidden items-center transition-opacity md:flex md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100">
+          // Desktop-only, hover/keyboard-focus-revealed: a group-level bulk
+          // control (e.g. "expand all projects") is a pointer convenience, so it
+          // stays hidden until the header is hovered and never floats on touch
+          // viewports where there's no hover. Reveal on :focus-visible (keyboard)
+          // — NOT :focus-within — so clicking the button with the mouse doesn't
+          // leave it stuck visible: React reuses the same node when it swaps
+          // expand↔revert, so the clicked button keeps focus afterward.
+          <div className="absolute top-0.5 right-1 hidden items-center transition-opacity md:flex md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-hover/header:opacity-100">
             {headerAction}
           </div>
         )}
