@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from omnigent.runtime.tokenmaxx import TokenmaxxConfig
     from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
 
+    from omnigent.runtime.tokenmaxx import TokenmaxxConfig
     from omnigent.server.smart_routing import RoutingClient
     from omnigent.spec.types import LLMConfig, PolicySpec
 

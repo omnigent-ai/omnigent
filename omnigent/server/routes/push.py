@@ -86,9 +86,7 @@ def create_push_router(
             raise OmnigentError(
                 "endpoint and keys.{p256dh,auth} are required", code=ErrorCode.INVALID_INPUT
             )
-        sub = store.upsert(
-            generate_push_subscription_id(), user_id, body.endpoint, p256dh, auth
-        )
+        sub = store.upsert(generate_push_subscription_id(), user_id, body.endpoint, p256dh, auth)
         return {"id": sub.id, "object": "push_subscription"}
 
     @router.delete("/push/subscriptions")

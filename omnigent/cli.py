@@ -3066,6 +3066,7 @@ def server(
 
     # Tokenmaxx off-hours orchestrator (#11): parse the optional config block.
     from omnigent.runtime.tokenmaxx import parse_tokenmaxx_config
+
     # Web Push (#8): load/persist the server's stable VAPID key so a browser's
     # subscription survives restarts. The `vapid.subject` config is the JWT
     # contact (some push services require a real mailto/URL).

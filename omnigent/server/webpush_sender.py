@@ -53,9 +53,9 @@ async def notify_user_push(
     if not subs:
         return 0
 
-    payload = json.dumps(
-        {"title": title, "body": body, "navigatePath": navigate_path}
-    ).encode("utf-8")
+    payload = json.dumps({"title": title, "body": body, "navigatePath": navigate_path}).encode(
+        "utf-8"
+    )
 
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=30.0)

@@ -26,10 +26,14 @@ from omnigent.server.webpush import (
 # RFC 8291 §5 "Push Message Encryption Example" — verbatim base64url values.
 _RFC_PLAINTEXT = "V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24"
 _RFC_UA_PRIVATE = "q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94"
-_RFC_UA_PUBLIC = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"  # noqa: E501
+_RFC_UA_PUBLIC = (
+    "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+)
 _RFC_AUTH = "BTBZMqHH6r4Tts7J_aSIgg"
 _RFC_AS_PRIVATE = "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw"
-_RFC_AS_PUBLIC = "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"  # noqa: E501
+_RFC_AS_PUBLIC = (
+    "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+)
 _RFC_SALT = "DGv6ra1nlYgDCS1FRnbzlw"
 
 
@@ -42,8 +46,10 @@ def test_rfc8291_sender_key_handling() -> None:
     # the RFC's published sender public key — proves our key (de)serialization.
     from cryptography.hazmat.primitives import serialization
 
-    pub = _as_private_key(_RFC_AS_PRIVATE).public_key().public_bytes(
-        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    pub = (
+        _as_private_key(_RFC_AS_PRIVATE)
+        .public_key()
+        .public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
     )
     assert b64url_encode(pub) == _RFC_AS_PUBLIC
 
