@@ -3151,6 +3151,9 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.routes.schedules import create_schedules_router
+
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3168,6 +3171,15 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        # Schedules REST API (#6 loops & monitors). Mounted via the generic
+        # extra_routers seam so create_app's signature stays untouched.
+        extra_routers=[
+            (
+                create_schedules_router(schedule_store, auth_provider, permission_store),
+                "/v1",
+                ["schedules"],
+            ),
+        ],
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
