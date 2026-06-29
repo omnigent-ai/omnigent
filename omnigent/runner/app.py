@@ -4095,11 +4095,13 @@ async def _auto_create_antigravity_terminal(
         prepare_bridge_dir,
         seed_isolated_agy_home,
         write_bridge_state,
+        write_fork_preamble,
         write_mcp_config,
         write_tmux_target,
     )
     from omnigent.antigravity_native_launch import build_agy_launch
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 
     if server_client is None:
         raise RuntimeError("server_client is required for runner-owned Antigravity terminals.")
@@ -4148,10 +4150,16 @@ async def _auto_create_antigravity_terminal(
     # else the session id.
     labels = snapshot.get("labels")
     bridge_id = session_id
+    fork_carry_history = False
     if isinstance(labels, dict):
         _bid = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
         if isinstance(_bid, str) and _bid:
             bridge_id = _bid
+        # The fork route stamps this on a clone bound to a native harness that
+        # carries prior history (see _CURSOR_FORK_HISTORY_HARNESSES). agy can't
+        # rebuild a native transcript, so on a fresh fork it carries history as
+        # a text preamble replayed onto the first turn (see below).
+        fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
     # Cancel any surviving reader BEFORE clearing its conversation state, else it
     # keeps mirroring with stale state alongside the one spawned below (mirrors the
@@ -4161,6 +4169,33 @@ async def _auto_create_antigravity_terminal(
     # Clear stale turn/conversation state so the reader binds this run's real agy
     # conversation id (the cold-start mints it below) instead of a prior run's.
     clear_bridge_state(bridge_dir)
+
+    # A fork bound to antigravity-native carries history as a text preamble: agy
+    # owns its conversation store and exposes NO transcript-export / history-
+    # rebuild API, so a fork CANNOT reconstruct the native conversation the way
+    # claude/codex/pi/qwen-native do (those rebuild a resumable session file from
+    # the copied items). Instead — exactly like cursor-native — render the copied
+    # Omnigent items once and stash them; the executor prepends them to the fork's
+    # FIRST typed turn (text-prefix replay ONLY, NO native-conversation
+    # reconstruction). Only on a FRESH fork (``not resume``): a resumed agy
+    # conversation already holds its own history. Best-effort — a failure just
+    # starts the agy turn without the prior context.
+    if fork_carry_history and not resume and server_client is not None:
+        try:
+            from omnigent.claude_native import _fetch_all_session_items_for_claude_resume
+
+            fork_items = await _fetch_all_session_items_for_claude_resume(
+                server_client, session_id
+            )
+            await asyncio.to_thread(
+                write_fork_preamble, bridge_dir, _cursor_fork_history_preamble(fork_items)
+            )
+        except Exception:  # noqa: BLE001 — context carry-over is best-effort
+            _logger.warning(
+                "antigravity-native: could not build fork history preamble (session=%s).",
+                session_id,
+                exc_info=True,
+            )
 
     # Pre-accept agy's first-run onboarding wizard (HOME-global) before launch:
     # a host-spawned agy terminal has no TTY to answer it and would hang with a
@@ -4863,10 +4898,13 @@ def _cursor_fork_history_preamble(items: list[dict[str, Any]]) -> str:
     prefix on the fork's first message (text-prefix replay). Only user/assistant
     message text is replayed — cursor's TUI has no surface to import tool-call
     history or reconstruct native bubbles, so this formats the turns as a clean
-    speaker-labelled transcript (the closest single-block analog), mirroring the
-    antigravity executor's documented text-prefix fallback. The human framing +
-    strip sentinel are added by
-    :func:`omnigent.cursor_native_bridge.wrap_fork_preamble`.
+    speaker-labelled transcript (the closest single-block analog). SHARED with
+    antigravity-native, which has the same constraint (agy owns its conversation
+    store and exposes no transcript-export API) and replays this preamble onto
+    its first typed turn (see :func:`_auto_create_antigravity_terminal`); the
+    per-harness human framing + strip sentinel are added by
+    :func:`omnigent.cursor_native_bridge.wrap_fork_preamble` /
+    :func:`omnigent.antigravity_native_bridge.wrap_fork_preamble`.
 
     :param items: Committed Omnigent items (``GET /v1/sessions/{id}/items``),
         chronological.

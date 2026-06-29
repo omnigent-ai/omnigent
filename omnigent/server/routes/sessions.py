@@ -10007,9 +10007,21 @@ _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
 # _auto_create_cursor_terminal / cursor_native_executor and the opencode
 # resume/fork rehydration in _auto_create_opencode_terminal). opencode-native
 # joins cursor here: opencode has no history-import API, so a fork seeds prior
-# context as a noReply preamble rather than a rebuilt session.
+# context as a noReply preamble rather than a rebuilt session. antigravity-native
+# joins too: agy owns its conversation store and exposes no transcript-export /
+# history-rebuild API, so a fork replays the prior turns as a text preamble on
+# the first typed turn (see _auto_create_antigravity_terminal /
+# antigravity_native_executor). Both id spellings are listed because
+# canonicalize_harness passes the reversed native ids through unchanged.
 _CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset(
-    {"cursor-native", "native-cursor", "opencode-native", "native-opencode"}
+    {
+        "cursor-native",
+        "native-cursor",
+        "opencode-native",
+        "native-opencode",
+        "antigravity-native",
+        "native-antigravity",
+    }
 )
 
 
@@ -10045,15 +10057,17 @@ def _agent_carries_native_fork_history(agent: Agent) -> bool:
 def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     """Return whether *agent*'s native harness carries FORK history via preamble.
 
-    Cursor's conversation is server-backed and opencode has no history-import
-    API, so neither can seed a local store for a rebuilt resume; instead the
-    runner replays prior turns as a text preamble on the fork (cursor: the
-    first message; opencode: a ``noReply`` context message). Fork-only —
-    switch-agent does not call this, so switching into one still launches fresh.
-    Returns ``False`` when the bundle can't be loaded.
+    Cursor's conversation is server-backed, opencode has no history-import API,
+    and agy owns its conversation store with no transcript-export API, so none
+    can seed a local store for a rebuilt resume; instead the runner replays prior
+    turns as a text preamble on the fork (cursor / antigravity: the first typed
+    message; opencode: a ``noReply`` context message). Fork-only — switch-agent
+    does not call this, so switching into one still launches fresh. Returns
+    ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
-    :returns: ``True`` for the cursor-native / opencode-native harnesses.
+    :returns: ``True`` for the cursor-native / opencode-native /
+        antigravity-native harnesses.
     """
     from omnigent.harness_aliases import canonicalize_harness
 

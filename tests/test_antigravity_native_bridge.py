@@ -13,20 +13,27 @@ import omnigent.antigravity_native_bridge as _mod
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    FORK_HISTORY_CLOSE_TAG,
+    FORK_HISTORY_OPEN_TAG,
     AntigravityNativeBridgeState,
     agy_home_dir,
     build_antigravity_native_spawn_env,
     build_mcp_config,
     clear_bridge_state,
+    clear_fork_preamble,
     ensure_agy_onboarding_complete,
     inject_user_message_via_tui,
     prepare_bridge_dir,
     read_bridge_state,
+    read_fork_preamble,
     read_tmux_info,
     seed_isolated_agy_home,
     send_interaction_keys_via_tui,
+    strip_fork_history,
     update_conversation_id,
+    wrap_fork_preamble,
     write_bridge_state,
+    write_fork_preamble,
     write_mcp_bridge_config,
     write_mcp_config,
     write_tmux_target,
@@ -1215,3 +1222,80 @@ def test_send_interaction_keys_via_tui_rejects_empty_keys(tmp_path: Path) -> Non
     """No keys is a programming error, not an empty send-keys call."""
     with pytest.raises(RuntimeError, match="at least one key"):
         send_interaction_keys_via_tui(tmp_path / "bridge")
+
+
+# ---------------------------------------------------------------------------
+# Fork history via text-preamble replay
+# ---------------------------------------------------------------------------
+#
+# agy owns its conversation store and exposes no transcript-export / history-
+# rebuild API, so a fork CANNOT reconstruct the native conversation; instead it
+# replays the prior Omnigent transcript as a fenced text preamble on the first
+# typed turn (text-prefix replay ONLY — NO native-conversation reconstruction),
+# exactly like cursor-native. These mirror the cursor-native fork tests.
+
+
+class TestForkPreamble:
+    """The fork preamble file + sentinel framing (text-prefix replay)."""
+
+    def test_read_does_not_consume_clear_does(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "You: hi")
+        # Read is idempotent (the file survives) so a failed/retried inject can
+        # re-read it; only clear consumes.
+        assert read_fork_preamble(tmp_path) == "You: hi"
+        assert read_fork_preamble(tmp_path) == "You: hi"
+        clear_fork_preamble(tmp_path)
+        assert read_fork_preamble(tmp_path) is None
+
+    def test_empty_preamble_is_not_written(self, tmp_path: Path) -> None:
+        write_fork_preamble(tmp_path, "")
+        assert read_fork_preamble(tmp_path) is None
+
+    def test_read_missing_is_none_and_clear_is_noop(self, tmp_path: Path) -> None:
+        assert read_fork_preamble(tmp_path) is None
+        clear_fork_preamble(tmp_path)  # no file -> no error
+
+    def test_wrap_fences_preamble_before_user_text(self) -> None:
+        wrapped = wrap_fork_preamble("You: hi\n\nAssistant: yo", "do it")
+        assert wrapped.startswith(FORK_HISTORY_OPEN_TAG)
+        assert FORK_HISTORY_CLOSE_TAG in wrapped
+        # The user's real text follows the fenced block.
+        assert wrapped.endswith("do it")
+        assert wrapped.index(FORK_HISTORY_CLOSE_TAG) < wrapped.index("do it")
+
+    def test_wrap_defangs_sentinels_inside_preamble(self) -> None:
+        # A literal close tag in the replayed transcript must not produce a second
+        # real close tag inside the block (which would let the reader's strip stop
+        # early and leak history). The framed block holds exactly one pair.
+        wrapped = wrap_fork_preamble(f"You: see {FORK_HISTORY_CLOSE_TAG} here", "go")
+        assert wrapped.count(FORK_HISTORY_CLOSE_TAG) == 1
+        assert wrapped.count(FORK_HISTORY_OPEN_TAG) == 1
+        # The defanged form stays readable.
+        assert "[/omnigent_fork_history]" in wrapped
+
+
+class TestStripForkHistory:
+    """The reader's user-bubble strip: the fenced block must not be mirrored."""
+
+    def test_strips_whole_block_leaving_user_text(self) -> None:
+        wrapped = wrap_fork_preamble("You: hi\n\nAssistant: yo", "continue please")
+        # The RPC reader mirrors a USER_INPUT step as a user message; the fenced
+        # preamble must be removed so the copied history isn't duplicated.
+        assert strip_fork_history(wrapped) == "continue please"
+
+    def test_noop_when_no_sentinel(self) -> None:
+        assert strip_fork_history("just a normal turn") == "just a normal turn"
+
+    def test_strips_unterminated_block_to_end(self) -> None:
+        # A truncated paste with an open tag but no close strips to end-of-text
+        # (degrades gracefully) rather than mirroring the whole raw block.
+        text = f"{FORK_HISTORY_OPEN_TAG}\nprior stuff with no close"
+        assert strip_fork_history(text) == ""
+
+    def test_preserves_user_close_tag_after_real_close(self) -> None:
+        # The non-greedy first alternative stops at the FIRST close tag (always
+        # the real one, since the preamble is defanged to hold exactly one pair),
+        # so a literal CLOSE tag in the user's OWN text after the block survives.
+        wrapped = wrap_fork_preamble("You: hi", f"now do {FORK_HISTORY_CLOSE_TAG} this")
+        stripped = strip_fork_history(wrapped)
+        assert stripped == f"now do {FORK_HISTORY_CLOSE_TAG} this"
