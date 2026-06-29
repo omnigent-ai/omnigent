@@ -270,6 +270,20 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 # (2) gives each session its own config so concurrent sessions never clobber one
 # another. Known file-based OAuth markers are copied best-effort for platforms
 # whose agy auth provider uses them, but HOME is deliberately not relocated.
+#
+# WHY NOT RELOCATE HOME (#1477). An earlier isolation design pointed ``HOME`` at
+# the per-session tree. That broke auth on macOS: agy stores its OAuth token in
+# the OS keyring (verified against agy 1.0.12 — the binary's auth path is
+# ``keyring`` / "load token from keyring", NOT a ``~/.gemini`` file), and the
+# keyring item is bound to the real login HOME, so any relocated HOME stalled
+# every turn at the interactive OAuth prompt. The alternative of dropping HOME
+# isolation entirely on macOS (#1493) restored auth but reintroduced the
+# HOME-global ``mcp_config.json`` footgun (#1194) there — concurrent sessions
+# would clobber one another's relay config. ``--gemini_dir`` resolves both at
+# once: real HOME ⇒ keyring auth works on every platform; isolated gemini dir ⇒
+# per-session MCP config. Verified live (agy 1.0.12): ``agy --gemini_dir=<dir>``
+# materializes its ``antigravity-cli`` + ``config`` state under ``<dir>`` while
+# authenticating from the real-HOME keyring.
 _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
