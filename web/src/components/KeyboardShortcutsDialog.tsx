@@ -83,6 +83,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Previous session", keys: [MOD_KEY, UP] },
       { label: "Next session", keys: [MOD_KEY, DOWN] },
+      { label: "Jump to session (1–9)", keys: [MOD_KEY, ALT, "1…9"] },
     ],
   },
   {

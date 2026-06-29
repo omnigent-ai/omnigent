@@ -121,6 +121,7 @@ import { isConversationUnseen } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
+import { useDigitSessionHotkey } from "@/hooks/useDigitSessionHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { SettingsSidebarBody, useSettingsRoute } from "./settingsNav";
@@ -1208,6 +1209,9 @@ function ConversationList({
     ...visible("Shared with me", sections.shared),
   ];
   useSessionSwitchHotkey(orderedConversationIds, activeId);
+  // Cmd/Ctrl+Alt+1..9 jumps to the Nth visible session (browser-safe; works in
+  // the desktop app too — unlike the Electron-only plain-digit pinned hotkeys).
+  useDigitSessionHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
   // see the hook). Empty when the Pinned section is collapsed.
