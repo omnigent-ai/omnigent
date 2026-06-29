@@ -236,9 +236,8 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
         const anchorIdx = ids.indexOf(lastSelectedIdRef.current);
         const currentIdx = ids.indexOf(id);
         if (anchorIdx !== -1 && currentIdx !== -1) {
-          const [start, end] = anchorIdx < currentIdx
-            ? [anchorIdx, currentIdx]
-            : [currentIdx, anchorIdx];
+          const [start, end] =
+            anchorIdx < currentIdx ? [anchorIdx, currentIdx] : [currentIdx, anchorIdx];
           for (let i = start; i <= end; i++) {
             next.add(ids[i]);
           }
