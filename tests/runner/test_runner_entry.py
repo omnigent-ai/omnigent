@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import io
 import logging
 import os
@@ -11,11 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-
-# Import before any test monkeypatches httpx.AsyncClient: the MCP SDK evaluates
-# `httpx.AsyncClient | None` eagerly at import, which breaks if AsyncClient has
-# been replaced by a stub. Importing here resolves + caches it with the real type.
-import mcp.client.streamable_http  # noqa: F401
 import pytest
 
 from omnigent.runner._entry import (
@@ -36,6 +32,13 @@ from omnigent.runner._entry import (
     main,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+
+# Force-load the MCP streamable-http client before any test monkeypatches
+# httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
+# import, which TypeErrors if AsyncClient has been swapped for a stub. Loading it
+# here (via import_module, so there is no bound-but-unused import) resolves and
+# caches it with the real type.
+importlib.import_module("mcp.client.streamable_http")
 
 
 class _TrackingTerminalRegistry:
