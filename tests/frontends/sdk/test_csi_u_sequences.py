@@ -108,7 +108,10 @@ def test_csi_u_install_registers_special_keys() -> None:
     seqs = _ansi_sequences()
 
     assert seqs.get("\x1b[27u") == Keys.Escape
-    assert seqs.get("\x1b[127;5u") == Keys.ControlH  # Ctrl+Backspace
+    # Modified Backspace now deletes a WORD (Claude Code parity): both
+    # Option/Alt+Backspace (mod 3) and Ctrl+Backspace (mod 5) route to ControlW.
+    assert seqs.get("\x1b[127;3u") == Keys.ControlW  # Option/Alt+Backspace
+    assert seqs.get("\x1b[127;5u") == Keys.ControlW  # Ctrl+Backspace
     assert seqs.get("\x1b[127;2u") == Keys.Backspace  # Shift+Backspace
     assert seqs.get("\x1b[3;2~") == Keys.Delete  # Shift+Delete
     assert seqs.get("\x1b[13u") == Keys.ControlM  # plain Enter via CSI-u
