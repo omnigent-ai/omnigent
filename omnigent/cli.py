@@ -3158,6 +3158,8 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.routes.work_items import create_work_items_router
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3175,6 +3177,15 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        # Tasks/Work-Items REST API (#3). Mounted via the generic
+        # extra_routers seam so create_app's signature stays untouched.
+        extra_routers=[
+            (
+                create_work_items_router(work_item_store, auth_provider, permission_store),
+                "/v1",
+                ["work-items"],
+            ),
+        ],
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
