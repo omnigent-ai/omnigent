@@ -2455,8 +2455,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
   if (sandboxLabel === undefined && !terminalSpinUp) {
     return null;
   }
-  const line =
-    sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up… getting your terminal ready.";
+  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -2470,7 +2469,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         description={
           sandboxLabel !== undefined
             ? "Setting up your sandbox — this can take a minute."
-            : "Getting your terminal ready — this can take a few seconds."
+            : "This can take a few seconds."
         }
       />
     );
