@@ -47,7 +47,7 @@ permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync`: this job never serves the bundle
+  # No web SPA build during `uv sync`: this job never serves the bundle
   # and the hardened runner has no npm mirror (build would time out).
   OMNIGENT_SKIP_WEB_UI: "true"
   # Pin the PyPI index for uv/pip resolution (same as ci.yml).

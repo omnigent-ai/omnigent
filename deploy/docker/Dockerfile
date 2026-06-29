@@ -58,10 +58,10 @@ ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=20
 
 # ── Web UI builder ──────────────────────────────────────
-# Builds the ap-web SPA so `docker build` works from a clean checkout —
-# no separate `cd ap-web && npm run build` step, no "SPA bundle missing"
+# Builds the web SPA so `docker build` works from a clean checkout —
+# no separate `cd web && npm run build` step, no "SPA bundle missing"
 # hard-fail. vite.config emits to ../omnigent/server/static/web-ui
-# (relative to ap-web/), so from /web/ap-web the bundle lands at
+# (relative to web/), so from /web/web the bundle lands at
 # /web/omnigent/server/static/web-ui, which the server builder overlays.
 # Server-only: the host target never reaches this stage.
 #
@@ -70,11 +70,11 @@ ARG NODE_VERSION=20
 FROM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
-WORKDIR /web/ap-web
+WORKDIR /web/web
 # Manifests first so the install layer caches across pure source edits.
-COPY ap-web/package.json ap-web/package-lock.json ./
+COPY web/package.json web/package-lock.json ./
 RUN npm install --no-audit --no-fund
-COPY ap-web/ ./
+COPY web/ ./
 RUN npm run build
 
 # ── Python builder (shared: server + host) ──────────────
@@ -139,7 +139,7 @@ ARG PYPI_INDEX_URL=https://pypi.org/simple
 # complete image. This replaces the old "prebuild or hard-fail" check.
 COPY --from=web-builder /web/omnigent/server/static/web-ui ./omnigent/server/static/web-ui
 RUN test -f ./omnigent/server/static/web-ui/index.html \
-    || (echo "ERROR: SPA bundle missing after web-builder stage — check the ap-web build." && exit 1)
+    || (echo "ERROR: SPA bundle missing after web-builder stage — check the web build." && exit 1)
 
 # psycopg[binary] is not a baseline dep — pulled in by the
 # [databricks] extra in pyproject — so add it explicitly here.

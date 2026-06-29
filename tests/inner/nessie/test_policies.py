@@ -370,7 +370,7 @@ def test_headless_subagent_purpose_guard_ignores_non_session_tools() -> None:
     "path,expected",
     [
         ("src/app.py", "ALLOW"),
-        ("ap-web/src/store/chatStore.ts", "ALLOW"),
+        ("web/src/store/chatStore.ts", "ALLOW"),
         ("/etc/passwd", "DENY"),
         ("~/.bashrc", "DENY"),
         ("../outside.py", "DENY"),

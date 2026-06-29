@@ -36,7 +36,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import secrets
 import uuid
 from collections import deque
@@ -108,34 +107,6 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
-
-
-def _finalize_trace_status(response_id: str) -> None:
-    """PATCH the trace status to OK on the MLflow server.
-
-    OTLP-ingested traces stay "In progress" because the server has
-    no signal that all spans have arrived. This call explicitly
-    marks the trace as complete after the OTel provider is flushed.
-    """
-    try:
-        from omnigent.runtime.telemetry import trace_id_from_response_id
-
-        trace_id = trace_id_from_response_id(response_id)
-        request_id = f"tr-{trace_id}"
-
-        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI") or os.environ.get(
-            "OTEL_EXPORTER_OTLP_ENDPOINT", ""
-        )
-        if not tracking_uri:
-            return
-        import httpx
-
-        httpx.Client(timeout=5).patch(
-            f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/traces/{request_id}",
-            json={"status": "OK"},
-        ).close()
-    except Exception:
-        _logger.debug("failed to finalize trace status", exc_info=True)
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -420,7 +391,7 @@ class ExecutorAdapter(HarnessApp):
                             from omnigent.runtime.telemetry import record_cancellation
 
                             record_cancellation(agent_span)
-                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                            tctx.end_agent_span(agent_span, response=None)
                             agent_span = None
                         await executor.interrupt_session(self._session_key)
                         return
@@ -437,7 +408,6 @@ class ExecutorAdapter(HarnessApp):
                                 tctx.end_tool_span(
                                     _active_tool_span,
                                     result=event.result,
-                                    status="ERROR" if event.error else "OK",
                                     error=event.error,
                                     duration_ms=event.duration_ms,
                                     parent_span=_active_tool_parent,
@@ -465,14 +435,13 @@ class ExecutorAdapter(HarnessApp):
                             from omnigent.runtime.telemetry import record_cancellation
 
                             record_cancellation(agent_span)
-                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                            tctx.end_agent_span(agent_span, response=None)
                         return
                     if isinstance(event, ExecutorError):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
                                 agent_span,
                                 response=None,
-                                status="ERROR",
                                 error=event.message,
                             )
                             agent_span = None
@@ -481,9 +450,7 @@ class ExecutorAdapter(HarnessApp):
             # End agent span on unhandled exceptions so it's not
             # left open (which would leak on the OTel provider).
             if tctx is not None and agent_span is not None:
-                tctx.end_agent_span(
-                    agent_span, response=None, status="ERROR", error="unhandled exception"
-                )
+                tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
                 agent_span = None
             raise
         finally:
@@ -510,7 +477,6 @@ class ExecutorAdapter(HarnessApp):
                         provider.force_flush(timeout_millis=5000)
                 except Exception:
                     pass
-                _finalize_trace_status(ctx.response_id)
             # Clear the per-turn pointers so a stray late callback
             # (e.g. one fired after the SDK's stream closed) sees
             # ``None`` and returns an explicit error rather than
@@ -928,7 +894,7 @@ class ExecutorAdapter(HarnessApp):
                 )
             )
         elif isinstance(event, ToolCallComplete):
-            # Paired function_call_output. Downstream consumers (ap-web
+            # Paired function_call_output. Downstream consumers (web
             # blockStream, runner persistence) pair results to requests
             # STRICTLY by call_id and discard empty ones — there is NO
             # positional correlation, so a ToolCallComplete that reaches

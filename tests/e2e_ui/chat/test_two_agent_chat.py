@@ -51,9 +51,9 @@ Beyond the relay itself, this journey covers the SPA's multi-agent surfaces,
 none of which any other UI test touches:
 
 - the `sys_session_send` tool call rendering in the transcript
-  (ap-web/src/components/blocks/ToolCard.tsx);
+  (web/src/components/blocks/ToolCard.tsx);
 - the right-rail Agents tab and SubagentsPanel child row + status dot
-  (ap-web/src/shell/SubagentsPanel.tsx);
+  (web/src/shell/SubagentsPanel.tsx);
 - navigation into the child's own `/c/<child-id>` session and back;
 - round 2: a follow-up relayed to the SAME child (named continuation —
   one child row after two rounds, the D6 ambient-hint behavior that was

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -87,12 +85,6 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             item.add_marker(skip_windows)
 
 
-# Tmpdir owned by *this* process (master or single worker) for the
-# isolated MLflow SQLite store. None when we honored a caller-supplied
-# `MLFLOW_TRACKING_URI` and didn't create one ourselves. Cleaned up
-# in `pytest_unconfigure`.
-_OWNED_MLFLOW_DIR: str | None = None
-
 # Per-worker progress log path; resolved from
 # ``PYTEST_PROGRESS_LOG_DIR`` in :func:`pytest_configure`. ``None``
 # when env var is unset (local dev).
@@ -100,37 +92,8 @@ _PROGRESS_LOG_PATH: str | None = None
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Isolate MLflow's tracking SQLite per pytest-xdist worker.
-
-    Without this, every worker reads/writes the same default MLflow
-    SQLite store. Two workers concurrently running alembic migrations
-    on first init race on `_alembic_tmp_*` table creation and one
-    crashes with `OperationalError: table already exists`.
-
-    Workers inherit the master process's environment, so the master's
-    `MLFLOW_TRACKING_URI` would propagate to every worker if we just
-    set it once. Instead we always set it in the worker (overriding
-    the inherited master value). Honor a caller-supplied URI only when
-    we're running outside xdist (no `PYTEST_XDIST_WORKER`).
-
-    Also resolves the per-worker progress log path used by the
-    test-start/finish hooks below.
-    """
-    global _OWNED_MLFLOW_DIR, _PROGRESS_LOG_PATH
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker_id is None:
-        # Master / serial run: respect caller-supplied URI.
-        if "MLFLOW_TRACKING_URI" not in os.environ:
-            worker_id = "master"
-            tmpdir = tempfile.mkdtemp(prefix=f"mlflow-{worker_id}-")
-            _OWNED_MLFLOW_DIR = tmpdir
-            os.environ["MLFLOW_TRACKING_URI"] = f"sqlite:///{tmpdir}/mlflow.db"
-    else:
-        # Workers always get their own DB; master's URI propagates
-        # otherwise and every worker collides.
-        tmpdir = tempfile.mkdtemp(prefix=f"mlflow-{worker_id}-")
-        _OWNED_MLFLOW_DIR = tmpdir
-        os.environ["MLFLOW_TRACKING_URI"] = f"sqlite:///{tmpdir}/mlflow.db"
+    """Resolve the per-worker progress log path and run guardrails."""
+    global _PROGRESS_LOG_PATH
 
     log_dir = os.environ.get("PYTEST_PROGRESS_LOG_DIR")
     if log_dir:
@@ -148,30 +111,16 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
     looks like a real (non-test) DB or a base URL aimed at a dev/prod host
     or port. Set ``OMNIGENT_DISABLE_TEST_GUARDRAILS=1`` to temporarily
     downgrade violations to warn-only for deliberate integration runs.
-
-    The resolved DB URI mirrors how a run would pick one: an explicit
-    ``OMNIGENT_DATABASE_URI`` wins (so pointing the suite at a real DB
-    warns loudly), else we fall back to the per-worker tmp MLflow SQLite
-    set just above — a representative throwaway DB that passes cleanly.
     """
     from omnigent.testing.guardrails import check_test_environment
 
-    db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or os.environ.get("MLFLOW_TRACKING_URI", "")
+    db_uri = os.environ.get("OMNIGENT_DATABASE_URI", "")
     base_url = config.getoption("--omnigent-server-url", default=None)
     check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=False)
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
-    """Remove the per-worker MLflow tmpdir created in pytest_configure.
-
-    `ignore_errors=True` because MLflow / SQLite may still hold open
-    file handles at session end; on POSIX the unlink-while-open
-    behavior is fine, but on Windows or NFS-style filesystems it can
-    surface as a noisy traceback. We don't want a cleanup hiccup to
-    fail the test session.
-    """
-    if _OWNED_MLFLOW_DIR is not None:
-        shutil.rmtree(_OWNED_MLFLOW_DIR, ignore_errors=True)
+    """Clean up per-session resources."""
 
 
 # Per-worker progress logger: fsync'd START/END lines so a

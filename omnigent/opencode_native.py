@@ -60,7 +60,7 @@ from omnigent.opencode_native_state import read_launch_state, write_launch_state
 _logger = logging.getLogger(__name__)
 
 # Built-in native-UI agent name (matches the descriptor's
-# ``wrapper_agent_name`` and the ap-web native registry).
+# ``wrapper_agent_name`` and the web native registry).
 _AGENT_NAME = "opencode-native-ui"
 
 

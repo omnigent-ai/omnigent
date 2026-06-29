@@ -32,6 +32,7 @@ from omnigent.inner.copilot_executor import (
     _resolve_reasoning_effort,
 )
 from omnigent.inner.executor import (
+    CompactionComplete,
     ExecutorConfig,
     ExecutorError,
     Message,
@@ -103,7 +104,7 @@ class _FakeSession:
     async def disconnect(self) -> None:
         self._state["session_closed"] += 1
 
-    def abort(self) -> None:
+    async def abort(self) -> None:
         self._state["aborted"] += 1
 
 
@@ -408,6 +409,89 @@ async def test_run_turn_streams_text_reasoning_and_usage(
     # github_token threaded to the client; unsubscribed after the turn.
     assert state["client_kwargs"][0]["github_token"] == "gho_x"
     assert state["unsub_calls"] >= 1
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_emits_compaction_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A successful SDK compaction surfaces as a CompactionComplete (before
+    # TurnComplete) so the runner persists a compaction item and a resumed
+    # session skips replaying the full transcript.
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("SESSION_COMPACTION_START", conversationTokens=120000),
+                _ev("ASSISTANT_USAGE", model="claude-haiku-4.5", inputTokens=5, outputTokens=1),
+                _ev(
+                    "SESSION_COMPACTION_COMPLETE",
+                    success=True,
+                    summaryContent="summary of the conversation so far",
+                    postCompactionTokens=4200,
+                    preCompactionTokens=120000,
+                    tokensRemoved=115800,
+                    messagesRemoved=42,
+                ),
+                _ev("ASSISTANT_MESSAGE_DELTA", deltaContent="done"),
+                _ev("ASSISTANT_MESSAGE", content="done"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    events = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+    comps = [e for e in events if isinstance(e, CompactionComplete)]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(comps) == 1
+    assert comps[0].summary == "summary of the conversation so far"
+    assert comps[0].token_count == 4200
+    assert comps[0].model == "claude-haiku-4.5"
+    assert comps[0].compacted_messages is None
+    # CompactionComplete must precede TurnComplete (runner persists it first).
+    assert events.index(comps[0]) < events.index(completes[0])
+    assert completes and completes[0].response == "done"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_without_summary_uses_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No summaryContent -> synthetic placeholder; missing postCompactionTokens -> 0.
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("SESSION_COMPACTION_COMPLETE", success=True),
+                _ev("ASSISTANT_MESSAGE", content="ok"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    events = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+    comps = [e for e in events if isinstance(e, CompactionComplete)]
+    assert len(comps) == 1
+    assert comps[0].summary.startswith("[GitHub Copilot compaction")
+    assert comps[0].token_count == 0
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_compaction_emits_no_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A failed/aborted compaction (success=False) must emit nothing.
+    _install_fake_copilot(
+        monkeypatch,
+        [
+            [
+                _ev("SESSION_COMPACTION_COMPLETE", success=False, error="compaction failed"),
+                _ev("ASSISTANT_MESSAGE", content="ok"),
+            ]
+        ],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    events = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+    assert not [e for e in events if isinstance(e, CompactionComplete)]
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes and completes[0].response == "ok"
     await ex.close()
 
 
@@ -899,9 +983,36 @@ async def test_interrupt_session_drops_and_recreates(monkeypatch: pytest.MonkeyP
     assert await ex.interrupt_session("unknown") is False  # no live session
     _ = [e async for e in ex.run_turn([_user("first")], [], "SYS")]
     assert await ex.interrupt_session("conv1") is True
+    assert state["aborted"] == 1  # SDK abort issued before teardown
+    assert state["session_closed"] >= 1  # session disconnected
     assert state["client_closed"] >= 1
     _ = [e async for e in ex.run_turn([_user("second")], [], "SYS")]
     assert len(state["create_kwargs"]) == 2  # session re-created after interrupt
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_aborts_then_drops_even_when_abort_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failing abort must NOT prevent the session teardown: interrupt still
+    # drops the session and the next turn rebuilds a fresh one.
+    state = _install_fake_copilot(
+        monkeypatch,
+        [[_ev("ASSISTANT_MESSAGE", content="one")], [_ev("ASSISTANT_MESSAGE", content="two")]],
+    )
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [e async for e in ex.run_turn([_user("first")], [], "SYS")]
+    sess = ex._session_states["conv1"].session
+
+    async def _boom() -> None:
+        raise RuntimeError("abort boom")
+
+    monkeypatch.setattr(sess, "abort", _boom)
+    assert await ex.interrupt_session("conv1") is True
+    assert state["client_closed"] >= 1
+    _ = [e async for e in ex.run_turn([_user("second")], [], "SYS")]
+    assert len(state["create_kwargs"]) == 2  # fresh session next turn
     await ex.close()
 
 

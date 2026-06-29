@@ -129,7 +129,7 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Composer status line: real model + context ring (Web UI).** For
   native-qwen the composer's model/effort chip is currently **hidden** (web UI
   flag `nativeVendorOwnsModel` in `chatStore.sessionBindingPatch` →
-  `ComposerStatusLine` in `ap-web/src/pages/ChatPage.tsx`). It was showing the
+  `ComposerStatusLine` in `web/src/pages/ChatPage.tsx`). It was showing the
   bound spec's *default* model (`claude-sonnet-4-6`) because the qwen-native-ui
   spec sets no model and qwen picks its model inside the vendor TUI (OpenAI-compat
   env / qwen's own `/model`), so Omnigent's `llmModel` was a misleading default.
@@ -245,9 +245,20 @@ comments; this is the *what*, not the *how*.)
   - *Full route:* spec with `executor.profile: <db-profile>` (or a
     `databricks-*` model), then `omni run`; confirm the runner log's
     `qwen gateway routing:` line shows the Databricks base URL + profile.
-- [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
-  defined by Omnigent aren't exposed to it (so they can't be invoked or
-  recorded). Permission gating on qwen's *own* tool calls already works.
+- [x] **Omnigent tools.** Qwen-native now exposes the shared Omnigent MCP relay
+  (`omnigent.claude_native_bridge serve-mcp`, `mcpServers.omnigent`,
+  `trust: true`) to qwen via the `--mcp-config <path>` launch flag (the
+  claude-native model). qwen connects to it on boot, `/mcp` lists it, and the
+  model can call Omnigent's builtin tools (`sys_*`, `load_skill`, `web_fetch`, …).
+  The config lives in the per-session bridge dir, **not** the workspace, so we
+  drop no file in the user's repo, concurrent same-workspace sessions can't
+  collide, and CLI-provided servers are ungated (no "Untrusted MCP server"
+  prompt → no pre-approval step). The token + config are written by
+  `qwen_native_bridge.write_mcp_config`; the live tool surface is advertised by
+  the `tool_relay.json` that `ensure_comment_relay` writes. The `bridge.json`
+  bearer token is written through `_ensure_secure_bridge_dir` (the same
+  owner-only ancestor validation the shared relay applies to token-bearing
+  trees). Permission gating on qwen's *own* tool calls already works.
 - [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
   file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
   What works today), so the bytes flow through Omnigent and the sandbox roots are

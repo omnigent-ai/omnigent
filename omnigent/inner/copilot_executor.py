@@ -60,6 +60,7 @@ from omnigent.reasoning_effort import COPILOT_EFFORTS, validate_effort
 
 from .datamodel import OSEnvSpec
 from .executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -618,6 +619,32 @@ class CopilotExecutor(Executor):
                 turn_error = str(
                     data.get("message") or data.get("errorMessage") or "copilot session error"
                 )
+            elif etype.endswith("SESSION_COMPACTION_COMPLETE"):
+                # The Copilot SDK auto-compacted the session's context window.
+                # Surface it as a CompactionComplete so the runner persists a
+                # compaction item and a resumed session gets the pre-compacted
+                # summary instead of replaying the full transcript (parity with
+                # claude-sdk / openai-agents). Only a *successful* compaction
+                # counts; ``success`` is False on a failed/aborted attempt.
+                if data.get("success"):
+                    post_tokens = data.get("postCompactionTokens")
+                    yield CompactionComplete(
+                        # Copilot uniquely reports the real summary text; fall
+                        # back to a synthetic placeholder like the peers do.
+                        summary=str(
+                            data.get("summaryContent")
+                            or "[GitHub Copilot compaction: context was automatically compacted]"
+                        ),
+                        # Post-compaction context size (same semantic as the
+                        # peers' ``context_tokens``).
+                        token_count=(
+                            int(post_tokens) if isinstance(post_tokens, (int, float)) else 0
+                        ),
+                        model=usage_model or model,
+                        # The event carries no message list; resume falls back to
+                        # the summary (allowed by the field's contract).
+                        compacted_messages=None,
+                    )
 
         try:
             while True:
@@ -704,9 +731,22 @@ class CopilotExecutor(Executor):
         state = self._session_states.get(session_key)
         if state is None:
             return False
-        # Drop the session so the next turn starts a fresh one — mirrors the
-        # cursor / pi executors (a resumed turn would bypass the runner's
-        # interrupt marker).
+        # Best-effort SDK abort first, to cleanly cancel the in-flight turn on
+        # the bundled CLI *before* teardown. ``session.abort()`` is the SDK's
+        # blessed cancel (it keeps the session valid), so it stops the next
+        # ``stop()`` from racing a live generation — which can orphan the CLI's
+        # tool subprocesses or dump a post-cancel stream. Mirrors pi / claude-sdk.
+        if state.session is not None:
+            try:
+                await asyncio.wait_for(state.session.abort(), timeout=0.5)
+            except Exception as exc:  # noqa: BLE001 — abort is best-effort
+                logger.debug("CopilotExecutor: interrupt abort failed: %s", exc)
+        # Always drop the session so the next turn starts a fresh one — mirrors
+        # the cursor / pi executors. A resumed Copilot session sends only the
+        # latest user message (see ``_build_copilot_prompt``), which would bypass
+        # the runner's "[System: interrupted]" marker and silently continue the
+        # abandoned request; a fresh session replays full history (marker
+        # included). See ``claude_sdk_executor.interrupt_session`` for the rationale.
         try:
             await self.close_session(session_key)
             return True

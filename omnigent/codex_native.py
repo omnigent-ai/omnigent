@@ -1910,6 +1910,30 @@ def _codex_rollout_records_from_session_items(
     for index, item in enumerate(items):
         if _session_item_response_id(item) in interrupted_response_ids:
             continue
+        # Compaction items carry the post-compaction context. Emit a
+        # Compacted rollout record and discard all prior records — the
+        # replacement_history replaces them.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                compacted_record: dict[str, Any] = {
+                    "timestamp": timestamp,
+                    "type": "compacted",
+                    "payload": {
+                        "message": item.get("summary", ""),
+                        "replacement_history": compacted_msgs,
+                    },
+                }
+                w_id = item.get("window_id")
+                if w_id is not None:
+                    compacted_record["payload"]["window_id"] = w_id
+                # Replace all prior response_item records — the
+                # replacement_history is the new context baseline.
+                # Keep only session_meta and turn_context records.
+                records = [r for r in records if r.get("type") in ("session_meta",)]
+                records.append(compacted_record)
+                seen_turn_ids.clear()
+            continue
         payload = _codex_response_item_from_session_item(item)
         if payload is None:
             continue

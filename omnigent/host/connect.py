@@ -714,6 +714,17 @@ class HostProcess:
                 "(the /v1/hosts tunnel route). Confirm you have access and that "
                 "the server is up to date, then retry. " + self._login_fix_hint()
             )
+        if status == 409:
+            return HostConnectError(
+                "Connection refused (HTTP 409): this machine is already "
+                "registered to a different account on this server, so the "
+                "account you authenticated as cannot claim it. This usually "
+                "means the host was first registered under another identity "
+                "(e.g. the single-user 'local' owner before the server "
+                "switched to accounts auth). Ask an administrator to remove "
+                "the existing host registration, or reset this machine's host "
+                "id, then retry. " + self._login_fix_hint()
+            )
         return HostConnectError(
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "

@@ -1,13 +1,13 @@
 """Desktop setup-page connect flow (Electron shell).
 
-The desktop shell's setup page (``ap-web/electron/setup/index.html``) is the
+The desktop shell's setup page (``web/electron/setup/index.html``) is the
 user-facing "connect to a server" screen. This exercises it in a real browser:
 the scheme-defaulting this change added means a bare (or ``/omnigent``)
 Databricks workspace URL now connects over https on the first click instead of
 tripping the unencrypted-http warning that the old http:// default produced.
 
 The setup page and the Electron main process share one module
-(``ap-web/electron/src/url.js``), loaded here as ``window.omnigentUrl``, so the
+(``web/electron/src/url.js``), loaded here as ``window.omnigentUrl``, so the
 same ``normalizeUrl`` the main process navigates with is also verified in the
 browser — coverage the web-only harness cannot otherwise reach.
 
@@ -23,8 +23,8 @@ from playwright.sync_api import Page, expect
 
 # Repo-root-relative path to the Electron setup page. Loading it via file://
 # resolves the page's relative ``<script src="../src/url.js">`` against
-# ap-web/electron/src/url.js, so window.omnigentUrl is the real shared module.
-_SETUP_PAGE = Path(__file__).resolve().parents[3] / "ap-web" / "electron" / "setup" / "index.html"
+# web/electron/src/url.js, so window.omnigentUrl is the real shared module.
+_SETUP_PAGE = Path(__file__).resolve().parents[3] / "web" / "electron" / "setup" / "index.html"
 
 # The setup page expects the Electron preload bridge (window.omnigentSetup),
 # which is absent in a plain browser. Stub it: getServerUrl/getRecentServers
@@ -115,7 +115,7 @@ def test_loopback_connects_over_http_without_warning(page: Page) -> None:
 def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
     """The shared url.js (also used by the main process) defaults the scheme.
 
-    The setup page loads ``ap-web/electron/src/url.js`` as
+    The setup page loads ``web/electron/src/url.js`` as
     ``window.omnigentUrl`` — the exact module the Electron main process uses to
     normalize the URL it navigates to. Exercising it here covers the
     main-process scheme logic the web-only e2e harness cannot otherwise reach.
