@@ -16,7 +16,13 @@ from omnigent.spec._omnigent_compat import (
     is_omnigent_yaml,
     load_omnigent_yaml,
 )
-from omnigent.spec.parser import expand_env_vars, parse, parse_default_policies, parse_server_llm
+from omnigent.spec.parser import (
+    expand_env_vars,
+    parse,
+    parse_default_mcp_servers,
+    parse_default_policies,
+    parse_server_llm,
+)
 from omnigent.spec.tar_utils import ExtractionError, extract_safe
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
@@ -84,6 +90,7 @@ __all__ = [
     "load",
     "materialize_bundle",
     "parse",
+    "parse_default_mcp_servers",
     "parse_default_policies",
     "parse_server_llm",
     "validate",

@@ -3369,6 +3369,47 @@ def parse_default_policies(
     return _parse_policies(raw, expand_env=expand_env) or []
 
 
+def parse_default_mcp_servers(
+    raw: dict[str, Any] | None,
+    *,
+    expand_env: bool = True,
+) -> list[MCPServerConfig]:
+    """
+    Parse the ``mcp_servers:`` mapping from the server ``--config`` YAML
+    into a list of :class:`MCPServerConfig` — server-wide MCP servers made
+    available to every session in addition to each agent's own declarations.
+
+    The YAML shape reuses the same inline grammar as ``type: mcp`` entries
+    in an agent spec's ``tools:`` block — a mapping keyed by server name,
+    each entry carrying ``type: mcp`` and either a ``url`` (http transport)
+    or a ``command`` (stdio transport):
+
+    .. code-block:: yaml
+
+        mcp_servers:
+          company_search:
+            type: mcp
+            url: https://mcp.company.com/sse
+            headers:
+              Authorization: "Bearer ${MCP_TOKEN}"
+
+    Returns an empty list when *raw* is ``None`` or an empty mapping — the
+    server starts up with no default MCP servers in that case (the default;
+    no behaviour change when the key is absent).
+
+    :param raw: The ``mcp_servers:`` value from the server config YAML, or
+        ``None`` when the key is absent.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        ``headers`` / ``env`` values. ``True`` for production; ``False``
+        for validation contexts where env vars may be unset.
+    :returns: Ordered list of :class:`MCPServerConfig`. Empty when *raw*
+        is ``None`` or ``{}``.
+    """
+    if not raw:
+        return []
+    return _parse_inline_mcp_servers(raw, expand_env=expand_env)
+
+
 def parse_server_llm(
     raw: dict[str, Any] | None,
     *,

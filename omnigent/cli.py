@@ -3046,7 +3046,11 @@ def server(
     # 7200 matches RuntimeCaps.execution_timeout default.
     effective_timeout = execution_timeout or cfg.get("execution_timeout") or 7200
 
-    from omnigent.spec import parse_default_policies, parse_server_llm
+    from omnigent.spec import (
+        parse_default_mcp_servers,
+        parse_default_policies,
+        parse_server_llm,
+    )
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
@@ -3087,6 +3091,7 @@ def server(
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
+        default_mcp_servers=parse_default_mcp_servers(cfg.get("mcp_servers")),
         llm=server_llm,
         routing_client=routing_client,
         tokenmaxx=parse_tokenmaxx_config(cfg.get("tokenmaxx")),

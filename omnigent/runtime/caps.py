@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
     from omnigent.runtime.tokenmaxx import TokenmaxxConfig
     from omnigent.server.smart_routing import RoutingClient
-    from omnigent.spec.types import LLMConfig, PolicySpec
+    from omnigent.spec.types import LLMConfig, MCPServerConfig, PolicySpec
 
 
 @dataclass
@@ -39,6 +39,12 @@ class RuntimeCaps:
         ``policies:`` key in the server ``--config`` YAML
         at startup. ``[]`` means no server-wide policies (the
         default — no behaviour change when the key is absent).
+    :param default_mcp_servers: Server-wide MCP servers made available
+        to every session in addition to the agent's own declarations.
+        Loaded from the ``mcp_servers:`` key in the server ``--config``
+        YAML at startup. ``[]`` (the default) means none — no behaviour
+        change when the key is absent. A session/agent server with the
+        same ``name`` takes precedence over a default of that name.
     :param llm: Server-level LLM configuration for policy
         functions. Parsed from the ``llm:`` key in the server
         ``--config`` YAML at startup. When present, a
@@ -64,6 +70,10 @@ class RuntimeCaps:
     # Stored as a list so the builder can append it without importing
     # the full GuardrailsSpec type at caps construction time.
     default_policies: list[PolicySpec] = field(default_factory=list)
+    # Populated from ``mcp_servers:`` in the server --config YAML.
+    # Server-wide MCP servers merged into every session's effective set
+    # (deduped by name; the agent's own server of a given name wins).
+    default_mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     # Populated from ``llm:`` in the server --config YAML.
     # Used by the policy engine builder to construct a shared
     # PolicyLLMClient for function policy callables.
