@@ -123,3 +123,39 @@ describe("FolderTree sorting", () => {
     expect(order).toEqual(["c.js", "a.md", "b.txt"]);
   });
 });
+
+describe("FolderTree file size / download alignment", () => {
+  it("overlays the download button on the file size so both share one slot", () => {
+    // The size label and the hover download button must occupy the same
+    // relative container: the size reserves the width and the button overlays
+    // it (absolute inset-0), so the button appears exactly where the size was.
+    renderTree({ files: [file("readme.md", 2048)] });
+
+    const size = screen.getByText("2.0 KB");
+    const slot = size.parentElement;
+    expect(slot).toHaveClass("relative");
+    // Size hides on hover but keeps its width to avoid a layout shift.
+    expect(size).toHaveClass("group-hover:invisible");
+
+    const download = screen.getByRole("button", { name: /download readme\.md/i });
+    // Button sits in an absolutely-positioned overlay inside the same slot.
+    const overlay = download.closest("span.absolute") as HTMLElement | null;
+    expect(overlay).not.toBeNull();
+    expect(slot).toContainElement(overlay);
+  });
+
+  it("renders the dirty-directory dot in a fixed-width slot matching the download column", () => {
+    // The directory status dot must align with the file rows' download button
+    // column, so it lives in a fixed-width (w-[22px]) centered container.
+    renderTree({
+      files: [dir("src")],
+      changedFiles: [
+        { path: "src/app.ts", name: "app.ts", status: "modified", bytes: 1, modified_at: null },
+      ],
+    });
+
+    const dot = screen.getByText("●");
+    const slot = dot.parentElement;
+    expect(slot).toHaveClass("w-[22px]");
+  });
+});
