@@ -53,7 +53,6 @@ TraceValue: TypeAlias = Any  # type: ignore[explicit-any]
 # OpenInference semantic conventions for span kinds.
 _SPAN_KIND_ATTR = "openinference.span.kind"
 _SPAN_KIND_AGENT = "AGENT"
-_SPAN_KIND_LLM = "LLM"
 _SPAN_KIND_TOOL = "TOOL"
 _SPAN_KIND_GUARDRAIL = "GUARDRAIL"
 
@@ -61,6 +60,14 @@ _SPAN_KIND_GUARDRAIL = "GUARDRAIL"
 _INPUT_VALUE = "input.value"
 _OUTPUT_VALUE = "output.value"
 _LLM_MODEL_NAME = "llm.model_name"
+
+# OTel GenAI semantic-convention attribute keys (Agent Spans + Tool Spans).
+# See https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
+_GEN_AI_OP_NAME = "gen_ai.operation.name"
+_GEN_AI_AGENT_NAME = "gen_ai.agent.name"
+_GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
+_GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+_TOOL_NAME = "tool.name"
 
 # ---------------------------------------------------------------------------
 # Global enable/disable
@@ -137,12 +144,21 @@ class TracingContext:
             if not parent.is_recording():
                 parent_ended = True
 
+        from omnigent.runtime.telemetry import parse_provider_name
+
         attrs: dict[str, str] = {
             _SPAN_KIND_ATTR: _SPAN_KIND_AGENT,
             "agent.name": agent_name,
+            _GEN_AI_OP_NAME: "invoke_agent",
+            _GEN_AI_AGENT_NAME: agent_name,
         }
         if model:
             attrs[_LLM_MODEL_NAME] = model
+            provider, model_name = parse_provider_name(model)
+            if provider:
+                attrs[_GEN_AI_PROVIDER_NAME] = provider
+            if model_name:
+                attrs[_GEN_AI_REQUEST_MODEL] = model_name
         if parent_ended and parent is not None:
             ctx = parent.get_span_context()
             if ctx is not None:
@@ -181,7 +197,10 @@ class TracingContext:
             context=ctx_carrier,
             attributes=attrs,
         )
-        span.set_attribute(_INPUT_VALUE, _truncate_str(user_message))
+        from omnigent.runtime.telemetry import should_capture_content
+
+        if should_capture_content():
+            span.set_attribute(_INPUT_VALUE, _truncate_str(user_message))
         if self._root_span is None:
             self._root_span = span
         self._current_span = span
@@ -198,7 +217,9 @@ class TracingContext:
             return
         from opentelemetry.trace import StatusCode
 
-        if response is not None:
+        from omnigent.runtime.telemetry import should_capture_content
+
+        if response is not None and should_capture_content():
             span.set_attribute(_OUTPUT_VALUE, _truncate_str(response))
         if error:
             span.set_attribute("error.message", error)
@@ -211,51 +232,6 @@ class TracingContext:
             self._current_span = self._inherited_parent
         elif span is self._current_span:
             self._current_span = self._inherited_parent
-
-    def start_llm_span(
-        self,
-        messages: list[Message] | None = None,
-        model: str | None = None,
-    ) -> Span:
-        """Begin an LLM span for an executor.run_turn call."""
-        from opentelemetry import trace
-
-        attrs: dict[str, str] = {_SPAN_KIND_ATTR: _SPAN_KIND_LLM}
-        if model:
-            attrs[_LLM_MODEL_NAME] = model
-
-        ctx_carrier = (
-            trace.set_span_in_context(self._current_span)
-            if self._current_span is not None
-            else None
-        )
-        span = _tracer().start_span(
-            name="llm_call",
-            context=ctx_carrier,
-            attributes=attrs,
-        )
-        truncated = _truncate_messages(messages)
-        span.set_attribute(_INPUT_VALUE, json.dumps(truncated))
-        return span
-
-    def end_llm_span(
-        self,
-        span: Span | None,
-        response_text: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        if span is None:
-            return
-        from opentelemetry.trace import StatusCode
-
-        if response_text is not None:
-            span.set_attribute(_OUTPUT_VALUE, _truncate_str(response_text))
-        if error:
-            span.set_attribute("error.message", error)
-            span.set_status(StatusCode.ERROR, error)
-        else:
-            span.set_status(StatusCode.OK)
-        span.end()
 
     def start_tool_span(
         self,
@@ -275,8 +251,12 @@ class TracingContext:
             context=ctx_carrier,
             attributes={_SPAN_KIND_ATTR: _SPAN_KIND_TOOL},
         )
-        span.set_attribute("tool.name", tool_name)
-        span.set_attribute(_INPUT_VALUE, _safe_serialize_str(tool_args))
+        from omnigent.runtime.telemetry import should_capture_content
+
+        span.set_attribute(_TOOL_NAME, tool_name)
+        span.set_attribute(_GEN_AI_OP_NAME, "execute_tool")
+        if should_capture_content():
+            span.set_attribute(_INPUT_VALUE, _safe_serialize_str(tool_args))
         self._current_span = span
         return span
 
@@ -292,7 +272,10 @@ class TracingContext:
             return
         from opentelemetry.trace import StatusCode
 
-        span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(result))
+        from omnigent.runtime.telemetry import should_capture_content
+
+        if should_capture_content():
+            span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(result))
         if duration_ms:
             span.set_attribute("duration_ms", duration_ms)
         if error:
@@ -327,7 +310,10 @@ class TracingContext:
                 "policy.phase": phase,
             },
         )
-        span.set_attribute(_INPUT_VALUE, _safe_serialize_str(content))
+        from omnigent.runtime.telemetry import should_capture_content
+
+        if should_capture_content():
+            span.set_attribute(_INPUT_VALUE, _safe_serialize_str(content))
         return span
 
     def end_policy_span(
