@@ -26,10 +26,10 @@ from omnigent.server.webpush import (
 # RFC 8291 §5 "Push Message Encryption Example" — verbatim base64url values.
 _RFC_PLAINTEXT = "V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24"
 _RFC_UA_PRIVATE = "q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94"
-_RFC_UA_PUBLIC = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+_RFC_UA_PUBLIC = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"  # noqa: E501
 _RFC_AUTH = "BTBZMqHH6r4Tts7J_aSIgg"
 _RFC_AS_PRIVATE = "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw"
-_RFC_AS_PUBLIC = "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+_RFC_AS_PUBLIC = "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"  # noqa: E501
 _RFC_SALT = "DGv6ra1nlYgDCS1FRnbzlw"
 
 
@@ -59,8 +59,11 @@ def test_rfc8291_encryption_vector() -> None:
         salt=b64url_decode(_RFC_SALT),
     )
     # Header is fully determined by the inputs; assert it exactly.
-    expected_header = b64url_decode(_RFC_SALT) + bytes.fromhex("00001000") + b"\x41" + b64url_decode(
-        _RFC_AS_PUBLIC
+    expected_header = (
+        b64url_decode(_RFC_SALT)
+        + bytes.fromhex("00001000")
+        + b"\x41"
+        + b64url_decode(_RFC_AS_PUBLIC)
     )
     assert body[: len(expected_header)] == expected_header
     # And the whole body must decrypt back to the RFC plaintext via the RFC's

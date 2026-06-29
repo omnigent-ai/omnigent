@@ -12,6 +12,7 @@ import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
+import { registerServiceWorker } from "./lib/webPush";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
 
@@ -40,6 +41,12 @@ void resolveIdentity();
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
+
+// Register the PWA service worker (manifest + Web Push, #8). Feature-detected
+// and best-effort — a register failure (e.g. non-secure context) must never
+// block app boot. Actual push subscription happens lazily once the user
+// grants notification permission (see useIdleNotifications).
+void registerServiceWorker().catch(() => {});
 
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the
