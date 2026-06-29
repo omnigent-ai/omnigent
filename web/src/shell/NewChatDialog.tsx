@@ -133,10 +133,10 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
 
 // Claude-native model + reasoning-effort defaults for the new-session
 // model/effort picker. These are Claude Code's own effective defaults, so a
-// fresh session shows "Sonnet Medium" and rides along as `model_override` /
+// fresh session shows "Opus Medium" and rides along as `model_override` /
 // `reasoning_effort` on the create. Effort levels mirror CLAUDE_NATIVE_EFFORT
 // _LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS server-side).
-const CLAUDE_NATIVE_DEFAULT_MODEL = "sonnet";
+const CLAUDE_NATIVE_DEFAULT_MODEL = "opus";
 const CLAUDE_NATIVE_DEFAULT_EFFORT = "medium";
 const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "low", label: "Low" },
