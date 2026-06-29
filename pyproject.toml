@@ -93,6 +93,7 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    "croniter>=6.2.2",
 ]
 
 [project.optional-dependencies]
