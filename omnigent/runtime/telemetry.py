@@ -214,6 +214,208 @@ _GEN_AI_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
 _GEN_AI_CACHE_READ_TOKENS = "gen_ai.usage.cache_read_input_tokens"
 _GEN_AI_CACHE_CREATION_TOKENS = "gen_ai.usage.cache_creation_input_tokens"
 
+# OTel GenAI metric instrument names. See
+# https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/
+_METRIC_TOKEN_USAGE = "gen_ai.client.token.usage"
+_METRIC_OPERATION_DURATION = "gen_ai.client.operation.duration"
+_METRIC_TOOL_DURATION = "omnigent.tool.duration"
+
+# Metric attribute keys
+_ATTR_TOKEN_TYPE = "gen_ai.token.type"
+
+# Lazy meter cache. Initialized on first record call; cleared by
+# tests via _reset_instrument_cache_for_tests.
+_meter = None
+_token_usage_histogram = None
+_operation_duration_histogram = None
+_tool_duration_histogram = None
+_tool_allowlist: frozenset[str] | None = None
+
+
+def _get_meter():
+    """Lazy-init the meter from the configured MeterProvider."""
+    global _meter
+    if _meter is None:
+        from opentelemetry import metrics as otel_metrics
+
+        _meter = otel_metrics.get_meter("omnigent.runtime.telemetry")
+    return _meter
+
+
+def _get_token_usage_histogram():
+    global _token_usage_histogram
+    if _token_usage_histogram is None:
+        _token_usage_histogram = _get_meter().create_histogram(
+            name=_METRIC_TOKEN_USAGE,
+            unit="{token}",
+            description="Number of input or output tokens used per LLM request.",
+        )
+    return _token_usage_histogram
+
+
+def _get_operation_duration_histogram():
+    global _operation_duration_histogram
+    if _operation_duration_histogram is None:
+        _operation_duration_histogram = _get_meter().create_histogram(
+            name=_METRIC_OPERATION_DURATION,
+            unit="s",
+            description="Wall-clock duration of a GenAI client operation (agent turn).",
+        )
+    return _operation_duration_histogram
+
+
+def _get_tool_duration_histogram():
+    global _tool_duration_histogram
+    if _tool_duration_histogram is None:
+        _tool_duration_histogram = _get_meter().create_histogram(
+            name=_METRIC_TOOL_DURATION,
+            unit="s",
+            description="Duration of a single tool call inside an agent turn.",
+        )
+    return _tool_duration_histogram
+
+
+def _get_tool_allowlist() -> frozenset[str] | None:
+    """
+    Read OMNIGENT_TOOL_METRIC_ALLOWLIST (comma-separated tool names)
+    once and cache. When set, tool names outside the allowlist bucket
+    to "_other" on the tool.duration metric to bound cardinality.
+    Returns None when unset (no bucketing).
+    """
+    global _tool_allowlist
+    if _tool_allowlist is None:
+        raw = os.environ.get("OMNIGENT_TOOL_METRIC_ALLOWLIST", "").strip()
+        if raw:
+            _tool_allowlist = frozenset(name.strip() for name in raw.split(",") if name.strip())
+    return _tool_allowlist
+
+
+def _bucket_tool_name(tool_name: str) -> str:
+    """Bucket non-allowlisted tool names to '_other' if allowlist is set."""
+    allowlist = _get_tool_allowlist()
+    if allowlist is None:
+        return tool_name
+    return tool_name if tool_name in allowlist else "_other"
+
+
+def _reset_instrument_cache_for_tests() -> None:
+    """
+    Public-named helper for test isolation: clears the lazy meter +
+    instrument caches so the next call rebinds against whatever
+    MeterProvider the test fixture installed.
+
+    Tests should call this in fixture teardown to avoid the singleton
+    meter leaking across tests.
+    """
+    global _meter, _token_usage_histogram, _operation_duration_histogram
+    global _tool_duration_histogram, _tool_allowlist
+    _meter = None
+    _token_usage_histogram = None
+    _operation_duration_histogram = None
+    _tool_duration_histogram = None
+    _tool_allowlist = None
+
+
+def record_token_usage_metric(
+    *,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
+    """
+    Emit gen_ai.client.token.usage histogram data points. One point
+    per non-None token count (input + output) with gen_ai.token.type
+    attribute distinguishing them.
+
+    Silent no-op on emission error (provider unset, exporter down,
+    bad value coerce). Operators see the silence via the
+    omnigent.telemetry.emission.failures counter, not via raised
+    exceptions in the request path.
+
+    :param input_tokens: Prompt-token count or None.
+    :param output_tokens: Completion-token count or None.
+    :param provider: gen_ai.provider.name attribute value (e.g.
+        "anthropic", "openai", "databricks"). Omitted when None.
+    :param model: gen_ai.request.model attribute value.
+    """
+    try:
+        histogram = _get_token_usage_histogram()
+        common: dict[str, str] = {}
+        if provider:
+            common["gen_ai.provider.name"] = provider
+        if model:
+            common["gen_ai.request.model"] = model
+        if input_tokens is not None:
+            try:
+                value = int(input_tokens)
+            except (TypeError, ValueError):
+                return
+            histogram.record(value, attributes={**common, _ATTR_TOKEN_TYPE: "input"})
+        if output_tokens is not None:
+            try:
+                value = int(output_tokens)
+            except (TypeError, ValueError):
+                return
+            histogram.record(value, attributes={**common, _ATTR_TOKEN_TYPE: "output"})
+    except Exception:
+        _logger.debug("token-usage metric emission failed", exc_info=True)
+
+
+def record_operation_duration_metric(
+    *,
+    duration_seconds: float,
+    provider: str | None = None,
+    model: str | None = None,
+    error_type: str | None = None,
+) -> None:
+    """Emit gen_ai.client.operation.duration histogram data point."""
+    try:
+        histogram = _get_operation_duration_histogram()
+        attributes: dict[str, str] = {"gen_ai.operation.name": "invoke_agent"}
+        if provider:
+            attributes["gen_ai.provider.name"] = provider
+        if model:
+            attributes["gen_ai.request.model"] = model
+        if error_type:
+            attributes["error.type"] = error_type
+        histogram.record(duration_seconds, attributes=attributes)
+    except Exception:
+        _logger.debug("operation-duration metric emission failed", exc_info=True)
+
+
+def record_tool_duration_metric(
+    *,
+    tool_name: str,
+    duration_seconds: float,
+    error_type: str | None = None,
+) -> None:
+    """Emit omnigent.tool.duration histogram data point with tool.name attr."""
+    try:
+        histogram = _get_tool_duration_histogram()
+        attributes: dict[str, str] = {"tool.name": _bucket_tool_name(tool_name)}
+        if error_type:
+            attributes["error.type"] = error_type
+        histogram.record(duration_seconds, attributes=attributes)
+    except Exception:
+        _logger.debug("tool-duration metric emission failed", exc_info=True)
+
+
+def shutdown_metrics() -> None:
+    """
+    Flush + shut down the MeterProvider on process exit so the
+    PeriodicExportingMetricReader (typically 60s) does not drop
+    accumulated data points. Register via atexit or FastAPI lifespan.
+    """
+    try:
+        from opentelemetry import metrics as otel_metrics
+
+        provider = otel_metrics.get_meter_provider()
+        if hasattr(provider, "shutdown"):
+            provider.shutdown(timeout_millis=5000)
+    except Exception:
+        _logger.debug("MeterProvider shutdown failed", exc_info=True)
+
 
 def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
     """
@@ -247,6 +449,20 @@ def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
         span.set_attribute(
             _GEN_AI_CACHE_CREATION_TOKENS, int(usage["cache_creation_input_tokens"])
         )
+
+    # Emit the matching gen_ai.client.token.usage metric data point so
+    # operators get per-key/per-model cost visibility without parsing
+    # spans. The provider + model attributes come from the agent span's
+    # gen_ai.provider.name / gen_ai.request.model which the executor
+    # adapter set in start_agent_span (PR #1050 wiring).
+    provider = span.attributes.get("gen_ai.provider.name") if span.attributes else None
+    model = span.attributes.get("gen_ai.request.model") if span.attributes else None
+    record_token_usage_metric(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        provider=str(provider) if provider else None,
+        model=str(model) if model else None,
+    )
 
 
 def record_error(span: Span, exc: BaseException) -> None:
@@ -607,3 +823,11 @@ def init() -> None:
         endpoint or "<none>",
         _capture_content,
     )
+
+
+# Atexit registration so PeriodicExportingMetricReader flushes
+# its buffer on process exit (default 60s interval would drop on
+# SIGTERM otherwise). Idempotent — shutdown_metrics swallows
+# double-call errors.
+import atexit as _atexit
+_atexit.register(shutdown_metrics)

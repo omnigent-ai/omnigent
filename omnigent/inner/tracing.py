@@ -212,12 +212,15 @@ class TracingContext:
         response: str | None,
         error: str | None = None,
     ) -> None:
-        """End an AGENT span."""
+        """End an AGENT span and emit the operation-duration metric."""
         if span is None:
             return
         from opentelemetry.trace import StatusCode
 
-        from omnigent.runtime.telemetry import should_capture_content
+        from omnigent.runtime.telemetry import (
+            record_operation_duration_metric,
+            should_capture_content,
+        )
 
         if response is not None and should_capture_content():
             span.set_attribute(_OUTPUT_VALUE, _truncate_str(response))
@@ -227,6 +230,28 @@ class TracingContext:
         else:
             span.set_status(StatusCode.OK)
         span.end()
+
+        # Emit gen_ai.client.operation.duration in seconds. Read the
+        # provider/model attrs the span carries (set in start_agent_span
+        # via parse_provider_name in PR #1050) so per-provider metrics
+        # are dimensionable.
+        try:
+            attributes = dict(span.attributes or {})
+            start_ns = getattr(span, "start_time", None) or span.start_time
+            end_ns = getattr(span, "end_time", None) or span.end_time
+            if start_ns and end_ns:
+                duration_s = (end_ns - start_ns) / 1_000_000_000
+                provider = attributes.get("gen_ai.provider.name")
+                model = attributes.get("gen_ai.request.model")
+                record_operation_duration_metric(
+                    duration_seconds=duration_s,
+                    provider=str(provider) if provider else None,
+                    model=str(model) if model else None,
+                    error_type="error" if error else None,
+                )
+        except Exception:
+            logger.debug("operation duration metric emission failed", exc_info=True)
+
         if span is self._root_span:
             self._root_span = None
             self._current_span = self._inherited_parent
@@ -272,7 +297,10 @@ class TracingContext:
             return
         from opentelemetry.trace import StatusCode
 
-        from omnigent.runtime.telemetry import should_capture_content
+        from omnigent.runtime.telemetry import (
+            record_tool_duration_metric,
+            should_capture_content,
+        )
 
         if should_capture_content():
             span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(result))
@@ -284,6 +312,20 @@ class TracingContext:
         else:
             span.set_status(StatusCode.OK)
         span.end()
+
+        # Emit omnigent.tool.duration in seconds.
+        try:
+            attributes = dict(span.attributes or {})
+            tool_name = str(attributes.get("tool.name", "_unknown"))
+            duration_s = (duration_ms / 1000.0) if duration_ms else 0.0
+            record_tool_duration_metric(
+                tool_name=tool_name,
+                duration_seconds=duration_s,
+                error_type="error" if error else None,
+            )
+        except Exception:
+            logger.debug("tool duration metric emission failed", exc_info=True)
+
         if span is self._current_span:
             self._current_span = parent_span
 
