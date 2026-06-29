@@ -21,6 +21,7 @@ import {
   CornerUpLeftIcon,
   CopyIcon,
   FileTextIcon,
+  FolderIcon,
   GitBranchIcon,
   GitForkIcon,
   ImageIcon,
@@ -102,11 +103,28 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findCodexModelOption } from "@/lib/codexNativeModels";
 import {
+  composerAttachmentKey,
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import {
+  buildMentionPreamble,
+  detectMentionAt,
+  type MentionItem,
+  mentionItemPath,
+  mentionMarkerFor,
+  type MentionState,
+  parseMentionToken,
+  rankMentionEntries,
+} from "@/lib/composerMentions";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+// Re-exported so existing tests importing these from "./ChatPage" keep working
+// after the pure helpers moved to the shared lib.
+export { detectMentionAt, mentionMarkerFor };
+export type { MentionItem, MentionState };
 import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -124,6 +142,12 @@ import {
   isSlashCommandText,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
+import { FileMentionMenu } from "@/components/FileMentionMenu";
+import {
+  useWorkspaceAllFiles,
+  useWorkspaceDirectory,
+  type WorkspaceFile,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import {
   IntelligentModelControl,
@@ -150,7 +174,10 @@ import {
   type CodexGoal,
 } from "@/components/codex";
 
-const ATTACHED_RE = /\[Attached:[^\]]*\]\s*/g;
+// Matches both wordings the native executors emit: "[Attached: <path>]"
+// (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
+// is the path. Global so all markers in a message are found / stripped.
+const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 
 function extractUserText(content: MessageContentBlock[]): string {
   return content
@@ -161,6 +188,39 @@ function extractUserText(content: MessageContentBlock[]): string {
     .join("")
     .replace(ATTACHED_RE, "")
     .trim();
+}
+
+/**
+ * Pull the paths out of the "[Attached: …]" markers an "@"-mention adds to a
+ * user message, so the bubble can show what was attached (the marker text
+ * itself is stripped from the rendered text by {@link extractUserText}). A
+ * trailing "/" marks a folder. Returns [] for ordinary messages.
+ */
+function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
+  const text = content
+    .filter(
+      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
+    )
+    .map((c) => c.text)
+    .join("");
+  const out: MentionItem[] = [];
+  for (const m of text.matchAll(ATTACHED_RE)) {
+    const raw = m[1].trim();
+    if (!raw) continue;
+    // Split a trailing ":start-end" line span back out so the chip can show
+    // it without truncation (it's the whole point of a partial-file attach).
+    const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
+    if (range) {
+      out.push({
+        path: range[1],
+        isDir: false,
+        lineRange: { start: Number(range[2]), end: Number(range[3]) },
+      });
+    } else {
+      out.push({ path: raw.replace(/\/$/, ""), isDir: raw.endsWith("/") });
+    }
+  }
+  return out;
 }
 
 // Leading whitespace + the command token, so the composer overlay can tint
@@ -2706,11 +2766,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
+  // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
+  // markers (no input_file block), so surface them as chips — otherwise the
+  // marker is stripped and the user can't see what they attached.
+  const mentionedChips = extractAttachedPaths(bubble.content);
   // Runtime-injected `[System: ...]` notifications (task completion,
   // timer firings, terminal idle) ride in on role=user. When the content
   // is a pure system marker — no attached images or files — swap the
   // normal bubble for a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0) {
+  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
   }
@@ -2800,6 +2864,32 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 >
                   <FileTextIcon className="size-3 shrink-0" />
                   <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
+                </span>
+              ))}
+            </div>
+          )}
+          {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
+          {mentionedChips.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1.5">
+              {mentionedChips.map((item) => (
+                <span
+                  key={mentionItemPath(item)}
+                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                >
+                  {item.isDir ? (
+                    <FolderIcon className="size-3 shrink-0" />
+                  ) : (
+                    <FileTextIcon className="size-3 shrink-0" />
+                  )}
+                  <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
+                    @{item.path}
+                    {item.isDir ? "/" : ""}
+                  </span>
+                  {item.lineRange && (
+                    <span className="shrink-0">
+                      :{item.lineRange.start}-{item.lineRange.end}
+                    </span>
+                  )}
                 </span>
               ))}
             </div>
@@ -3399,6 +3489,19 @@ export function Composer({
   // opens with matches the reset logic below pre-selects the first item (0)
   // so Tab/Enter complete it immediately.
   const [menuIndex, setMenuIndex] = useState(-1);
+  // Active "@"-file-mention being typed, plus its highlighted row and the
+  // workspace paths the user has already tagged. ``@``-mention is wired for
+  // the native coding-agent sessions (see ``mentionEnabled``): those harnesses
+  // run in the workspace and read a file from an "[Attached: …]" marker, so a
+  // tagged path is delivered by prepending that marker at send time — no
+  // upload, the agent reads the on-disk file directly.
+  // Active "@"-mention token (owned here; the shared useMentionBrowser hook
+  // owns the selection index, tagged chips, and attach/drill/keyboard glue).
+  const [mention, setMention] = useState<MentionState | null>(null);
+  // Attachments pushed in from outside the composer (e.g. the file viewer's
+  // "Attach to agent" button). Drained into ``mentionedItems`` below, then
+  // cleared from the store so they aren't re-applied.
+  const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -3409,6 +3512,7 @@ export function Composer({
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
+
   // Read-only when either the user lacks a write grant OR the session
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
@@ -3458,6 +3562,21 @@ export function Composer({
     conversationId,
     showCodexGoal,
   );
+  // "@"-file-mention is scoped to the native coding-agent harnesses: their
+  // vendor CLIs run in the workspace and read an on-disk file from an
+  // attachment marker the executor already emits. In-process SDK sessions
+  // get no mention menu, so the workspace listing is never fetched for them
+  // (``enabled`` gate below). Codex's marker says "Attached file:" while the
+  // others say "Attached:" — see ``mentionMarkerFor``. ``sessionHarness`` is
+  // already read above for the status-tray harness label.
+  // Derive from the canonical native-agent registry (which folds reversed
+  // spellings like ``native-pi``) rather than a literal harness-string compare,
+  // so the composer's "@" entry point can't split-brain from the file viewer's
+  // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
+  const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const workspaceFilesQuery = useWorkspaceAllFiles(conversationId ?? undefined, {
+    enabled: mentionEnabled,
+  });
   const valueRef = useRef(value);
   valueRef.current = value;
   const filesRef = useRef(files);
@@ -3553,8 +3672,6 @@ export function Composer({
   // Tint the `/skill` token blue while the draft reads as a slash command, so
   // the command shape is signalled as the user types it.
   const composerIsCommand = files.length === 0 && isSlashCommandText(value);
-  const hasDraft = value.trim().length > 0 || files.length > 0;
-  const showInterruptButton = isWorking && !hasDraft;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3588,6 +3705,100 @@ export function Composer({
     prevMenuMatchesRef.current = menuMatches;
     setMenuIndex(menuMatches.length > 0 ? 0 : -1);
   }
+
+  // "@"-mention is a drill-down file/folder browser. The token after "@"
+  // doubles as a path: text up to the last "/" is the directory being
+  // browsed; text after it filters that directory's entries. Opening a
+  // folder rewrites the token to "<dir>/" so the menu re-lists it — that
+  // is how nested files are reached (recursion via navigation, mirroring
+  // the terminal's git-tracked walk). At any level the user can attach a
+  // single file or the whole folder.
+  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
+  // Root listing reuses the gate's useWorkspaceAllFiles; a sub-directory
+  // uses the lazy per-dir hook (disabled — null path — at the root). Both
+  // return files AND directories with a ``type`` discriminator.
+  const mentionDirQuery = useWorkspaceDirectory(
+    conversationId ?? undefined,
+    mentionEnabled && mention && mentionDir ? mentionDir : null,
+  );
+  const mentionSourceEntries: WorkspaceFile[] = mentionDir
+    ? (mentionDirQuery.data ?? [])
+    : (workspaceFilesQuery.data?.data ?? []);
+  // Folders first, filtered by the typed segment, capped (see rankMentionEntries).
+  const mentionEntries: WorkspaceFile[] =
+    mentionEnabled && mention ? rankMentionEntries(mentionSourceEntries, mentionFilter) : [];
+  // True while a mention token is active but its listing hasn't resolved yet:
+  // the cold-boot root fetch, or a sub-directory's first load after drilling
+  // in. During this window ``mentionEntries`` is transiently empty (so the
+  // menu is closed), and a stray Enter must NOT fall through to ``submit`` and
+  // send the half-typed "@dir/" token as a chat message. A *settled*
+  // zero-match (e.g. "@notafile") is deliberately excluded — sending that
+  // literally is the user's intent.
+  const mentionListingPending =
+    mentionEnabled &&
+    mention != null &&
+    (mentionDir ? mentionDirQuery.isLoading : workspaceFilesQuery.isLoading);
+
+  // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
+  // state and the data source above stay here; everything stateful is shared
+  // so this composer and the launcher can't drift. ``setText`` also flags the
+  // draft dirty so attach/drill participate in draft persistence.
+  const {
+    mentionIndex,
+    mentionOpen,
+    mentionedItems,
+    setMentionedItems,
+    attachMention,
+    openMentionDir,
+    removeMentionedItem,
+    handleKeyDown: handleMentionKeyDown,
+    dismiss: dismissMention,
+  } = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries,
+    text: value,
+    setText: (next) => {
+      setValue(next);
+      dirtyRef.current = true;
+    },
+    textareaRef,
+    isMobile,
+  });
+
+  // Depends on mentionedItems (from the hook above), so it's computed here.
+  const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
+  const showInterruptButton = isWorking && !hasDraft;
+
+  // Drain externally-queued attachments (file viewer "Attach to agent") into
+  // the local mention chips, deduping against what's already tagged, then
+  // clear the store queue so they aren't re-applied. Placed after
+  // ``useMentionBrowser`` since it owns ``setMentionedItems``.
+  useEffect(() => {
+    if (pendingComposerAttachments.length === 0) return;
+    setMentionedItems((prev) => {
+      // Dedup against already-tagged chips AND within this batch (accumulate
+      // into ``seen`` as we go) so a duplicated queue can't double-apply.
+      const seen = new Set(prev.map(composerAttachmentKey));
+      const fresh: MentionItem[] = [];
+      for (const a of pendingComposerAttachments) {
+        const k = composerAttachmentKey(a);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        fresh.push(a);
+      }
+      return fresh.length > 0 ? [...prev, ...fresh] : prev;
+    });
+    useChatStore.getState().clearPendingComposerAttachments();
+    textareaRef.current?.focus();
+    // Defense-in-depth against the cross-session leak: if the composer unmounts
+    // while an entry is still queued (route change, panel close, the
+    // loading-conversation gate during a session switch), clear the queue so
+    // the next-mounted composer doesn't drain a stale chip. ``switchTo`` also
+    // resets the queue, but this closes the non-switch unmount paths too.
+    return () => useChatStore.getState().clearPendingComposerAttachments();
+    // setMentionedItems is a stable useState setter (from useMentionBrowser).
+  }, [pendingComposerAttachments, setMentionedItems]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -3782,8 +3993,13 @@ export function Composer({
 
   const submit = () => {
     const trimmed = value.trim();
-    // Allow send if there's text OR attached files.
-    if ((!trimmed && files.length === 0) || disabled || hasPendingElicitation) return;
+    // Allow send if there's text, attached files, OR "@"-tagged paths.
+    if (
+      (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
+      disabled ||
+      hasPendingElicitation
+    )
+      return;
 
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
@@ -3795,7 +4011,7 @@ export function Composer({
     // Anything else (unknown command, or a skill on a native-terminal
     // session where ``onSendSlashCommand`` is undefined) falls through to the
     // plaintext send path below.
-    if (isSlashCommandText(trimmed) && files.length === 0) {
+    if (isSlashCommandText(trimmed) && files.length === 0 && mentionedItems.length === 0) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
@@ -3856,7 +4072,14 @@ export function Composer({
             )
             .join("\n\n") + "\n\n"
         : "";
-    const messageText = quotePreamble + trimmed;
+    // Prepend each "@"-tagged path as an attachment marker on its own line —
+    // the same format the native executors emit for attachments and that
+    // title-seeding strips (_ATTACHMENT_MARKER_RE). Wording is harness-aware
+    // (codex says "Attached file:"). Folders carry a trailing "/" so the
+    // agent knows to open the directory. The native vendor reads the on-disk
+    // workspace file/folder from this marker; no upload happens.
+    const messageText =
+      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -3867,6 +4090,8 @@ export function Composer({
     setValue("");
     setFiles([]);
     setAttachmentError(null);
+    setMentionedItems([]);
+    setMention(null);
     onClearAllQuotes();
   };
 
@@ -3895,6 +4120,11 @@ export function Composer({
     if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
       return;
     }
+
+    // "@"-mention menu navigation (shared useMentionBrowser) — mutually
+    // exclusive with the slash menu below (a mention token can't also read as a
+    // "/"-command). Takes priority over history recall and submission.
+    if (handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -3928,6 +4158,10 @@ export function Composer({
     // newline (no Shift available on-screen) and Send must be tapped instead.
     if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
       e.preventDefault();
+      // The mention menu is briefly closed while its listing loads (see
+      // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
+      // token isn't sent as a chat message. The menu reopens when entries land.
+      if (mentionListingPending) return;
       submit();
       return;
     }
@@ -4048,6 +4282,19 @@ export function Composer({
             commands={slashCommands}
           />
         )}
+        {/* "@"-file-mention browser — native coding-agent sessions only.
+            Also shown (as a loading row) while the listing is still fetching,
+            so "@" isn't silently dead during runner cold-boot or a drill-in. */}
+        {(mentionOpen || mentionListingPending) && (
+          <FileMentionMenu
+            currentDir={mentionDir}
+            activeIndex={mentionIndex}
+            entries={mentionEntries}
+            loading={mentionListingPending}
+            onOpenDir={openMentionDir}
+            onAttach={attachMention}
+          />
+        )}
         {/* Quote chips — one per quoted selection, shown above the textarea */}
         {replyQuotes.length > 0 && (
           <div className="flex flex-col gap-1.5 px-4 pt-3 pb-0">
@@ -4103,6 +4350,16 @@ export function Composer({
               setValue(e.target.value);
               dirtyRef.current = true;
               if (commandError !== null) setCommandError(null);
+              // Recompute the active "@"-mention from the caret on every
+              // keystroke (native coding-agent sessions — ``mentionEnabled``).
+              setMention(
+                mentionEnabled
+                  ? detectMentionAt(
+                      e.target.value,
+                      e.target.selectionStart ?? e.target.value.length,
+                    )
+                  : null,
+              );
               // Treat user-driven changes as exiting recall mode. Recall-
               // driven setValue toggles `recallingRef` first so we skip the
               // reset for that one tick.
@@ -4116,6 +4373,14 @@ export function Composer({
               isComposingRef.current = false;
             }}
             onKeyDown={handleKeyDown}
+            onBlur={() => {
+              // Dismiss the "@"-mention menu when focus leaves the textarea
+              // (clicking a chip's ✕, the Send button, or another field).
+              // Menu rows ``preventDefault`` on mousedown so selecting an entry
+              // keeps focus and does NOT blur — this only fires for genuine
+              // focus-out, where the lingering menu would otherwise float.
+              dismissMention();
+            }}
             onPaste={handlePaste}
             onScroll={(e) => {
               // Keep the overlay's scroll position locked to the textarea's.
@@ -4182,6 +4447,41 @@ export function Composer({
         {attachmentError !== null && (
           <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
             {attachmentError}
+          </div>
+        )}
+        {/* "@"-mention chips — one per tagged workspace file/folder. Each is
+            delivered as a "[Attached: <path>]" marker at send time. */}
+        {mentionedItems.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+            {mentionedItems.map((item, i) => (
+              <span
+                key={mentionItemPath(item)}
+                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              >
+                {item.isDir ? (
+                  <FolderIcon className="size-3 shrink-0" />
+                ) : (
+                  <FileTextIcon className="size-3 shrink-0" />
+                )}
+                <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
+                  @{item.path}
+                  {item.isDir ? "/" : ""}
+                </span>
+                {item.lineRange && (
+                  <span className="shrink-0">
+                    :{item.lineRange.start}-{item.lineRange.end}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => removeMentionedItem(i)}
+                  className="ml-0.5 rounded-full hover:text-foreground"
+                  aria-label={`Remove ${item.path}`}
+                >
+                  <XIcon className="size-3" />
+                </button>
+              </span>
+            ))}
           </div>
         )}
         {/* Inline slash-command feedback: errors and /help output */}
