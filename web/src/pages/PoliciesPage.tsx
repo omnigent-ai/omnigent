@@ -11,7 +11,7 @@
  * themselves — client-side gating is just UX.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -32,6 +32,7 @@ import {
   type DefaultPolicy,
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { coercePolicyParams } from "@/lib/policyParams";
@@ -59,7 +60,7 @@ function AddDefaultPolicyDialog({
   const addPolicy = useAddDefaultPolicy();
 
   const entry = registry.find((r) => r.handler === selected);
-  const schema = entry?.params_schema as
+  const rawSchema = entry?.params_schema as
     | {
         properties?: Record<
           string,
@@ -68,7 +69,7 @@ function AddDefaultPolicyDialog({
             description?: string;
             default?: unknown;
             enum?: string[];
-            items?: { type?: string; enum?: string[] };
+            items?: { type?: string; enum?: string[]; "x-enum-source"?: string };
             uniqueItems?: boolean;
           }
         >;
@@ -76,7 +77,23 @@ function AddDefaultPolicyDialog({
       }
     | null
     | undefined;
-  const properties = schema?.properties ?? {};
+  const modelIds = useMemo(
+    () => CLAUDE_NATIVE_MODELS.map((m) => m.id),
+    [],
+  );
+  const properties = useMemo(() => {
+    const props = rawSchema?.properties ?? {};
+    if (!modelIds.length) return props;
+    const enriched: typeof props = {};
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.items?.["x-enum-source"] === "models" && !prop.items.enum) {
+        enriched[key] = { ...prop, items: { ...prop.items, enum: modelIds } };
+      } else {
+        enriched[key] = prop;
+      }
+    }
+    return enriched;
+  }, [rawSchema?.properties, modelIds]);
   const paramKeys = Object.keys(properties);
 
   function handleSelect(handler: string) {
