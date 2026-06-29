@@ -183,6 +183,29 @@ def _strip_mcp_tool_prefix(name: str) -> str:
     return name
 
 
+# Prefix of the local host-tool bridge (``sys_os_read`` / ``sys_os_write`` /
+# ``sys_os_edit`` / ``sys_os_shell``). These are the out-of-turn workspace
+# file/shell tools the inner SDK keeps firing AFTER a respawn-driven desync —
+# the #1026 evidence was 88 orphaned ``sys_os_shell`` callbacks in one session.
+# An orphaned host-tool callback is therefore the deterministic signature of a
+# generation that outlived its turn, so it escalates the Tier-1 self-heal on
+# the FIRST occurrence instead of waiting for the consecutive-orphan threshold.
+_HOST_TOOL_PREFIX = "sys_os_"
+
+
+def _is_host_tool(tool_name: str) -> bool:
+    """Whether *tool_name* is a local host-tool-bridge call (``sys_os_*``).
+
+    Accepts both the bare name the MCP-server callback receives and the
+    ``mcp__omnigent__sys_os_*`` wire form, so the check is robust to either
+    callsite.
+
+    :param tool_name: Tool name from the inner SDK's callback.
+    :returns: ``True`` for ``sys_os_*`` host tools.
+    """
+    return _strip_mcp_tool_prefix(tool_name).startswith(_HOST_TOOL_PREFIX)
+
+
 class ExecutorAdapter(HarnessApp):
     """
     :class:`HarnessApp` subclass that drives any inner
@@ -688,18 +711,28 @@ class ExecutorAdapter(HarnessApp):
         with contextlib.suppress(Exception):
             await executor.close()
 
-    async def _maybe_resync_on_orphan(self) -> None:
+    async def _maybe_resync_on_orphan(self, *, force: bool = False) -> None:
         """Tier-1 per-conversation SDK reset after repeated orphan callbacks.
 
-        Fires only once the consecutive-orphan counter crosses
+        Fires once the consecutive-orphan counter crosses
         :data:`_ORPHAN_RESYNC_THRESHOLD` (reset to zero at every ``run_turn``
-        start, so it measures orphans with no intervening clean turn). Drops
-        the cached inner executor — forcing the next turn to rebuild a fresh
-        client — and clears every stale turn slot under :attr:`_lock` so no
-        further callback can dispatch into a dead ctx.
+        start, so it measures orphans with no intervening clean turn) — OR
+        immediately when *force* is set. Drops the cached inner executor —
+        forcing the next turn to rebuild a fresh client — and clears every
+        stale turn slot under :attr:`_lock` so no further callback can dispatch
+        into a dead ctx.
+
+        ``force=True`` is passed for an orphaned HOST-tool (``sys_os_*``)
+        callback (#1026 gap 2): a host-tool orphan is the deterministic
+        signature of a generation that outlived its turn after a respawn, so
+        the executor is dropped on the FIRST one — interrupting the abandoned
+        generation at its source — rather than letting it flush dozens of
+        ``sys_os_shell`` orphans (the 88x storm in the issue evidence) until
+        the threshold trips. Without this, an out-of-turn host-tool dispatch
+        would keep returning the desync error for the rest of the session.
 
         Idempotent under concurrency: the :attr:`_resyncing` guard plus the
-        threshold check ensure a burst of simultaneous orphans triggers
+        threshold/force check ensure a burst of simultaneous orphans triggers
         exactly ONE reset (the rest observe ``_resyncing`` or the
         zeroed counter and no-op).
 
@@ -707,8 +740,11 @@ class ExecutorAdapter(HarnessApp):
         NOT done here: the adapter runs *inside* that subprocess and has no
         handle on the runner's process manager. The runner owns that
         escalation via ``_resync_turn_state`` → ``_cancel_inprocess_turn``.
+
+        :param force: Drop the executor on this orphan regardless of the
+            consecutive-orphan count (set for host-tool orphans).
         """
-        if self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
+        if not force and self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
             return
         if self._resyncing:
             return
@@ -716,8 +752,9 @@ class ExecutorAdapter(HarnessApp):
         try:
             async with self._lock:
                 # Re-check under the lock: a concurrent reset may have already
-                # zeroed the counter while we awaited the lock.
-                if self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
+                # zeroed the counter while we awaited the lock. ``force`` skips
+                # the count gate (a single host-tool orphan must still reset).
+                if not force and self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
                     return
                 _logger.error(
                     "runner_turn_context_desync: %d consecutive orphan callbacks; "
@@ -874,16 +911,23 @@ class ExecutorAdapter(HarnessApp):
             # classifier treat it as a non-retryable-forever desync (P2.11)
             # rather than looping.
             self._orphan_callback_count += 1
+            host_tool = _is_host_tool(tool_name)
             _logger.error(
                 "runner_turn_context_desync: tool callback fired with no active "
-                "turn context (tool=%s, consecutive_orphans=%d); returning error",
+                "turn context (tool=%s, host_tool=%s, consecutive_orphans=%d); "
+                "returning error",
                 tool_name,
+                host_tool,
                 self._orphan_callback_count,
             )
-            # P1.8: after N consecutive orphans with no intervening clean turn,
-            # force a Tier-1 per-conversation SDK reset so the conversation
-            # self-heals instead of flushing orphans until the subprocess dies.
-            await self._maybe_resync_on_orphan()
+            # #1026 gap 2: an out-of-turn HOST-tool (``sys_os_*``) callback is
+            # the deterministic respawn-desync signature, so force the Tier-1
+            # reset on the FIRST one — dropping the abandoned generation at its
+            # source so it stops flushing host-tool orphans (the 88x
+            # ``sys_os_shell`` storm) rather than erroring for the rest of the
+            # session. Non-host orphans keep the P1.8 consecutive-count gate: a
+            # single late straggler after a clean turn must not reset.
+            await self._maybe_resync_on_orphan(force=host_tool)
             return {
                 "error": "no active turn context for tool dispatch",
                 "code": "runner_turn_context_desync",

@@ -16,6 +16,7 @@ Covers the harness-subprocess half of the cross-process lifecycle-desync fix:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -36,6 +37,8 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent, TurnContext
 from omnigent.server.schemas import CreateResponseRequest
+
+_ADAPTER_LOGGER = "omnigent.runtime.harnesses._executor_adapter"
 
 
 class _FakeExecutor(Executor):
@@ -414,3 +417,131 @@ async def test_new_turn_registered_during_reset_survives() -> None:
         ToolResultEvent(type="tool_result", call_id="call_new", output="ok")
     )
     assert await asyncio.wait_for(fut, timeout=1.0) == "ok"
+
+
+# ── #1026 gap 2: out-of-turn host-tool (sys_os_*) self-heals on first orphan ──
+
+
+async def test_orphan_host_tool_callback_forces_immediate_resync(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Gap 2: ONE out-of-turn ``sys_os_*`` orphan drops the abandoned executor.
+
+    The #1026 storm was 88 orphaned ``sys_os_shell`` callbacks because the
+    Tier-1 self-heal only fired after ``_ORPHAN_RESYNC_THRESHOLD`` consecutive
+    orphans. A host-tool orphan is the deterministic respawn-desync signature,
+    so the watchdog now escalates on the FIRST one — interrupting the
+    generation at its source so it stops flushing host-tool orphans.
+
+    This is the proof BOTH directions hinge on: on stock code a single
+    ``sys_os_shell`` orphan leaves the executor cached (count == 1, no reset);
+    with the fix it is dropped immediately.
+    """
+    executor = _FakeExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._ensure_executor()
+    assert adapter._executor is executor
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER):
+        # A SINGLE out-of-turn host-tool dispatch (ctx is None).
+        result = await adapter._stable_tool_executor("sys_os_shell", {"command": "ls"})
+
+    # The call still safe-fails (no ctx to dispatch into) ...
+    assert result == {
+        "error": "no active turn context for tool dispatch",
+        "code": "runner_turn_context_desync",
+    }
+    # ... but the executor was dropped on the FIRST orphan (well below the
+    # consecutive-orphan threshold), and the counter reset.
+    assert _ORPHAN_RESYNC_THRESHOLD > 1, "fixture assumes the threshold is > 1"
+    assert adapter._executor is None
+    assert executor.close_calls == 1
+    assert executor.close_session_calls == 1
+    assert adapter._orphan_callback_count == 0
+    assert "forcing Tier-1 SDK reset" in caplog.text
+
+
+async def test_orphan_host_tool_mcp_prefixed_form_also_resyncs() -> None:
+    """Gap 2: the ``mcp__omnigent__sys_os_*`` wire form is recognized too."""
+    executor = _FakeExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._ensure_executor()
+
+    result = await adapter._stable_tool_executor("mcp__omnigent__sys_os_read", {"path": "/x"})
+
+    assert result["code"] == "runner_turn_context_desync"
+    assert adapter._executor is None
+    assert executor.close_calls == 1
+
+
+async def test_orphan_non_host_tool_keeps_threshold_gate() -> None:
+    """Gap 2 guard: a non-host orphan still waits for the consecutive threshold.
+
+    A single late ``Bash`` straggler after a clean turn must NOT drop the
+    executor — only host-tool orphans escalate immediately. This is the
+    negative control that proves the fast path is host-tool-scoped, not a
+    blanket threshold-of-1.
+    """
+    executor = _FakeExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._ensure_executor()
+
+    result = await adapter._stable_tool_executor("Bash", {"command": "ls"})
+
+    assert result["code"] == "runner_turn_context_desync"
+    # Non-host orphan: executor still cached, counter still climbing.
+    assert adapter._executor is executor
+    assert executor.close_calls == 0
+    assert adapter._orphan_callback_count == 1
+
+
+async def test_out_of_turn_host_tool_does_not_error_forever() -> None:
+    """Gap 2: repeated out-of-turn host-tool dispatches stay bounded + clean.
+
+    Each call returns a structured desync error (never raises, never hangs),
+    and every one re-triggers the immediate self-heal so a freshly-rebuilt
+    abandoned generation can never pile up unbounded the way the 88x storm
+    did. Proves the out-of-turn host-tool path recovers/defers cleanly rather
+    than erroring for the rest of the session.
+    """
+    adapter = ExecutorAdapter(executor_factory=lambda: _FakeExecutor())
+
+    for _ in range(_ORPHAN_RESYNC_THRESHOLD * 5):
+        # Each iteration rebuilds the cached executor (simulating the inner SDK
+        # still alive), then fires one out-of-turn host-tool orphan.
+        adapter._ensure_executor()
+        result = await adapter._stable_tool_executor("sys_os_shell", {"command": "ls"})
+        assert result["code"] == "runner_turn_context_desync"
+        # The self-heal dropped it again — never an unbounded pile-up.
+        assert adapter._executor is None
+        assert adapter._orphan_callback_count == 0
+
+
+async def test_host_tool_fast_resync_disabled_reproduces_pileup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NEGATIVE CONTROL (gap 2): without host-tool detection the storm returns.
+
+    Flip the smallest real toggle the fix reads — module-level
+    :func:`_is_host_tool` forced to ``False`` (pre-fix: host tools were not
+    special) — and the SAME ``sys_os_shell`` orphan falls back to the
+    consecutive-threshold gate, so a single one does NOT self-heal and the
+    counter climbs unbounded: the exact 88x pile-up #1026 reported.
+    """
+    import omnigent.runtime.harnesses._executor_adapter as _adapter_mod
+
+    monkeypatch.setattr(_adapter_mod, "_is_host_tool", lambda _name: False)
+
+    executor = _FakeExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    adapter._ensure_executor()
+
+    for _ in range(_ORPHAN_RESYNC_THRESHOLD - 1):
+        result = await adapter._stable_tool_executor("sys_os_shell", {"command": "ls"})
+        assert result["code"] == "runner_turn_context_desync"
+
+    # Below the threshold and NOT host-fast-tracked: executor still cached, the
+    # orphan count piled up instead of self-healing on the first call.
+    assert adapter._executor is executor
+    assert executor.close_calls == 0
+    assert adapter._orphan_callback_count == _ORPHAN_RESYNC_THRESHOLD - 1

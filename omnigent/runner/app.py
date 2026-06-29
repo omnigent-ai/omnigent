@@ -13025,7 +13025,7 @@ def create_runner_app(
         :param reason: Short machine reason for the desync, logged for ops,
             e.g. ``"verdict_delivery_channel_dead"``.
         """
-        _logger.error("resyncing turn state for %s: %s", conv_id, reason)
+        _logger.warning("resyncing turn state for %s: %s", conv_id, reason)
         _desynced_sessions.add(conv_id)
         # Clear the live-response marker up front so any concurrent mid-turn
         # forward sees no live turn and 204s instead of racing the cancel.
@@ -13127,10 +13127,48 @@ def create_runner_app(
         """
         await _resync_turn_state(conv_id, "verdict_delivery_channel_dead")
 
+    async def _resync_turn_state_on_harness_respawn(conv_id: str, reason: str) -> None:
+        """``HarnessProcessManager`` respawn hook adapter for ``_resync_turn_state``.
+
+        Fires when ``get_client`` tears down and respawns a conversation's
+        harness subprocess for a model or agent switch (``_on_harness_respawn``).
+        A respawn that lands while a turn is STILL bound on the runner side is
+        the deterministic #1026 desync: the inner generation is killed with the
+        subprocess, the runner's active-turn slot is never cleaned, and every
+        later inner-SDK callback orphans ("no active turn context"). Driving
+        ``_resync_turn_state`` here collapses recovery to respawn time instead
+        of waiting for the ``_ORPHAN_RESYNC_THRESHOLD`` backstop to trip.
+
+        GATED on ``conv_id in _active_turns``: a respawn BETWEEN turns (the
+        common ``/model`` case with no turn running) is normal and must NOT
+        publish a spurious desync ``failed`` or cancel anything. Only a respawn
+        that races a live turn needs recovery. ``_resync_turn_state`` is itself
+        idempotent, so a redundant signal collapses to one recovery.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param reason: Machine reason from the process manager, e.g.
+            ``"harness_respawn_model_switch"`` / ``"harness_respawn_agent_switch"``.
+        """
+        if conv_id not in _active_turns:
+            return
+        await _resync_turn_state(conv_id, reason)
+
     # Test seam: drive the desync recovery entry directly (the full
     # harness→runner verdict-POST-failure round-trip is impractical to script
     # in-process). Mirrors the active_turns / interrupted_sessions exposures.
     app.state.resync_turn_state = _resync_turn_state
+    # Test seam: drive the gated respawn→resync adapter directly (the real
+    # signal originates inside the process manager's ``get_client``).
+    app.state.resync_turn_state_on_harness_respawn = _resync_turn_state_on_harness_respawn
+    # Wire the deterministic respawn→resync hook: when the process manager
+    # respawns a conversation's harness for a model/agent switch, signal the
+    # runner so an in-flight turn is cancelled + resynced AT RESPAWN TIME
+    # rather than after the orphan-callback backstop trips (#1026 gap 1).
+    # ``hasattr`` guard: alternate/stub process managers (tests, embedded
+    # variants) need not implement the hook — they simply never signal a
+    # respawn desync and fall back to the orphan-callback backstop.
+    if process_manager is not None and hasattr(process_manager, "set_respawn_hook"):
+        process_manager.set_respawn_hook(_resync_turn_state_on_harness_respawn)
     # Test seam: simulate ``proxy_stream`` reaching its terminal bookkeeping
     # (e.g. after a successful interrupt) so tests can assert the publish-once
     # guard dedupes the desync ``failed`` against a competing ``idle``.

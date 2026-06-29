@@ -264,6 +264,13 @@ class _ChainProcessManager:
     def __init__(self) -> None:
         self._sessions: set[str] = set()
         self.consume_task: asyncio.Task[None] | None = None
+        # Receives the runner's gated respawn→resync adapter via the real
+        # ``create_runner_app`` wiring (mirrors the production
+        # ``HarnessProcessManager.set_respawn_hook`` surface).
+        self.respawn_hook: Any = None
+
+    def set_respawn_hook(self, hook: Any) -> None:
+        self.respawn_hook = hook
 
     async def get_client(self, conversation_id: str, harness: str, env: Any = None) -> Any:
         del harness, env
@@ -708,3 +715,310 @@ async def test_negative_control_runner_legacy_swallow_leaves_turn_wedged() -> No
     assert conv in app.state.active_turns
     assert _drain_status_events(app.state.session_event_queues, conv) == []
     assert conv not in app.state.desync_terminalized
+
+
+# ── #1026 gap 1: mid-turn model/agent switch respawn → resync at respawn time ──
+
+
+def _fake_entry(harness: str, model: str | None, returncode: int | None = None) -> Any:
+    """Build a ``_SubprocessEntry`` with a dead-simple fake process + client.
+
+    Avoids spawning a real subprocess so ``get_client``'s respawn branches can
+    be exercised in-process. ``returncode`` defaults to ``None`` (alive); set it
+    to exercise the crash-respawn branch.
+    """
+    from omnigent.runtime.harnesses.process_manager import _SubprocessEntry
+
+    class _FakeProc:
+        def __init__(self, rc: int | None) -> None:
+            self.returncode = rc
+
+    return _SubprocessEntry(
+        process=_FakeProc(returncode),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=None,  # type: ignore[arg-type]
+        harness=harness,
+        model=model,
+    )
+
+
+async def test_get_client_signals_resync_on_model_and_agent_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gap 1 (process-manager half): a model/agent-switch respawn fires the hook.
+
+    Drives the REAL :meth:`HarnessProcessManager.get_client` respawn branches
+    with ``_spawn_entry`` / ``_close_entry`` stubbed out (no real subprocess).
+    Proves the hook fires with the right reason for a model switch AND an agent
+    (harness) switch, and does NOT fire when nothing changed or on a crash
+    respawn (covered by the orphan backstop instead).
+    """
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+    signals: list[tuple[str, str]] = []
+
+    async def _hook(conv_id: str, reason: str) -> None:
+        signals.append((conv_id, reason))
+
+    pm.set_respawn_hook(_hook)
+
+    closed: list[Any] = []
+
+    async def _fake_close(entry: Any) -> None:
+        closed.append(entry)
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        return _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_switch"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+
+    # Seed a live entry on model-A.
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+
+    # 1) Model switch A -> B respawns and signals.
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == [(conv, "harness_respawn_model_switch")]
+    assert len(closed) == 1
+
+    # 2) Same model again: no respawn, no signal.
+    signals.clear()
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == []
+
+    # 3) Agent (harness) switch respawns and signals.
+    signals.clear()
+    await pm.get_client(conv, "openai-agents", env={})
+    assert signals == [(conv, "harness_respawn_agent_switch")]
+
+    # 4) Crash respawn (dead subprocess) does NOT signal — the orphan/teardown
+    #    backstop owns that path, and there is no live turn to interrupt.
+    signals.clear()
+    pm._entries[conv] = _fake_entry("openai-agents", None, returncode=1)
+    await pm.get_client(conv, "openai-agents", env={})
+    assert signals == []
+
+
+async def test_get_client_isolates_respawn_hook_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising respawn hook must NOT break harness acquisition.
+
+    The respawn→resync signal is best-effort: if the runner's resync adapter
+    throws, ``get_client`` must still return the freshly-spawned client (a turn
+    must not lose its harness purely because a recovery hint errored). The raise
+    is logged, never swallowed silently.
+    """
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    async def _boom_hook(conv_id: str, reason: str) -> None:
+        del conv_id, reason
+        raise RuntimeError("resync adapter blew up")
+
+    pm.set_respawn_hook(_boom_hook)
+
+    async def _fake_close(entry: Any) -> None:
+        del entry
+
+    spawned: list[Any] = []
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        entry = _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+        spawned.append(entry)
+        return entry
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_hook_boom"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runtime.harnesses.process_manager"):
+        # Model switch respawns → hook raises → must NOT propagate.
+        client = await pm.get_client(conv, harness, env={model_key: "model-B"})
+
+    # The freshly-spawned client was still handed back, and the entry registered.
+    assert spawned, "a respawn must have occurred"
+    assert client is spawned[-1].client
+    assert pm._entries[conv] is spawned[-1]
+    # The failure was logged (not silently swallowed).
+    assert "respawn resync hook failed" in caplog.text
+
+
+async def test_respawn_adapter_gates_on_active_turn() -> None:
+    """Gap 1 (runner gate): the respawn adapter only resyncs a LIVE turn.
+
+    A respawn between turns (the common ``/model`` case, no turn running) must
+    be a clean no-op — no spurious desync ``failed``. A respawn that races a
+    live turn drives the real ``_resync_turn_state``.
+    """
+    conv = "conv_respawn_gate"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    # The real wiring installed the gated adapter onto the process manager.
+    assert pm.respawn_hook is not None
+
+    # No active turn → no-op (no status published, nothing terminalized).
+    await pm.respawn_hook(conv, "harness_respawn_model_switch")
+    assert _drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+
+    # Active stream-mode turn → real resync clears the gate + publishes once.
+    app.state.active_turns[conv] = None
+    await pm.respawn_hook(conv, "harness_respawn_model_switch")
+    assert conv not in app.state.active_turns
+    statuses = _drain_status_events(app.state.session_event_queues, conv)
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+
+async def _run_respawn_chain(adapter: ExecutorAdapter) -> tuple[Any, str, asyncio.Task[None]]:
+    """Wire a real in-flight turn + buffered message, then fire the respawn hook.
+
+    Mirrors :func:`_run_three_factor_chain` but triggers recovery via the gap-1
+    respawn→resync hook (the process manager respawning a harness mid-turn for a
+    model switch) instead of the verdict-delivery drop. Returns ``(app, conv,
+    consume_task)``; the caller awaits the cancelled turn's teardown.
+    """
+    conv = "conv_respawn_chain"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    assert pm.respawn_hook is not None
+
+    # Factor #1: a REAL in-flight harness turn parking a REAL tool dispatch.
+    resp = await _start_turn_stream(adapter, _request("primary turn"))
+    consume_task: asyncio.Task[None] = asyncio.create_task(_drain_stream(resp.body_iterator))
+    pm.consume_task = consume_task
+    await _spin_until(lambda: _wedged_dispatch_call_id(adapter) is not None)
+    app.state.active_turns[conv] = None
+
+    # A continuation message buffers while the turn is in flight.
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        buffered = await client.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "message", "role": "user", "content": "after the switch"},
+        )
+    assert buffered.status_code == 202
+    assert app.state.session_message_buffers.get(conv)
+
+    # The process manager respawns the harness mid-turn (model switch) and fires
+    # the hook BEFORE any orphan callback accumulates — deterministic recovery,
+    # NOT the >=3-orphan backstop.
+    assert adapter._orphan_callback_count == 0
+    await pm.respawn_hook(conv, "harness_respawn_model_switch")
+    return app, conv, consume_task
+
+
+async def test_model_switch_mid_turn_orphan_burst_next_turn_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Gap 1+2 headline: mid-turn model switch → resync at respawn → recovers.
+
+    The real-session evidence: a model switch mid-turn cancelled the turn, then
+    98 ``no active turn context`` orphans fired (88 ``sys_os_shell``) and the
+    session never recovered. This proves the fixed path:
+
+    * the respawn hook drives ``_resync_turn_state`` at RESPAWN time (orphan
+      count is 0 when recovery starts — not the >=3 backstop);
+    * the in-flight stream sentinel is popped and recovery hands off to the
+      buffered continuation (no spurious desync ``failed``);
+    * an out-of-turn ``sys_os_shell`` orphan self-heals on the FIRST occurrence
+      (gap 2) instead of erroring for the rest of the session;
+    * a SUBSEQUENT real harness turn rebinds a live ctx and dispatches a tool to
+      a terminal ``TurnComplete``.
+    """
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER):
+        app, conv, consume_task = await _run_respawn_chain(adapter)
+
+        # Recovery at respawn: the stream sentinel was popped synchronously and
+        # the buffered continuation owns the terminal edge (no desync failed).
+        assert conv not in app.state.active_turns
+        await asyncio.gather(consume_task, return_exceptions=True)
+        await _spin_until(lambda: adapter._current_ctx is None)
+        statuses = _drain_status_events(app.state.session_event_queues, conv)
+        assert all(
+            s.get("error", {}).get("code") != _RUNNER_TURN_CONTEXT_DESYNC_CODE for s in statuses
+        ), statuses
+
+        # Gap 2: the out-of-turn host-tool orphan self-heals on the FIRST call.
+        adapter._ensure_executor()
+        out = await adapter._stable_tool_executor("sys_os_shell", {"command": "ls"})
+        assert out["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+        assert adapter._executor is None
+
+    assert "forcing Tier-1 SDK reset" in caplog.text
+
+    # ── A SUBSEQUENT REAL harness turn rebinds and DISPATCHES a tool to terminal. ──
+    cont_executor = _DispatchParkingExecutor(events=[TurnComplete(response="ok")])
+    adapter._executor_factory = lambda: cont_executor
+    cont_resp = await _start_turn_stream(adapter, _request("continuation work"))
+    cont_consume: asyncio.Task[None] = asyncio.create_task(_drain_stream(cont_resp.body_iterator))
+    await _spin_until(lambda: _wedged_dispatch_call_id(adapter) is not None)
+    cont_call_id = _wedged_dispatch_call_id(adapter)
+    assert cont_call_id is not None
+    await adapter._handle_tool_result_event(_tool_result(cont_call_id, "dispatched-live"))
+    await asyncio.gather(cont_consume, return_exceptions=True)
+    await _spin_until(lambda: adapter._current_ctx is None)
+    assert adapter._orphan_callback_count == 0
+
+
+async def test_respawn_without_hook_leaves_turn_wedged() -> None:
+    """NEGATIVE CONTROL (gap 1): no respawn signal → the turn stays wedged.
+
+    The pre-gap-1 behavior: a mid-turn respawn cancelled the subprocess but
+    NEVER signalled the runner, so the active-turn gate stayed set and the
+    buffered continuation never started — wedged until the orphan backstop.
+    Skipping the hook reproduces exactly that: the gate is still occupied and
+    no recovery happened.
+    """
+    conv = "conv_respawn_nohook"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+    app.state.session_message_buffers[conv] = [
+        {"content": "after the switch", "conversation_id": conv}
+    ]
+
+    # Pre-fix: the respawn does NOT signal resync (the hook is never invoked).
+    # The gate stays occupied and the buffered continuation is stranded.
+    assert conv in app.state.active_turns
+    assert _drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+    assert app.state.session_message_buffers.get(conv)
