@@ -12733,6 +12733,29 @@ def _mcp_input_required_response(
     return Response(content=body, media_type="application/json")
 
 
+def _encode_default_mcp_servers_header() -> str:
+    """Base64'd JSON of the server-wide default MCP servers (#4), or ``""``.
+
+    Conveyed on the agent-contents response so the runner merges these into the
+    spec it parses and caches. Every MCP execution path — the inner SDK loop,
+    the native-harness mcp config, and the runner proxy — reads
+    ``spec.mcp_servers``, so merging into the spec reaches all of them with a
+    single injection. Empty (header omitted) unless the operator configured
+    ``mcp_servers:`` in the server ``--config`` (the shared registry).
+    """
+    import base64
+    import json
+
+    from omnigent.runtime import get_caps
+    from omnigent.runtime.mcp_defaults import serialize_mcp_servers
+
+    defaults = get_caps().default_mcp_servers
+    if not defaults:
+        return ""
+    payload = json.dumps(serialize_mcp_servers(defaults)).encode("utf-8")
+    return base64.b64encode(payload).decode("ascii")
+
+
 async def _handle_mcp_tools_list(
     rpc_id: int | str | None,
     session_id: str,
@@ -19492,21 +19515,28 @@ def create_sessions_router(
                 "Agent bundle not found in artifact store",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        _contents_headers = {
+            "X-Agent-Version": str(agent.version),
+            "X-Agent-Name": agent.name,
+            # Provenance for the runner's env-expansion decision:
+            # session-scoped agents are
+            # tenant-uploaded and must NOT have ${VAR} expanded
+            # against the runner process env; template agents
+            # (session_id is None) are operator-authored and may.
+            # The runner fails safe (treats a missing header as
+            # session-scoped → no expansion).
+            "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
+        }
+        # Shared MCP registry (#4): convey the server-wide default MCP servers so
+        # the runner merges them into the spec it parses — reaching every MCP
+        # path (inner SDK loop, native harness, proxy). Omitted when none.
+        _default_mcp = _encode_default_mcp_servers_header()
+        if _default_mcp:
+            _contents_headers["X-Default-Mcp-Servers"] = _default_mcp
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
-            headers={
-                "X-Agent-Version": str(agent.version),
-                "X-Agent-Name": agent.name,
-                # Provenance for the runner's env-expansion decision:
-                # session-scoped agents are
-                # tenant-uploaded and must NOT have ${VAR} expanded
-                # against the runner process env; template agents
-                # (session_id is None) are operator-authored and may.
-                # The runner fails safe (treats a missing header as
-                # session-scoped → no expansion).
-                "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
-            },
+            headers=_contents_headers,
         )
 
     @router.put(

@@ -584,6 +584,39 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+def _merge_server_default_mcp_servers(spec, header_value):
+    """Merge the server's shared-registry default MCP servers (#4) into ``spec``.
+
+    The agent-contents response carries ``RuntimeCaps.default_mcp_servers`` as a
+    base64'd JSON header (see the server's ``_encode_default_mcp_servers_header``).
+    Folding them into the parsed spec here is the single injection that reaches
+    every MCP path, since they all read ``spec.mcp_servers`` — the inner SDK
+    loop, the native-harness mcp config, and the runner proxy. No-op when the
+    header is absent; a malformed header is logged and ignored (fail open — a
+    bad default must not break spec resolution).
+
+    :param spec: The freshly-parsed :class:`AgentSpec`.
+    :param header_value: The raw ``X-Default-Mcp-Servers`` header, or ``None``.
+    :returns: ``spec`` unchanged, or a copy with the defaults merged in.
+    """
+    if not header_value:
+        return spec
+    import base64
+    import json
+
+    from omnigent.runtime.mcp_defaults import (
+        deserialize_mcp_servers,
+        merge_default_mcp_servers,
+    )
+
+    try:
+        raw = json.loads(base64.b64decode(header_value))
+    except Exception:  # noqa: BLE001 — a malformed default header must not break resolution
+        _logger.warning("ignoring malformed X-Default-Mcp-Servers header", exc_info=True)
+        return spec
+    return merge_default_mcp_servers(spec, deserialize_mcp_servers(raw))
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -654,6 +687,9 @@ async def _resolve_agent_spec_from_server(
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    # Shared MCP registry (#4): fold any server-wide default MCP servers
+    # (conveyed as a header) into the spec so every MCP path picks them up.
+    spec = _merge_server_default_mcp_servers(spec, resp.headers.get("X-Default-Mcp-Servers"))
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
