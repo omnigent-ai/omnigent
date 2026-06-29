@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import secrets
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -13,12 +15,15 @@ from pathlib import Path
 
 import tomllib
 
+from omnigent.inner.terminal import _process_alive as _owner_pid_alive
+
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
 
 _STATE_FILE = "state.json"
 _STARTUP_ERROR_FILE = "startup_error.json"
+_OWNER_PID_FILENAME = "owner.pid"
 # Must match ``_CONFIG_FILE`` in ``claude_native_bridge.py`` because
 # ``serve-mcp`` reads this filename for the token.
 _MCP_CONFIG_FILE = "bridge.json"
@@ -113,7 +118,72 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(bridge_dir, 0o700)
+    # Record the creating process pid so the periodic dead-peer sweep
+    # can prune this dir only when its owner is provably dead (O6).
+    # Mirrors inner/terminal.py's owner.pid convention.
+    with contextlib.suppress(OSError):
+        (bridge_dir / _OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
     return bridge_dir
+
+
+def cleanup_bridge_dir(bridge_id: str) -> bool:
+    """
+    Remove the entire per-session bridge directory for *bridge_id*.
+
+    Called on conversation teardown (O6): unlike ``clear_bridge_state``
+    (which only unlinks ``state.json``), this rmtrees the whole dir so
+    codex-home, sockets, mcp/policy config, and the owner marker do not
+    accumulate.
+
+    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
+    :returns: ``True`` when a directory was removed, ``False`` when
+        none existed (idempotent).
+    """
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+    if not bridge_dir.exists():
+        return False
+    shutil.rmtree(bridge_dir, ignore_errors=True)
+    return not bridge_dir.exists()
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove codex-native bridge dirs whose owner process is provably dead.
+
+    The in-run analog of terminal/process orphan sweeps: scans
+    ``bridge_root()`` and rmtrees each dir whose ``owner.pid`` marker
+    names a process that no longer exists. Conservative in the dangerous
+    direction (a reused/foreign pid reads as alive and is left), with a
+    TOCTOU re-check immediately before removal. Dirs with no marker are
+    left untouched (older versions / not ours).
+
+    Reuses the canonical liveness predicate from
+    ``inner/terminal.py:_process_alive`` via ``_owner_pid_alive``.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    root = bridge_root()
+    if not root.exists():
+        return 0
+    pruned = 0
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        marker = entry / _OWNER_PID_FILENAME
+        try:
+            pid = int(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if _owner_pid_alive(pid):
+            continue
+        # TOCTOU re-check immediately before removal: a pid reused by a
+        # live process between the read and now reads as alive and is
+        # skipped. See inner/terminal.py:_process_alive for the rule.
+        if _owner_pid_alive(pid):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        pruned += 1
+    return pruned
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:

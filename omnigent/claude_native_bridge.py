@@ -36,6 +36,7 @@ import queue
 import re
 import secrets
 import shlex
+import shutil
 import stat
 import sys
 import tempfile
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
 from omnigent.inner.bundle_skills import claude_native_skill_args
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
+from omnigent.inner.terminal import _process_alive as _owner_pid_alive
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins.os_env import build_os_env_tools
@@ -80,6 +82,7 @@ _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 _STATE_FILE = "state.json"
+_OWNER_PID_FILENAME = "owner.pid"
 _HOOKS_FILE = "hooks.jsonl"
 _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
@@ -772,6 +775,10 @@ def prepare_bridge_dir(
     if launch_model is not None:
         payload["launch_model"] = launch_model
     _write_json_file(bridge_dir / _CONFIG_FILE, payload)
+    # Owner-pid marker for the periodic dead-peer prune (O6). See
+    # inner/terminal.py for the owner.pid convention.
+    with contextlib.suppress(OSError):
+        (bridge_dir / _OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
     # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
     # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
     # breaks approval routing on reattach/rebind. ``build_hook_settings``
@@ -786,6 +793,65 @@ def prepare_bridge_dir(
         with contextlib.suppress(FileNotFoundError):
             (bridge_dir / filename).unlink()
     return bridge_dir
+
+
+def cleanup_bridge_dir(bridge_id: str) -> bool:
+    """
+    Remove the entire per-session bridge directory for *bridge_id*.
+
+    Called on conversation teardown (O6): unlike clearing individual
+    state files, this rmtrees the whole dir so config, sockets, and the
+    owner marker do not accumulate.
+
+    :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
+    :returns: ``True`` when a directory was removed, ``False`` when
+        none existed (idempotent).
+    """
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+    if not bridge_dir.exists():
+        return False
+    shutil.rmtree(bridge_dir, ignore_errors=True)
+    return not bridge_dir.exists()
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """
+    Remove claude-native bridge dirs whose owner process is provably dead.
+
+    The in-run analog of terminal/process orphan sweeps: scans
+    ``_BRIDGE_ROOT`` and rmtrees each dir whose ``owner.pid`` marker names
+    a process that no longer exists. Conservative in the dangerous direction
+    (a reused/foreign pid reads as alive and is left), with a TOCTOU
+    re-check immediately before removal. Dirs with no marker are left
+    untouched (older versions / not ours).
+
+    Reuses the canonical liveness predicate from
+    ``inner/terminal.py:_process_alive`` via ``_owner_pid_alive``.
+
+    :returns: The number of orphaned bridge dirs removed.
+    """
+    root = _BRIDGE_ROOT
+    if not root.exists():
+        return 0
+    pruned = 0
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        marker = entry / _OWNER_PID_FILENAME
+        try:
+            pid = int(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if _owner_pid_alive(pid):
+            continue
+        # TOCTOU re-check immediately before removal: a pid reused by a
+        # live process between the read and now reads as alive and is
+        # skipped. See inner/terminal.py:_process_alive for the rule.
+        if _owner_pid_alive(pid):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        pruned += 1
+    return pruned
 
 
 def ensure_claude_workspace_trusted(workspace: Path) -> None:
