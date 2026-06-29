@@ -132,9 +132,14 @@ _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
-# Session-status edge values (mirror the transcript forwarder's vocabulary).
+# Session-status edge values (mirror the transcript forwarder's vocabulary). The
+# schema accepts ``waiting`` alongside ``running``/``idle``/``failed`` (see
+# ``omnigent/server/routes/sessions.py`` ``_EXTERNAL_SESSION_STATUS_VALUES``); the
+# reader uses it to surface a blocking ASK_QUESTION/permission card rather than
+# letting the turn read idle while an approval still gates it.
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+_STATUS_WAITING = "waiting"
 # Terminal-failure session status (a valid ``external_session_status``; see the
 # ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
 # closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
@@ -146,6 +151,12 @@ _STATUS_FAILED = "failed"
 # keys turn transitions on.
 _TYPE_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
 _TYPE_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+
+# A step blocking on a human (ASK_QUESTION / permission approval). The same value
+# ``omnigent.antigravity_native_steps.pending_interaction`` keys on; held here so
+# the reader can detect "is the turn blocked on an approval?" at the snapshot
+# level without importing a private name.
+_STATUS_WAITING_STEP = "CORTEX_STEP_STATUS_WAITING"
 
 # Root-cascade trajectory type in ``GetAllCascadeTrajectories`` summaries. Only a
 # root cascade is a rotation candidate — a subagent/child trajectory carries a
@@ -520,6 +531,35 @@ def _is_user_turn_step(step: dict[str, object]) -> bool:
     return step.get("type") == _TYPE_USER_INPUT
 
 
+def _is_waiting_step(step: dict[str, object]) -> bool:
+    """
+    Return whether a step is blocking on a human (an ASK_QUESTION/permission ask).
+
+    A WAITING step parks the turn behind an approval/question card; the reader
+    surfaces it as a ``waiting`` session status (never idle) and hands it to the
+    interaction bridge. Keys on the same ``CORTEX_STEP_STATUS_WAITING`` status
+    :func:`~omnigent.antigravity_native_steps.pending_interaction` keys on.
+
+    :param step: One RPC step dict.
+    :returns: ``True`` for a ``CORTEX_STEP_STATUS_WAITING`` step.
+    """
+    return step.get("status") == _STATUS_WAITING_STEP
+
+
+def _snapshot_has_waiting(steps: list[dict[str, object]]) -> bool:
+    """
+    Return whether any step in a snapshot is WAITING on a human.
+
+    The turn is blocked on an approval/question while a WAITING step is present,
+    so :func:`_emit_step` holds the session at ``waiting`` (and suppresses IDLE)
+    for the whole snapshot rather than per-step.
+
+    :param steps: All steps in one poll snapshot / stream frame.
+    :returns: ``True`` when at least one step is WAITING.
+    """
+    return any(_is_waiting_step(step) for step in steps)
+
+
 def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
     """
     Return whether a step closes a turn (assistant text, no further tool calls).
@@ -555,7 +595,7 @@ def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
     return not (isinstance(tool_calls, list) and tool_calls)
 
 
-def _is_turn_close_step(step: dict[str, object]) -> bool:
+def _is_turn_close_step(step: dict[str, object], *, is_last_step: bool) -> bool:
     """
     Return whether a step ends the current turn (fire the IDLE edge).
 
@@ -577,22 +617,43 @@ def _is_turn_close_step(step: dict[str, object]) -> bool:
     close a turn here (a tool result is followed by a recovery/answer planner;
     closing on it would pre-empt that planner).
 
+    THE ``is_last_step`` GATE (premature-idle fix): agy splits NARRATION and tool
+    dispatch into separate planner steps — a mid-turn "Let me check the files
+    first…" is a DONE PLANNER_RESPONSE carrying text and NO ``toolCalls``, which
+    is byte-for-byte indistinguishable from a final answer (both share
+    ``stopReason STOP_REASON_STOP_PATTERN``). Closing on it drops the spinner to
+    idle while tool calls, tool output, and the real answer still stream behind
+    it. The authoritative signal we DO have per snapshot is position: a turn-end
+    text planner is the LAST step in the trajectory snapshot, whereas a narration
+    planner is followed by more steps. So the text/degenerate-DONE closes fire
+    only when this step is the snapshot's last; a terminal ERROR still closes
+    unconditionally (agy reports no recovery step after it, last or not).
+
     :param step: One RPC step dict.
+    :param is_last_step: Whether this step is the final step in the snapshot it
+        was read from. A text-only / degenerate DONE planner closes the turn only
+        when it is last; an earlier such planner is mid-turn narration.
     :returns: ``True`` when this step ends the turn.
     """
-    if _is_assistant_text_close_step(step):
-        return True
     if step.get("type") != _TYPE_PLANNER_RESPONSE:
         return False
     status = step.get("status")
+    # A terminal ERROR ends the turn wherever it sits: agy emits no recovery or
+    # answer planner after it, so waiting for a later step would stick the turn.
     if status == _STATUS_ERROR:
         return True
     if status != _STATUS_DONE:
         return False
-    # A DONE planner that dispatches a tool call is a continuation, not a close.
+    # A DONE planner that dispatches a tool call is a continuation, not a close —
+    # the tool result (and possibly more planner steps) follow.
     planner = step.get("plannerResponse")
     tool_calls = planner.get("toolCalls") if isinstance(planner, dict) else None
-    return not (isinstance(tool_calls, list) and tool_calls)
+    if isinstance(tool_calls, list) and tool_calls:
+        return False
+    # A DONE planner with no tool call (text answer OR degenerate empty) closes
+    # the turn only when it is the snapshot's last step. An identical-looking
+    # planner with later steps after it is mid-turn narration, not the answer.
+    return is_last_step
 
 
 def _status_event(status: str) -> OutboundEvent:
@@ -1076,6 +1137,11 @@ class _ReaderState:
         committed ``message`` is posted (stream path only).
     :param turn_active: Whether a turn is currently considered open (a RUNNING
         edge fired and no closing IDLE edge yet).
+    :param waiting_active: Whether the session is currently parked at ``waiting``
+        (a WAITING approval/question edge fired and no resume ``running`` or
+        closing ``idle`` edge since). Prevents re-emitting the ``waiting`` edge on
+        every re-read of the same pending approval and drives the resume-to-running
+        transition once the human answers.
     :param posted_model_enum: The last model enum already mirrored via
         ``external_model_change``. ``None`` = none posted yet.  Tracks the raw
         enum (NOT the displayName) so de-dup comparison is enum-stable.
@@ -1113,6 +1179,7 @@ class _ReaderState:
     prefixes: dict[int, str] = field(default_factory=dict)
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
+    waiting_active: bool = False
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
     port: int = 0
@@ -1183,7 +1250,9 @@ async def _poll_loop(
             await _sleep(poll_interval_s)
             continue
 
-        for step in steps:
+        waiting_pending = _snapshot_has_waiting(steps)
+        last_index = len(steps) - 1
+        for index, step in enumerate(steps):
             await _process_committed_step(
                 step,
                 client=client,
@@ -1191,6 +1260,8 @@ async def _poll_loop(
                 cascade_id=cascade_id,
                 state=state,
                 on_pending_interaction=on_pending_interaction,
+                is_last_step=index == last_index,
+                waiting_pending=waiting_pending,
             )
 
         await _sleep(poll_interval_s)
@@ -1258,7 +1329,10 @@ async def _stream_loop(
             # which lists every live root cascade); on detection ``supervise_reader``
             # flips this loop's ``stop`` and returns the new cascade id so
             # :func:`run_reader_with_bridge` rotates the Omnigent session + rebinds.
-            for step in _frame_steps(frame):
+            frame_steps = _frame_steps(frame)
+            waiting_pending = _snapshot_has_waiting(frame_steps)
+            last_index = len(frame_steps) - 1
+            for index, step in enumerate(frame_steps):
                 await _process_stream_step(
                     step,
                     client=client,
@@ -1266,6 +1340,8 @@ async def _stream_loop(
                     cascade_id=cascade_id,
                     state=state,
                     on_pending_interaction=on_pending_interaction,
+                    is_last_step=index == last_index,
+                    waiting_pending=waiting_pending,
                 )
         # Backoff before re-opening the stream so an immediate clean trailer
         # (no frames) cannot busy-spin re-POSTing at zero delay. Skipped when
@@ -1306,6 +1382,8 @@ async def _process_committed_step(
     cascade_id: str,
     state: _ReaderState,
     on_pending_interaction: OnPendingInteraction,
+    is_last_step: bool,
+    waiting_pending: bool,
 ) -> None:
     """
     Emit one step's committed items + status edges + interaction (poll path).
@@ -1330,19 +1408,26 @@ async def _process_committed_step(
     :param cascade_id: agy cascade id (namespaces ids).
     :param state: Per-run shared trackers.
     :param on_pending_interaction: Async callback for a distinct interaction.
+    :param is_last_step: Whether this step is the snapshot's last (gates the
+        text/degenerate-DONE turn close so mid-turn narration does not idle).
+    :param waiting_pending: Whether the snapshot carries any WAITING step (the
+        turn is blocked on a human approval — hold ``waiting``, never idle).
     :returns: None.
     """
     key = _step_key(step)
     if key not in state.seen:
         if _is_settled(step):
             state.seen.add(key)
-        state.turn_active = await _emit_step(
+        state.turn_active, state.waiting_active = await _emit_step(
             step,
             client=client,
             session_id=session_id,
             cascade_id=cascade_id,
             allocator=state.allocator,
             turn_active=state.turn_active,
+            waiting_active=state.waiting_active,
+            is_last_step=is_last_step,
+            waiting_pending=waiting_pending,
         )
         # Telemetry: model-change detection on USER_INPUT (design §10.4).
         await _maybe_emit_model_change(
@@ -1411,6 +1496,8 @@ async def _process_stream_step(
     cascade_id: str,
     state: _ReaderState,
     on_pending_interaction: OnPendingInteraction,
+    is_last_step: bool,
+    waiting_pending: bool,
 ) -> None:
     """
     Emit one streamed step: incremental deltas, then committed items on DONE.
@@ -1435,6 +1522,10 @@ async def _process_stream_step(
     :param cascade_id: agy cascade id (namespaces ids + message ids).
     :param state: Per-run shared trackers (incl. the per-step prefix trackers).
     :param on_pending_interaction: Async callback for a distinct interaction.
+    :param is_last_step: Whether this step is the frame's last (gates the
+        text/degenerate-DONE turn close so mid-turn narration does not idle).
+    :param waiting_pending: Whether the frame carries any WAITING step (hold
+        ``waiting``, never idle).
     :returns: None.
     """
     if _is_generating_planner(step):
@@ -1461,6 +1552,8 @@ async def _process_stream_step(
         cascade_id=cascade_id,
         state=state,
         on_pending_interaction=on_pending_interaction,
+        is_last_step=is_last_step,
+        waiting_pending=waiting_pending,
     )
     # Once committed, the live block is retired by the committed message; drop both
     # prefix trackers so a later same-index step (e.g. an agy timeout-retry reusing
@@ -1644,14 +1737,31 @@ async def _emit_step(
     cascade_id: str,
     allocator: _ToolCallIdAllocator,
     turn_active: bool,
-) -> bool:
+    waiting_active: bool,
+    is_last_step: bool,
+    waiting_pending: bool,
+) -> tuple[bool, bool]:
     """
     Emit one new step's status edges + mapped conversation items.
 
     Replicates the transcript parser's ordering: a RUNNING status edge (when this
     step opens a turn) is posted BEFORE the step's items, and an IDLE edge (when
     this step closes the turn) AFTER them. Status edges fire only on a real
-    transition, deduped via the ``turn_active`` flag threaded through the loop.
+    transition, deduped via the ``turn_active`` / ``waiting_active`` flags threaded
+    through the loop.
+
+    A turn blocked on a human (``waiting_pending``: the snapshot carries a WAITING
+    ASK_QUESTION/permission step) holds the session at ``waiting`` rather than
+    idle — agy parks the turn behind an approval card, so dropping to idle would
+    falsely report the turn finished. The ``waiting`` edge fires once on entering
+    the blocked state; the turn cannot close (IDLE is suppressed) while a WAITING
+    step is pending. When the human answers and agy resumes, the snapshot no
+    longer carries the WAITING step and live work re-emits ``running``.
+
+    The ``is_last_step`` gate is what stops a mid-turn narration planner (DONE,
+    text, no tool calls — identical in shape to a final answer) from prematurely
+    closing the turn: a text/degenerate close fires IDLE only when the step is the
+    snapshot's last (see :func:`_is_turn_close_step`).
 
     :param step: One new (not-yet-seen) RPC step dict.
     :param client: HTTP client for Omnigent event posts.
@@ -1659,17 +1769,42 @@ async def _emit_step(
     :param cascade_id: agy cascade id (namespaces response/call ids).
     :param allocator: Per-run tool-call id allocator (fallback ids only).
     :param turn_active: Whether a turn is currently considered open on entry.
-    :returns: The updated ``turn_active`` flag after this step.
+    :param waiting_active: Whether the session is currently parked at ``waiting``
+        (a WAITING approval edge fired and no resume/close edge since).
+    :param is_last_step: Whether this step is the snapshot's final step.
+    :param waiting_pending: Whether the snapshot carries any WAITING step (the
+        turn is blocked on a human approval/question).
+    :returns: The updated ``(turn_active, waiting_active)`` flags after this step.
     """
     if _is_user_turn_step(step) and not turn_active:
         turn_active = True
         await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 
+    # Enter the blocked state once when a WAITING approval gates the turn: emit a
+    # single ``waiting`` edge (never idle) so the card is shown as blocking rather
+    # than the turn reading finished. Gated on this being the WAITING step itself
+    # so the edge orders naturally with the step's items.
+    if turn_active and waiting_pending and not waiting_active and _is_waiting_step(step):
+        waiting_active = True
+        await _post_event(client, session_id, _status_event(_STATUS_WAITING))
+    # Resume out of the blocked state: once the human has answered, the snapshot no
+    # longer carries a WAITING step, so live work re-emits ``running``.
+    elif turn_active and waiting_active and not waiting_pending:
+        waiting_active = False
+        await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
+
     for event in map_step_to_events(step, conversation_id=cascade_id, allocator=allocator):
         await _post_event(client, session_id, event)
 
-    if _is_turn_close_step(step) and turn_active:
+    # Never close the turn while a WAITING approval is pending — the turn is parked
+    # behind the card, not finished.
+    if (
+        not waiting_pending
+        and _is_turn_close_step(step, is_last_step=is_last_step)
+        and turn_active
+    ):
         turn_active = False
+        waiting_active = False
         # An ERROR planner closes the turn as FAILED, not a clean idle: a model /
         # safety-policy / rate-limit / provider-overload error must surface as a
         # failed turn (alongside the error item the mapper now emits), not a
@@ -1677,7 +1812,7 @@ async def _emit_step(
         close_status = _STATUS_FAILED if _step_is_error_planner(step) else _STATUS_IDLE
         await _post_event(client, session_id, _status_event(close_status))
 
-    return turn_active
+    return turn_active, waiting_active
 
 
 def _step_is_error_planner(step: dict[str, object]) -> bool:
