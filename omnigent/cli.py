@@ -3009,6 +3009,7 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
@@ -3016,6 +3017,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    work_item_store = SqlAlchemyWorkItemStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3068,6 +3070,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        work_item_store=work_item_store,
         caps=caps,
     )
 

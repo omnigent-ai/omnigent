@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     )
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
+    from omnigent.stores.work_item_store import WorkItemStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
     from omnigent.tools.base import ToolContext
@@ -36,6 +37,7 @@ _file_store: FileStore | None = None
 _artifact_store: ArtifactStore | None = None
 _comment_store: CommentStore | None = None
 _policy_store: PolicyStore | None = None
+_work_item_store: WorkItemStore | None = None
 _caps: RuntimeCaps = RuntimeCaps()
 
 # Server-resident tmux terminal registry. Initialized in
@@ -169,6 +171,7 @@ def init(
     artifact_store: ArtifactStore | None = None,
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
+    work_item_store: WorkItemStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -205,7 +208,7 @@ def init(
 
     global _conversation_store, _agent_store
     global _agent_cache, _file_store, _artifact_store, _caps
-    global _terminal_registry, _comment_store, _policy_store
+    global _terminal_registry, _comment_store, _policy_store, _work_item_store
     _conversation_store = conversation_store
     _agent_store = agent_store
     _agent_cache = agent_cache
@@ -213,6 +216,7 @@ def init(
     _artifact_store = artifact_store
     _comment_store = comment_store
     _policy_store = policy_store
+    _work_item_store = work_item_store
     _caps = caps if caps is not None else RuntimeCaps()
     # Tmux terminal registry: server-resident, conversation-scoped
     # ``inner.terminal.TerminalInstance`` map. See
