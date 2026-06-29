@@ -16765,3 +16765,146 @@ async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
         e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
     ]
     assert len(idle_events) == 1, f"stop must publish exactly one idle; got {queued_events!r}"
+
+
+async def test_events_interrupt_on_kiro_native_503_skips_idle_when_inject_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """interrupt returns 503 and publishes no idle when Escape can't reach tmux.
+
+    Failure-path parity with the sibling harnesses (e.g.
+    ``..._interrupt_on_native_session_503_skips_cleanup_when_inject_fails``): if
+    the bridge can't deliver Escape (pane gone, bridge dir not advertised), the
+    runner must surface a 503 and must NOT publish ``session.status: idle`` — idle
+    would clear the web-UI spinner while the kiro turn keeps generating. Guards
+    against a reorder that moves the idle publish ahead of the ``try``.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(bridge_dir: Any, *, timeout_s: float) -> None:
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(kiro_native_bridge, "inject_interrupt", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_int_fail", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        int_resp = await client.post(
+            "/v1/sessions/conv_kiro_int_fail/events",
+            json={"type": "interrupt"},
+        )
+        queue = _session_event_queues_ref.get("conv_kiro_int_fail")
+        queued_events: list[dict[str, Any]] = []
+        while queue is not None and not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict):
+                queued_events.append(item)
+
+    assert int_resp.status_code == 503, (
+        f"kiro-native interrupt with inject_interrupt failure must return 503; "
+        f"got {int_resp.status_code}: {int_resp.text}"
+    )
+    body = int_resp.json()
+    assert body.get("error") == "kiro_native_interrupt_failed", (
+        f"503 body must carry the bridge-failure error code; got {body!r}"
+    )
+    status_idle = [
+        e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert status_idle == [], (
+        f"No session.status: idle should be enqueued when Escape injection "
+        f"failed; got {status_idle!r}."
+    )
+
+
+async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stop_session returns 503 and publishes no idle when the kill can't reach tmux.
+
+    Failure-path parity with ``..._stop_session_on_native_returns_503_when_kill_fails``:
+    a failed kill must surface 503 rather than lie to the web UI with 204 + idle
+    while the ``kiro-cli`` process may still be alive.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_kill(bridge_dir: Any, *, timeout_s: float) -> None:
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, timeout_s
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(kiro_native_bridge, "kill_session", _fake_kill)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_stop_fail", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        stop_resp = await client.post(
+            "/v1/sessions/conv_kiro_stop_fail/events",
+            json={"type": "stop_session"},
+        )
+        queue = _session_event_queues_ref.get("conv_kiro_stop_fail")
+        queued_events: list[dict[str, Any]] = []
+        while queue is not None and not queue.empty():
+            item = queue.get_nowait()
+            if isinstance(item, dict):
+                queued_events.append(item)
+
+    assert stop_resp.status_code == 503, (
+        f"kiro-native stop_session with kill failure must return 503; "
+        f"got {stop_resp.status_code}: {stop_resp.text}"
+    )
+    body = stop_resp.json()
+    assert body.get("error") == "kiro_native_stop_failed", (
+        f"503 body must carry the stop-failure error code; got {body!r}"
+    )
+    status_idle = [
+        e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
+    ]
+    assert status_idle == [], (
+        f"No session.status: idle should be enqueued when kill_session failed; "
+        f"got {status_idle!r}."
+    )
