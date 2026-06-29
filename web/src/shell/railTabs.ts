@@ -9,7 +9,7 @@
  */
 
 /** The selectable tabs in the right workspace rail, in display order. */
-export type RightRailTab = "files" | "subagents" | "terminals" | "todos" | "schedules";
+export type RightRailTab = "files" | "canvas" | "subagents" | "terminals" | "todos" | "schedules";
 
 /**
  * Count/status badge geometry shared across the rail tabs and the mobile
