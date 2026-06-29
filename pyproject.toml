@@ -36,6 +36,9 @@ dependencies = [
     "mcp>=1.0,<2",
     "starlette>=0.27,<1",
     "uvicorn[standard]>=0.30,<1",
+    # websockets >=15 asyncio client hangs on macOS before emitting any handshake
+    # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
+    "websockets>=10.4,<15",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
