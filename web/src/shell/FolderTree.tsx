@@ -491,12 +491,22 @@ function FileRowItem({
               {gitStatusLetter(fileStatus)}
             </span>
           )}
-          {bytes !== null && !isDeleted && (
-            <span className="shrink-0 text-muted-foreground text-[10px]">{formatBytes(bytes)}</span>
-          )}
         </button>
-        {!isDeleted && conversationId && (
-          <FileDownloadButton conversationId={conversationId} path={path} />
+        {bytes !== null && !isDeleted ? (
+          <div className="relative shrink-0 flex items-center">
+            <span className="text-muted-foreground text-[10px] group-hover:invisible">
+              {formatBytes(bytes)}
+            </span>
+            {conversationId && (
+              <span className="absolute inset-0 flex items-center justify-center">
+                <FileDownloadButton conversationId={conversationId} path={path} />
+              </span>
+            )}
+          </div>
+        ) : (
+          !isDeleted && conversationId && (
+            <FileDownloadButton conversationId={conversationId} path={path} />
+          )
         )}
       </div>
       {tooltip}
@@ -671,8 +681,8 @@ function TreeNodeRow({
           {node.name}/
         </span>
         {dirStatus && (
-          <span className={cn("shrink-0 text-[8px] leading-none", dirDotClass)} aria-hidden>
-            ●
+          <span className="flex w-[22px] shrink-0 items-center justify-center" aria-hidden>
+            <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
           </span>
         )}
       </button>

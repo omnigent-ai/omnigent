@@ -114,14 +114,22 @@ function FileListItem({
           >
             <bdi>{file.path}</bdi>
           </span>
-          {file.bytes !== null && !isDeleted && (
-            <span className="shrink-0 text-muted-foreground text-[10px]">
+        </button>
+        {file.bytes !== null && !isDeleted ? (
+          <div className="relative shrink-0 flex items-center">
+            <span className="text-muted-foreground text-[10px] group-hover:invisible">
               {formatBytes(file.bytes)}
             </span>
-          )}
-        </button>
-        {!isDeleted && conversationId && (
-          <FileDownloadButton conversationId={conversationId} path={file.path} />
+            {conversationId && (
+              <span className="absolute inset-0 flex items-center justify-center">
+                <FileDownloadButton conversationId={conversationId} path={file.path} />
+              </span>
+            )}
+          </div>
+        ) : (
+          !isDeleted && conversationId && (
+            <FileDownloadButton conversationId={conversationId} path={file.path} />
+          )
         )}
       </div>
       {tooltip}

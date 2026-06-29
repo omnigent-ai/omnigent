@@ -60,3 +60,27 @@ describe("FlatFileList runner-offline state", () => {
     expect(screen.queryByText(/agent is asleep/i)).not.toBeInTheDocument();
   });
 });
+
+describe("FlatFileList file size / download alignment", () => {
+  it("overlays the download button on the file size so both share one slot", () => {
+    // The size label and the hover download button must occupy the same
+    // relative container: the size reserves the width and the button overlays
+    // it (absolute inset-0), so the button appears exactly where the size was.
+    renderList({
+      files: [
+        { path: "src/app.ts", name: "app.ts", status: "modified", bytes: 2048, modified_at: null },
+      ],
+    });
+
+    const size = screen.getByText("2.0 KB");
+    const slot = size.parentElement;
+    expect(slot).toHaveClass("relative");
+    // Size hides on hover but keeps its width to avoid a layout shift.
+    expect(size).toHaveClass("group-hover:invisible");
+
+    const download = screen.getByRole("button", { name: /download app\.ts/i });
+    const overlay = download.closest("span.absolute") as HTMLElement | null;
+    expect(overlay).not.toBeNull();
+    expect(slot).toContainElement(overlay);
+  });
+});
