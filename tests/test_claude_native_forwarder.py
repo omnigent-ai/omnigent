@@ -2825,7 +2825,8 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     A malformed transcript item that Omnigent rejects with a permanent 4xx
     should not be reposted forever at the poll interval. After the
     retry budget is exhausted, the forwarder emits a failed status,
-    marks the source id handled, and persists the new byte cursor.
+    marks the source id handled, persists the new byte cursor, and
+    dead-letters the dropped item to disk so it is recoverable (#1120).
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -2908,6 +2909,15 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     assert second.seen_source_ids == ("poison-item:0:message",)
     assert persisted["byte_offset"] == transcript_path.stat().st_size
     assert persisted["seen_source_ids"] == ["poison-item:0:message"]
+    # The dropped item is dead-lettered to disk so it is recoverable
+    # instead of silently lost (#1120).
+    dead_letter = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    assert len(dead_letter) == 1
+    record = json.loads(dead_letter[0])
+    assert record["session_id"] == "conv_abc"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["reason"] == "permanent HTTP failure after retries"
+    assert record["payload"]["item_type"] == "message"
 
 
 @pytest.mark.asyncio
@@ -6484,3 +6494,138 @@ def test_retry_tracker_transient_failures_escalate_degraded() -> None:
     tracker.clear("item:source-1")
     assert forwarder._forward_health.consecutive_failures == 0
     assert forwarder._forward_health.degraded_logged is False
+
+
+@pytest.mark.asyncio
+async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
+    """
+    A permanently-rejected sub-agent transcript item is dead-lettered (#1120).
+
+    Drives the real ``_forward_available_subagents`` drop path: the
+    ``external_subagent_start`` POST succeeds, the child item POST is rejected
+    with a permanent 400 (and the item tracker exhausts on the first failure),
+    so the dropped item is appended to ``{bridge_dir}/dead_letter.jsonl`` instead
+    of being silently lost.
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    forwarder._reset_forward_health()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="dl1",
+        agent_type="Explore",
+        description="dead-letter item flow",
+        tool_use_id="toolu_dl",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-assistant-dl",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "lost"}],
+                },
+            },
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Accept the start POST; permanently reject the child item POST.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_subagent_start":
+            return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
+        if body.get("type") == "external_conversation_item":
+            return httpx.Response(400, json={"error": "nope"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0, max_permanent_attempts=1
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    forwarder._reset_forward_health()
+    dl_path = bridge_dir / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_child_dl"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["payload"]["item_data"]["content"][0]["text"] == "lost"
+
+
+@pytest.mark.asyncio
+async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
+    """
+    A permanently-rejected sub-agent START is dead-lettered (#1120).
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    forwarder._reset_forward_health()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="dlstart1",
+        agent_type="Explore",
+        description="dead-letter start flow",
+        tool_use_id="toolu_dlstart",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Permanently reject the sub-agent start POST.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        return httpx.Response(400, json={"error": "nope"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0, max_permanent_attempts=1
+            ),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    forwarder._reset_forward_health()
+    dl_path = bridge_dir / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_parent"
+    assert record["event_type"] == "external_subagent_start"
+    assert record["payload"]["subagent_id"] == "dlstart1"
+    assert record["payload"]["agent_type"] == "Explore"
