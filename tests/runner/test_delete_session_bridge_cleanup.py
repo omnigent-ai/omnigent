@@ -51,3 +51,24 @@ async def test_delete_session_removes_native_bridge_dir(
     assert resp.status_code == 200
 
     assert not bridge_dir.exists(), "bridge dir (with token) must be deleted"
+
+
+async def test_cleanup_resources_removes_native_bridge_dir(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """The PRODUCTION delete path must remove the token-bearing bridge dir.
+
+    Server-side session delete drives ``DELETE /v1/sessions/{id}/resources``
+    (``cleanup_session_resources``), NOT the bare ``DELETE /v1/sessions/{id}``
+    route — so the bridge dir must be removed there too, else the #1350 leak
+    persists in real deletes even though the bare-route test passes.
+    """
+    session_id = f"conv_{uuid.uuid4().hex}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    assert (bridge_dir / "bridge.json").exists()
+
+    resp = await client.delete(f"/v1/sessions/{session_id}/resources")
+    assert resp.status_code == 200
+
+    assert not bridge_dir.exists(), "bridge dir must be deleted on the real /resources path"

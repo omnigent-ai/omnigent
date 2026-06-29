@@ -17247,6 +17247,17 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
+        # This is the runner endpoint the SERVER's session-delete actually
+        # drives (server delete_session -> DELETE /v1/sessions/{id}/resources),
+        # so the token-bearing native bridge dir must be removed here, not only
+        # in the bare delete_session route (issue #1350). Delete-only path:
+        # NOT done inside resource_registry.cleanup_session, because the
+        # agent-switch reset (reset_session_state) reuses cleanup_session while
+        # the session — and its bridge — lives on.
+        await _delete_native_bridge_dirs(
+            server_client=server_client,
+            session_id=session_id,
+        )
         return JSONResponse(
             status_code=200,
             content={
