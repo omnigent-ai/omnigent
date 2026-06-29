@@ -127,9 +127,8 @@ function FileListItem({
             )}
           </div>
         ) : (
-          !isDeleted && conversationId && (
-            <FileDownloadButton conversationId={conversationId} path={file.path} />
-          )
+          !isDeleted &&
+          conversationId && <FileDownloadButton conversationId={conversationId} path={file.path} />
         )}
       </div>
       {tooltip}

@@ -504,9 +504,8 @@ function FileRowItem({
             )}
           </div>
         ) : (
-          !isDeleted && conversationId && (
-            <FileDownloadButton conversationId={conversationId} path={path} />
-          )
+          !isDeleted &&
+          conversationId && <FileDownloadButton conversationId={conversationId} path={path} />
         )}
       </div>
       {tooltip}
