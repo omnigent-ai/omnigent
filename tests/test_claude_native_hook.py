@@ -325,7 +325,14 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             ),
             {"target_session_id": "conv_new"},
         ),
-        ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_old", {"runner_id": ""}),
+        (
+            "PATCH",
+            "http://127.0.0.1:8787/v1/sessions/conv_old",
+            {
+                "runner_id": "",
+                "labels": {"omnigent.claude_native.bridge_id": "conv_old-cleared"},
+            },
+        ),
     ]
     recorded = (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8")
     assert '"omnigent_clear_rotated_to":"conv_new"' in recorded
@@ -1868,3 +1875,184 @@ def test_evaluate_policy_retries_5xx_and_succeeds(
     assert captured.out == ""
     # Two 503s then one 200 = 3 total attempts.
     assert call_count == 3
+
+
+def test_build_reauth_remints_and_preserves_routing_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_build_reauth`` re-mints the bearer and keeps the routing header.
+
+    The fresh token must be merged OVER the existing headers so the
+    ``X-Databricks-Org-Id`` workspace-routing header (which the Apps server
+    needs to avoid a 403 reroute to the account) is preserved, not dropped.
+    """
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh-token",
+    )
+    reauth = claude_native_hook._build_reauth(
+        "https://ap.example.com",
+        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
+    )
+    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
+
+
+def test_build_reauth_returns_none_without_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_build_reauth`` returns ``None`` when no refresh mechanism is available.
+
+    Local unauthenticated servers (no token factory) must not synthesize an
+    auth header; returning ``None`` lets the caller fall through to its normal
+    handling (which fails closed for a tool-call gate).
+    """
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: None,
+    )
+    reauth = claude_native_hook._build_reauth(
+        "https://ap.example.com", {"Authorization": "Bearer stale"}
+    )
+    assert reauth() is None
+
+
+def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An expired hook token self-heals: 302→/oidc re-mints and the tool is allowed.
+
+    End-to-end repro of the production bug — an "old" native session (token
+    past the ~1h Databricks OAuth lifetime) hits the Apps front-door
+    ``302 → /oidc`` on every tool call and used to fail CLOSED ("policy
+    evaluation unavailable"). The hook must now re-mint through the token
+    factory and retry, returning the real ALLOW verdict (no deny output).
+    """
+    attempts: list[dict[str, str]] = []
+
+    class _RedirectThenOkClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _RedirectThenOkClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            attempts.append(dict(self._headers))
+            req = httpx.Request("POST", url)
+            if len(attempts) == 1:
+                return httpx.Response(
+                    302,
+                    headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+                    request=req,
+                )
+            return httpx.Response(200, text='{"result":"POLICY_ACTION_ALLOW"}', request=req)
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RedirectThenOkClient)
+    # The hook re-mints through the runner's token factory; stub a fresh token.
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh-token",
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigents.example.databricksapps.com",
+        ap_auth_headers={"Authorization": "Bearer stale-token", "X-Databricks-Org-Id": "o1"},
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    # Two attempts: first with the lapsed token, retry with the fresh one.
+    assert len(attempts) == 2
+    assert attempts[0]["Authorization"] == "Bearer stale-token"
+    assert attempts[1]["Authorization"] == "Bearer fresh-token"
+    # Routing header survives the re-mint.
+    assert attempts[1]["X-Databricks-Org-Id"] == "o1"
+    # ALLOW verdict → no hook output → the tool is NOT denied (no fail-closed).
+    assert captured.out == ""
+    assert "re-minted token and retrying" in captured.err
+
+
+def test_evaluate_policy_fails_closed_when_reauth_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    If the token can't be re-minted, the tool still fails CLOSED (safety net).
+
+    Re-auth is best-effort. When no refresh mechanism is available, the
+    authoritative PreToolUse gate must still DENY rather than let an
+    unevaluated tool through — preserving the fail-closed guarantee from #163.
+    """
+
+    class _RedirectClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _RedirectClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            return httpx.Response(
+                302,
+                headers={"Location": "https://w.example.com/oidc/x"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RedirectClient)
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: None,
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigents.example.databricksapps.com",
+        ap_auth_headers={"Authorization": "Bearer stale-token"},
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (
+        result["hookSpecificOutput"]["permissionDecisionReason"]
+        == native_policy_hook._EVAL_UNAVAILABLE_REASON
+    )

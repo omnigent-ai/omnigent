@@ -130,6 +130,13 @@ class EvaluationContext:
         callable. ``None`` means "engine not yet populated"
         (test contexts); empty dict means "no usage recorded
         yet."
+    :param subtree_usage: Subtree-scoped cumulative LLM cost for
+        this conversation and its descendants only (not the whole
+        session tree). Same shape as ``usage``. Injected by the
+        engine ONLY when a ``subagent_cost_budget`` policy is
+        configured — ``None`` otherwise, so sessions without that
+        policy pay no subtree-cost lookup. Surfaced as
+        ``event["context"]["subtree_usage"]`` to the callable.
     :param user_daily_cost: The session owner's per-UTC-day cost
         rollup, shape
         ``{"cost_usd": <float>, "ask_approved_usd": <float>}``,
@@ -179,6 +186,7 @@ class EvaluationContext:
     request_data: Any = None
     session_state: dict[str, Any] | None = None
     usage: dict[str, float] | None = None
+    subtree_usage: dict[str, float] | None = None
     user_daily_cost: dict[str, float | str] | None = None
     model: str | None = None
     harness: str | None = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from types import TracebackType
@@ -361,5 +362,110 @@ async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
         handle = sessions_module._runner_relay_tasks.get(session_id)
         if handle is not None:
             await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(session_id)
+
+
+class _TunnelCloseStreamResponse:
+    """
+    Async context manager that raises ``ConnectionError`` mid-stream.
+
+    Emits the ready heartbeat, waits for a gate, then raises
+    ``ConnectionError`` to simulate a ws-tunnel drop.
+
+    :param gate: Event the test sets once its collector is subscribed,
+        so the error fires after the collector can observe it.
+    """
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self._gate = gate
+
+    async def __aenter__(self) -> _TunnelCloseStreamResponse:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        yield 'data: {"type": "session.heartbeat"}\n\n'
+        await self._gate.wait()
+        raise ConnectionError("tunnel closed before request completed")
+
+
+class _TunnelCloseRunnerClient:
+    """Fake runner client whose stream drops with ``ConnectionError``.
+
+    :param gate: Event that gates the error (set by the test once
+        its stream collector is subscribed).
+    """
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self._gate = gate
+
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: Any,
+    ) -> _TunnelCloseStreamResponse:
+        del method, path, timeout
+        return _TunnelCloseStreamResponse(self._gate)
+
+
+@pytest.mark.asyncio
+async def test_relay_publishes_failed_status_on_tunnel_close() -> None:
+    """
+    A tunnel close mid-stream publishes ``session.status`` "failed".
+
+    Regression test for #1114: before the fix the relay swallowed the
+    ``ConnectionError`` and exited silently, leaving the client's SSE
+    stream truncated with no error event.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    session_id = "conv_tunnel_close"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_tunnel_close",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=None,
+        )
+        assert handle is not None
+
+        # Subscribe BEFORE releasing the error so the published
+        # session.status event fans out to the collector.
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+
+        # The relay task should finish quickly after the ConnectionError.
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        # Wait for the failed-status event to arrive at the collector.
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "failed"
+        assert event["error"]["code"] == "runner_disconnected"
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
         sessions_module._runner_relay_tasks.clear()
         session_stream.close(session_id)

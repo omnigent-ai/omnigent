@@ -14,6 +14,12 @@ ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_EFFORTS = ANTHROPIC_EFFORTS
 CODEX_EFFORTS = OPENAI_EFFORTS
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
+GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
+ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
+# The GitHub Copilot SDK's ``create_session(reasoning_effort=...)`` accepts
+# exactly these levels (``copilot.session.ReasoningEffort`` literal); per-model
+# support is gated by the Copilot backend (``list_models()``).
+COPILOT_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 
 def format_supported(values: Iterable[str]) -> str:

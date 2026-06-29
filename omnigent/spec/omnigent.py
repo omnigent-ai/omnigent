@@ -58,6 +58,7 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    SharePolicy,
     ToolRuntime,
     ToolsConfig,
 )
@@ -411,6 +412,7 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
             command=config.command,
             args=list(config.args) if config.args else None,
             env=dict(config.env) if config.env else None,
+            tools=list(config.tools) if config.tools else None,
         )
     if config.url is None:
         raise OmnigentError(
@@ -421,6 +423,7 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
     return MCPTool(
         url=config.url,
         headers=dict(config.headers) if config.headers else None,
+        tools=list(config.tools) if config.tools else None,
     )
 
 
@@ -1176,6 +1179,10 @@ def agent_def_to_agent_spec(
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
+        # AgentDef.agent_session_sharing is the raw YAML string
+        # ("none"/"non-public"/"public"); map it to the SharePolicy enum
+        # AgentSpec expects.
+        agent_session_sharing=SharePolicy(agent_def.agent_session_sharing),
         skills_filter=skills_filter,
     )
 
@@ -1834,6 +1841,7 @@ def _translate_mcp_tool_from_def(
             url=tool.url,
             headers=dict(tool.headers) if tool.headers else {},
             databricks_profile=tool.profile,
+            tools=list(tool.tools) if tool.tools else None,
         )
     if tool.command is not None:
         return MCPServerConfig(
@@ -1842,6 +1850,7 @@ def _translate_mcp_tool_from_def(
             command=tool.command,
             args=list(tool.args) if tool.args else [],
             env=dict(tool.env) if tool.env else {},
+            tools=list(tool.tools) if tool.tools else None,
         )
     raise OmnigentError(
         f"omnigent MCP tool {tool_name!r} has neither 'url' nor "

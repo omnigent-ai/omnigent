@@ -8,7 +8,10 @@ engine evaluation alongside spec-declared policies.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.entities import Policy as StoredPolicy
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
 from omnigent.runtime.policies.builder import (
     _load_session_policy_specs,
@@ -74,8 +77,13 @@ def test_stored_python_policy_without_factory_params() -> None:
     assert spec.function.arguments is None
 
 
-def test_stored_url_policy_returns_none() -> None:
-    """A stored ``type="url"`` policy returns ``None`` (not yet supported)."""
+def test_stored_url_policy_raises() -> None:
+    """A stored ``type="url"`` policy is rejected loudly, not skipped.
+
+    URL policy evaluation is unimplemented; converting one must raise
+    rather than silently return ``None`` (which would let an operator
+    store a guardrail that never enforces).
+    """
     stored = StoredPolicy(
         id="pol_url",
         name="external",
@@ -84,7 +92,11 @@ def test_stored_url_policy_returns_none() -> None:
         type="url",
         handler="https://example.com/eval",
     )
-    assert _stored_policy_to_spec(stored) is None
+    with pytest.raises(OmnigentError) as excinfo:
+        _stored_policy_to_spec(stored)
+    assert excinfo.value.code == ErrorCode.INVALID_INPUT
+    assert "url" in str(excinfo.value)
+    assert "external" in str(excinfo.value)
 
 
 # ── _load_session_policy_specs ──────────────────────────────────────────────
@@ -124,6 +136,28 @@ def test_load_session_policy_specs_filters_disabled(db_uri: str) -> None:
 
     assert len(specs) == 1
     assert specs[0].name == "enabled_policy"
+
+
+def test_load_session_policy_specs_rejects_enabled_url(db_uri: str) -> None:
+    """An enabled url-type session policy raises at load time (fail closed).
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create(
+        policy_id="pol_url",
+        session_id=conv.id,
+        name="external",
+        type="url",
+        handler="https://example.com/eval",
+        enabled=True,
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        _load_session_policy_specs(conv.id, store)
+    assert excinfo.value.code == ErrorCode.INVALID_INPUT
 
 
 # ── build_policy_engine integration ─────────────────────────────────────────

@@ -13,7 +13,11 @@ import logging
 
 import pytest
 
-from omnigent.runner.app import _cursor_native_model_from_spec
+from omnigent.runner.app import (
+    _cursor_fork_history_preamble,
+    _cursor_message_item_text,
+    _cursor_native_model_from_spec,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
@@ -61,3 +65,53 @@ def test_cursor_native_model_from_spec_warns_on_dropped_model(
     with caplog.at_level(logging.WARNING):
         assert _cursor_native_model_from_spec(_spec("databricks-claude-opus")) is None
     assert any("databricks-claude-opus" in rec.getMessage() for rec in caplog.records)
+
+
+def _msg(role: str, text: str) -> dict:
+    """A message item as returned by GET /v1/sessions/{id}/items."""
+    block = "input_text" if role == "user" else "output_text"
+    return {"type": "message", "role": role, "content": [{"type": block, "text": text}]}
+
+
+class TestCursorMessageItemText:
+    def test_string_content(self) -> None:
+        assert _cursor_message_item_text("hi") == "hi"
+
+    def test_joins_text_blocks(self) -> None:
+        content = [
+            {"type": "input_text", "text": "one "},
+            {"type": "text", "text": "two"},
+            {"type": "input_image", "image_url": "data:..."},  # non-text -> skipped
+        ]
+        assert _cursor_message_item_text(content) == "one two"
+
+    def test_non_text_is_empty(self) -> None:
+        assert _cursor_message_item_text(None) == ""
+        assert _cursor_message_item_text([{"type": "input_image"}]) == ""
+
+
+class TestCursorForkHistoryPreamble:
+    def test_renders_user_and_assistant_turns(self) -> None:
+        items = [
+            _msg("user", "add hello.txt"),
+            _msg("assistant", "done"),
+            _msg("user", "now delete it"),
+        ]
+        # Turns render as a speaker-labelled transcript, blank-line separated —
+        # the closest single-block analog to claude/codex native bubbles.
+        assert _cursor_fork_history_preamble(items) == (
+            "You: add hello.txt\n\nAssistant: done\n\nYou: now delete it"
+        )
+
+    def test_skips_non_message_and_empty_items(self) -> None:
+        items = [
+            {"type": "function_call", "name": "sys_os_write"},  # tool call -> skipped
+            _msg("assistant", ""),  # empty text -> skipped
+            {"type": "message", "role": "system", "content": [{"text": "x"}]},  # system
+            _msg("user", "real"),
+        ]
+        assert _cursor_fork_history_preamble(items) == "You: real"
+
+    def test_no_replayable_text_yields_empty(self) -> None:
+        assert _cursor_fork_history_preamble([]) == ""
+        assert _cursor_fork_history_preamble([{"type": "function_call"}]) == ""

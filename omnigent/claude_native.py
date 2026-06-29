@@ -20,9 +20,14 @@ import shutil
 import signal
 import subprocess
 import sys
-import termios
-import tty
 import uuid
+
+# termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
+# which is disabled on Windows. Guard the import (special-cased by mypy, which
+# type-checks on Linux) so importing this module never crashes the CLI there.
+if sys.platform != "win32":
+    import termios
+    import tty
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -56,6 +61,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     augment_claude_args,
@@ -3456,6 +3462,55 @@ def _claude_transcript_records_from_session_items(
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
     for index, item in enumerate(items):
+        # Compaction items carry the post-compaction context. Replace
+        # all prior records with the compacted messages so the
+        # reconstructed transcript reflects the compacted state.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                records.clear()
+                parent_uuid = None
+                tool_parent_by_call_id.clear()
+                # Emit a compact_boundary system record so Claude
+                # Code recognizes the compaction on resume.
+                boundary_uuid = _synthetic_claude_transcript_uuid(
+                    session_id=session_id,
+                    external_session_id=external_session_id,
+                    item=item,
+                    index=index,
+                )
+                records.append(
+                    {
+                        "parentUuid": None,
+                        "isSidechain": False,
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "content": "Conversation compacted",
+                        "isMeta": False,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "uuid": boundary_uuid,
+                        "level": "info",
+                    }
+                )
+                parent_uuid = boundary_uuid
+                for ci, cm in enumerate(compacted_msgs):
+                    cm_uuid = _synthetic_claude_transcript_uuid(
+                        session_id=session_id,
+                        external_session_id=external_session_id,
+                        item=cm,
+                        index=ci,
+                    )
+                    cm_record = _claude_transcript_record_from_session_item(
+                        cm,
+                        session_id=external_session_id,
+                        record_uuid=cm_uuid,
+                        parent_uuid=parent_uuid,
+                        cwd=cwd,
+                    )
+                    if cm_record is not None:
+                        records.append(cm_record)
+                        parent_uuid = cm_uuid
+            continue
         record_uuid = _synthetic_claude_transcript_uuid(
             session_id=session_id,
             external_session_id=external_session_id,
@@ -3961,6 +4016,10 @@ def _claude_terminal_request(
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
+    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # command/args to wrap the same fully-augmented Claude launch. Identity by
+    # default. See omnigent.claude_launcher.
+    command, args = resolve_claude_launch(command, args)
     spec: dict[str, Any] = {
         "command": command,
         "args": args,

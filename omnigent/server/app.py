@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import mimetypes
 import os
+import re
 import tarfile
+import uuid
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -18,12 +21,18 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from omnigent._platform import resolve_repo_symlink
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native_coding_agents import (
+    ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIMI_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
+    OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
+    QWEN_NATIVE_CODING_AGENT,
 )
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
@@ -42,12 +51,16 @@ from omnigent.server.performance_metrics import (
     ServerPerformanceMetrics,
     publish_server_metrics_periodically,
     set_request_duration_for_access_log,
+    set_request_id_for_access_log,
+    set_request_session_id_for_access_log,
+    set_request_user_agent_for_access_log,
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
     SessionLiveness,
@@ -69,24 +82,139 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_pep440_version(version: str) -> bool:
+    """Return whether *version* can be parsed as a PEP 440 version."""
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        Version(version)
+    except InvalidVersion:
+        return False
+    return True
+
+
+def _metadata_omnigent_version() -> str:
+    """Return the omnigent version recorded in installed package metadata."""
+    from importlib.metadata import version as _pkg_version
+
+    return _pkg_version("omnigent")
+
+
+def _source_pyproject_version(start: Path | None = None) -> str | None:
+    """Return ``[project].version`` from a source checkout's ``pyproject.toml``."""
+    import tomllib
+
+    current = start or Path(__file__).resolve()
+    for parent in (current, *current.parents):
+        pyproject = parent / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            _logger.warning(
+                "could not read %s for server version fallback (%s)",
+                pyproject,
+                exc,
+            )
+            return None
+        project = data.get("project")
+        if not isinstance(project, dict) or project.get("name") != "omnigent":
+            continue
+        version = project.get("version")
+        if not isinstance(version, str) or not version:
+            return None
+        if not _is_pep440_version(version):
+            _logger.warning(
+                "pyproject version %r from %s is not PEP 440",
+                version,
+                pyproject,
+            )
+            return None
+        return version
+    return None
+
+
+def _server_version() -> str:
+    """Return the server version exposed to clients.
+
+    Source/editable installs can have placeholder package metadata such as
+    ``source``. Prefer the installed metadata when it is parseable, but fall
+    back to the source checkout's ``pyproject.toml`` version so local developer
+    servers still report a PEP 440 version.
+    """
+    version = _metadata_omnigent_version()
+    if _is_pep440_version(version):
+        return version
+    fallback = _source_pyproject_version()
+    if fallback is not None:
+        _logger.info(
+            "installed omnigent version %r is not PEP 440; using pyproject version %s",
+            version,
+            fallback,
+        )
+        return fallback
+    _logger.warning(
+        "installed omnigent version %r is not PEP 440 and no pyproject fallback was found",
+        version,
+    )
+    return version
+
+
+def _register_web_mimetypes() -> None:
+    """Pin Content-Type for web UI assets regardless of the OS MIME registry.
+
+    Starlette's ``StaticFiles`` derives ``Content-Type`` from
+    ``mimetypes.guess_type``. On Windows that consults the registry, where
+    ``.js`` is frequently mapped to ``text/plain`` — so the browser refuses to
+    execute the SPA's ES modules ("Loading module … was blocked because of a
+    disallowed MIME type"). Registering the web types explicitly makes the
+    bundled UI serve correctly on every platform and removes the dependency on
+    a machine's registry configuration.
+    """
+    for ext, ctype in (
+        (".js", "text/javascript"),
+        (".mjs", "text/javascript"),
+        (".css", "text/css"),
+        (".json", "application/json"),
+        (".map", "application/json"),
+        (".wasm", "application/wasm"),
+        (".svg", "image/svg+xml"),
+    ):
+        mimetypes.add_type(ctype, ext)
+
+
+_register_web_mimetypes()
+
 _WEB_UI_DIST = Path(__file__).parent / "static" / "web-ui"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
 _PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
+_OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
+_KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
+_ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
+_QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
+_KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
+_SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
 # seeder is a safety net.
-_DEBBY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "debby"
-_POLLY_BUNDLE_SOURCE = Path(_examples_resources.__file__).parent / "polly"
+# resolve_repo_symlink dereferences the packaged symlink on a no-symlink
+# Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
+_DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
+_POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
 
 
 class _FastAPICallNext(Protocol):
@@ -352,7 +480,12 @@ def _ensure_default_agents(
     _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -514,6 +647,49 @@ def _ensure_default_codex_agent(
     )
 
 
+def _build_opencode_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the opencode-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.opencode_native import _materialize_opencode_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_opencode_agent_spec(Path(tmpdir), model=None)
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_opencode_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the opencode-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer OpenCode
+    as a built-in agent alongside Claude / Codex / Pi. Content-aware via
+    :func:`_ensure_builtin_agent`: a new wheel with a changed spec refreshes
+    the row in place rather than being ignored.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_OPENCODE_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_opencode_native_bundle(),
+    )
+
+
 def _build_pi_native_bundle() -> bytes:
     """
     Build a gzipped tarball of the pi-native-ui agent spec.
@@ -597,6 +773,164 @@ def _ensure_default_cursor_agent(
         agent_cache,
         name=_CURSOR_NATIVE_AGENT_NAME,
         bundle_bytes=_build_cursor_native_bundle(),
+    )
+
+
+def _build_kiro_native_bundle() -> bytes:
+    """Build a gzipped tarball of the kiro-native-ui agent spec."""
+    import tempfile
+
+    from omnigent.kiro_native import _materialize_kiro_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_kiro_agent_spec(Path(tmpdir), model=None)
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_kiro_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the kiro-native-ui agent."""
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_KIRO_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_kiro_native_bundle(),
+    )
+
+
+def _ensure_default_antigravity_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the antigravity-native-ui agent.
+
+    Called during server lifespan startup so the Web UI can offer Antigravity
+    as a built-in native-terminal agent (the ``agy`` TUI), alongside Claude
+    Code / Codex / Pi. Content-aware via :func:`_ensure_builtin_agent`: a new
+    wheel with a changed spec refreshes the row in place rather than being
+    ignored.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_ANTIGRAVITY_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_antigravity_native_bundle(),
+    )
+
+
+def _build_antigravity_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the antigravity-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.antigravity_native import _materialize_antigravity_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_antigravity_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _build_qwen_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the qwen-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.qwen_native import _materialize_qwen_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_qwen_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_qwen_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the qwen-native-ui agent.
+
+    Called during server lifespan startup so the Web UI offers Qwen Code as a
+    built-in native-terminal agent on every deployment (not only after the
+    ``omnigent qwen`` CLI first registers it). Content-aware via
+    :func:`_ensure_builtin_agent`.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_QWEN_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_qwen_native_bundle(),
+    )
+
+
+def _build_kimi_native_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the kimi-native-ui agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.kimi_native import _materialize_kimi_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_kimi_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_kimi_native_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the kimi-native-ui agent.
+
+    Called during server lifespan startup so the Web UI offers Kimi as a
+    built-in native-terminal agent on every deployment (not only after the
+    ``omnigent kimi`` CLI first registers it). Content-aware via
+    :func:`_ensure_builtin_agent`.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_KIMI_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_kimi_native_bundle(),
     )
 
 
@@ -1039,19 +1373,35 @@ def create_app(
         call_next: _FastAPICallNext,
     ) -> Response:
         """
-        Count each HTTP request while it is being processed.
+        Count each HTTP request and enrich access logs.
+
+        Generates a per-request correlation ID, captures the
+        ``User-Agent`` header and session ID from the URL path, and
+        stores them in context variables for the Uvicorn access
+        formatter.
 
         :param request: Incoming FastAPI request, e.g. ``GET /health``.
         :param call_next: FastAPI middleware continuation that executes
             the matched route and returns its response.
         :returns: The downstream route response.
         """
+        request_id = uuid.uuid4().hex
+        set_request_id_for_access_log(request_id)
+        set_request_user_agent_for_access_log(
+            request.headers.get("user-agent"),
+        )
+        session_match = _SESSION_PATH_RE.search(request.url.path)
+        set_request_session_id_for_access_log(
+            session_match.group(1) if session_match else None,
+        )
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
         try:
             response = await call_next(request)
             status_code = response.status_code
+            response.headers["X-Request-Id"] = request_id
             return response
         except Exception:
             failed = True
@@ -1174,6 +1524,31 @@ def create_app(
             return {h for h in host_ids if host_registry.get(h) is not None}
         return host_store.online_host_ids(host_ids)
 
+    def _bulk_host_versions(host_ids: list[str]) -> dict[str, str]:
+        """
+        Map each requested host_id to the version from its live hello frame.
+
+        Resolved from the in-memory host registry only: the host version
+        isn't persisted to the hosts table, so a host connected to another
+        replica (multi-replica ``host_store`` deploys) is absent here and
+        the caller reports ``host_version=None`` for that session — the info
+        popover then simply omits the host version. Single-server /
+        single-replica deploys (the common case) resolve it fully. The
+        registry lookup is an in-memory dict read, so this stays off the
+        DB hot path the surrounding bulk liveness query optimizes.
+
+        :param host_ids: Bound host identifiers to resolve, e.g.
+            ``["host_abc123"]``. Empty input returns an empty map.
+        :returns: ``{host_id: version}`` for every id with a live local
+            tunnel; ids without one are absent.
+        """
+        versions: dict[str, str] = {}
+        for host_id in set(host_ids):
+            host_conn = host_registry.get(host_id)
+            if host_conn is not None:
+                versions[host_id] = host_conn.hello.version
+        return versions
+
     def _session_liveness(sid: str) -> SessionLiveness:
         """
         Resolve strict runner + host liveness for one session.
@@ -1247,6 +1622,7 @@ def create_app(
             conn.host_id for conn in connectivity.values() if conn.host_id is not None
         }
         online_hosts = _bulk_hosts_online(list(host_ids_to_check))
+        host_versions = _bulk_host_versions(list(host_ids_to_check))
         result: dict[str, SessionLiveness] = {}
         for sid in ids:
             conn = connectivity.get(sid)
@@ -1257,8 +1633,10 @@ def create_app(
                 continue
             if conn.host_id is None:
                 host_online: bool | None = None
+                host_version: str | None = None
             else:
                 host_online = conn.host_id in online_hosts
+                host_version = host_versions.get(conn.host_id)
             if conn.runner_id is None:
                 # No runner binding: an in-process executor (or a session
                 # not yet dispatched) is reachable — EXCEPT an unbound fork
@@ -1271,7 +1649,11 @@ def create_app(
                 # Strict: reachable only if the runner tunnel is up. No
                 # host-relaunch optimism — host state lives in host_online.
                 runner_online = _runner_up(conn)
-            result[sid] = SessionLiveness(runner_online=runner_online, host_online=host_online)
+            result[sid] = SessionLiveness(
+                runner_online=runner_online,
+                host_online=host_online,
+                host_version=host_version,
+            )
         return result
 
     @app.get("/health")
@@ -1301,8 +1683,11 @@ def create_app(
             ``"conv_abc,conv_def,conv_ghi"``.
         :returns: ``{"status": "ok"}`` with optional ``session``
             and/or ``sessions`` fields. Each session object has shape
-            ``{"runner_online": bool, "host_online": bool | None}``
-            (the single ``session`` object also includes its ``id``).
+            ``{"runner_online": bool, "host_online": bool | None,
+            "host_version": str | None}`` (the single ``session``
+            object also includes its ``id``). ``host_version`` is the
+            bound host's reported version, or ``None`` when there's no
+            host binding / the version isn't resolvable on this replica.
         """
         result: dict[str, Any] = {"status": "ok"}
         batch_ids = [s.strip() for s in session_ids.split(",") if s.strip()] if session_ids else []
@@ -1326,12 +1711,14 @@ def create_app(
                 "id": session_id,
                 "runner_online": single.runner_online,
                 "host_online": single.host_online,
+                "host_version": single.host_version,
             }
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
                     "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
                     "host_online": sl.host_online,
+                    "host_version": sl.host_version,
                 }
                 for sid in batch_ids
             }
@@ -1347,9 +1734,7 @@ def create_app(
         :returns: ``{"version": "<semver string>"}``,
             e.g. ``{"version": "0.1.0"}``.
         """
-        from importlib.metadata import version as _pkg_version
-
-        return {"version": _pkg_version("omnigent")}
+        return {"version": _server_version()}
 
     @app.get("/v1/info")
     async def info() -> dict[str, bool | str | None]:
@@ -1371,9 +1756,10 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``), and the short sandbox
+        ``managed_sandboxes_enabled``), the short sandbox
         provider name (``sandbox_provider``) the web UI labels the
-        new-session sandbox option with.
+        new-session sandbox option with, and the installed
+        ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider
 
@@ -1415,6 +1801,22 @@ def create_app(
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
         sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        # server_version is the installed omnigent package version (same
+        # source as /api/version), surfaced so the web UI can show it in the
+        # session info popover alongside the per-session host version.
+        # smart_routing_enabled: true when the server can route — either
+        # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
+        # + llm: config) or the managed deployment registered a
+        # policy_llm_connection_factory (which means it has LLM capability
+        # and will supply its own RoutingClient).
+        try:
+            from omnigent.runtime._globals import _caps
+
+            smart_routing_enabled = _caps is not None and (
+                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
+            )
+        except ImportError:
+            smart_routing_enabled = False
         return {
             "accounts_enabled": accounts_enabled,
             "login_url": login_url,
@@ -1422,6 +1824,8 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
+            "server_version": _server_version(),
+            "smart_routing_enabled": smart_routing_enabled,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
@@ -1501,6 +1905,19 @@ def create_app(
         ),
         prefix="/v1",
         tags=["terminals"],
+    )
+    app.include_router(
+        create_session_mcp_servers_router(
+            conversation_store,
+            agent_store,
+            artifact_store,
+            agent_cache,
+            runner_router=runner_router,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session_mcp_servers"],
     )
     if comment_store is not None:
         app.include_router(
@@ -1809,9 +2226,9 @@ def create_app(
                 tags=["auth"],
             )
 
-    # Mount the built ap-web SPA at "/" if a build is present. The SPA is
-    # built into ``omnigent/server/static/web-ui/`` by ``ap-web/``'s Vite
-    # build (see ``ap-web/vite.config.ts`` ``build.outDir``). The mount is
+    # Mount the built web SPA at "/" if a build is present. The SPA is
+    # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
+    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is
     # registered AFTER all API routers so router routes win on overlap.
     # Skipping the mount when no build is present keeps API-only
     # deployments working (and ``/`` 404s cleanly instead of exploding at
@@ -1875,11 +2292,11 @@ class _SPAStaticFiles(StaticFiles):
     for the literal root and directory paths, so a refresh on
     ``/c/abc`` would 404.
 
-    The fallback is gated by an extension check: a path with a file
-    extension (``.js``, ``.css``, ``.png``, ``.woff2``, …) is treated as
-    an asset request and a 404 is returned verbatim — that surfaces
-    real broken-asset bugs rather than masking them with the HTML
-    shell. Extensionless paths fall back to ``index.html``.
+    The fallback is gated by an API-prefix and extension check: unmatched
+    ``/v1`` / ``/api`` / ``/auth`` / ``/health`` paths return a JSON 404,
+    and a path with a file extension (``.js``, ``.css``, ``.png``,
+    ``.woff2``, …) returns the static 404 verbatim. Other extensionless
+    paths fall back to ``index.html``.
     """
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -1900,12 +2317,39 @@ class _SPAStaticFiles(StaticFiles):
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
+            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "error": {
+                            "code": ErrorCode.NOT_FOUND,
+                            "message": "Not found",
+                        }
+                    },
+                )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
                 response = await super().get_response("index.html", scope)
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)
+
+
+def _is_web_ui_api_fallback_path(path: str) -> bool:
+    """
+    Return whether an unmatched static path belongs to the API namespace.
+
+    The web UI is mounted at ``/`` and receives every unmatched request after
+    the routers. Without this guard, an unknown API route such as
+    ``/v1/sessions/x/codex_goal`` is served the SPA shell as ``200 text/html``,
+    which makes browser clients fail with a JSON parse error instead of a
+    route-level 404.
+
+    :param path: Static mount-relative path, e.g. ``"v1/sessions/x"``.
+    :returns: True for paths that should never fall back to ``index.html``.
+    """
+    first_segment = path.lstrip("/").split("/", 1)[0]
+    return first_segment in _WEB_UI_API_FALLBACK_PREFIXES
 
 
 class _RangeAwareGZipMiddleware(GZipMiddleware):

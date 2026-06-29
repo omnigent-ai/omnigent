@@ -11,7 +11,7 @@ one agreed definition of a *single* child being busy. That definition lives
 here so the two can't drift.
 
 The predicate mirrors the web ``SubagentsPanel`` ``childStatus`` semantics
-(``ap-web/src/shell/SubagentsPanel.tsx``): awaiting input outranks everything
+(``web/src/shell/SubagentsPanel.tsx``): awaiting input outranks everything
 (a sub-agent parked on an elicitation is still mid-turn), then ``launching``,
 then the live ``busy`` flag, then any non-terminal ``current_task_status``.
 

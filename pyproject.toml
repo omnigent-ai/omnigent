@@ -36,6 +36,9 @@ dependencies = [
     "mcp>=1.0,<2",
     "starlette>=0.27,<1",
     "uvicorn[standard]>=0.30,<1",
+    # websockets >=15 asyncio client hangs on macOS before emitting any handshake
+    # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
+    "websockets>=10.4,<15",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
@@ -65,8 +68,11 @@ dependencies = [
     # object has no setter" on any `omni host ...` invocation.
     "click>=8.0,<8.2",
     "fastapi>=0.100,<1",
-    "pexpect>=4.9,<5",
-    "pyte>=0.8,<1",
+    # pexpect/pyte back the POSIX tmux/PTY terminal stack, which is disabled
+    # on Windows (no usable PTY); omnigent never imports them on the core
+    # path, so skip them there to avoid shipping an unusable dependency.
+    "pexpect>=4.9,<5; platform_system != 'Windows'",
+    "pyte>=0.8,<1; platform_system != 'Windows'",
     "pydantic>=2.0,<3",
     "sqlalchemy>=2.0,<3",
     "tiktoken>=0.7,<1",
@@ -131,6 +137,11 @@ e2b = ["e2b>=2.26,<3"]
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
 openshell = ["openshell>=0.0.7,<1"]
+# On-demand Kubernetes runner Pod launcher (server-managed
+# `sandbox.provider: kubernetes`). The launcher module ships in the base
+# package and imports the official client lazily, so only users of the
+# provider need this extra.
+kubernetes = ["kubernetes>=36,<37"]
 # MLflow tracing is opt-in: tracing is disabled by default and the
 # server degrades gracefully when mlflow is absent, so the (heavy) mlflow
 # dependency only installs for users who want it (`omnigent[tracing]`).
@@ -145,6 +156,11 @@ agents-sdk = [
 # harness module imports the SDK lazily on first turn, so only users of the
 # harness need this extra. Early SDK (v0.1.x) — pin minor.
 antigravity = ["google-antigravity>=0.1,<1"]
+# GitHub Copilot SDK harness (`harness: copilot`). Optional: the harness module
+# imports the SDK lazily on first turn, so only users of the harness need this
+# extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
+# why it is not part of the baseline install. Pin major.
+copilot = ["github-copilot-sdk>=1,<2"]
 # Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
 # harness imports the cursor-sdk lazily on first turn, so only `--harness
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
@@ -296,6 +312,7 @@ pythonpath = [".", "sdks/python-client", "sdks/ui"]
 markers = [
     "live: end-to-end tests requiring real LLM API key (run with --llm-api-key)",
     "live_app: end-to-end tests requiring a deployed Databricks App server",
+    "databricks: requires the `databricks` extra (psycopg / databricks-sdk / mlflow). Deselected on the standard lanes via -m 'not databricks'; runs only in the Pytest (databricks) lane, which installs the extra. Use for tests that build a postgresql+psycopg engine or call the Databricks SDK.",
     "model(name, ...): one arg pins this test to that model overriding the suite-wide --model CLI default; multiple args fan the test out across all listed models via indirect parametrize.",
     "model_pinned: opt out of tests/_model_pools.py spreading and retry rotation; literal model strings are used as written.",
     "flaky(reruns=2, reruns_delay=0): rerun a nondeterministic test on failure (pytest-rerunfailures). Use for tests flaky due to timing/scheduling races (e.g. PTY drain timing), NOT real-LLM nondeterminism — those use llm_flaky, which rotates models per attempt.",
@@ -306,6 +323,8 @@ markers = [
     "min_runner_version(version): skip this test when the pinned runner/host under test is older than `version` (PEP 440 release-tuple comparison, so a `.devN` of X satisfies X). Used by the runner/host backwards-compat CI (Config 2); inert in normal runs (no OMNIGENT_COMPAT_RUNNER_VERSION set).",
     "mock_only: tests/integration test that only works in mock-LLM mode (no --llm-api-key). Skipped by tests/integration/conftest.py when a real --llm-api-key is supplied (the real-LLM Integration jobs). Use for tests whose mock LLM is scripted with a fixed tool-call sequence — a real LLM cannot reproduce the scripted markers.",
     "visual: UI diff visual-regression snapshot (pytest-playwright-visual-snapshot). Runs only in the pinned-runner gate (.github/workflows/ui-snapshot.yml); the main e2e_ui suite excludes it via -m 'not visual' since it runs on the unpinned ubuntu-latest.",
+    "posix_only: test relies on POSIX-only behaviour (fork, PTY, tmux, Unix sockets, signals); auto-skipped on Windows by tests/conftest.py.",
+    "windows_only: test relies on Windows-only behaviour (Job Objects, cmd.exe); auto-skipped on POSIX by tests/conftest.py.",
 ]
 # Visual snapshot baselines are committed here, keyed per-OS by the plugin
 # (e.g. test_empty_landing_matches_baseline[linux].png). Failure artifacts
@@ -441,6 +460,13 @@ known-first-party = ["omnigent"]
 "omnigent/tools/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# The native Antigravity (agy) transcript forwarder / supervisor is a
+# long-lived boundary loop that must restart on ANY non-cancellation
+# Exception (a crash there silently stops the web transcript mirror), so its
+# top-level catch is a deliberate, documented boundary catch — BLE001 is
+# waived for these top-level antigravity_native modules (see the inline
+# comments at each catch site).
+"omnigent/antigravity_native*.py" = ["BLE001"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -539,6 +565,12 @@ ignore_missing_imports = true
 # as modal above.
 [[tool.mypy.overrides]]
 module = "boxlite.*"
+ignore_missing_imports = true
+
+# kubernetes is an optional dep (the `kubernetes` extra); same lazy-import
+# posture as modal above. urllib3 rides in via the kubernetes client.
+[[tool.mypy.overrides]]
+module = "kubernetes.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

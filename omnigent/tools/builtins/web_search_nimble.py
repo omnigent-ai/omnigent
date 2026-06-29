@@ -43,6 +43,11 @@ _DEFAULT_MAX_RESULTS: int = 5
 _DEFAULT_SEARCH_DEPTH = "lite"
 _VALID_SEARCH_DEPTHS = frozenset({"lite", "deep"})
 
+# Identifies this integration to Nimble via the ``X-Client-Source`` header that
+# Nimble's own SDKs send (e.g. langchain-nimble sends ``"langchain-nimble"``),
+# so traffic from the Omnigent provider is attributable.
+_CLIENT_SOURCE = "omnigent"
+
 
 def _nimble_url() -> str:
     """Resolve the Nimble Search URL; ``OMNIGENT_NIMBLE_BASE_URL`` overrides for tests."""
@@ -93,6 +98,7 @@ def _search_nimble(
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "X-Client-Source": _CLIENT_SOURCE,
             },
             json={
                 "query": query,

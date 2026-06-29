@@ -18,7 +18,7 @@ dist/
 .venv/
 venv/
 
-# Node build outputs. Critical: without this, a local `ap-web/node_modules/`
+# Node build outputs. Critical: without this, a local `web/node_modules/`
 # (left over from `npm install` on the host) would be copied into the
 # build context and overlay the freshly-installed node_modules from the
 # Dockerfile's `npm ci` step — breaking `npm run build` with
@@ -40,7 +40,7 @@ htmlcov/
 mlflow.db
 conv_*
 
-# ap-web/ IS copied into the build context — the web-builder stage in
+# web/ IS copied into the build context — the web-builder stage in
 # the Dockerfile runs `npm run build` against it to produce the SPA
 # bundle. The node_modules exclusion above keeps the host's install
 # from overlaying the container's.

@@ -827,12 +827,18 @@ class SkillSpec:
         disk, e.g. ``Path("/agents/code-review")``. Used by
         ``read_skill_file`` to resolve resource paths. ``None``
         when the skill was created in-memory (e.g. tests).
+    :param user_invocable: Whether the skill may be invoked directly
+        by a user as a slash command. ``False`` for internal
+        orchestration skills (frontmatter ``user-invocable: false``);
+        such skills are excluded from the composer's ``/`` menu.
+        Defaults to ``True`` (absent frontmatter field = invocable).
     """
 
     name: str
     description: str
     content: str
     skill_dir: Path | None = None
+    user_invocable: bool = True
 
 
 @dataclass
@@ -919,6 +925,12 @@ class MCPServerConfig:
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict, repr=False)
+    # Optional per-server tool allow-list: only these tool names are exposed to
+    # the model; others are filtered at registration (server/mcp_pool.py,
+    # runner/mcp_manager.py). ``None`` exposes all. Applies to both transports
+    # and mirrors ``MCPTool.tools`` / the YAML ``tools:`` whitelist documented
+    # in docs/AGENT_YAML_SPEC.md.
+    tools: list[str] | None = None
     description: str | None = None
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.
@@ -963,6 +975,28 @@ class ToolRuntime(str, Enum):
     SERVER = "server"
     CLIENT = "client"
     UC_FUNCTION = "uc_function"
+
+
+class SharePolicy(str, Enum):
+    """How much session-sharing authority ``sys_session_share`` grants.
+
+    Maps the top-level ``agent_session_sharing:`` YAML flag. The flag is
+    the *only* thing that enables the ``sys_session_share`` tool — it is
+    independent of ``spawn`` / ``tools.agents`` (which gate the
+    spawn-lifecycle tools). Sharing mutates access control, so it is
+    off by default and the public tier is a deliberate extra opt-in.
+
+    - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
+      registered at all (default).
+    - :attr:`NON_PUBLIC`: the agent may grant access to named users
+      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+    - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
+      (anonymous read of the full transcript).
+    """
+
+    NONE = "none"
+    NON_PUBLIC = "non-public"
+    PUBLIC = "public"
 
 
 @dataclass
@@ -1450,6 +1484,16 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``sys_session_get_history`` / ``sys_session_get_info``)
         are always registered and are not affected by either
         opt-in.
+    :param agent_session_sharing: Authority for the agent to share the
+        session it is running in, via ``sys_session_share``. YAML key is
+        ``agent_session_sharing:`` (top-level, like ``spawn:``). This
+        flag is the SOLE enabler of that tool — it is independent of
+        ``spawn`` / ``tools.agents``, and has no bearing on sharing the
+        session through the server API or CLI. One of
+        :class:`SharePolicy`: ``none`` (default — tool not registered),
+        ``non-public`` (grant named users only), or ``public`` (also
+        allow ``__public__`` anonymous read). **Defaults to
+        ``SharePolicy.NONE``.**
     """
 
     spec_version: int
@@ -1495,3 +1539,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
+    agent_session_sharing: SharePolicy = SharePolicy.NONE

@@ -25,6 +25,7 @@ from omnigent.repl._repl import (
     _build_startup_header,
     _consume_pending_local_skill_slash_command,
     _decode_terminal_target_key,
+    _fetch_server_version,
     _is_recoverable_sse_transport_error,
     _parse_sub_agent_handle,
     _parse_terminal_tool_output,
@@ -1468,6 +1469,249 @@ def test_render_startup_banner_without_header_is_name_only() -> None:
     assert "~/" not in plain
 
 
+def test_startup_header_shows_server_version_on_url_line() -> None:
+    """A resolved server version renders inline on the URL row: ``<url>  ·  server <ver>``.
+
+    What this proves: the version the user asked to surface (the headline
+    of this change) actually reaches the box and sits on the SAME line as
+    the URL as one "which server / what version" block. A regression that
+    stopped threading ``server_version`` into ``_render_startup_banner_ansi``
+    would drop it and fail the membership assert; one that split it onto its
+    own row would put the URL and version on different lines, failing the
+    same-line assert. The width assert guards the combined row against
+    pushing the 80-column box into a wrap.
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~/omnigent",
+        description=None,
+        model_label=None,
+        credential=None,
+        creds_line=None,
+    )
+    remote = "https://omnigent.example.com"
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        _render_startup_banner_ansi(
+            "polly", server_url=remote, server_version="0.3.0.dev0", header=header
+        ),
+    )
+    assert "server 0.3.0.dev0" in plain
+    # URL and version share one line — find the row carrying the URL and
+    # assert the version is on that same row.
+    url_line = next(line for line in plain.split("\n") if remote in line)
+    assert "server 0.3.0.dev0" in url_line
+    widths = [len(line) for line in plain.split("\n")]
+    assert max(widths) < 80, f"combined URL+version row widened the box to {max(widths)} cols"
+
+
+def test_startup_header_shows_local_server_url_with_version() -> None:
+    """A loopback server URL IS shown in the header, inline with the version.
+
+    What this proves: unlike the minimal banner (which hides loopback URLs
+    as noise), the header surfaces a local ``http://127.0.0.1:<port>`` dev
+    server so the combined ``<url>  ·  server <ver>`` line appears for local
+    sessions too. A regression that re-gated the header URL row on
+    ``_is_remote_server_url`` would drop the URL and fail the membership
+    assert.
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~/omnigent",
+        description=None,
+        model_label=None,
+        credential=None,
+        creds_line=None,
+    )
+    local = "http://127.0.0.1:7393"
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        _render_startup_banner_ansi(
+            "polly", server_url=local, server_version="0.3.0.dev0", header=header
+        ),
+    )
+    # The loopback URL and the version share one row in the header box.
+    url_line = next(line for line in plain.split("\n") if local in line)
+    assert "server 0.3.0.dev0" in url_line
+
+
+def test_startup_header_shows_databricks_workspace_url_not_api_mount() -> None:
+    """A Databricks server shows the ``/omnigent`` SPA URL and NO version.
+
+    What this proves two things for a workspace mount: (1) the header maps
+    the internal ``/api/2.0/omnigent`` proxy mount to the recognizable
+    workspace ``/omnigent`` URL — a regression rendering the raw
+    ``server_url`` would leak the API path; and (2) the server-version row
+    is suppressed even when a version is passed, because a workspace build
+    has no meaningful version string to show (its ``/api/version`` returns a
+    placeholder like ``"source"``).
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~",
+        description=None,
+        model_label=None,
+        credential="Subscription",
+        creds_line=None,
+    )
+    api_mount = "https://e2-dogfood.staging.cloud.databricks.com/api/2.0/omnigent"
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        # Pass a version to prove the renderer suppresses it for a workspace
+        # mount regardless of what the caller hands in.
+        _render_startup_banner_ansi(
+            "polly", server_url=api_mount, server_version="0.3.0.dev0", header=header
+        ),
+    )
+    # The clean workspace URL is shown, the internal API path is NOT.
+    assert "https://e2-dogfood.staging.cloud.databricks.com/omnigent" in plain
+    assert "/api/2.0/omnigent" not in plain
+    # No version row for a Databricks workspace server.
+    assert "server " not in plain
+    assert "0.3.0.dev0" not in plain
+
+
+def test_startup_header_omits_server_version_when_unresolved() -> None:
+    """No ``server <ver>`` row when the version probe returned ``None``.
+
+    What this proves: the row is purely additive — an unreachable or old
+    server (probe → ``None``) yields the same box as before, never a bare
+    ``server`` label or blank row.
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~/omnigent",
+        description=None,
+        model_label=None,
+        credential=None,
+        creds_line=None,
+    )
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        _render_startup_banner_ansi("polly", server_url=None, server_version=None, header=header),
+    )
+    assert "server " not in plain
+
+
+def _run(coro):
+    """Drive an async helper to completion from a sync test."""
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def _fake_version_client(by_path: dict[str, dict]) -> tuple[object, list[str]]:
+    """Build a fake ``OmnigentClient`` whose ``_http.get`` serves per-path JSON.
+
+    :param by_path: Maps a request path suffix (e.g. ``"/v1/info"``) to the
+        JSON body its response should return.
+    :returns: ``(client, targets)`` — the fake client, and a list that
+        records each full URL the helper requested, in order.
+    """
+    targets: list[str] = []
+
+    class _FakeResp:
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self) -> dict:
+            return self._body
+
+    class _FakeHttp:
+        async def get(self, target: str, timeout: object = None):
+            targets.append(target)
+            for suffix, body in by_path.items():
+                if target.endswith(suffix):
+                    return _FakeResp(body)
+            return _FakeResp({})
+
+    class _FakeClient:
+        _base_url = "https://omnigent.example.com"
+        _http = _FakeHttp()
+
+    return _FakeClient(), targets
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        # Happy path: server_version present in the /v1/info body.
+        ({"server_version": "0.3.0.dev0"}, "0.3.0.dev0"),
+        # Server too old to report the field → falls through, None here.
+        ({"accounts_enabled": False}, None),
+        # Non-string / empty values are rejected rather than rendered.
+        ({"server_version": ""}, None),
+        ({"server_version": 3}, None),
+    ],
+)
+def test_fetch_server_version_parses_info(payload, expected) -> None:
+    """``_fetch_server_version`` extracts a non-empty string ``server_version`` from /v1/info.
+
+    What this proves: only a usable version string reaches the header; a
+    missing field, empty string, or non-string is treated as "unknown" and
+    falls through (here ``/api/version`` also has nothing, so the result is
+    ``None``) so the banner never shows a garbage version. Also pins the
+    probe to go through the client's AUTHENTICATED ``_http`` (so a hosted,
+    auth-gated server answers instead of 401-ing), trying ``/v1/info`` first.
+    """
+    client, targets = _fake_version_client({"/v1/info": payload, "/api/version": {}})
+    assert _run(_fetch_server_version(client)) == expected
+    # The richer capabilities probe is always tried first, via the authed _http.
+    assert targets[0] == "https://omnigent.example.com/v1/info"
+
+
+def test_fetch_server_version_falls_back_to_api_version() -> None:
+    """When ``/v1/info`` lacks ``server_version``, fall back to ``/api/version``.
+
+    What this proves: an older server (e.g. a staging deploy that predates
+    ``server_version`` landing in ``/v1/info`` but still serves the
+    long-standing ``/api/version``) still fills the version row instead of
+    showing the URL alone. Pins the order: ``/v1/info`` first, then the
+    legacy endpoint only when the first yields no usable version.
+    """
+    client, targets = _fake_version_client(
+        {
+            # Modern endpoint present but without the field (older server).
+            "/v1/info": {"accounts_enabled": False},
+            # Legacy endpoint still reports the installed version.
+            "/api/version": {"version": "0.1.2"},
+        }
+    )
+    assert _run(_fetch_server_version(client)) == "0.1.2"
+    assert targets == [
+        "https://omnigent.example.com/v1/info",
+        "https://omnigent.example.com/api/version",
+    ]
+
+
+def test_fetch_server_version_never_raises() -> None:
+    """Any probe error yields ``None`` (boot must not fail).
+
+    What this proves: the version probe is a non-blocking nicety — an
+    ``httpx`` error mid-probe (including a 401 from an auth-gated server
+    that the client somehow can't satisfy, or a network drop) returns
+    ``None`` instead of propagating and taking down REPL boot.
+    """
+
+    class _BoomHttp:
+        async def get(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("network down")
+
+    class _FakeClient:
+        _base_url = "https://omnigent.example.com"
+        _http = _BoomHttp()
+
+    assert _run(_fetch_server_version(_FakeClient())) is None
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -1573,6 +1817,44 @@ def test_build_startup_header_subscription_credential(tmp_path, monkeypatch) -> 
     assert header.creds_line is None
     # The description is summarized for the box.
     assert header.description == "A test agent"
+
+
+def test_build_startup_header_creds_line_hints_first_available(tmp_path, monkeypatch) -> None:
+    """
+    A surface with no default names the credential the launch will fall back to.
+
+    The Databricks-only GPT-head scenario: a multi-family agent (anthropic +
+    openai) where the ``openai`` surface has NO default, but a Databricks
+    workspace that serves openai is configured. The creds line must not read a
+    bare "not configured" — the head WILL launch through that workspace (the
+    runtime spawn-env fallback), so the header names it: "no default → will use
+    …". Header and launch resolve it through the same
+    :func:`first_available_provider`, so the readout cannot disagree with what
+    actually launches.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  claude-subscription:\n"
+        "    kind: subscription\n"
+        "    cli: claude\n"
+        "    default: anthropic\n"
+        "  databricks:\n"  # serves openai, but is NOT marked the openai default
+        "    kind: databricks\n"
+        "    profile: gtm-ws\n"
+    )
+    header = _build_startup_header(
+        "claude-sdk", "Two-headed brainstorming partner.", ["anthropic", "openai"]
+    )
+    assert header.creds_line is not None
+    # anthropic has its explicit default; openai has none → the hint names the
+    # first-available credential the launch falls back to (the Databricks ws).
+    assert "Claude → Subscription" in header.creds_line
+    assert "Codex → no default → will use 🧱 Databricks (gtm-ws)" in header.creds_line
 
 
 def test_build_startup_header_creds_line_includes_pi_surface(tmp_path, monkeypatch) -> None:
@@ -2110,6 +2392,41 @@ async def test_registered_skill_command_uses_structured_slash_command() -> None:
     rendered = "\n".join(str(item) for item in host.output_calls)
     assert "review this plan" in rendered
     assert "load_skill" not in rendered
+
+
+def test_register_skill_commands_skips_non_user_invocable() -> None:
+    """``user-invocable: false`` skills are not registered as REPL slash commands."""
+    from omnigent.repl import _repl as repl_mod
+
+    invocable = SkillSpec(name="visible-skill", description="d", content="c")
+    internal = SkillSpec(name="internal-skill", description="d", content="c", user_invocable=False)
+    registered = repl_mod.register_skill_commands([invocable, internal])
+    try:
+        assert "/visible-skill" in registered
+        assert "/internal-skill" not in registered
+        assert "/internal-skill" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+
+
+def test_register_skill_commands_skips_invalid_command_names() -> None:
+    """Skill names that aren't valid slash-command tokens are skipped + not registered."""
+    from omnigent.repl import _repl as repl_mod
+
+    valid = SkillSpec(name="superpowers:using-superpowers", description="d", content="c")
+    namespaced = SkillSpec(name="fe-innovate--innovate", description="d", content="c")
+    spacey = SkillSpec(name="bad name", description="d", content="c")
+    slashy = SkillSpec(name="etc/hosts", description="d", content="c")
+    registered = repl_mod.register_skill_commands([valid, namespaced, spacey, slashy])
+    try:
+        assert "/superpowers:using-superpowers" in registered  # ``:`` namespace ok
+        assert "/fe-innovate--innovate" in registered  # ``--`` namespace ok
+        assert "/bad name" not in registered
+        assert "/etc/hosts" not in registered
+        assert "/bad name" not in repl_mod.COMMANDS
+        assert "/etc/hosts" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
 
 
 def test_consume_pending_local_skill_slash_command_only_suppresses_match() -> None:

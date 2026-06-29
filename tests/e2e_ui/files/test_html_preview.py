@@ -39,7 +39,7 @@ from playwright.sync_api import Page, expect
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Must stay in sync with ``HTML_PREVIEW_SANDBOX`` in
-# ``ap-web/src/shell/codeViewerHelpers.ts``. ``allow-scripts`` re-enables JS
+# ``web/src/shell/codeViewerHelpers.ts``. ``allow-scripts`` re-enables JS
 # (#778); the popup flags let links escape into a real new tab (#777); we
 # deliberately do NOT include ``allow-same-origin`` (would let untrusted
 # artifact JS reach the parent app's origin).

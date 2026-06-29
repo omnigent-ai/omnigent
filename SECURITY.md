@@ -16,7 +16,7 @@ two pieces so the scan work happens only **once per PR**:
 - **`.github/workflows/security-scan.yml`** — runs the deterministic scan once
   on `pull_request` and produces the `Security Scan` check.
 - **`.github/workflows/security-gate.yml`** — a reusable poller run as the first
-  job (`gate`) of every CI workflow (`ci`, `lint`, `e2e`, `e2e-ui`, ap-web
+  job (`gate`) of every CI workflow (`ci`, `lint`, `e2e`, `e2e-ui`, web
   tests); the real jobs declare `needs: gate`. It does not re-scan — for an
   untrusted PR it waits for the `Security Scan` check and mirrors its result
   (failure → the dependent CI jobs are skipped); trusted authors and non-PR

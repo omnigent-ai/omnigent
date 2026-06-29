@@ -21,6 +21,7 @@ from click import ClickException
 from click.testing import CliRunner, Result
 
 from omnigent.cli import (
+    _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _adopt_ambient_credentials,
     _announce_auto_configured_credentials,
@@ -34,6 +35,8 @@ from omnigent.cli import (
     _is_removed_ad_hoc_invocation,
     _is_run_shorthand,
     _load_global_config,
+    _manage_goose_harness,
+    _manage_kimi_harness,
     _manage_qwen_harness,
     _materialize_harness_launcher_file,
     _node_dependency_problem,
@@ -193,6 +196,17 @@ def _fake_run_codex_native_capture(
         :param kwargs: Whatever ``omnigent.codex_native.run_codex_native``
             is called with.
         """
+        captured.update(kwargs)
+
+    return _stub
+
+
+def _fake_run_kiro_native_capture(
+    captured: dict[str, object],
+) -> Callable[..., None]:
+    """Build a ``run_kiro_native`` stub that records its kwargs."""
+
+    def _stub(**kwargs: object) -> None:
         captured.update(kwargs)
 
     return _stub
@@ -520,6 +534,109 @@ def test_codex_command_session_and_resume_mutually_exclusive(
 
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output
+
+
+def test_kiro_command_is_registered_in_click_help() -> None:
+    """``omnigent kiro`` is a true top-level Click command."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "kiro" in _CLICK_SUBCOMMANDS
+    assert "kiro" in result.output
+
+
+def test_kiro_command_parses_native_options_and_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent kiro`` routes mapped options to the native Kiro runner."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", lambda: {"server": "https://cfg"})
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda server: server)
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        _fake_run_kiro_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "kiro",
+            "--model",
+            "auto",
+            "--effort",
+            "high",
+            "--agent",
+            "dev",
+            "--trust-tools",
+            "Read",
+            "--trust-all-tools",
+            "-p",
+            "hi",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["server"] == "https://cfg"
+    assert captured["session_id"] is None
+    assert captured["resume_picker"] is False
+    assert captured["model"] == "auto"
+    assert captured["prompt"] == "hi"
+    assert captured["kiro_args"] == (
+        "--effort",
+        "high",
+        "--agent",
+        "dev",
+        "--trust-tools",
+        "Read",
+        "--trust-all-tools",
+    )
+
+
+def test_kiro_command_bare_resume_requests_picker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent kiro --resume`` requests the Kiro-native picker."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        _fake_run_kiro_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["kiro", "--resume"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["session_id"] is None
+    assert captured["resume_picker"] is True
+
+
+def test_kiro_command_session_and_resume_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid Kiro resume inputs fail before backend side effects."""
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+
+    result = CliRunner().invoke(cli, ["kiro", "--session", "conv_a", "--resume", "conv_b"])
+
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+
+
+def test_kiro_command_rejects_kiro_resume_passthrough_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro-owned resume flags are reserved for internal cold-resume mapping."""
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+
+    result = CliRunner().invoke(cli, ["kiro", "--", "--resume-id", "kiro-session"])
+
+    assert result.exit_code != 0
+    assert "Kiro resume flags are reserved" in result.output
 
 
 # ── bundled-agent shorthands (omnigent polly / omnigent debby) ──────────
@@ -2221,6 +2338,22 @@ def test_materialize_harness_launcher_file_writes_omnigent_yaml() -> None:
     assert "profile" not in raw["executor"], raw["executor"]
 
 
+def test_materialize_harness_launcher_file_kimi_gets_os_env() -> None:
+    """``run --harness kimi`` bakes a caller-process ``os_env`` so the SDK kimi
+    operates in the user's current directory, matching claude-sdk.
+
+    Regression: kimi was missing from ``_OS_ENV_HARNESSES``, so its launcher
+    spec had no ``os_env`` block and the headless harness ran detached from the
+    cwd (the user saw it operate out of the /tmp spec dir, not their folder)."""
+    for alias in ("kimi", "kimi-code"):
+        generated = _materialize_harness_launcher_file(
+            harness=alias, model=None, system_prompt=None
+        )
+        raw = yaml.safe_load(generated.read_text())
+        assert raw["executor"]["harness"] == "kimi"
+        assert raw["os_env"] == {"type": "caller_process", "sandbox": {"type": "none"}}
+
+
 def test_run_without_agent_drops_into_configure_when_unconfigured(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2247,6 +2380,13 @@ def test_run_without_agent_drops_into_configure_when_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured
+    )
+    # The kimi fallback in ``_pick_first_run_harness`` gates on the ``kimi``
+    # binary being on PATH. Stub it to False so the test stays deterministic
+    # on machines where the developer has kimi installed.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda _key: False,
     )
     # The configure picker would block on a real terminal; stub it.
     configure = Mock()
@@ -3936,6 +4076,48 @@ def test_setup_no_internal_beta_runs_configure_flow(
     run_onboarding.assert_not_called()
 
 
+def test_setup_uses_compact_branding_on_short_terminals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A short first-run terminal should show the setup picker, not scroll past it."""
+    configure_flow = Mock()
+    print_landing = Mock()
+    print_brandmark = Mock()
+    monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure_flow)
+    monkeypatch.setattr("omnigent.inner.ui.print_landing", print_landing)
+    monkeypatch.setattr("omnigent.inner.ui.print_brandmark", print_brandmark)
+    monkeypatch.setattr(
+        "omnigent.cli.shutil.get_terminal_size",
+        lambda fallback: os.terminal_size((80, 24)),
+    )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
+
+    assert result.exit_code == 0, result.output
+    print_brandmark.assert_called_once_with("setup")
+    print_landing.assert_not_called()
+    configure_flow.assert_called_once_with()
+
+
+def test_setup_keeps_full_landing_on_tall_terminals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Roomy terminals keep the full first-run lockup."""
+    configure_flow = Mock()
+    print_landing = Mock()
+    print_brandmark = Mock()
+    monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure_flow)
+    monkeypatch.setattr("omnigent.inner.ui.print_landing", print_landing)
+    monkeypatch.setattr("omnigent.inner.ui.print_brandmark", print_brandmark)
+    monkeypatch.setattr(
+        "omnigent.cli.shutil.get_terminal_size",
+        lambda fallback: os.terminal_size((120, 40)),
+    )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
+
+    assert result.exit_code == 0, result.output
+    print_landing.assert_called_once_with(tagline="all your agents, one cli")
+    print_brandmark.assert_not_called()
+    configure_flow.assert_called_once_with()
+
+
 # ─── setup dependency preflight (Node / tmux) ─────────────────────────
 
 
@@ -3978,7 +4160,7 @@ def test_node_dependency_problem_missing(monkeypatch: pytest.MonkeyPatch) -> Non
     problem = _node_dependency_problem()
 
     assert problem is not None
-    assert "node not found on PATH" in problem
+    assert "node not found" in problem
     assert "Pi" in problem  # the harnesses that need it are named
 
 
@@ -4008,10 +4190,10 @@ def test_node_dependency_problem_too_old(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert problem is not None
     assert "too old" in problem
-    # The concrete version and the opaque error users actually see must
-    # both appear — that's what makes the warning recognizable.
+    # The concrete detected version and the required floor must both appear —
+    # that's what makes the compact warning recognizable and actionable.
     assert "v20.12.2" in problem
-    assert "markAsUncloneable" in problem
+    assert "Node.js 22 LTS" in problem
 
 
 def test_node_dependency_problem_probe_inconclusive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4085,7 +4267,7 @@ def test_warn_missing_harness_dependencies_lists_all_gaps(
 
     err = capsys.readouterr().err
     assert "Node.js is too old" in err
-    assert "tmux not found on PATH" in err
+    assert "tmux not found" in err
 
 
 def test_click_subcommands_allowlist_covers_registered_commands() -> None:
@@ -4168,6 +4350,13 @@ def test_pick_first_run_harness_none_when_unconfigured(monkeypatch: pytest.Monke
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured
     )
+    # The kimi fallback in _pick_first_run_harness gates on the ``kimi``
+    # binary being on PATH. Stub it to False so the test stays deterministic
+    # on machines where the developer has kimi installed.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda _key: False,
+    )
     assert _pick_first_run_harness() is None
 
 
@@ -4249,6 +4438,13 @@ def test_resolve_first_run_plan_drops_into_configure_when_empty(
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured, before and after configure
+    )
+    # The kimi fallback in ``_pick_first_run_harness`` gates on the ``kimi``
+    # binary being on PATH. Stub it to False so the test stays deterministic
+    # regardless of the developer's local install.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda _key: False,
     )
     configure = Mock()
     monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure)
@@ -4678,3 +4874,157 @@ def test_manage_qwen_harness_back_does_not_launch(
     _manage_qwen_harness()
 
     launch.assert_not_called()
+
+
+# ── omnigent setup: Goose drill-in (_manage_goose_harness) ───────────────
+
+
+def test_manage_goose_harness_missing_cli_shows_hint_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the goose CLI is missing, the drill-in shows the install hint and
+    returns without launching ``goose configure`` (Goose has no npm auto-install).
+    """
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(it, "console", Mock())
+    launch = Mock()
+    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    # Should never reach the select() menu when the CLI is absent.
+    monkeypatch.setattr(it, "select", Mock(side_effect=AssertionError("select called")))
+
+    _manage_goose_harness()
+
+    launch.assert_not_called()
+
+
+def test_manage_goose_harness_back_does_not_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the CLI installed, choosing "← Back" exits without launching configure."""
+    import omnigent.onboarding.goose_auth as ga
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(
+        ga,
+        "goose_config_summary",
+        lambda: ga.GooseConfigSummary(installed=True, provider=None, model=None),
+    )
+    monkeypatch.setattr(it, "console", Mock())
+    launch = Mock(return_value="x")
+    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    # rows = [Run goose configure, Show configuration options, ← Back]; pick Back (2).
+    monkeypatch.setattr(it, "select", lambda *a, **k: 2)
+
+    _manage_goose_harness()
+
+    launch.assert_not_called()
+
+
+def test_manage_goose_harness_configure_launches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Choosing "Run goose configure" launches the configure flow, then exits."""
+    import omnigent.onboarding.goose_auth as ga
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(
+        ga,
+        "goose_config_summary",
+        lambda: ga.GooseConfigSummary(installed=True, provider="anthropic", model="claude-x"),
+    )
+    monkeypatch.setattr(it, "console", Mock())
+    launch = Mock(return_value="✓ provider configured: anthropic")
+    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    # First iteration: pick "Run goose configure" (0); second: "← Back" (2).
+    choices = iter([0, 2])
+    monkeypatch.setattr(it, "select", lambda *a, **k: next(choices))
+
+    _manage_goose_harness()
+
+    launch.assert_called_once()
+
+
+# ── omnigent setup: Kimi Code drill-in (_manage_kimi_harness) ────────────
+
+
+def test_manage_kimi_harness_not_installed_shows_hint_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing kimi CLI shows the curl install_hint and returns.
+
+    Kimi is curl-installed (no npm ``package``), so the drill-in can't
+    auto-install it — it must surface the install_hint and bail without
+    touching login / logout.
+    """
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
+    console = Mock()
+    monkeypatch.setattr(it, "console", console)
+    login = Mock()
+    logout = Mock()
+    monkeypatch.setattr(hi, "harness_login", login)
+    monkeypatch.setattr(hi, "harness_logout", logout)
+    # If the drill-in wrongly reached the menu loop, this select would drive it.
+    monkeypatch.setattr(it, "select", lambda *a, **k: 0)
+
+    _manage_kimi_harness()
+
+    login.assert_not_called()
+    logout.assert_not_called()
+    # The curl install command was surfaced to the user.
+    printed = " ".join(str(c.args[0]) for c in console.print.call_args_list if c.args)
+    assert "code.kimi.com/kimi-code/install.sh" in printed
+
+
+def test_manage_kimi_harness_back_does_not_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the CLI installed, choosing "← Back" exits without signing in."""
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(it, "console", Mock())
+    login = Mock()
+    logout = Mock()
+    monkeypatch.setattr(hi, "harness_login", login)
+    monkeypatch.setattr(hi, "harness_logout", logout)
+    # rows = [Sign in, Sign out, Show auth options, ← Back]; pick Back (3).
+    monkeypatch.setattr(it, "select", lambda *a, **k: 3)
+
+    _manage_kimi_harness()
+
+    login.assert_not_called()
+    logout.assert_not_called()
+
+
+def test_manage_kimi_harness_login_runs_kimi_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting "Sign in" drives ``harness_login(KIMI_KEY)`` then loops; Back exits."""
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(it, "console", Mock())
+    login = Mock(return_value=False)  # kimi has no status probe; return is ignored
+    logout = Mock()
+    monkeypatch.setattr(hi, "harness_login", login)
+    monkeypatch.setattr(hi, "harness_logout", logout)
+    # First iteration: Sign in (0); second: ← Back (3) to exit the loop.
+    choices = iter([0, 3])
+    monkeypatch.setattr(it, "select", lambda *a, **k: next(choices))
+
+    _manage_kimi_harness()
+
+    login.assert_called_once_with(hi.KIMI_KEY)
+    logout.assert_not_called()

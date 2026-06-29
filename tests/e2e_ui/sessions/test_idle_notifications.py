@@ -274,7 +274,7 @@ def test_idle_notification_fires_when_backgrounded(
     # generic fallback. The preview text is real LLM output, so assert
     # the contract rather than exact content: non-empty either way, and
     # a non-fallback body must respect the preview caps
-    # (``previewText`` in ap-web/src/lib/lastAssistantText.ts:
+    # (``previewText`` in web/src/lib/lastAssistantText.ts:
     # ≤160 chars including the "…" elision marker, ≤3 lines).
     body = first["options"]["body"]
     assert isinstance(body, str) and body.strip(), notifs

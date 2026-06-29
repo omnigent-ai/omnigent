@@ -8,7 +8,7 @@ renderer, and update flow as the empty-landing snapshot -- see ``README.md``.
 Determinism strategy -- the chat page is a pure function of the committed bundle
 plus ``page.route`` stubs for every call the bind path makes (the exact load
 order is: open the per-session SSE stream, then fetch the slim session + the
-items page; see ``ap-web/src/store/chatStore.ts``):
+items page; see ``web/src/store/chatStore.ts``):
 
 * ``GET /v1/sessions/{id}/stream`` is answered with the server's ``[DONE]``
   sentinel -- a *clean* close the store does NOT reconnect on -- so no live event
@@ -71,16 +71,22 @@ _HOSTS_BODY = {
 }
 _EMPTY_LIST_BODY = {"object": "list", "data": [], "has_more": False}
 
-_USER_TEXT = "How do I read a file in Python and print its contents?"
+_USER_TEXT = "How do I read a file in Python?"
+# Keep every line comfortably SHORT. The code box is narrow, and a line that
+# lands near its wrap/overflow boundary renders nondeterministically: subpixel
+# differences flip the SPA between "fits" (clipped, no wrap toggle) and
+# "overflows" (wraps + shows a wrap toggle), which adds a row and shifts the
+# whole transcript below it -- a snapshot flake with no UI change behind it. So
+# no line here should approach the box width.
 _ASSISTANT_TEXT = (
-    "Use a `with` block so the file is closed automatically:\n\n"
+    "Use a `with` block so the file closes itself:\n\n"
     "```python\n"
-    "with open('notes.txt', encoding='utf-8') as f:\n"
+    "with open('notes.txt') as f:\n"
     "    print(f.read())\n"
     "```\n\n"
-    "A couple of things to keep in mind:\n\n"
-    "- `with` releases the handle even if an error is raised mid-read.\n"
-    "- Pass `encoding='utf-8'` explicitly so the read is platform-independent.\n"
+    "A couple of notes:\n\n"
+    "- `with` frees the handle even on an error.\n"
+    "- Use `f.read()` for all of it, or loop to stream.\n"
 )
 
 # Server returns newest-first; the client reverses to chronological, so the

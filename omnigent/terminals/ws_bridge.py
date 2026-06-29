@@ -30,20 +30,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import logging
 import os
-import pty
 import shutil
 import signal
 import struct
-import termios
+import sys
 import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
+
+# fcntl/pty/termios are POSIX-only. This module drives tmux PTY ``attach``
+# sessions, a feature that is disabled on Windows (see the terminal
+# entrypoints), so importing it must not crash the server there. The
+# ``sys.platform`` guard is special-cased by mypy, which type-checks on Linux
+# and therefore still sees the real modules.
+if sys.platform != "win32":
+    import fcntl
+    import pty
+    import termios
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -58,7 +66,7 @@ _PTY_READ_CHUNK: Final[int] = 4096
 # Default per-frame cap: merge queued PTY chunks into bounded sends so
 # huge bursts stream.
 _WS_COALESCE_MAX_BYTES: Final[int] = 64 * 1024
-# Keep these in sync with ap-web's SYNC_ECHO_* constants so the server
+# Keep these in sync with web's SYNC_ECHO_* constants so the server
 # emits frames the browser is still willing to write synchronously after
 # input.
 _INTERACTIVE_WS_COALESCE_MAX_BYTES: Final[int] = 2048
@@ -138,7 +146,7 @@ class _SpawnedPty:
 
 
 # Terminal type advertised to tmux for the attach client. The far end
-# of this bridge is always an xterm.js-compatible emulator (the ap-web
+# of this bridge is always an xterm.js-compatible emulator (the web
 # terminal or the REPL's embedded terminal), never the bridging
 # process's own controlling terminal — so its capabilities, not the
 # ambient ``TERM``, describe the client. Inheriting ambient ``TERM``

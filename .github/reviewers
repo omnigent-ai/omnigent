@@ -23,7 +23,7 @@
 /.github/                    @PattaraS @serena-ruan @dhruv0811 @TomeHirata
 
 # Web UI
-/ap-web/                     @SabhyaC26 @serena-ruan @daniellok-db @hzub
+/web/                     @SabhyaC26 @serena-ruan @daniellok-db
 
 # Core agent runtime & harnesses
 /omnigent/inner/             @SabhyaC26 @TomeHirata @dhruv0811 @dbczumar

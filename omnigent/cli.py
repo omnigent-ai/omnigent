@@ -29,6 +29,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -43,7 +44,7 @@ from omnigent.host.local_server import (
     stop_local_omnigent_server,
     stop_untracked_local_server,
 )
-from omnigent.inner import ui
+from omnigent.inner import _proc, ui
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -189,6 +190,9 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "default_agent",
         "harness",
         "model",
+        # OpenCode-specific default model (``provider/model``) the native
+        # ``omni opencode`` TUI launches on; set via `omni setup` → OpenCode.
+        "opencode_model",
         "server",
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
     }
@@ -249,6 +253,7 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "ANTHROPIC_BEDROCK_BASE_URL",
         "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
         "COHERE_API_KEY",
         "DEEPSEEK_API_KEY",
         "GEMINI_API_KEY",
@@ -451,7 +456,10 @@ def _bundled_example_path(name: str) -> str:
     """
     import importlib.resources
 
-    return str(importlib.resources.files("omnigent.resources.examples").joinpath(name))
+    resource = importlib.resources.files("omnigent.resources.examples").joinpath(name)
+    # On a no-symlink Windows checkout the packaged symlink is a stub text file;
+    # dereference it to the real examples/<name> directory.
+    return str(resolve_repo_symlink(Path(str(resource))))
 
 
 def _pick_first_run_harness() -> _FirstRunPlan | None:
@@ -480,6 +488,15 @@ def _pick_first_run_harness() -> _FirstRunPlan | None:
         return _FirstRunPlan(harness="codex", agent=None)
     if default_provider_for_harness(config, "pi") is not None:
         return _FirstRunPlan(harness="pi", agent=None)
+    # Kimi authenticates against its own backend (``kimi login`` OAuth or a
+    # Moonshot API key) rather than the ambient-detected provider config, so
+    # ``default_provider_for_harness`` can't gate it. Fall back to "binary
+    # installed" as the readiness proxy: the executor will fail loud at the
+    # first turn if no provider is actually configured.
+    from omnigent.onboarding.harness_install import KIMI_KEY, harness_cli_installed
+
+    if harness_cli_installed(KIMI_KEY):
+        return _FirstRunPlan(harness="kimi", agent=None)
     return None
 
 
@@ -1160,6 +1177,7 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "antigravity",
         "attach",
         "claude",
         "codex",
@@ -1167,13 +1185,19 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "cursor",
         "debby",
         "debug",
+        "goose",
+        "hermes",
         "host",
+        "kimi",
+        "kiro",
         "lakebox",
         "login",
+        "opencode",
         "pane-picker",
         "pane-split",
         "pi",
         "polly",
+        "qwen",
         "resume",
         "run",
         "sandbox",
@@ -2043,7 +2067,7 @@ def _spawn_host_daemon_process(
             env=env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     except OSError:
         return None
@@ -2325,7 +2349,7 @@ def _host_daemon_alive() -> bool:
 _LOCAL_SERVER_DISCOVER_TIMEOUT_S = 120.0
 
 
-def _ensure_databricks_server_auth(server: str) -> None:
+def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False) -> None:
     """Sign in (or fail with the login hint) for Databricks-fronted servers.
 
     Probes ``/v1/me`` with whatever credentials the auth chain can mint
@@ -2342,9 +2366,14 @@ def _ensure_databricks_server_auth(server: str) -> None:
 
     :param server: Remote server base URL without a trailing slash,
         e.g. ``"https://myapp-123.aws.databricksapps.com"``.
+    :param non_interactive: When ``True``, never run the browser login —
+        emit the same fail-loud hint a headless invocation gets, even on a
+        TTY. Lets callers (e.g. ``omnigent host --non-interactive``) keep
+        their scripted, no-prompt behavior.
     :raises click.ClickException: When the server is Databricks-fronted,
-        no credentials resolve, and stdin is not a TTY (or the login
-        flow itself fails).
+        no credentials resolve, and the login flow is suppressed (stdin is
+        not a TTY or ``non_interactive`` is set) — or the login flow itself
+        fails.
     """
     import httpx as _httpx
 
@@ -2366,13 +2395,17 @@ def _ensure_databricks_server_auth(server: str) -> None:
     if workspace_host is None:
         return
     login_cmd = f"omnigent login {server}"
-    if not sys.stdin.isatty():
+    if non_interactive or not sys.stdin.isatty():
         raise click.ClickException(
             f"Not signed in to {server} (Databricks-fronted; /v1/me answered "
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
     click.echo(f"Not signed in to {server} — running `{login_cmd}` first.")
-    _databricks_login(server, workspace_host)
+    # Recover the ``?o=`` selector from a prior login record so a re-login
+    # still targets the right workspace.
+    from omnigent.cli_auth import load_databricks_org_id
+
+    _databricks_login(server, workspace_host, org_id=load_databricks_org_id(server))
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -2408,7 +2441,7 @@ def _ensure_backend(server: str | None) -> str:
         # otherwise the session-create call deep in the REPL bring-up
         # surfaces the edge redirect as an opaque non-JSON-response
         # traceback.
-        server = _workspace_api_server_url(server)
+        server = _resolve_server_url(server)
         _ensure_databricks_server_auth(server)
         with runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE):
             _ensure_host_daemon(server)
@@ -2638,7 +2671,7 @@ def _start_cli_runner_process(
             env=env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         if log_fh is not None:
@@ -3001,10 +3034,31 @@ def server(
 
     from omnigent.spec import parse_default_policies, parse_server_llm
 
+    server_llm = parse_server_llm(cfg.get("llm"))
+
+    # Build the default LLM-based routing client when BOTH the server
+    # has an ``llm:`` config AND the feature is explicitly enabled via
+    # OMNIGENT_SMART_ROUTING=1.  Hidden by default — managed deployments
+    # override RuntimeCaps.routing_client with their own implementation.
+    routing_client = None
+    if server_llm is not None and os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
+        from omnigent.runtime.policies.builder import (
+            _build_policy_llm_client,
+            _resolve_server_llm_connection,
+        )
+
+        _conn = _resolve_server_llm_connection(server_llm)
+        _policy_client = _build_policy_llm_client(server_llm, _conn)
+        if _policy_client is not None:
+            from omnigent.server.smart_routing import LLMRoutingClient
+
+            routing_client = LLMRoutingClient(_policy_client)
+
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
-        llm=parse_server_llm(cfg.get("llm")),
+        llm=server_llm,
+        routing_client=routing_client,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -3150,7 +3204,7 @@ def server(
     if not (_WEB_UI_DIST / "index.html").is_file():
         click.echo(
             "  ⚠ web UI not built — serving API only. "
-            "Run `cd ap-web && npm install && npm run build`, "
+            "Run `cd web && npm install && npm run build`, "
             "then restart (or install a release wheel/image).",
             err=True,
         )
@@ -4024,6 +4078,24 @@ def _expand_builtin_env_vars(  # type: ignore[explicit-any]  # entries are parse
 _RESUME_PICKER_SENTINEL = "__resume_picker__"
 
 
+def _reject_native_on_windows(harness: str) -> None:
+    """Fail a native (tmux/PTY) harness command with an actionable message.
+
+    The ``omnigent claude`` / ``codex`` / ``cursor`` native wrappers drive a
+    private tmux server and PTY, which don't exist on Windows. Point users at
+    the SDK harnesses / web UI instead of letting them hit a tmux crash.
+
+    :param harness: The native command name, e.g. ``"claude"``.
+    :raises click.ClickException: Always, when running on Windows.
+    """
+    if IS_WINDOWS:
+        raise click.ClickException(
+            f"`omnigent {harness}` (native tmux/PTY terminal) is not supported on "
+            "Windows. Use an SDK-based harness via `omnigent run <agent.yaml>` "
+            "or the web UI."
+        )
+
+
 @cli.command(
     context_settings={
         "ignore_unknown_options": True,
@@ -4132,6 +4204,7 @@ def claude(
       omnigent claude --resume                  # interactive picker
       omnigent claude --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("claude")
     startup_profiler = StartupProfiler.from_env(
         name="omnigent claude",
         env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -4258,6 +4331,7 @@ def codex(
       omnigent codex --resume                  # interactive picker
       omnigent codex --server https://<app>.databricksapps.com
     """
+    _reject_native_on_windows("codex")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(
@@ -4303,6 +4377,105 @@ def codex(
         codex_args=codex_args,
         model=model,
         prompt=prompt,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch OpenCode, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to opencode-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.option("--model", default=None, help="OpenCode model to use for the native session.")
+@click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
+def opencode(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    model: str | None,
+    opencode_args: tuple[str, ...],
+) -> None:
+    # :param server: Remote Omnigent server URL, or None for local.
+    # :param resume: None, picker sentinel, or a conversation id.
+    # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
+    # :param model: OpenCode model id pinned on the wrapper spec.
+    # :param opencode_args: Pass-through args persisted for the ``opencode attach`` TUI.
+    """Launch OpenCode TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent opencode
+      omnigent opencode --resume conv_abc123
+      omnigent opencode --resume                  # interactive picker
+      omnigent opencode --server https://<app>.databricksapps.com
+    """
+    from omnigent.opencode_native import run_opencode_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    if model is None:
+        # Prefer the OpenCode-specific default (set in `omni setup` → OpenCode →
+        # "Set default model"); fall back to the shared `model` key for back-compat.
+        model = cfg.get("opencode_model") or cfg.get("model")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    # Validate option combinations before any side effects (see the codex
+    # command): _ensure_backend can spawn the daemon and take the full
+    # local-server-discover timeout, which would mask a bad arg pair as an
+    # outage instead of a usage error.
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    # Ensure the host daemon (local when ``--server`` is omitted/empty, remote
+    # otherwise); the daemon-spawned runner owns ``opencode serve`` + the TUI,
+    # and this CLI attaches to the tmux terminal.
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+    run_opencode_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        opencode_args=opencode_args,
+        model=model,
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -4532,21 +4705,45 @@ def _ensure_bundled_agent_brain_credential(name: str) -> None:
     hidden=True,
     help="Deprecated alias for ``--resume <id>``; kept for one release.",
 )
+@click.option(
+    "--mode",
+    "mode",
+    default=None,
+    type=click.Choice(["plan", "ask"]),
+    help=(
+        "Start cursor-agent in the given execution mode. "
+        "``plan``: read-only/planning (analyze, propose plans, no edits). "
+        "``ask``: Q&A style for explanations and questions (read-only)."
+    ),
+)
+@click.option(
+    "--model",
+    default=None,
+    help="Cursor model to use for the native TUI (e.g. gpt-5.2, claude-4.6-sonnet-medium).",
+)
 @click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
 def cursor(
     server: str | None,
     resume: str | None,
     session_id: str | None,
+    mode: str | None,
+    model: str | None,
     cursor_args: tuple[str, ...],
 ) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param model: Cursor model id passed to cursor-agent as ``--model``.
     """Launch the Cursor TUI in an Omnigent terminal.
 
     \b
     Examples:
       omnigent cursor
+      omnigent cursor --model gpt-5.2
       omnigent cursor --resume conv_abc123
       omnigent cursor --resume                 # interactive picker
+      omnigent cursor --mode plan              # start in plan (read-only) mode
+      omnigent cursor --mode ask               # start in ask (Q&A) mode
     """
+    _reject_native_on_windows("cursor")
     choice = _split_resume_value(resume)
     if session_id is not None and (choice.picker or choice.conversation_id is not None):
         raise click.UsageError(
@@ -4559,6 +4756,10 @@ def cursor(
     cfg = _load_effective_config()
     if server is None:
         server = cfg.get("server")
+    # Deliberately no ``cfg.get("model")`` fallback (unlike ``codex``): the
+    # global config model is a Claude/Codex catalog id, not a cursor-agent
+    # model id, and pinning it would break the cursor TUI launch. Cursor's
+    # model is explicit-only here; persistent selection rides the web /model.
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
 
     server = _ensure_backend(server)
@@ -4571,6 +4772,495 @@ def cursor(
         session_id=resolved_session_id,
         resume_picker=choice.picker,
         cursor_args=cursor_args,
+        model=model,
+        auto_open_conversation=auto_open_conversation,
+        mode=mode,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Kiro TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to kiro-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.option("--model", default=None, help="Kiro model to use for the native chat.")
+@click.option("--effort", default=None, help="Kiro effort level to use for the native chat.")
+@click.option("--agent", "kiro_agent", default=None, help="Kiro agent to use for the native chat.")
+@click.option(
+    "--trust-tools",
+    "trust_tools",
+    multiple=True,
+    metavar="TOOL",
+    help="Trust a specific Kiro tool. May be passed multiple times.",
+)
+@click.option(
+    "--trust-all-tools",
+    is_flag=True,
+    default=False,
+    help="Explicitly trust all Kiro tools for this local launch.",
+)
+@click.option(
+    "-p",
+    "--prompt",
+    default=None,
+    help="Send this as the initial Kiro chat input when the TUI starts.",
+)
+@click.argument("kiro_args", nargs=-1, type=click.UNPROCESSED)
+def kiro(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    model: str | None,
+    effort: str | None,
+    kiro_agent: str | None,
+    trust_tools: tuple[str, ...],
+    trust_all_tools: bool,
+    prompt: str | None,
+    kiro_args: tuple[str, ...],
+) -> None:
+    """Launch the Kiro TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent kiro
+      omnigent kiro --resume conv_abc123
+      omnigent kiro --resume                  # interactive picker
+      omnigent kiro --model auto -p "review this repo"
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+    _reject_reserved_kiro_resume_args(kiro_args)
+
+    from omnigent.kiro_native import run_kiro_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    if model is None:
+        model = cfg.get("model")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+    launch_args = _build_kiro_launch_args(
+        effort=effort,
+        kiro_agent=kiro_agent,
+        trust_tools=trust_tools,
+        trust_all_tools=trust_all_tools,
+        passthrough_args=kiro_args,
+    )
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_kiro_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        kiro_args=launch_args,
+        model=model,
+        prompt=prompt,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
+    """Reject Kiro-owned resume flags in passthrough args."""
+    reserved = {"--resume", "--resume-id", "--resume-picker"}
+    if any(arg == flag or arg.startswith(f"{flag}=") for arg in kiro_args for flag in reserved):
+        raise click.UsageError(
+            "Kiro resume flags are reserved for Omnigent resume handling; use "
+            "`omnigent kiro --resume [CONVERSATION]` instead."
+        )
+
+
+def _build_kiro_launch_args(
+    *,
+    effort: str | None,
+    kiro_agent: str | None,
+    trust_tools: tuple[str, ...],
+    trust_all_tools: bool,
+    passthrough_args: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Build mapped Kiro CLI args for the runner-owned terminal launch."""
+    args: list[str] = []
+    if effort:
+        args.extend(["--effort", effort])
+    if kiro_agent:
+        args.extend(["--agent", kiro_agent])
+    for tool in trust_tools:
+        args.extend(["--trust-tools", tool])
+    if trust_all_tools:
+        args.append("--trust-all-tools")
+    args.extend(passthrough_args)
+    return tuple(args)
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Goose TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to goose-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
+def goose(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    goose_args: tuple[str, ...],
+) -> None:
+    """Launch the Goose TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent goose
+      omnigent goose --resume conv_abc123
+      omnigent goose --resume                 # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.goose_native import run_goose_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_goose_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        goose_args=goose_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Hermes TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to hermes-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
+def hermes(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    hermes_args: tuple[str, ...],
+) -> None:
+    """Launch the Hermes TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent hermes
+      omnigent hermes --resume conv_abc123
+      omnigent hermes --resume                 # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.hermes_native import run_hermes_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_hermes_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        hermes_args=hermes_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, binds a runner, "
+        "launches Antigravity (agy) in a terminal resource, and attaches "
+        'this TTY. Pass --server "" to auto-spawn a persistent local '
+        "server in the background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to antigravity-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.option("--model", default=None, help="Antigravity (agy) model to use for the session.")
+@click.argument("antigravity_args", nargs=-1, type=click.UNPROCESSED)
+def antigravity(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    model: str | None,
+    antigravity_args: tuple[str, ...],
+) -> None:
+    """Launch the Antigravity (agy) TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent antigravity
+      omnigent antigravity --resume conv_abc123
+      omnigent antigravity --resume                  # interactive picker
+      omnigent antigravity --server https://<app>.databricksapps.com
+    """
+    # Validate option combinations BEFORE any side effects (daemon spawn,
+    # server discovery) -- see the same comment in the claude command.
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.antigravity_native import run_antigravity_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    if model is None:
+        model = cfg.get("model")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    # permission_mode is left None here (parity with the claude/codex/pi CLI
+    # launchers): the attended terminal launch lets agy's own request-review
+    # prompt govern each tool, and an unattended/headless launch auto-bypasses
+    # inside run_antigravity_native. It is plumbed through build_agy_launch so a
+    # future caller CAN set it, but this human CLI path exposes no permission
+    # flag and never needs one.
+    run_antigravity_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        antigravity_args=antigravity_args,
+        model=model,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the qwen TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to qwen-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("qwen_args", nargs=-1, type=click.UNPROCESSED)
+def qwen(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    qwen_args: tuple[str, ...],
+) -> None:
+    """Launch the qwen (Qwen Code) TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent qwen
+      omnigent qwen --resume conv_abc123
+      omnigent qwen --resume                  # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.qwen_native import run_qwen_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_qwen_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        qwen_args=qwen_args,
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -4656,6 +5346,95 @@ def debby(run_args: tuple[str, ...]) -> None:
     _run_bundled_agent("debby", run_args)
 
 
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Kimi TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to kimi-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("kimi_args", nargs=-1, type=click.UNPROCESSED)
+def kimi(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    kimi_args: tuple[str, ...],
+) -> None:
+    """Launch the Kimi Code TUI in an Omnigent terminal.
+
+    Boots Moonshot AI's interactive ``kimi`` TUI
+    (https://github.com/MoonshotAI/Kimi-Code) in a runner-owned terminal and
+    attaches your TTY — the native experience, embedded in the Omnigent web
+    UI. No Omnigent provider config is needed: kimi authenticates against its
+    own backend (``kimi login`` for OAuth, or a Moonshot API key).
+
+    For the headless SDK harness (per-turn ``kimi -p`` behind the Omnigent
+    REPL) use ``omnigent run --harness kimi`` instead.
+
+    \b
+    Examples:
+      omnigent kimi
+      omnigent kimi --resume conv_abc123
+      omnigent kimi --resume                   # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.kimi_native import run_kimi_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_kimi_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        kimi_args=kimi_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
 @cli.command()
 @click.argument("target", required=False, metavar="[CONV_ID]")
 @click.option(
@@ -4701,8 +5480,7 @@ def resume(
 
     run_resume(
         target=target,
-        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
-        server=_workspace_api_server_url(server) if server else server,
+        server=_resolve_server_url(server) if server else server,
     )
 
 
@@ -4715,8 +5493,8 @@ def resume(
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
-    "'cursor', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', or 'qwen'"
+    "'cursor', 'kimi', "
+    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -4748,9 +5526,16 @@ _DEFAULT_HARNESS_PROMPTS = {
     "cursor": (
         "You are Cursor, running through Omnigent. Help the user with software engineering tasks."
     ),
+    "kimi": (
+        "You are Kimi Code, running through Omnigent. "
+        "Help the user with software engineering tasks."
+    ),
     "qwen": (
         "You are Qwen Code, running through Omnigent. "
         "Help the user with software engineering tasks."
+    ),
+    "goose": (
+        "You are Goose, running through Omnigent. Help the user with software engineering tasks."
     ),
 }
 _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."
@@ -4761,7 +5546,9 @@ _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnige
 # operations route through the Omnigent dispatch path (runner
 # visibility, timeouts, error recovery) instead of the harness's
 # internal built-in tools.
-_OS_ENV_HARNESSES: frozenset[str] = frozenset({"claude-sdk", "codex", "pi", "qwen"})
+_OS_ENV_HARNESSES: frozenset[str] = frozenset(
+    {"claude-sdk", "codex", "pi", "qwen", "goose", "kimi"}
+)
 
 
 def _validate_harness(harness: str) -> None:
@@ -5069,6 +5856,16 @@ def _dispatch_native_terminal_harness(
         from omnigent.cursor_native import run_cursor_native
 
         run_cursor_native(cursor_args=passthrough, **common)
+    elif native_agent.key == "opencode":
+        from omnigent.opencode_native import run_opencode_native
+
+        # OpenCode pins its model on the wrapper spec (like Codex), so it takes
+        # ``model`` first-class rather than via a ``--model`` passthrough arg.
+        run_opencode_native(opencode_args=(), model=model, **common)
+    elif native_agent.key == "kimi":
+        from omnigent.kimi_native import run_kimi_native
+
+        run_kimi_native(kimi_args=passthrough, **common)
     else:  # pragma: no cover - new native agent added without a dispatch arm
         raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
     return True
@@ -5169,7 +5966,10 @@ def _dispatch_run(
 
     if target is None:
         if server_from_cli and server is not None and harness is None:
-            base_url = server.rstrip("/")
+            # Normalize like every other entry point: expand a bare workspace
+            # URL to its /api/2.0/omnigent mount and strip any ?o= query. Else
+            # a direct ``--server`` request hits the root and bounces to /login.
+            base_url = _resolve_server_url(server)
             # Direct ``--server`` (no AGENT) has no local runner to bind, so an
             # interactive resume-by-id is an ATTACH: route it through the
             # `attach` pair (`_require_live_conversation` + `run_attach`), not
@@ -5404,8 +6204,7 @@ def _resolve_attach_server(server: str | None, configured_server: str | None) ->
     """
     chosen = server if server is not None else configured_server
     if chosen:
-        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
-        return _workspace_api_server_url(chosen.rstrip("/"))
+        return _resolve_server_url(chosen)
     local = local_server_url_if_healthy()
     return local.rstrip("/") if local else None
 
@@ -5840,8 +6639,19 @@ def _prompt_stop_local_server() -> None:
 
 @cli.group("host", cls=_HostGroup, invoke_without_command=True)
 @click.option("--server", default=None, help="Remote omnigent server URL.")
+@click.option(
+    "--non-interactive",
+    "non_interactive",
+    is_flag=True,
+    default=False,
+    help=(
+        "Never prompt for sign-in. When the server requires auth and you "
+        "are not logged in, fail with the `omnigent login` hint instead of "
+        "launching the browser login flow. Use this in scripts and CI."
+    ),
+)
 @click.pass_context
-def host(ctx: click.Context, server: str | None) -> None:
+def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     """
     Register this machine as a host with a server.
 
@@ -5855,11 +6665,20 @@ def host(ctx: click.Context, server: str | None) -> None:
     <url>``) or via ``--server <url>``. A leading ``status``, ``stop``,
     or ``stop-session`` token still runs that management subcommand.
 
+    When the target server is Databricks-fronted and you are not signed
+    in, ``host`` runs the same flow ``omnigent login`` would before
+    connecting (an interactive browser flow). Pass ``--non-interactive``
+    to keep the old scripted behavior: fail with the login command to run
+    instead of prompting.
+
     :param ctx: Click invocation context. ``ctx.invoked_subcommand`` is
         set when a management subcommand such as ``"status"`` is running.
     :param server: Remote Omnigent server URL, e.g.
         ``"https://example.databricksapps.com"``. ``None`` falls back
         to config; empty string selects local mode.
+    :param non_interactive: When ``True``, never launch the browser login
+        for an un-authed remote server — fail with the ``omnigent login``
+        hint instead.
     """
     ctx.ensure_object(dict)
     ctx.obj["server"] = server
@@ -5869,8 +6688,11 @@ def host(ctx: click.Context, server: str | None) -> None:
     if server is None:
         server = cfg.get("server")
     if server:
-        # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
-        server = _workspace_api_server_url(server)
+        server = _resolve_server_url(server)
+    # Remote mode is decided here, before the local-mode branch reassigns
+    # ``server`` to the spawned loopback URL — only a remote target needs
+    # the sign-in pre-flight.
+    remote_mode = bool(server)
 
     from omnigent.host.connect import run_host_process
 
@@ -5899,6 +6721,14 @@ def host(ctx: click.Context, server: str | None) -> None:
     # prompt over an error.
     stopped_cleanly = False
     try:
+        # Sign in first when the remote server is Databricks-fronted and we
+        # hold no usable credentials — otherwise the tunnel upgrade is
+        # redirected to a login page and the host dies with an opaque
+        # "redirected to a login page" error after several retries. On a TTY
+        # this runs the browser login and continues; ``--non-interactive``
+        # (or a headless invocation) fails loud with the command to run.
+        if remote_mode:
+            _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         run_host_process(server_url=server)
         stopped_cleanly = True
     except KeyboardInterrupt:
@@ -5942,8 +6772,7 @@ def _resolve_host_server(server: str | None) -> str | None:
     if server is None:
         configured = _load_effective_config().get("server")
         server = str(configured) if configured else None
-    # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
-    return _workspace_api_server_url(server.rstrip("/")) if server else None
+    return _resolve_server_url(server) if server else None
 
 
 def _daemon_base_url(record: _HostDaemonRecord) -> str | None:
@@ -6785,7 +7614,7 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
         time.sleep(0.1)
     if force:
         with contextlib.suppress(ProcessLookupError):
-            os.kill(record.pid, signal.SIGKILL)
+            os.kill(record.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):
@@ -7200,10 +8029,7 @@ def _node_dependency_problem() -> str | None:
     """
     node = shutil.which("node")
     if node is None:
-        return (
-            "node not found on PATH — the Claude, Codex, and Pi harnesses need "
-            f"{_NODE_MIN_VERSION_HINT}."
-        )
+        return f"node not found — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
     # Probe the exact API the bundled undici calls. Exit 0 ⇒ capability
     # present; exit 1 ⇒ too old; we treat any other failure as inconclusive.
     probe = (
@@ -7223,11 +8049,7 @@ def _node_dependency_problem() -> str | None:
         return None
     version = _node_version(node)
     detected = f" (detected {version})" if version else ""
-    return (
-        f"Node.js is too old for the bundled harness CLIs{detected} — they need "
-        f"{_NODE_MIN_VERSION_HINT}. Symptom if unfixed: "
-        "'TypeError: webidl.util.markAsUncloneable is not a function'."
-    )
+    return f"Node.js is too old{detected} — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
 
 
 @contextlib.contextmanager
@@ -7398,20 +8220,15 @@ def _warn_missing_harness_dependencies() -> None:
         problems.append(node_problem)
     if shutil.which("tmux") is None:
         problems.append(
-            "tmux not found on PATH — `omnigent claude` and `omnigent codex` launch "
-            "the agent through a local tmux terminal and refuse to start without it "
-            "(macOS: `brew install tmux`)."
+            "tmux not found — native Claude/Codex need tmux (macOS: `brew install tmux`)."
         )
     if not problems:
         return
-    ui.err_console.print()
-    ui.warn("External tooling needed for some harnesses is missing or outdated:")
+    ui.warn("Some harnesses need external tools:")
     for problem in problems:
         ui.err_console.print(f"  • {problem}", style="omni.warning", markup=False)
     ui.err_console.print(
-        "You can still configure credentials — the pure-Python openai-agents harness "
-        "runs without these — but install them before `omnigent claude` / "
-        "`omnigent codex` or the Pi harness.\n",
+        "You can configure credentials now; install these before launching those harnesses.",
         style="omni.warning",
         markup=False,
     )
@@ -8351,6 +9168,9 @@ class _HarnessMenuRow:
     provider: str | None = None
 
 
+_SOFT_INSTALL_ABORT = "\x00soft-install-abort"
+
+
 def _credential_label(name: str, entry: ProviderEntry) -> str:
     """A friendly, jargon-free label for a configured credential.
 
@@ -8370,61 +9190,6 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     return credential_label(
         entry.kind, name, profile=entry.profile, display_name=entry.display_name
     )
-
-
-def _harness_summary_lines(config: dict[str, Any], family: str) -> list[str]:  # type: ignore[explicit-any]
-    """The styled sub-line(s) shown under a harness on the level-1 overview.
-
-    Returns a prominent default line — a bold-green ``✓`` + the default
-    credential's label, with the model dimmed — and, when there are other
-    credentials, a dim ``+N more`` line (the full list is one keystroke away on
-    level 2). Mirrors how ``gh`` / ``gcloud`` summaries surface the active
-    item: highlight it, don't enumerate the rest. The returned strings carry
-    Rich markup; :func:`_render_menu` indents them without re-styling.
-
-    :param config: The parsed config mapping (``providers:`` block).
-    :param family: The harness surface, ``"anthropic"``, ``"openai"``, or
-        ``"pi"``.
-    :returns: One or two markup sub-lines, e.g. ``["[bold green]✓ Anthropic API
-        Key[/][dim]  ·  claude-opus-4-8[/]", "[dim]+1 more[/]"]``, or
-        ``["[dim]no credential yet — open to add one[/]"]``.
-    """
-    from omnigent.onboarding.provider_config import (
-        load_providers,
-        provider_families,
-        surface_default_model,
-        surface_default_provider,
-    )
-
-    serving = [
-        (name, entry)
-        for name, entry in load_providers(config).items()
-        if family in provider_families(entry)
-    ]
-    if not serving:
-        return ["[dim]no credential yet — open to add one[/]"]
-    # The surface's *effective* default: for the family surfaces this is the
-    # explicit per-family default; for pi it is what the pi harness would
-    # actually route through (explicit pi scope, else the fallback).
-    default = surface_default_provider(config, family)
-    default_label: str | None = None
-    default_model: str | None = None
-    others = 0
-    for name, entry in serving:
-        if default is not None and name == default.name:
-            default_label = _family_credential_label(config, family, name, entry)
-            default_model = surface_default_model(entry, family)
-        else:
-            others += 1
-    if default_label is None:
-        return ["[dim]no default set — open to choose one[/]"]
-    default_line = f"[bold green]✓ {default_label}[/]" + (
-        f"[dim]  ·  {default_model}[/]" if default_model else ""
-    )
-    lines = [default_line]
-    if others:
-        lines.append(f"[dim]+{others} more[/]")
-    return lines
 
 
 def _harness_credential_rows(config: dict[str, Any], family: str) -> list[_HarnessMenuRow]:  # type: ignore[explicit-any]
@@ -8616,10 +9381,12 @@ def _prompt_install_cursor() -> str | None:
             return "✓ cursor-sdk installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the key anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:  # run it yourself
         console.print(f"  Install the cursor extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    # choice == 1 (set key anyway): fall through to the key menu silently.
     return None
 
 
@@ -8657,6 +9424,8 @@ def _manage_cursor_harness() -> None:
     status: str | None = None
     if not cursor_sdk_installed():
         status = _prompt_install_cursor()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         key_set = cursor_api_key_configured(config)
@@ -8786,10 +9555,12 @@ def _prompt_install_antigravity() -> str | None:
             return "✓ google-antigravity installed"
         console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
         return "✗ Install failed — set the key anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
     if choice == 2:
         console.print(f"  Install the antigravity extra with:\n    [bold]{cmd_markup}[/bold]")
         return None
-    # choice == 1 (set key anyway) or Esc: fall through to the key menu silently.
+    # choice == 1 (set key anyway): fall through to the key menu silently.
     return None
 
 
@@ -8823,6 +9594,8 @@ def _manage_antigravity_harness() -> None:
     status: str | None = None
     if not antigravity_sdk_installed():
         status = _prompt_install_antigravity()
+        if status == _SOFT_INSTALL_ABORT:
+            return
     while True:
         config = _load_global_config()
         key_set = antigravity_api_key_configured(config)
@@ -9088,6 +9861,516 @@ def _manage_qwen_harness() -> None:
             status = None
 
 
+def _print_goose_auth_help() -> None:
+    """Print Goose's configuration options (Omnigent manages no Goose credential)."""
+    from omnigent.onboarding.interactive import console
+
+    console.print(
+        "\n  [bold]Configure Goose[/bold] (Omnigent stores no Goose credential):\n"
+        "    • Interactive: run [bold]goose configure[/bold] to pick a provider "
+        "and store its key (keyring or ~/.config/goose/config.yaml)\n"
+        "    • Env override: set [bold]GOOSE_PROVIDER[/bold] + [bold]GOOSE_MODEL[/bold] "
+        "(plus the provider's key, e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY)\n"
+    )
+
+
+def _launch_goose_configure() -> str | None:
+    """Launch the interactive ``goose configure`` flow; return a status line.
+
+    ``goose configure`` is interactive (pick a provider, enter its key), so this
+    hands the terminal to ``goose``; when the user exits, re-read the configured
+    provider. Mirrors :func:`_launch_qwen_auth`.
+
+    :returns: A status line reflecting the post-configure provider state.
+    """
+    from omnigent.onboarding.goose_auth import goose_config_summary
+    from omnigent.onboarding.harness_install import (
+        GOOSE_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console
+
+    if not harness_cli_installed(GOOSE_KEY):
+        return "✗ goose CLI not found"
+    spec = harness_install_spec(GOOSE_KEY)
+    assert spec is not None
+    console.print(
+        "  [dim]Launching [bold]goose configure[/bold] — pick a provider and "
+        "enter its key, then return.[/dim]"
+    )
+    with contextlib.suppress(OSError, KeyboardInterrupt):
+        subprocess.run([spec.binary, "configure"], check=False)
+    summary = goose_config_summary()
+    if summary.provider:
+        model = f" ({summary.model})" if summary.model else ""
+        return f"✓ provider configured: {summary.provider}{model}"
+    return "Provider not detected yet"
+
+
+def _manage_goose_harness() -> None:
+    """Run the level-2 loop for Goose: ensure the CLI, then guide ``goose configure``.
+
+    Goose owns its own auth (keyring / ``~/.config/goose/config.yaml``) — Omnigent
+    stores no Goose credential — so, like the Qwen drill-in, this reports
+    best-effort configuration status and offers to launch ``goose configure``; it
+    does not store a key through Omnigent. A missing CLI gates the drill-in
+    (nothing to configure for a harness you can't run); Goose ships out-of-band
+    (brew / curl, no npm package), so we show its install hint rather than
+    auto-installing. Serves both ``goose-native`` (TUI) and the headless
+    ``goose`` (ACP) harness — both launch the same ``goose`` binary and read the
+    same config.
+
+    :returns: None. Side effects: may launch the interactive ``goose configure``.
+    """
+    from omnigent.onboarding.goose_auth import goose_config_summary
+    from omnigent.onboarding.harness_install import (
+        GOOSE_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    # Gate on the CLI. Goose installs out-of-band (no npm package), so we can't
+    # auto-install — show the hint and return.
+    if not harness_cli_installed(GOOSE_KEY):
+        spec = harness_install_spec(GOOSE_KEY)
+        hint = spec.install_hint if spec and spec.install_hint else "brew install block-goose-cli"
+        console.print(
+            f"  Goose's CLI isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
+            "  then re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        summary = goose_config_summary()
+        if summary.provider:
+            model = f" · {summary.model}" if summary.model else ""
+            header = f"Goose — provider configured: {summary.provider}{model}"
+        else:
+            header = "Goose — no provider configured yet"
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run goose configure", action="configure"),
+            _HarnessMenuRow("Show configuration options", action="help"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "configure":
+            status = _launch_goose_configure()
+        elif action == "help":
+            _print_goose_auth_help()
+            status = None
+
+
+def _manage_hermes_harness() -> None:
+    """Run the level-2 loop for Hermes: ensure the CLI is installed.
+
+    Hermes owns its own auth via ``hermes model`` (interactive provider/model
+    picker) and is installed via a curl script from Nous Research — Omnigent
+    stores no Hermes credential. A missing CLI gates the drill-in; when
+    installed, the drill-in offers to launch ``hermes model`` for provider
+    configuration.
+
+    :returns: None. Side effects: may launch ``hermes model``.
+    """
+    from omnigent.onboarding.harness_install import (
+        HERMES_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(HERMES_KEY):
+        spec = harness_install_spec(HERMES_KEY)
+        hint = (
+            spec.install_hint
+            if spec and spec.install_hint
+            else "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+        )
+        console.print(
+            f"  Hermes isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
+            "  then re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run hermes model (configure provider)", action="model"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Hermes Agent",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "model":
+            import subprocess
+
+            try:
+                subprocess.run(["hermes", "model"], check=False)
+                status = "✓ hermes model completed"
+            except FileNotFoundError:
+                status = "✗ hermes binary not found"
+
+
+def _manage_kiro_harness() -> None:
+    """Run the level-2 loop for Kiro: ensure the CLI is installed and signed in.
+
+    Kiro owns its own auth via ``kiro-cli login`` (Builder ID / social login /
+    Identity Center) and is installed via Kiro's curl installer — Omnigent stores
+    no Kiro credential. A missing CLI gates the drill-in; when installed, the
+    drill-in offers to launch ``kiro-cli login`` to sign in. Mirrors
+    :func:`_manage_hermes_harness`.
+
+    :returns: None. Side effects: may launch ``kiro-cli login``.
+    """
+    from omnigent.onboarding.harness_install import (
+        KIRO_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(KIRO_KEY):
+        spec = harness_install_spec(KIRO_KEY)
+        hint = (
+            spec.install_hint
+            if spec and spec.install_hint
+            else "curl -fsSL https://cli.kiro.dev/install | bash"
+        )
+        console.print(
+            f"  Kiro isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
+            "  then re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run kiro-cli login (sign in)", action="login"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Kiro",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            import subprocess
+
+            try:
+                subprocess.run(["kiro-cli", "login"], check=False)
+                status = "✓ kiro-cli login completed"
+            except FileNotFoundError:
+                status = "✗ kiro-cli binary not found"
+
+
+def _print_kimi_auth_help() -> None:
+    """Print Kimi Code's authentication options.
+
+    Kimi authenticates against Moonshot AI's backend rather than an Omnigent
+    credential: ``kimi login`` (OAuth or a Moonshot API key) for the default
+    provider, and ``kimi provider add`` to register any other provider (an
+    OpenAI-compatible endpoint, a Databricks gateway, …) in
+    ``~/.kimi/config.toml``. Omnigent has no per-spawn provider override for
+    upstream kimi, so all of this lives in the kimi CLI's own config —
+    Omnigent-side injection remains a deferred follow-up.
+    """
+    from omnigent.onboarding.interactive import console
+
+    console.print(
+        "\n  [bold]Authenticate Kimi Code[/bold] (kimi manages its own config in "
+        "~/.kimi/config.toml):\n"
+        "    • Default provider: run [bold]kimi login[/bold] "
+        "(Moonshot OAuth, or paste a Moonshot API key)\n"
+        "    • Other providers: run [bold]kimi provider add[/bold] "
+        "(OpenAI-compatible endpoint, gateway, …), then pin that model id in "
+        "the agent spec\n"
+        "    • Omnigent stores no kimi credential and cannot thread one per "
+        "spawn — configure it once in the kimi CLI\n"
+    )
+
+
+def _manage_kimi_harness() -> None:
+    """Run the level-2 loop for Kimi Code: install the CLI and drive ``kimi login``.
+
+    Unlike Qwen (which has no ``login`` subcommand), Kimi ships a real
+    ``kimi login`` (Moonshot OAuth or API key) and ``kimi logout``, so this
+    drill-in offers sign-in / sign-out directly. Kimi has no first-class
+    "am I logged in?" probe (its install spec sets ``status_args=None``), so
+    :func:`~omnigent.onboarding.harness_install.harness_cli_logged_in` always
+    reports ``False`` for it — meaning ``harness_login`` runs ``kimi login``
+    every time it is asked (the interactive flow lets the user cancel if
+    already authenticated) and its boolean return is not a reliable success
+    signal. We therefore treat login / logout as best-effort side effects and
+    report that the flow finished rather than asserting an auth state.
+
+    Like the other CLI-backed harnesses, a missing CLI gates the drill-in —
+    there is nothing to configure for a harness you can't run.
+
+    :returns: None. Side effects: may install the kimi CLI and run
+        ``kimi login`` / ``kimi logout`` in the foreground.
+    """
+    from omnigent.onboarding.harness_install import (
+        KIMI_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+        harness_login,
+        harness_logout,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    # Gate on the CLI. Kimi ships a single binary via a curl installer (not
+    # npm), so there's no in-process auto-install — name the command and let
+    # the user run it, then re-open. Mirrors how ``harness_setup_hint`` treats
+    # the other curl-installed CLI (cursor-agent).
+    if not harness_cli_installed(KIMI_KEY):
+        spec = harness_install_spec(KIMI_KEY)
+        hint = (spec.install_hint if spec else None) or "see Kimi Code docs"
+        console.print(
+            "  Kimi Code's CLI isn't installed. Install it with:\n"
+            f"    [bold]{hint}[/bold]\n"
+            "  then re-open this menu to sign in."
+        )
+        return
+
+    # Carry the prior action's confirmation as a transient status line.
+    status: str | None = None
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Sign in (kimi login)", action="login"),
+            _HarnessMenuRow("Sign out (kimi logout)", action="logout"),
+            _HarnessMenuRow("Show auth options", action="help"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Kimi Code — authentication is managed by the kimi CLI",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            # ``kimi login`` runs in the foreground (OAuth / API-key prompt);
+            # its boolean return is unreliable for kimi (no status probe), so
+            # don't assert success — just confirm the flow finished.
+            console.print("  [dim]Signing in to Kimi (its login will open)…[/dim]")
+            harness_login(KIMI_KEY)
+            status = "kimi login flow finished — kimi stores its own credentials"
+        elif action == "logout":
+            console.print("  [dim]Signing out of Kimi…[/dim]")
+            harness_logout(KIMI_KEY)
+            status = "kimi logout flow finished"
+        elif action == "help":
+            _print_kimi_auth_help()
+            status = None
+
+
+def _prompt_install_copilot() -> str | None:
+    """Offer to install the missing ``copilot`` extra; return a status line.
+
+    Shown atop the Copilot drill-in when the optional-extra ``github-copilot-sdk``
+    is absent. Three-choice ``select`` like :func:`_prompt_install_cursor` /
+    :func:`_prompt_install_antigravity` (install now / set token anyway / show
+    command), and like them does NOT gate token management on the SDK: the
+    ``copilot:`` token is stored independently and is useful once the SDK lands,
+    so declining falls through to the token menu. Install is portable and
+    index-free — see
+    :func:`omnigent.onboarding.copilot_auth.copilot_install_command`.
+
+    :returns: Status string for the drill-in's transient status line, or
+        ``None`` (set-token-anyway / Esc / printed-command, no actionable result).
+    """
+    from rich.markup import escape as _rich_escape
+
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_EXTRA_INSTALL_COMMAND,
+        install_copilot_sdk,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    cmd = COPILOT_EXTRA_INSTALL_COMMAND
+    # ``select`` renders text through Rich markup; escape the literal
+    # ``[copilot]`` so it renders verbatim.
+    cmd_markup = _rich_escape(cmd)
+    choice = select(
+        "Copilot's SDK (github-copilot-sdk) isn't installed. Install it now?",
+        [
+            f"Install it now ({cmd_markup})",
+            "Set the GitHub token anyway",
+            "I'll run it myself (show the command)",
+        ],
+        descriptions=[
+            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            "Skip the install — store the token now; the SDK can be added later.",
+            "Print the command so you can install it yourself, then continue.",
+        ],
+        default=0,
+        clear_on_exit=True,
+    )
+    if choice == 0:
+        console.print(f"  [dim]Installing the copilot extra — running `{cmd_markup}`…[/dim]")
+        if install_copilot_sdk():
+            console.print("  [green]✓ github-copilot-sdk installed[/green]")
+            return "✓ github-copilot-sdk installed"
+        console.print(f"  [red]Install failed.[/red] Run it manually: [bold]{cmd_markup}[/bold]")
+        return "✗ Install failed — set the token anyway, or install by hand"
+    if choice < 0:
+        return _SOFT_INSTALL_ABORT
+    if choice == 2:  # run it yourself
+        console.print(f"  Install the copilot extra with:\n    [bold]{cmd_markup}[/bold]")
+        return None
+    # choice == 1 (set token anyway): fall through to the token menu silently.
+    return None
+
+
+def _manage_copilot_harness() -> None:
+    """Run the level-2 loop for Copilot: manage its GitHub token.
+
+    Copilot runs via the ``github-copilot-sdk`` package and authenticates against
+    GitHub's Copilot backend with a GitHub token — the SDK requires one and it
+    has no provider/gateway family. So this manages exactly that credential:
+    set / replace / remove a token stored in the omnigent secret store, mirroring
+    how cursor / antigravity persist theirs (the secret in the store, a
+    ``keychain:``/``env:`` reference in ``~/.omnigent/config.yaml``).
+
+    When the optional ``github-copilot-sdk`` is missing, the drill-in first
+    offers to install it (:func:`_prompt_install_copilot`). Unlike the CLI-backed
+    harnesses (which gate on the CLI), declining still drops into the token
+    menu — the ``copilot:`` token is independently storable. Mirrors cursor /
+    antigravity.
+
+    :returns: None. Side effects: may install the ``copilot`` extra, and may
+        write the ``copilot:`` block of ``~/.omnigent/config.yaml`` and the
+        secret store.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_CONFIG_KEY,
+        COPILOT_SECRET_NAME,
+        copilot_github_token_configured,
+        copilot_github_token_ref,
+        copilot_sdk_installed,
+    )
+    from omnigent.onboarding.interactive import select
+
+    # Offer the install once on entry (not per loop iteration) when the SDK is
+    # absent; the result seeds the menu's status line. Declining falls through
+    # to token management, since the token is SDK-independent.
+    status: str | None = None
+    if not copilot_sdk_installed():
+        status = _prompt_install_copilot()
+        if status == _SOFT_INSTALL_ABORT:
+            return
+    while True:
+        config = _load_global_config()
+        token_set = copilot_github_token_configured(config)
+
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow(
+                "Replace GitHub token" if token_set else "Set GitHub token",
+                action="set_key",
+            )
+        ]
+        if token_set:
+            rows.append(_HarnessMenuRow("Remove GitHub token", action="remove_key"))
+        rows.append(_HarnessMenuRow("← Back", action="back"))
+
+        header = (
+            "Copilot — GitHub token configured" if token_set else "Copilot — no GitHub token yet"
+        )
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "set_key":
+            status = _set_copilot_github_token()
+        elif action == "remove_key":
+            ref = copilot_github_token_ref(config)
+            # Only the secret we own (``keychain:copilot``) is ours to delete: a
+            # hand-edited block may point at a shared ``keychain:<other>`` secret,
+            # and an ``env:`` ref names the user's own environment. In both of
+            # those cases just drop the config block and leave the secret.
+            if ref == f"keychain:{COPILOT_SECRET_NAME}":
+                secret_store.delete_secret(COPILOT_SECRET_NAME)
+            _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            status = "✓ Removed Copilot GitHub token"
+
+
+def _set_copilot_github_token() -> str | None:
+    """Prompt for and store a Copilot GitHub token; return a status line.
+
+    Offers an existing ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``
+    first (recorded as an ``env:`` ref, so the secret stays in the environment),
+    else reads it with a hidden prompt and stores it under ``keychain:copilot``.
+    The token shape is checked softly (a classic ``ghp_`` PAT — which Copilot
+    rejects — or a wrong paste is flagged but can be forced). The token is never
+    echoed.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_SECRET_NAME,
+        COPILOT_TOKEN_ENV_VARS,
+        copilot_github_token_settings,
+        looks_like_github_copilot_token,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    detected_var = next((v for v in COPILOT_TOKEN_ENV_VARS if os.environ.get(v)), None)
+    if detected_var is not None and click.confirm(
+        f"Detected {detected_var} in the environment — use it?", default=True
+    ):
+        detected = os.environ[detected_var]
+        if not looks_like_github_copilot_token(detected) and not click.confirm(
+            f"${detected_var} doesn't look like a Copilot-capable GitHub token "
+            "(github_pat_/gho_). Use it anyway?",
+            default=False,
+        ):
+            return None
+        _save_global_config(copilot_github_token_settings(f"env:{detected_var}"))
+        return f"✓ Copilot GitHub token set (from ${detected_var})"
+
+    pasted = prompt_text("GitHub token with Copilot access", hide_input=True).strip()
+    if not pasted:
+        return None
+    if not looks_like_github_copilot_token(pasted) and not click.confirm(
+        "That doesn't look like a Copilot-capable GitHub token (github_pat_/gho_). "
+        "Store it anyway?",
+        default=False,
+    ):
+        return None
+    secret_store.store_secret(COPILOT_SECRET_NAME, pasted)
+    _save_global_config(copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"))
+    return "✓ Copilot GitHub token stored"
+
+
 def _manage_credential(provider: str, family: str) -> str | None:
     """Run the level-3 loop for one credential: make default / remove.
 
@@ -9351,6 +10634,245 @@ def _remove_credential(provider: str) -> str | None:
     return f"✓ Removed {label}"
 
 
+def _launch_opencode_auth_login() -> str | None:
+    """Launch interactive ``opencode auth login``; return a post-login status.
+
+    ``opencode auth login`` is interactive (pick a provider, sign in), so this
+    hands the terminal to ``opencode`` and re-reads the credential state on
+    return. Mirrors :func:`_launch_goose_configure`.
+    """
+    from omnigent.onboarding.harness_install import (
+        OPENCODE_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console
+    from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+    if not harness_cli_installed(OPENCODE_KEY):
+        return "✗ opencode CLI not found"
+    spec = harness_install_spec(OPENCODE_KEY)
+    assert spec is not None
+    console.print(
+        "  [dim]Launching [bold]opencode auth login[/bold] — pick a provider and "
+        "sign in, then return.[/dim]"
+    )
+    with contextlib.suppress(OSError, KeyboardInterrupt):
+        subprocess.run([spec.binary, "auth", "login"], check=False)
+    summary = opencode_auth_summary()
+    if summary.has_provider:
+        return f"✓ providers: {summary.describe()}"
+    return "No provider detected yet"
+
+
+def _run_opencode_auth_list() -> None:
+    """Show ``opencode auth list`` (stored credentials + detected env providers)."""
+    from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_install_spec
+
+    spec = harness_install_spec(OPENCODE_KEY)
+    if spec is None:
+        return
+    with contextlib.suppress(OSError, KeyboardInterrupt):
+        subprocess.run([spec.binary, "auth", "list"], check=False)
+
+
+def _list_opencode_models() -> list[str]:
+    """Return the ``provider/model`` ids OpenCode can launch (``opencode models``).
+
+    Best-effort: an absent CLI or a failed/empty invocation yields ``[]`` (the
+    caller then tells the user to sign a provider in first).
+    """
+    from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_install_spec
+
+    spec = harness_install_spec(OPENCODE_KEY)
+    if spec is None:
+        return []
+    try:
+        result = subprocess.run(
+            [spec.binary, "models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _set_opencode_default_model(current: str | None) -> str | None:
+    """Pick OpenCode's default model and persist it as ``opencode_model``.
+
+    The choice is what ``omni opencode`` launches on when no ``--model`` is
+    given — written into the per-session ``opencode.json`` at spawn so the TUI
+    starts on it instead of ``opencode/big-pickle``. Returns a status line for
+    the drill-in, or ``None`` when cancelled.
+
+    :param current: The currently-persisted default model, or ``None``.
+    """
+    from omnigent.onboarding.interactive import console, select
+    from omnigent.onboarding.opencode_auth import reachable_provider_ids
+
+    models = _list_opencode_models()
+    if not models:
+        return "✗ no models — sign in to a provider first (opencode auth login)"
+    # `opencode models` can list hundreds of `provider/model` ids across every
+    # provider on models.dev — too long for the picker (it overflows the
+    # viewport and flickers). Narrow to the providers the user can actually
+    # authenticate (stored auth.json + env keys); fall back to the full list
+    # only if that filter would hide everything.
+    reachable = reachable_provider_ids()
+    if reachable:
+        scoped = [m for m in models if m.split("/", 1)[0] in reachable]
+        models = scoped or models
+    options = list(models)
+    clear_index = -1
+    if current is not None:
+        clear_index = len(options)
+        options.append("Clear default (use OpenCode's own default)")
+    default = models.index(current) if current in models else 0
+    # Even filtered to reachable providers the list can exceed the screen, so
+    # bound the picker to a scrolling viewport sized to the terminal (leaving
+    # room for the title / status / footer / "N more" markers).
+    rows = shutil.get_terminal_size(fallback=(80, 24)).lines
+    idx = select(
+        "Pick OpenCode's default model",
+        options,
+        default=default,
+        clear_on_exit=True,
+        status=f"current: {current}" if current else None,
+        max_visible=max(5, rows - 8),
+    )
+    if idx < 0:
+        return None
+    if idx == clear_index:
+        _save_global_config({}, unset_keys=("opencode_model",))
+        console.print("  [green]✓ default model cleared[/green]")
+        return "✓ default model cleared"
+    chosen = models[idx]
+    _save_global_config({"opencode_model": chosen})
+    console.print(f"  [green]✓ default model set to[/green] [bold]{chosen}[/bold]")
+    return f"✓ default model: {chosen}"
+
+
+def _print_opencode_auth_help() -> None:
+    """Explain where OpenCode's model credentials come from."""
+    from omnigent.onboarding.interactive import console
+
+    console.print(
+        "  OpenCode resolves a model from the provider its agent uses:\n"
+        "    • [bold]opencode auth login[/bold] — sign in to a provider (OpenAI, Anthropic, …);\n"
+        "      stored in ~/.local/share/opencode/auth.json.\n"
+        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are auto-detected.\n"
+        "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
+        "      Omnigent synthesizes opencode's per-session provider config from it.\n"
+        "  Omnigent stores no OpenCode credential of its own.\n"
+        "  [dim]Tip:[/dim] 'Set default model' picks which model `omni opencode` launches on\n"
+        "  (otherwise OpenCode uses its built-in default, opencode/big-pickle)."
+    )
+
+
+def _manage_opencode_harness() -> None:
+    """Run the level-2 drill-in for OpenCode: ensure the CLI, then manage providers.
+
+    OpenCode owns its own provider auth — ``opencode auth login`` (stored in
+    ``~/.local/share/opencode/auth.json``) or ambient provider env vars — so,
+    like the Goose / Qwen drill-ins, this reports which providers OpenCode can
+    reach and offers to launch its native login; it never stores a key through
+    Omnigent. (For the Databricks-gateway path the agent's ``profile`` is
+    synthesized into opencode's per-session config instead — set under
+    Claude / Codex.)
+
+    OpenCode is npm-installable, so a missing CLI gates the drill-in with an
+    install offer.
+
+    :returns: None. Side effect: may ``npm install`` the opencode CLI.
+    """
+    from omnigent.onboarding.harness_install import (
+        OPENCODE_KEY,
+        harness_cli_installed,
+        harness_install_command,
+        install_harness_cli,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(OPENCODE_KEY):
+        cmd = " ".join(harness_install_command(OPENCODE_KEY))
+        choice = select(
+            "OpenCode's CLI isn't installed. Install it now?",
+            [
+                f"Yes — install ({cmd})",
+                "No — back to harnesses",
+                "I'll run it myself (show the command)",
+            ],
+            descriptions=[
+                f"Runs `{cmd}` (needs npm).",
+                "Return to the harness picker without installing.",
+                "Print the command so you can install it yourself, then return.",
+            ],
+            default=0,
+            clear_on_exit=True,
+        )
+        if choice == 0:
+            console.print(f"  [dim]Installing OpenCode — running `{cmd}`…[/dim]")
+            if install_harness_cli(OPENCODE_KEY):
+                console.print("  [green]✓ OpenCode installed[/green]")
+            else:
+                console.print(
+                    f"  [red]Install failed.[/red] Run it manually, then re-open: "
+                    f"[bold]{cmd}[/bold]"
+                )
+                return
+        elif choice == 2:  # run it yourself
+            console.print(f"  Install OpenCode with:\n    [bold]{cmd}[/bold]")
+            return
+        else:
+            return
+
+    # OpenCode owns its provider auth (``opencode auth login`` → auth.json) or
+    # ambient env keys; Omnigent stores nothing. Report what's reachable and
+    # offer to run its native login — like the Goose/Qwen drill-ins.
+    status: str | None = None
+    while True:
+        from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+        summary = opencode_auth_summary()
+        default_model = _load_effective_config().get("opencode_model")
+        header = (
+            f"OpenCode — providers: {summary.describe()}"
+            if summary.has_provider
+            else "OpenCode — no provider configured yet"
+        )
+        model_label = (
+            f"Set default model (current: {default_model})"
+            if default_model
+            else "Set default model"
+        )
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Run opencode auth login", action="login"),
+            _HarnessMenuRow(model_label, action="model"),
+            _HarnessMenuRow("List providers & credentials", action="list"),
+            _HarnessMenuRow("Show provider options", action="help"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            status = _launch_opencode_auth_login()
+        elif action == "model":
+            status = _set_opencode_default_model(default_model)
+        elif action == "list":
+            _run_opencode_auth_list()
+            status = None
+        elif action == "help":
+            _print_opencode_auth_help()
+            status = None
+
+
 def _run_configure_harnesses_interactive() -> None:
     """Run the interactive model/credential three-level picker.
 
@@ -9359,13 +10881,22 @@ def _run_configure_harnesses_interactive() -> None:
     Opening it backfills a legacy databricks ``auth:`` block into a real
     provider and adopts any ambient-detected credential — announcing the
     newly auto-configured machine credentials in a callout — then loops on
-    the level-1 harness overview (Claude / Codex / Pi / Cursor / Antigravity /
-    Qwen Code / Quit) until the user quits or presses Esc.
+    the level-1 harness overview. Every harness is shown on a single compact
+    row — the harness name on the left, then an aligned ``✓``/``✗`` status
+    column (the configured credential, or "Not installed" / "Not configured")
+    — in 0.3 priority order: Claude, Codex, Cursor, OpenCode,
+    Hermes, Pi, then Antigravity, Qwen Code, Goose, Copilot, Kiro, Kimi Code.
+    The actionable hint (install command / next step) renders only for the
+    highlighted row, as the selector's description line, so the overview stays
+    uncluttered.
 
     :returns: None. Side effect: may write ``~/.omnigent/config.yaml`` via
         the backfill/adopt steps and any add/set-default/remove the user
         performs while navigating.
     """
+    from rich.cells import cell_len
+    from rich.markup import escape
+
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_ENV_VARS,
         ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
@@ -9373,16 +10904,30 @@ def _run_configure_harnesses_interactive() -> None:
         antigravity_sdk_installed,
     )
     from omnigent.onboarding.configure_models import family_label
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_EXTRA_INSTALL_COMMAND,
+        COPILOT_TOKEN_ENV_VARS,
+        copilot_github_token_configured,
+        copilot_sdk_installed,
+    )
     from omnigent.onboarding.cursor_auth import (
         CURSOR_EXTRA_INSTALL_COMMAND,
         cursor_api_key_configured,
         cursor_sdk_installed,
     )
+    from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
+        COPILOT_KEY,
         CURSOR_KEY,
+        GOOSE_KEY,
+        HERMES_KEY,
+        KIMI_KEY,
+        KIRO_KEY,
+        OPENCODE_KEY,
         QWEN_KEY,
         harness_cli_installed,
         harness_install_command,
+        harness_install_spec,
     )
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
@@ -9399,18 +10944,12 @@ def _run_configure_harnesses_interactive() -> None:
 
     # Backfill a databricks provider from a legacy global auth: block FIRST (it
     # outranks ambient detection in routing), then adopt ambient detections.
-    # The databricks backfill is silent (it just shows up in the harness summary
+    # The databricks backfill is silent (it just shows up in the harness status
     # line); newly-adopted machine credentials get a one-time callout naming
-    # what was auto-configured and from where. The detection scan can take a
-    # beat (on macOS it shells out to ``claude auth status`` to read the
-    # Keychain), so surface a spinner over just that step — it clears before the
-    # callout (and the menu) paints, and is a no-op off a TTY.
-    from omnigent._runner_startup import runner_startup_progress
-
-    with runner_startup_progress(
-        initial_message="Searching for existing credentials…"
-    ) as progress:
-        _adopt_ambient_credentials(progress=progress)
+    # what was auto-configured and from where. No progress spinner here: a
+    # transient spinner over the (fast) detection left a cleared-region gap and
+    # a residual line directly above the menu on first paint.
+    _adopt_ambient_credentials()
 
     # Level 1: pick a harness. The cursor moves between Claude, Codex, Pi, and
     # Quit; each harness's status renders as a non-selectable sub-line beneath
@@ -9426,156 +10965,359 @@ def _run_configure_harnesses_interactive() -> None:
     # provider family (its v1 auth is the CLI's own env vars / ``/auth`` flow,
     # not an Omnigent credential), so it dispatches to its own drill-in.
     _QWEN = "\x00qwen"
+    # Sentinel marking the OpenCode row — native-server harness with no Omnigent
+    # credential of its own (it routes through the bound agent's Databricks
+    # gateway profile or ambient provider env), so it dispatches to its own
+    # binary-install/info drill-in.
+    _OPENCODE = "\x00opencode"
+    # Sentinel marking the Goose row — like Qwen/Antigravity/Cursor it is not a
+    # provider family (Goose owns its own auth via ``goose configure``, not an
+    # Omnigent credential), so it dispatches to its own drill-in.
+    _GOOSE = "\x00goose"
+    # Sentinel marking the Hermes row — like Goose it owns its own auth via
+    # ``hermes model`` and is installed via a curl installer.
+    _HERMES = "\x00hermes"
+    # Sentinel marking the Kiro row — like Goose/Hermes it owns its own auth (via
+    # ``kiro-cli login``) and is installed via Kiro's curl installer, so it
+    # dispatches to its own drill-in rather than a provider family.
+    _KIRO = "\x00kiro"
+    # Sentinel marking the Kimi Code row — like Cursor/Antigravity/Qwen it is
+    # not a provider family. Auth lives entirely in the kimi CLI (``kimi login``
+    # / ``kimi provider add`` → ~/.kimi/config.toml), so it dispatches to its
+    # own drill-in rather than ``_manage_harness_providers``.
+    _KIMI = "\x00kimi"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
+
+    # Status glyph + Rich color per readiness kind: "ready" is a configured,
+    # launchable harness (green ✓); "missing" is an absent CLI/SDK (red ✗);
+    # "warn" is installed-but-unconfigured (yellow ✗ — present, not usable
+    # yet). The glyph leads the status, which sits in a left-aligned column
+    # right of the names, so every ✓/✗ lines up in a single column.
+    status_styles = {"ready": ("✓", "green"), "missing": ("✗", "red"), "warn": ("✗", "yellow")}
+
+    def _install_hint(command: str) -> str:
+        # Selection-only tooltip. The command is escaped so a bracketed extra
+        # (e.g. ``pip install "omnigent[cursor]"``) renders literally instead of
+        # parsing as Rich markup.
+        return f"Install with `{escape(command)}`"
+
+    def _truncate_cells(text: str, max_cells: int) -> str:
+        """Truncate *text* to a terminal-cell budget, adding an ellipsis if needed."""
+        if cell_len(text) <= max_cells:
+            return text
+        ellipsis = "…"
+        budget = max(0, max_cells - cell_len(ellipsis))
+        out: list[str] = []
+        used = 0
+        for ch in text:
+            width = cell_len(ch)
+            if used + width > budget:
+                break
+            out.append(ch)
+            used += width
+        return "".join(out) + ellipsis
+
+    def _family_row(fam: str) -> tuple[str, str, str, str, str]:
+        # Claude / Codex / Pi: a CLI binary plus a usable default credential.
+        # Pi's default is its *effective* one (explicit pi scope, else the
+        # cross-family fallback).
+        name = family_label(fam)
+        if not harness_cli_installed(fam):
+            return (
+                fam,
+                name,
+                "Not installed",
+                "missing",
+                _install_hint(" ".join(harness_install_command(fam))),
+            )
+        default = surface_default_provider(config, fam)
+        if default is None:
+            return (fam, name, "Not configured", "warn", "Open to add a credential.")
+        label = _family_credential_label(config, fam, default.name, default)
+        return (fam, name, label, "ready", "")
+
+    def build_harness_rows() -> list[tuple[str, str, str, str, str]]:
+        # One visible row per harness, in 0.3 priority order. No folding — every
+        # harness shows at once. Each row is (target, name, status, kind, hint),
+        # where ``hint`` is the selection-only description (install command /
+        # next step), empty for a ready harness.
+        from omnigent.onboarding.hermes_auth import hermes_config_summary
+        from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+        rows: list[tuple[str, str, str, str, str]] = []
+        rows.append(_family_row(ANTHROPIC_FAMILY))
+        rows.append(_family_row(OPENAI_FAMILY))
+
+        # Cursor — readiness is the CURSOR_API_KEY (the cursor-sdk extra is a
+        # soft dependency; the key is independently storable, so a missing SDK
+        # is surfaced as the install hint, not a hard block).
+        if cursor_api_key_configured(config) or bool(os.environ.get("CURSOR_API_KEY")):
+            rows.append((CURSOR_KEY, "Cursor", "API key", "ready", ""))
+        elif not cursor_sdk_installed():
+            rows.append(
+                (
+                    CURSOR_KEY,
+                    "Cursor",
+                    "Not installed",
+                    "missing",
+                    _install_hint(CURSOR_EXTRA_INSTALL_COMMAND),
+                ),
+            )
+        else:
+            rows.append(
+                (
+                    CURSOR_KEY,
+                    "Cursor",
+                    "Not configured",
+                    "warn",
+                    "Open to add the Cursor API key.",
+                ),
+            )
+
+        # OpenCode — its own provider auth (login or env keys); the status is
+        # what it can reach (e.g. "1 stored").
+        opencode = opencode_auth_summary()
+        if not opencode.installed:
+            rows.append(
+                (
+                    _OPENCODE,
+                    "OpenCode",
+                    "Not installed",
+                    "missing",
+                    _install_hint(" ".join(harness_install_command(OPENCODE_KEY))),
+                ),
+            )
+        elif opencode.ready:
+            rows.append((_OPENCODE, "OpenCode", opencode.describe(), "ready", ""))
+        else:
+            rows.append(
+                (
+                    _OPENCODE,
+                    "OpenCode",
+                    "Not configured",
+                    "warn",
+                    "Open to sign in (opencode auth login).",
+                ),
+            )
+
+        # Hermes — curl-installed; its provider/model live in
+        # ``~/.hermes/config.yaml`` (written by `hermes model`). Read that so a
+        # configured Hermes shows the picked model as ready, instead of always
+        # reading "not configured" on an installed binary. A fresh install
+        # ships ``provider: auto`` (nothing picked), so it still reads
+        # "not configured" until `hermes model` selects a concrete provider.
+        hermes = hermes_config_summary()
+        if not hermes.installed:
+            hermes_spec = harness_install_spec(HERMES_KEY)
+            hermes_hint = (
+                hermes_spec.install_hint
+                if hermes_spec and hermes_spec.install_hint
+                else "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+            )
+            rows.append(
+                (_HERMES, "Hermes", "Not installed", "missing", _install_hint(hermes_hint)),
+            )
+        elif hermes.ready:
+            rows.append((_HERMES, "Hermes", hermes.describe(), "ready", ""))
+        else:
+            rows.append(
+                (
+                    _HERMES,
+                    "Hermes",
+                    "Not configured",
+                    "warn",
+                    "Open to configure with `hermes model`.",
+                ),
+            )
+
+        rows.append(_family_row(PI_SURFACE))
+
+        # Antigravity — Gemini key (antigravity-sdk extra is soft, like Cursor).
+        if antigravity_api_key_configured(config) or any(
+            os.environ.get(v) for v in ANTIGRAVITY_ENV_VARS
+        ):
+            rows.append((_ANTIGRAVITY, "Antigravity", "Gemini API key", "ready", ""))
+        elif not antigravity_sdk_installed():
+            rows.append(
+                (
+                    _ANTIGRAVITY,
+                    "Antigravity",
+                    "Not installed",
+                    "missing",
+                    _install_hint(ANTIGRAVITY_EXTRA_INSTALL_COMMAND),
+                ),
+            )
+        else:
+            rows.append(
+                (
+                    _ANTIGRAVITY,
+                    "Antigravity",
+                    "Not configured",
+                    "warn",
+                    "Open to add the Gemini API key.",
+                ),
+            )
+
+        # Qwen Code — no CLI login; auth via OpenAI-compatible env vars or the
+        # interactive /auth flow.
+        if not harness_cli_installed(QWEN_KEY):
+            rows.append(
+                (
+                    _QWEN,
+                    "Qwen Code",
+                    "Not installed",
+                    "missing",
+                    _install_hint(" ".join(harness_install_command(QWEN_KEY))),
+                ),
+            )
+        elif _qwen_auth_configured():
+            rows.append((_QWEN, "Qwen Code", "Authenticated", "ready", ""))
+        else:
+            rows.append(
+                (
+                    _QWEN,
+                    "Qwen Code",
+                    "Not configured",
+                    "warn",
+                    "Open to set up auth (/auth or env vars).",
+                ),
+            )
+
+        # Goose — its own provider config via `goose configure`.
+        if not harness_cli_installed(GOOSE_KEY):
+            goose_spec = harness_install_spec(GOOSE_KEY)
+            goose_hint = (
+                goose_spec.install_hint
+                if goose_spec and goose_spec.install_hint
+                else "brew install block-goose-cli"
+            )
+            rows.append((_GOOSE, "Goose", "Not installed", "missing", _install_hint(goose_hint)))
+        else:
+            goose_summary = goose_config_summary()
+            if goose_summary.provider:
+                rows.append((_GOOSE, "Goose", goose_summary.provider, "ready", ""))
+            else:
+                rows.append(
+                    (_GOOSE, "Goose", "Not configured", "warn", "Open to run `goose configure`."),
+                )
+
+        # Copilot — GitHub token (github-copilot-sdk extra is soft).
+        if copilot_github_token_configured(config) or any(
+            os.environ.get(v) for v in COPILOT_TOKEN_ENV_VARS
+        ):
+            rows.append((COPILOT_KEY, "Copilot", "GitHub token", "ready", ""))
+        elif not copilot_sdk_installed():
+            rows.append(
+                (
+                    COPILOT_KEY,
+                    "Copilot",
+                    "Not installed",
+                    "missing",
+                    _install_hint(COPILOT_EXTRA_INSTALL_COMMAND),
+                ),
+            )
+        else:
+            rows.append(
+                (
+                    COPILOT_KEY,
+                    "Copilot",
+                    "Not configured",
+                    "warn",
+                    "Open to add the GitHub token.",
+                ),
+            )
+
+        # Kiro — native CLI, own auth via `kiro-cli login`; there is no
+        # reliable local status probe, so an installed binary is still only
+        # "not configured" until the user signs in.
+        if harness_cli_installed(KIRO_KEY):
+            rows.append(
+                (_KIRO, "Kiro", "Not configured", "warn", "Sign in with `kiro-cli login`.")
+            )
+        else:
+            kiro_spec = harness_install_spec(KIRO_KEY)
+            kiro_hint = (
+                kiro_spec.install_hint
+                if kiro_spec and kiro_spec.install_hint
+                else "curl -fsSL https://cli.kiro.dev/install | bash"
+            )
+            rows.append((_KIRO, "Kiro", "Not installed", "missing", _install_hint(kiro_hint)))
+
+        # Kimi Code — native CLI, own auth via `kimi login`; there is no local
+        # login status probe yet. Curl-installed (no npm package), so use its
+        # install_hint when absent and show "not configured" when present.
+        if harness_cli_installed(KIMI_KEY):
+            rows.append(
+                (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
+            )
+        else:
+            kimi_spec = harness_install_spec(KIMI_KEY)
+            kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
+            rows.append((_KIMI, "Kimi Code", "Not installed", "missing", _install_hint(kimi_hint)))
+        return rows
+
     while True:
         config = _load_global_config()
+        harness_rows = build_harness_rows()
+        # Place the status in a single column a fixed gutter right of the names,
+        # so every ✓/✗ glyph lines up vertically (the earlier right-aligned
+        # status scattered the glyphs and read as messy). The name column is the
+        # widest harness name + a 4-space gutter; the status is escaped when
+        # interpolated into markup so a credential label containing a ``[`` can't
+        # parse as a Rich tag (descriptions are escaped the same way).
+        name_col = max(len(name) for _t, name, *_rest in harness_rows) + 4
+        term_width = max(40, shutil.get_terminal_size(fallback=(80, 24)).columns)
+        # _render_menu prefixes selected rows with ``"    ❯  "`` (7 cells).
+        # Cap the status text from the actual terminal width so verbose status
+        # rows (e.g. OpenCode's provider summary) do not wrap in the compact
+        # single-line overview.
+        max_status_width = max(8, min(30, term_width - 7 - name_col - len("✓ ")))
         options: list[str] = []
         selectable: list[bool] = []
         row_target: list[str | None] = []
-        for fam in families:
-            # A harness's readiness is a single descent: is the CLI installed? →
-            # does it have a usable default credential? → show that credential.
-            # Only a fully ready harness carries no name-level marker (its green
-            # default line in the summary already says it's ready); any harness
-            # that can't be used yet — not installed, or installed but with no
-            # usable default — gets a red ✗, so it's clear at a glance which
-            # harnesses still need attention. Pi's default is its *effective*
-            # one (explicit pi scope, else the cross-family fallback).
-            installed = harness_cli_installed(fam)
-            ready = installed and surface_default_provider(config, fam) is not None
-            marker = "  " if ready else "[red]✗[/] "
-            options.append(f"{marker}{family_label(fam)}")
+        descriptions: list[str] = []
+        for target, name, status_text, kind, desc in harness_rows:
+            status_text = _truncate_cells(status_text, max_status_width)
+            glyph, color = status_styles[kind]
+            options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
-            row_target.append(fam)
-            # Sub-line text follows the same descent. An uninstalled harness
-            # points at the install command (creds are moot until it exists);
-            # otherwise the summary helper renders "no credential yet" / "no
-            # default set" / the ✓ default line.
-            if not installed:
-                # Parallel to "no credential yet — open to add one": name the
-                # state, point at the action. The exact ``npm install`` command
-                # is shown on drill-in (``_prompt_install_harness``), so it stays
-                # off the overview — keeping the line short enough not to wrap.
-                sub_lines = ["[dim]not installed yet — open to install[/]"]
-            else:
-                sub_lines = _harness_summary_lines(config, fam)
-            for sub_line in sub_lines:
-                # Indent every status sub-line a touch more than the harness
-                # name so it reads as hanging off the marker column — the
-                # configured default's ✓ (and the "not installed" / "no
-                # credential yet" hints) all start at the same column.
-                options.append(f"  {sub_line}")
-                selectable.append(False)  # a sub-line — cursor skips it
-                row_target.append(None)
-        # Cursor: runs via the ``cursor-sdk`` package and authenticates with a
-        # ``CURSOR_API_KEY`` (the SDK requires one; it has no provider/gateway
-        # family and a ``cursor-agent login`` does not apply). So readiness is
-        # simply whether an API key is configured — one stored by setup (the
-        # ``cursor:`` block) or inherited from the environment — and its
-        # drill-in manages exactly that key.
-        cursor_key_set = cursor_api_key_configured(config) or bool(
-            os.environ.get("CURSOR_API_KEY")
-        )
-        options.append(f"{'  ' if cursor_key_set else '[red]✗[/] '}Cursor")
-        selectable.append(True)
-        row_target.append(CURSOR_KEY)
-        # ``cursor-sdk`` now ships in an OPTIONAL extra, so the key can be set
-        # with no SDK present. When the extra is missing, lead with that gap and
-        # the install command (parallel to Antigravity post-#322), then still
-        # report key status. ``[cursor]`` is escaped — sub-lines render through
-        # Rich markup, where bare brackets parse as a tag.
-        cursor_sub_lines: list[str] = []
-        if not cursor_sdk_installed():
-            from rich.markup import escape as _rich_escape
-
-            cursor_sub_lines.append(
-                f"[dim]not installed — open to install "
-                f"({_rich_escape(CURSOR_EXTRA_INSTALL_COMMAND)})[/]"
-            )
-        cursor_sub_lines.append(
-            "[green]✓[/] API key configured"
-            if cursor_key_set
-            else "[dim]no API key yet — open to add one[/]"
-        )
-        for cursor_sub in cursor_sub_lines:
-            options.append(f"  {cursor_sub}")
-            selectable.append(False)
-            row_target.append(None)
-        # Antigravity (Gemini-native, no provider family): like Cursor, readiness
-        # is just whether a Gemini key is configured (``antigravity:`` block or
-        # ambient env); its drill-in manages that key. Vertex specs need no key,
-        # so a ✗ isn't a hard blocker for that path.
-        ag_key_set = antigravity_api_key_configured(config) or any(
-            os.environ.get(v) for v in ANTIGRAVITY_ENV_VARS
-        )
-        options.append(f"{'  ' if ag_key_set else '[red]✗[/] '}Antigravity")
-        selectable.append(True)
-        row_target.append(_ANTIGRAVITY)
-        # The antigravity SDK ships in an OPTIONAL extra (unlike Cursor's baseline
-        # ``cursor-sdk``), so a user can have a key but no SDK. Lead with that gap when
-        # the extra is missing — naming the install command inline — then still report
-        # key status. ``[antigravity]`` is escaped since the sub-lines render as Rich
-        # markup (bare brackets parse as a tag).
-        ag_sub_lines: list[str] = []
-        if not antigravity_sdk_installed():
-            from rich.markup import escape as _rich_escape
-
-            ag_sub_lines.append(
-                f"[dim]not installed — open to install "
-                f"({_rich_escape(ANTIGRAVITY_EXTRA_INSTALL_COMMAND)})[/]"
-            )
-        ag_sub_lines.append(
-            "[green]✓[/] Gemini API key configured"
-            if ag_key_set
-            else "[dim]no Gemini API key yet — open to add one[/]"
-        )
-        for ag_sub in ag_sub_lines:
-            options.append(f"  {ag_sub}")
-            selectable.append(False)
-            row_target.append(None)
-        # Qwen Code (OpenAI-compatible auth, no provider family — like Cursor /
-        # Antigravity). Qwen has no CLI login (its ``auth`` subcommand was
-        # removed); auth comes from OpenAI-compatible env vars or the interactive
-        # ``/auth`` flow. "Ready" means the CLI is installed AND we can detect
-        # auth — ``_qwen_auth_configured`` reads env vars / ~/.qwen creds, so the
-        # overview never falsely shows "signed in" for a fresh, unauthed install.
-        qwen_installed = harness_cli_installed(QWEN_KEY)
-        qwen_authed = qwen_installed and _qwen_auth_configured()
-        options.append(f"{'  ' if qwen_authed else '[red]✗[/] '}Qwen Code")
-        selectable.append(True)
-        row_target.append(_QWEN)
-        if not qwen_installed:
-            from rich.markup import escape as _rich_escape
-
-            qwen_cmd = _rich_escape(" ".join(harness_install_command(QWEN_KEY)))
-            qwen_sub = f"[dim]not installed — open to install ({qwen_cmd})[/]"
-        elif qwen_authed:
-            qwen_sub = "[green]✓[/] authentication detected"
-        else:
-            qwen_sub = "[dim]installed — open to set up auth (/auth or env vars)[/]"
-        options.append(f"  {qwen_sub}")
-        selectable.append(False)
-        row_target.append(None)
+            row_target.append(target)
+            descriptions.append(desc)
         options.append("Quit")
         selectable.append(True)
         row_target.append(_QUIT)
+        descriptions.append("")
         idx = select(
             "Configure harnesses",
             options,
+            descriptions=descriptions,
             selectable=selectable,
             clear_on_exit=True,
+            compact=True,
         )
         if idx < 0:  # Esc / q — exit
             return
         target = row_target[idx]
         if target == CURSOR_KEY:
             _manage_cursor_harness()
+        elif target == COPILOT_KEY:
+            _manage_copilot_harness()
         elif target in families:
             _manage_harness_providers(target)
         elif target == _ANTIGRAVITY:
             _manage_antigravity_harness()
         elif target == _QWEN:
             _manage_qwen_harness()
+        elif target == _OPENCODE:
+            _manage_opencode_harness()
+        elif target == _GOOSE:
+            _manage_goose_harness()
+        elif target == _HERMES:
+            _manage_hermes_harness()
+        elif target == _KIRO:
+            _manage_kiro_harness()
+        elif target == _KIMI:
+            _manage_kimi_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
 
@@ -9600,8 +11342,14 @@ def setup(internal_beta: bool) -> None:
     """
     from omnigent.inner import ui
 
-    # Brand lockup at the top of the first-run experience (TTY-gated).
-    ui.print_landing(tagline="all your agents, one cli")
+    # Brand the first-run experience without pushing the actual picker below a
+    # typical 80×24 terminal. The full lockup is great in roomy terminals, but
+    # on short terminals it combines with the missing-tool warning and scrolls
+    # the menu off the first screen.
+    if shutil.get_terminal_size(fallback=(80, 24)).lines >= 32:
+        ui.print_landing(tagline="all your agents, one cli")
+    else:
+        ui.print_brandmark("setup")
 
     if internal_beta:
         # The internal-beta workspace defaults are excluded from the public OSS
@@ -9902,6 +11650,35 @@ def _cached_workspace_bearer(workspace_host: str) -> str | None:
     return _databricks_workspace_token(workspace_host)
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _with_default_scheme(server_url: str) -> str:
+    """Prepend a scheme to a schemeless server URL, defaulting to https.
+
+    The internal user guide hands out workspace URLs without a scheme
+    (e.g. ``example.cloud.databricks.com/omnigent``), so a missing
+    scheme defaults to ``https`` to let that URL be pasted verbatim.
+    Loopback hosts (``localhost``, ``127.0.0.1``, ``::1``) default to
+    ``http`` instead — local dev servers are plain http (the examples
+    use ``http://localhost:6767``). A URL that already carries a scheme
+    is returned unchanged.
+
+    :param server_url: The user-supplied server URL, possibly
+        schemeless, e.g. ``"example.cloud.databricks.com/omnigent"``.
+    :returns: The URL with a scheme, e.g.
+        ``"https://example.cloud.databricks.com/omnigent"``.
+    """
+    from urllib.parse import urlsplit
+
+    server_url = server_url.strip()
+    if "://" in server_url:
+        return server_url
+    host = urlsplit(f"https://{server_url}").hostname or ""
+    scheme = "http" if host in _LOOPBACK_HOSTS else "https"
+    return f"{scheme}://{server_url}"
+
+
 def _workspace_api_server_url(server: str) -> str:
     """Expand a bare Databricks workspace URL to its omnigent API base.
 
@@ -9913,7 +11690,10 @@ def _workspace_api_server_url(server: str) -> str:
     ``/api/2.0/omnigent`` mount answers like the API proxy, the
     expanded URL is adopted. Detection is behavioral — no hostname
     patterns — and URLs that already carry a path are returned
-    untouched without any probe.
+    untouched without any probe, the one exception being the
+    guide-issued web-UI URL (``https://<ws>/omnigent``): its bare root
+    is probed so the pasted web URL logs in just like the bare host
+    (a root that is not a workspace leaves the URL untouched).
 
     Some workspace edges (Azure) answer the anonymous mount probe with
     a plain 404 — not the AWS proxy's 401-with-``DatabricksRealm``
@@ -9933,10 +11713,32 @@ def _workspace_api_server_url(server: str) -> str:
 
     import httpx as _httpx
 
-    from omnigent.conversation_browser import WORKSPACE_API_PATH
+    from omnigent.conversation_browser import (
+        WORKSPACE_API_PATH,
+        WORKSPACE_UI_PATH,
+        display_server_url,
+    )
 
     server = server.rstrip("/")
     parsed = urlsplit(server)
+    # Strip any ?o= selector / query / fragment before probing: callers append
+    # a path (``f"{base}/v1/..."``), so a query-bearing base would push that
+    # path into the query (``…/?o=123/v1/me``) and break the probe + expansion.
+    # The selector is carried separately (recorded at login, replayed as the
+    # X-Databricks-Org-Id header), never on the base URL.
+    if parsed.query or parsed.fragment:
+        server = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")).rstrip("/")
+        parsed = urlsplit(server)
+    # The internal user guide hands out the workspace web-UI URL
+    # (``https://<ws>/omnigent``) for browser access; accept it for login
+    # too by expanding its bare root to the API mount. A root that does
+    # not answer as a Databricks workspace leaves the pasted URL
+    # untouched, so a non-workspace server served under ``/omnigent``
+    # still works.
+    if parsed.scheme == "https" and parsed.path == WORKSPACE_UI_PATH:
+        root = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+        expanded = _workspace_api_server_url(root)
+        return expanded if expanded != root else server
     if parsed.path not in ("", "/") or parsed.scheme != "https":
         return server
     try:
@@ -9959,7 +11761,9 @@ def _workspace_api_server_url(server: str) -> str:
     except _httpx.HTTPError:
         return server
     if _workspace_mount_probe_matches(candidate, api_probe):
-        click.echo(f"Using {candidate} (Databricks workspace-hosted omnigent).")
+        click.echo(
+            f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent)."
+        )
         return candidate
     # The anonymous probe came back inconclusive (404 on Azure even
     # when the mount exists). Retry it with a cached workspace bearer;
@@ -9977,7 +11781,9 @@ def _workspace_api_server_url(server: str) -> str:
         except _httpx.HTTPError:
             authed_probe = None
         if authed_probe is not None and _workspace_mount_probe_matches(candidate, authed_probe):
-            click.echo(f"Using {candidate} (Databricks workspace-hosted omnigent).")
+            click.echo(
+                f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent)."
+            )
             return candidate
         click.echo(
             f"Note: {server} answers like a Databricks workspace, but "
@@ -9997,6 +11803,25 @@ def _workspace_api_server_url(server: str) -> str:
         "retry, or pass the full mount URL."
     )
     return server
+
+
+def _resolve_server_url(server: str) -> str:
+    """
+    Normalize a user-supplied ``--server`` value to the Omnigent API base.
+
+    Every ``--server`` entry point (and ``login``) needs the same
+    normalization, so they all route through here: strip a trailing slash,
+    default a schemeless URL to ``https`` (``http`` for loopback hosts),
+    then expand a bare Databricks workspace URL — or the ``/omnigent``
+    web-UI URL the internal user guide hands out — to the
+    ``/api/2.0/omnigent`` mount.
+
+    :param server: A non-empty ``--server`` value, e.g.
+        ``"example.cloud.databricks.com/omnigent"``.
+    :returns: The normalized API base URL without a trailing slash, e.g.
+        ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
+    """
+    return _workspace_api_server_url(_with_default_scheme(server.rstrip("/")))
 
 
 def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> str | None:
@@ -10045,7 +11870,53 @@ def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> st
     return None
 
 
-def _databricks_login(server: str, workspace_host: str) -> None:
+def _org_id_from_url(url: str) -> str | None:
+    """Extract the ``?o=<workspace-id>`` workspace selector from *url*.
+
+    A Databricks host can front many workspaces under one hostname, where
+    the bare host resolves to the account and ``?o=<workspace-id>`` picks
+    the workspace. The selector is threaded into both the login (to bind
+    the grant to the workspace) and every API request (to route to it).
+
+    :param url: A user-supplied server URL, possibly carrying ``?o=``,
+        e.g. ``"https://acme.databricks.com/?o=123"``.
+    :returns: The workspace id, e.g. ``"123"``, or ``None`` when absent.
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    values = parse_qs(urlsplit(url).query).get("o")
+    return values[0] if values and values[0] else None
+
+
+def _host_with_org(workspace_host: str, org_id: str | None) -> str:
+    """Append the ``?o=<org>`` workspace selector to *workspace_host*.
+
+    ``databricks auth login --host https://<ws>/?o=<org>`` makes the CLI
+    record ``workspace_id`` in the profile and bind the grant to that
+    workspace; without it the grant is account-scoped and the workspace
+    rejects it (HTTP 403). Returns *workspace_host* unchanged when no org
+    id is known, so single-workspace hosts are untouched.
+
+    :param workspace_host: The workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :param org_id: The workspace id from :func:`_org_id_from_url`, or
+        ``None``.
+    :returns: ``"https://<ws>/?o=<org>"`` when *org_id* is set, else
+        *workspace_host*.
+    """
+    if not org_id:
+        return workspace_host
+    # Encode (not interpolate) so a value with ``&``/``=`` can't inject extra
+    # query params onto the ``--host`` URL; keep the ``/?o=`` slash the CLI wants.
+    from urllib.parse import urlencode, urlsplit, urlunsplit
+
+    parsed = urlsplit(workspace_host.rstrip("/"))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path or "/", urlencode({"o": org_id}), "")
+    )
+
+
+def _databricks_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
     """Log in to a Databricks-fronted Omnigent server.
 
     Covers both Databricks Apps deployments and workspace-hosted
@@ -10064,6 +11935,10 @@ def _databricks_login(server: str, workspace_host: str) -> None:
         ``"https://myapp-123.aws.databricksapps.com"``.
     :param workspace_host: The Databricks workspace to authenticate
         against, e.g. ``"https://example.databricks.com"``.
+    :param org_id: The ``?o=`` workspace selector from the login URL
+        (see :func:`_org_id_from_url`). When set, the login binds the
+        grant to this workspace and the verify request routes to it —
+        needed where the bare host is the account, not a workspace.
     :raises click.ClickException: When the ``databricks`` extra or CLI
         binary is missing, the workspace login fails, or the server
         rejects the workspace token.
@@ -10086,13 +11961,13 @@ def _databricks_login(server: str, workspace_host: str) -> None:
     token = _databricks_workspace_token(workspace_host)
     fresh_login_done = False
     if token is None:
-        token = _login_and_mint_workspace_token(workspace_host)
+        token = _login_and_mint_workspace_token(workspace_host, org_id)
         fresh_login_done = True
 
     # Verify the workspace token actually gets through the edge to THIS
     # server (the user may lack access to it), and learn our identity
     # for the success message.
-    verify = _verify_databricks_server_token(server, token)
+    verify = _verify_databricks_server_token(server, token, org_id)
     if verify.status_code != 200 and not fresh_login_done:
         # A cached grant can be stale or minted for a different
         # workspace (the CLI token cache is host-keyed but not
@@ -10102,8 +11977,8 @@ def _databricks_login(server: str, workspace_host: str) -> None:
             f"The cached Databricks credentials were rejected by {server} "
             f"(HTTP {verify.status_code}) — refreshing the workspace login."
         )
-        token = _login_and_mint_workspace_token(workspace_host)
-        verify = _verify_databricks_server_token(server, token)
+        token = _login_and_mint_workspace_token(workspace_host, org_id)
+        verify = _verify_databricks_server_token(server, token, org_id)
     if verify.status_code != 200:
         raise click.ClickException(
             f"{workspace_host} accepted the login, but {server} rejected the token "
@@ -10120,9 +11995,10 @@ def _databricks_login(server: str, workspace_host: str) -> None:
         server,
         workspace_host,
         user_id=user_id,
-        # Workspace responses carry the org id; recorded so browser
-        # links can append the ``?o=<org>`` workspace selector.
-        org_id=verify.headers.get("x-databricks-org-id"),
+        # Recorded so later commands replay it as ``?o=`` to route requests
+        # and browser links append it. The login URL's selector wins; fall
+        # back to the org id the workspace stamps on responses.
+        org_id=org_id or verify.headers.get("x-databricks-org-id"),
     )
     who = f" as {user_id}" if user_id else ""
     click.echo(
@@ -10130,17 +12006,20 @@ def _databricks_login(server: str, workspace_host: str) -> None:
     )
 
 
-def _login_and_mint_workspace_token(workspace_host: str) -> str:
+def _login_and_mint_workspace_token(workspace_host: str, org_id: str | None = None) -> str:
     """Run the browser login for a workspace and mint a bearer from it.
 
     :param workspace_host: The workspace host, e.g.
         ``"https://example.databricks.com"``.
+    :param org_id: The ``?o=`` workspace selector (see
+        :func:`_org_id_from_url`); passed to the browser login so the
+        minted grant is bound to the workspace.
     :returns: A fresh bearer token for the workspace.
     :raises click.ClickException: When the Databricks CLI binary is
         missing, the login exits non-zero, or no token resolves after
         a successful login.
     """
-    _run_databricks_browser_login(workspace_host)
+    _run_databricks_browser_login(workspace_host, org_id)
     token = _databricks_workspace_token(workspace_host)
     if token is None:
         raise click.ClickException(
@@ -10150,11 +12029,16 @@ def _login_and_mint_workspace_token(workspace_host: str) -> str:
     return token
 
 
-def _run_databricks_browser_login(workspace_host: str) -> None:
+def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None) -> None:
     """Run ``databricks auth login --host <workspace>`` (browser flow).
 
     :param workspace_host: The workspace host, e.g.
         ``"https://example.databricks.com"``.
+    :param org_id: The ``?o=`` workspace selector (see
+        :func:`_org_id_from_url`). When set, ``?o=<org_id>`` is appended
+        to ``--host`` so the CLI records ``workspace_id`` and binds the
+        grant to that workspace (else the grant is account-scoped and
+        the workspace rejects it).
     :raises click.ClickException: When the Databricks CLI binary is
         missing or the login exits non-zero.
     """
@@ -10164,25 +12048,32 @@ def _run_databricks_browser_login(workspace_host: str) -> None:
             "The Databricks CLI is required to log in to a workspace. "
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
-    click.echo(f"Opening browser to log in to {workspace_host} ...")
+    login_host = _host_with_org(workspace_host, org_id)
+    click.echo(f"Opening browser to log in to {login_host} ...")
     result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", workspace_host],
+        [databricks_bin, "auth", "login", "--host", login_host],
         check=False,
     )
     if result.returncode != 0:
         raise click.ClickException(
-            f"`databricks auth login --host {workspace_host}` failed "
+            f"`databricks auth login --host {login_host}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )
 
 
-def _verify_databricks_server_token(server: str, token: str) -> httpx.Response:
+def _verify_databricks_server_token(
+    server: str, token: str, org_id: str | None = None
+) -> httpx.Response:
     """Probe ``GET /v1/me`` on *server* with a workspace bearer.
 
     :param server: The server URL, e.g.
         ``"https://myapp-123.aws.databricksapps.com"``.
     :param token: The workspace bearer token to present.
+    :param org_id: The ``?o=`` workspace selector (see
+        :func:`_org_id_from_url`). When set, the probe carries
+        ``?o=<org_id>`` so the request routes to the workspace rather
+        than defaulting to the account (which answers HTTP 503).
     :returns: The probe response (200 means the token is accepted and
         the body carries ``user_id``).
     :raises click.ClickException: When the server is unreachable.
@@ -10193,6 +12084,7 @@ def _verify_databricks_server_token(server: str, token: str) -> httpx.Response:
         return _httpx.get(
             f"{server}/v1/me",
             headers={"Authorization": f"Bearer {token}"},
+            params={"o": org_id} if org_id else None,
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:
@@ -10221,6 +12113,29 @@ def _databricks_workspace_token(workspace_host: str) -> str | None:
         return None
 
 
+def _remember_default_server(server: str) -> None:
+    """
+    Persist *server* as the user-level default after a successful login.
+
+    A bare ``omnigent`` (and ``omnigent host``) fall back to the
+    configured ``server`` key when no ``--server`` is passed (see
+    :func:`run` and :func:`host`). Without this, a user who runs
+    ``omnigent login <server>`` and then bare ``omnigent`` is still routed
+    at whatever default ``setup`` baked in — the confusing "I just logged
+    in, yet I'm asked to log in again to a different server" path.
+    Recording the just-logged-in server as the default closes that gap.
+
+    Any existing default is overwritten: targeting more than one server is
+    rare, and the server the user most recently logged in to is the best
+    available signal of intent.
+
+    :param server: Normalized server URL the login succeeded against, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    """
+    _save_global_config({"server": server})
+    click.echo(f"Set {server} as your default server.")
+
+
 @cli.command("login")
 @click.argument("server_url")
 def login(server_url: str) -> None:
@@ -10244,20 +12159,30 @@ def login(server_url: str) -> None:
       the ``databricks`` extra.
 
     Subsequent ``omnigent run --server <url>`` commands then
-    use the stored token via the runner / host-tunnel auth chain.
+    use the stored token via the runner / host-tunnel auth chain. A
+    successful login also records the server as the user-level default
+    (the ``server`` key in ``~/.omnigent/config.yaml``), so a bare
+    ``omnigent`` afterwards targets it instead of whatever default
+    ``setup`` baked in.
 
     \b
     Example:
       omnigent login http://localhost:6767
-      omnigent run --server http://localhost:6767
+      omnigent login example.cloud.databricks.com/omnigent  # https:// assumed
+      omnigent          # connects to the server just logged in to
 
     :param server_url: The remote server URL, e.g.
-        ``"http://localhost:6767"``.
+        ``"http://localhost:6767"``. A missing scheme defaults to
+        ``https://`` (``http://`` for loopback hosts), and the workspace
+        web-UI URL (``<ws>/omnigent``) is accepted alongside the bare
+        workspace root.
     """
     import httpx as _httpx
 
-    # A bare Databricks workspace URL means its /api/2.0/omnigent mount.
-    server = _workspace_api_server_url(server_url.rstrip("/"))
+    server = _resolve_server_url(server_url)
+    # Read the ``?o=`` selector from the raw input: normalization strips the
+    # query when expanding to the API mount.
+    org_id = _org_id_from_url(server_url)
 
     # ── Step 0: Probe the server's auth mode. ──────────────────
     # /v1/me returns a JSON ``login_url`` on 401 — "/login" for
@@ -10275,7 +12200,8 @@ def login(server_url: str) -> None:
 
     databricks_workspace = _databricks_workspace_login_target(server, probe)
     if databricks_workspace is not None:
-        _databricks_login(server, databricks_workspace)
+        _databricks_login(server, databricks_workspace, org_id=org_id)
+        _remember_default_server(server)
         return
 
     detected_login_url: str | None = None
@@ -10295,10 +12221,12 @@ def login(server_url: str) -> None:
             "The proxy in front of it injects your identity on every "
             "request."
         )
+        _remember_default_server(server)
         return
 
     if detected_login_url == "/login":
         _accounts_login(server)
+        _remember_default_server(server)
         return
 
     # Fall through: OIDC mode (or unknown — let the ticket endpoint's
@@ -10353,6 +12281,7 @@ def login(server_url: str) -> None:
                 expires_at=_time.time() + expires_in,
             )
             click.echo(f"Logged in as {user_id}")
+            _remember_default_server(server)
             return
         # 410 or other error — ticket expired.
         raise click.ClickException("Login ticket expired or was rejected. Please try again.")

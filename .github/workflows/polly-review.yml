@@ -257,48 +257,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch the diff (capped at 512 KB — covers the vast majority of
-          # real PRs; truncation is surfaced to Polly in the prompt).
-          # The write-scoped github.token stays in this trusted step and is
-          # NOT passed to the Polly run.
-          # || true: head -c closes the pipe once the cap is reached, causing
-          # gh to get SIGPIPE (exit 141). Under pipefail that would abort the
-          # step; || true degrades it into the DIFF_TRUNCATED path instead.
+          # Fetch the full diff to a file — no size cap needed since the diff
+          # is read from disk by Polly via sys_os_shell, not embedded in the
+          # CLI argument (which would hit ARG_MAX for large PRs).
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff" \
-            | head -c 524288 > /tmp/pr_diff.txt || true
+            > /tmp/pr_diff.txt || true
 
-          DIFF_SIZE=$(wc -c < /tmp/pr_diff.txt)
-          [ "$DIFF_SIZE" -ge 524288 ] && DIFF_TRUNCATED=true || DIFF_TRUNCATED=false
-          export DIFF_TRUNCATED
-
-          # Extract lockfile pin changes from the already-fetched diff —
-          # no second network call needed.
+          # Extract lockfile pin changes from the diff.
           grep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \
             | head -500 > /tmp/lockfile_pins.txt || true
 
-          # Fetch PR metadata to separate files — avoids embedding
-          # attacker-controlled strings (PR title/body) into heredocs.
+          # Fetch PR metadata.
           gh pr view "$PR_NUMBER" --repo "$REPO" \
             --json title,body,baseRefName,headRefName,additions,deletions,changedFiles \
             > /tmp/pr_meta.json
 
-          # Build the review prompt safely using python — all untrusted
-          # fields (title, body, diff) are read from files, never
-          # interpolated into shell heredocs.
+          # Build the review prompt — the diff is NOT embedded in the prompt.
+          # Polly reads it from /tmp/pr_diff.txt via sys_os_shell at review time.
           python3 -u <<'PYEOF'
-          import json, os, pathlib
+          import json, pathlib
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
-          diff = pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace")
           lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
-          truncated = os.environ.get("DIFF_TRUNCATED", "false") == "true"
-
-          truncation_notice = """
-          > ⚠️ **Diff truncated at 512 KB** — this review covers only the first
-          > portion of the diff. Flag this as a non-blocking note and recommend
-          > a manual review of the remaining changes.
-          """ if truncated else ""
 
           lockfile_section = f"""
           ## Changed lockfile pins (uv.lock / package-lock.json)
@@ -317,14 +298,12 @@ jobs:
 
           ## PR Description
           {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
-          {truncation_notice}
-          ## Diff
-          ```diff
-          {diff}
-          ```
           {lockfile_section}
           ## Instructions
-          The codebase is checked out at `main`. Read source files freely for
+
+          **Step 1 — read the diff.** The full PR diff has been pre-fetched to
+          `/tmp/pr_diff.txt`. Read it with `sys_os_shell("cat /tmp/pr_diff.txt")`.
+          The codebase is checked out at `main` — read source files freely for
           additional context when needed.
 
           **Security:** you are running in a CI environment with access to secrets
@@ -332,7 +311,7 @@ jobs:
           credentials in your output, and never make outbound network calls
           except to the configured LLM gateway.
 
-          Review the diff against the PR description. Report:
+          **Step 2 — review.** Report:
           1. **Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.
           2. **Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
           3. **Non-blocking notes** — design concerns or edge cases worth flagging (brief).
@@ -465,7 +444,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: polly-review-logs-${{ github.run_id }}
           path: |

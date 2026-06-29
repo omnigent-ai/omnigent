@@ -319,7 +319,7 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
     # Structured fields the purpose guard and the per-dispatch model
     # override read must survive the collapse.
     assert sanitized_args["type"] == "object"
-    assert set(sanitized_args["properties"]) == {"input", "purpose", "model"}
+    assert set(sanitized_args["properties"]) == {"input", "purpose", "model", "cost_budget"}
     assert sanitized_args["required"] == ["input"]
     # Exact dict: the chosen object branch minus its stripped
     # additionalProperties — anything else means extra keys leaked or
@@ -1513,11 +1513,17 @@ class TestBuildEnvAndDir(unittest.TestCase):
         config = executor._build_env_and_dir([], None, None, None)
         try:
             self.assertIn("PI_CODING_AGENT_DIR", config.env)
-            models_path = os.path.join(config.env["PI_CODING_AGENT_DIR"], "models.json")
-            self.assertTrue(os.path.exists(models_path))
+            managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
+            models_path = managed_dir / "models.json"
+            self.assertTrue(models_path.is_file())
             with open(models_path) as f:
                 data = json.load(f)
             self.assertIn("providers", data)
+            settings_path = managed_dir / "settings.json"
+            self.assertTrue(settings_path.is_file())
+            with open(settings_path) as f:
+                settings = json.load(f)
+            self.assertIn("retry", settings)
         finally:
             import shutil
 
@@ -1550,6 +1556,42 @@ class TestBuildEnvAndDir(unittest.TestCase):
             import shutil
 
             shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
+def test_gateway_seeds_managed_settings_from_global_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway mode copies global Pi settings into the managed agent dir."""
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    (global_agent / "settings.json").write_text(
+        json.dumps({"extensions": ["/ext/demo.ts"], "packages": ["npm:@x/y"]}),
+        encoding="utf-8",
+    )
+    (global_agent / "npm").mkdir()
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
+        global_agent,
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+
+    config = executor._build_env_and_dir([], None, None, None)
+    try:
+        managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
+        settings = json.loads((managed_dir / "settings.json").read_text(encoding="utf-8"))
+        assert settings["extensions"] == ["/ext/demo.ts"]
+        assert settings["packages"] == ["npm:@x/y"]
+        assert (managed_dir / "npm").is_symlink()
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

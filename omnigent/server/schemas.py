@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
 from omnigent.entities import ConversationItem
 
@@ -80,6 +80,59 @@ class MCPServerSummary(BaseModel):
     url: str | None = None
     command: str | None = None
     args: list[str] = Field(default_factory=list)
+
+
+_MCP_SERVER_NAME_RE = r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$"
+
+
+class UpsertMCPServerRequest(BaseModel):
+    """
+    Request body for creating or updating a session agent MCP server.
+
+    Secret-bearing fields (``headers`` and ``env``) are intentionally
+    not accepted by the UI route. Existing secrets are preserved when a
+    server is edited without changing transport.
+    """
+
+    name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
+    transport: Literal["http", "stdio"]
+    description: str | None = Field(default=None, max_length=512)
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("name")
+    @classmethod
+    def _reject_dot_names(cls, value: str) -> str:
+        """Reject names that would make unsafe or confusing YAML filenames."""
+        if value in {".", ".."}:
+            raise ValueError("name cannot be '.' or '..'")
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def _string_args_only(cls, value: list[str]) -> list[str]:
+        """Keep args as a small list of strings."""
+        return [str(item) for item in value]
+
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> UpsertMCPServerRequest:
+        """Enforce the same transport shape as the agent spec parser."""
+        if self.transport == "http":
+            if not self.url:
+                raise ValueError("url is required when transport is 'http'")
+            if not (self.url.startswith("http://") or self.url.startswith("https://")):
+                raise ValueError("url must start with http:// or https://")
+            if self.command:
+                raise ValueError("command is not allowed when transport is 'http'")
+            if self.args:
+                raise ValueError("args are not allowed when transport is 'http'")
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("command is required when transport is 'stdio'")
+            if self.url:
+                raise ValueError("url is not allowed when transport is 'stdio'")
+        return self
 
 
 class SkillSummary(BaseModel):
@@ -158,6 +211,9 @@ class AgentObject(BaseModel):
         (secret fields omitted). Empty list when the spec
         declares no MCP servers or when the bundle cannot be
         loaded.
+    :param mcp_servers_editable: Whether the MCP list can be edited
+        through the session UI. Built-in template agents are read-only;
+        session-scoped uploaded agents are editable.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -178,6 +234,16 @@ class AgentObject(BaseModel):
         the launchable choices. Empty list when the spec
         declares no terminals or when the bundle cannot be
         loaded.
+    :param builtin: Whether this is a server-*seeded* built-in
+        agent (deterministic, name-derived id) as opposed to an
+        operator/user-registered template (random id, e.g. via
+        ``omnigent server --agent``) or a session-scoped upload.
+        The Web UI's new-session picker uses this to decide
+        whether a same-named ``omnigent run`` upload may shadow
+        the catalog entry: seeded built-ins are protected, while
+        a user-registered template is superseded by a newer
+        same-named upload. Always ``False`` for session-scoped
+        agents.
     """
 
     id: str
@@ -189,9 +255,11 @@ class AgentObject(BaseModel):
     updated_at: int | None = None
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
+    mcp_servers_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
+    builtin: bool = False
 
 
 # ── Session Policies ───────────────────────────────────────────
@@ -712,6 +780,12 @@ class Usage(BaseModel):
         (e.g. supervisors that delegate / use the harness default).
         ``None`` when the executor doesn't report it; the cost path
         then falls back to the session override / spec model.
+    :param cost_usd: Authoritative per-turn cost in USD reported
+        directly by the harness/provider (e.g. GitHub Copilot's
+        AI-credit total). When present, the server-side cost path uses
+        it in preference to the catalog token-price estimate; ``None``
+        when the harness doesn't report a cost (the common case, where
+        cost is computed from token counts x catalog pricing).
     """
 
     input_tokens: int = 0
@@ -722,6 +796,7 @@ class Usage(BaseModel):
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
+    cost_usd: float | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -1119,6 +1194,15 @@ class SessionCreateRequest(BaseModel):
         harness (native CLIs read it as ``--model`` at terminal launch;
         SDK harnesses via the spawn env). Validated server-side against
         a conservative model-id charset. ``None`` = harness default.
+    :param reasoning_effort: Optional per-session reasoning-effort
+        override to persist at create time, e.g. ``"high"``. Set by the
+        web UI's new-chat model/effort picker (claude-native today) so
+        the value is on the session row before the runner launches the
+        harness — native Claude Code reads it as ``--effort`` at terminal
+        launch; SDK harnesses via the spawn env. Validated server-side
+        against the shared effort vocabulary; provider-specific support
+        is enforced downstream at launch. ``None`` = harness default.
+        Mirrors the multipart create path (:class:`SessionCreateMetadata`).
     :param cost_control_mode_override: Optional per-session
         cost-control switch to persist at create time: ``"on"``
         activates the spec's configured cost-control mode, ``"off"``
@@ -1151,6 +1235,7 @@ class SessionCreateRequest(BaseModel):
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
+    reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
     harness_override: str | None = None
 
@@ -1398,7 +1483,12 @@ class SessionResponse(BaseModel):
         be found (deleted or orphaned session).
     :param status: Session lifecycle status. One of
         ``"idle"`` (no loop running), ``"running"`` (loop
-        executing), or ``"failed"`` (terminal failure).
+        executing), ``"waiting"`` (loop parked on background
+        work / sub-agents), or ``"failed"`` (terminal failure).
+        Current read paths collapse ``"waiting"`` -> ``"running"``
+        before building this snapshot; the literal stays a superset
+        of what the runtime can produce so a server that forwards
+        the raw status never 500s on serialization.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1474,7 +1564,7 @@ class SessionResponse(BaseModel):
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
         ``PATCH /v1/sessions/{id}`` or the REPL's ``/model``
-        command; both write the same column so the ap-web UI and
+        command; both write the same column so the web UI and
         the TUI stay in sync.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
@@ -1601,7 +1691,7 @@ class SessionResponse(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1702,7 +1792,7 @@ class UpdateSessionRequest(BaseModel):
         the runner-side side effects — specifically the
         native ``/effort`` / ``/model`` / Codex collaboration-mode
         forwards into the live runtime. Used by automatic bind-time
-        handoffs (ap-web's sticky-pref apply on session switch, the
+        handoffs (web's sticky-pref apply on session switch, the
         REPL's pre-create ``/model`` snapshot) where injecting a
         visible slash command into a freshly-spawned pane would
         render as an unexpected "Command model X" item before the
@@ -1730,6 +1820,103 @@ class UpdateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CodexGoalObject(BaseModel):
+    """
+    Current Codex goal state for a Codex-native session.
+
+    Mirrors Codex app-server's ``ThreadGoal`` shape using Omnigent's
+    snake-case API convention. ``created_at`` and ``updated_at`` are optional
+    because older app-server documentation examples omit them even though the
+    current protocol includes them.
+
+    :param thread_id: Codex app-server thread id, e.g. ``"thr_123"``.
+    :param objective: Goal objective text, e.g.
+        ``"Finish the migration and keep tests green"``.
+    :param status: Raw Codex goal lifecycle status, e.g. ``"active"``.
+    :param token_budget: Optional token budget, e.g. ``40000``.
+        ``None`` means no explicit budget is set.
+    :param tokens_used: Tokens spent while pursuing this goal, e.g. ``1024``.
+    :param time_used_seconds: Wall-clock seconds spent on this goal,
+        e.g. ``60``.
+    :param created_at: Unix timestamp when the goal was created, e.g.
+        ``1776272400``. ``None`` when not provided by Codex.
+    :param updated_at: Unix timestamp when the goal was last updated, e.g.
+        ``1776272460``. ``None`` when not provided by Codex.
+    """
+
+    thread_id: str
+    objective: str
+    status: str
+    token_budget: Annotated[int, Strict(), Field(gt=0)] | None = None
+    tokens_used: Annotated[int, Strict(), Field(ge=0)]
+    time_used_seconds: Annotated[int, Strict(), Field(ge=0)]
+    created_at: int | None = None
+    updated_at: int | None = None
+
+
+class CodexGoalResponse(BaseModel):
+    """
+    Response body for reading or setting a Codex-native session goal.
+
+    :param goal: Current goal state, or ``None`` when the session has no
+        persisted Codex goal.
+    """
+
+    goal: CodexGoalObject | None
+
+
+class SetCodexGoalRequest(BaseModel):
+    """
+    Request body for ``PUT /v1/sessions/{id}/codex_goal``.
+
+    :param objective: Goal objective text, e.g.
+        ``"Finish the migration and keep tests green"``. Must be non-empty
+        after trimming and no longer than 4000 characters, matching Codex
+        app-server's goal contract.
+    :param token_budget: Optional positive token budget, e.g. ``40000``.
+        Explicit JSON ``null`` clears the Codex goal budget; omitting the
+        field leaves it absent from the forwarded request.
+    :param status: Optional user-selected goal status. ``"active"`` starts or
+        resumes the goal, and ``"paused"`` stores it paused. Omit this field
+        to preserve Codex's current lifecycle state.
+    """
+
+    objective: str = Field(min_length=1, max_length=4000)
+    token_budget: Annotated[int, Strict(), Field(gt=0)] | None = None
+    status: Literal["active", "paused"] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class UpdateCodexGoalStatusRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/sessions/{id}/codex_goal/status``.
+
+    Codex app-server represents pause/resume as ``thread/goal/set`` status
+    updates. Omnigent exposes the two user-driven transitions explicitly:
+    ``"paused"`` pauses an active goal, and ``"active"`` resumes a paused,
+    blocked, or usage-limited goal.
+
+    :param status: Target Codex goal status, either ``"paused"`` or
+        ``"active"``.
+    """
+
+    status: Literal["active", "paused"]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ClearCodexGoalResponse(BaseModel):
+    """
+    Response body for ``DELETE /v1/sessions/{id}/codex_goal``.
+
+    :param cleared: ``True`` when Codex removed an existing goal; ``False``
+        when no goal was present.
+    """
+
+    cleared: bool
+
+
 class SessionForkRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
@@ -1749,11 +1936,18 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
+    :param model_override: Model id to launch the fork on, e.g.
+        ``"databricks-gpt-5-4-mini"`` — the "restart with model" path.
+        Overrides the model the fork would otherwise inherit from the
+        source; the value is validated and family-checked against the
+        fork's harness. When ``None`` (default), the fork keeps the
+        source's model (within the same provider family).
     """
 
     title: str | None = None
     agent_id: str | None = None
     up_to_response_id: str | None = None
+    model_override: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1866,7 +2060,7 @@ class SessionListItem(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
     title: str | None = None
@@ -1885,6 +2079,26 @@ class SessionListItem(BaseModel):
     archived: bool = False
     comments_count: int = 0
     comments_updated_at: int | None = None
+
+
+class SessionList(BaseModel):
+    """Paginated list of sessions; ``data`` is a page of ``SessionListItem``."""
+
+    object: Literal["list"] = "list"
+    data: list[SessionListItem] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class ChildSessionList(BaseModel):
+    """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
 
 
 # ── Permissions ────────────────────────────────────────────────────
@@ -2228,7 +2442,7 @@ class SessionTodosEvent(_SSEEventBase):
     Emitted after an ``external_session_todos`` POST from the
     ``omnigent claude`` transcript forwarder, which captures todo
     updates via ``PostToolUse``/``TodoWrite`` hook events from Claude
-    Code and forwards them to the Omnigent server. Lets ap-web render a
+    Code and forwards them to the Omnigent server. Lets web render a
     live todo panel in the right column without polling.
 
     :param type: Always ``"session.todos"``.
@@ -2266,7 +2480,7 @@ class SessionTerminalPendingEvent(_SSEEventBase):
        sub-agents) and carries the authoritative ``pending=False`` clear
        emitted by the runner's ``finally`` block.
 
-    Together they allow ap-web to show a spinner on the Terminal pill
+    Together they allow web to show a spinner on the Terminal pill
     while the backend boots the terminal instead of a silent greyed-out
     button, and to distinguish "still starting up" from "no terminal"
     (killed or never created).
@@ -2545,6 +2759,46 @@ class SessionCreatedEvent(_SSEEventBase):
     child_session_id: str
     agent_id: str | None = None
     parent_session_id: str | None = None
+
+
+class SessionSupersededEvent(_SSEEventBase):
+    """
+    This conversation was superseded by another and clients should
+    follow to it.
+
+    Emitted by ``_publish_session_superseded`` in
+    ``omnigent/server/routes/sessions.py`` when the claude-native
+    forwarder rotates a session away on a Claude ``/clear`` (the old
+    conversation keeps its history but the live terminal moves to a
+    fresh conversation — see ``_post_clear_supersession`` in
+    ``omnigent/claude_native_forwarder.py``). A client actively viewing
+    the superseded conversation auto-redirects to ``target_conversation_id``.
+
+    Category: **transient** (SSE-only), live-only by design. There is no
+    SSE replay: a client that connects after the rotation does not get
+    this event. The durable counterpart is the persisted notice message
+    appended to the old conversation (a ``message`` item linking to the
+    new conversation), which a reloading client renders instead of being
+    force-redirected.
+
+    The wire shape is FLAT (not enveloped):
+    ``{"type": "session.superseded", "conversation_id": <old>,
+    "target_conversation_id": <new>, "reason": "clear"}``.
+
+    :param type: Always ``"session.superseded"``.
+    :param conversation_id: The superseded (old) conversation id this
+        event rides the stream of, e.g. ``"conv_old"``.
+    :param target_conversation_id: The conversation to follow to, e.g.
+        ``"conv_new"``.
+    :param reason: Why the session was superseded. Currently always
+        ``"clear"`` (a Claude Code ``/clear``); kept as a field so the
+        client can branch on future supersession causes.
+    """
+
+    type: Literal["session.superseded"]
+    conversation_id: str
+    target_conversation_id: str
+    reason: Literal["clear"] = "clear"
 
 
 # ── Response pass-through events (response.*) ──────────────────────
@@ -3173,11 +3427,17 @@ class CompactionCompletedEvent(_SSEEventBase):
     """
     Conversation history compaction has finished.
 
-    Emitted by ``omnigent/server/routes/sessions.py`` after
-    ``compact_conversation_now()`` returns successfully. Clients
-    that rendered a "Compacting…" spinner on
+    Emitted after compaction completes — either by the server after
+    ``compact_conversation_now()`` (explicit ``/compact``), or by a
+    harness that compacted its own internal context. Clients that
+    rendered a "Compacting…" spinner on
     :class:`CompactionInProgressEvent` should upgrade it to the
     permanent "Conversation compacted" marker on this event.
+
+    When emitted by a harness, ``summary`` and ``summary_model``
+    are populated so the runner can persist a compaction item for
+    session resume. When emitted by the server's explicit
+    ``/compact`` path, those fields are ``None``.
 
     :param type: Always ``"response.compaction.completed"``.
     :param total_tokens: Tiktoken estimate of the post-compaction
@@ -3185,10 +3445,17 @@ class CompactionCompletedEvent(_SSEEventBase):
         update the context-ring immediately without waiting for the
         next ``response.completed`` usage report. ``None`` when
         token counting is unavailable.
+    :param summary: Text summary of the compacted conversation,
+        or ``None`` for server-side compaction (already persisted).
+    :param summary_model: Model used for summarization, or ``None``
+        if truncation-based or server-side.
     """
 
     type: Literal["response.compaction.completed"]
     total_tokens: int | None = None
+    summary: str | None = None
+    summary_model: str | None = None
+    compacted_messages: list[dict[str, Any]] | None = None
 
 
 class CompactionFailedEvent(_SSEEventBase):
@@ -3427,6 +3694,7 @@ ServerStreamEvent = Annotated[
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
+    | SessionSupersededEvent
     | SessionPresenceEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent
