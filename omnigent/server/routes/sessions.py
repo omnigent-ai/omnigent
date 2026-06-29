@@ -9992,6 +9992,11 @@ _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
         "hermes-native",
         "native-hermes",
         "pi-native",
+        # qwen-native rebuilds qwen's on-disk chat recording (+ runtime/meta
+        # sidecars) from the copied items, so a fork carries history into the
+        # qwen TUI (see _build_qwen_fork_recording / write_qwen_session_recording).
+        # Only the canonical id is needed — "native-qwen" is aliased to it.
+        "qwen-native",
     }
 )
 

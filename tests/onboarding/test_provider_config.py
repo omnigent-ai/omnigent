@@ -38,6 +38,11 @@ from omnigent.onboarding.provider_config import (
         ("native-codex", OPENAI_FAMILY),
         ("codex", OPENAI_FAMILY),
         ("openai-agents", OPENAI_FAMILY),
+        # Qwen Code is OpenAI-compatible; the native TUI harness keys both
+        # spellings so a same-agent qwen→qwen fork/switch reads same-family.
+        ("qwen", OPENAI_FAMILY),
+        ("qwen-native", OPENAI_FAMILY),
+        ("native-qwen", OPENAI_FAMILY),
         # An unknown harness has no family (caller falls back / shows nothing).
         ("some-unknown-harness", None),
     ],

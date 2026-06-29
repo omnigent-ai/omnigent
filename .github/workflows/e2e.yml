@@ -54,7 +54,11 @@ env:
 jobs:
   # Security gate: untrusted PRs wait on the deterministic scan
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
+  # Skip when the automerge label is applied/removed -- safe to short-circuit
+  # here because every non-gate job is transitively downstream of gate, so
+  # no skipped check-run can overwrite an existing result on this SHA.
   gate:
+    if: github.event.label.name != 'automerge'
     uses: ./.github/workflows/security-gate.yml
 
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
