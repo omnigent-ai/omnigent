@@ -20,14 +20,15 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 pytestmark = pytest.mark.asyncio
 
 
-async def test_root_returns_api_metadata_without_web_ui(
+async def test_root_serves_html_landing_without_web_ui(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    API-only deployments expose a browser-friendly root response.
+    With no web UI bundle, ``GET /`` serves a friendly HTML landing page
+    (status 200) explaining the API-only state — not JSON metadata.
 
     :param runtime_init: Fixture that initializes the runtime with a mock LLM.
     :param db_uri: Test database URI.
@@ -52,12 +53,9 @@ async def test_root_returns_api_metadata_without_web_ui(
         resp = await client.get("/")
 
     assert resp.status_code == 200
-    assert resp.json() == {
-        "service": "omnigent",
-        "status": "ok",
-        "health": "/health",
-        "docs": "/docs",
-    }
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "web UI" in resp.text
+    assert "OMNIGENT_SKIP_WEB_UI" in resp.text
 
 
 async def test_web_ui_static_files_send_cache_control_headers(
