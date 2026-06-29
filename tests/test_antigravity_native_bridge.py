@@ -1354,3 +1354,32 @@ def test_ensure_agy_feedback_survey_disabled_follows_symlink(tmp_path: Path) -> 
         "model": "x",
         "showFeedbackSurvey": False,
     }
+
+
+def test_ensure_agy_feedback_survey_disabled_write_failure_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A write-side OSError is swallowed + logged so the launch is never broken (#1494 review).
+
+    The read of an existing-but-unreadable file is already covered; this exercises
+    the WRITE phase guarantee — a failing atomic replace must not propagate out of
+    a best-effort helper called inline on the launch path.
+    """
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"model": "x"}), encoding="utf-8")
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    # os.replace is the last step of the atomic write; failing it stresses the
+    # finally-cleanup + outer best-effort guard together.
+    monkeypatch.setattr(_mod.os, "replace", _boom)
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)  # must NOT raise
+    # The original file is untouched (the failed write never landed) and no stray
+    # temp file is left behind in the settings dir.
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "x"}
+    leftover = [p.name for p in settings.parent.iterdir() if p.name != settings.name]
+    assert leftover == []
+    assert "could not write" in caplog.text
