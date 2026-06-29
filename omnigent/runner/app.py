@@ -2820,6 +2820,82 @@ async def _persist_qwen_external_session_id(
         )
 
 
+async def _build_qwen_fork_recording(
+    server_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    workspace: str,
+) -> str | None:
+    """Synthesize a qwen chat recording for a forked clone from its Omnigent items.
+
+    A forked clone has its OWN copied Omnigent items but no qwen recording yet
+    (``external_session_id`` is NULL on a fork). We rebuild a recording from those
+    items under the clone's deterministic session id so the TUI resumes with the
+    prior conversation. The rebuild reads harness-neutral items (not the source's
+    vendor transcript), so it works cross-harness (claude/pi/codex → qwen).
+
+    If a recording for the clone's id already exists, return the id WITHOUT
+    rebuilding — the rebuild is idempotent. Otherwise a relaunch after a failed
+    ``external_session_id`` persist (best-effort; qwen has no re-capture path)
+    would re-enter here and overwrite qwen's live, full-fidelity recording with
+    a text-only rebuild.
+
+    :param server_client: Runner Omnigent server client.
+    :param session_id: The forked clone's Omnigent conversation id.
+    :param workspace: Realpath'd cwd qwen will resume in.
+    :returns: The qwen session id to ``--resume``, or ``None`` when there's
+        nothing carryable or the build fails (caller then launches fresh).
+    """
+    from omnigent.pi_native_resume import fetch_all_session_items_for_pi_resume
+    from omnigent.qwen_native_bridge import (
+        qwen_session_id_for_conversation,
+        qwen_session_recording_exists,
+        qwen_session_records_from_session_items,
+        write_qwen_session_recording,
+    )
+
+    qwen_session_id = qwen_session_id_for_conversation(session_id)
+    # Already built (e.g. a relaunch after the external_session_id persist failed):
+    # resume the live recording, never clobber it with a fresh text-only rebuild.
+    if qwen_session_recording_exists(qwen_session_id, workspace):
+        _logger.info(
+            "qwen fork-rebuild: recording already present for clone %s; resuming it",
+            session_id,
+        )
+        return qwen_session_id
+    try:
+        items = await fetch_all_session_items_for_pi_resume(server_client, session_id)
+        records = qwen_session_records_from_session_items(
+            items,
+            qwen_session_id=qwen_session_id,
+            cwd=workspace,
+        )
+        if not records:
+            _logger.info(
+                "qwen fork-rebuild: no carryable items for clone %s; launching fresh",
+                session_id,
+            )
+            return None
+        recording = await asyncio.to_thread(
+            write_qwen_session_recording, qwen_session_id, workspace, records
+        )
+    except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+        _logger.warning(
+            "Could not build qwen recording from items for forked clone %s; launching fresh",
+            session_id,
+            exc_info=True,
+        )
+        return None
+    _logger.info(
+        "qwen fork-rebuild: session=%s qwen_session_id=%s recording=%s records=%d",
+        session_id,
+        qwen_session_id,
+        recording,
+        len(records),
+    )
+    return qwen_session_id
+
+
 async def _auto_create_qwen_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2898,19 +2974,45 @@ async def _auto_create_qwen_terminal(
     # clean fresh launch). qwen restores history into the TUI from its own
     # checkpoint and emits only NEW events to ``--json-file`` on resume (verified),
     # so the forwarder never re-mirrors the prior transcript — no duplicate bubbles.
-    existing_session_id = launch_config.external_session_id
-    qwen_session_id = existing_session_id or qwen_session_id_for_conversation(session_id)
-    # Scope the recording check to THIS workspace's qwen project slug: qwen
-    # resolves ``--resume`` per-project (cwd), so a recording made under another
-    # workspace must not pick ``--resume`` here (→ blocking "No saved session").
-    if qwen_session_recording_exists(qwen_session_id, workspace):
+    # Forked clone carrying history into qwen: rebuild a recording from the
+    # clone's copied Omnigent items and force ``--resume``. Gated on a NULL
+    # ``external_session_id`` so it normally runs only on the FIRST launch;
+    # ``_build_qwen_fork_recording`` is also idempotent (resumes an existing
+    # recording, never clobbers it). Mirrors pi-native's fork rebuild
+    # (``_resolve_pi_external_session_id`` case 2).
+    forked_qwen_session_id: str | None = None
+    if (
+        launch_config.fork_carry_history
+        and not launch_config.external_session_id
+        and server_client is not None
+    ):
+        forked_qwen_session_id = await _build_qwen_fork_recording(
+            server_client,
+            session_id=session_id,
+            workspace=workspace,
+        )
+
+    if forked_qwen_session_id is not None:
+        qwen_session_id = forked_qwen_session_id
         resume_args = ["--resume", qwen_session_id]
-    else:
-        resume_args = ["--session-id", qwen_session_id]
-    if existing_session_id != qwen_session_id:
-        # First launch (or a prior persist that didn't land): record the id so the
-        # next resume reads it from the snapshot and forks can carry history.
+        # Record the id so the clone reflects its own qwen session and later
+        # relaunches resume it via the normal path instead of rebuilding.
         await _persist_qwen_external_session_id(server_client, session_id, qwen_session_id)
+    else:
+        existing_session_id = launch_config.external_session_id
+        qwen_session_id = existing_session_id or qwen_session_id_for_conversation(session_id)
+        # Scope the recording check to THIS workspace's qwen project slug: qwen
+        # resolves ``--resume`` per-project (cwd), so a recording made under another
+        # workspace must not pick ``--resume`` here (→ blocking "No saved session").
+        if qwen_session_recording_exists(qwen_session_id, workspace):
+            resume_args = ["--resume", qwen_session_id]
+        else:
+            resume_args = ["--session-id", qwen_session_id]
+        if existing_session_id != qwen_session_id:
+            # First launch (or a prior persist that didn't land): record the id so the
+            # next resume reads it from the snapshot and forks can carry history.
+            await _persist_qwen_external_session_id(server_client, session_id, qwen_session_id)
+
     # Expose Omnigent's builtin tools (sys_*, load_skill, web_fetch, …) to qwen
     # via the shared MCP relay, passed through qwen's ``--mcp-config`` flag (the
     # claude-native model). The config lives in the bridge dir — never the

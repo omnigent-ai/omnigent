@@ -321,6 +321,7 @@ _BUILTIN_CLAUDE = _agent("ag_builtin_claude", "claude-native-ui", "bundle/claude
 _BUILTIN_CODEX = _agent("ag_builtin_codex", "codex-native-ui", "bundle/codex", None)
 _BUILTIN_CURSOR = _agent("ag_builtin_cursor", "cursor-native-ui", "bundle/cursor", None)
 _BUILTIN_PI = _agent("ag_builtin_pi", "pi-native-ui", "bundle/pi", None)
+_BUILTIN_QWEN = _agent("ag_builtin_qwen", "qwen-native-ui", "bundle/qwen", None)
 
 
 # ── Tests ────────────────────────────────────────────────────────
@@ -430,6 +431,14 @@ async def test_switch_cross_family_resets_model_but_carries_history(
             _BUILTIN_PI,
             "pi-native",
             {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
+            True,
+        ),
+        # qwen-native rebuilds qwen's on-disk chat recording from the copied
+        # items → carry history (parity with claude/codex/pi native).
+        (
+            _BUILTIN_QWEN,
+            "qwen-native",
+            {"omnigent.ui": "terminal", "omnigent.wrapper": "qwen-native-ui"},
             True,
         ),
     ],

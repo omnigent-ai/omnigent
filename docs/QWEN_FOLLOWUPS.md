@@ -183,6 +183,32 @@ comments; this is the *what*, not the *how*.)
   transcript is never re-mirrored — qwen sidesteps the double-mirror problem that
   forced goose-native to start fresh.
 
+- [x] **Carry history into qwen on fork / switch-agent (incl. cross-harness).**
+  Forking a session — or switching its agent — into qwen-native now seeds the new
+  qwen session with the prior conversation, the same way claude-/codex-/pi-native
+  do. qwen-native is registered in `_FORK_HISTORY_NATIVE_HARNESSES`
+  (`server/routes/sessions.py`), so both the fork and switch-agent routes stamp
+  `omnigent.fork.carry_history` and clear `external_session_id` on the clone. On
+  the clone's first launch, `_auto_create_qwen_terminal` calls
+  `_build_qwen_fork_recording`, which fetches the clone's copied Omnigent items
+  (`fetch_all_session_items_for_pi_resume` — harness-neutral) and rebuilds qwen's
+  on-disk recording via `qwen_session_records_from_session_items` +
+  `write_qwen_session_recording`, then forces `--resume`. Because it rebuilds from
+  Omnigent items (not the source's vendor transcript), it works **cross-harness**
+  (claude/pi/codex → qwen). **Key on-disk-format finding:** qwen resolves
+  `--resume <id>` from *three* files, not the `.jsonl` alone — it also needs
+  `chats/<id>.runtime.json` (session index entry) and the project `meta.json`; a
+  bare recording yields the blocking "No saved session found" screen (verified on
+  v0.18.2). The synthesized recording emits only `user`/`assistant` message
+  records (the `system` snapshot records qwen writes live are optional for
+  resume); tool calls are dropped (text turns carry the context). The rebuild is
+  gated on a NULL `external_session_id` so it runs only on the first launch — once
+  the minted id is persisted, later relaunches take the normal resume path and
+  never clobber qwen's live recording (which by then holds post-fork turns). The
+  minted id is the clone's own deterministic `qwen_session_id_for_conversation`,
+  so the resume path recomputes it. Mirrors pi-native's fork rebuild
+  (`_resolve_pi_external_session_id` case 2).
+
 ### Medium
 
 - [x] **Compaction via `/compact` (web → TUI), with spinner + divider.**

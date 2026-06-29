@@ -47,6 +47,10 @@ describe("isNativeHarness", () => {
     // NATIVE_HARNESSES (the in-process `antigravity` SDK harness is NOT).
     ["antigravity-native", true],
     ["native-antigravity", true],
+    // qwen-native rebuilds qwen's on-disk chat recording from the copied
+    // Omnigent items, so it carries fork/switch history (both spellings).
+    ["qwen-native", true],
+    ["native-qwen", true],
     ["claude-sdk", false],
     ["claude_sdk", false],
     ["openai-agents", false],
@@ -99,6 +103,9 @@ describe("forkTargetCarriesHistory", () => {
     ["native-pi"],
     ["antigravity-native"],
     ["native-antigravity"],
+    // qwen-native rebuilds qwen's on-disk recording from the copied items.
+    ["qwen-native"],
+    ["native-qwen"],
   ])("native target %s carries history", (target) => {
     expect(forkTargetCarriesHistory(target)).toBe(true);
   });

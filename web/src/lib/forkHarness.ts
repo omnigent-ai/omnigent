@@ -54,11 +54,17 @@ export function harnessFamily(
 }
 
 /**
- * Whether a harness is a native CLI harness (Claude Code / Codex / Cursor /
- * Pi / Antigravity). Mirrors Python `NATIVE_HARNESSES`
- * (`omnigent/harness_aliases.py`) — including both native-antigravity spellings
- * (the in-process `antigravity` SDK harness is NOT native) — so both sides
- * classify the same set.
+ * Whether a harness is a native CLI harness that carries fork/switch history
+ * (Claude Code / Codex / Cursor / Pi / Antigravity / Qwen Code). These are the
+ * native harnesses whose history the runner rebuilds or replays on a fork — the
+ * subset of Python `NATIVE_HARNESSES` (`omnigent/harness_aliases.py`) that the
+ * server gates in `_FORK_HISTORY_NATIVE_HARNESSES` /
+ * `_CURSOR_FORK_HISTORY_HARNESSES` (`server/routes/sessions.py`). A native
+ * harness that always starts fresh (e.g. goose-native) is intentionally absent
+ * so the picker doesn't promise history it would drop. Both native-antigravity
+ * spellings are included (the in-process `antigravity` SDK harness is NOT
+ * native); qwen-native rebuilds qwen's on-disk chat recording from the copied
+ * Omnigent items (see `write_qwen_session_recording`).
  */
 export function isNativeHarness(harness: string | null | undefined): boolean {
   return (
@@ -71,7 +77,9 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
     harness === "pi-native" ||
     harness === "native-pi" ||
     harness === "antigravity-native" ||
-    harness === "native-antigravity"
+    harness === "native-antigravity" ||
+    harness === "qwen-native" ||
+    harness === "native-qwen"
   );
 }
 
