@@ -45,6 +45,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.mcp_server_store.sqlalchemy_store import SqlAlchemyMcpServerStore
 
 # ── Controllable mock LLM ─────────────────────────────
 
@@ -594,6 +595,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
+        mcp_server_store=SqlAlchemyMcpServerStore(db_uri),
     )
 
 

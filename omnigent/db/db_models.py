@@ -77,6 +77,56 @@ class SqlAgent(Base):
     )
 
 
+class SqlMcpServer(Base):
+    """
+    SQLAlchemy model for the ``mcp_servers`` table.
+
+    Each row is a reusable, owner-scoped MCP server connection. Unlike
+    the per-agent MCP declarations baked into agent bundles, these are
+    registered once and referenced when creating agents.
+
+    Secret-bearing ``headers`` and ``env`` are stored as JSON text
+    (``headers_json`` / ``env_json``); ``args`` likewise. They are never
+    returned verbatim by the API — only their keys.
+
+    :param id: Unique identifier, e.g. ``"mcp_0f1a2b3c..."``.
+    :param created_at: Unix epoch seconds when the row was created.
+    :param updated_at: Unix epoch seconds of the last update, or ``None``.
+    :param owner: Owning user id. ``None`` only for legacy/global rows.
+    :param name: Server name, unique per owner.
+    :param transport: ``"http"`` or ``"stdio"``.
+    :param url: HTTP endpoint for http transport, else ``None``.
+    :param headers_json: JSON-encoded dict of HTTP headers, or ``None``.
+    :param command: Executable for stdio transport, else ``None``.
+    :param args_json: JSON-encoded list of stdio args, or ``None``.
+    :param env_json: JSON-encoded dict of stdio env vars, or ``None``.
+    :param description: Optional free-text description.
+    """
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    owner: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    name: Mapped[str] = mapped_column(String(256))
+    transport: Mapped[str] = mapped_column(String(16))
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    headers_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    command: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    args_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    env_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_mcp_servers_created_at", "created_at"),
+        Index("ix_mcp_servers_owner", "owner"),
+        # One server name per owner. Owner-scoped uniqueness so two
+        # different users may each register a server named "litellm".
+        Index("ix_mcp_servers_owner_name", "owner", "name", unique=True),
+    )
+
+
 class SqlFile(Base):
     """
     SQLAlchemy model for the ``files`` table.
