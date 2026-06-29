@@ -790,7 +790,7 @@ def test_inject_user_message_via_tui_resends_enter_when_coalesced(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     enters = {"n": 0}
-    tui = {"pane": "> hi there\n? for shortcuts"}
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Activate the turn only on the second Enter."""
@@ -799,6 +799,8 @@ def test_inject_user_message_via_tui_resends_enter_when_coalesced(
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> hi there\n? for shortcuts"
         if cmd[-1] == "Enter":
             enters["n"] += 1
             if enters["n"] >= 2:
@@ -816,17 +818,16 @@ def test_inject_user_message_via_tui_accepts_changed_active_footer(
     _fast_tmux_timeouts: None,
 ) -> None:
     """
-    The submit is confirmed when the footer leaves idle, even if the running
-    footer text differs from the known marker.
+    The submit is confirmed when the draft leaves the composer, even if the
+    running footer text differs from the known marker.
 
     A future agy build could rename the running footer or a narrow pane could
-    truncate it; as long as the idle ``? for shortcuts`` marker is gone from a
-    non-empty pane, the turn is treated as started — so a working submit is not
-    misread as stuck and falsely failed.
+    truncate it; delivery must key off draft disappearance instead.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    tui = {"pane": "> hi\n? for shortcuts"}
+    content = "hello there"
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Idle until Enter; then a non-idle footer that is NOT the known marker."""
@@ -835,13 +836,14 @@ def test_inject_user_message_via_tui_accepts_changed_active_footer(
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
         if cmd[-1] == "Enter":
             tui["pane"] = "> \n(generating response, press the cancel key to stop)"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    # Must not raise: the idle marker is gone, so the submit is confirmed.
-    inject_user_message_via_tui(bridge_dir, content="hi", timeout_s=0.5)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
 
 
 def test_inject_user_message_via_tui_mid_turn_sends_one_enter(
@@ -862,16 +864,20 @@ def test_inject_user_message_via_tui_mid_turn_sends_one_enter(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     enters = {"n": 0}
+    tui = {"pane": "> \nesc to cancel"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """agy is mid-turn the entire time: the footer never leaves ``esc to cancel``."""
+        """agy stays mid-turn, but the draft clears after Enter."""
         del kwargs
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> steer me\nesc to cancel", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> steer me\nesc to cancel"
         if cmd[-1] == "Enter":
             enters["n"] += 1
+            tui["pane"] = "> \nesc to cancel"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -879,48 +885,45 @@ def test_inject_user_message_via_tui_mid_turn_sends_one_enter(
     assert enters["n"] == 1, "mid-turn submit must send exactly one Enter (no re-send)"
 
 
-def test_submit_verify_ignores_single_transient_nonidle_frame(
+def test_inject_user_message_via_tui_ignores_transcript_echo_after_submit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
 ) -> None:
     """
-    A lone non-idle capture (a mid-repaint frame) must not be read as submitted.
+    The submitted prompt remaining in transcript history is not a stuck draft.
 
-    The "idle marker gone" signal is only accepted on two CONSECUTIVE polls. A
-    single transient frame with neither marker — followed by the idle footer
-    again — resets the counter, so the submit is confirmed only once the active
-    marker actually appears. Otherwise an early return on a redraw glitch could
-    cost the caller a full state-wait before a "did not register" error.
+    Claude/Kiro-style verification must scope matching to agy's live composer.
+    After Enter, agy echoes the prompt above a fresh empty composer; matching the
+    whole pane would falsely retry Enter and could submit an empty follow-up.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    # capture-pane sequence after Enter: idle, one transient blank frame, idle
-    # again, then the running footer. A correct 2-consecutive rule reaches index 3.
-    panes = [
-        "> hi\n? for shortcuts",  # idle
-        "> \n",  # transient: neither marker (mid-repaint)
-        "> hi\n? for shortcuts",  # idle again — resets the non-idle counter
-        "> \nesc to cancel",  # turn running — the real confirmation
-    ]
-    captures = {"n": 0}
+    content = "Reply exactly: transcript echo ok"
+    enters = {"n": 0}
+    separator = "────────────────────────────────────────────────────────────────────────────────"
+    tui = {"pane": f"{separator}\n>\n{separator}\n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """Serve the scripted pane sequence; never empty so liveness stays true."""
+        """After Enter, keep the prompt only in transcript history."""
         del kwargs
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
-            idx = min(captures["n"], len(panes) - 1)
-            captures["n"] += 1
-            return SimpleNamespace(returncode=0, stdout=panes[idx], stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"{separator}\n> {content}\n{separator}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+            tui["pane"] = (
+                f"{separator}\n> {content}\n⣾  Generating...\n{separator}\n"
+                f">\n{separator}\nesc to cancel"
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message_via_tui(bridge_dir, content="hi", timeout_s=0.5)
-    # Must have polled past the transient frame to the running footer (index 3),
-    # i.e. it did NOT return early on the lone non-idle frame at index 1.
-    assert captures["n"] >= 4
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert enters["n"] == 1
 
 
 def test_inject_user_message_via_tui_raises_when_target_never_advertised(
@@ -966,6 +969,7 @@ def test_inject_user_message_via_tui_raises_when_session_dies_before_submit(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     has_session_calls = {"n": 0}
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Alive at the entry check; dead by the time the submit re-checks."""
@@ -975,11 +979,34 @@ def test_inject_user_message_via_tui_raises_when_session_dies_before_submit(
             # 1st call = entry gate (alive); later calls = per-submit re-check (dead).
             return SimpleNamespace(returncode=0 if has_session_calls["n"] == 1 else 1, stdout="")
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> draft\n? for shortcuts", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> draft message\n? for shortcuts"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="exited before the message could be submitted"):
+        inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+
+
+def test_inject_user_message_via_tui_raises_when_paste_never_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A successful tmux paste command is not enough; the draft must render."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Pane stays empty even after paste-buffer returns successfully."""
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="> \n? for shortcuts", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not render the pasted message"):
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
 
 
@@ -991,21 +1018,25 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     """
     If no turn ever starts after the submit attempts, the delivery raises.
 
-    The pane stays idle forever (Enter never takes), so after the bounded
-    re-send budget the executor gets a clear error rather than a false success.
+    The pasted draft stays visible forever (Enter never takes), so after the
+    bounded re-send budget the executor gets a clear error rather than a false
+    success.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane never leaves idle — the submit never starts a turn."""
         del kwargs
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> draft\n? for shortcuts", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> draft message\n? for shortcuts"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="did not start a turn"):
+    with pytest.raises(RuntimeError, match="draft is still visible"):
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
 
 
@@ -1121,6 +1152,43 @@ def test_seed_isolated_agy_home_seeds_platform_credentials_and_state(
     onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
     assert json.loads(onboarding.read_text(encoding="utf-8"))["onboardingComplete"] is True
     assert (iso_gemini / "config" / ".migrated").is_file()
+
+
+def test_seed_isolated_agy_home_trusts_workspace_in_isolated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workspace trust is seeded under isolated --gemini_dir, not real ~/.gemini."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(
+        json.dumps({"colorScheme": "dark", "trustedWorkspaces": ["/real/repo"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.mkdir(parents=True)
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    isolated_settings = iso_gemini / "antigravity-cli" / "settings.json"
+    isolated_settings.parent.mkdir(parents=True)
+    isolated_settings.write_text(
+        json.dumps({"colorScheme": "solarized dark", "trustedWorkspaces": ["/existing"]}),
+        encoding="utf-8",
+    )
+
+    seed_isolated_agy_home(bridge_dir, trusted_workspace=workspace)
+
+    isolated = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert isolated["colorScheme"] == "solarized dark"
+    assert isolated["trustedWorkspaces"] == ["/existing", str(workspace.resolve())]
+    # The user's real agy settings are never modified by this bridge-scoped seed.
+    assert json.loads(real_settings.read_text(encoding="utf-8")) == {
+        "colorScheme": "dark",
+        "trustedWorkspaces": ["/real/repo"],
+    }
 
 
 def test_seed_isolated_agy_home_tolerates_missing_credential(

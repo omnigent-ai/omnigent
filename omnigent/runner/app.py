@@ -4219,7 +4219,11 @@ async def _auto_create_antigravity_terminal(
     await asyncio.to_thread(write_mcp_config, bridge_dir)
     env_overrides = {
         **env_overrides,
-        **await asyncio.to_thread(seed_isolated_agy_home, bridge_dir),
+        **await asyncio.to_thread(
+            seed_isolated_agy_home,
+            bridge_dir,
+            trusted_workspace=workspace,
+        ),
     }
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an

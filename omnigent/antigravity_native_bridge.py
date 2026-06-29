@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -470,7 +471,11 @@ def write_mcp_config(
     return path
 
 
-def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
+def seed_isolated_agy_home(
+    bridge_dir: Path,
+    *,
+    trusted_workspace: Path | str | None = None,
+) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
     Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
@@ -483,6 +488,11 @@ def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
     (the footgun this whole design avoids).
 
     :param bridge_dir: Native Antigravity bridge directory.
+    :param trusted_workspace: Optional workspace path to pre-trust inside the
+        isolated agy settings file. This suppresses agy's unhookable first-run
+        "Do you trust this project?" TUI gate for host-spawned sessions, mirroring
+        ``ensure_claude_workspace_trusted`` while keeping trust scoped to this
+        bridge-owned ``--gemini_dir``.
     :returns: Env overrides to layer onto the agy launch environment. Currently
         empty because ``HOME`` must stay real for platform auth.
     """
@@ -524,6 +534,9 @@ def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
     # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
     with contextlib.suppress(OSError):
         (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
+
+    if trusted_workspace is not None:
+        _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
 
     return {}
 
@@ -641,6 +654,30 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             settings_path,
             exc_info=True,
         )
+
+
+def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> None:
+    """Add *workspace* to isolated agy ``trustedWorkspaces`` settings."""
+    settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+    data: dict[str, object] = {}
+    if settings_path.is_file():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+    workspace_key = str(workspace.resolve())
+    existing = data.get("trustedWorkspaces")
+    trusted = list(existing) if isinstance(existing, list) else []
+    if workspace_key in trusted:
+        return
+    trusted.append(workspace_key)
+    data["trustedWorkspaces"] = trusted
+    settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, settings_path)
 
 
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
@@ -816,6 +853,9 @@ _PASTE_BUFFER = "omnigent-agy-paste"
 _AGY_IDLE_MARKER = "? for shortcuts"
 # agy TUI footer while a turn is running — the positive "submit took" signal.
 _AGY_ACTIVE_MARKER = "esc to cancel"
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
+# TUI horizontal separator around agy's bottom composer.
+_AGY_SEPARATOR_CHAR = "─"
 
 
 def write_tmux_target(
@@ -1025,6 +1065,93 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
+def _format_pane_debug_tail(pane: str) -> str:
+    """
+    Return a short, redacted pane tail for delivery failure diagnostics.
+
+    The agy pane header can include the authenticated user's email address. Keep
+    this diagnostic safe to surface in an executor error by redacting email-like
+    tokens and limiting the output to a small tail.
+    """
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    tail = "\n".join(lines[-12:])
+    return _EMAIL_RE.sub("[REDACTED_EMAIL]", tail) or "<empty pane>"
+
+
+def _agy_input_region(pane: str) -> str:
+    """
+    Return agy's live bottom composer region, excluding transcript history.
+
+    agy renders the editable composer between horizontal separator lines. After
+    a successful submit, the submitted prompt remains in transcript history
+    above a fresh empty composer, so checking the full pane would falsely think
+    the draft is still present. The last separator pair scopes matching to the
+    currently editable input box, mirroring Kiro's input-region guard.
+    """
+    lines = pane.splitlines()
+    separator_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if _agy_separator_line(line)
+    ]
+    if len(separator_indexes) >= 2:
+        start = separator_indexes[-2] + 1
+        end = separator_indexes[-1]
+        return "\n".join(lines[start:end])
+    return "\n".join(lines[-8:])
+
+
+def _agy_separator_line(line: str) -> bool:
+    """Return whether *line* is one of agy's composer separator rules."""
+    stripped = line.strip()
+    return len(stripped) >= 8 and set(stripped) == {_AGY_SEPARATOR_CHAR}
+
+
+def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool:
+    """
+    Return whether the pasted draft is still visible in agy's composer.
+
+    The baseline region prevents matching the empty prompt or stale text that was
+    already present before this paste. Candidate lines are normalized by removing
+    agy's leading ``>`` prompt glyph.
+    """
+    if not needle:
+        return False
+    region = _agy_input_region(pane)
+    if region == baseline_region:
+        return False
+    normalized_needle = needle.strip()
+    if not normalized_needle:
+        return False
+    return any(
+        line == normalized_needle
+        or line.startswith(normalized_needle)
+        or normalized_needle in line
+        for line in _agy_draft_candidate_lines(region)
+    )
+
+
+def _agy_draft_candidate_lines(region: str) -> list[str]:
+    """Return composer lines that can represent editable draft text."""
+    candidates: list[str] = []
+    for raw_line in region.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == ">":
+            continue
+        if line.startswith(">"):
+            line = line[1:].strip()
+        if not line:
+            continue
+        if _AGY_IDLE_MARKER in line or _AGY_ACTIVE_MARKER in line:
+            continue
+        if "Generating" in line:
+            continue
+        candidates.append(line)
+    return candidates
+
+
 def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
     """
     Best-effort wait until agy's input box is mounted (its footer is rendered).
@@ -1051,51 +1178,44 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
-def _submit_and_verify(socket_path: str, tmux_target: str) -> None:
+def _submit_and_verify(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str = "",
+    baseline_region: str = "",
+    draft_seen: bool = False,
+) -> None:
     """
-    Press Enter to submit the pasted draft, verifying the submit where possible.
+    Press Enter to submit the pasted draft, verifying by composer state.
 
-    There are two cases, distinguished by the footer BEFORE the Enter:
-
-    **Idle (a sequential turn — the common case).** agy shows
-    :data:`_AGY_IDLE_MARKER`. The agy TUI coalesces a rapid stdin burst into a
-    paste, so an Enter that lands while the paste is still being consumed is
-    folded in as a newline and the draft sits unsent. After each Enter this polls
-    for the footer leaving idle — :data:`_AGY_ACTIVE_MARKER` appears (accepted on
-    first sighting) OR :data:`_AGY_IDLE_MARKER` is gone for TWO consecutive polls
-    (robust to a future agy renaming/truncating the running footer, while a single
-    transient redraw frame cannot be misread as started). If neither holds within
-    :data:`_SUBMIT_VERIFY_TIMEOUT_S` the Enter is re-sent (the draft is still in
-    the box; an Enter on an emptied box is a no-op).
-
-    **Mid-turn (a steer).** agy already shows :data:`_AGY_ACTIVE_MARKER`, so the
-    idle→running transition this function watches for is unavailable and a second
-    Enter could queue a spurious empty turn. agy queues a mid-turn paste as the
-    next ``USER_INPUT`` (verified against agy 1.0.10), and the caller's
-    paste-commit poll already confirmed the draft rendered in the input box, so a
-    single best-effort Enter is sent and the function returns WITHOUT a footer
-    confirmation. The forwarder is the system-of-record for whether the steer
-    actually registered (it mirrors the resulting ``USER_INPUT`` step); this path
-    deliberately does not re-send or hard-fail on the unverifiable mid-turn case.
+    This mirrors the stronger Claude/Kiro native bridge contract. Footer text is
+    only a readiness hint: it can change across agy builds, be truncated in narrow
+    panes, or redraw independently from the editable draft. The reliable local
+    submit signal is that the draft which was visible before Enter is no longer
+    present in the live bottom composer region. If the same draft remains visible,
+    Enter was likely folded into the paste burst and is re-sent within a bounded
+    retry budget. If no usable needle exists, submit once and return — absence
+    checks would be vacuous. ``inject_user_message_via_tui`` fails earlier when a
+    normal text draft never renders.
 
     :param socket_path: tmux server socket path.
     :param tmux_target: tmux pane target.
     :returns: None.
-    :raises RuntimeError: When the agy TUI exits mid-submit, or (idle case only)
-        the footer never leaves idle after :data:`_MAX_SUBMIT_ATTEMPTS` attempts.
+    :raises RuntimeError: When the agy TUI exits mid-submit, or the visible
+        draft remains in the composer after :data:`_MAX_SUBMIT_ATTEMPTS` attempts.
     """
     if not _session_alive(socket_path, tmux_target):
         raise RuntimeError(
             "the agy terminal exited before the message could be submitted; restart the session"
         )
-    if _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target):
-        # Mid-turn steer: footer-transition verification is unavailable (see the
-        # docstring). Deliver one best-effort Enter; do not re-send.
+    if not draft_seen:
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         return
+    last_pane = _capture_pane(socket_path, tmux_target)
     for _ in range(_MAX_SUBMIT_ATTEMPTS):
         # Re-check liveness each attempt: if the TUI exited between the paste and
-        # now, every capture returns "" and the footer never changes — so fail
+        # now, every capture returns "" and the draft never clears — so fail
         # fast with the real cause instead of spinning the full budget and then
         # blaming paste-coalescing.
         if not _session_alive(socket_path, tmux_target):
@@ -1105,23 +1225,22 @@ def _submit_and_verify(socket_path: str, tmux_target: str) -> None:
             )
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        non_idle_polls = 0
         while time.monotonic() < deadline:
+            if not _session_alive(socket_path, tmux_target):
+                raise RuntimeError(
+                    "the agy terminal exited before the message could be submitted; "
+                    "restart the session"
+                )
             pane = _capture_pane(socket_path, tmux_target)
-            if pane and _AGY_ACTIVE_MARKER in pane:
+            last_pane = pane or last_pane
+            if pane and not _draft_in_input_region(pane, needle, baseline_region):
                 return
-            if pane and _AGY_IDLE_MARKER not in pane:
-                non_idle_polls += 1
-                if non_idle_polls >= 2:
-                    return
-            else:
-                # Idle footer present, or an empty capture (tmux failure): reset
-                # so the two confirmations must be consecutive, not cumulative.
-                non_idle_polls = 0
             time.sleep(_TMUX_POLL_INTERVAL_S)
+    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region)
     raise RuntimeError(
-        "agy did not start a turn after the message was submitted to its terminal "
-        "(the submit Enter may have been folded into the paste)"
+        "agy did not accept the submitted message; the draft is still visible "
+        "in the input box; "
+        f"draft_visible={draft_visible}; pane_tail:\n{_format_pane_debug_tail(last_pane)}"
     )
 
 
@@ -1146,7 +1265,7 @@ def inject_user_message_via_tui(
     kill-to-end), stream the content through a named tmux buffer
     (``load-buffer``/``paste-buffer -p`` so interior newlines stay data and a
     large message is not capped by the send-keys argv limit), wait for the draft
-    to render, then submit (footer-verified when idle; best-effort mid-turn — see
+    to render, then submit and verify the draft left the live composer (see
     :func:`_submit_and_verify`).
 
     :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
@@ -1181,6 +1300,7 @@ def inject_user_message_via_tui(
     # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k).
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
     # ``delete=False`` + name captured BEFORE the write, so a write failure still
     # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
     paste_path: str | None = None
@@ -1209,14 +1329,32 @@ def inject_user_message_via_tui(
     # Wait until the paste is visibly committed to the input box before Enter, so
     # the submit is not folded into the paste burst (see _submit_and_verify).
     needle = _submit_needle(content)
+    draft_seen = False
+    last_commit_pane = ""
     if needle:
         commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
         while time.monotonic() < commit_deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
+            pane = _capture_pane(socket_path, tmux_target)
+            last_commit_pane = pane or last_commit_pane
+            if _draft_in_input_region(
+                pane, needle, baseline_region
+            ):
+                draft_seen = True
                 break
             time.sleep(_TMUX_POLL_INTERVAL_S)
+        if not draft_seen:
+            raise RuntimeError(
+                "agy did not render the pasted message in its input box before submit; "
+                f"pane_tail:\n{_format_pane_debug_tail(last_commit_pane)}"
+            )
     time.sleep(_PASTE_SETTLE_S)
-    _submit_and_verify(socket_path, tmux_target)
+    _submit_and_verify(
+        socket_path,
+        tmux_target,
+        needle=needle,
+        baseline_region=baseline_region,
+        draft_seen=draft_seen,
+    )
 
 
 def send_interaction_keys_via_tui(
