@@ -902,6 +902,14 @@ class McpServerConnection:
             # Streamable HTTP client in teardown, which would block the
             # except-clause SSE fallback below from ever running. Route
             # straight to SSE.
+            #
+            # Note: this routing is one-way and purely path-based, not
+            # capability-based. A server that speaks Streamable HTTP but
+            # happens to live at a /sse path is sent only to the SSE
+            # client, with no reverse fallback to Streamable HTTP. That
+            # is the intended trade-off: it matches the /sse convention
+            # and avoiding the teardown hang takes priority over covering
+            # a misnamed-endpoint case that is not known to occur.
             return await self._open_sse_transport(stack, timeout, headers)
         try:
             return await self._open_streamable_http_transport(stack, timeout, headers)
