@@ -1,23 +1,25 @@
 """
 Provider catalog and model discovery for onboarding.
 
-Copied and trimmed from ``mlflow/utils/providers.py`` and
-``mlflow/utils/model_catalog/``. MLflow is **not** a dependency
-of omnigent — this is a standalone copy of the catalog data
-and the minimal loading/query logic needed for provider selection
-during ``omnigent create``.
+Model lists are fetched live from the MLflow GitHub Release catalog
+(``https://github.com/mlflow/mlflow/releases/download/model-catalog%2Flatest/{provider}.json``)
+with a 1-hour in-process TTL cache. MLflow is **not** a required
+dependency — the fetch uses only the stdlib ``urllib.request``.
+Auth configuration (``PROVIDER_ENV_VARS``, ``get_provider_config``) is
+omnigent-specific and lives here permanently.
 """
 
 from __future__ import annotations
 
-import functools
-import importlib.resources
 import json
 import re
+import threading
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
+
+import cachetools
 
 
 @dataclass
@@ -91,49 +93,149 @@ class ProviderConfig:
 
 
 # ---------------------------------------------------------------------------
-# Catalog loading
+# Catalog loading — live fetch from MLflow GitHub Release assets
 # ---------------------------------------------------------------------------
 
+_MLFLOW_CATALOG_URL = (
+    "https://github.com/mlflow/mlflow/releases/download/model-catalog%2Flatest/{provider}.json"
+)
+_CATALOG_TTL_SECONDS = 3600
+_catalog_cache: cachetools.TTLCache[str, dict[str, Any] | None] = cachetools.TTLCache(
+    maxsize=64, ttl=_CATALOG_TTL_SECONDS
+)
+_catalog_cache_lock = threading.Lock()
+_CATALOG_MISS = object()
 
-def _catalog_dir() -> Path:
+
+def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
     """
-    Return the path to the bundled model_catalog directory.
+    Fetch ``{provider}.json`` from the MLflow GitHub Release catalog.
 
-    :returns: Absolute path to the ``model_catalog/`` package directory.
-    """
-    # importlib.resources.files returns Traversable; cast to Path
-    # since we only use it with Path operations (glob, read_text).
-    return Path(str(importlib.resources.files(__package__).joinpath("model_catalog")))
-
-
-@functools.lru_cache(maxsize=1)
-def _list_provider_names() -> list[str]:
-    """
-    Return provider names from the bundled catalog (directory listing).
-
-    :returns: Sorted list of provider stem names, e.g. ``["anthropic", "openai", ...]``.
-    """
-    try:
-        return sorted(p.stem for p in Path(_catalog_dir()).glob("*.json") if p.is_file())
-    except (FileNotFoundError, TypeError):
-        return []
-
-
-@functools.lru_cache(maxsize=128)
-def _load_provider_catalog(provider: str) -> dict[str, Any]:
-    """
-    Load a single provider's catalog JSON from bundled package resources.
+    Skipped when ``OMNIGENT_DISABLE_CATALOG_LOOKUP=1`` (set by the test
+    suite to avoid network calls in CI).
 
     :param provider: Provider name, e.g. ``"anthropic"``.
-    :returns: Parsed JSON dict with ``schema_version`` and ``models`` keys,
-        or empty dict if the file is missing.
+    :returns: Parsed JSON dict (the full catalog file), or ``None`` on
+        any network or parse error or when the lookup is disabled.
     """
-    resource_path = _catalog_dir() / f"{provider}.json"
+    import os
+
+    if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
+        return None
+    url = _MLFLOW_CATALOG_URL.format(provider=provider)
     try:
-        result: dict[str, Any] = json.loads(resource_path.read_text("utf-8"))
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            result: dict[str, Any] = json.loads(resp.read())
         return result
-    except (FileNotFoundError, TypeError):
-        return {}
+    except Exception:
+        return None
+
+
+def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
+    """
+    Return the MLflow catalog for *provider*, cached with a 1-hour TTL.
+
+    Falls back to an empty dict on network failure (or when the lookup
+    is disabled via ``OMNIGENT_DISABLE_CATALOG_LOOKUP``) so callers
+    degrade gracefully rather than raising.
+
+    :param provider: Provider name, e.g. ``"anthropic"``.
+    :returns: Parsed catalog dict (``schema_version`` + ``models`` keys),
+        or ``{}`` on failure.
+    """
+    with _catalog_cache_lock:
+        cached = _catalog_cache.get(provider, _CATALOG_MISS)
+        if cached is not _CATALOG_MISS:
+            return cached or {}
+    result = _download_provider_catalog(provider)
+    with _catalog_cache_lock:
+        _catalog_cache[provider] = result
+    return result or {}
+
+
+def _list_provider_names() -> list[str]:
+    """
+    Return the known provider names supported by the MLflow catalog.
+
+    This is a static list matching the JSON files published in the
+    MLflow GitHub Release assets, used to drive ``get_all_providers()``
+    without requiring an upfront network scan. Provider variants (e.g.
+    ``vertex_ai-llama_models``) are included; consolidation is applied
+    later in ``get_all_providers()``.
+
+    :returns: Sorted list of provider names.
+    """
+    return sorted(
+        [
+            "ai21",
+            "aleph_alpha",
+            "amazon_nova",
+            "anthropic",
+            "anyscale",
+            "azure",
+            "azure_ai",
+            "azure_text",
+            "bedrock",
+            "bedrock_mantle",
+            "cerebras",
+            "cloudflare",
+            "codestral",
+            "cohere",
+            "cohere_chat",
+            "dashscope",
+            "databricks",
+            "deepinfra",
+            "deepseek",
+            "featherless_ai",
+            "fireworks_ai",
+            "friendliai",
+            "gemini",
+            "gigachat",
+            "github_copilot",
+            "gmi",
+            "gradient_ai",
+            "groq",
+            "heroku",
+            "hyperbolic",
+            "lambda_ai",
+            "lemonade",
+            "llamagate",
+            "meta_llama",
+            "minimax",
+            "mistral",
+            "moonshot",
+            "morph",
+            "nebius",
+            "nlp_cloud",
+            "novita",
+            "nscale",
+            "oci",
+            "ollama",
+            "openai",
+            "openrouter",
+            "ovhcloud",
+            "palm",
+            "perplexity",
+            "publicai",
+            "replicate",
+            "sagemaker",
+            "sambanova",
+            "sarvam",
+            "snowflake",
+            "text-completion-codestral",
+            "text-completion-openai",
+            "together_ai",
+            "v0",
+            "vercel_ai_gateway",
+            "vertex_ai",
+            "volcengine",
+            "voyage",
+            "wandb",
+            "watsonx",
+            "xai",
+            "zai",
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +336,7 @@ def get_models(provider: str) -> list[ModelInfo]:
     seen: set[str] = set()
 
     for file_provider in matching_files:
-        catalog = _load_provider_catalog(file_provider)
+        catalog = _fetch_provider_catalog(file_provider)
         for model_name, entry in catalog.get("models", {}).items():
             # Strip provider prefix if present (e.g. "gemini/gemini-2.5-flash")
             if model_name.startswith(f"{provider}/"):
@@ -325,6 +427,9 @@ _DEFAULT_MODEL_OVERRIDE: dict[str, str] = {
     # OpenRouter (and the gateway add's OSS pre-fill) → a broadly-served OSS
     # model rather than an OpenAI/Anthropic id.
     "openrouter": "moonshotai/kimi-k2.6",
+    # xAI — pin the flagship so click.prompt(default=...) always has a value
+    # even when the catalog fetch is disabled (e.g. in tests).
+    "xai": "grok-3",
 }
 
 
