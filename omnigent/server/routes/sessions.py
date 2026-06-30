@@ -904,6 +904,7 @@ def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread
         if unread_set is not None:
             unread_set.discard(session_id)
 
+
 # Sessions whose current turn was Stopped: the relay drops the turn's trailing
 # response.* output (no forward, no persist). The fence lifts on the next
 # turn's "running" status or on any terminal response.* event.
