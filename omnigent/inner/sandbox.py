@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TypeAlias, cast
+from typing import Protocol, TypeAlias, cast
 
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
@@ -250,6 +250,19 @@ class SandboxPolicy:
         )
 
 
+class ContainmentHandle(Protocol):
+    """A releasable handle for post-spawn containment (e.g. a Job Object).
+
+    Returned by :meth:`SandboxBackend.post_spawn` and held by the parent for
+    the helper's lifetime. ``close()`` releases the resource; for a Windows
+    Job Object configured with kill-on-close, that terminates the contained
+    process tree.
+    """
+
+    def close(self) -> None:
+        pass
+
+
 class SandboxBackend(ABC):
     """
     Backend interface for host sandbox implementations.
@@ -284,6 +297,7 @@ class SandboxBackend(ABC):
         policy: SandboxPolicy,
         cwd: Path,
         chdir: Path | None = None,
+        target: str | None = None,
     ) -> list[str]:
         """
         Wrap *argv* with whatever launcher the backend needs at spawn
@@ -311,11 +325,40 @@ class SandboxBackend(ABC):
             ``None``, the helper starts in *cwd*. When set (e.g. for
             ``OSEnvSpec.start_in_scratch``), the launcher chdirs
             there on entry. In-process backends may ignore this.
+        :param target: Absolute path to the binary that the launcher
+            will exec as its final target (e.g. the ``claude`` CLI).
+            When set, the backend must ensure this path is reachable
+            inside the sandbox namespace — for bwrap this means
+            bind-mounting the target's directory chain just as it does
+            for ``argv[0]`` (the Python interpreter). ``None`` when
+            the target is already covered by the default mounts (e.g.
+            ``/usr/bin/something``).
         :returns: The (possibly wrapped) argv. The default
             implementation returns *argv* unchanged.
         """
-        del policy, cwd, chdir
+        del policy, cwd, chdir, target
         return argv
+
+    def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
+        """
+        Apply post-spawn containment to a just-launched helper process.
+
+        Called by :class:`omnigent.inner.os_env._HelperProcessClient` on
+        the parent side immediately after ``subprocess.Popen`` returns,
+        for active policies. Unlike :meth:`wrap_launcher_argv` (which
+        prepends a launcher *before* exec), this hook acts on an
+        already-running ``pid`` — the model Windows Job Objects require,
+        since a process is assigned to a job only after it exists.
+
+        :param policy: The resolved :class:`SandboxPolicy`.
+        :param pid: OS process id of the just-spawned helper.
+        :returns: An optional :class:`ContainmentHandle` releasing the
+            containment resource (e.g. the Job Object handle) on
+            ``close()``. The caller holds it for the helper's lifetime
+            and closes it on teardown. The default returns ``None``.
+        """
+        del policy, pid
+        return None
 
 
 _BACKENDS: dict[str, SandboxBackend] = {}
@@ -637,6 +680,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
                 launcher_argv,
                 sandbox,
                 Path(os.getcwd()),
+                target=target_path,
             )
         )
         os.environ[_LAUNCHER_WRAPPED_ENV] = "1"
@@ -753,6 +797,10 @@ def _ensure_builtin_backends() -> None:
         from . import bwrap_sandbox  # noqa: F401
     if "darwin_seatbelt" not in _BACKENDS:
         from . import seatbelt_sandbox  # noqa: F401
+    # Windows-only: the backend module touches ctypes.windll, so import it
+    # solely on Windows to keep the POSIX import graph clean.
+    if os.name == "nt" and "windows_jobobject" not in _BACKENDS:
+        from . import windows_jobobject_sandbox  # noqa: F401
 
 
 def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
@@ -762,6 +810,8 @@ def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
     - **Linux**: ``linux_bwrap`` (mount/PID/UTS/IPC namespaces +
       seccomp via the ``bwrap`` binary).
     - **macOS**: ``darwin_seatbelt`` (SBPL via ``sandbox-exec``).
+    - **Windows**: ``windows_jobobject`` (Job Object process-tree
+      containment + resource limits; no filesystem/network isolation).
 
     This is a pure *platform* decision — it does **not** probe for the
     backend's binary. The default is resolved at spec **parse** time
@@ -791,13 +841,15 @@ def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
     :returns: :class:`OSEnvSandboxSpec` with the OS-appropriate
         ``type``.
     :raises OSError: When the host platform has no sandbox backend at
-        all (anything other than Linux or macOS). Set
+        all (anything other than Linux, macOS, or Windows). Set
         ``os_env.sandbox.type='none'`` explicitly to run without one.
     """
     if sys.platform.startswith("linux"):
         return OSEnvSandboxSpec(type="linux_bwrap")
     if sys.platform == "darwin":
         return OSEnvSandboxSpec(type="darwin_seatbelt")
+    if os.name == "nt":
+        return OSEnvSandboxSpec(type="windows_jobobject")
     raise OSError(
         f"No sandbox backend is available on platform {sys.platform!r}. "
         "Set os_env.sandbox.type='none' explicitly to run without a sandbox."

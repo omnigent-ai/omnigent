@@ -156,6 +156,36 @@ def test_host_accepts_server_as_positional(
     assert runs == [_HostRun(server_url="https://from-arg.example.com")]
 
 
+def test_host_accepts_option_after_positional_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify ``host <url> --non-interactive`` parses the trailing option.
+
+    The positional-URL shorthand must not swallow options that follow the
+    URL: ``omnigent host https://… --non-interactive`` is the scripted/CI
+    form (#1428). A regression here — the URL rewrite misclassifying the
+    trailing option as an extra positional — makes the command exit
+    non-zero with "Unexpected extra argument(s)".
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    runs: list[_HostRun] = []
+
+    def _fake_run(server_url: str, **kwargs: object) -> None:
+        runs.append(_HostRun(server_url=server_url))
+
+    with patch("omnigent.host.connect.run_host_process", _fake_run):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["host", "https://from-arg.example.com", "--non-interactive"])
+
+    assert result.exit_code == 0, (
+        f"Expected success, got {result.exit_code}. Output: {result.output}"
+    )
+    assert runs == [_HostRun(server_url="https://from-arg.example.com")]
+
+
 def test_host_accepts_empty_positional_as_local_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

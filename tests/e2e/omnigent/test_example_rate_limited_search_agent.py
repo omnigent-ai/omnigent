@@ -24,6 +24,7 @@ from tests.e2e.omnigent._example_helpers import (
     assert_completed_one_shot,
     run_one_shot,
 )
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
 # Low-token summary request so the policy's rate limit stays
 # comfortably unrehced — the goal is to exercise the hook, not
@@ -34,22 +35,32 @@ _PROMPT = "Summarize in one sentence: the sky is blue."
 def test_rate_limited_search_agent_one_shot(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Run the rate-limited search agent one-shot. The FunctionPolicy
     registers + runs its pre-turn hook before the LLM returns.
 
+    Uses the mock LLM server for deterministic responses.
+
     :param omnigent_python: Interpreter with omnigent +
         openai-agents installed.
     :param omnigent_repo_root: Repo root for subprocess cwd.
-    :param omnigent_credentials_env: PAT + BASE_URL env.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     """
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The sky is blue due to Rayleigh scattering of sunlight."}],
+    )
     result = run_one_shot(
         omnigent_python=omnigent_python,
         omnigent_repo_root=omnigent_repo_root,
-        omnigent_credentials_env=omnigent_credentials_env,
+        omnigent_credentials_env=mock_credentials_env,
         example_name="rate_limited_search_agent",
         prompt=_PROMPT,
+        model="mock-model",
     )
     assert_completed_one_shot(result, "rate_limited_search_agent")

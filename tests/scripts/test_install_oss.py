@@ -272,3 +272,57 @@ def test_linux_pkg_install_cmd_none_present(lib: Path, tmp_path: Path) -> None:
     r = run(lib, "linux_pkg_install_cmd tmux", env={"PATH": bindir})
     assert r.returncode == 0, r.stderr
     assert r.stdout == "", f"No package manager should produce empty output, got {r.stdout!r}."
+
+
+def test_check_bubblewrap_noop_on_macos(lib: Path, tmp_path: Path) -> None:
+    """On macOS the bubblewrap check is a silent no-op — seatbelt needs no binary."""
+    bindir = _bindir(tmp_path)
+    r = run(lib, "uname() { echo Darwin; }; check_bubblewrap", env={"PATH": bindir})
+    assert r.returncode == 0, r.stderr
+    assert "bubblewrap" not in (r.stdout + r.stderr), (
+        f"macOS should say nothing about bubblewrap, got stdout={r.stdout!r} stderr={r.stderr!r}."
+    )
+
+
+def test_check_bubblewrap_present_on_linux(lib: Path, tmp_path: Path) -> None:
+    """When ``bwrap`` is on PATH the Linux check reports it available."""
+    bindir = _bindir(tmp_path, "bwrap")
+    r = run(lib, "uname() { echo Linux; }; check_bubblewrap", env={"PATH": bindir})
+    assert r.returncode == 0, r.stderr
+    assert "bubblewrap (bwrap) is available" in r.stdout, (
+        f"A present bwrap should be reported available, got {r.stdout!r}."
+    )
+
+
+def test_check_bubblewrap_missing_warns_with_pkg_cmd(lib: Path, tmp_path: Path) -> None:
+    """Missing ``bwrap`` warns (non-fatally) with the detected install command.
+
+    The native harness sandbox needs bwrap on Linux, but the installer must not
+    abort the whole install over it — it warns and continues (exit 0).
+    """
+    bindir = _bindir(tmp_path, "apt-get")  # package manager present, but no bwrap
+    r = run(
+        lib,
+        "uname() { echo Linux; }; NON_INTERACTIVE=true; check_bubblewrap",
+        env={"PATH": bindir},
+    )
+    assert r.returncode == 0, "A missing bwrap must warn, not fail (exit 0)."
+    assert "sudo apt-get install -y bubblewrap" in r.stderr, (
+        f"The warning should name the detected install command, got {r.stderr!r}."
+    )
+
+
+def test_check_bubblewrap_missing_no_pkg_manager_warns_generically(
+    lib: Path, tmp_path: Path
+) -> None:
+    """Missing ``bwrap`` with no known package manager falls back to a generic warning."""
+    bindir = _bindir(tmp_path)  # no bwrap, no package manager
+    r = run(
+        lib,
+        "uname() { echo Linux; }; NON_INTERACTIVE=true; check_bubblewrap",
+        env={"PATH": bindir},
+    )
+    assert r.returncode == 0, "A missing bwrap must warn, not fail (exit 0)."
+    assert "Install it with your package manager" in r.stderr, (
+        f"With no package manager the warning should be generic, got {r.stderr!r}."
+    )

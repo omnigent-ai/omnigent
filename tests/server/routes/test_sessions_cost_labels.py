@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL, parse_verdict
 from omnigent.errors import OmnigentError
 from omnigent.runner.identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
@@ -401,7 +402,8 @@ def test_create_session_rejects_cost_control_label_seed(
             "agent_id": "ag_test",
             "labels": {COST_CONTROL_PLAN_LABEL: _FORGED_PLAN},
         },
-        headers={"X-Forwarded-Email": ALICE},
+        # Sentinel Origin: first-party client past the require_trusted_origin guard.
+        headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     assert resp.status_code == 400
     assert "cost_control" in resp.json()["error"]["message"]
@@ -427,7 +429,8 @@ def test_bundled_create_rejects_cost_control_label_seed(
             "metadata": _json.dumps({"labels": {COST_CONTROL_PLAN_LABEL: _FORGED_PLAN}}),
         },
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        headers={"X-Forwarded-Email": ALICE},
+        # Sentinel Origin: first-party client past the require_trusted_origin guard.
+        headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     assert resp.status_code == 400
     assert "cost_control" in resp.json()["error"]["message"]
@@ -445,7 +448,8 @@ def test_create_session_with_ordinary_labels_succeeds(
     resp = TestClient(app).post(
         "/v1/sessions",
         json={"agent_id": "ag_test", "labels": {"team": "ml"}},
-        headers={"X-Forwarded-Email": ALICE},
+        # Sentinel Origin: first-party client past the require_trusted_origin guard.
+        headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     assert resp.status_code == 201
     conv = conversation_store.get_conversation(resp.json()["id"])

@@ -135,3 +135,117 @@ async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 404
+
+
+# ── GET /v1/sessions/projects ────────────────────────────────────────
+
+
+async def test_list_projects_empty(client: httpx.AsyncClient) -> None:
+    """No project labels anywhere → empty project list."""
+    resp = await client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+async def test_list_projects_returns_names_sorted(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Projects surface as a sorted list of names."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    a = conv_store.create_conversation()
+    b = conv_store.create_conversation()
+    conv_store.set_labels(a.id, {"omni_project": "Sprint 42"})
+    conv_store.set_labels(b.id, {"omni_project": "Customer X"})
+
+    resp = await client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert resp.json() == ["Customer X", "Sprint 42"]
+
+
+# ── GET /v1/sessions?project= (filter) ───────────────────────────────
+
+
+async def test_list_sessions_filtered_by_project(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?project=X`` returns only sessions in that project."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    # GET /v1/sessions filters has_agent_id=True, so bind the conversations to
+    # a seeded agent — otherwise the list comes back empty.
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="project-agent", bundle_location="test:///bundle")
+    filed = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.create_conversation(agent_id=agent_id)  # unfiled
+    conv_store.set_labels(filed.id, {"omni_project": "X"})
+
+    resp = await client.get("/v1/sessions?project=X")
+    assert resp.status_code == 200
+    ids = [s["id"] for s in resp.json()["data"]]
+    assert ids == [filed.id]
+
+
+async def test_list_sessions_empty_project_returns_unfiled(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?project=`` (empty) returns only sessions with no project label."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="project-agent", bundle_location="test:///bundle")
+    filed = conv_store.create_conversation(agent_id=agent_id)
+    unfiled = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(filed.id, {"omni_project": "X"})
+
+    resp = await client.get("/v1/sessions?project=")
+    assert resp.status_code == 200
+    ids = [s["id"] for s in resp.json()["data"]]
+    assert unfiled.id in ids
+    assert filed.id not in ids
+
+
+# ── PATCH /v1/sessions/{id} project label ────────────────────────────
+
+
+async def test_patch_session_sets_project_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """PATCH with ``labels: {project: X}`` upserts the project label."""
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omni_project": "Sprint 42"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get("omni_project") == "Sprint 42"
+
+
+async def test_patch_session_empty_project_removes_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """PATCH with ``labels: {project: ""}`` removes the project label rather
+    than persisting an empty value — so the session returns to Unfiled."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(session_id, {"omni_project": "Sprint 42"})
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omni_project": ""}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "omni_project" not in conv.labels

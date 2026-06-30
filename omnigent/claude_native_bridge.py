@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib import error, request
 
+from omnigent._platform import stable_user_id
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 
 if TYPE_CHECKING:
@@ -73,8 +74,8 @@ BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 # trusted parent (`/tmp`) is shared; everything under
 # `_BRIDGE_ROOT_PARENT` must be owned by the current uid and not be a
 # symlink — see :func:`_ensure_secure_dir`.
-_TRUSTED_PARENT = Path("/tmp")
-_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{os.getuid()}"
+_TRUSTED_PARENT = Path(tempfile.gettempdir())
+_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
@@ -154,6 +155,13 @@ _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# When Claude Code's input prompt never renders (it failed to boot), the
+# readiness gate attaches the tail of the captured pane to its error so
+# the real cause — often Claude Code's own startup crash, e.g. a
+# ``JSON Parse error`` from an HTML page served to its API client —
+# surfaces in the web UI error banner instead of only in the terminal.
+_TERMINAL_FAILURE_TAIL_LINES = 12
+_TERMINAL_FAILURE_TAIL_CHARS = 800
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
@@ -178,9 +186,10 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-native reuses the relay/MCP implementation but keeps bridge
-    files below ``~/.omnigent/codex-native``. Both roots use the same
-    owner-only ancestor validation; only the trusted anchor differs.
+    Codex-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse the
+    relay/MCP implementation but keep bridge files below their own bridge roots.
+    All roots use the same owner-only ancestor validation; only the trusted
+    anchor differs.
 
     :param target: Normalized bridge directory path being created or validated,
         e.g. ``Path("/tmp/omnigent-501/claude-native/abc")``.
@@ -204,9 +213,66 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = codex_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    from omnigent.cursor_native_bridge import bridge_root as cursor_bridge_root
+
+    cursor_root = _absolute_syntactic_path(cursor_bridge_root())
+    if target.is_relative_to(cursor_root):
+        return _absolute_syntactic_path(cursor_root.parent.parent)
+
+    from omnigent.antigravity_native_bridge import bridge_root as antigravity_bridge_root
+
+    # antigravity-native keeps its bridge files below ``~/.omnigent/antigravity-native``,
+    # the same ``$HOME/.omnigent/<harness>-native`` shape codex uses, so apply the
+    # identical anchor logic: in production trust ``$HOME`` and validate/chmod the
+    # two bridge-owned dirs below it (``.omnigent`` and ``antigravity-native``); in
+    # tests the monkeypatched root may differ, so trust the direct parent.
+    antigravity_root = _absolute_syntactic_path(antigravity_bridge_root())
+    if target.is_relative_to(antigravity_root):
+        trusted_parent = antigravity_root.parent
+        if (
+            antigravity_root.name == "antigravity-native"
+            and antigravity_root.parent.name == ".omnigent"
+        ):
+            trusted_parent = antigravity_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
+    from omnigent.qwen_native_bridge import bridge_root as qwen_bridge_root
+
+    qwen_root = _absolute_syntactic_path(qwen_bridge_root())
+    if target.is_relative_to(qwen_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/qwen-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(qwen_root.parent.parent)
+
+    from omnigent.hermes_native_bridge import bridge_root as hermes_bridge_root
+
+    hermes_root = _absolute_syntactic_path(hermes_bridge_root())
+    if target.is_relative_to(hermes_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/hermes-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(hermes_root.parent.parent)
+
+    from omnigent.opencode_native_bridge import bridge_root as opencode_bridge_root
+
+    # opencode-native keeps its bridge files below ``~/.omnigent/opencode-native``
+    # (the same ``$HOME/.omnigent/<harness>-native`` shape codex/antigravity use),
+    # so apply the identical anchor logic: in production trust ``$HOME`` and
+    # validate/chmod the two bridge-owned dirs below it (``.omnigent`` and
+    # ``opencode-native``); in tests the monkeypatched root may differ, so trust
+    # the direct parent.
+    opencode_root = _absolute_syntactic_path(opencode_bridge_root())
+    if target.is_relative_to(opencode_root):
+        trusted_parent = opencode_root.parent
+        if opencode_root.name == "opencode-native" and opencode_root.parent.name == ".omnigent":
+            trusted_parent = opencode_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
-        f"({claude_root!s}, {codex_root!s})"
+        f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
+        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s})"
     )
 
 
@@ -598,7 +664,7 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
-    my_uid = os.getuid()
+    my_uid = getattr(os, "getuid", lambda: -1)()
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)
@@ -1143,6 +1209,10 @@ def build_hook_settings(
             # timeout is irrelevant there.
             "timeout": 10,
         }
+        # The ``AskUserQuestion`` matcher only fires if that tool is actually
+        # callable. A session launched with ``--disallowedTools AskUserQuestion``
+        # (e.g. the exit-plan-mode e2e fixture) can never trigger this hook, so
+        # the registration is dormant there — harmless, just never reached.
         hooks["PreToolUse"] = [
             {"matcher": "AskUserQuestion", "hooks": [ask_uq_hook]},
             {"hooks": [evaluate_policy_hook]},
@@ -2538,6 +2608,7 @@ def display_cost_approval_popup(
     policy_name: str | None = None,
     python_executable: str | None = None,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    config_file: Path | None = None,
 ) -> None:
     """
     Overlay a cost-budget approval modal on the Claude Code tmux pane.
@@ -2548,8 +2619,8 @@ def display_cost_approval_popup(
     checkpoint. The popup script resolves the **same** elicitation Future
     (via the same resolve endpoint the web card uses), so whichever
     surface answers first wins and the other clears. The popup reads AP
-    routing (base URL + auth headers) from this bridge's
-    ``permission_hook.json`` so no token lands on the command line.
+    routing (base URL + auth headers) from *config_file* so no token lands
+    on the command line.
 
     Fire-and-forget by design: ``tmux display-popup`` blocks its tmux
     client until the popup closes, so it is spawned **detached**
@@ -2559,16 +2630,15 @@ def display_cost_approval_popup(
     Claude-native resolver for the harness-agnostic
     :func:`omnigent.native_cost_popup.launch_cost_popup`: it reads the
     pane's tmux socket/target from this bridge's ``tmux.json`` and points
-    the popup at this bridge's ``permission_hook.json`` for Omnigent routing
-    (base URL + auth headers, so no token lands on the command line), then
-    delegates. The launcher pops the modal on every attached client and
-    skips silently when none is attached (e.g. the Terminal tab is closed)
-    — the web ``ApprovalCard`` remains the answer surface.
+    the popup at *config_file* for Omnigent routing (base URL + auth
+    headers, so no token lands on the command line), then delegates. The
+    launcher pops the modal on every attached client and skips silently when
+    none is attached (e.g. the Terminal tab is closed) — the web
+    ``ApprovalCard`` remains the answer surface.
 
     :param bridge_dir: Bridge directory path, e.g.
-        ``/tmp/omnigent/claude-native/<digest>``. Supplies both the
-        tmux target (``tmux.json``) and the AP-routing config
-        (``permission_hook.json``).
+        ``/tmp/omnigent/claude-native/<digest>``. Supplies the tmux target
+        (``tmux.json``); the AP-routing config comes from *config_file*.
     :param session_id: Omnigent session id that owns the elicitation, e.g.
         ``"conv_abc123"``. Used in the resolve URL the popup POSTs to.
     :param elicitation_id: Outstanding elicitation correlation id, e.g.
@@ -2582,6 +2652,11 @@ def display_cost_approval_popup(
         valid on the host the tmux server runs on).
     :param timeout_s: Seconds to wait for ``tmux.json`` to be advertised,
         e.g. ``30.0``.
+    :param config_file: AP-routing config the popup reads (base URL + auth
+        headers). ``None`` falls back to this bridge's ``permission_hook.json``
+        — but that carries the one-shot launch token, which dies with the ~1h
+        Databricks OAuth lifetime, so callers should pass a freshly-minted
+        snapshot to keep a late-firing verdict POST from 401-ing.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised within
         *timeout_s* (the pane isn't up yet); the caller treats this as a
@@ -2593,7 +2668,7 @@ def display_cost_approval_popup(
     launch_cost_popup(
         info["socket_path"],
         info["tmux_target"],
-        bridge_dir / _PERMISSION_HOOK_FILE,
+        config_file if config_file is not None else bridge_dir / _PERMISSION_HOOK_FILE,
         session_id=session_id,
         elicitation_id=elicitation_id,
         message=message,
@@ -2775,6 +2850,32 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     return bool(needle) and needle in tail
 
 
+def _format_terminal_failure_tail(pane: str) -> str:
+    r"""
+    Format the tail of a captured tmux pane for a failure message.
+
+    When Claude Code's input prompt never renders, its own on-screen
+    output — often a startup error or stack trace (e.g. a ``JSON Parse
+    error`` raised when its API client receives an HTML page instead of
+    JSON) — is the only signal of the real cause. The readiness gate
+    raises into the web UI's error banner, so attaching this tail
+    surfaces that cause without the user having to open the terminal.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: A ``" Last terminal output:\n<tail>"`` block — the last
+        :data:`_TERMINAL_FAILURE_TAIL_LINES` non-blank lines, capped at
+        :data:`_TERMINAL_FAILURE_TAIL_CHARS` characters — or ``""`` when
+        the pane has no visible text.
+    """
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    tail = "\n".join(lines[-_TERMINAL_FAILURE_TAIL_LINES:])
+    if len(tail) > _TERMINAL_FAILURE_TAIL_CHARS:
+        tail = "…" + tail[-_TERMINAL_FAILURE_TAIL_CHARS:]
+    return f" Last terminal output:\n{tail}"
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -2803,16 +2904,25 @@ def _wait_for_claude_prompt_ready(
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the prompt never renders within
-        *timeout_s* (Claude failed to boot).
+        *timeout_s* (Claude failed to boot). The message carries the
+        tail of the captured pane (see :func:`_format_terminal_failure_tail`)
+        so Claude Code's own startup output surfaces in the caller's error.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    # Timed out: Claude Code never rendered its input prompt. Capture the
+    # pane one last time and attach its tail so the real cause — often a
+    # startup crash like a ``JSON Parse error`` — surfaces in the web UI
+    # error banner this raises into, instead of only a generic timeout
+    # the user has to open the terminal to diagnose.
+    pane = _capture_pane(socket_path, tmux_target)
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         "(input prompt never rendered). The message was not delivered."
+        + _format_terminal_failure_tail(pane)
     )
 
 
@@ -3268,8 +3378,29 @@ def _stdio_jsonrpc_loop(
         active tool relay.
     :returns: None when stdin reaches EOF.
     """
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
+    use_content_length = False
+    while True:
+        raw_line = sys.stdin.buffer.readline()
+        if raw_line == b"":
+            return
+        if raw_line.lower().startswith(b"content-length:"):
+            use_content_length = True
+            try:
+                length = int(raw_line.decode("ascii", errors="ignore").split(":", 1)[1].strip())
+            except ValueError:
+                continue
+            while True:
+                header = sys.stdin.buffer.readline()
+                if header in {b"\r\n", b"\n", b""}:
+                    break
+            if length <= 0:
+                continue
+            raw_payload = sys.stdin.buffer.read(length)
+            if len(raw_payload) != length:
+                return
+            line = raw_payload.decode("utf-8", errors="replace").strip()
+        else:
+            line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -3304,7 +3435,7 @@ def _stdio_jsonrpc_loop(
                 # -32603 is the JSON-RPC 2.0 "Internal error" code.
                 "error": {"code": -32603, "message": f"internal error: {exc}"},
             }
-        _write_jsonrpc(response, stdout_lock)
+        _write_jsonrpc(response, stdout_lock, framed=use_content_length)
 
 
 def _handle_mcp_request(
@@ -3605,17 +3736,29 @@ def _build_tools(config: dict[str, Any]) -> tuple[dict[str, Tool], Callable[[], 
     return tools, _close_tools
 
 
-def _write_jsonrpc(payload: dict[str, Any], stdout_lock: threading.Lock) -> None:
+def _write_jsonrpc(
+    payload: dict[str, Any],
+    stdout_lock: threading.Lock,
+    *,
+    framed: bool = False,
+) -> None:
     """
     Write one JSON-RPC message to stdout.
 
     :param payload: JSON-RPC object to serialize.
     :param stdout_lock: Lock protecting stdout.
+    :param framed: When ``True``, write MCP ``Content-Length`` framed output.
     :returns: None.
     """
     raw = json.dumps(payload, separators=(",", ":"))
     with stdout_lock:
-        print(raw, flush=True)
+        if framed:
+            encoded = raw.encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+        else:
+            print(raw, flush=True)
 
 
 def _model_from_transcript_entry(entry: dict[str, Any]) -> str | None:
@@ -4442,6 +4585,18 @@ def _assistant_transcript_items_from_entry(
     return response_id if items else current_response_id, items
 
 
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"^prompt is too long",
+    re.IGNORECASE,
+)
+
+_CONTEXT_OVERFLOW_REPLACEMENT = (
+    "Context limit reached — the conversation has grown too long for "
+    "the model’s context window. Use /compact to summarize and free up "
+    "space, or /clear to start a new conversation."
+)
+
+
 def _assistant_message_item(
     *,
     source_key: str,
@@ -4460,13 +4615,16 @@ def _assistant_message_item(
     :param text: Assistant text block.
     :returns: Parsed transcript item.
     """
+    display_text = text
+    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+        display_text = _CONTEXT_OVERFLOW_REPLACEMENT
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",
         data={
             "role": "assistant",
             "agent": agent_name,
-            "content": [{"type": "output_text", "text": text}],
+            "content": [{"type": "output_text", "text": display_text}],
         },
         response_id=response_id,
     )

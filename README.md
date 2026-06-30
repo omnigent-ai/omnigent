@@ -2,20 +2,21 @@
 
 # <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg" alt="" height="38" valign="middle" /> Omnigent
 
-### A meta-harness for all your AI agents
+### The open-source meta-harness for all your AI agents.
 
-Omnigent provides a common layer over Claude Code, Codex, Cursor, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Hermes, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
+[![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/omnigent)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](#1-install)
 
 [omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/download/mac)**
 
 </div>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-hero.png" alt="An Omnigent orchestrator and its sub-agents in one shared session" width="520" />
+  <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-desktop.png" alt="The Omnigent desktop app: starting a new session, with pinned and project-grouped sessions in the sidebar" width="720" />
 </p>
 
 ---
@@ -28,10 +29,10 @@ Omnigent lets you:
   follow you: start in your terminal, continue in the browser, pick it up on
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
-- **🤖 Supervise multiple agents.** Use Claude Code, Codex, Pi, and custom
-  agents (defined in YAML) together in the same session. Ask one agent to
-  review another's work, or split a task across agents that are each good at
-  different things.
+- **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
+  Hermes, Pi, and custom agents (defined in YAML) together in the same
+  session. Ask one agent to review another's work, or split a task across
+  agents that are each good at different things.
 
 - **🔌 Use any model.** A first-party API key, a Claude/ChatGPT subscription,
   or any compatible gateway. All first-class.
@@ -41,9 +42,13 @@ Omnigent lets you:
   conversation to continue on their own.
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
-  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io), or
-  [Islo](https://islo.dev) sandboxes, launched from the CLI or provisioned by
-  the server per session (*managed hosts*).
+  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [CoreWeave](https://docs.coreweave.com/products/sandboxes),
+  [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
+  [Boxlite](https://github.com/boxlite-ai/boxlite), or
+  [Databricks](https://www.databricks.com) sandboxes, launched from the
+  CLI or provisioned by the server per session (*managed hosts*).
 
 - **🛡️ Govern your agents.** Create
   [policies](#6-govern-your-agents-with-policies) to pause for your approval
@@ -91,22 +96,57 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **`uv`** (required). https://docs.astral.sh/uv/getting-started/installation/
   The installer offers to set this up for you.
 - **`git`** (required).
-- **Node.js 22 LTS or newer** with **`npm`**, for the Claude, Codex, and Pi
-  coding harnesses. `omnigent run` installs the harness CLI you pick.
+- **Node.js 22 LTS or newer** with **`npm`**, for the npm-installed coding
+  harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
+  harness CLI you pick.
   https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
-- **`tmux`**, required by the native `omnigent claude` / `omnigent codex`
-  wrappers (`brew install tmux` / `apt install tmux`; the installer offers
+- **Kiro CLI** (optional), for `omnigent kiro`: install with
+  `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
+  Kiro tool approvals stay answerable in the embedded Terminal; supported
+  one-time approvals also appear as Chat cards. See
+  `docs/kiro-native-elicitation.md`.
+- **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
+  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
+  (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
-- **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent claude` /
-  `omnigent codex` and `pi` harnesses wrap each agent terminal in a `bwrap`
-  OS-sandbox; on Linux that isolation is mandatory, so a missing `bwrap`
-  binary makes those terminals fail to start (`apt install bubblewrap`; the
-  installer offers to install it for you). macOS uses the built-in `seatbelt`
-  sandbox and needs nothing extra.
+- **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
+  terminal wrappers and the `pi` harness wrap each agent
+  terminal in a `bwrap` OS-sandbox; on Linux that isolation is mandatory, so a
+  missing `bwrap` binary makes those terminals fail to start
+  (`apt install bubblewrap`; the installer offers to install it for you). macOS
+  uses the built-in `seatbelt` sandbox and needs nothing extra.
 - **Databricks** (optional). To use a Databricks workspace as your model
   provider, install Omnigent with the `databricks` extra:
-  `uv tool install "omnigent[databricks]"`. Signing in to the workspace also
-  uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+  `uv tool install "omnigent[databricks]"` — or pass it to the bootstrap
+  installer with `... | sh -s -- --extra databricks`. Signing in to the
+  workspace also uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+
+</details>
+
+<details>
+<summary>Windows (native)</summary>
+
+Omnigent runs natively on Windows in a degraded mode. The `install_oss.sh`
+bootstrap is POSIX-only, so install with `uv` directly:
+
+```powershell
+uv tool install --python 3.12 omnigent
+# or from the repo:
+uv tool install --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
+```
+
+What works on Windows: `omnigent server`, the web UI, and the SDK-based
+harnesses (`omnigent run <agent.yaml>` with the claude-sdk / cursor / codex
+harnesses). Agents run under a Windows **Job Object** for process-tree
+containment.
+
+What is **not** available on Windows (use Linux/macOS, or WSL, for these):
+
+- the native `omnigent claude` / `omnigent codex` / `omnigent cursor`
+  tmux/PTY terminal wrappers (run an SDK harness or the web UI instead);
+- `bwrap`/`seatbelt` filesystem & network sandboxing and the L7 egress proxy
+  — the Job Object backend contains the process tree and enforces resource
+  limits but does **not** isolate the filesystem or network.
 
 </details>
 
@@ -155,12 +195,15 @@ in a native window and adds OS notifications and a dock badge —
 omnigent
 ```
 
-Or launch a specific agent runtime, or your own agent:
+Or launch a specific agent runtime:
 
 ```bash
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
-omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
+omnigent cursor                      # Cursor
+omnigent opencode                    # OpenCode
+omnigent hermes                      # Hermes Agent (Nous Research)
+omnigent pi                          # Pi
 ```
 
 #### 🐙 Polly and 🟠🔵 Debby
@@ -171,10 +214,9 @@ Two example agents ship with the repo, and they make good first sessions:
 omnigent run examples/polly/
 omnigent run examples/debby/
 
-# Run an orchestrator on a different harness (sub-agents keep their own):
-omnigent run examples/polly/ --harness pi
-omnigent run examples/debby/ --harness openai-agents
-omnigent run examples/polly/ --harness cursor  # Cursor CLI (needs cursor-agent + CURSOR_API_KEY)
+# ...or on a different harness (sub-agents keep their own):
+omnigent run examples/polly/ --harness <harness>
+omnigent run examples/debby/ --harness <harness>
 ```
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
@@ -244,10 +286,14 @@ mobile, so you get the same chat, sub-agents, terminals, and files, in sync
 with your laptop.
 
 One `docker compose up` runs the server on any host you have (a VPS, a home
-server); Render deploys with one click; Fly.io, Railway, Hugging Face Spaces,
-and Modal are covered too. The server can also provision a cloud sandbox per
-session (*managed hosts*), so no laptop has to stay online. The full menu of
-targets, the database options, and the sandbox setup live in
+server); **Render** and **Railway** deploy with one click; **Fly.io**, **Hugging
+Face Spaces**, **Modal**, **Cloudflare** (serverless, scale-to-zero), and
+**Databricks Apps** (backed by Lakebase Postgres and Unity Catalog Volumes) are
+covered too — and a **Cloudflare quick tunnel** (public) or **Tailscale**
+(private) reaches a server running on your own laptop without a deploy. The
+server can also provision a cloud sandbox per session (*managed hosts*), so no
+laptop has to stay online. The full menu of targets, the database options, and
+the sandbox setup live in
 [`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:
@@ -356,23 +402,30 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 
 ## Write your own agent
 
-An agent is a short YAML file: your prompt, your tools, and optional helper
-sub-agents a supervisor can delegate to. You don't have to write it by hand:
-agents can build agents, so describe the agent you want in any Omnigent chat
-and it authors the file for you.
+An agent is a short YAML file: your prompt, your tools — local Python
+functions, MCP servers, and sub-agents a supervisor can delegate to. You don't
+have to write it by hand: agents can build agents, so describe the agent you
+want in any Omnigent chat and it authors the file for you.
 
 ```yaml
 name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi, antigravity
+  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor,
+                               # cursor-native, hermes, hermes-native, opencode,
+                               # pi, pi-native, openai-agents
 
 tools:
   # A local Python function (schema auto-generated from the signature)
   word_count:
     type: function
     callable: mypackage.mymodule.word_count
+
+  # Tools from an MCP server (a local command, or a remote URL)
+  docs:
+    type: mcp
+    url: https://example.com/mcp
 
   # A sub-agent the supervisor can delegate to
   researcher:
@@ -397,3 +450,13 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+
+
+### Contributors
+
+Thanks to all of our amazing contributors!
+
+<a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
+</a>
+

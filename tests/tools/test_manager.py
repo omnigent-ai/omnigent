@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +16,14 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    SharePolicy,
     SkillSpec,
     ToolRuntime,
     ToolsConfig,
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
-from omnigent.tools.client_specified import ClientSideToolSpec
+from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
@@ -53,7 +55,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # Read-only session discovery tools are registered for every
         # agent (a user-added agent that declares no sub-agents still
         # needs to list/peek/get-info on its session-mates); the
-        # spawn-lifecycle writes (sys_session_send/close/create) are
+        # mutating tools (sys_session_send/close/create/share) are
         # opt-in via tools.agents or the top-level ``spawn: true``.
         "sys_session_get_history",
         "sys_session_list",
@@ -294,17 +296,91 @@ def test_schemas_empty_when_no_skills() -> None:
     assert _non_lifecycle_schemas(mgr) == []
 
 
+def test_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A tool whose ``get_schema`` raises is skipped, not allowed to drop
+    the entire toolset: every other tool's schema is still returned and
+    a warning names the offending tool.
+
+    Regression test for the silent total-toolset drop in #378. A single
+    unimportable ``type: function`` tool (dotted ``callable`` path that
+    fails to import) used to abort the whole list comprehension, leaving
+    the model with zero declared tools and only a swallowed WARNING.
+    """
+
+    class _BoomTool:
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy = {s["function"]["name"] for s in mgr.get_tool_schemas()}
+    assert healthy  # sanity: always-present lifecycle tools exist
+
+    mgr._tools["boom"] = _BoomTool()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # every healthy tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
+
+
+def test_client_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A client-side tool whose ``get_schema`` raises is skipped, not
+    allowed to drop the entire client toolset: every other client tool's
+    schema is still returned and a warning names the offending tool.
+
+    Mirrors ``test_schemas_isolate_a_failing_tool`` for the
+    ``get_client_tool_schemas`` path that ``SpawnTool`` uses to propagate
+    client tools to sub-agents (#378).
+    """
+
+    class _BoomClientTool(ClientSideTool):
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy_tool = ClientSideTool(
+        ClientSideToolSpec(
+            name="weather",
+            schema={"type": "function", "function": {"name": "weather"}},
+        )
+    )
+    mgr._tools["weather"] = healthy_tool
+    healthy = {s["function"]["name"] for s in mgr.get_client_tool_schemas()}
+    assert healthy == {"weather"}  # sanity: the good client tool is advertised
+
+    mgr._tools["boom"] = _BoomClientTool(ClientSideToolSpec(name="boom", schema={}))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_client_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # the healthy client tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
+
+
 def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     """
     Read-only session discovery (``sys_session_get_history`` /
     ``sys_session_list`` / ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
-    spawn-lifecycle writes (``sys_session_send`` /
-    ``sys_session_close`` / ``sys_session_create``) are NOT registered
-    without an opt-in (``tools.agents`` or top-level ``spawn: true``).
-    A regression that registered the writes by default would expose
-    the child-session spawn surface to every custom agent.
+    mutating session tools (``sys_session_send`` /
+    ``sys_session_close`` / ``sys_session_create`` /
+    ``sys_session_share``) are NOT registered without an opt-in
+    (``tools.agents`` or top-level ``spawn: true``). A regression that
+    registered the writes by default would expose the child-session
+    spawn surface — and, for share, the ability to expose the session
+    to a third party or ``__public__`` — to every custom agent.
     """
     mgr = ToolManager(_make_spec([]))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
@@ -318,6 +394,11 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     assert "sys_session_send" not in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names
+    # Sharing has its OWN dedicated `share:` flag (default `none`), so it
+    # is absent here even though this spec also lacks spawn/agents. A
+    # regression registering it by default would let any prompt-injected
+    # agent expose its session (incl. via __public__).
+    assert "sys_session_share" not in names
     # Model awareness pairs with the dispatch grant — without send there
     # is no args.model to pick, so the listing tool must stay gated too.
     assert "sys_list_models" not in names
@@ -342,6 +423,11 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_create" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
+    # Sharing is DECOUPLED from spawn — its own `share:` flag governs it,
+    # so `spawn: true` alone (share defaulting to `none`) does NOT
+    # register it. A regression coupling them would re-expose sharing to
+    # every spawn-capable agent.
+    assert "sys_session_share" not in names
 
 
 def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
@@ -399,6 +485,51 @@ def test_declared_agents_grant_send_close_but_not_create() -> None:
     assert "sys_session_create" not in names
     # Model awareness rides the same grant as send.
     assert "sys_list_models" in names
+    # Declaring sub-agents does NOT enable sharing — that is the separate
+    # `share:` flag's job, decoupled from the spawn/agents grant.
+    assert "sys_session_share" not in names
+
+
+def test_share_non_public_registers_share_tool_without_public() -> None:
+    """
+    ``agent_session_sharing: non-public`` alone (no spawn / declared
+    agents) registers ``sys_session_share`` — proving the flag is
+    independently sufficient AND does not drag in the spawn-lifecycle
+    tools. The advertised ``user_id`` schema must NOT mention
+    ``__public__``, so the model is not offered a grantee the runner
+    would reject. If the gating regressed to the spawn opt-in, share
+    would be absent here.
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC))
+    schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
+    assert "sys_session_share" in schemas
+    # Sharing is decoupled from spawn — none of the spawn writes ride along.
+    assert "sys_session_send" not in schemas
+    assert "sys_session_close" not in schemas
+    assert "sys_session_create" not in schemas
+    # non-public must not advertise the public sentinel.
+    user_id_desc = schemas["sys_session_share"]["function"]["parameters"]["properties"]["user_id"][
+        "description"
+    ]
+    assert "__public__" not in user_id_desc
+
+
+def test_share_public_registers_share_tool_advertising_public() -> None:
+    """
+    ``agent_session_sharing: public`` registers ``sys_session_share``
+    and the advertised ``user_id`` schema DOES mention ``__public__`` —
+    the only tier where anonymous-read grants are permitted. If
+    ``allow_public`` weren't threaded from the flag into the tool, the
+    public option would be hidden (or, worse, advertised under
+    non-public).
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC))
+    schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
+    assert "sys_session_share" in schemas
+    user_id_desc = schemas["sys_session_share"]["function"]["parameters"]["properties"]["user_id"][
+        "description"
+    ]
+    assert "__public__" in user_id_desc
 
 
 def test_both_grants_compose() -> None:
@@ -476,6 +607,83 @@ def test_shutdown_safe_without_start() -> None:
     spec = _make_spec()
     mgr = ToolManager(spec)
     mgr.shutdown()
+
+
+def test_shutdown_idempotent() -> None:
+    """Calling ``shutdown()`` twice does not raise."""
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    mgr.start()
+    mgr.shutdown()
+    mgr.shutdown()
+
+
+def test_shutdown_closes_os_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``shutdown()`` closes ``_os_env`` when it was self-created."""
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    mgr.start()
+
+    class _FakeOSEnv:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_env = _FakeOSEnv()
+    mgr._os_env = fake_env  # type: ignore[assignment]
+    mgr._pre_resolved_os_env = None
+
+    mgr.shutdown()
+    assert fake_env.closed
+    assert mgr._os_env is None
+
+
+def test_shutdown_skips_pre_resolved_os_env() -> None:
+    """``shutdown()`` does NOT close a pre-resolved (shared) OS env."""
+    spec = _make_spec()
+
+    class _FakeOSEnv:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    shared_env = _FakeOSEnv()
+    mgr = ToolManager(spec, os_env=shared_env)  # type: ignore[arg-type]
+    mgr.start()
+    mgr.shutdown()
+    assert not shared_env.closed
+
+
+def test_shutdown_calls_tool_shutdown() -> None:
+    """``shutdown()`` calls ``shutdown()`` on every registered tool."""
+    from omnigent.tools.base import Tool
+
+    class _TrackingTool(Tool):
+        shut_down = False
+
+        @classmethod
+        def name(cls) -> str:
+            return "_tracking"
+
+        @classmethod
+        def description(cls) -> str:
+            return "test"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": "_tracking"}}
+
+        def shutdown(self) -> None:
+            self.shut_down = True
+
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    tracker = _TrackingTool()
+    mgr._tools["_tracking"] = tracker
+    mgr.start()
+    mgr.shutdown()
+    assert tracker.shut_down
 
 
 # ── Client-specified tools ────────────────────────────────

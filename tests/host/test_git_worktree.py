@@ -317,7 +317,19 @@ def test_remove_worktree_missing_path_fails(git_repo: Path) -> None:
 
 @pytest.mark.parametrize(
     "bad",
-    ["", "-leading", "a..b", "a/.hidden", "x.lock", "a b", "a~b", "a:b", "/lead", "trail/"],
+    [
+        "",
+        "-leading",
+        "a..b",
+        "a/.hidden",
+        "x.lock",
+        "x.lock/y",
+        "a b",
+        "a~b",
+        "a:b",
+        "/lead",
+        "trail/",
+    ],
 )
 def test_validate_branch_name_rejects_bad(bad: str) -> None:
     """Branch names violating git ref-format are rejected before reaching argv."""

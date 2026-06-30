@@ -23,15 +23,21 @@ import asyncio
 import contextlib
 import logging
 import os
+import secrets
 import shutil
 import signal
+import socket
 import sys
+import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
+from omnigent._platform import IS_WINDOWS
+from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -39,12 +45,30 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 _logger = logging.getLogger(__name__)
 
 # Per-AP-instance directory holding all per-conversation Unix
-# sockets and the AP_PID sentinel file. ``/tmp/omnigent`` is the
-# default parent — each Omnigent instance gets a uuid-named subdir so
-# concurrent Omnigent processes (zero-downtime restarts, multi-tenant
-# single-machine deployments) don't step on each other.
-_TMP_PARENT = Path("/tmp/omnigent")
+# sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
+# uuid-named subdir so concurrent Omnigent processes (zero-downtime restarts,
+# multi-tenant single-machine deployments) don't step on each other.
+#
+# POSIX pins ``/tmp/omnigent`` deliberately: Unix socket paths have a tight
+# length limit, so a short, predictable parent matters (gettempdir() can be a
+# long ``/var/folders/...`` path on macOS). Windows uses TCP loopback for the
+# harness IPC (no socket-path length concern) and has no ``/tmp`` — a literal
+# ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current drive —
+# so use the real temp dir.
+if IS_WINDOWS:
+    _TMP_PARENT = Path(tempfile.gettempdir()) / "omnigent"
+else:
+    _TMP_PARENT = Path("/tmp/omnigent")
 _TMP_PARENT_ENV_VAR = "OMNIGENT_HARNESS_TMP_PARENT"
+
+# S1 (security): env var carrying the per-spawn bearer token for the harness
+# control channel. The parent generates a fresh token per subprocess, ships it
+# here (private to the parent/child pair), and presents it on every ``/v1``
+# request; the harness scaffold's auth middleware compares against it. This is
+# the access boundary on Windows, where the IPC is a loopback TCP listener
+# reachable by any local process; on POSIX (uid-isolated UDS) it is defence in
+# depth.
+_HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 
 # Sentinel file the Omnigent instance writes into its subdir on boot. The
 # orphan sweep uses it to tell whether a sibling subdir belongs to
@@ -74,6 +98,44 @@ _DEFAULT_IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
 # Picking 1/30th of the timeout keeps reaping reasonably prompt
 # without hammering ``time.monotonic()`` more than necessary.
 _DEFAULT_REAPER_INTERVAL_S = 60
+
+# Env override for the harness idle-reap window, so operators can tune it
+# without code changes (mirrors the runner-level ``runner.idle_timeout_s``).
+# ``0`` disables harness reaping entirely.
+_HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
+
+
+def _resolve_harness_idle_timeout_s() -> float:
+    """Resolve the harness idle-reap window in seconds.
+
+    Honors :envvar:`OMNIGENT_HARNESS_IDLE_TIMEOUT_S` (``0`` disables reaping);
+    otherwise the 30-minute default. An unparseable or negative value logs a
+    warning and falls back to the default rather than failing the runner at
+    boot — an env typo shouldn't take the runner down.
+    """
+    raw = os.environ.get(_HARNESS_IDLE_TIMEOUT_ENV)
+    if not raw:
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not a number; using default %ss",
+            _HARNESS_IDLE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_IDLE_TIMEOUT_S,
+        )
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    if value < 0:
+        _logger.warning(
+            "%s=%r is negative; using default %ss",
+            _HARNESS_IDLE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_IDLE_TIMEOUT_S,
+        )
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    return value
+
 
 # Grace period between SIGTERM and SIGKILL when releasing a
 # subprocess. Long enough for a well-behaved harness to flush
@@ -114,6 +176,10 @@ _SPAWN_POLL_INTERVAL_S = 0.05
 # normal lifecycle — if SIGTERM doesn't land in 3 s, SIGKILL is
 # the only recourse.
 _ORPHAN_SIGTERM_GRACE_S = 3.0
+
+
+class NoLiveHarnessError(RuntimeError):
+    """Raised when ``get_client`` is called with ``harness="any"`` and no subprocess is live."""
 
 
 def _default_tmp_parent() -> Path:
@@ -184,23 +250,24 @@ def _resolve_module_path(harness: str) -> str:
     )
 
 
-async def _wait_for_socket_bind(
+async def _wait_for_bind(
     process: asyncio.subprocess.Process,
-    socket_path: Path,
+    endpoint: _HarnessEndpoint,
     harness: str,
     conversation_id: str,
 ) -> None:
     """
     Poll until the runner subprocess is accepting connections.
 
-    Probes ``connect()`` rather than just ``socket_path.exists()``
-    to close the bind/listen gap: uvicorn's ``bind()`` creates
-    the file before ``listen()`` wires the accept loop, so a
-    caller racing that window hits ``ECONNREFUSED``.
+    Probes ``connect()`` rather than just existence to close the
+    bind/listen gap: uvicorn's ``bind()`` readies the endpoint
+    before ``listen()`` wires the accept loop, so a caller racing
+    that window hits ``ECONNREFUSED``. Works for both the UDS
+    (POSIX) and TCP-loopback (Windows) endpoints.
 
     :param process: The just-spawned runner subprocess handle.
-    :param socket_path: Absolute Unix socket path the runner is
-        expected to bind.
+    :param endpoint: The transport endpoint the runner is expected
+        to bind.
     :param harness: Human-readable harness name, used for the
         failure message.
     :param conversation_id: AP-allocated conversation id, used
@@ -220,20 +287,20 @@ async def _wait_for_socket_bind(
                 f"{conversation_id!r} exited with "
                 f"{process.returncode} during spawn (see Omnigent stderr)"
             )
-        if socket_path.exists() and await _can_connect_uds(socket_path):
-            # Lock down the socket file's permissions defensively;
-            # the parent dir is already 0o700 so this is
+        if await endpoint.can_connect():
+            # Lock down the socket file's permissions defensively
+            # (UDS only); the parent dir is already 0o700 so this is
             # belt-and-suspenders against an unusual umask.
-            os.chmod(socket_path, _SOCKET_MODE)
+            endpoint.harden()
             return
         if loop.time() >= deadline:
-            # Process never bound the socket — kill it and fail
-            # loud rather than wait forever.
+            # Process never bound — kill it and fail loud rather
+            # than wait forever.
             process.kill()
             await process.wait()
             raise RuntimeError(
                 f"harness {harness!r} for conversation "
-                f"{conversation_id!r} did not bind socket "
+                f"{conversation_id!r} did not bind its endpoint "
                 f"within {_SPAWN_READY_TIMEOUT_S:.0f}s"
             )
         await asyncio.sleep(_SPAWN_POLL_INTERVAL_S)
@@ -256,6 +323,99 @@ async def _can_connect_uds(socket_path: Path) -> bool:
     with contextlib.suppress(Exception):
         await writer.wait_closed()
     return True
+
+
+def _pick_free_tcp_port() -> int:
+    """Bind 127.0.0.1:0 to let the OS choose a free port, then release it.
+
+    The standard allocation trick: the OS guarantees the port is free at the
+    moment of bind. A small TOCTOU window exists before the runner re-binds it,
+    but loopback collisions are vanishingly rare and ``_wait_for_bind`` fails
+    loud if the child cannot bind.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+async def _can_connect_tcp(host: str, port: int) -> bool:
+    """Probe whether the loopback TCP listener is accepting connections.
+
+    The Windows analog of :func:`_can_connect_uds`: a successful connect proves
+    the runner reached ``listen()``, not merely ``bind()``.
+    """
+    try:
+        _, writer = await asyncio.open_connection(host, port)
+    except OSError:
+        return False
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    return True
+
+
+@dataclass
+class _HarnessEndpoint:
+    """How the parent reaches a harness subprocess.
+
+    POSIX uses a Unix domain socket (a filesystem path under the per-instance
+    dir). Windows has no usable filesystem UDS in asyncio's Proactor loop, so it
+    uses a TCP listener on loopback. Exactly one of ``socket_path`` /
+    (``host``, ``port``) is set. This object encapsulates the per-transport
+    differences — spawn flags, readiness probe, httpx wiring, cleanup — so
+    :class:`HarnessProcessManager` stays transport-agnostic.
+    """
+
+    socket_path: Path | None = None
+    host: str | None = None
+    port: int | None = None
+
+    @classmethod
+    def create(cls, instance_dir: Path, conversation_id: str) -> _HarnessEndpoint:
+        """Allocate the platform-appropriate endpoint for a conversation."""
+        if IS_WINDOWS:
+            return cls(host="127.0.0.1", port=_pick_free_tcp_port())
+        return cls(socket_path=_socket_path(instance_dir, conversation_id))
+
+    @property
+    def is_uds(self) -> bool:
+        return self.socket_path is not None
+
+    def spawn_args(self) -> list[str]:
+        """The ``_runner`` CLI flags selecting this transport."""
+        if self.socket_path is not None:
+            return ["--socket", str(self.socket_path)]
+        return ["--bind", f"{self.host}:{self.port}"]
+
+    def make_transport(self) -> httpx.AsyncBaseTransport:
+        """An httpx transport routed at this endpoint."""
+        if self.socket_path is not None:
+            return httpx.AsyncHTTPTransport(uds=str(self.socket_path))
+        return httpx.AsyncHTTPTransport()
+
+    @property
+    def base_url(self) -> str:
+        """The httpx base URL. Under UDS the host is cosmetic; under TCP it routes."""
+        if self.socket_path is not None:
+            return "http://harness.local"
+        return f"http://{self.host}:{self.port}"
+
+    async def can_connect(self) -> bool:
+        """Whether the runner is accepting connections at this endpoint yet."""
+        if self.socket_path is not None:
+            return self.socket_path.exists() and await _can_connect_uds(self.socket_path)
+        assert self.host is not None and self.port is not None
+        return await _can_connect_tcp(self.host, self.port)
+
+    def harden(self) -> None:
+        """Post-bind hardening. Lock down the UDS file mode; no-op for TCP."""
+        if self.socket_path is not None:
+            os.chmod(self.socket_path, _SOCKET_MODE)
+
+    def cleanup(self) -> None:
+        """Best-effort removal of any on-disk artifact (the UDS file)."""
+        if self.socket_path is not None and self.socket_path.exists():
+            self.socket_path.unlink()
 
 
 class _SubprocessEntry:
@@ -286,13 +446,13 @@ class _SubprocessEntry:
         self,
         process: asyncio.subprocess.Process,
         client: httpx.AsyncClient,
-        socket_path: Path,
+        endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
     ) -> None:
         self.process = process
         self.client = client
-        self.socket_path = socket_path
+        self.endpoint = endpoint
         self.harness = harness
         self.model = model
         self.last_used_at: float = 0.0
@@ -366,25 +526,32 @@ class HarnessProcessManager:
     def __init__(
         self,
         *,
-        idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
+        idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
         tmp_parent: Path | None = None,
     ) -> None:
-        self._idle_timeout_s = idle_timeout_s
+        # ``None`` (the default at both construction sites) resolves from the
+        # OMNIGENT_HARNESS_IDLE_TIMEOUT_S env var, else the 30-minute default.
+        self._idle_timeout_s = (
+            idle_timeout_s if idle_timeout_s is not None else _resolve_harness_idle_timeout_s()
+        )
         self._reaper_interval_s = reaper_interval_s
         self._tmp_parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
         # Pre-allocate the instance dir path so it stays stable
         # across re-entrant ``start()`` calls (idempotent boot).
         self._instance_dir = self._tmp_parent / f"ap-{uuid.uuid4().hex}"
         self._entries: dict[str, _SubprocessEntry] = {}
-        # Per-conversation in-flight harness response_id, populated
-        # by callers when the harness emits ``response.created``
-        # and cleared on ``response.completed``/``response.failed``
-        # /``response.cancelled``. :meth:`forward_cancel` reads it to translate
-        # an AP-side cancel into the harness's own response_id —
-        # AP's ``task_id`` and the harness's ``resp_<uuid>`` are
-        # different identifiers; the harness scaffold's ``/cancel``
-        # route keys ``_in_flight`` by the harness id only.
+        # Per-conversation in-flight harness response_id. The runner's
+        # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
+        # the harness emits ``response.created`` and clears it via
+        # :meth:`clear_in_flight` at stream end (``_on_proxy_stream_end``,
+        # reached on every terminal path). Two readers depend on it:
+        # :meth:`forward_cancel` translates an AP-side cancel into the
+        # harness's own response_id (AP's ``task_id`` and the harness's
+        # ``resp_<uuid>`` are different identifiers; the harness scaffold's
+        # ``/cancel`` route keys ``_in_flight`` by the harness id only),
+        # and the idle reaper skips any conversation present here so an
+        # actively-streaming turn is never reaped mid-flight.
         self._in_flight_response_ids: dict[str, str] = {}
         # Per-conversation spawn lock — see §Process management:
         # Spawn lock. The lock guards the lazy-init window in
@@ -566,6 +733,10 @@ class HarnessProcessManager:
                     await self._close_entry(entry)
                     entry = None
             if entry is None:
+                if harness == "any":
+                    raise NoLiveHarnessError(
+                        f"no live harness subprocess for conversation {conversation_id!r}"
+                    )
                 entry = await self._spawn_entry(conversation_id, harness, env)
                 self._entries[conversation_id] = entry
             # Use ``time.monotonic()`` directly rather than
@@ -605,10 +776,11 @@ class HarnessProcessManager:
         REPL.
 
         The harness-side ``response_id`` is looked up from
-        ``_in_flight_response_ids``, which callers populate on
-        ``response.created`` (currently no writers wired up — the
-        mapping is always empty in production, so this method is a
-        no-op until in-flight tracking is restored).
+        ``_in_flight_response_ids``, which the runner's ``proxy_stream``
+        populates on ``response.created`` (via :meth:`mark_in_flight`)
+        and clears at stream end (via :meth:`clear_in_flight`). If no
+        turn is currently live the mapping has no entry and this method
+        is a silent no-op.
 
         Best-effort: a missing harness (no entry registered for
         this conversation) OR a missing in-flight mapping (no turn
@@ -684,6 +856,40 @@ class HarnessProcessManager:
             registered.
         """
         return conversation_id in self._in_flight_response_ids
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """
+        Record that *conversation_id* has a live harness turn.
+
+        Called by the runner's ``proxy_stream`` on ``response.created``.
+        Registering the response id keeps the idle reaper from killing
+        an actively-streaming turn (the reaper skips any conversation
+        present in ``_in_flight_response_ids``) and lets
+        :meth:`forward_cancel` translate an AP-side cancel into the
+        harness's own response id. Always paired with a later
+        :meth:`clear_in_flight`.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        :param response_id: The harness-side ``resp_<uuid>`` from the
+            ``response.created`` event.
+        """
+        self._in_flight_response_ids[conversation_id] = response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """
+        Clear the live-turn marker for *conversation_id*.
+
+        Called by the runner from ``_on_proxy_stream_end``, which is
+        reached on every terminal path (success, error, status-fail,
+        interrupt) — so a dropped or late terminal SSE event cannot
+        leave an entry permanently marked in-flight and therefore never
+        reaped. No-op if no marker is set.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        """
+        self._in_flight_response_ids.pop(conversation_id, None)
 
     async def release(self, conversation_id: str) -> None:
         """
@@ -782,12 +988,11 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
-        socket_path = _socket_path(self._instance_dir, conversation_id)
+        endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
-        # would block uvicorn binding. Best-effort delete.
-        if socket_path.exists():
-            socket_path.unlink()
+        # would block uvicorn binding. Best-effort delete (UDS only).
+        endpoint.cleanup()
 
         # Always build an explicit env dict (never ``None``): the
         # subprocess inherits AP's env (PATH, HOME, PYTHONPATH, provider
@@ -796,6 +1001,16 @@ class HarnessProcessManager:
         # payload running in the harness can't impersonate the runner.
         # See ``_build_harness_spawn_env``.
         effective_env: dict[str, str] = _build_harness_spawn_env(env)
+        # S1 (security): on Windows the harness IPC is a loopback-TCP listener
+        # reachable by any local process, so mint a fresh per-spawn bearer token
+        # as the access boundary the uid-isolated UDS provides on POSIX. This is
+        # Windows-only: POSIX keeps the UDS and sets no token, leaving the
+        # scaffold's auth gate inert. The token is delivered via the harness's
+        # private env and presented by our client (below) on every /v1 request.
+        auth_token: str | None = None
+        if IS_WINDOWS:
+            auth_token = secrets.token_urlsafe(32)
+            effective_env[_HARNESS_AUTH_TOKEN_ENV] = auth_token
 
         parent_pid = os.getpid()
 
@@ -817,8 +1032,7 @@ class HarnessProcessManager:
             harness,
             "--module",
             module_path,
-            "--socket",
-            str(socket_path),
+            *endpoint.spawn_args(),
             "--conversation-id",
             conversation_id,
             "--parent-pid",
@@ -827,7 +1041,7 @@ class HarnessProcessManager:
             stderr=None,
             env=effective_env,
         )
-        await _wait_for_socket_bind(process, socket_path, harness, conversation_id)
+        await _wait_for_bind(process, endpoint, harness, conversation_id)
 
         # ``base_url`` is required for relative-URL routing; the
         # actual host portion is irrelevant under uds transport,
@@ -838,8 +1052,13 @@ class HarnessProcessManager:
         # call_tool → PATCH → resume); use a generous fixed
         # timeout that still surfaces a genuinely-stuck harness.
         client = httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(uds=str(socket_path)),
-            base_url="http://harness.local",
+            transport=endpoint.make_transport(),
+            base_url=endpoint.base_url,
+            # S1 (security): present the per-spawn bearer token (Windows only)
+            # so the harness scaffold accepts this client and rejects any
+            # unauthenticated local peer on the loopback-TCP channel. Empty on
+            # POSIX, where the uid-isolated UDS is the access boundary.
+            headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
             # See the comment above the constant for rationale.
             # Connect/write/pool keep the 5s default so a vanished
             # harness still surfaces quickly; read=None defers
@@ -849,7 +1068,7 @@ class HarnessProcessManager:
         return _SubprocessEntry(
             process=process,
             client=client,
-            socket_path=socket_path,
+            endpoint=endpoint,
             harness=harness,
             # Record the model this subprocess was spawned with so a later
             # turn requesting a different model (e.g. after ``/model``)
@@ -880,9 +1099,8 @@ class HarnessProcessManager:
         close_subprocess_transport(entry.process)
         # Best-effort socket cleanup. uvicorn's atexit usually
         # handles this when SIGTERM lands cleanly, but a
-        # hard-killed runner won't.
-        if entry.socket_path.exists():
-            entry.socket_path.unlink()
+        # hard-killed runner won't. No-op for TCP endpoints.
+        entry.endpoint.cleanup()
 
     async def _idle_reaper_loop(self) -> None:
         """
@@ -892,7 +1110,10 @@ class HarnessProcessManager:
         ``last_used_at`` is older than ``idle_timeout_s`` AND
         has no in-flight response on the harness. Sleeps for
         ``reaper_interval_s`` between passes. Terminates on
-        :class:`asyncio.CancelledError` from :meth:`shutdown`.
+        :class:`asyncio.CancelledError` from :meth:`shutdown`. A
+        non-positive ``idle_timeout_s`` (e.g.
+        ``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``) disables reaping — each
+        pass is a no-op.
 
         Two safety guards beyond raw ``last_used_at`` checks:
 
@@ -926,6 +1147,12 @@ class HarnessProcessManager:
                 await asyncio.sleep(self._reaper_interval_s)
             except asyncio.CancelledError:
                 return
+            # ``idle_timeout_s <= 0`` disables harness reaping entirely
+            # (``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``). Without this guard a 0
+            # window makes ``cutoff == now``, so every entry (``last_used_at``
+            # always <= now) is reaped on each pass — the inverse of "disabled".
+            if self._idle_timeout_s <= 0:
+                continue
             now = time.monotonic()
             cutoff = now - self._idle_timeout_s
             stale: list[str] = []
@@ -1040,27 +1267,38 @@ class HarnessProcessManager:
                 pid,
             )
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _pid_alive(pid: int) -> bool:
     """
-    Return True if ``pid`` corresponds to a live process.
+    Return True if ``pid`` is still in the process table.
 
-    Implementation: ``os.kill(pid, 0)`` is the cross-platform
-    "does this PID exist" probe — it sends no actual signal but
-    raises ProcessLookupError if the PID is gone.
+    On POSIX this is ``os.kill(pid, 0)``: a process that was killed but not yet
+    reaped is still a zombie in the table and counts as alive here. That matters
+    — callers (the orphan sweep, and tests that SIGKILL a harness then wait on
+    this before expecting a respawn) use ``not _pid_alive(pid)`` as a proxy for
+    "fully reaped", which is the moment the asyncio child watcher sets the
+    subprocess ``returncode`` and ``get_client`` respawns. A psutil probe that
+    treats a zombie as already-dead would break that synchronization (the wait
+    returns while ``returncode`` is still ``None``).
+
+    ``os.kill(pid, 0)`` cannot be used on Windows — it maps to
+    ``TerminateProcess`` and would *kill* the target — so there we fall back to
+    the psutil probe. (Windows has no zombies, so the distinction is moot.)
 
     :param pid: OS process id to check.
     :returns: True if the process exists, False otherwise.
     """
+    if IS_WINDOWS:
+        return _proc.process_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        # PID exists but we can't signal it — for the orphan
-        # sweep's purposes that means "live, leave alone."
+        # Exists but owned by another user — for the orphan sweep that means
+        # "live, leave alone".
         return True
     return True
 

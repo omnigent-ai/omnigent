@@ -4,8 +4,7 @@ The response-body extraction helpers (:func:`get_output_items`,
 :func:`final_assistant_text`)
 were originally duplicated in several terminal e2e files
 (``test_terminal_async.py``, ``test_terminal_interactive.py``,
-``test_terminal_hierarchy.py``, ``test_archer_terminal.py``,
-``test_terminal.py``). Promoted here per the testing skill's
+``test_terminal_hierarchy.py``, ``test_terminal.py``). Promoted here per the testing skill's
 "shared helpers go in helpers.py, not conftest" rule. The older
 copies remain inline for now; new files should import from here.
 

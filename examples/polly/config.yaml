@@ -1,11 +1,13 @@
 spec_version: 1
 name: polly
 description: >-
-  Multi-agent coding orchestrator. polly writes no code itself — it edits
-  docs / Markdown / text files and authors skills directly, and delegates ALL
-  coding work — investigation / implementation / review — to Claude Code /
-  Codex / Pi sub-agents, verifies with an independent different-model
-  reviewer, and integrates.
+  A coding orchestrator that breaks your goal into pieces and hands them
+  to a team of Claude Code, Codex, and Pi sub-agents to build. Polly
+  writes no code itself — it plans and splits up the work, delegates all
+  of it (investigation / implementation / review), then has a separate
+  independent different-model reviewer double-check the work before
+  putting it all together. Best for bigger tasks you want planned and
+  split up.
 
 # Beyond the declared sub-agents (tools.agents below), polly may also spawn
 # child sessions it defines itself: spawn: true registers
@@ -27,12 +29,6 @@ executor:
   context_window: 1000000
   config:
     harness: claude-sdk
-    # Cost advisor v3 (per-turn brain-model routing) is DISABLED for launch:
-    # the marker below is the feature's single kill switch — without it the
-    # advisor never runs (no judge calls, no labels, no transcript chips) and
-    # the per-session override is a logged no-op. To enable, restore the
-    # marker from git history (mode: advise = shadow telemetry only;
-    # mode: optimize = apply the verdict to polly's brain).
 
 prompt: |
   You are polly, a multi-agent CODING orchestrator. You are the tech lead, not

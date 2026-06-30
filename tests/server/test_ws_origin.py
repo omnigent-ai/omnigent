@@ -2,7 +2,7 @@
 
 Three layers, each catching a distinct breakage:
 
-- pure-policy tests for :func:`websocket_origin_allowed` and
+- pure-policy tests for :func:`origin_allowed` and
   :func:`origin_hostname_is_loopback` (the decision table);
 - ASGI-level tests of :class:`WebSocketOriginMiddleware` that prove a
   rejected handshake is closed with the forbidden-origin code and the
@@ -25,9 +25,9 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.ws_origin import (
     FORBIDDEN_ORIGIN_CLOSE_CODE,
     WebSocketOriginMiddleware,
+    origin_allowed,
     origin_hostname_is_loopback,
     parse_allowed_origins,
-    websocket_origin_allowed,
 )
 
 _LOCAL_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
@@ -88,7 +88,7 @@ def test_origin_hostname_is_loopback(origin: str, expected: bool) -> None:
 
 
 # --------------------------------------------------------------------------
-# websocket_origin_allowed (the decision table)
+# origin_allowed (the decision table)
 # --------------------------------------------------------------------------
 
 
@@ -110,9 +110,7 @@ def test_origin_hostname_is_loopback(origin: str, expected: bool) -> None:
         ("https://evil.example.com", False, True),
     ],
 )
-def test_websocket_origin_allowed_no_allowlist(
-    origin: str | None, local_mode: bool, allowed: bool
-) -> None:
+def test_origin_allowed_no_allowlist(origin: str | None, local_mode: bool, allowed: bool) -> None:
     """Policy decisions with no explicit allowlist configured.
 
     A failure means the core CSWSH guard is wrong: e.g. a cross-origin
@@ -124,10 +122,7 @@ def test_websocket_origin_allowed_no_allowlist(
     :param allowed: Expected policy decision.
     :returns: None.
     """
-    assert (
-        websocket_origin_allowed(origin, local_mode=local_mode, extra_allowed=frozenset())
-        is allowed
-    )
+    assert origin_allowed(origin, local_mode=local_mode, extra_allowed=frozenset()) is allowed
 
 
 @pytest.mark.parametrize(
@@ -147,7 +142,7 @@ def test_websocket_origin_allowed_no_allowlist(
         (None, False, True),
     ],
 )
-def test_websocket_origin_allowed_with_allowlist(
+def test_origin_allowed_with_allowlist(
     origin: str | None, local_mode: bool, allowed: bool
 ) -> None:
     """Policy decisions when ``OMNIGENT_WS_ALLOWED_ORIGINS`` is set.
@@ -162,7 +157,7 @@ def test_websocket_origin_allowed_with_allowlist(
     :returns: None.
     """
     extra = frozenset({"https://ui.example.com"})
-    assert websocket_origin_allowed(origin, local_mode=local_mode, extra_allowed=extra) is allowed
+    assert origin_allowed(origin, local_mode=local_mode, extra_allowed=extra) is allowed
 
 
 def test_parse_allowed_origins_splits_and_strips(monkeypatch: pytest.MonkeyPatch) -> None:

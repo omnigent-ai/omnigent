@@ -371,26 +371,11 @@ class RunnerMcpManager:
         if entry is None:
             raise RuntimeError(f"runner failed to initialize MCPs for spec {spec.name!r}")
 
-        # Tool names from the LLM are namespaced as ``{server}__{bare}``
-        # (see ``_mcp_tool_schema``).  Strip the prefix to get the bare
-        # name used by the MCP server internally.
-        bare_name = tool_name
-        owning_server: _ServerEntry | None = None
-        for server in entry.servers.values():
-            if server.error is not None:
-                continue
-            prefix = f"{server.config.name}__"
-            if tool_name.startswith(prefix):
-                candidate = tool_name[len(prefix) :]
-                if any(td.name == candidate for td in server.tools):
-                    bare_name = candidate
-                    owning_server = server
-                    break
-            elif any(td.name == tool_name for td in server.tools):
-                # Caller already passed the bare name (e.g. in tests).
-                owning_server = server
-                break
-        if owning_server is None or owning_server.connection is None:
+        route = self._resolve_tool_route(spec, tool_name)
+        if route is None:
+            raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+        owning_server, bare_name = route
+        if owning_server.connection is None:
             raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
 
         return await owning_server.connection.call_tool(
@@ -399,23 +384,16 @@ class RunnerMcpManager:
             session_id=session_id,
         )
 
-    def _resolve_owning_server(
+    def _resolve_tool_route(
         self,
         spec: AgentSpec,
-        bare_tool: str,
-    ) -> _ServerEntry | None:
+        tool_name: str,
+    ) -> tuple[_ServerEntry, str] | None:
         """
-        Find the server entry that owns *bare_tool*.
+        Find the live server and bare MCP tool name for *tool_name*.
 
-        Used by the MRTR retry path in ``/mcp/execute`` to access
-        the ``McpServerConnection`` directly for
-        ``call_tool_with_elicitation``.
-
-        :param spec: Agent spec whose MCP servers to search.
-        :param bare_tool: The bare tool name (no namespace prefix),
-            e.g. ``"get_me"``.
-        :returns: The owning ``_ServerEntry``, or ``None`` if the
-            tool is not found.
+        Namespaced names must match their server prefix exactly. Bare names
+        are accepted only for internal/test callers.
         """
         configs = list(spec.mcp_servers or [])
         if not configs:
@@ -427,9 +405,35 @@ class RunnerMcpManager:
         for server in entry.servers.values():
             if server.error is not None:
                 continue
-            if any(td.name == bare_tool for td in server.tools):
-                return server
+            prefix = f"{server.config.name}__"
+            if tool_name.startswith(prefix):
+                bare_tool = tool_name[len(prefix) :]
+                if any(td.name == bare_tool for td in server.tools):
+                    return server, bare_tool
+                return None
+            if "__" not in tool_name and any(td.name == tool_name for td in server.tools):
+                return server, tool_name
         return None
+
+    def _resolve_owning_server(
+        self,
+        spec: AgentSpec,
+        tool_name: str,
+    ) -> _ServerEntry | None:
+        """
+        Find the server entry that owns *tool_name*.
+
+        Used by the MRTR retry path in ``/mcp/execute`` to access
+        the ``McpServerConnection`` directly for
+        ``call_tool_with_elicitation``.
+
+        :param spec: Agent spec whose MCP servers to search.
+        :param tool_name: Namespaced or bare MCP tool name.
+        :returns: The owning ``_ServerEntry``, or ``None`` if the
+            tool is not found.
+        """
+        route = self._resolve_tool_route(spec, tool_name)
+        return None if route is None else route[0]
 
     async def shutdown(self) -> None:
         """Best-effort close of every active MCP connection."""

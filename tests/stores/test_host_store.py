@@ -115,13 +115,13 @@ def test_upsert_persists_configured_harnesses(host_store: HostStore) -> None:
         host_id="host_ch1",
         name="laptop",
         owner="alice@example.com",
-        configured_harnesses={"claude-sdk": True, "codex": False},
+        configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
     )
 
     fetched = host_store.get_host("host_ch1")
     assert fetched is not None
     # Exact equality: the False bit is the actionable "warn" value.
-    assert fetched.configured_harnesses == {"claude-sdk": True, "codex": False}
+    assert fetched.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
 def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(

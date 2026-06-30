@@ -138,6 +138,8 @@ class _FakeNamespace(SessionsNamespace):
         self.interrupt_calls: list[str] = []
         self.create_calls: list[tuple[bytes, str]] = []
         self.get_calls: list[str] = []
+        self.subtree_busy_calls: list[tuple[str, int]] = []
+        self._subtree_busy_result: bool = False
 
     async def create(  # type: ignore[override]
         self,
@@ -181,6 +183,17 @@ class _FakeNamespace(SessionsNamespace):
 
     async def interrupt(self, session_id: str) -> None:  # type: ignore[override]
         self.interrupt_calls.append(session_id)
+
+    async def subtree_busy(  # type: ignore[override]
+        self,
+        session_id: str,
+        *,
+        max_depth: int = 3,
+        limit: int = 100,
+    ) -> bool:
+        del limit
+        self.subtree_busy_calls.append((session_id, max_depth))
+        return self._subtree_busy_result
 
     def stream(  # type: ignore[override]
         self,
@@ -1813,3 +1826,42 @@ async def test_stream_dispatches_action_required_calls() -> None:
         "type": "function_call_output",
         "data": {"call_id": "call_stream", "output": "stream-result"},
     }
+
+
+@pytest.mark.asyncio
+async def test_tree_busy_delegates_to_namespace_with_session_id() -> None:
+    """``chat.tree_busy()`` rolls up via the namespace for THIS session.
+
+    This is the SDK-driver accessor from #444: a per-session ``status`` reads
+    idle once the agent delegates, so a driver gates "your turn" on
+    ``tree_busy()`` instead. Failure means the helper queries the wrong
+    session or doesn't forward the rollup verdict.
+    """
+    session = _make_session(session_id="conv_parent")
+    ns = _FakeNamespace(stream_scripts=[], session_obj=session)
+    ns._subtree_busy_result = True
+    chat = SessionsChat(
+        namespace=ns,
+        files_uploader=None,
+        files_getter=None,
+        session=session,
+    )
+
+    assert await chat.tree_busy() is True
+    assert ns.subtree_busy_calls == [("conv_parent", 3)]
+
+
+@pytest.mark.asyncio
+async def test_tree_busy_forwards_max_depth_and_false_verdict() -> None:
+    session = _make_session(session_id="conv_parent")
+    ns = _FakeNamespace(stream_scripts=[], session_obj=session)
+    ns._subtree_busy_result = False
+    chat = SessionsChat(
+        namespace=ns,
+        files_uploader=None,
+        files_getter=None,
+        session=session,
+    )
+
+    assert await chat.tree_busy(max_depth=5) is False
+    assert ns.subtree_busy_calls == [("conv_parent", 5)]

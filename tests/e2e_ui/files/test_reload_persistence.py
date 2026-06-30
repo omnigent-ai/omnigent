@@ -1,4 +1,4 @@
-"""E2E: file-viewer and comment state survive a full browser reload.
+"""E2E: file-viewer, comment, and files-panel state survive a full browser reload.
 
 These tests prove the durability path that the AppShell unit tests can
 only approximate: ``AppShell.test.tsx`` mocks ``FileViewer`` and asserts
@@ -24,6 +24,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import open_right_rail
 
 # The agent spec uses ``os_env.cwd: .`` (see ``_TEST_AGENT_YAML`` in
 # conftest), so filesystem PUTs land in ``<repo-root>/<session_id>/``
@@ -181,3 +183,42 @@ def test_comment_persists_across_reload(
     ).json()
     assert len(comments) == 1, f"Expected exactly 1 persisted comment, got {comments}"
     assert comments[0]["body"] == _COMMENT_BODY
+
+
+def test_files_panel_collapsed_state_persists_across_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Collapse the Working-folder panel, reload, and assert it stays collapsed.
+
+    Unlike the file-viewer/comment cases above (server-persisted, URL-
+    rehydrated), the panel's collapsed state lives in a single app-global
+    localStorage key with no per-conversation keying — the same preference
+    the panel reads to carry the choice across *sessions*. A cold reload is
+    the strongest single-session proxy for that: it re-mounts ``FilesPanel``,
+    whose initial collapsed state is seeded purely from the stored
+    preference (``readFilesPanelPreferences().collapsed``). A failure after
+    reload means the choice wasn't persisted, the durability path the
+    AppShell unit test can only approximate with a mocked store.
+    """
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    # The Working-folder header doubles as the collapse toggle; ``aria-expanded``
+    # tracks the panel's collapsed state and starts expanded by default.
+    rail = page.get_by_role("complementary", name="Workspace")
+    header = rail.get_by_role("button", name=re.compile("Working folder"))
+    expect(header).to_have_attribute("aria-expanded", "true", timeout=30_000)
+
+    header.click()
+    expect(header).to_have_attribute("aria-expanded", "false")
+
+    page.reload()
+    open_right_rail(page)
+
+    # A cold reload must restore the collapsed choice from localStorage.
+    header_after = page.get_by_role("complementary", name="Workspace").get_by_role(
+        "button", name=re.compile("Working folder")
+    )
+    expect(header_after).to_have_attribute("aria-expanded", "false", timeout=30_000)

@@ -42,11 +42,8 @@ async def _create_session(
     """Create a session via ``POST /v1/sessions`` and return its id.
 
     ``GET /v1/sessions`` filters to conversations with ``agent_id IS
-    NOT NULL`` (i.e. real sessions). The legacy ``POST /v1/responses``
-    path used by ``create_test_response`` does NOT bind an agent id,
-    so its conversations are invisible to this route. Tests that
-    need a session in the listing must go through ``POST /v1/
-    sessions`` instead.
+    NOT NULL`` (i.e. real sessions). Tests that need a session in the
+    listing must go through ``POST /v1/sessions``.
 
     :param client: HTTP client wired to the test app.
     :param name: Agent name to write into the uploaded bundle, e.g.

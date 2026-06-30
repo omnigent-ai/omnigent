@@ -791,6 +791,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         engine: Any,
         result: Any,
         conversation_store: Any,
+        elicitation_id: str | None = None,
     ) -> bool:
         """
         Stand-in for ``_hold_native_ask_gate`` that simulates accept.

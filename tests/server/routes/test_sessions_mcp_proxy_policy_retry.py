@@ -254,7 +254,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
         result=PolicyResult(
             action=PolicyAction.ASK,
             reason="approval required",
-            deciding_policy="test-gate",
+            deciding_policies=["test-gate"],
         )
     )
 
@@ -420,7 +420,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
         result=PolicyResult(
             action=PolicyAction.ASK,
             reason="approval required",
-            deciding_policy="test-gate",
+            deciding_policies=["test-gate"],
         )
     )
 

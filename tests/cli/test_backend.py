@@ -233,6 +233,25 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     assert empty_string_env["OPENAI_API_KEY"] == "test-key"
 
 
+def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAUDE_CODE_SKIP_BEDROCK_AUTH reaches the local daemon env.
+
+    LiteLLM proxies fronting Bedrock need this flag to disable AWS SigV4
+    auth. Without it in the daemon allowlist, ``omni claude`` drops the
+    flag and Claude Code falls back to native AWS auth (which fails).
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -648,6 +667,7 @@ def test_foreground_connect_registers_status_record(
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
     observed: list[cli._HostDaemonRecord] = []
 
     def _fake_run_host_process(server_url: str) -> None:
@@ -905,6 +925,7 @@ def test_foreground_connect_remote_omits_local_server_prompt(
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
     monkeypatch.setattr(
         cli,
         "local_server_url_if_healthy",
@@ -1207,6 +1228,24 @@ def test_ensure_backend_local_discovers_url(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == [None, None]
 
 
+def test_ensure_backend_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A schemeless ``--server`` URL is defaulted to https before expansion.
+
+    Covers run / claude / codex / chat, which all resolve ``--server``
+    through ``_ensure_backend``; the guide hands out schemeless URLs.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s: False)
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server: None)
+
+    result = _ensure_backend("dbc-x.cloud.databricks.com/omnigent")
+
+    # Scheme defaulted to https before the workspace expansion ran.
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
 def test_discover_local_server_url_returns_when_healthy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1373,11 +1412,11 @@ def _patch_auth_preflight(
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []
-    monkeypatch.setattr(
-        cli,
-        "_databricks_login",
-        lambda server, workspace_host: login_calls.append(f"{server} {workspace_host}"),
-    )
+
+    def _capture_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+        login_calls.append(f"{server} {workspace_host}")
+
+    monkeypatch.setattr(cli, "_databricks_login", _capture_login)
     return login_calls
 
 
@@ -1428,6 +1467,168 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
 
     assert login_calls == []
     assert result == "https://myapp-1234.aws.databricksapps.com"
+
+
+# ── Foreground ``host`` auth pre-flight ─────────────────────────────
+#
+# ``host`` runs the same Databricks sign-in pre-flight ``run`` does before
+# connecting to a remote server, but exposes ``--non-interactive`` so a
+# scripted invocation keeps the old fail-loud behavior instead of launching
+# the browser login. ``CliRunner`` swaps ``sys.stdin`` for a non-TTY stream,
+# so the auto-login-on-TTY branch is covered by the direct pre-flight test
+# below; the ``host`` wiring is asserted with a capturing pre-flight stub.
+
+_HOST_DATABRICKS_SERVER = "https://myapp-1234.aws.databricksapps.com"
+
+
+def test_databricks_preflight_non_interactive_overrides_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``non_interactive=True`` fails with the login hint even on a TTY.
+
+    Without the override an un-authed Databricks server would launch the
+    browser login on a TTY (covered by
+    ``test_ensure_backend_databricks_preflight_runs_login_on_tty``); the
+    flag is what lets ``host`` stay scripted.
+    """
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=True)
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    # The browser login never ran despite the TTY.
+    assert login_calls == []
+
+
+def _patch_foreground_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> list[str]:
+    """Stub the foreground-host plumbing and capture connect targets.
+
+    Covers both local and remote ``host`` invocations: the local server
+    bring-up is stubbed so ``host ""`` reaches ``run_host_process`` too.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temp dir for the host pidfile.
+    :returns: Capture list of ``run_host_process`` server URLs.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(
+        cli,
+        "ensure_local_omnigent_server",
+        lambda: LocalServerStartup(url="http://127.0.0.1:8000", spawned=True),
+    )
+    # No healthy local server after exit → the Ctrl-C stop prompt stays quiet.
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    connected: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url: connected.append(server_url),
+    )
+    return connected
+
+
+def _capture_preflight(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    """Replace the auth pre-flight with a capturing no-op.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: Capture list of ``(server, non_interactive)`` pre-flight calls.
+    """
+    calls: list[tuple[str, bool]] = []
+
+    def _capture(server: str, *, non_interactive: bool = False) -> None:
+        calls.append((server, non_interactive))
+
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", _capture)
+    return calls
+
+
+def test_host_remote_runs_auth_preflight_before_connect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Remote ``host`` runs the sign-in pre-flight, then connects."""
+    preflight = _capture_preflight(monkeypatch)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER])
+
+    assert result.exit_code == 0, result.output
+    assert preflight == [(_HOST_DATABRICKS_SERVER, False)]
+    assert connected == [_HOST_DATABRICKS_SERVER]
+
+
+def test_host_non_interactive_flag_forwarded_to_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--non-interactive`` reaches the pre-flight as ``non_interactive=True``."""
+    preflight = _capture_preflight(monkeypatch)
+    _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER, "--non-interactive"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert preflight == [(_HOST_DATABRICKS_SERVER, True)]
+
+
+def test_host_non_interactive_flag_positional_shorthand(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``omnigent host <url> --non-interactive`` parses the flag with the shorthand."""
+    preflight = _capture_preflight(monkeypatch)
+    _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", _HOST_DATABRICKS_SERVER, "--non-interactive"])
+
+    assert result.exit_code == 0, result.output
+    assert preflight == [(_HOST_DATABRICKS_SERVER, True)]
+
+
+def test_host_local_skips_auth_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Local-mode ``host ""`` never runs the remote sign-in pre-flight."""
+    preflight = _capture_preflight(monkeypatch)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", ""])
+
+    assert result.exit_code == 0, result.output
+    assert preflight == []
+    assert connected == ["http://127.0.0.1:8000"]
+
+
+def test_host_remote_preflight_hints_headless(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Un-authed Databricks ``host`` (no TTY) fails with the login hint, never connecting."""
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=False)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER])
+
+    assert result.exit_code != 0
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in result.output
+    # Pre-flight bailed: no browser login and no connect.
+    assert login_calls == []
+    assert connected == []
+
+
+def test_host_remote_preflight_skips_when_authenticated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 200 probe (valid creds / header mode) connects without a login flow."""
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=200, tty=False)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER])
+
+    assert result.exit_code == 0, result.output
+    assert login_calls == []
+    assert connected == [_HOST_DATABRICKS_SERVER]
 
 
 # ── Workspace-URL expansion for attach / resume / host ──────────────
@@ -1512,6 +1713,17 @@ def test_resolve_attach_server_local_fallback_not_expanded(
     assert _resolve_attach_server(None, configured_server=None) == "http://127.0.0.1:8123"
 
 
+def test_resolve_attach_server_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``attach --server <ws>/omnigent`` (no scheme) is defaulted to https."""
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = _resolve_attach_server("dbc-x.cloud.databricks.com/omnigent", configured_server=None)
+
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
 def test_resolve_host_server_expands_explicit_workspace_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1550,6 +1762,57 @@ def test_resolve_host_server_none_stays_local(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert _resolve_host_server(None) is None
+
+
+def test_resolve_host_server_defaults_scheme_and_accepts_omnigent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``host`` subcommands accept a schemeless ``/omnigent`` workspace URL.
+
+    The internal user guide's web URL omits the scheme and ends in
+    ``/omnigent``; host must default it to https before expansion, just
+    like ``omnigent login``.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = _resolve_host_server("dbc-x.cloud.databricks.com/omnigent")
+
+    # Scheme defaulted to https before the expansion saw the URL.
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
+def test_host_command_defaults_scheme_and_accepts_omnigent_web_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``omnigent host --server <ws>/omnigent`` (no scheme) normalizes before connect.
+
+    Pasting the guide's web URL (schemeless, ``/omnigent`` suffix) must
+    default to https and expand to the API mount, not connect to the raw
+    input.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    observed: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url: observed.append(server_url),
+    )
+
+    result = CliRunner().invoke(
+        cli_group, ["host", "--server", "dbc-x.cloud.databricks.com/omnigent"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Scheme defaulted to https before the workspace expansion ran.
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    # The foreground connect targeted the expanded API-mount URL.
+    assert observed == [_expand_marker("https://dbc-x.cloud.databricks.com/omnigent")]
 
 
 def test_resume_command_expands_server_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1593,3 +1856,23 @@ def test_resume_command_without_server_skips_expansion(
 
     assert result.exit_code == 0, result.output
     assert captured == {"target": "conv_abc123", "server": None}
+
+
+def test_resume_command_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent resume --server <ws>/omnigent`` (no scheme) is defaulted to https."""
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.resume_dispatch.run_resume",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["resume", "conv_abc123", "--server", "dbc-x.cloud.databricks.com/omnigent"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert captured["server"] == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")

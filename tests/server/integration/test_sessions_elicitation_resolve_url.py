@@ -374,6 +374,9 @@ def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     :param tool_name: Tool Claude wants to call, e.g. ``"Bash"``.
     :returns: JSON-serializable payload mirroring Claude Code's
         published wire shape for the ``PermissionRequest`` event.
+        Deliberately carries no ``tool_use_id``: the real
+        PermissionRequest payload has no per-call id (it is minted only
+        when the tool call is emitted, after this permission check).
     """
     return {
         "session_id": "claude_sess_abc",
@@ -383,7 +386,6 @@ def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "hook_event_name": "PermissionRequest",
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
-        "tool_use_id": "tool_use_xyz",
     }
 
 
@@ -420,7 +422,6 @@ def _claude_ask_user_question_payload() -> dict[str, Any]:
                 },
             ],
         },
-        "tool_use_id": "tool_use_ask",
     }
 
 
@@ -1228,6 +1229,33 @@ async def test_resolve_url_decline_round_trip(client: httpx.AsyncClient) -> None
     resp = await hook_task
     assert resp.status_code == 200, resp.text
     assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+
+
+async def test_resolve_url_cancel_round_trip(client: httpx.AsyncClient) -> None:
+    """
+    A ``cancel`` verdict at the URL endpoint maps to Claude's
+    ``deny`` behavior and clears the pending elicitation.
+
+    ``cancel`` is a valid MCP ``ElicitationResult`` action alongside
+    ``accept`` and ``decline``. It represents dismissing the prompt
+    without an explicit choice, so the gated tool must not run.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    agent = await create_test_agent(client, "test-resolve-url-cancel")
+    session_id = await _create_session(client, agent["id"])
+    hook_task, elicitation_id = await _park_permission_hook(client, session_id, tool_name="Bash")
+
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "cancel"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert pending_elicitations.count_for(session_id) == 0
 
 
 async def test_resolve_url_unknown_session_returns_404(

@@ -90,6 +90,18 @@ class _StubResourceRegistry:
         """
         self._session_status_publisher = publisher
 
+    def set_terminal_exit_publisher(
+        self,
+        publisher: Callable[[Any], None],
+    ) -> None:
+        """
+        Accept the terminal-exit publisher installed by the runner app.
+
+        :param publisher: Callable receiving a terminal-exit event.
+        :returns: None.
+        """
+        self._terminal_exit_publisher = publisher
+
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
         """
         Return a fixed env root for the launched terminal.
@@ -101,13 +113,59 @@ class _StubResourceRegistry:
         del session_id, agent_spec
         return str(self._tmp_path)
 
-    async def launch_terminal(
+    async def launch_required_terminal(
         self,
         session_id: str,
         terminal_name: str,
         session_key: str,
         spec: TerminalEnvSpec,
+        cwd_override: str | None = None,
+        sandbox_override: str | None = None,
+        parent_os_env: object | None = None,
+        resource_role: str | None = None,
+    ) -> SessionResourceView:
+        """Return a required terminal resource view for a fake instance."""
+        return await self._launch(
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            spec=spec,
+            cwd_override=cwd_override,
+            sandbox_override=sandbox_override,
+            parent_os_env=parent_os_env,
+            resource_role=resource_role,
+        )
+
+    async def launch_auxiliary_terminal(
+        self,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
+        cwd_override: str | None = None,
+        sandbox_override: str | None = None,
+        parent_os_env: object | None = None,
+        resource_role: str | None = None,
+    ) -> SessionResourceView:
+        """Return an auxiliary terminal resource view for a fake instance."""
+        return await self._launch(
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            spec=spec,
+            cwd_override=cwd_override,
+            sandbox_override=sandbox_override,
+            parent_os_env=parent_os_env,
+            resource_role=resource_role,
+        )
+
+    async def _launch(
+        self,
         *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         parent_os_env: object | None = None,
@@ -124,8 +182,7 @@ class _StubResourceRegistry:
         :param sandbox_override: Optional sandbox override (unused).
         :param parent_os_env: Agent's ``os_env`` threaded through by the
             runner so the launched terminal can inherit the sandbox
-            (unused in the stub — see real
-            :class:`SessionResourceRegistry.launch_terminal`).
+            (unused in the stub).
         :param resource_role: Runner-private role marker (e.g.
             ``"claude-native"``) for the bridge-inject path (unused in
             the stub).

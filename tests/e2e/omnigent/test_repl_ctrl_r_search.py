@@ -1,10 +1,13 @@
 """Phase 0 characterization test — Ctrl+R reverse-incremental search.
 
+Migrated to mock LLM: uses canned responses for the LLM turns so the
+test is deterministic and requires no real Databricks credentials.
+
 Submits a prompt carrying a unique substring, presses ``Ctrl+R``,
 types the substring, and asserts (a) the reverse-search prompt
-activates, (b) the history entry containing the substring
-surfaces in the input area, and (c) pressing Enter accepts the
-match back into the input buffer.
+activates, (b) the history entry containing the substring surfaces in
+the input area, and (c) pressing Enter accepts the match back into
+the input buffer.
 
 **What breaks if this fails:**
 - ``omnigent.cli`` removes the ``@kb.add("c-r")`` binding that
@@ -28,7 +31,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from tests._model_pools import resolve_model
 from tests.e2e.omnigent._pexpect_harness import (
     await_turn_complete,
     clean_exit,
@@ -38,8 +40,9 @@ from tests.e2e.omnigent._pexpect_harness import (
 )
 from tests.e2e.omnigent._repl_test_helpers import drain_for
 from tests.e2e.omnigent._snapshot import compare_snapshot
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
-_MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
+_MODEL = "mock-ctrl-r-model"
 _HARNESS = "openai-agents"
 
 # A prompt with a clearly-unique substring we can search for.
@@ -70,34 +73,41 @@ _ACCEPT_DRAIN_TIMEOUT = 3.0
 def test_repl_ctrl_r_reverse_search(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Submit one prompt, press Ctrl+R, type a substring, and
     verify the search toolbar appears and the matching history
     entry is surfaced.
 
+    Uses the mock LLM server for deterministic responses.
+
     :param omnigent_python: Interpreter with omnigent +
         openai-agents installed.
     :param omnigent_repo_root: Working directory for the
         subprocess.
-    :param omnigent_credentials_env: Env vars with
-        ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` /
-        ``DATABRICKS_CONFIG_PROFILE`` populated.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     """
-    yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
-    env = dict(omnigent_credentials_env)
-    env["PYTHONPATH"] = f"{omnigent_repo_root}:{omnigent_repo_root / 'sdks' / 'python-client'}" + (
-        f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else ""
+    # Two turns: the initial prompt and the re-submitted prompt via Ctrl+R.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "ok"},
+            {"text": "ok again"},
+        ],
+        key=_MODEL,
     )
+    yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
     child = spawn_omnigent_run(
         omnigent_python=omnigent_python,
         yaml_path=yaml_path,
         model=_MODEL,
         harness=_HARNESS,
-        env=env,
+        env=mock_credentials_env,
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
     )

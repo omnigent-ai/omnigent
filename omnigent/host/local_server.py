@@ -28,6 +28,8 @@ from pathlib import Path
 import click
 import psutil
 
+from omnigent.inner import _proc
+
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
 
 # Max seconds to wait for a bind-race-doomed server child's natural
@@ -319,9 +321,10 @@ def _terminate_pid(pid: int) -> None:
         if not _pid_alive(pid):
             return
         time.sleep(_STOP_POLL_INTERVAL_S)
-    # Grace period expired — force-kill so the port is freed.
+    # Grace period expired — force-kill so the port is freed. Windows has no
+    # SIGKILL; os.kill with SIGTERM there maps to TerminateProcess (forceful).
     with contextlib.suppress(ProcessLookupError, OSError):
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     # Brief wait for the kernel to reap after SIGKILL.
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
@@ -660,7 +663,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
             env=child_env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         log_fh.close()

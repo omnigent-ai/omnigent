@@ -1,0 +1,57 @@
+name: Rerun Security Gate
+
+# Stage 1 of a two-stage relay (the privileged half is rerun-security-gate-run.yml).
+#
+# When the skip-security-scan waiver could change verdict -- the label is added
+# or removed -- the per-workflow `Security Gate` pollers must re-run so they
+# re-mirror the (now-flipped) single `Security Scan` check. Re-running another
+# workflow needs `actions: write`, but on a FORK PR the `pull_request_target`
+# token is held behind the fork-approval gate, so it cannot re-run anything
+# itself (see maintainer-approval-rerun.yml, which solves the identical problem
+# the same way). So this stage only RECORDS the PR number as an artifact
+# (read-only, works on forks); the privileged re-run runs in
+# rerun-security-gate-run.yml on `workflow_run`, which gets a writable token even
+# for forks and is not held behind the fork-approval gate.
+# https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+#
+# Trigger: skip-security-scan labeled/unlabeled is the ONLY thing that can flip
+# the waiver (it is label-only -- see should-scan.sh; there is no approval half).
+# Other labels are ignored by the job `if:` below (stage 2 then no-ops).
+
+on:
+  pull_request_target:
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  # NOT cancel-in-progress: this fires on EVERY label, so an unrelated label
+  # spins a run that enters this group; cancelling an in-flight record would
+  # drop a legitimate trigger. Recording is cheap and idempotent.
+  group: rerun-security-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    name: Record PR for gate re-run
+    # Only when the waiver state could have changed: the skip-security-scan
+    # label was added/removed. Unrelated labels record nothing, so stage 2 no-ops.
+    if: github.event.label.name == 'skip-security-scan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Record PR number
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p pr
+          echo "$PR_NUMBER" > pr/pr_number
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rerun-security-gate-pr-number
+          path: pr/
+          retention-days: 1
+          if-no-files-found: error

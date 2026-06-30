@@ -25,6 +25,7 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlConversation,
     SqlConversationItem,
@@ -32,6 +33,7 @@ from omnigent.db.db_models import (
     SqlUserDailyCost,
 )
 from omnigent.db.utils import (
+    _supports_fts5,
     delete_fts_by_conversation,
     ensure_fts_table,
     extract_search_text,
@@ -55,6 +57,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ConversationNotFoundError,
     ConversationStore,
@@ -261,11 +264,17 @@ def _upsert_labels(
         touched by this call.
     """
     dialect = session.bind.dialect.name if session.bind is not None else ""
+    # Defense-in-depth: clamp every value to the column width so no label
+    # writer can overflow ``String(256)`` and raise ``DataError`` on
+    # PostgreSQL. Callers (session error labels, client-supplied ``body.labels``
+    # on session create/patch, policy-author writes) all funnel through here,
+    # so this is the single point that guarantees the column constraint. The
+    # slice is character-based, matching Postgres ``VARCHAR(n)`` semantics.
     rows = [
         {
             "conversation_id": conversation_id,
             "key": key,
-            "value": value,
+            "value": value[:LABEL_VALUE_MAX_LEN],
             "updated_at": updated_at,
         }
         for key, value in updates.items()
@@ -495,9 +504,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         row to escalate the transaction to ``RESERVED``. SQLite
         starts transactions as ``DEFERRED`` (read-only) by
         default — concurrent ``append()`` calls would otherwise
-        both run the ``select(max(position))`` query without
-        holding any write lock, both compute the same ``max_pos``,
-        and both try to INSERT at ``max_pos + 1`` → UNIQUE
+        both read the same ``next_position`` counter (or, for a
+        pre-counter conversation, the same ``max(position)``) without
+        holding any write lock, both allocate the same position, and
+        both try to INSERT it → UNIQUE
         constraint failure on
         ``ix_conversation_items_conversation_id_position``.
         Reproduced 2026-04-30 in the user's 20-shell scenario:
@@ -508,8 +518,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         escalates this transaction to ``RESERVED`` immediately,
         so a second concurrent transaction blocks on
         ``busy_timeout`` (20s, set in :func:`make_managed_session_maker`)
-        rather than racing the SELECT, and re-reads ``max_pos``
-        with the up-to-date state once the holder commits.
+        rather than racing the read, and re-reads the up-to-date
+        ``next_position`` counter (or, for a pre-counter conversation,
+        ``max(position)``) once the holder commits.
 
         :param session: The active SQLAlchemy session.
         :param conversation_id: The conversation to lock,
@@ -1172,12 +1183,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             objects in relevance order.
         """
         with self._session() as session:
-            # Dialect-specific search: SQLite has FTS5 virtual tables
-            # (MATCH + rank), PostgreSQL doesn't. ILIKE on the JSON
-            # data column is a functional fallback. Proper tsvector
-            # indexing is a future optimization (tracked in GAPS.md).
-            is_sqlite = self._engine.dialect.name == "sqlite"
-            if is_sqlite:
+            # Dialect-specific search: the SQLite family (SQLite + D1) has
+            # FTS5 virtual tables (MATCH + rank); PostgreSQL doesn't. ILIKE on
+            # the JSON data column is a functional fallback there. Proper
+            # tsvector indexing is a future optimization (tracked in GAPS.md).
+            use_fts = _supports_fts5(self._engine.dialect.name)
+            if use_fts:
                 if conversation_id is not None:
                     stmt = text(
                         "SELECT item_id FROM conversation_items_fts "
@@ -1377,15 +1388,34 @@ class SqlAlchemyConversationStore(ConversationStore):
             if conv_row is not None:
                 conv_row.updated_at = now
 
-            # coalesce to -1 so the first appended item gets position 0.
-            max_pos = session.execute(
-                select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
-                    SqlConversationItem.conversation_id == conversation_id
+            # Allocate item positions from the conversation's maintained
+            # next_position counter instead of running a MAX(position) aggregate
+            # on every append. Reading + advancing the counter under
+            # _lock_conversation keeps allocation O(1), drops a query per write,
+            # and stays collision-free. The aggregate is an index lookup on this
+            # schema (ix_conversation_items_conversation_id_position), but a
+            # maintained counter avoids the per-append round-trip regardless and
+            # scales to backends where that same allocation is a full scan.
+            #
+            # Backwards compatibility: conversations created before this counter
+            # existed have next_position = NULL; fall back to a one-time
+            # MAX(position) scan (coalesce to -1 so the first item gets 0), then
+            # persist the counter below so every later append is scan-free.
+            if conv_row is not None and conv_row.next_position is not None:
+                next_pos = conv_row.next_position
+            else:
+                next_pos = (
+                    session.execute(
+                        select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
+                            SqlConversationItem.conversation_id == conversation_id
+                        )
+                    ).scalar_one()
+                    + 1
                 )
-            ).scalar_one()
 
             for item in items:
-                max_pos += 1
+                position = next_pos
+                next_pos += 1
                 data_dict = item.data.model_dump(exclude_none=True)
                 # Strip NUL bytes before they reach a Postgres text
                 # column, which rejects them outright. Tool output can
@@ -1400,7 +1430,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     response_id=item.response_id,
                     created_at=now,
                     status="completed",  # items are final on append
-                    position=max_pos,
+                    position=position,
                     type=item.type,
                     data=data,
                     search_text=search,
@@ -1420,7 +1450,81 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
 
+            # Persist the advanced counter so the next append reads it instead
+            # of scanning; this also lazily backfills a pre-counter conversation.
+            if conv_row is not None:
+                conv_row.next_position = next_pos
+
         return persisted
+
+    def list_projects(
+        self,
+        accessible_by: str | None = None,
+    ) -> list[str]:
+        """
+        Return all distinct project names, ordered alphabetically.
+
+        Projects are implicit: they exist as long as at least one
+        *non-archived* ``conversation_labels`` row with ``key="omni_project"``
+        references them. Archived sessions keep their project label (so
+        unarchiving restores a session to its original project), but a project
+        whose every member is archived drops out of this list — that is what
+        makes "Delete project" (which archives all members) remove the folder
+        while leaving the sessions recoverable. The label key is namespaced
+        (``omni_*``) to keep this internal storage key distinct from the
+        user-facing "project" term and from any future reserved keys; it is
+        never surfaced as a label in the UI.
+
+        :param accessible_by: When set, restrict to sessions that
+            ``accessible_by`` has a permission row for (mirrors the
+            ``list_conversations`` ACL filter).
+        :returns: List of project names ordered ascending.
+        """
+        with self._session() as session:
+            # Join to the conversation so archived sessions don't keep an
+            # otherwise-empty project alive in the sidebar.
+            stmt = (
+                select(SqlConversationLabel.value)
+                .join(
+                    SqlConversation,
+                    SqlConversation.id == SqlConversationLabel.conversation_id,
+                )
+                .where(
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                    SqlConversation.archived.is_(False),
+                )
+                .distinct()
+                .order_by(SqlConversationLabel.value)
+            )
+            if accessible_by is not None:
+                from omnigent.db.db_models import SqlSessionPermission
+
+                accessible_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.user_id == accessible_by
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
+            return [row[0] for row in session.execute(stmt).all()]
+
+    def delete_label(
+        self,
+        conversation_id: str,
+        key: str,
+    ) -> None:
+        """
+        Delete a single label key from a conversation.
+
+        No-op if the label does not exist.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key to remove, e.g. ``"omni_project"``.
+        """
+        with self._session() as session:
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == key,
+                )
+            )
 
     def list_conversations(
         self,
@@ -1438,6 +1542,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         search_query: str | None = None,
         accessible_by: str | None = None,
         include_archived: bool = False,
+        project: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1482,6 +1587,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
+        :param project: When set to a non-empty string, only return
+            sessions that have a ``conversation_labels`` row with
+            ``key="omni_project"`` and ``value=project``. When set to an
+            empty string ``""``, only return sessions with NO project
+            label (i.e., unfiled sessions). ``None`` disables the
+            filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -1531,6 +1642,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .distinct()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
+            if project is not None:
+                if project == "":
+                    # Unfiled: sessions with no project label at all.
+                    stmt = stmt.where(
+                        SqlConversation.id.not_in(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.key == PROJECT_LABEL_KEY
+                            )
+                        )
+                    )
+                else:
+                    # Specific project: session must have this project label.
+                    stmt = stmt.where(
+                        SqlConversation.id.in_(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                                SqlConversationLabel.value == project,
+                            )
+                        )
+                    )
             if after:
                 stmt = self._apply_cursor(
                     stmt,
@@ -2085,7 +2216,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         title: str | None = None,
         agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -2119,21 +2254,40 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``, defaults to ``"Fork of <source_title>"``
             (or ``"Fork of <source_id>"`` when the source has no
             title).
-        :param agent_id: Agent ID to bind the fork to. When
-            ``None``, the fork inherits the source's ``agent_id``.
-            Callers that clone the agent row before forking pass
-            the cloned agent's ID here.
+        :param agent_id: Agent ID to bind the fork to. When ``None``,
+            the fork inherits the source's ``agent_id``. With
+            ``cloned_agent_bundle_location`` set, a fresh agent row is
+            created with this id; otherwise it must name an existing
+            agent, whose ``session_id`` is repointed at the fork.
+        :param cloned_agent_name: Name for the cloned agent row.
+            Required when ``cloned_agent_bundle_location`` is set.
+        :param cloned_agent_bundle_location: When set, clone this
+            bundle into a new session-scoped agent row (id
+            ``agent_id``) created atomically in this transaction, so a
+            fork failure rolls it back instead of orphaning a
+            ``session_id IS NULL`` built-in. ``None`` keeps the legacy
+            bind-existing behavior.
+        :param cloned_agent_description: Optional description for the
+            cloned agent row. Ignored unless
+            ``cloned_agent_bundle_location`` is set.
         :param copy_model_settings: When ``True`` (default), copy the
             source's ``model_override`` and ``reasoning_effort``. When
             ``False``, both are left ``None`` so the fork falls back to
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param model_override: When set, the fork's ``model_override`` is
+            this value instead of the source's copied one — the
+            "restart with model" path, where the whole point is to launch
+            the clone on a different model. Wins over the
+            ``copy_model_settings`` copy; ``reasoning_effort`` still follows
+            ``copy_model_settings`` (a same-family model switch keeps the
+            effort). ``None`` (default) leaves the copy behavior unchanged.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
-            fresh. Set by the route whenever the fork binds a native
-            target, regardless of the source's provider family.
+            fresh. Set by the route only for native targets whose harness can
+            replay fork history.
         :param resume_source_native_session: When ``True`` (default), a
             full fork of a source with a native session stamps
             :data:`FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY` so the runner
@@ -2180,6 +2334,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else f"Fork of {source_conversation_id[:16]}…"
                 )
             )
+            # Cloning the agent in-transaction: start the conversation with
+            # agent_id=NULL (the row doesn't exist yet — an autoflush would
+            # else break the agent_id FK) and backfill after inserting it.
+            creating_clone = cloned_agent_bundle_location is not None
             new_conv_id = generate_conversation_id()
             new_conv = SqlConversation(
                 id=new_conv_id,
@@ -2191,9 +2349,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # root mirrors its own id (matches the
                 # ``_new_session_conversation_row`` invariant).
                 root_conversation_id=new_conv_id,
-                agent_id=agent_id if agent_id is not None else source.agent_id,
+                agent_id=(
+                    None
+                    if creating_clone
+                    else (agent_id if agent_id is not None else source.agent_id)
+                ),
                 reasoning_effort=source.reasoning_effort if copy_model_settings else None,
-                model_override=source.model_override if copy_model_settings else None,
+                # An explicit override wins over the copied value — this is
+                # the "restart with model" launch model. Otherwise fall back
+                # to the source's copied model (gated by copy_model_settings).
+                model_override=(
+                    model_override
+                    if model_override is not None
+                    else (source.model_override if copy_model_settings else None)
+                ),
                 # The brain-harness override is family-bound like the model,
                 # so it follows the same copy gate.
                 harness_override=source.harness_override if copy_model_settings else None,
@@ -2264,8 +2433,35 @@ class SqlAlchemyConversationStore(ConversationStore):
                     src_item.search_text or "",
                 )
 
-            # Bind the cloned agent to the forked session atomically.
-            if agent_id is not None:
+            # The clone copied len(source_items) items at dense positions
+            # 0..N-1, so its position allocator starts at N. Seed it from the
+            # snapshot (not the source row's counter) so the fork is correct
+            # even when the source predates the counter.
+            new_conv.next_position = len(source_items)
+
+            # Create/bind the fork's session-scoped agent atomically.
+            if creating_clone:
+                # Mint the clone here so it's born with session_id set (never
+                # NULL) and rolls back with the fork on failure — never
+                # leaking as a phantom built-in.
+                assert (
+                    agent_id is not None
+                    and cloned_agent_name is not None
+                    and cloned_agent_bundle_location is not None
+                )
+                session.add(
+                    _new_session_agent_row(
+                        agent_id=agent_id,
+                        agent_name=cloned_agent_name,
+                        agent_bundle_location=cloned_agent_bundle_location,
+                        agent_description=cloned_agent_description,
+                        conversation_id=new_conv.id,
+                        now=now,
+                    )
+                )
+                session.flush()
+                new_conv.agent_id = agent_id
+            elif agent_id is not None:
                 agent_row = session.get(SqlAgent, agent_id)
                 if agent_row is not None:
                     agent_row.session_id = new_conv.id

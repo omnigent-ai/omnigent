@@ -164,7 +164,7 @@ Sandboxes boot from `ghcr.io/omnigent-ai/omnigent-host:latest`, an image
 published by CI from the `host` target of
 [`deploy/docker/Dockerfile`](../docker/Dockerfile) with Omnigent
 and its dependencies preinstalled — including the coding-harness CLIs
-(`claude`, `codex`, `pi`), so agents on any harness run without an
+(`claude`, `codex`, `pi`, `kiro-cli`), so agents on any harness run without an
 in-sandbox install.
 
 To use a different image (a fork, or extra tooling baked in), build the

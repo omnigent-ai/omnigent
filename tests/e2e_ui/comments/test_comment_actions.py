@@ -21,14 +21,23 @@ every file type):
      in a fresh browser context lands on the file with the exact comment
      auto-selected (panel open, card highlighted).
 
-The per-card Edit/Delete affordances are author-gated: they render only when
-the viewer authored the comment. The e2e server runs in header mode with a
-single-user fallback, so a header-less POST records ``created_by = "local"``,
-which the client treats as "no author" — hiding Edit/Delete. The edit/delete
-tests therefore drive the browser AS a real identity (``X-Forwarded-Email``)
-and seed the comment authored by that same identity (see
-``editor_commented_session``); the other tests, which don't depend on author
-gating, use the cheaper header-less ``commented_session``.
+The per-card Edit/Delete affordances are author-gated, with a deliberate
+single-user carve-out:
+
+  * Multi-user: they render only when the viewer authored the comment
+    (``created_by === currentAuthorId``). The author-gated tests drive the
+    browser AS a real identity (``X-Forwarded-Email``) and seed the comment
+    authored by that same identity (see ``editor_commented_session``).
+  * Single-user (the default local-dev experience): the e2e server runs in
+    header mode with a single-user fallback, so a header-less POST records
+    ``created_by = None`` (the server maps the ``"local"`` sentinel to None
+    via ``attribution_user``). The client treats a null author as "owned by
+    any editor", so Edit/Delete render without any identity header — see
+    ``test_single_user_comment_is_editable_and_deletable``, which guards the
+    plain local-dev path that header-driven tests would otherwise mask.
+
+The tests that don't depend on author gating (show-more, address-all,
+copy-link) use the cheaper header-less ``commented_session``.
 """
 
 from __future__ import annotations
@@ -79,14 +88,12 @@ _LONG_BODY = "\n".join(
 _LEVEL_EDIT = 2
 
 # A real (non-``local``) identity used by the author-gated edit/delete tests.
-# The per-card Edit/Delete affordances only render when the viewer authored the
-# comment (``created_by === currentAuthorId``). The e2e server runs in header
-# mode with single-user fallback, so a header-less POST records
-# ``created_by = "local"``, which the client treats as "no author"
-# (``getCurrentAuthorId()`` returns null for the ``local`` sentinel) — hiding
-# Edit/Delete. To exercise those affordances we drive the browser AS this user
-# (X-Forwarded-Email) and seed the comment authored by the same user, so the
-# stored ``created_by`` matches the viewer.
+# In multi-user mode the per-card Edit/Delete affordances only render when the
+# viewer authored the comment (``created_by === currentAuthorId``). To exercise
+# that path we drive the browser AS this user (X-Forwarded-Email) and seed the
+# comment authored by the same user, so the stored ``created_by`` matches the
+# viewer. (The single-user path — header-less, ``created_by = None`` — is
+# covered separately by ``test_single_user_comment_is_editable_and_deletable``.)
 _EDITOR = "editor@ui.test"
 
 
@@ -117,8 +124,9 @@ def _seed_comment(
     When ``author`` is given it is sent as ``X-Forwarded-Email`` so the server
     records that identity as ``created_by`` (required for the author-gated
     Edit/Delete affordances to render for a browser driven as the same user).
-    With no ``author`` the server's single-user fallback records
-    ``created_by = "local"``.
+    With no ``author`` the server's single-user fallback maps the ``"local"``
+    sentinel to ``created_by = None`` (via ``attribution_user``), which the
+    client treats as "owned by any editor".
 
     :param base_url: Live server origin.
     :param session_id: Session to attach the comment to.
@@ -336,6 +344,62 @@ def test_delete_comment(
         ctx.close()
 
     # REST confirms the comment is gone.
+    comments_resp = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?path={_FILE_PATH}",
+        timeout=10.0,
+    )
+    comments_resp.raise_for_status()
+    assert comments_resp.json() == [], "comment should be deleted server-side"
+
+
+def test_single_user_comment_is_editable_and_deletable(
+    page: Page,
+    commented_session: tuple[str, str, str],
+) -> None:
+    """In single-user mode, a header-less comment shows Edit/Delete to any editor.
+
+    This guards the default local-dev experience: there is no identity header,
+    so the server records ``created_by = None`` (the ``"local"`` sentinel mapped
+    via ``attribution_user``). The client treats a null author as "owned by any
+    editor", so the per-card Edit and Delete affordances must render and work
+    using the plain ``page`` fixture — no ``X-Forwarded-Email`` context.
+
+    Regression guard: when the comments route stored the raw ``"local"``
+    sentinel instead of ``None``, ``getCurrentAuthorId()`` (null for ``local``)
+    never matched ``created_by``, so Edit/Delete silently vanished in local dev
+    even though the author-gated tests (driven as a real identity) still passed.
+    """
+    base_url, session_id, _comment_id = commented_session
+
+    # The server contract this test guards: a header-less POST records no
+    # author. (Before the fix it stored the raw ``"local"`` sentinel here.)
+    seeded = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/comments?path={_FILE_PATH}",
+        timeout=10.0,
+    )
+    seeded.raise_for_status()
+    assert seeded.json()[0]["created_by"] is None, seeded.json()
+
+    file_viewer = _open_comments_panel(page, base_url, session_id)
+    expect(file_viewer).to_contain_text(_SHORT_BODY)
+
+    # Edit renders for the header-less viewer and persists.
+    file_viewer.get_by_role("button", name="Edit").click()
+    edit_textarea = file_viewer.locator("textarea")
+    expect(edit_textarea).to_have_value(_SHORT_BODY)
+    edited_body = "Edited in single-user mode (e2e)."
+    edit_textarea.fill(edited_body)
+    file_viewer.get_by_role("button", name="Save", exact=True).click()
+    expect(file_viewer).to_contain_text(edited_body)
+    expect(file_viewer).not_to_contain_text(_SHORT_BODY)
+
+    # Delete also renders and removes the comment.
+    file_viewer.get_by_role("button", name="Delete").click()
+    expect(file_viewer).not_to_contain_text(edited_body)
+    expect(file_viewer).to_contain_text("No open comments.")
+
+    # REST confirms the comment is gone, and the seeded comment carried no
+    # author (created_by None) — the single-user contract this test guards.
     comments_resp = httpx.get(
         f"{base_url}/v1/sessions/{session_id}/comments?path={_FILE_PATH}",
         timeout=10.0,

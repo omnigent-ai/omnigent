@@ -1,5 +1,5 @@
 {
     "exit_code": {"kind": "exact", "value": 0},
     "follow_up_assistant_response_rendered": {"kind": "exact", "value": true},
-    "follow_up_user_banner_rendered": {"kind": "exact", "value": true}
+    "follow_up_user_prompt_echoed": {"kind": "exact", "value": true}
 }

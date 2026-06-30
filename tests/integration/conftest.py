@@ -22,6 +22,7 @@ of this package.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import httpx
@@ -30,13 +31,19 @@ import pytest
 from tests import _model_pools
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import (  # noqa: F401  (re-exported pytest fixtures)
+    _enforce_min_runner_version,
+    _enforce_min_server_version,
     create_runner_bound_session,
     databricks_workspace_host,
     http_client,
     live_runner_id,
     live_server,
     llm_api_key,
+    mock_llm_server_url,
     register_inline_agent,
+    reset_mock_llm,
+    server_version,
+    using_mock_llm,
 )
 from tests.integration.model_selection import resolve_default_model
 
@@ -46,41 +53,82 @@ from tests.integration.model_selection import resolve_default_model
 _SUPPORTED_HARNESSES = frozenset({"claude-sdk", "codex", "openai-agents"})
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Gate the whole directory on ``--integration`` (real LLM + harness CLIs).
+def _is_mock_mode(config: pytest.Config) -> bool:
+    """Return True when no real ``--llm-api-key`` was provided.
 
-    On the codex harness, also rerun each journey up to 2x: codex
-    multi-turn dispatch flakes in bursts (empty failed turns, the
-    legacy class; burn-in failures were codex-only
-    while claude-sdk / openai-agents stayed clean). Reruns resolve a
-    different pool model per attempt via tests/_model_pools rotation.
-    Per-attempt runtime stays under the CI --timeout=180 cap (turn
-    polls are capped at 50s in helpers.run_turn), so a rerun never
-    follows a thread-timeout hard kill.
+    :param config: Pytest config object.
+    :returns: Whether mock LLM mode is active.
+    """
+    return config.getoption("--llm-api-key") is None
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Gate the whole directory on mock mode (no ``--llm-api-key``).
+
+    All tests run against the mock LLM server. Without ``--llm-api-key``
+    the ``--integration`` flag is not required. If someone passes a real
+    ``--llm-api-key`` without ``--integration`` the tests are skipped so
+    they don't accidentally hit real credentials.
 
     :param config: Pytest config object.
     :param items: Collected test items.
     """
-    if not config.getoption("--integration"):
-        marker = pytest.mark.skip(reason="Integration tests require --integration flag")
+    if not config.getoption("--integration") and not _is_mock_mode(config):
+        marker = pytest.mark.skip(
+            reason="Integration tests require --integration flag or mock mode (omit --llm-api-key)"
+        )
         for item in items:
             item.add_marker(marker)
-        return
-    if config.getoption("--harness") == "codex":
-        for item in items:
-            item.add_marker(pytest.mark.flaky(reruns=2, reruns_delay=5))
+
+
+@pytest.fixture(autouse=True, scope="function")
+def _reset_mock_llm_between_tests(
+    mock_llm_server_url: str | None,  # noqa: F811
+) -> Iterator[None]:
+    """Clear the shared mock-LLM queues before and after every test.
+
+    The ``mock_llm_server_url`` fixture is session-scoped: the mock
+    server's keyed response queues, captured requests, and gates
+    persist across every test in a shard. ``_ResponseQueue.next()``
+    silently returns a default ``"Mock LLM response"`` when exhausted
+    and ``resolve_queue`` falls back to the ``"default"`` queue on a key
+    miss, so a queue left non-empty (or keyed for another agent) by one
+    test leaks scripted responses into its siblings — the recurring
+    cause of ``test_smoke`` / ``test_multi_turn`` / ``test_sharing``
+    breaking when run alongside the scripted round-trip tests.
+
+    Resetting before *and* after each test makes every integration test
+    start from a clean queue without a per-file opt-in fixture.
+    ``reset_mock_llm`` is a no-op when the URL is ``None`` (real-LLM
+    mode never starts the server fixture lazily) and the server is
+    always up in mock mode, so calling it unconditionally is safe in
+    both modes.
+
+    :param mock_llm_server_url: Mock server URL, or ``None`` in real mode.
+    """
+    reset_mock_llm(mock_llm_server_url)
+    try:
+        yield
+    finally:
+        reset_mock_llm(mock_llm_server_url)
 
 
 @pytest.fixture(scope="session")
 def harness_name(request: pytest.FixtureRequest) -> str:
     """The harness under test, from ``--harness``; fails loud on the default.
 
+    In mock mode (no ``--llm-api-key``), defaults to ``"openai-agents"``
+    when ``--harness`` is not explicitly set.
+
     :param request: Pytest fixture request.
     :returns: e.g. ``"claude-sdk"``.
-    :raises pytest.UsageError: When ``--harness`` is absent or unsupported.
+    :raises pytest.UsageError: When ``--harness`` is absent or unsupported
+        and not in mock mode.
     """
     harness: str = request.config.getoption("--harness")
     if harness not in _SUPPORTED_HARNESSES:
+        if _is_mock_mode(request.config):
+            return "openai-agents"
         raise pytest.UsageError(
             f"tests/integration/ requires an explicit --harness from "
             f"{sorted(_SUPPORTED_HARNESSES)}; got {harness!r}."
@@ -92,7 +140,8 @@ def harness_name(request: pytest.FixtureRequest) -> str:
 def model_name(request: pytest.FixtureRequest, harness_name: str) -> str:
     """Resolve the model: param > ``model`` marker > ``--model``.
 
-    Mirrors ``tests/inner/conftest.py``: explicit choices skip
+    In mock mode, defaults to ``"mock-model"``. Mirrors
+    ``tests/inner/conftest.py``: explicit choices skip
     :mod:`tests._model_pools` spreading but still rotate on
     ``llm_flaky`` reruns. The workflow ``--model`` default is spread
     when ``OMNIGENT_TEST_MODEL_SPREAD`` is on, except for Codex: that
@@ -102,6 +151,8 @@ def model_name(request: pytest.FixtureRequest, harness_name: str) -> str:
     :param harness_name: Harness under test, e.g. ``"codex"``.
     :returns: e.g. ``"databricks-claude-sonnet-4-6"``.
     """
+    if _is_mock_mode(request.config):
+        return "mock-model"
     if hasattr(request, "param") and request.param is not None:
         return _model_pools.resolve_model(request.param, spread=False)
     marker = request.node.get_closest_marker("model")
@@ -111,13 +162,18 @@ def model_name(request: pytest.FixtureRequest, harness_name: str) -> str:
 
 
 @pytest.fixture(autouse=True)
-def _skip_when_cli_missing(harness_name: str) -> None:
+def _skip_when_cli_missing(request: pytest.FixtureRequest, harness_name: str) -> None:
     """Skip when the harness's CLI binary isn't installed locally.
 
+    In mock mode, the harness CLI is not needed — the mock server
+    handles all LLM calls directly, so this check is skipped.
     nightly.yml installs claude/codex; local machines may not have both.
 
+    :param request: Pytest fixture request.
     :param harness_name: The harness under test.
     """
+    if _is_mock_mode(request.config):
+        return
     skip_if_harness_cli_missing(harness_name)
 
 
@@ -139,7 +195,9 @@ def journey_session(
     live_runner_id: str,  # noqa: F811  (pytest fixture, not the import)
     harness_name: str,
     model_name: str,
+    using_mock_llm: bool,  # noqa: F811
     request: pytest.FixtureRequest,
+    mock_llm_server_url: str | None,  # noqa: F811
 ) -> JourneySession:
     """Register a fresh inline agent + session for one journey test.
 
@@ -150,7 +208,9 @@ def journey_session(
     :param live_runner_id: Runner to bind the session to.
     :param harness_name: Harness under test.
     :param model_name: Resolved model for this test.
+    :param using_mock_llm: Whether mock LLM mode is active.
     :param request: Pytest fixture request (for ``--profile``).
+    :param mock_llm_server_url: Mock LLM server URL, or ``None``.
     :returns: The registered agent + bound session.
     """
     agent_name = register_inline_agent(
@@ -163,6 +223,9 @@ def journey_session(
             "You are a terse test assistant. Follow instructions "
             "exactly and literally. When asked to reply with a token, "
             "reply with the token text only."
+        ),
+        mock_llm_base_url=(
+            f"{mock_llm_server_url}/v1" if using_mock_llm and mock_llm_server_url else None
         ),
     )
     session_id = create_runner_bound_session(

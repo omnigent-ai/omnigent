@@ -1,0 +1,8 @@
+command: ["opentelemetry-instrument", "python", "app.py"]
+env:
+  - name: AP_LAKEBASE_ENDPOINT
+    valueFrom: postgres
+  - name: AP_ARTIFACT_VOLUME_PATH
+    valueFrom: artifact_volume
+  - name: OTEL_TRACES_SAMPLER
+    value: 'always_on'

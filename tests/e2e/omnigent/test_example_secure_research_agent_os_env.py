@@ -23,25 +23,33 @@ from tests.e2e.omnigent._example_helpers import (
     assert_completed_one_shot,
     run_one_shot,
 )
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
 
 def test_secure_research_agent_os_env_one_shot(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Run the os_env variant one-shot cross-platform.
 
+    Uses the mock LLM server for deterministic responses.
+
     :param omnigent_python: Interpreter with omnigent +
         openai-agents installed.
     :param omnigent_repo_root: Repo root for subprocess cwd.
-    :param omnigent_credentials_env: PAT + BASE_URL env.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     """
+    configure_mock_llm(mock_llm_server_url, [{"text": "OK"}])
     result = run_one_shot(
         omnigent_python=omnigent_python,
         omnigent_repo_root=omnigent_repo_root,
-        omnigent_credentials_env=omnigent_credentials_env,
+        omnigent_credentials_env=mock_credentials_env,
         example_name="secure_research_agent_os_env",
+        model="mock-model",
     )
     assert_completed_one_shot(result, "secure_research_agent_os_env")

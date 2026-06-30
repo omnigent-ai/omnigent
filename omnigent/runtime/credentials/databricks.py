@@ -25,10 +25,10 @@ If none of the above yield both a host and a token, the resolver raises
 Note: this resolver intentionally does NOT honor ``OPENAI_BASE_URL`` /
 ``OPENAI_API_KEY``. Those env vars are used by the *OpenAI* client paths
 (serving endpoints, openai-agents harness) and ALREADY contain the full
-serving-endpoints URL — appending ``/ai-gateway/mlflow/v1`` to them would
-produce malformed URLs like ``…/serving-endpoints/ai-gateway/mlflow/v1``.
-The supervisor needs the bare workspace host, not an OpenAI base URL,
-so we resolve via the SDK and cfg file only.
+serving-endpoints URL. Callers of this resolver need the bare workspace
+host so they can append their own path (e.g. ``/serving-endpoints``);
+reusing a full OpenAI base URL would produce malformed URLs, so we
+resolve via the SDK and cfg file only.
 
 The SDK-based path mirrors (but does not import from)
 ``omnigent/inner/databricks_executor.py:_read_databrickscfg``. The
@@ -75,8 +75,8 @@ class WorkspaceCreds:
 
     :param host: The workspace host URL with no trailing slash,
         e.g. ``"https://example.databricks.com"``. This is
-        the BARE workspace host — callers append the gateway path
-        (``/ai-gateway/mlflow/v1``) themselves.
+        the BARE workspace host — callers append their own path
+        (e.g. ``/serving-endpoints``) themselves.
     :param token: The bearer token used in the
         ``Authorization: Bearer <token>`` header.
     """
@@ -392,7 +392,7 @@ def resolve_databricks_workspace(profile: str | None) -> WorkspaceCreds:
     var is set, otherwise ``~/.databrickscfg``.
 
     Trailing slashes on the host are stripped on every code path so
-    callers can append the gateway path (``/ai-gateway/mlflow/v1``)
+    callers can append their own path (e.g. ``/serving-endpoints``)
     without further normalization.
 
     :param profile: The Databricks config profile to look up,

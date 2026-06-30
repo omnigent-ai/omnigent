@@ -1,0 +1,31 @@
+name: Duplicate PRs Test
+
+# Offline unit test for the duplicate-PR-closing logic: runs
+# duplicate-prs.test.js (mocked GitHub client, no network). Triggers only when
+# the script or its test change. Runs on `pull_request` (PR head checkout) so it
+# tests the PR's own version. No secrets, no network.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/duplicate-prs.js
+      - .github/workflows/duplicate-prs.test.js
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duplicate-prs-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run duplicate-PR unit test
+        run: node .github/workflows/duplicate-prs.test.js

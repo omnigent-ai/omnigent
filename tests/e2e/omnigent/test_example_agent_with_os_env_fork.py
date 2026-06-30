@@ -25,12 +25,14 @@ from tests.e2e.omnigent._example_helpers import (
     assert_completed_one_shot,
     run_one_shot,
 )
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
 
 def test_agent_with_os_env_fork_one_shot(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     ``omnigent run agent_with_os_env_fork -p <prompt>`` completes
@@ -38,10 +40,14 @@ def test_agent_with_os_env_fork_one_shot(
     creates that dir with one file so the fork has something to
     mirror.
 
+    Uses the mock LLM server for deterministic responses.
+
     :param omnigent_python: Interpreter with omnigent +
         openai-agents installed.
     :param omnigent_repo_root: Repo root for subprocess cwd.
-    :param omnigent_credentials_env: PAT + BASE_URL env.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     """
     # The YAML pins ``cwd: /tmp/fork-demo``. Create the dir with
     # a seed file so the fork has real content to hardlink
@@ -50,10 +56,12 @@ def test_agent_with_os_env_fork_one_shot(
     fork_demo.mkdir(exist_ok=True)
     (fork_demo / "notes.txt").write_text("original content\n")
 
+    configure_mock_llm(mock_llm_server_url, [{"text": "OK"}])
     result = run_one_shot(
         omnigent_python=omnigent_python,
         omnigent_repo_root=omnigent_repo_root,
-        omnigent_credentials_env=omnigent_credentials_env,
+        omnigent_credentials_env=mock_credentials_env,
         example_name="agent_with_os_env_fork",
+        model="mock-model",
     )
     assert_completed_one_shot(result, "agent_with_os_env_fork")

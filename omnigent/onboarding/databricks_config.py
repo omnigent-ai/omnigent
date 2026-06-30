@@ -6,10 +6,39 @@ import configparser
 import importlib.util
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
 _logger = logging.getLogger(__name__)
 
 _DATABRICKSCFG_PATH = Path.home() / ".databrickscfg"
+
+
+def normalize_workspace_url(raw: str) -> str:
+    """Reduce a Databricks workspace URL to its bare ``scheme://host`` origin.
+
+    Users routinely paste the URL straight from a browser address bar, which
+    carries a path and query the workspace host does not — e.g.
+    ``https://my-ws.cloud.databricks.com/browse?o=1234567890``. Both the
+    ``~/.databrickscfg`` profile host and ``ucode configure --workspaces``
+    need the bare origin: the Databricks CLI keys its OAuth token cache by
+    host, so a path-laden value resolves to "no access token" and
+    ``ucode configure`` then exits non-zero.
+
+    :param raw: A workspace URL, possibly carrying a path/query/fragment
+        and/or a trailing slash, e.g.
+        ``"https://my-ws.cloud.databricks.com/browse?o=1"``.
+    :returns: ``scheme://host`` with no path, query, fragment, or trailing
+        slash (e.g. ``"https://my-ws.cloud.databricks.com"``). When *raw* has
+        no parseable scheme+host (e.g. a bare ``"host/path"`` with no scheme),
+        the input is returned trimmed of surrounding whitespace and a trailing
+        slash — matching the prior ``rstrip("/")`` behavior so callers that
+        pre-add a scheme never regress.
+    """
+    parsed = urlparse(raw.strip())
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return raw.strip().rstrip("/")
+
 
 # The install command surfaced wherever a Databricks flow is gated on the
 # `databricks` extra (the add-provider menu, `setup --internal-beta`).

@@ -30,6 +30,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
     encode_host_frame,
@@ -54,6 +55,10 @@ _LAUNCH_RESULT_TIMEOUT_S = 30.0
 _LIST_DIR_TIMEOUT_S = 5.0
 _LIST_DIR_DEFAULT_LIMIT = 20
 _LIST_DIR_MAX_LIMIT = 1000
+# Per-call timeout for host.create_dir round-trips. mkdir is a single
+# fast syscall on the host side; 5s matches list_dir and is generous
+# for transient network slowness without making the picker feel hung.
+_CREATE_DIR_TIMEOUT_S = 5.0
 
 
 async def _proxy_list_dir(
@@ -126,6 +131,78 @@ async def _proxy_list_dir(
         # Cleanup runs on every path so a cancelled caller doesn't
         # leave an orphan in the pending dict.
         host_conn.pending_list_dirs.pop(request_id, None)
+
+
+async def _proxy_create_dir(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    path: str,
+) -> dict[str, Any]:
+    """
+    Send a ``host.create_dir`` frame and await the result.
+
+    Mirrors :func:`_proxy_list_dir`: enqueue the frame, register a
+    future on the host connection's ``pending_create_dirs`` map, await
+    with a timeout, and clean up in a finally block. The host's WS
+    receive loop in ``host_tunnel.py`` resolves the future when the
+    result frame arrives.
+
+    :param host_registry: Server-side registry; used to enqueue the
+        outbound frame on the host's send queue.
+    :param host_conn: Live host connection.
+    :param path: Absolute or tilde-prefixed directory to create. The
+        host expands ``~`` itself.
+    :returns: Dict with the result fields: ``status`` (``"ok"`` or
+        ``"failed"``), ``path`` (created absolute path or ``None``),
+        ``error`` (string or ``None``).
+    :raises HTTPException: 504 on timeout, 502 on connection drop.
+    """
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_create_dirs[request_id] = future
+
+    frame = encode_host_frame(
+        HostCreateDirFrame(
+            request_id=request_id,
+            path=path,
+        )
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_CREATE_DIR_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not respond to create_dir "
+                    f"within {_CREATE_DIR_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        # Cleanup runs on every path so a cancelled caller doesn't
+        # leave an orphan in the pending dict.
+        host_conn.pending_create_dirs.pop(request_id, None)
+
+
+class CreateDirectoryRequest(BaseModel):
+    """Request body for ``POST /v1/hosts/{host_id}/directories``.
+
+    :param path: Absolute path of the directory to create on the host
+        machine, e.g. ``"/Users/corey/projects/new-app"``, or a
+        tilde-prefixed path (``"~/scratch"``) the host expands against
+        its own process owner. Missing parents are created.
+    """
+
+    path: str
 
 
 class LaunchRunnerRequest(BaseModel):
@@ -754,6 +831,90 @@ def create_hosts_router(
             "object": "list",
             "data": result.get("entries", []),
             "has_more": bool(result.get("has_more", False)),
+        }
+
+    @router.post("/hosts/{host_id}/directories")
+    async def create_host_directory(
+        request: Request,
+        host_id: str,
+        body: CreateDirectoryRequest,
+    ) -> dict[str, Any]:
+        """
+        Create a new directory on a host.
+
+        Backs the Web UI workspace picker's "New folder" action so a
+        user can make a fresh directory to start a session in without
+        dropping to a terminal. Owner-scoped exactly like the
+        filesystem browse endpoints (``GET /v1/hosts/{id}/filesystem``):
+        only the host owner can create directories, and — like browse —
+        this is NOT scoped to a session. The workspace-boundary check
+        still runs at session-create time, so creating a directory here
+        does not by itself grant an agent access to it.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param body: Request body carrying the absolute (or
+            tilde-prefixed) ``path`` to create.
+        :returns: ``{"object": "directory", "path": "<created abs path>"}``.
+        :raises HTTPException: 404 if host not found, 403 if not owned
+            by caller, 409 if host is offline or the directory could not
+            be created (already exists / permission denied), 400 on path
+            validation, 504 on host timeout, 502 on host I/O failure.
+        """
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner check below as None.
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.owner != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        path = body.path
+        if not path.strip():
+            raise HTTPException(status_code=400, detail="path must not be empty")
+        if "\x00" in path:
+            raise HTTPException(
+                status_code=400,
+                detail="path must not contain NUL bytes",
+            )
+        # Absolute or tilde-prefixed only — the host needs a path it can
+        # resolve on its own; a relative path has no stable meaning here.
+        if not path.startswith(("/", "~")):
+            raise HTTPException(
+                status_code=400,
+                detail="path must be absolute or tilde-prefixed",
+            )
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        result = await _proxy_create_dir(
+            host_registry=host_registry,
+            host_conn=conn,
+            path=path,
+        )
+
+        if result.get("status") == "failed":
+            # Unexpected I/O failure on the host.
+            raise HTTPException(
+                status_code=502,
+                detail=f"host create_dir failed: {result.get('error') or 'unknown error'}",
+            )
+        # Expected filesystem error (already exists / permission denied /
+        # parent is a file) → 409 Conflict with the host's message, so
+        # the picker can show "directory already exists" inline.
+        if result.get("error"):
+            raise HTTPException(
+                status_code=409,
+                detail=str(result.get("error")),
+            )
+
+        return {
+            "object": "directory",
+            "path": result.get("path"),
         }
 
     return router

@@ -23,10 +23,10 @@ jobs:
   gate:
     name: Security Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - name: Check out trust check from main
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: main             # trusted; never the PR head
           sparse-checkout: .github/scripts/security-scan
@@ -56,10 +56,22 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           echo "Untrusted PR -- waiting for the single 'Security Scan' check on $HEAD_SHA"
+          # First-timer short-circuit. When a first-time contributor's runs are
+          # held behind GitHub's approval gate, Security Scan shows up as a
+          # workflow RUN with conclusion=action_required and NO check-run, so the
+          # poll below never sees it and spins the full ~6 min before failing
+          # open. Detect the held state and proceed now (same fail-open outcome);
+          # the gate re-runs on the next push or maintainer approval event.
+          held=$(gh api "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&event=pull_request" \
+            --jq '[.workflow_runs[] | select(.name=="Security Scan")] | sort_by(.created_at) | last | .conclusion' 2>/dev/null || echo "")
+          if [ "$held" = "action_required" ]; then
+            echo "::warning::Security Scan is awaiting maintainer approval (action_required); proceeding (fail-open). It will re-gate on the next push or maintainer approval event."
+            exit 0
+          fi
           q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
           conclusion=""
           details_url=""
-          for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
+          for _ in $(seq 1 108); do  # up to ~9 min (108 * 5s)
             status=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .status" 2>/dev/null || echo "")
             if [ "$status" = "completed" ]; then
               conclusion=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .conclusion")

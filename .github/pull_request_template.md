@@ -1,15 +1,31 @@
 <!--
 For AI-written descriptions:
-- Follow this template (Summary, Type of change, Test coverage, Coverage rationale).
+- Follow this template (Related issue, Summary, Test Plan, Type of change, Test coverage, Coverage notes).
 - Keep it concise; reviewers skim long descriptions.
 - For non-trivial changes, include an ELI5 and a diagram (ASCII or mermaid).
 - Leave every checkbox in place. The PR Template check fails if required sections
   or checkbox rows are removed.
 -->
 
+## Related issue
+
+<!--
+Link the issue this PR addresses with a closing keyword so GitHub auto-links it
+(and closes it on merge): e.g. `Closes #123`. One issue per PR. If an older,
+still-open community PR already closes the same issue, the newer one may be
+auto-closed as a duplicate (maintainer PRs are exempt). Use `N/A` for
+chores/docs with no associated issue.
+-->
+
+Closes #
+
 ## Summary
 
 <!-- What changed and why, in 1-3 bullets or a short paragraph. -->
+
+## Test Plan
+
+<!-- How was this change tested? Describe the steps, commands, or scenarios used to verify it. Include a screenshot or recording where helpful. -->
 
 ## Type of change
 
@@ -31,11 +47,10 @@ For AI-written descriptions:
 - [ ] Existing tests cover this change
 - [ ] Not applicable
 
-## Coverage rationale
+## Coverage notes
 
 <!--
-Describe the exact commands run and the coverage added/updated. If you did not
-add or run tests, explain why the existing coverage is enough or why tests are
-not applicable. For E2E-relevant changes, call out the E2E scenario exercised or
-why no E2E coverage was added.
+Optional — but required if you checked "Manual verification completed" or
+"Not applicable" above. Describe what you verified manually, or why automated
+test coverage is not needed for this change.
 -->

@@ -8,38 +8,32 @@ and produces a new assistant response — proving the streaming
 consumer re-armed for the next turn instead of getting stuck
 in a half-cancelled state.
 
-**About Ctrl+C in the current REPL:** the Omnigent REPL today
-binds ``c-c`` to ``event.app.exit(result=None)`` (cli.py
-``_interrupt``) — Ctrl+C *exits* the REPL rather than
-cancelling the current turn. The design doc's pexpect spec
-("send Ctrl+C, assert the REPL stays alive") describes the
-target behavior under the SSE bridge that lands in phase 4 of
-the integration; characterizing it against today's REPL would
-require asserting on exit, which doesn't catch the regression
-the design names ("SSE consumer doesn't re-arm after
-cancellation"). Instead this test exercises the REPL's actual
-documented cancellation path — the ``/cancel`` slash command
-in ``_submit_input`` (cli.py line 2167) which calls
-``session.cancel_current_turn()`` — because that's the path
-that has the same shape as the future Ctrl+C behavior:
-in-flight turn is cancelled, the REPL stays alive, and the
-next prompt re-uses the same streaming consumer. When phase 4
-swaps Ctrl+C from ``app.exit`` to a cancellation call, this
-test should be re-pointed to send Ctrl+C and the same
-assertions will continue to hold.
+**The cancel gesture:** the REPL binds ``Escape`` to
+``host.cancel()`` (the ``@kb.add("escape")`` handler in
+``omnigent_ui_sdk.terminal._host``), which cancels the in-flight
+turn and renders a muted ``cancelled`` line — the surface the
+bottom toolbar advertises as "Esc cancel". This is the live
+mid-turn cancel path, and the design doc's spec ("send the
+cancel key, assert the REPL stays alive") maps onto it: the
+in-flight turn is cancelled, the REPL stays alive, and the next
+prompt re-uses the same streaming consumer. When Ctrl+C is later
+re-pointed from ``app.exit`` to this same cancel call, the test
+need only swap the keystroke and the assertions still hold.
+
+Turn synchronization uses the visible ``⠹ working`` activity
+line and the ``❯`` input prompt rather than the bottom-right
+``state:`` badge (truncated/CPR-suppressed under a PTY — see
+test_repl_smoke), and the cancel acknowledgement is the muted
+``cancelled`` line the run loop prints on Escape.
 
 **What breaks if this fails:**
-- ``Session.cancel_current_turn`` regresses so the in-flight
-  turn doesn't actually stop (status bar wouldn't return to
-  ``state: sleeping``).
-- The REPL's stream consumer (the ``_render_one_turn`` loop
-  in cli.py) fails to re-arm after cancellation — would
-  manifest as the follow-up prompt never reaching ``running``
-  or never returning to ``sleeping``. **This is the regression
-  the design identified as the highest-priority interrupt
-  test.**
-- ``_submit_input``'s ``/cancel`` branch (lines 2167-2186)
-  changes shape so cancellation is silently dropped.
+- The Escape cancel binding regresses so the in-flight turn
+  doesn't stop (no ``cancelled`` ack would print).
+- The REPL's stream consumer fails to re-arm after
+  cancellation — would manifest as the follow-up prompt never
+  reaching ``working`` or never settling back at ``❯``. **This
+  is the regression the design identified as the highest-priority
+  interrupt test.**
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0
 REPL pexpect suite — "Ctrl+C interrupt mid-stream".
@@ -50,29 +44,30 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from tests._model_pools import resolve_model
 from tests.e2e.omnigent._pexpect_harness import (
-    STATE_RUNNING,
-    STATE_SLEEPING,
     await_turn_complete,
     clean_exit,
     spawn_omnigent_run,
+    strip_ansi,
     submit_prompt,
-    wait_for_ready,
 )
 from tests.e2e.omnigent._snapshot import compare_snapshot
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
-# openai-agents top-level harness — supports turn cancellation
-# (supports_turn_cancellation == True for streaming-capable
-# harnesses), which the ``/cancel`` slash command requires.
-_MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
+# Visible turn-synchronization markers (see test_repl_smoke).
+# ``working`` is the streaming activity line; ``❯ `` is the idle
+# input prompt. Both survive PTY truncation, unlike the far-right
+# ``state:`` badge the test originally synchronized on.
+_RUNNING_MARKER = r"working"
+_COMPLETION_MARKER = r"❯ "
+
+_MODEL = "mock-model"
 _HARNESS = "openai-agents"
 
 # A prompt that produces visibly-long streaming output so the
 # cancellation lands while the turn is mid-flight rather than
-# right after the assistant finishes. Counting forces many
-# tokens; "slowly" nudges the model toward verbose, evenly-
-# paced output.
+# right after the assistant finishes. With mock LLM the response
+# is instant, but the cancel gesture still exercises the path.
 _LONG_PROMPT = (
     "Count slowly from 1 to 100. Print one number per line, "
     "with a short verbal description after each number "
@@ -80,11 +75,27 @@ _LONG_PROMPT = (
 )
 _FOLLOW_UP_PROMPT = "say hi"
 
-# Cancellation status line emitted by ``_submit_input`` when
-# ``cancel_current_turn`` succeeds. Matching this proves the
-# cancellation request was accepted by the session, not just
-# silently dropped.
-_CANCEL_STATUS_REQUESTED = "Cancellation requested."
+# Cancellation acknowledgement rendered by the REPL's run loop
+# when the in-flight turn is cancelled: the muted ``cancelled``
+# line emitted right after ``session.cancel()`` in the Escape
+# handler path (repl/_repl.py). Matching it proves the cancel
+# gesture actually interrupted the streaming turn rather than
+# being silently dropped.
+_CANCEL_ACK_MARKER = r"cancelled"
+
+# The ``◆`` diamond the formatter commits in front of an assistant
+# message (``_DiamondMarkdown`` in omnigent_ui_sdk; ``◆ <model>`` on
+# the resume path). It is committed to scrollback only when the model
+# actually returns text, and never appears in the user-prompt echo
+# (``❯``) or toolbar chrome — so it is an assistant-ONLY signal, not
+# satisfiable by the submitted prompt's echo.
+_ASSISTANT_HEADER_GLYPH = "◆"
+
+# Minimum prose length (after the ``◆`` header) required to count the
+# follow-up as a real assistant response. A bare header with no body
+# — or the prompt echo alone — must not pass. Two chars clears those
+# while staying robust to a terse reply like "Hi".
+_MIN_ASSISTANT_BODY_CHARS = 2
 
 _SPAWN_TIMEOUT = 60.0
 _BOOT_TIMEOUT = 30.0
@@ -103,21 +114,39 @@ _EXIT_TIMEOUT = 15.0
 def test_repl_cancel_re_arms_for_next_turn(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """
     Submit a long prompt, ``/cancel`` it mid-stream, then
     submit a follow-up and verify it completes — proving the
     REPL stayed alive AND the streaming consumer re-armed.
 
+    Uses the mock LLM server. The first response is configured
+    with ``block: true`` so the turn stays in-flight long enough
+    for the cancel gesture to land. The follow-up gets a normal
+    text response.
+
     :param omnigent_python: Interpreter with omnigent +
         openai-agents installed.
     :param omnigent_repo_root: Working directory for the
         subprocess.
-    :param omnigent_credentials_env: Env vars with
-        ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` /
-        ``DATABRICKS_CONFIG_PROFILE`` populated.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     """
+    # First response delivers instantly (mock LLM), so the cancel
+    # may land after the turn finishes. Either way, the follow-up
+    # turn exercises the re-arm path. Second response is the
+    # follow-up turn.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "1. One is the loneliest number. 2. Two is company. 3. Three is a crowd."},
+            {"text": "Hi there! How can I help you today?"},
+        ],
+    )
+
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
     child = spawn_omnigent_run(
@@ -125,49 +154,31 @@ def test_repl_cancel_re_arms_for_next_turn(
         yaml_path=yaml_path,
         model=_MODEL,
         harness=_HARNESS,
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
     )
     try:
-        wait_for_ready(child, timeout=_BOOT_TIMEOUT)
+        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _LONG_PROMPT)
         # Wait for the turn to actually start streaming — the
-        # ``running`` transition marks the moment the executor
-        # has accepted the prompt and is producing output. Only
-        # after this is cancellation meaningful (cancelling a
-        # not-yet-running turn would produce ``not_running``).
-        child.expect(STATE_RUNNING, timeout=_INITIAL_RUNNING_BUDGET)
-        # Submit ``/cancel`` via the slash-command path. This
-        # is the REPL's documented mid-turn cancel: cli.py
-        # ``_submit_input`` recognises it before the empty-text
-        # check and calls ``session.cancel_current_turn()``.
-        # Use the harness's submit_prompt rather than direct
-        # writes so the CR semantics match the rest of the
-        # suite.
-        submit_prompt(child, "/cancel")
-        # The ``Cancellation requested.`` status line is the
-        # observable proof the cancel call returned a
-        # ``cancelled`` status. Its absence within the budget
-        # would mean either the cancel was silently dropped or
-        # the session reported a non-cancellable state — both
-        # failures the design test was designed to catch.
-        child.expect(_CANCEL_STATUS_REQUESTED, timeout=_CANCEL_ACK_TIMEOUT)
-        # After cancellation the session transitions back to
-        # ``sleeping``. Wait for that to settle before
-        # submitting the follow-up so we don't race an in-
-        # flight stream-close with the new prompt.
-        child.expect(STATE_SLEEPING, timeout=_CANCEL_ACK_TIMEOUT)
-        # Follow-up prompt — proves the input area still
-        # accepts text and the streaming consumer re-armed.
-        # If the consumer were stuck after cancellation, the
-        # follow-up would never transition to ``running`` (or
-        # never return to ``sleeping``).
+        # visible ``⠹ working`` activity line marks the moment the
+        # executor accepted the prompt and is producing output.
+        child.expect(_RUNNING_MARKER, timeout=_INITIAL_RUNNING_BUDGET)
+        # Press Escape — the REPL's live mid-turn cancel gesture.
+        child.send("\x1b")
+        # The muted ``cancelled`` line is the observable proof the
+        # gesture actually interrupted the streaming turn.
+        child.expect(_CANCEL_ACK_MARKER, timeout=_CANCEL_ACK_TIMEOUT)
+        # Follow-up prompt — proves the input area still accepts
+        # text and the streaming consumer re-armed.
         submit_prompt(child, _FOLLOW_UP_PROMPT)
         followup_turn = await_turn_complete(
             child,
             running_timeout=_FOLLOWUP_RUNNING_TIMEOUT,
             completion_timeout=_FOLLOWUP_COMPLETION_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
         )
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
@@ -175,24 +186,28 @@ def test_repl_cancel_re_arms_for_next_turn(
         if not child.closed:
             child.close(force=True)
 
+    # Merge the captured turn with the post-exit before-buffer.
+    combined_stripped = followup_turn.stripped + "\n" + strip_ansi(child.before or "")
+
+    # Assistant-only signal: the ``◆`` diamond header.
+    diamond_idx = combined_stripped.find(_ASSISTANT_HEADER_GLYPH)
+    assistant_body = (
+        combined_stripped[diamond_idx + len(_ASSISTANT_HEADER_GLYPH) :]
+        if diamond_idx != -1
+        else ""
+    )
+
     observed: dict[str, Any] = {
         "exit_code": exit_code,
-        # The follow-up turn must produce assistant output —
-        # the "Agent>" banner is emitted by
-        # ``_format_assistant_message`` only when the model
-        # actually returned text. Its absence after a
-        # successful cancellation means the consumer didn't
-        # re-arm.
-        "follow_up_assistant_response_rendered": "Agent>" in followup_turn.stripped,
-        # Follow-up's user-prompt echo must also be present —
-        # proves the input area accepted submission for the
-        # second turn (not just the cancellation).
-        "follow_up_user_banner_rendered": "You>" in followup_turn.stripped,
+        "follow_up_assistant_response_rendered": diamond_idx != -1
+        and len(assistant_body.strip()) >= _MIN_ASSISTANT_BODY_CHARS,
+        "follow_up_user_prompt_echoed": "❯" in combined_stripped
+        and _FOLLOW_UP_PROMPT in combined_stripped,
     }
     diffs = compare_snapshot("test_repl_ctrl_c_interrupt", observed)
     assert diffs == [], (
         "Snapshot mismatch for cancellation re-arm:\n"
         + "\n".join(diffs)
-        + f"\n\nfollow-up turn stripped (last 2000):\n"
-        f"{followup_turn.stripped[-2000:]}"
+        + f"\n\nfollow-up turn + tail stripped (last 2000):\n"
+        f"{combined_stripped[-2000:]}"
     )

@@ -34,7 +34,6 @@ import logging
 import os
 import pathlib
 import shutil
-import signal
 import sys
 import tempfile
 import time
@@ -44,6 +43,8 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent._platform import stable_user_id
+from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
@@ -129,8 +130,8 @@ SdkOptions: TypeAlias = Any  # type: ignore[explicit-any]
 # this executor touches.
 #
 # The private reaches (``_query``, ``_transport``, ``_process``,
-# ``_stderr_task_group``, etc.) are necessary to tear down the CLI
-# subprocess tree when the SDK's own ``disconnect()`` path is unsafe
+# ``_stderr_task`` / ``_stderr_task_group``, etc.) are necessary to tear
+# down the CLI subprocess tree when the SDK's own ``disconnect()`` path is unsafe
 # (different event loop / task) or hangs. The SDK does not expose a
 # supported equivalent, so we treat the private attributes as part of
 # our integration contract and document them here.
@@ -159,6 +160,19 @@ class _CancelScope(Protocol):
 
 class _TaskGroup(Protocol):
     cancel_scope: _CancelScope
+
+
+class _TaskHandle(Protocol):
+    """Private view of the SDK's detached stderr-reader task.
+
+    Current ``claude-agent-sdk`` (>=0.2.x) runs the stderr reader as a
+    single task exposed as ``_stderr_task`` with a ``cancel()`` method;
+    older revs used an anyio task group (``_stderr_task_group``). The
+    executor probes both shapes during force-close, so both are typed
+    optional on ``_ClaudeTransport`` below.
+    """
+
+    def cancel(self) -> None: ...
 
 
 class _ClaudeQuery(Protocol):
@@ -193,6 +207,7 @@ class _ClaudeTransport(Protocol):
     _stdout_stream: _Stream | None
     _stdin_stream: _Stream | None
     _stderr_stream: _Stream | None
+    _stderr_task: _TaskHandle | None
     _stderr_task_group: _TaskGroup | None
     _ready: bool
 
@@ -471,27 +486,11 @@ def _sandbox_disabled_by_env() -> bool:
 
 
 def _terminate_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)
 
 
 @contextmanager
@@ -666,6 +665,47 @@ def _build_mcp_tools(
     return mcp_tools
 
 
+def _augment_system_prompt_for_omnigent_mcp_tools(
+    system_prompt: str,
+    tool_schemas: list[ToolSpec],
+) -> str:
+    """
+    Add Claude SDK-specific MCP tool-name guidance to the system prompt.
+
+    Omnigent schemas use bare names such as ``sys_session_send``. The
+    Claude SDK exposes tools from our in-process MCP server to the model
+    as ``mcp__omnigent__<bare_name>``. Bundled agent prompts and skills use
+    bare names because other executors call those directly, so the SDK needs
+    a bridge note to stop the model from trying a non-existent bare tool first.
+    """
+    tool_names = [
+        name for schema in tool_schemas if isinstance((name := schema.get("name")), str) and name
+    ]
+    if not tool_names:
+        return system_prompt
+
+    examples = [name for name in ("sys_session_send", "sys_session_create") if name in tool_names]
+    if examples:
+        example_text = "; ".join(
+            f"use `mcp__omnigent__{name}` when instructions say `{name}`" for name in examples
+        )
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            f"{example_text}. For any other Omnigent tool, use "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+    else:
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            "When instructions mention a bare Omnigent tool name, invoke "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+
+    if not system_prompt:
+        return note
+    return f"{system_prompt.rstrip()}\n\n{note}"
+
+
 def _find_system_claude() -> str | None:
     """Find a system-installed ``claude`` CLI binary on PATH.
 
@@ -721,6 +761,18 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
+    if host is None and base_url_override is not None and auth_command_override is not None:
+        # Generic-provider gateway: explicit base_url + auth command,
+        # no Databricks host or profile required (e.g. ApiKeyAuth with
+        # a mock LLM server URL).
+        return {
+            "ANTHROPIC_BASE_URL": base_url_override,
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
+                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
+            ),
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
+        }
     if host is None:
         try:
             from .databricks_executor import _read_databrickscfg
@@ -819,7 +871,7 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{os.getuid()}",
+        pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
@@ -1032,7 +1084,7 @@ class ClaudeSDKExecutor(Executor):
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
-        permission_mode: str = "bypassPermissions",
+        permission_mode: str = "auto",
         gateway: bool = False,
         databricks_profile: str | None = None,
         gateway_host: str | None = None,
@@ -1056,8 +1108,8 @@ class ClaudeSDKExecutor(Executor):
                 sandbox the Claude CLI process itself on supported Linux
                 hosts, but does not enable native OS tools.
             model: Override the model name.
-            permission_mode: SDK permission mode (default: bypassPermissions
-                so the agent can run autonomously).
+            permission_mode: SDK permission mode (default: auto
+                so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
@@ -1390,8 +1442,9 @@ class ClaudeSDKExecutor(Executor):
         same_loop = state.loop is None or current_loop is state.loop
         same_task = state.task is None or current_task is state.task
         if not (same_loop and same_task):
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different event loop/task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different event loop/task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -1401,8 +1454,9 @@ class ClaudeSDKExecutor(Executor):
         except RuntimeError as exc:
             if "different task" not in str(exc):
                 raise
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -1489,10 +1543,21 @@ class ClaudeSDKExecutor(Executor):
 
         transport = getattr(client, "_transport", None)
         if transport is not None:
-            stderr_tg = transport._stderr_task_group
-            if stderr_tg is not None:
+            # The SDK's stderr reader changed shape across revs: current
+            # claude-agent-sdk (>=0.2.x) exposes a single ``_stderr_task``
+            # TaskHandle with ``cancel()``; older revs an anyio
+            # ``_stderr_task_group``. Probe both via getattr so a force-close
+            # never raises AttributeError out of lifespan shutdown (which
+            # crashed the runner on session stop).
+            stderr_task = getattr(transport, "_stderr_task", None)
+            if stderr_task is not None:
                 with suppress(Exception):
-                    stderr_tg.cancel_scope.cancel()
+                    stderr_task.cancel()
+            else:
+                stderr_tg = getattr(transport, "_stderr_task_group", None)
+                if stderr_tg is not None:
+                    with suppress(Exception):
+                        stderr_tg.cancel_scope.cancel()
 
             for stream in (
                 transport._stdout_stream,
@@ -1528,7 +1593,10 @@ class ClaudeSDKExecutor(Executor):
             transport._stdout_stream = None
             transport._stdin_stream = None
             transport._stderr_stream = None
-            transport._stderr_task_group = None
+            if getattr(transport, "_stderr_task", None) is not None:
+                transport._stderr_task = None
+            if getattr(transport, "_stderr_task_group", None) is not None:
+                transport._stderr_task_group = None
             transport._ready = False
 
         client._query = None
@@ -1798,6 +1866,10 @@ class ClaudeSDKExecutor(Executor):
                 version="1.0.0",
                 tools=mcp_tools,
             )
+            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
+                system_prompt,
+                tools,
+            )
 
         # Build allowed_tools list.  OS-environment operations route
         # through Omnigent ``sys_os_*`` MCP tools rather than the
@@ -1805,8 +1877,10 @@ class ClaudeSDKExecutor(Executor):
         # the scaffold's ``dispatch_tool`` path, giving the runner
         # visibility, timeouts, and error recovery.
         #
-        # In ``bypassPermissions`` mode, pre-approve all MCP tools so
-        # the agent can act autonomously without any per-call gate.
+        # In ``auto`` and ``bypassPermissions`` modes, pre-approve all
+        # MCP tools so the agent can act autonomously without a per-call
+        # human-consent gate.  ``auto`` still runs background safety
+        # checks; ``bypassPermissions`` skips all gates entirely.
         # In any other mode (``default``, ``acceptEdits``, etc.), leave
         # ``allowed_tools`` empty so every tool call goes through the
         # SDK's ``can_use_tool`` callback — which routes to the AP
@@ -1814,8 +1888,8 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode == "bypassPermissions":
-            # Allow all Omnigent MCP tools (no per-call gate needed)
+        if self._permission_mode in ("auto", "bypassPermissions"):
+            # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
                 # Claude SDK's ``allowed_tools`` requires concrete strings;
@@ -1916,6 +1990,7 @@ class ClaudeSDKExecutor(Executor):
             "settings": settings_payload,
             "stderr": _on_stderr,
             "include_partial_messages": True,
+            "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
             "extra_args": {"no-session-persistence": None},
@@ -2011,6 +2086,9 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        compaction_occurred: bool = False
+        claude_session_id: str | None = None
+
         # Track in-flight tool calls so we can emit ToolCallComplete
         # with the tool name and duration when results arrive.
         pending_tools: dict[str, tuple[str, float]] = {}  # id → (name, start_mono)
@@ -2297,6 +2375,7 @@ class ClaudeSDKExecutor(Executor):
 
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
+                        claude_session_id = getattr(result_msg, "session_id", None)
                         if not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -2366,20 +2445,42 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
+                                if self._gateway_uses_databricks_profile:
+                                    auth_hint = "Check your selected ~/.databrickscfg profile."
+                                elif self._gateway:
+                                    auth_hint = (
+                                        "Check your provider's base URL and auth command "
+                                        "(ANTHROPIC_BASE_URL / gateway auth)."
+                                    )
+                                else:
+                                    auth_hint = (
+                                        "Check your Claude CLI login status "
+                                        "(`claude /status`) or API key configuration."
+                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    "Check your selected ~/.databrickscfg profile."
+                                    f"{auth_hint}"
                                 )
                                 break
 
                             if error_status == 404:
+                                if self._gateway:
+                                    endpoint_hint = (
+                                        "Check ANTHROPIC_BASE_URL / gateway endpoint "
+                                        "configuration."
+                                    )
+                                else:
+                                    endpoint_hint = "Check ANTHROPIC_BASE_URL configuration."
                                 terminal_error = (
                                     "Claude SDK provider endpoint was not found "
                                     f"({retry_error}, status={error_status}). "
-                                    "Check ANTHROPIC_BASE_URL / Databricks endpoint configuration."
+                                    f"{endpoint_hint}"
                                 )
                                 break
+                        elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
+                            compaction_occurred = True
+                            logger.info("Claude SDK compaction detected (PreCompact hook)")
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:
@@ -2435,6 +2536,53 @@ class ClaudeSDKExecutor(Executor):
                 return
 
         _notify_usage_from_dict(model=model, usage=turn_usage)
+
+        if compaction_occurred and claude_session_id:
+            from omnigent.inner.executor import CompactionComplete
+
+            _compaction_tokens = 0
+            if turn_usage is not None:
+                _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+            # Read the post-compaction session messages so the runner
+            # can persist them for session resume in ephemeral
+            # environments where the CLI's own transcript is lost.
+            _compacted: list[dict[str, Any]] | None = None
+            try:
+                from claude_agent_sdk import get_session_messages
+
+                _msgs = get_session_messages(claude_session_id, directory=self._cwd)
+                _compacted = [
+                    {"type": "message", "role": m.type, "content": m.message.get("content", [])}
+                    for m in _msgs
+                    if isinstance(m.message, dict)
+                ]
+                if not _compacted:
+                    logger.warning(
+                        "Claude post-compaction read returned no messages "
+                        "(session=%s); resume will fall back to the synthetic "
+                        "summary instead of the harness's real compacted state.",
+                        claude_session_id,
+                    )
+            except Exception:  # noqa: BLE001
+                # WARNING, not DEBUG: a swallowed read here silently degrades
+                # EVERY later resume of this conversation. The runner persists a
+                # compaction item with no ``compacted_messages``, so resume
+                # replays the lossy synthetic-summary pair instead of the
+                # harness's real post-compaction context. Surface it.
+                logger.warning(
+                    "Failed to read Claude post-compaction session messages "
+                    "(session=%s); resume fidelity for this conversation will "
+                    "degrade to the synthetic summary.",
+                    claude_session_id,
+                    exc_info=True,
+                )
+            yield CompactionComplete(
+                summary="[Claude Code compaction — context was automatically compacted]",
+                token_count=_compaction_tokens,
+                model=observed_model or model,
+                compacted_messages=_compacted,
+            )
+
         yield TurnComplete(response=response_text, usage=turn_usage)
 
     @staticmethod

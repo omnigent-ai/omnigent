@@ -1,11 +1,17 @@
 name: e2e-subagent-tool-gate
 description: |
-  E2E fixture: sub-agent TOOL_CALL approval tunneling.
+  E2E fixture: sub-agent TOOL_CALL ASK pass-through.
 
-  NOTE: bundled tools/python/echo.py inside the toolworker
-  sub-agent dropped during AP→Omnigent conversion. The test
-  will fail until the echo tool is repackaged into an importable
-  module.
+  The toolworker sub-agent has a LOCAL function tool (echo)
+  and a worker_tool_gate policy that ASKs on tool_call:echo.
+  The test asserts the nested echo tool registers with the
+  spawned child's executor and that the sub-agent's TOOL_CALL
+  ASK is a non-interactive pass-through (no banner tunnels to
+  the root REPL — see #765).
+
+  The toolworker runs on a distinct model (gpt-4o-mini) from
+  the parent (gpt-4o) so the mock LLM's per-model keyed queues
+  keep the parent's and sub-agent's scripted calls separate.
 
 executor:
   model: gpt-4o
@@ -22,10 +28,10 @@ tools:
   toolworker:
     type: agent
     description: |
-      Sub-agent with a LOCAL Python tool and a TOOL_CALL ASK
-      policy. (Tool dropped in AP→Omnigent conversion.)
+      Sub-agent with a LOCAL Python tool (echo) and a
+      TOOL_CALL ASK policy on tool_call:echo.
     executor:
-      model: gpt-4o
+      model: gpt-4o-mini
     prompt: |
       # Toolworker sub-agent
 

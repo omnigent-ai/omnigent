@@ -415,7 +415,9 @@ def _make_tool(
     *,
     has_inline_deps: bool = False,
     inline_deps: list[str] | None = None,
+    container_image: str | None = None,
     docker_image: str | None = None,
+    container_runtime: str = "docker",
     srt_available: bool = False,
     uv_available: bool = False,
     sandbox_enabled: bool = True,
@@ -430,7 +432,11 @@ def _make_tool(
         has_inline_deps=has_inline_deps,
         inline_deps=inline_deps,
     )
-    sandbox_config = SandboxConfig(docker_image=docker_image)
+    sandbox_config = SandboxConfig(
+        container_image=container_image,
+        docker_image=docker_image,
+        container_runtime=container_runtime,
+    )
     tools = load_local_python_tools(
         [info],
         tmp_path,
@@ -481,13 +487,49 @@ def test_build_command_srt_disabled(tmp_path: Path) -> None:
     assert cmd[0] == sys.executable
 
 
-def test_build_command_docker(tmp_path: Path) -> None:
-    """docker_image set → docker run command."""
-    tool = _make_tool(tmp_path, docker_image="python:3.11")
+def test_build_command_container(tmp_path: Path) -> None:
+    """container_image set → docker run command (default runtime)."""
+    tool = _make_tool(tmp_path, container_image="python:3.11")
     cmd = tool._build_command(state_root=None)
     assert cmd[0] == "docker"
     assert "run" in cmd
     assert "python:3.11" in cmd
+
+
+def test_build_command_docker_image_alias(tmp_path: Path) -> None:
+    """docker_image (deprecated alias) still works."""
+    tool = _make_tool(tmp_path, docker_image="python:3.11")
+    cmd = tool._build_command(state_root=None)
+    assert cmd[0] == "docker"
+    assert "python:3.11" in cmd
+
+
+def test_build_command_podman(tmp_path: Path) -> None:
+    """container_runtime='podman' → podman run command with network isolation."""
+    tool = _make_tool(tmp_path, container_image="python:3.11", container_runtime="podman")
+    cmd = tool._build_command(state_root=None)
+    assert cmd[0] == "podman"
+    assert "run" in cmd
+    assert "python:3.11" in cmd
+    assert "--network" in cmd
+    net_idx = cmd.index("--network")
+    assert cmd[net_idx + 1] == "none"
+
+
+def test_build_command_container_network_isolation(tmp_path: Path) -> None:
+    """Both runtimes include --network none for sandbox isolation."""
+    for runtime in ("docker", "podman"):
+        tool = _make_tool(tmp_path, container_image="python:3.11", container_runtime=runtime)
+        cmd = tool._build_command(state_root=None)
+        assert "--network" in cmd, f"{runtime}: missing --network flag"
+        net_idx = cmd.index("--network")
+        assert cmd[net_idx + 1] == "none", f"{runtime}: --network not set to none"
+
+
+def test_sandbox_config_rejects_invalid_runtime() -> None:
+    """SandboxConfig.__post_init__ rejects unknown container_runtime values."""
+    with pytest.raises(ValueError, match="container_runtime"):
+        SandboxConfig(container_runtime="rkt")  # type: ignore[arg-type]
 
 
 # ─── Schema + name plumbing ─────────────────────────────────────────

@@ -51,9 +51,10 @@ from omnigent.claude_native_bridge import (
     prepare_bridge_dir,
     write_tmux_target,
 )
-from tests._model_pools import resolve_model
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
+    reset_mock_llm,
     send_user_message_to_session,
     upload_agent,
 )
@@ -68,12 +69,6 @@ _BRIDGE_READY_TIMEOUT_S = 90.0
 # How long to poll comment statuses after the turn is injected.
 _COMMENT_POLL_TIMEOUT_S = 240.0
 _COMMENT_POLL_INTERVAL_S = 3.0
-
-# Databricks-gateway Claude model the launched CLI is pinned to (CLAUDE.md's
-# claude-native default). The workspace Anthropic gateway serves model ids like
-# this; without a pin, Claude Code normalises tier aliases to canonical
-# Anthropic names the gateway rejects.
-_CLAUDE_NATIVE_MODEL = resolve_model("databricks-claude-sonnet-4-6", key=__name__)
 
 # Claude Code treats this env var as "I'm already inside a Claude Code session"
 # and refuses to start a fresh one. The agent/CI process running this suite may
@@ -323,8 +318,7 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
     http_client: httpx.Client,
     claude_native_ui_agent: str,
     live_runner_id: str,
-    databricks_workspace_host: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Claude Code addresses review comments without being told which tools to use.
@@ -336,7 +330,10 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
     3. Start Claude Code in a private tmux window with the Omnigent
        MCP bridge (same as ``omnigent claude`` does).
     4. POST two draft comments on ``app.py`` via the REST API.
-    5. Ask the agent to address all open comments via the REST API.
+    5. Pre-configure the mock LLM with tool-call responses that call
+       ``list_comments`` then ``update_comment`` for both comment IDs so the
+       mock server drives the MCP relay round-trip deterministically.
+    6. Ask the agent to address all open comments via the REST API.
        The prompt explicitly says "use your available tools" and "in this
        session" so Claude targets the MCP relay tools (not GitHub CLI).
        Because this test launches Claude in its own tmux window (not via the
@@ -346,8 +343,8 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
        b. Awaits the ``notifications/tools/list_changed`` delivery so Claude
           re-fetches its tool list before the message is injected.
        c. Injects the user message into Claude's tmux window.
-    6. Poll comment statuses until both are ``"addressed"`` or timeout.
-    7. Assert both comments have status ``"addressed"``.
+    7. Poll comment statuses until both are ``"addressed"`` or timeout.
+    8. Assert both comments have status ``"addressed"``.
 
     **What breaks if this test fails:**
 
@@ -365,10 +362,8 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
     :param http_client: HTTP client pointed at the live server.
     :param claude_native_ui_agent: Registered agent name (``"claude-native-ui"``).
     :param live_runner_id: Runner id the session is bound to.
-    :param databricks_workspace_host: Workspace host from ``--profile``
-        (``None`` without a profile), used to build the Anthropic gateway URL.
-    :param llm_api_key: ``--llm-api-key`` value; under ``--profile`` this is
-        the Databricks workspace bearer used to authenticate the claude CLI.
+    :param mock_llm_server_url: Mock LLM server base URL (no ``/v1`` suffix —
+        the Anthropic SDK appends ``/v1/messages`` automatically).
     """
     # ── 0. Guard: opt-in + required binaries ─────────────────────────────────
     # TODO(claude-native-comments-ci): enable this in CI. Blocked on CI's
@@ -387,9 +382,7 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
             "via --profile oss with this gate set."
         )
     if shutil.which("claude") is None:
-        pytest.skip(
-            "'claude' CLI is not on PATH. Install and authenticate Claude Code to run this test."
-        )
+        pytest.skip("'claude' CLI is not on PATH. Install Claude Code to run this test.")
     if shutil.which("tmux") is None:
         pytest.skip(
             "'tmux' is not on PATH. This test requires tmux to run Claude Code headlessly."
@@ -402,61 +395,83 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
         runner_id=live_runner_id,
     )
 
-    # Authenticate the claude CLI against the Databricks Anthropic gateway the
-    # same way .github/workflows/ai-review.yml runs Claude Code: base URL ->
-    # <host>/serving-endpoints/anthropic, the workspace bearer as
-    # ANTHROPIC_AUTH_TOKEN, plus the gateway coding-agent header. Without a
-    # --profile (no gateway) nothing is injected and the developer's ambient
-    # claude login is used.
-    launch_env: dict[str, str] = {}
-    model: str | None = None
-    if databricks_workspace_host:
-        model = _CLAUDE_NATIVE_MODEL
-        launch_env = {
-            "ANTHROPIC_BASE_URL": f"{databricks_workspace_host}/serving-endpoints/anthropic",
-            # Authenticate via AUTH_TOKEN (sent as ``Authorization: Bearer``),
-            # NOT ANTHROPIC_API_KEY: a present API key makes Claude Code's
-            # interactive "use this API key?" gate block TUI startup, so the
-            # MCP bridge never spawns. This matches .github/workflows/ai-review.yml.
-            "ANTHROPIC_AUTH_TOKEN": llm_api_key,
-            "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
-            # Pin every tier alias to the one served gateway model so Claude
-            # Code's tier resolution (incl. its fast/background model) never
-            # emits a canonical Anthropic name the gateway rejects.
-            "ANTHROPIC_DEFAULT_FABLE_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": _CLAUDE_NATIVE_MODEL,
-        }
+    # ── 2. Add two draft comments to the session via REST ─────────────────
+    r1 = http_client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json={
+            "path": "app.py",
+            "body": "Typo: 'recieve' should be 'receive'.",
+            "start_index": 0,
+            "end_index": 20,
+            "anchor_content": "def recieve_data():",
+        },
+    )
+    r1.raise_for_status()
+    comment1_id: str = r1.json()["id"]
 
-    with _claude_code_session(session_id, model=model, launch_env=launch_env):
-        # ── 2. Add two draft comments to the session via REST ─────────────────
-        r1 = http_client.post(
-            f"/v1/sessions/{session_id}/comments",
-            json={
-                "path": "app.py",
-                "body": "Typo: 'recieve' should be 'receive'.",
-                "start_index": 0,
-                "end_index": 20,
-                "anchor_content": "def recieve_data():",
+    r2 = http_client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json={
+            "path": "app.py",
+            "body": "Variable name 'x' is not descriptive; rename to 'count'.",
+            "start_index": 100,
+            "end_index": 110,
+            "anchor_content": "x = 0",
+        },
+    )
+    r2.raise_for_status()
+    comment2_id: str = r2.json()["id"]
+
+    # ── 3. Pre-configure mock LLM with tool-call responses ─────────────────
+    # The mock server returns these responses in order for any model key.
+    # The Claude CLI executes the tool_use blocks as real MCP calls against
+    # the relay, so comment status changes reach the Omnigent server even
+    # though the LLM itself is a mock.  We configure with the actual IDs
+    # now (after posting) so update_comment receives the right targets.
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            # Turn 1: list open comments.
+            {
+                "tool_calls": [
+                    {"name": "list_comments", "arguments": "{}"},
+                ]
             },
-        )
-        r1.raise_for_status()
-        comment1_id: str = r1.json()["id"]
-
-        r2 = http_client.post(
-            f"/v1/sessions/{session_id}/comments",
-            json={
-                "path": "app.py",
-                "body": "Variable name 'x' is not descriptive; rename to 'count'.",
-                "start_index": 100,
-                "end_index": 110,
-                "anchor_content": "x = 0",
+            # Turn 2: address comment 1.
+            {
+                "tool_calls": [
+                    {
+                        "name": "update_comment",
+                        "arguments": (f'{{"comment_id": "{comment1_id}", "status": "addressed"}}'),
+                    }
+                ]
             },
-        )
-        r2.raise_for_status()
-        comment2_id: str = r2.json()["id"]
+            # Turn 3: address comment 2.
+            {
+                "tool_calls": [
+                    {
+                        "name": "update_comment",
+                        "arguments": (f'{{"comment_id": "{comment2_id}", "status": "addressed"}}'),
+                    }
+                ]
+            },
+            # Turn 4: final text reply.
+            {"text": "I have addressed all open comments."},
+        ],
+    )
 
+    # Route the Claude CLI's LLM calls to the mock server.  ANTHROPIC_API_KEY
+    # bypasses the CLI's OAuth login gate so no real account is needed.
+    # CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS suppresses beta headers the mock
+    # server does not expect.
+    launch_env: dict[str, str] = {
+        "ANTHROPIC_BASE_URL": mock_llm_server_url,
+        "ANTHROPIC_API_KEY": "mock-key",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+
+    with _claude_code_session(session_id, model=None, launch_env=launch_env):
         # Confirm both comments start as draft so we know the "addressed" state
         # at the end can only have been set by the agent.
         pre_resp = http_client.get(f"/v1/sessions/{session_id}/comments")
@@ -471,7 +486,7 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
             f"Expected comment 2 to start as 'draft', got {pre_statuses.get(comment2_id)!r}"
         )
 
-        # ── 3. Ask the agent to address comments — no tool names in the prompt
+        # ── 4. Ask the agent to address comments — no tool names in the prompt
         # The runner will:
         #   a. Call _start_comment_relay_for_session → write tool_relay.json
         #   b. Send notifications/tools/list_changed so Claude re-fetches tools
@@ -489,7 +504,7 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
             ),
         )
 
-        # ── 4. Poll comment statuses until both are addressed ─────────────────
+        # ── 5. Poll comment statuses until both are addressed ─────────────────
         # Claude processes the injected message, calls list_comments to find
         # the draft comments, then calls update_comment on each. These tool
         # calls go through the relay HTTP server running in the runner process
@@ -507,7 +522,7 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
                 break
             time.sleep(_COMMENT_POLL_INTERVAL_S)
 
-        # ── 5. Assert final comment statuses ─────────────────────────────────
+        # ── 6. Assert final comment statuses ─────────────────────────────────
         # Capture tmux pane for diagnostics.
         try:
             _tfile = bridge_dir_for_bridge_id(session_id) / "tmux.json"

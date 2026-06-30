@@ -28,8 +28,12 @@ import yaml as _yaml
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
+    _build_goose_spawn_env,
+    _build_kimi_spawn_env,
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
+    _build_qwen_spawn_env,
+    _resolve_provider_for_build,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -91,6 +95,7 @@ def _make_spec(
     model: str | None = None,
     profile: str | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
+    os_env: object | None = None,
 ) -> AgentSpec:
     """
     Build a minimal :class:`AgentSpec` for a given harness.
@@ -115,6 +120,7 @@ def _make_spec(
         instructions="You are a test agent.",
         executor=ExecutorSpec(type="omnigent", config=config, model=model, auth=auth),
         llm=LLMConfig(model=model) if model is not None else None,
+        os_env=os_env,  # type: ignore[arg-type]
     )
 
 
@@ -282,6 +288,120 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+def test_codex_falls_back_to_first_available_openai_credential(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A configured-but-not-default openai credential routes the codex head at spawn.
+
+    The headline fix: a user who configured an openai-family credential via
+    ``omnigent setup`` (a Databricks workspace, or any key/gateway) but never
+    marked it ``default`` would otherwise launch Debby's GPT (codex) head with NO
+    credential — codex's own "Invalid API key". The spawn-env builder now falls
+    back to the first credential that can serve the head's family, so the head
+    launches. This lives in the RUNNER — every launch surface (CLI, web UI, a
+    remote host) funnels through the spawn-env build — and resolves per spawn:
+    nothing is written to the user's config.
+
+    HOME is isolated and OPENROUTER cleared so the only openai-family credential
+    in play is the configured-but-not-default one (no ambient login/key shadows
+    the fallback).
+    """
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = {
+        "providers": {
+            "vendor-openai": {  # configured, but NOT marked default
+                "kind": "key",
+                "openai": _key_family(
+                    "https://openai.example.com/v1",
+                    "sk-oai-secret",
+                    "gpt-default-model",
+                ),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    before = (config_home / "config.yaml").read_text()
+    spec = _make_spec(harness="codex")  # unpinned, no auth — like Debby's GPT head
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    # The fallback credentialed the head — full gateway wiring, same as a default.
+    assert env["HARNESS_CODEX_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openai.example.com/v1"
+    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    # Resolved per spawn — the user's config is NOT mutated (no default written).
+    assert (config_home / "config.yaml").read_text() == before
+    # The fallback is spawn-only: the readout-style resolver (flag off, the
+    # default) still returns nothing, so /model won't show an unchosen default.
+    assert _resolve_provider_for_build(spec, harness_type="codex") is None
+
+
+def test_claude_sdk_falls_back_to_first_available_anthropic_credential(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A configured-but-not-default anthropic credential routes the BRAIN head at spawn.
+
+    The brain-head counterpart to the codex fallback — Debby's Claude head /
+    Polly's claude-sdk brain, the most-used surface. With an anthropic
+    credential configured but never marked default, the spawn-env builder falls
+    back to it via the same `first_available_provider`, so the brain launches
+    instead of hitting api.anthropic.com with no key. Resolved per spawn; the
+    config is not mutated; the readout resolver (`for_launch=False`) still
+    returns `None`. HOME is isolated so a real CLI login can't shadow the test.
+    """
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = {
+        "providers": {
+            "vendor-anthropic": {  # configured, but NOT marked default
+                "kind": "key",
+                "anthropic": _key_family(
+                    "https://anthropic.example.com/v1",
+                    "sk-ant-secret",
+                    "claude-default-model",
+                ),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    before = (config_home / "config.yaml").read_text()
+    spec = _make_spec(harness="claude-sdk")  # unpinned, no auth — like Debby's Claude head
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+    assert (config_home / "config.yaml").read_text() == before
+    assert _resolve_provider_for_build(spec, harness_type="claude-sdk") is None
+
+
+def test_for_launch_gates_legacy_databricks_synthesis(config_home: Path) -> None:
+    """
+    A legacy Databricks credential is folded into a synthesized provider only
+    for a launch.
+
+    A legacy ``executor.profile`` resolves to a synthesized ``databricks``
+    provider when ``for_launch=True`` (the spawn-env builders), but the readout
+    resolver (``for_launch=False``, the default — used by ``/model`` / cost)
+    returns ``None``. This locks the new gating so the readout never presents a
+    synthesized provider for a legacy profile the way a launch routes one.
+    """
+    _write_config(config_home, {})
+    spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
+
+    # Readout: strict — the legacy profile is NOT synthesized into a provider.
+    assert _resolve_provider_for_build(spec, harness_type="codex") is None
+    # Launch: the legacy profile resolves to a synthesized databricks provider.
+    launch = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+    assert launch is not None
+    assert launch.kind == "databricks"
+    assert launch.profile == "legacy-profile"
 
 
 def test_openai_agents_uses_openai_global_default(config_home: Path) -> None:
@@ -575,6 +695,92 @@ def test_openai_agents_falls_back_to_catalog_default_model(config_home: Path) ->
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == catalog_default
 
 
+def test_qwen_uses_openai_global_default(config_home: Path) -> None:
+    """
+    A ``default: true`` openai provider routes the qwen harness.
+
+    Qwen consumes the openai family (OpenAI-compatible wire), so it should
+    emit env vars for gateway configuration.
+    """
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="qwen")
+
+    env = _build_qwen_spawn_env(spec, workdir=None)
+
+    # qwen uses OpenAI-compatible provider routing via HARNESS_QWEN_GATEWAY
+    assert env["HARNESS_QWEN_GATEWAY"] == "true"
+    # The base URL host is the origin of the gateway endpoint
+    assert env["HARNESS_QWEN_GATEWAY_HOST"] == "https://openai.example.com"
+    assert env["HARNESS_QWEN_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    # Model comes from provider's default_model
+    assert env["HARNESS_QWEN_MODEL"] == "gpt-default-model"
+
+
+def test_goose_spawn_env_forwards_model_and_no_gateway(config_home: Path) -> None:
+    """The headless goose builder forwards a spec model as ``HARNESS_GOOSE_MODEL``
+    and wires NO provider/gateway credential (Goose owns its own auth)."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="goose", model="claude-haiku-4-5")
+
+    env = _build_goose_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_GOOSE_MODEL"] == "claude-haiku-4-5"
+    # Unlike qwen, goose emits no gateway/provider env (uses goose configure).
+    assert not any(k.startswith("HARNESS_GOOSE_GATEWAY") for k in env)
+    assert "OPENAI_API_KEY" not in env and "GOOSE_PROVIDER" not in env
+
+
+def test_goose_spawn_env_drops_databricks_model(config_home: Path) -> None:
+    """A ``databricks-*`` model isn't a valid Goose model id, so it's dropped
+    (provider/model then come from the user's goose config)."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="goose", model="databricks-claude-opus-4-8")
+
+    env = _build_goose_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_GOOSE_MODEL" not in env
+
+
+def test_goose_spawn_env_no_model_is_empty(config_home: Path) -> None:
+    """With no spec model, goose falls back entirely to its ambient config."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="goose")
+
+    env = _build_goose_spawn_env(spec, workdir=None)
+
+    assert "HARNESS_GOOSE_MODEL" not in env
+
+
+def test_qwen_falls_back_to_catalog_default_model(config_home: Path) -> None:
+    """
+    An openai ``key`` provider with no ``models.default`` resolves the
+    catalog default for the qwen harness.
+
+    Proves the analogous fallback in :func:`_build_qwen_spawn_env`.
+    """
+    from omnigent.onboarding.providers import default_chat_model
+
+    config: dict[str, object] = {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": True,
+                "openai": _key_family_no_model("https://api.openai.com/v1", "sk-oai-secret"),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="qwen")
+
+    env = _build_qwen_spawn_env(spec, workdir=None)
+
+    catalog_default = default_chat_model("openai")
+    assert catalog_default is not None
+    # qwen uses the single gateway base URL (not JSON object like pi)
+    assert env["HARNESS_QWEN_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
+    assert env["HARNESS_QWEN_MODEL"] == catalog_default
+
+
 def test_pi_falls_back_to_catalog_default_model(config_home: Path) -> None:
     """
     An anthropic ``key`` provider with no ``models.default`` resolves the
@@ -767,6 +973,28 @@ def test_legacy_profile_suppresses_global_default_provider(config_home: Path) ->
     assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
 
 
+def test_codex_spec_databricks_auth_routes_via_synthesized_provider(config_home: Path) -> None:
+    """
+    A spec ``executor.auth: {type: databricks}`` on codex routes via the
+    synthesized-provider path.
+
+    The codex / pi / qwen builders' legacy ``else``-branch was removed; a spec
+    ``DatabricksAuth`` now resolves (for a launch) to a synthesized
+    ``databricks`` provider that the one databricks apply branch wires. A
+    nonexistent profile keeps ucode a no-op, so this deterministically asserts
+    the gateway + profile wiring the fold owns (no ``~/.databrickscfg`` needed).
+    """
+    _write_config(config_home, {})
+    spec = _make_spec(harness="codex", auth=DatabricksAuth(profile="test-dbx-ws"))
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "test-dbx-ws"
+    # A databricks-kind provider delegates to ucode and never emits a raw base_url.
+    assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
+
+
 # ── cli-config kind: model_provider pinning ─────────────────────────────────
 
 
@@ -853,6 +1081,39 @@ def test_openai_agents_cli_config_default_fails_loud(config_home: Path) -> None:
         _build_openai_agents_sdk_spawn_env(spec)
 
 
+def test_pi_cli_config_databricks_default_routes_gateway(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cli-config Databricks gateway default routes the pi (gateway) harness.
+
+    Unlike openai-agents (which fails loud), pi CAN consume a cli-config
+    Databricks AI Gateway — the gateway's Anthropic Messages surface is one Pi
+    speaks. The gateway-harness pi path must translate it into the
+    ``HARNESS_PI_GATEWAY_*`` transport (the same vars an inline gateway emits),
+    pointing at the gateway's ``/anthropic`` surface — NOT raise the
+    "can only drive the 'codex' harness" error.
+    """
+    _isolate_home_with_codex_config(config_home, monkeypatch)
+    _write_config(config_home, _cli_config_default_config())
+    spec = _make_spec(harness="pi")
+
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    # The gateway's codex /codex/v1 base_url is rewritten to the /anthropic
+    # surface Pi speaks natively, registered under pi's "claude" family key.
+    assert env["HARNESS_PI_GATEWAY_BASE_URLS"] == (
+        '{"claude": "https://example.ai-gateway.cloud.databricks.com/anthropic"}'
+    )
+    assert env["HARNESS_PI_GATEWAY_HOST"] == "https://example.ai-gateway.cloud.databricks.com"
+    # The bearer-token command comes from the codex [model_providers.X.auth]
+    # table (the "!" Pi-models.json prefix is stripped for the transport var).
+    # The fixture's [auth] declares command="jq" with no args, so it is "jq".
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "jq"
+    # Default model is the Databricks gateway default (no spec/override model).
+    assert env["HARNESS_PI_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
 _DISMISSIBLE_CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
@@ -917,3 +1178,124 @@ def test_codex_undismissed_config_provider_routes_via_detection(
     env = _build_codex_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "Databricks"
+
+
+# ── Kimi Code CLI spawn-env ────────────────────────────────────────────────
+
+
+def test_kimi_spawn_env_threads_spec_model_only(config_home: Path) -> None:
+    """The kimi builder only emits ``HARNESS_KIMI_MODEL`` (when set) and
+    ``HARNESS_KIMI_CWD`` (when workdir given). Upstream kimi has no per-spawn
+    provider override, so no HARNESS_KIMI_GATEWAY_* / _DATABRICKS_PROFILE
+    env vars are emitted — provider routing lives in ``~/.kimi/config.toml``."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi", model="kimi-k2-turbo")
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert env == {"HARNESS_KIMI_MODEL": "kimi-k2-turbo"}
+
+
+def test_kimi_cwd_threads_through_as_subprocess_cwd(config_home: Path, tmp_path: Path) -> None:
+    """``cwd`` (the session workspace) lands in ``HARNESS_KIMI_CWD`` so kimi's
+    subprocess operates on the user's project — NOT the /tmp agent bundle dir.
+
+    Regression: the builder previously threaded the bundle ``workdir`` here, so
+    `omni --harness kimi` / web kimi sessions ran kimi out of the bundle dir and
+    it reported only ``kimi.yaml`` instead of the repo. Mirrors pi's cwd."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi")
+
+    env = _build_kimi_spawn_env(spec, cwd=tmp_path)
+
+    assert env["HARNESS_KIMI_CWD"] == str(tmp_path)
+
+
+def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
+    """With no provider configured and no spec auth, kimi uses its own
+    ``kimi login`` credentials — no HARNESS_KIMI_GATEWAY_* leaks in.
+
+    A regression here would either steal an ambient OPENAI_API_KEY (mis-billing)
+    or point at a stale URL the user never configured. Upstream kimi reads its
+    provider config from ``~/.kimi/config.toml``; Omnigent never injects."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi")
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
+    assert "HARNESS_KIMI_GATEWAY_PROVIDER" not in env
+    assert "HARNESS_KIMI_DATABRICKS_PROFILE" not in env
+
+
+def test_kimi_ignores_global_default_provider(config_home: Path) -> None:
+    """An openai default provider does NOT inject creds into the kimi env.
+
+    Counterpart to the other harnesses: their spawn-env builders adopt the
+    global default. For kimi we DO NOT — upstream has no per-spawn provider
+    override flag, so silently injecting a key the executor can't pass to the
+    subprocess would be misleading (and would mis-bill the user against an
+    OpenAI key when their ``~/.kimi/config.toml`` actually points at
+    Moonshot). The builder emits no gateway vars regardless of what's
+    configured."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="kimi")
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        ApiKeyAuth(api_key="sk-secret"),
+        DatabricksAuth(profile="my-profile"),
+        ProviderAuth(name="vendor-named"),
+    ],
+)
+def test_kimi_declared_auth_raises(
+    config_home: Path,
+    auth: ApiKeyAuth | DatabricksAuth | ProviderAuth,
+) -> None:
+    """A kimi spec that declares any ``executor.auth`` fails loud.
+
+    Upstream kimi has no per-spawn provider override (no ``--config-file`` /
+    ``--mcp-config-file``), so declared auth can't be threaded. Silently
+    launching against whatever ambient ``~/.kimi/config.toml`` resolves to
+    would be a confused-deputy / mis-attribution risk, so the builder raises
+    instead. Regression guard for the originally-dead ``OmnigentError``."""
+    from omnigent.errors import OmnigentError
+
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="kimi", auth=auth)
+
+    with pytest.raises(OmnigentError, match=r"kimi.*does not support"):
+        _build_kimi_spawn_env(spec, cwd=None)
+
+
+def test_kimi_os_env_serialized(config_home: Path) -> None:
+    """``spec.os_env`` is serialized into ``HARNESS_KIMI_OS_ENV`` so the wrap
+    can rebuild the sandbox spec and confine kimi's in-process Bash/edit/read
+    tools — parity with every sibling builder. Without this the executor's
+    sandbox launcher never engages and kimi runs unconfined."""
+    import json as _json
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {"providers": {}})
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        fork=False,
+    )
+    spec = _make_spec(harness="kimi", os_env=os_env)
+
+    env = _build_kimi_spawn_env(spec, cwd=None)
+
+    assert "HARNESS_KIMI_OS_ENV" in env
+    decoded = _json.loads(env["HARNESS_KIMI_OS_ENV"])
+    assert decoded["sandbox"]["type"] == "darwin_seatbelt"

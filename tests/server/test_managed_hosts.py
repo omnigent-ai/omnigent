@@ -11,12 +11,16 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
+    BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
+    KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
+    OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
     RepoWorkspace,
     launch_managed_host,
@@ -33,9 +37,13 @@ from omnigent.stores.host_store import HostStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
+    install_fake_boxlite_launcher,
     install_fake_daytona_launcher,
+    install_fake_e2b_launcher,
     install_fake_islo_launcher,
+    install_fake_kubernetes_launcher,
     install_fake_modal_launcher,
+    install_fake_openshell_launcher,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -196,6 +204,92 @@ def test_parse_daytona_without_section_defaults(
     assert fake.env is None
 
 
+def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented boxlite YAML shape (cloud: remote ``boxlite serve``)
+    parses into a config whose factory constructs boxlite launchers
+    carrying the endpoint, image, and env-passthrough names, with the
+    boxlite token TTL (no platform lifetime cap; 7-day policy bound).
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "boxlite",
+            "server_url": "https://srv.example.com/",
+            "boxlite": {
+                "image": "docker.io/me/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "cloud": {"endpoint": "https://boxlite.example.com:8100"},
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == BOXLITE_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "boxlite"
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.endpoint == "https://boxlite.example.com:8100"
+    assert fake.image == "docker.io/me/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+
+
+def test_parse_boxlite_without_section_defaults_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: boxlite` + `server_url` is a complete config: the boxlite
+    block is optional, so endpoint/image/env reach the launcher as None
+    — LOCAL mode (embedded micro-VMs on the server host, no endpoint).
+    """
+    cfg = parse_sandbox_config({"provider": "boxlite", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.endpoint is None
+    assert fake.image is None
+    assert fake.env is None
+
+
+def test_parse_boxlite_local_customization_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `sandbox.boxlite.home_dir` + `registry` reach the launcher: a custom data
+    dir and a private-registry block (credential env NAMES, never values).
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "boxlite",
+            "server_url": "https://s.example.com",
+            "boxlite": {
+                "local": {
+                    "home_dir": "/data/boxlite",
+                    "registry": {
+                        "host": "ghcr.io",
+                        "username_env": "GHCR_USER",
+                        "password_env": "GHCR_PAT",
+                    },
+                },
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_boxlite_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.home_dir == "/data/boxlite"
+    assert fake.registry == {
+        "host": "ghcr.io",
+        "username_env": "GHCR_USER",
+        "password_env": "GHCR_PAT",
+    }
+
+
 def test_parse_valid_islo_config_builds_parameterized_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -264,6 +358,200 @@ def test_parse_islo_without_section_defaults(
     assert fake.disk_gb is None
 
 
+def test_parse_valid_e2b_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented e2b YAML shape parses into a config whose factory
+    constructs E2B launchers carrying the configured template name and
+    env-passthrough names, with the e2b token TTL (24h cap → mirror
+    Modal's 25h token lifetime).
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "e2b",
+            "server_url": "https://srv.example.com/",
+            "e2b": {
+                "template": "omnigent-host",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == e2b_managed_token_ttl_s()
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "e2b"
+    fake = FakeSandboxLauncher()
+    install_fake_e2b_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.template == "omnigent-host"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+
+
+def test_parse_e2b_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: e2b` + `server_url` is a complete config: template and
+    env are optional and reach the launcher as None (its own env-var
+    fallbacks / default-template apply).
+    """
+    cfg = parse_sandbox_config({"provider": "e2b", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_e2b_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.template is None
+    assert fake.env is None
+
+
+def test_parse_e2b_template_rejects_non_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A present-but-malformed e2b template fails loud at parse time."""
+    with pytest.raises(ValueError, match=r"sandbox\.e2b\.template"):
+        parse_sandbox_config(
+            {
+                "provider": "e2b",
+                "server_url": "https://s.example.com",
+                "e2b": {"template": ""},
+            }
+        )
+
+
+def test_parse_valid_openshell_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented openshell YAML shape parses into a config whose
+    factory constructs OpenShell launchers carrying image, env names,
+    and the optional gateway cluster.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "openshell",
+            "server_url": "https://srv.example.com/",
+            "openshell": {
+                "image": "docker.io/me/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "cluster": "my-gateway",
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == OPENSHELL_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "openshell"
+    fake = FakeSandboxLauncher()
+    install_fake_openshell_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "docker.io/me/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.cluster == "my-gateway"
+
+
+def test_parse_openshell_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: openshell` + `server_url` is a complete config: optional
+    constructor fields reach the launcher as None so its env-var
+    fallbacks / official-image default / active-gateway apply.
+    """
+    cfg = parse_sandbox_config({"provider": "openshell", "server_url": "https://s.example.com"})
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_openshell_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.cluster is None
+
+
+def test_parse_valid_kubernetes_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented kubernetes YAML shape parses into a config whose factory
+    constructs Kubernetes launchers carrying namespace / Secret / SA / node
+    selector / in-cluster / resources, with the 7-day token TTL.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://omnigent.omnigent.svc.cluster.local/",
+            "kubernetes": {
+                "image": "ghcr.io/me/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "namespace": "omnigent-sandboxes",
+                "secret_name": "omnigent-creds",
+                "service_account": "omnigent-runner",
+                "node_selector": {"omnigent.ai/runner-ready": "true"},
+                "in_cluster": True,
+                "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "http://omnigent.omnigent.svc.cluster.local"
+    assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "kubernetes"
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "ghcr.io/me/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.namespace == "omnigent-sandboxes"
+    assert fake.secret_name == "omnigent-creds"
+    assert fake.service_account == "omnigent-runner"
+    assert fake.node_selector == {"omnigent.ai/runner-ready": "true"}
+    assert fake.in_cluster is True
+    assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
+
+
+def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `provider: kubernetes` + `server_url` is a complete config: optional fields
+    reach the launcher as None so its env-var fallbacks / defaults apply.
+    """
+    cfg = parse_sandbox_config(
+        {"provider": "kubernetes", "server_url": "http://s.svc.cluster.local"}
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.namespace is None
+    assert fake.secret_name is None
+    assert fake.in_cluster is None
+    assert fake.resources is None
+
+
+@pytest.mark.parametrize(
+    ("kubernetes_block", "expected_fragment"),
+    [
+        ({"namespace": "Bad_NS"}, "sandbox.kubernetes.namespace"),
+        ({"node_selector": {"omnigent.ai/x": "Bad Value"}}, "node_selector"),
+        ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
+        ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
+        ({"in_cluster": "yes"}, "must be a boolean"),
+    ],
+)
+def test_parse_kubernetes_invalid_block_fails_loud(
+    kubernetes_block: dict[str, object], expected_fragment: str
+) -> None:
+    """An operator typo in the kubernetes block fails parse loud, not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": kubernetes_block,
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_fragment"),
     [
@@ -295,6 +583,118 @@ def test_parse_islo_without_section_defaults(
             {"provider": "daytona", "server_url": "https://s", "daytona": {"env": ["", "X"]}},
             "sandbox.daytona.env",
         ),
+        # boxlite section present but malformed.
+        ({"provider": "boxlite", "server_url": "https://s", "boxlite": "x"}, "sandbox.boxlite"),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"image": "  "}},
+            "sandbox.boxlite.image",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"env": "OPENAI"}},
+            "sandbox.boxlite.env",
+        ),
+        # boxlite mode blocks (local / cloud are mutually exclusive).
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"local": {}, "cloud": {"endpoint": "https://b"}},
+            },
+            "mutually exclusive",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"cloud": "x"}},
+            "sandbox.boxlite.cloud",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"cloud": {"endpoint": "  "}},
+            },
+            "sandbox.boxlite.cloud.endpoint",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"local": "x"}},
+            "sandbox.boxlite.local",
+        ),
+        # A bare `cloud:` / `local:` YAML key (value None) is malformed — it must
+        # be rejected, not silently fall through to LOCAL mode (a `cloud:` typo
+        # would otherwise run locally with no diagnostic).
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"cloud": None}},
+            "sandbox.boxlite.cloud",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"local": None}},
+            "sandbox.boxlite.local",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"local": {"home_dir": "  "}},
+            },
+            "sandbox.boxlite.local.home_dir",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"local": {"registry": "x"}},
+            },
+            "sandbox.boxlite.local.registry",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"local": {"registry": {"transport": "https"}}},
+            },
+            "sandbox.boxlite.local.registry.host",
+        ),
+        # M3: bearer token + basic auth both set (boxlite silently drops basic).
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {
+                    "local": {
+                        "registry": {"host": "ghcr.io", "token_env": "T", "password_env": "P"}
+                    }
+                },
+            },
+            "mutually exclusive",
+        ),
+        # M4: misplaced / unknown keys are rejected, not silently ignored.
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"endpoint": "https://b"},
+            },
+            "unknown key",
+        ),
+        (
+            {"provider": "boxlite", "server_url": "https://s", "boxlite": {"bogus": 1}},
+            "unknown key",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"cloud": {"endpoint": "https://b", "bogus": 1}},
+            },
+            "unknown key",
+        ),
+        (
+            {
+                "provider": "boxlite",
+                "server_url": "https://s",
+                "boxlite": {"local": {"registry": {"host": "ghcr.io", "passwrod_env": "P"}}},
+            },
+            "unknown key",
+        ),
         # islo section present but malformed.
         ({"provider": "islo", "server_url": "https://s", "islo": "x"}, "sandbox.islo"),
         (
@@ -320,6 +720,23 @@ def test_parse_islo_without_section_defaults(
         (
             {"provider": "islo", "server_url": "https://s", "islo": {"memory_mb": "large"}},
             "sandbox.islo.memory_mb",
+        ),
+        # openshell section present but malformed.
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": "x"},
+            "sandbox.openshell",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"image": "  "}},
+            "sandbox.openshell.image",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"env": ["", "X"]}},
+            "sandbox.openshell.env",
+        ),
+        (
+            {"provider": "openshell", "server_url": "https://s", "openshell": {"cluster": "  "}},
+            "sandbox.openshell.cluster",
         ),
     ],
 )
@@ -799,6 +1216,122 @@ async def test_launch_clone_failure_terminates_and_deletes_host(db_uri: str) -> 
     assert host_store.list_hosts(_OWNER) == []
     # The host never started — the clone failed first.
     assert fake.host_starts == []
+
+
+class _EntrypointFakeLauncher(FakeSandboxLauncher):
+    """
+    An entrypoint-as-host fake (like the kubernetes launcher): ``provision``
+    only RESERVES the sandbox id (no box created), and the host is started by a
+    ``start_host`` override — not the exec-model base default.
+
+    Records the ``start_host`` call and, to prove the token is armed BEFORE the
+    host starts, captures whether the token already resolves at call time (then
+    simulates the host dialing back).
+    """
+
+    provider: ClassVar[str] = "kubernetes"
+
+    def __init__(self, host_store: HostStore) -> None:
+        super().__init__()
+        self._host_store = host_store
+        self.start_calls: list[dict[str, object]] = []
+        self.token_resolved_at_start: bool = False
+
+    def provision(self, name: str) -> str:
+        """Reserve a sandbox id (no box created); recorded + deterministic."""
+        self.provisioned_names.append(name)
+        return f"omnigent-pod-{len(self.provisioned_names)}"
+
+    def run(self, sandbox_id: str, command: str, *, check: bool = True):
+        """The entrypoint model never execs in — the base default is overridden."""
+        raise AssertionError("entrypoint launcher must not exec via run()")
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        on_stage=None,
+    ) -> str:
+        """Record the call, prove the token already resolves, and connect."""
+        self.start_calls.append(
+            {
+                "sandbox_id": sandbox_id,
+                "token": token,
+                "host_id": host_id,
+                "server_url": server_url,
+                "repo_url": repo_url,
+                "repo_name": repo_name,
+            }
+        )
+        # The token was registered before start_host, so it resolves now.
+        self.token_resolved_at_start = self._host_store.resolve_launch_token(token) is not None
+        # Simulate the host's entrypoint dialing back over the tunnel.
+        self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
+        return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
+
+
+async def test_launch_entrypoint_provider_arms_token_before_launch_host(db_uri: str) -> None:
+    """
+    Entrypoint-as-host seam: the uniform launch path reserves the sandbox id via
+    provision(), registers the token, THEN calls start_host (never run) — so the
+    host authenticates the moment its entrypoint dials back, with no race.
+    """
+    host_store = HostStore(db_uri)
+    fake = _EntrypointFakeLauncher(host_store)
+
+    result = await launch_managed_host(
+        config=_injected_config(fake),
+        owner=_OWNER,
+        host_store=host_store,
+        repo=parse_repo_workspace("https://github.com/org/repo.git#main"),
+    )
+
+    # start_host ran once, with the reserved id and repo info.
+    assert len(fake.start_calls) == 1
+    call = fake.start_calls[0]
+    assert call["sandbox_id"] == "omnigent-pod-1"
+    assert call["server_url"] == "https://srv.example.com"
+    assert call["repo_url"] == "https://github.com/org/repo.git"
+    assert call["repo_name"] == "repo"
+    # The token was already resolvable when start_host ran (no dial-back race).
+    assert fake.token_resolved_at_start is True
+    # The workspace (cloned dir) is returned and the host is online + bound.
+    assert result.workspace == "/home/omnigent/workspace/repo"
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+    assert host.status == "online"
+    assert host.sandbox_provider == "kubernetes"
+    assert host.sandbox_id == "omnigent-pod-1"
+
+
+async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: str) -> None:
+    """
+    A start_host failure tears the sandbox down (by the reserved id) and deletes
+    the host row, exactly like the exec path.
+    """
+    host_store = HostStore(db_uri)
+
+    class _Failing(_EntrypointFakeLauncher):
+        def start_host(self, sandbox_id: str, **kwargs: object) -> str:
+            raise click.ClickException("pod could not be scheduled")
+
+    fake = _Failing(host_store)
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+        )
+    assert exc.value.status_code == 502
+    assert "pod could not be scheduled" in exc.value.detail
+    # The reserved sandbox was terminated and no host row survives.
+    assert fake.terminated == ["omnigent-pod-1"]
+    assert host_store.list_hosts(_OWNER) == []
 
 
 # ── relaunch_managed_host ───────────────────────────────────

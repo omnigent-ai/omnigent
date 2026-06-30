@@ -546,8 +546,10 @@ def login_databricks_workspace(workspace_url: str, *, console: Console | None = 
     import click
     from rich.console import Console
 
+    from omnigent.onboarding.databricks_config import normalize_workspace_url
+
     console = console or Console()
-    workspace_url = workspace_url.rstrip("/")
+    workspace_url = normalize_workspace_url(workspace_url)
     cli = find_databricks_cli()
     if cli is None:
         installer = (

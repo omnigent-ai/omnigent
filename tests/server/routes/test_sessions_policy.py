@@ -19,9 +19,11 @@ from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
 from omnigent.policies.types import PolicyAction, PolicyResult
 from omnigent.server.routes.sessions import (
+    _build_evaluation_context,
     _build_skill_slash_command_policy_body,
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
+    _persist_policy_deny_sentinel,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.spec import AgentSpec
@@ -84,11 +86,16 @@ class _FakeConversationStore:
             ci = ConversationItem(
                 id=f"item_{i}",
                 type=getattr(item, "type", "function_call"),
-                data=FunctionCallData(
-                    agent="test-agent",
-                    name="sys_os_shell",
-                    arguments="{}",
-                    call_id="call_1",
+                response_id=getattr(item, "response_id", "turn_1"),
+                data=getattr(
+                    item,
+                    "data",
+                    FunctionCallData(
+                        agent="test-agent",
+                        name="sys_os_shell",
+                        arguments="{}",
+                        call_id="call_1",
+                    ),
                 ),
                 created_at=1,
                 status="completed",
@@ -298,7 +305,7 @@ async def test_pending_verdict_registers_elicitation():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Requires user approval",
-        deciding_policy="approve_shell",
+        deciding_policies=["approve_shell"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
@@ -356,7 +363,7 @@ async def test_pending_verdict_carries_per_policy_ask_timeout():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Requires user approval",
-        deciding_policy="approve_shell",
+        deciding_policies=["approve_shell"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
@@ -679,7 +686,7 @@ async def test_input_ask_approved_falls_through_to_allow():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Deleting files requires approval",
-        deciding_policy="llm_prompt_classifier_policy",
+        deciding_policies=["llm_prompt_classifier_policy"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
@@ -696,6 +703,7 @@ async def test_input_ask_approved_falls_through_to_allow():
         engine: Any,
         result: PolicyResult,
         conversation_store: Any,
+        elicitation_id: str | None = None,
     ) -> bool:
         """Stand in for the server-side approval park; simulate approve.
 
@@ -757,7 +765,7 @@ async def test_input_ask_declined_denies():
     ask_result = PolicyResult(
         action=PolicyAction.ASK,
         reason="Deleting files requires approval",
-        deciding_policy="llm_prompt_classifier_policy",
+        deciding_policies=["llm_prompt_classifier_policy"],
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
@@ -772,6 +780,7 @@ async def test_input_ask_declined_denies():
         engine: Any,
         result: PolicyResult,
         conversation_store: Any,
+        elicitation_id: str | None = None,
     ) -> bool:
         """Stand in for the server-side approval park; simulate decline.
 
@@ -804,6 +813,35 @@ async def test_input_ask_declined_denies():
     # through (the dangerous direction).
     assert result["verdict"] == "deny"
     assert result["reason"] == "Deleting files requires approval"
+
+
+@pytest.mark.asyncio
+async def test_input_policy_deny_sentinel_persists_as_assistant_history():
+    """INPUT policy DENY stores the deny sentinel for later history reads."""
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+
+    await _persist_policy_deny_sentinel(
+        "sess_1",
+        conv,
+        "Request contains BLOCK_THIS_TOKEN",
+        conv_store,
+        agent_store,
+    )
+
+    assert len(conv_store.appended_items) == 1
+    item = conv_store.appended_items[0]
+    assert item.type == "message"
+    assert item.response_id.startswith("deny_")
+    assert item.data.role == "assistant"
+    assert item.data.agent == "test-agent"
+    assert item.data.content == [
+        {
+            "type": "output_text",
+            "text": "[Denied by policy: Request contains BLOCK_THIS_TOKEN]",
+        }
+    ]
 
 
 # ── OUTPUT policy tests (step 5.7) ──────────────────────────
@@ -916,3 +954,25 @@ async def test_output_deny_replaces_text():
     denied_text = denied_content[0]["text"]
     assert "[Denied by policy: Response contains a secret]" in denied_text
     assert "sk-1234" not in denied_text
+
+
+def test_build_evaluation_context_request_accepts_string_data() -> None:
+    """REQUEST-phase ``data`` may be a bare string and must NOT raise.
+
+    opencode's policy plugin sends the prompt text directly as ``data`` for
+    PHASE_REQUEST (``{"event": {"type": "PHASE_REQUEST", "data": "<prompt>"}}``).
+    The old code did ``data.get("text")`` unconditionally and ``AttributeError``ed
+    on a string, 500ing the evaluate endpoint — which silently failed the
+    request-phase gate OPEN (cost-over-budget terminal prompts sailed through).
+    """
+    ctx = _build_evaluation_context(Phase.REQUEST, "delete the prod database", {})
+    assert ctx.content == "delete the prod database"
+
+
+def test_build_evaluation_context_request_dict_still_works() -> None:
+    """The native-hook convention (dict with ``text``) still resolves."""
+    ctx = _build_evaluation_context(Phase.REQUEST, {"text": "hello"}, {})
+    assert ctx.content == "hello"
+    # ``content`` fallback also honored.
+    ctx2 = _build_evaluation_context(Phase.REQUEST, {"content": "hi"}, {})
+    assert ctx2.content == "hi"

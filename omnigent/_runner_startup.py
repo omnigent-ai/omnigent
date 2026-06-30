@@ -177,6 +177,8 @@ def runner_startup_progress(
         from rich.live import Live
         from rich.spinner import Spinner
 
+        from omnigent.inner.mascots import MASCOT_ART_COLOR
+
         # ``Console(stderr=True)`` keeps the spinner off stdout so piped
         # one-shot output (``omnigent run … -p "…"``) stays clean.
         # ``transient=True`` erases the spinner line on stop. We drive a
@@ -190,7 +192,7 @@ def runner_startup_progress(
         # and a CPR handshake — isn't disturbed by a stream proxy being
         # torn down a frame before the prompt's first paint.
         console = Console(stderr=True)
-        spinner = Spinner("dots", text=initial_message)
+        spinner = Spinner("dots", text=initial_message, style=MASCOT_ART_COLOR)
         live = Live(
             spinner,
             console=console,

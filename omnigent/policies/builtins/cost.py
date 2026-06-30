@@ -645,6 +645,134 @@ def user_daily_cost_budget(
     return evaluate  # type: ignore[return-value]
 
 
+# session_state key recording the highest ``ask_thresholds_usd`` checkpoint
+# the user has already approved continuing past for a SUBAGENT cost budget.
+# Unlike ``_ASK_APPROVED_KEY`` (which routes to the ROOT conversation), this
+# stays local to the child's own session_state so approvals are scoped to the
+# subagent, not the whole spawn tree.
+_SUBAGENT_ASK_APPROVED_KEY = "subagent_cost_ask_approved_usd"
+
+
+def _subtree_cost_usd(event: PolicyEvent) -> float:
+    """Read cumulative subtree cost (USD) from a policy event.
+
+    :param event: Policy event dict.
+    :returns: ``event["context"]["subtree_usage"]["total_cost_usd"]`` as a
+        float, or ``0.0`` when the field is absent / not yet priced.
+    """
+    context = event.get("context") or {}
+    subtree_usage = context.get("subtree_usage") or {}
+    raw = subtree_usage.get("total_cost_usd", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def subagent_cost_budget(
+    max_cost_usd: float | None = None,
+    ask_thresholds_usd: list[float] | None = None,
+    expensive_models: list[str] | None = None,
+) -> PolicyCallable:
+    """Factory: gate a sub-agent on its own subtree LLM spend (USD).
+
+    Identical gating logic to :func:`cost_budget`, but scoped to the
+    **child conversation's subtree** (itself + its descendants) rather
+    than the whole session tree. Reads
+    ``event["context"]["subtree_usage"]["total_cost_usd"]`` instead of
+    ``event["context"]["usage"]["total_cost_usd"]``.
+
+    Intended to be attached to a child session at spawn time via
+    ``sys_session_send``'s ``cost_budget`` argument. The parent sets the
+    budget; the child gates against its own subtree spend.
+
+    The soft-checkpoint approval key (``subagent_cost_ask_approved_usd``)
+    stays local to the child's ``session_state`` — it is NOT routed to
+    the root conversation, so approvals are scoped to the subagent.
+
+    :param max_cost_usd: Optional hard limit in USD for the subtree. Must be
+        ``> 0`` if provided. Either this or ask_thresholds_usd must be set.
+    :param ask_thresholds_usd: Optional soft warning checkpoints in USD.
+        Same semantics as :func:`cost_budget`.
+    :param expensive_models: Optional case-insensitive substring tokens.
+        Same semantics as :func:`cost_budget`.
+    :returns: A policy callable implementing the subtree budget gate.
+    :raises ValueError: If neither max_cost_usd nor ask_thresholds_usd is set,
+        or if validation fails.
+    """
+    # At least one of max_cost_usd or ask_thresholds_usd must be present.
+    if max_cost_usd is None and not ask_thresholds_usd:
+        raise ValueError("subagent_cost_budget requires max_cost_usd and/or ask_thresholds_usd")
+    if max_cost_usd is not None and max_cost_usd <= 0:
+        raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")
+    thresholds = sorted({float(t) for t in (ask_thresholds_usd or [])})
+    for t in thresholds:
+        if max_cost_usd is not None and not (0 < t < max_cost_usd):
+            raise ValueError(
+                f"each ask_thresholds_usd value must be in "
+                f"(0, max_cost_usd={max_cost_usd}), got {t!r}"
+            )
+    cfg = _resolve_expensive_models(expensive_models)
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate the subagent subtree cost budget for a request or tool call.
+
+        Same gating logic as :func:`cost_budget`'s ``evaluate``, reading
+        the subtree cost and using a local approval key.
+
+        :param event: Policy event dict.
+        :returns: DENY when over budget on an expensive model; ASK when
+            a new soft checkpoint is newly crossed; ALLOW otherwise.
+        """
+        phase = event.get("type")
+        if phase not in _GATED_PHASES:
+            return _ALLOW
+        cost = _subtree_cost_usd(event)
+        # Check hard limit if max_cost_usd is set.
+        if max_cost_usd is not None and cfg.hard_cap_enabled and cost >= max_cost_usd:
+            if _model_blocked_over_budget(
+                _current_model(event), cfg.expensive_tokens, cfg.exclude_tokens
+            ):
+                return {
+                    "result": "DENY",
+                    "reason": _over_budget_deny_reason(
+                        cost,
+                        max_cost_usd,
+                        cfg.expensive_tokens,
+                        _current_harness(event),
+                        phase=phase,
+                        policy_label="subagent cost-budget",
+                        budget_label="subagent cost budget",
+                    ),
+                }
+            return _ALLOW
+        # Check soft thresholds if ask_thresholds_usd is set.
+        if thresholds:
+            crossed = max((t for t in thresholds if cost >= t), default=None)
+            if crossed is not None:
+                state = event.get("session_state") or {}
+                approved_up_to = float(state.get(_SUBAGENT_ASK_APPROVED_KEY, 0.0) or 0.0)
+                if crossed > approved_up_to:
+                    limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd else ""
+                    return {
+                        "result": "ASK",
+                        "reason": (
+                            f"Subagent subtree cost ${cost:.2f} passed the ${crossed:.2f} "
+                            f"warning threshold{limit_str}. Continue?"
+                        ),
+                        "state_updates": [
+                            {
+                                "key": _SUBAGENT_ASK_APPROVED_KEY,
+                                "action": "set",
+                                "value": crossed,
+                            },
+                        ],
+                    }
+        return _ALLOW
+
+    return evaluate  # type: ignore[return-value]
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -720,5 +848,43 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
             },
             "required": ["max_cost_usd"],
         },
+    },
+    {
+        "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+        "kind": "factory",
+        "name": "Subagent Cost Budget",
+        "description": "Gates a sub-agent on its own subtree LLM spend (USD): once a hard limit "
+        "is reached DENY (the whole turn at the request phase, or each tool call) while still on "
+        "an expensive model (prompting a /model downgrade), and ASK for approval at each soft "
+        "warning checkpoint (request + tool-call phases). Reads "
+        "event.context.subtree_usage.total_cost_usd and event.context.model. Intended to be "
+        "attached to a child session via sys_session_send's cost_budget argument.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "max_cost_usd": {
+                    "type": "number",
+                    "description": "Hard limit in USD for the subtree; once cumulative subtree "
+                    "cost reaches it, tool calls are blocked while on an expensive model.",
+                },
+                "ask_thresholds_usd": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Optional soft warning checkpoints in USD; the subagent asks "
+                    "for approval the first time subtree spend crosses each (every value must "
+                    "be < max_cost_usd).",
+                },
+                "expensive_models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional case-insensitive substring tokens for the model "
+                    "tiers blocked once over budget (default: Fable + Opus + GPT-5, excluding "
+                    "the cheap -mini/-nano variants). An empty list disables the hard limit, "
+                    "leaving only the soft thresholds.",
+                },
+            },
+            "required": [],
+        },
+        "internal_only": True,
     },
 ]

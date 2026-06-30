@@ -5,8 +5,9 @@ Backend selection is fully determined by the agent spec:
 - **OpenAI model** → passthrough to OpenAI's native
   ``web_search_preview`` (server-side, uses the LLM API key).
 - **Other models** → requires ``search_provider`` in config
-  (``"google"`` or ``"perplexity"``) with the appropriate
-  credentials. No env var fallbacks — the spec is self-contained.
+  (``"google"``, ``"perplexity"``, or ``"nimble"``) with the
+  appropriate credentials. No env var fallbacks — the spec is
+  self-contained.
 
 Usage in config.yaml::
 
@@ -176,7 +177,7 @@ def _search(query: str, config: dict[str, str]) -> str:
     :param query: The search query string.
     :param config: Spec-level config. Required keys:
 
-        - ``search_provider``: ``"google"`` or ``"perplexity"``
+        - ``search_provider``: ``"google"``, ``"perplexity"``, or ``"nimble"``
         - ``api_key``: API key for the chosen backend
         - ``engine_id``: Required for Google only
 
@@ -190,6 +191,9 @@ def _search(query: str, config: dict[str, str]) -> str:
     if backend == "perplexity":
         return _run_perplexity(query, config)
 
+    if backend == "nimble":
+        return _run_nimble(query, config)
+
     return (
         "web_search requires configuration for non-OpenAI models. "
         "(For OpenAI models, web_search works automatically with no "
@@ -198,11 +202,12 @@ def _search(query: str, config: dict[str, str]) -> str:
         "  tools:\n"
         "    builtins:\n"
         "      - name: web_search\n"
-        "        search_provider: perplexity  # or google\n"
+        "        search_provider: perplexity  # or google, nimble\n"
         "        api_key: ${PERPLEXITY_API_KEY}\n\n"
         "Supported backends:\n"
         "  - google (requires api_key + engine_id)\n"
-        "  - perplexity (requires api_key)"
+        "  - perplexity (requires api_key)\n"
+        "  - nimble (requires api_key)"
     )
 
 
@@ -243,3 +248,22 @@ def _run_perplexity(query: str, config: dict[str, str]) -> str:
         return "Perplexity web search requires api_key in the web_search config."
 
     return _search_perplexity(query, config)
+
+
+def _run_nimble(query: str, config: dict[str, str]) -> str:
+    """
+    Run a Nimble web search query using spec config credentials.
+
+    :param query: The search query.
+    :param config: Must contain ``api_key``.
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_nimble import (
+        _search_nimble,
+    )
+
+    api_key = config.get("api_key")
+    if not api_key:
+        return "Nimble web search requires api_key in the web_search config."
+
+    return _search_nimble(query, config)

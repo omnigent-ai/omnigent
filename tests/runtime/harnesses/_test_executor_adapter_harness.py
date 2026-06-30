@@ -11,6 +11,7 @@ Four scripts:
 - ``"tool_call"``: a ToolCallRequest, then a ToolCallComplete
   with a result, then a TurnComplete (no further text).
 - ``"error"``: an ExecutorError event.
+- ``"cancelled"``: a TurnCancelled event.
 - ``"capture_messages"``: writes the received messages list as
   JSON to the path in ``MOCK_EXECUTOR_CAPTURE_PATH``, then
   emits a TurnComplete. Used to verify the full AP→harness→
@@ -39,6 +40,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
 )
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -121,6 +123,11 @@ def _build_tool_call() -> Executor:
                 name="echo_tool",
                 status=ToolCallStatus.SUCCESS,
                 result="tool result",
+                # A handles_tools_internally executor (e.g. antigravity) stamps
+                # the request's real call_id on the completion too, so the
+                # observed function_call and its function_call_output pair
+                # downstream (an id-less completion cannot pair and is dropped).
+                metadata={"call_id": "call_test_1"},
             ),
             TurnComplete(response=None),
         ]
@@ -142,6 +149,20 @@ def _build_error() -> Executor:
     return executor
 
 
+def _build_cancelled() -> Executor:
+    """
+    MockExecutor scripted with a provider-side :class:`TurnCancelled`.
+
+    The adapter should map this cleanly to ``response.cancelled`` rather than
+    falling through to ``response.completed``.
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    executor = MockExecutor()
+    executor._turns.append([TurnCancelled(reason="provider_cancelled")])
+    return executor
+
+
 def _build_capture_messages() -> Executor:
     """
     :class:`_CapturingExecutor` builder.
@@ -159,6 +180,7 @@ _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
     "error": _build_error,
+    "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
 }
 

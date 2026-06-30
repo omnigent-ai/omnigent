@@ -1,0 +1,47 @@
+---
+# Namespaced Role granting the server EXACTLY what the entrypoint-as-host
+# launcher calls — nothing more (no watch, no pods/exec). Lives in the DEDICATED
+# runner namespace `omnigent-sandboxes` and is bound to the omnigent-server SA
+# (in `omnigent`) via the cross-namespace rolebinding.yaml. Because the grant is
+# a namespaced Role here, it can ONLY ever touch objects in `omnigent-sandboxes`,
+# never the server/DB Pods or Secrets in `omnigent`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: omnigent-sandbox-manager
+  namespace: omnigent-sandboxes
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+rules:
+  # Manage the lifecycle of runner Pods, scoped to exactly what the launcher
+  # calls: provision_managed_host() creates them, the pod-start wait reads them
+  # (read_namespaced_pod is a `get`), and terminate() deletes them. The launcher
+  # never watches Pods, so `watch` is omitted. NOTE: there is deliberately NO
+  # `pods/exec` grant — the host runs as the Pod's OWN entrypoint
+  # (`omnigent host` under a PID-1 reaper), so the server never execs into a
+  # running container. Dropping exec removes the most powerful grant a
+  # compromised server could abuse (arbitrary in-Pod command execution).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  # Start-failure diagnostics ONLY: when a Pod won't start, the launcher tails
+  # the failed container's log (e.g. the init container's `git clone` error) so
+  # the launch error names WHAT failed instead of a generic timeout. Read-only.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # The per-launch token rides a per-Pod Secret (referenced by the Pod's
+  # `secretKeyRef`), so the launch token never enters the Pod spec or any
+  # audit-logged surface. The launcher creates that Secret at provision and
+  # deletes it alongside the Pod at terminate — hence create + delete (no get:
+  # the launcher never reads Secrets back, and the harness-credentials Secret is
+  # operator-managed, not touched here).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  # Surface scheduler/kubelet events (FailedScheduling, Failed pull, …) in the
+  # provider's error messages when a Pod won't become ready.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]

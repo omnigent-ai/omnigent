@@ -11,8 +11,10 @@ from a hostile cross-origin page.
 
 This module provides:
 
-- :func:`websocket_origin_allowed` — the pure policy function deciding
-  whether a handshake's ``Origin`` is acceptable for the current mode;
+- :func:`origin_allowed` — the pure, protocol-neutral policy function
+  deciding whether a connection's ``Origin`` is acceptable for the
+  current mode (shared by the WebSocket middleware here and the HTTP
+  ``require_trusted_origin`` dependency);
 - :class:`WebSocketOriginMiddleware` — an ASGI middleware that applies the
   policy to every WebSocket handshake *before* it reaches a route handler,
   so the check runs before any ``websocket.accept()`` (per the rule in
@@ -33,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
@@ -51,9 +54,9 @@ __all__ = [
     "FORBIDDEN_ORIGIN_CLOSE_CODE",
     "OMNIGENT_INTERNAL_WS_ORIGIN",
     "WebSocketOriginMiddleware",
+    "origin_allowed",
     "origin_hostname_is_loopback",
     "parse_allowed_origins",
-    "websocket_origin_allowed",
 ]
 
 # Optional comma-separated allowlist of additional permitted origins. When
@@ -110,29 +113,35 @@ def parse_allowed_origins() -> frozenset[str]:
     return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
 
-def websocket_origin_allowed(
+def origin_allowed(
     origin: str | None,
     *,
     local_mode: bool,
     extra_allowed: frozenset[str],
 ) -> bool:
-    """Decide whether a WebSocket handshake's ``Origin`` is acceptable.
+    """Decide whether a connection's ``Origin`` header is acceptable.
+
+    Protocol-neutral origin policy shared by the WebSocket handshake
+    middleware (:class:`WebSocketOriginMiddleware`) and the HTTP
+    ``require_trusted_origin`` dependency, so both surfaces enforce one
+    trust boundary.
 
     Policy:
 
     - The first-party sentinel (:data:`OMNIGENT_INTERNAL_WS_ORIGIN`) and
       any origin in ``extra_allowed`` are always allowed.
     - A missing ``Origin`` is allowed: non-browser clients never send one,
-      and browsers always do, so its absence is not a browser CSWSH
-      vector.
+      and browsers always do (the header is on the forbidden-header list,
+      so page JS cannot strip or forge it), so its absence is not a
+      browser CSRF / CSWSH vector.
     - In ``local_mode`` an ``Origin`` is allowed only when its hostname is
-      a loopback host — this is the CSWSH guard for the unauthenticated
-      single-user local server.
+      a loopback host — this is the CSRF / CSWSH guard for the
+      unauthenticated single-user local server.
     - In non-local modes the connection is authenticated by cookie / proxy
       header, so any ``Origin`` is allowed unless ``extra_allowed`` is
       non-empty, in which case only the allowlist (matched above) passes.
 
-    :param origin: The handshake ``Origin`` header, or ``None`` when the
+    :param origin: The connection's ``Origin`` header, or ``None`` when the
         client sent none, e.g. ``"http://localhost:8000"``.
     :param local_mode: Whether the server is a single-user local runtime
         (``OMNIGENT_LOCAL_SINGLE_USER`` truthy).
@@ -164,7 +173,11 @@ def _origin_from_scope(scope: Scope) -> str | None:
         ``type == "websocket"``.
     :returns: The decoded ``Origin`` value, or ``None`` when absent.
     """
-    for key, value in scope.get("headers", []):
+    # Annotate the ASGI headers explicitly: ``Scope`` values are typed
+    # ``Any``, so without this mypy infers ``value`` as ``Any`` and flags
+    # the ``value.decode(...)`` return as an Any-return.
+    headers: Iterable[tuple[bytes, bytes]] = scope.get("headers", [])
+    for key, value in headers:
         if key == b"origin":
             return value.decode("latin-1")
     return None
@@ -175,7 +188,7 @@ class WebSocketOriginMiddleware:
 
     Wraps the downstream app and, for ``websocket``-typed scopes only,
     rejects handshakes whose ``Origin`` is not permitted by
-    :func:`websocket_origin_allowed` — closing the connection before it
+    :func:`origin_allowed` — closing the connection before it
     reaches a route handler (and thus before any ``websocket.accept()``).
     Non-WebSocket scopes and permitted handshakes pass through untouched.
 
@@ -207,7 +220,7 @@ class WebSocketOriginMiddleware:
             return
 
         origin = _origin_from_scope(scope)
-        if websocket_origin_allowed(
+        if origin_allowed(
             origin,
             local_mode=local_single_user_enabled(),
             extra_allowed=parse_allowed_origins(),

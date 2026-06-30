@@ -44,7 +44,7 @@ async def test_patch_model_override_round_trips_through_snapshot(
 ) -> None:
     """PATCH writes the column and ``GET`` returns the same value.
 
-    This is the contract the ap-web picker and the REPL's ``/model``
+    This is the contract the web picker and the REPL's ``/model``
     command depend on for cross-surface sync: writing through one
     surface must be visible to the other on the very next snapshot.
     """
@@ -75,7 +75,7 @@ async def test_patch_model_override_clear_alias_resets(
     """``model_override: "default"`` is the explicit clear alias.
 
     Mirrors the REPL's ``/model default | off | reset`` semantics so
-    that ap-web's "clear" path and the REPL converge on the same wire
+    that web's "clear" path and the REPL converge on the same wire
     representation.
     """
     agent = await create_test_agent(client)
@@ -127,6 +127,51 @@ async def test_patch_model_override_rejects_empty_string(
         assert resp.status_code == 400, (
             f"Empty model_override {bad!r} should 400, got {resp.status_code}: {resp.text}"
         )
+
+
+@pytest.mark.parametrize(
+    "bad_model",
+    [
+        pytest.param("claude; rm -rf /", id="shell-metacharacters"),
+        pytest.param("--model=evil", id="flag-shaped"),
+        pytest.param(
+            'x",auth={command="sh",args=["-c","touch /tmp/pwned"]},wire_api="responses"}',
+            id="codex-toml-breakout",
+        ),
+    ],
+)
+async def test_patch_model_override_rejects_malformed(
+    client: httpx.AsyncClient,
+    bad_model: str,
+) -> None:
+    """PATCH ``model_override`` outside the model-id charset 400s.
+
+    Regression for a host-RCE gap: the create path validated the override
+    against the model-id charset, but the PATCH path only stripped it. A
+    value like ``x",auth={command="sh",args=["-c","..."]}`` would break out
+    of the ``model="..."`` field in the Codex provider ``config.toml`` and
+    replace the token-minting ``auth.command`` Codex runs via ``sh -c`` on
+    the host. PATCH must refuse it exactly like create does, and must not
+    persist it.
+
+    :param bad_model: The malformed override under test.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    resp = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": bad_model},
+    )
+    assert resp.status_code == 400, (
+        f"model_override {bad_model!r} should 400, got {resp.status_code}: {resp.text}"
+    )
+
+    # A rejected value must never reach the row the runner snapshots.
+    get = await client.get(f"/v1/sessions/{sid}")
+    assert get.status_code == 200
+    assert get.json().get("model_override") is None
 
 
 async def test_create_session_with_model_override_persists(
@@ -190,6 +235,58 @@ async def test_create_session_rejects_malformed_model_override(
     )
     assert resp.status_code == 400, (
         f"model_override {bad_model!r} should 400, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_create_session_with_reasoning_effort_persists(
+    client: httpx.AsyncClient,
+) -> None:
+    """Create-time ``reasoning_effort`` lands on the row and the snapshot.
+
+    This is the seam the web new-session model/effort picker relies on:
+    the value must be persisted before the runner fetches the session
+    snapshot (native Claude Code reads it as ``--effort`` at terminal
+    launch).
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "reasoning_effort": "high",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    # The create response itself must carry the effort — the runner's
+    # launch-config fetch consumes this exact snapshot shape.
+    assert created["reasoning_effort"] == "high"
+
+    get = await client.get(f"/v1/sessions/{created['id']}")
+    assert get.status_code == 200
+    assert get.json()["reasoning_effort"] == "high"
+
+
+async def test_create_session_rejects_invalid_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """Create-time ``reasoning_effort`` outside the effort vocabulary 400s.
+
+    Validated before any row exists so a bad value never creates an orphan
+    session, mirroring the ``model_override`` charset guard.
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "reasoning_effort": "turbo",
+        },
+    )
+    assert resp.status_code == 400, (
+        f"reasoning_effort 'turbo' should 400, got {resp.status_code}: {resp.text}"
     )
 
 
@@ -374,12 +471,69 @@ async def test_context_window_uses_effective_model(
     )
 
 
+async def test_context_window_override_bypasses_declared_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec-declared ``executor.context_window`` is bypassed by an override.
+
+    Anti-drift guarantee for the shared resolver: the ring and the runner's
+    compaction budget are now computed by the SAME
+    ``resolve_effective_context_window``, so a declared 1M window can't mask a
+    small override model. With no override the declared window wins (no catalog
+    lookup); with an override active the ring sizes against the override
+    model's real window instead. Before the shared resolver these two paths
+    drifted (PR #769).
+    """
+    from omnigent.llms import context_window as context_window_mod
+
+    lookup_calls: list[str] = []
+
+    def _stub(model: str) -> int:
+        lookup_calls.append(model)
+        return 200_000
+
+    monkeypatch.setattr(context_window_mod, "get_model_context_window", _stub)
+
+    agent = await create_test_agent(
+        client,
+        name="declared-window-agent",
+        executor={"type": "omnigent", "context_window": 1_000_000},
+    )
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    # No override: the declared 1M window wins and short-circuits the catalog.
+    lookup_calls.clear()
+    baseline = await client.get(f"/v1/sessions/{sid}")
+    assert baseline.status_code == 200
+    assert baseline.json()["context_window"] == 1_000_000
+    assert lookup_calls == [], (
+        f"A declared window must short-circuit the catalog lookup; got {lookup_calls!r}."
+    )
+
+    # Override active: the declared 1M is bypassed; the ring sizes against the
+    # override model's real (stubbed 200K) window.
+    await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": "claude-opus-4-7"},
+    )
+    lookup_calls.clear()
+    after = await client.get(f"/v1/sessions/{sid}")
+    assert after.status_code == 200
+    assert after.json()["context_window"] == 200_000, (
+        "An active override must bypass the declared 1M window and size the "
+        "ring against the override model's real window."
+    )
+    assert "claude-opus-4-7" in lookup_calls
+
+
 async def test_silent_patch_skips_claude_native_forward(
     client: httpx.AsyncClient,
 ) -> None:
     """``silent: true`` persists but doesn't inject ``/model`` into tmux.
 
-    Without this, the ap-web sticky-pref handoff on a fresh session
+    Without this, the web sticky-pref handoff on a fresh session
     would render a leading "Command model X" slash-command item
     before the user has sent anything — the bug a user reported.
 

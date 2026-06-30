@@ -70,7 +70,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -80,6 +79,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 # Opt-in only. claude-native needs a real *interactive* Claude login
@@ -201,8 +201,10 @@ def _spawn_host_daemon(
     daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         return subprocess.Popen(
-            [sys.executable, "-m", "omnigent.host._daemon_entry", "--server", live_server],
-            env=env,
+            # Compat-aware: pinned OLD host venv in runner compat mode (Config 2).
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
         )

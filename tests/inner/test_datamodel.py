@@ -65,6 +65,7 @@ class TestHistory(unittest.TestCase):
         for i in range(5):
             h.append(Message(role="user", content=f"msg {i}"))
         self.assertEqual(len(h.get_context_window()), 5)
+        self.assertEqual(len(h.get_context_window(max_tokens=4096)), 5)
 
 
 class TestConnection(unittest.TestCase):

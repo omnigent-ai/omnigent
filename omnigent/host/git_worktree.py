@@ -60,8 +60,8 @@ def validate_branch_name(name: str) -> None:
         raise WorktreeError(f"branch name must not start or end with '/': {name!r}")
     if name.endswith("."):
         raise WorktreeError(f"branch name must not end with '.': {name!r}")
-    if name.endswith(".lock"):
-        raise WorktreeError(f"branch name must not end with '.lock': {name!r}")
+    if any(part.endswith(".lock") for part in name.split("/")):
+        raise WorktreeError(f"branch name path components must not end with '.lock': {name!r}")
     if ".." in name:
         raise WorktreeError(f"branch name must not contain '..': {name!r}")
     if "//" in name:

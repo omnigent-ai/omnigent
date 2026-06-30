@@ -142,6 +142,16 @@ class Tool(abc.ABC):
         the child process. Default is a no-op.
         """
 
+    def shutdown(self) -> None:  # noqa: B027 — optional override hook; default is a no-op
+        """
+        Release resources held by this tool instance.
+
+        Called by :meth:`ToolManager.shutdown` during teardown.
+        Tools that hold subprocesses, file handles, or other
+        long-lived resources override this to clean up.
+        Default is a no-op.
+        """
+
     def is_async(self, arguments: str | None = None) -> bool:
         """
         Return ``True`` if this invocation runs in a background workflow.

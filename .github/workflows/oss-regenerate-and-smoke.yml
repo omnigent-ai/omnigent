@@ -2,7 +2,7 @@
 # a Docker build + CLI smoke. Runs on GitHub-hosted ubuntu-latest so resolution
 # sees public registries directly (lockfiles must record public sources, never
 # a proxy). Exists because sync PRs land manifest changes without lockfile
-# updates and the Dockerfile COPYs ap-web/package-lock.json, so the tree is not
+# updates and the Dockerfile COPYs web/package-lock.json, so the tree is not
 # Docker-buildable until lockfiles are (re)generated here. Runs every 12h (and
 # on manual dispatch); opens a PR with any regenerated lockfiles.
 name: OSS regenerate lockfiles + smoke
@@ -33,15 +33,15 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Set up uv (clean public resolution, no proxy cache)
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: false
 
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
           node-version: "20"
 
@@ -51,18 +51,29 @@ jobs:
       - name: Regenerate uv.lock
         run: uv lock
 
-      # npm's cooldown (ap-web/.npmrc `min-release-age=7`) is only honored by
+      # npm's cooldown (web/.npmrc `min-release-age=7`) is only honored by
       # npm >= 11.10.0; node 20 ships npm 10.x which silently ignores it.
+      # Pin the EXACT version (not a range) and keep it in lockstep with
+      # .github/actions/setup-node: this workflow generates the lockfile and
+      # that action verifies it, so a version gap would fail the freshness
+      # gate in lint.yml. 11.12.1 satisfies the >= 11.10.0 cooldown floor.
       - name: Ensure npm honors the dependency cooldown
-        run: npm install -g "npm@>=11.10.0"
+        run: npm install -g npm@11.12.1
       # Delete the lockfile so npm RESOLVES from scratch: min-release-age only
       # filters during resolution, and --package-lock-only keeps an existing
       # in-range pin without re-applying the cooldown.
+      #
+      # --legacy-peer-deps is REQUIRED: the tree pins React 18 at runtime while
+      # much of the UI stack (and @types/react) peer-requires React 19, so npm's
+      # strict resolver would ERESOLVE-fail without it. It MUST match the flag the
+      # freshness gate in lint.yml verifies with; generating without it resolves
+      # the peer graph differently and rewrites the dev/devOptional/extraneous
+      # flags, failing that byte-exact gate.
       - name: Regenerate package-lock.json
-        working-directory: ap-web
+        working-directory: web
         run: |
           rm -f package-lock.json
-          npm install --package-lock-only --no-audit --no-fund
+          npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
 
       # Validate BEFORE committing: the Docker build proves the regenerated
       # locks + public registries produce a working image.
@@ -76,11 +87,11 @@ jobs:
       # own CI. Skipped when the App isn't configured (falls back to GITHUB_TOKEN).
       - name: Mint App token
         id: app-token
-        if: vars.OSS_REGEN_APP_ID != ''
+        if: vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
-          app-id: ${{ vars.OSS_REGEN_APP_ID }}
-          private-key: ${{ secrets.OSS_REGEN_APP_KEY }}
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       # Persist the validated lockfiles via a PR (not a direct push to main, so
       # it works under branch protection). App token so `gh pr create` isn't
@@ -92,17 +103,17 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
           # --porcelain (not git diff) so first-regen UNTRACKED lockfiles count too.
-          if [ -z "$(git status --porcelain -- uv.lock ap-web/package-lock.json)" ]; then
+          if [ -z "$(git status --porcelain -- uv.lock web/package-lock.json)" ]; then
             echo "Lockfiles already current — nothing to PR."
             exit 0
           fi
           # One rolling branch, force-pushed each run, so regens update a single PR.
           BRANCH="automation/oss-lockfile-regen"
           git checkout -b "$BRANCH"
-          git add uv.lock ap-web/package-lock.json
+          git add uv.lock web/package-lock.json
           git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$BRANCH"
           # An already-open PR just picks up the force-pushed update.
@@ -115,7 +126,7 @@ jobs:
           # exempts gh from `set -e`, so a non-zero exit hits the else branch.)
           if gh pr create --base main --head "$BRANCH" \
               --title "chore(oss): regenerate public lockfiles against public PyPI/npm" \
-              --body "Automated: regenerated uv.lock + ap-web/package-lock.json against public PyPI/npm, validated by a Docker build + omnigent --help smoke (run ${{ github.run_id }}). Merge to keep the public lockfiles current and buildable."; then
+              --body "Automated: regenerated uv.lock + web/package-lock.json against public PyPI/npm, validated by a Docker build + omnigent --help smoke (run ${{ github.run_id }}). Merge to keep the public lockfiles current and buildable."; then
             echo "Opened the regen PR."
           else
             echo "::warning::Could not open the regen PR automatically (the GITHUB_TOKEN may be disallowed from creating PRs). The branch '$BRANCH' is pushed with the regenerated lockfiles — open the PR by hand:"

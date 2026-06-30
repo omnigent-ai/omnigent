@@ -17,6 +17,7 @@ from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
 
@@ -29,6 +30,9 @@ def workspace(tmp_path: Path) -> Path:
     (ws / "hello.txt").write_text("hello world")
     (ws / "src").mkdir()
     (ws / "src" / "main.py").write_text("print('hi')")
+    # A binary file (PNG signature + a NUL) that is not valid UTF-8, used to
+    # exercise the base64 binary-read path.
+    (ws / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff")
     return ws
 
 
@@ -165,6 +169,56 @@ async def test_read_file_content(
     assert body["content"] == "hello world"
     assert body["encoding"] == "utf-8"
     assert body["bytes"] == 11
+
+
+@pytest.mark.asyncio
+async def test_read_binary_file_content(
+    client: httpx.AsyncClient,
+) -> None:
+    """A non-UTF-8 file is returned whole as base64, not truncated text."""
+    import base64
+
+    raw = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/logo.png"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["encoding"] == "base64"
+    assert body["content_type"] == "image/png"
+    # The base64 payload round-trips to the exact original bytes — no
+    # UTF-8 replacement-char corruption.
+    assert base64.b64decode(body["content"]) == raw
+    assert body["bytes"] == len(raw)
+    assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_text_byte_cap_truncates_on_utf8_boundary(
+    workspace: Path,
+) -> None:
+    """A byte cap that lands mid-codepoint still yields decodable UTF-8.
+
+    Slicing the raw UTF-8 byte string at an arbitrary cap can split a
+    multi-byte codepoint, leaving invalid bytes that raise
+    ``UnicodeDecodeError`` (500) when the response path later decodes them.
+    The read path must truncate on a valid boundary instead.
+    """
+    # "é" is 2 bytes (0xC3 0xA9) in UTF-8; on "aé" a 2-byte cap keeps the "a"
+    # and lands mid-codepoint inside "é".
+    (workspace / "accents.txt").write_text("aé")
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    content = await fs.read("accents.txt", max_bytes=2)
+    assert content.truncated is True
+    # The partial trailing codepoint is dropped, leaving decodable bytes.
+    assert content.data.decode("utf-8") == "a"
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,9 @@ over a local bridge (``agent.send`` → streamed ``run.messages()``) →
 **Prerequisites (skipped when absent):**
 - The ``cursor-sdk`` package installed (a baseline dependency).
 - ``CURSOR_API_KEY`` set — the SDK requires an API key and does NOT reuse a
-  ``cursor-agent login``.
+  ``cursor-agent login``. The subprocess receives this key with surrounding
+  newlines to prove the CLI/spawn-env path strips env-detected keys before
+  forwarding them to the cursor SDK (F103).
 
 Unlike the other per-harness e2e tests, the Cursor SDK talks only to Cursor's
 own backend — there is no Databricks-gateway path, so this test does NOT use
@@ -19,6 +21,14 @@ own backend — there is no Databricks-gateway path, so this test does NOT use
 key is not provisioned on CI, the test **skips** (rather than fails) when
 ``CURSOR_API_KEY`` is absent so the e2e shards stay green; it runs for real
 wherever a key is present.
+
+**Why this test cannot use the mock LLM server:** The ``cursor-sdk`` connects
+directly to Cursor's proprietary backend using ``CURSOR_API_KEY`` — it does not
+honour ``OPENAI_BASE_URL`` the way the ``openai-agents`` harness does. There is
+no OpenAI-compatible shim path in the Cursor SDK, so pointing
+``OPENAI_BASE_URL`` at the mock server has no effect. This harness can only be
+exercised with a real Cursor API key; the ``pytest.skip`` below gates the test
+cleanly when the key is absent.
 
 **What breaks if this fails (with prerequisites present):**
 - ``CursorExecutor`` regresses (the ``SDKMessage`` → ExecutorEvent translation,
@@ -63,7 +73,8 @@ def test_per_harness_cursor_one_shot(
     """
     if importlib.util.find_spec("cursor_sdk") is None:
         pytest.skip("cursor prerequisite missing: the 'cursor-sdk' package is not installed.")
-    if not os.environ.get("CURSOR_API_KEY"):
+    cursor_api_key = os.environ.get("CURSOR_API_KEY", "").strip()
+    if not cursor_api_key:
         pytest.skip(
             "cursor prerequisite missing: CURSOR_API_KEY is not set. The Cursor SDK "
             "requires an API key (it does not reuse a 'cursor-agent login'), so this "
@@ -72,7 +83,11 @@ def test_per_harness_cursor_one_shot(
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
-    # The SDK reads CURSOR_API_KEY from the environment, so pass os.environ through.
+    env = dict(os.environ)
+    # Regression coverage for F103: this live gate runs the real
+    # CLI -> spawn-env -> cursor-harness path, so pad the key in the same shape
+    # that previously reached the SDK verbatim and failed auth.
+    env["CURSOR_API_KEY"] = f"\n{cursor_api_key}\n"
     result = subprocess.run(
         [
             str(omnigent_python),
@@ -87,7 +102,7 @@ def test_per_harness_cursor_one_shot(
             "--no-log",
             "--no-session",
         ],
-        env=dict(os.environ),
+        env=env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,

@@ -46,6 +46,53 @@ def test_enqueue_preserves_send_order_across_types(tmp_path: Path) -> None:
     assert second in files[2], files
 
 
+def test_enqueue_compact_payload_shape(tmp_path: Path) -> None:
+    """A queued compact request round-trips as well-formed JSON the extension reads.
+
+    The extension dispatches on ``payload.type == "compact"`` and feeds
+    ``payload.custom_instructions`` (when present) to Pi's
+    ``ctx.compact({customInstructions})``. The id must equal the returned
+    ``compact_`` id (the extension dedups on it).
+    """
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+
+    compact_id = pi_native_bridge.enqueue_compact(bridge_dir)
+
+    (path,) = list((bridge_dir / "inbox").glob("*.json"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["id"] == compact_id
+    assert compact_id.startswith("compact_")
+    assert payload["type"] == "compact"
+    assert isinstance(payload["created_at"], (int, float))
+    # No instructions given → key omitted so the extension uses Pi's default
+    # summarisation rather than passing an empty customInstructions string.
+    assert "custom_instructions" not in payload
+
+
+def test_enqueue_compact_includes_custom_instructions(tmp_path: Path) -> None:
+    """Non-blank custom instructions ride along; blank ones are dropped.
+
+    Pi's ``compact({customInstructions})`` focuses the summary on the given
+    text. An empty/whitespace string must be dropped so it doesn't override
+    Pi's default summarisation with a no-op instruction.
+    """
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+
+    pi_native_bridge.enqueue_compact(bridge_dir, "focus on the refactor")
+    pi_native_bridge.enqueue_compact(bridge_dir, "   ")
+
+    payloads = sorted(
+        (json.loads(p.read_text(encoding="utf-8")) for p in (bridge_dir / "inbox").glob("*.json")),
+        key=lambda payload: payload["created_at"],
+    )
+    assert len(payloads) == 2, payloads
+    with_instructions = [p for p in payloads if "custom_instructions" in p]
+    assert len(with_instructions) == 1, payloads
+    assert with_instructions[0]["custom_instructions"] == "focus on the refactor"
+
+
 def test_enqueue_user_message_payload_shape(tmp_path: Path) -> None:
     """A queued user message round-trips as well-formed JSON the extension reads.
 
@@ -120,3 +167,109 @@ def test_clear_inbox_drops_leftover_payloads(tmp_path: Path) -> None:
 def test_clear_inbox_is_a_noop_without_an_inbox(tmp_path: Path) -> None:
     """clear_inbox tolerates a bridge dir that has no inbox yet."""
     pi_native_bridge.clear_inbox(tmp_path / "nonexistent")  # must not raise
+
+
+def test_write_extension_files_embeds_tools(tmp_path: Path) -> None:
+    """write_extension_files embeds the tool list so the extension can register it.
+
+    The runner builds the session's Omnigent tool surface (sys_* tools) and
+    passes it to write_extension_files; the extension reads ``config.tools`` and
+    registers each via ``pi.registerTool``. The config must round-trip the list
+    verbatim so the schemas reach the Pi agent unchanged.
+    """
+    bridge_dir = tmp_path / "bridge"
+    tools = [
+        {
+            "name": "sys_os_read",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+        {
+            "name": "sys_os_shell",
+            "description": "Run a command",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+
+    _ext, cfg = pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test/",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={"Authorization": "Bearer t"},
+        tools=tools,
+    )
+
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    assert payload["sessionId"] == "conv_abc"
+    # serverUrl trailing slash is stripped so the extension can append paths.
+    assert payload["serverUrl"] == "http://omnigent.test"
+    assert payload["tools"] == tools
+
+
+def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
+    """Omitting tools writes an empty list (Pi runs with its built-ins only)."""
+    bridge_dir = tmp_path / "bridge"
+
+    _ext, cfg = pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+    )
+
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    assert payload["tools"] == []
+
+
+def test_refresh_config_auth_headers_replaces_only_auth(tmp_path: Path) -> None:
+    """Refreshing the bearer rewrites only ``authHeaders``, leaving the rest.
+
+    The baked launch token dies with the ~1h Databricks OAuth lifetime; the
+    runner re-mints it into ``config.json`` each turn and the extension
+    re-reads per request. The rewrite must touch only ``authHeaders`` so
+    ``serverUrl`` / ``tools`` (read once at startup) stay intact.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={"Authorization": "Bearer stale"},
+        tools=[{"name": "t"}],
+    )
+
+    assert (
+        pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"Authorization": "Bearer fresh"})
+        is True
+    )
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    assert payload["authHeaders"] == {"Authorization": "Bearer fresh"}
+    # Untouched: the static fields the extension reads once at startup.
+    assert payload["serverUrl"] == "http://omnigent.test"
+    assert payload["tools"] == [{"name": "t"}]
+
+
+def test_refresh_config_auth_headers_noops(tmp_path: Path) -> None:
+    """No-op (returns False) on empty headers, a missing config, or no change."""
+    bridge_dir = tmp_path / "bridge"
+    # Missing config: nothing to rewrite.
+    assert pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"a": "b"}) is False
+
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={"Authorization": "Bearer x"},
+    )
+    # Empty headers (local/unauthenticated) must never blank out a live token.
+    assert pi_native_bridge.refresh_config_auth_headers(bridge_dir, {}) is False
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    assert payload["authHeaders"] == {"Authorization": "Bearer x"}
+    # Identical headers: skip the rewrite.
+    assert (
+        pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"Authorization": "Bearer x"})
+        is False
+    )

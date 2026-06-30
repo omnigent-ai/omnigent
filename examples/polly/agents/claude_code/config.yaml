@@ -22,6 +22,9 @@ prompt: |
     contract.
   - Make the change, then drive it to green: run the relevant tests, lint, and
     typecheck for the code you touched.
+  - Co-sign every commit you author: end each commit message with a blank line
+    followed by this exact trailer as its final line —
+    `Co-authored-by: omnigent <noreply@omnigent.ai>`
   - When green, push your task branch and open a PR with `gh pr create` (clear
     title, what changed, how you verified). Never push to a protected branch
     (e.g. main) or force-push — open a PR and let it be reviewed/merged.

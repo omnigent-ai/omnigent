@@ -501,6 +501,13 @@ def _gemini_stream_chunk_to_chat(
     parts = candidate.get("content", {}).get("parts", [])
     finish_reason = _normalize_finish_reason(candidate.get("finishReason"))
 
+    # Each parallel function call needs a distinct ``tool_calls`` index. The
+    # downstream accumulator (``chat_stream_to_response_events``) keys tool
+    # calls by this index, overwriting name/id and *appending* arguments for a
+    # repeated index. Gemini returns parallel calls as multiple ``functionCall``
+    # parts in one chunk, so a fixed ``0`` would collapse them into a single
+    # corrupted call. Count tool calls so each gets its own index.
+    tool_call_index = 0
     for part in parts:
         if "text" in part:
             yield {
@@ -530,7 +537,7 @@ def _gemini_stream_chunk_to_chat(
                         "delta": {
                             "tool_calls": [
                                 {
-                                    "index": 0,
+                                    "index": tool_call_index,
                                     "id": f"call_{call_id}",
                                     "type": "function",
                                     "function": {
@@ -544,6 +551,7 @@ def _gemini_stream_chunk_to_chat(
                     }
                 ],
             }
+            tool_call_index += 1
 
     if finish_reason:
         yield {
