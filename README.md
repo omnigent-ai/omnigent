@@ -4,7 +4,7 @@
 
 ### The open-source meta-harness for all your AI agents.
 
-Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Hermes, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Hermes, Pi, Kimi, Qwen, Goose, Antigravity, Copilot, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
@@ -30,9 +30,10 @@ Omnigent lets you:
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
 - **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
-  Hermes, Pi, and custom agents (defined in YAML) together in the same
-  session. Ask one agent to review another's work, or split a task across
-  agents that are each good at different things.
+  Hermes, Pi, Kimi, Qwen, Goose, Antigravity, Copilot, and custom agents
+  (defined in YAML) together in the same session. Ask one agent to review
+  another's work, or split a task across agents that are each good at
+  different things.
 
 - **🔌 Use any model.** A first-party API key, a Claude/ChatGPT subscription,
   or any compatible gateway. All first-class.
@@ -413,8 +414,11 @@ prompt: You are a helpful data analyst.
 
 executor:
   harness: claude-sdk          # or: claude-native, codex, codex-native, cursor,
-                               # cursor-native, hermes, hermes-native, opencode,
-                               # pi, pi-native, openai-agents
+                               # cursor-native, antigravity, antigravity-native,
+                               # copilot, goose, goose-native, hermes,
+                               # hermes-native, kimi, kimi-native, kiro-native,
+                               # opencode, openai-agents, pi, pi-native, qwen,
+                               # qwen-native
 
 tools:
   # A local Python function (schema auto-generated from the signature)

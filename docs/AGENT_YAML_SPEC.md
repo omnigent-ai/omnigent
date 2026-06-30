@@ -49,7 +49,7 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, goose, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, opencode, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -162,6 +162,37 @@ executor:
 
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
+
+## Goose
+
+`harness: goose` runs the agent through Block's
+[Goose](https://github.com/block/goose) CLI in ACP mode (`goose acp`), the
+chat-first counterpart to the terminal-first `goose-native` TUI harness used by
+`omnigent goose`. Install the CLI with `brew install block-goose-cli` and
+configure it with `goose configure`; it authenticates against its own provider
+config (keyring) and does not use the Databricks gateway. Tool approvals surface
+as web elicitation cards.
+
+```yaml
+executor:
+  harness: goose               # terminal twin: goose-native
+  model: gpt-5
+```
+
+## OpenCode
+
+`harness: opencode` runs the agent through the
+[OpenCode](https://github.com/sst/opencode) server (`npm install -g
+opencode-ai@~1.17.7`). It is a native-server harness: the runner owns
+`opencode serve` and forwards events over loopback HTTP, the same path used by
+`omnigent opencode`. `opencode` is the friendly alias for the canonical
+`opencode-native` id (there is no separate SDK harness).
+
+```yaml
+executor:
+  harness: opencode            # canonical id: opencode-native
+  model: anthropic/claude-sonnet-4-20250514
+```
 
 ## Local OS access
 
