@@ -120,7 +120,9 @@ def test_spine_skills_present(polly_spec: AgentSpec) -> None:
     assert sorted(s.name for s in polly_spec.skills) == [
         "cross-review",
         "fanout",
+        "implement-plan",
         "investigate",
+        "plan-work",
     ]
 
 
@@ -150,6 +152,8 @@ def test_subagent_dispatch_text_advertises_task_titles_and_purpose(
     assert "Bad titles are `claude_code`, `claude-code`, `codex`" in config
     assert 'purpose: "implement"' in fanout
     assert 'title="<task_slug>"' in fanout
+    assert "follow implement-plan" in fanout
+    assert "the worker must follow" in fanout
     assert 'title="review-<task_slug>"' in cross_review
     assert 'purpose: "review"' in cross_review
     assert 'purpose: "implement"' in cross_review
@@ -169,6 +173,74 @@ def test_subagent_dispatch_text_advertises_task_titles_and_purpose(
         "explore",
         "search",
     ]
+
+
+def test_implement_plan_skill_keeps_worker_discipline() -> None:
+    """
+    The ``implement-plan`` skill gives workers plan-driven implementation
+    discipline while Polly keeps orchestration, fan-out, registry state, and
+    cross-review outside the worker workflow.
+    """
+    implement_plan = (
+        _POLLY_BUNDLE / "skills" / "implement-plan" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    compact = " ".join(implement_plan.split())
+
+    assert "Polly handles orchestration, worktrees, registry state, PR routing" in compact
+    assert "If Polly supplied a plan path, read it and treat it as the authority" in compact
+    assert "preserve their IDs in your task notes and final report" in compact
+    assert "Run `git branch --show-current`" in compact
+    assert "Confirm you are in Polly's assigned worktree and branch" in compact
+    assert "Before changing behavior in a file, find relevant tests" in compact
+    assert "Stage only files for this task" in compact
+    assert "Do not use `git add .`" in compact
+    assert "Open a PR with what changed and how it was verified" in compact
+    assert "Do not claim the whole plan is complete" in compact
+
+
+def test_plan_work_skill_selects_tracks_and_closes_repo_plans() -> None:
+    """
+    The ``plan-work`` skill gives Polly the missing plan intake and tracking
+    layer while keeping live task state in the registry.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    plan_work = (_POLLY_BUNDLE / "skills" / "plan-work" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    compact_config = " ".join(config.split())
+    compact_plan_work = " ".join(plan_work.split())
+
+    assert "plan-work" in compact_config
+    assert "select and slice existing repo plans such as `docs/plans/*.md`" in compact_config
+    assert "update the plan's durable high-level execution status" in compact_config
+    assert "scan `docs/plans/` for candidate `.md` plans" in compact_plan_work
+    assert "The registry is the live task tracker" in compact_plan_work
+    assert "Do not put per-worker transient state in the plan document" in compact_plan_work
+    for field in [
+        "plan path",
+        "unit ID",
+        "task slug",
+        "acceptance contract",
+        "dependencies",
+    ]:
+        assert field in compact_plan_work
+    assert "worker agent and conversation ID" in compact_plan_work
+    assert "PR URL when available" in compact_plan_work
+    assert "verification summary when available" in compact_plan_work
+    assert "blocking review findings" in compact_plan_work
+    assert "follow-ups" in compact_plan_work
+    assert "leave or mark it `not_started` and record the registry path" in compact_plan_work
+    assert "mark it `in_progress` and record the registry path" in compact_plan_work
+    assert "mark it `blocked` with a short blocker note" in compact_plan_work
+    assert "mark it `complete` and list the PRs" in compact_plan_work
+    assert "polly_status: not_started" in compact_plan_work
+    assert "polly_blocker: null" in compact_plan_work
+    assert (
+        "Allowed plan status values are `not_started`, `in_progress`, `blocked`, "
+        "and `complete`"
+    ) in compact_plan_work
+    assert ".polly/registry.json` owns execution progress" in compact_plan_work
+    assert 'exact instruction `follow implement-plan`' in compact_plan_work
 
 
 def test_orchestrator_keeps_timer_tool_but_forbids_worker_polling(
@@ -236,6 +308,21 @@ def test_orchestrator_forbids_premature_idle_after_announcing_intent() -> None:
     assert "never end a turn having only said you will dispatch" in " ".join(fanout.split())
     assert "never end a turn having only announced" in " ".join(cross_review.split())
     assert "do not end a turn having only said you will dispatch" in " ".join(investigate.split())
+
+
+def test_orchestrator_handles_claude_provider_unavailability() -> None:
+    """
+    Polly should not burn turns retrying Claude when the worker is present but
+    the provider is unavailable due to quota, rate limits, auth, or billing.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    compact = " ".join(config.split())
+
+    assert "provider availability failures like per-run worker availability failures" in compact
+    assert "Claude quota, rate limit, credit, billing, auth" in compact
+    assert "mark `claude_code` UNAVAILABLE for the rest of the run" in compact
+    assert "Prefer `codex` for implementation and `pi` for review / explore work" in compact
+    assert "If fewer than two different vendors remain available for cross-review" in compact
 
 
 def test_orchestrator_delegates_substantive_work() -> None:
