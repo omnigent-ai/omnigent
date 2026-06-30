@@ -426,23 +426,115 @@ class _RecordingClient:
         return httpx.Response(200, request=httpx.Request("POST", url))
 
 
-async def test_post_conversation_item_shape() -> None:
-    client = _RecordingClient()
+class _PostHelperSink:
+    """Capture calls to ``post_session_event_with_retry``."""
+
+    def __init__(self, responses: list[httpx.Response | None] | None = None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._responses = list(responses or [])
+
+    async def __call__(self, **kwargs: object) -> httpx.Response | None:
+        self.calls.append(kwargs)
+        if self._responses:
+            return self._responses.pop(0)
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+
+
+async def test_post_conversation_item_uses_session_event_retry_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _PostHelperSink()
+    monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
     item = fwd._MirrorItem(
         uuid="u1",
         item_type="message",
         item_data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
         response_id="qwen:u1",
     )
-    await fwd._post_conversation_item(client, session_id="conv_1", item=item)  # type: ignore[arg-type]
-    url, body = client.posts[0]
-    assert url == "/v1/sessions/conv_1/events"
-    assert body["type"] == "external_conversation_item"
-    assert body["data"] == {
-        "item_type": "message",
-        "item_data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-        "response_id": "qwen:u1",
+    response = await fwd._post_conversation_item(object(), session_id="conv_1", item=item)  # type: ignore[arg-type]
+    assert response.status_code == 200
+    assert sink.calls[0]["event_type"] == "external_conversation_item"
+    assert sink.calls[0]["url"] == "/v1/sessions/conv_1/events"
+    assert sink.calls[0]["payload"] == {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            "response_id": "qwen:u1",
+        },
     }
+
+
+async def test_post_external_compaction_status_uses_session_event_retry_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _PostHelperSink()
+    monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
+
+    response = await fwd._post_external_compaction_status(
+        object(),  # type: ignore[arg-type]
+        session_id="conv_1",
+        status="completed",
+    )
+
+    assert response.status_code == 200
+    assert sink.calls[0]["event_type"] == "external_compaction_status"
+    assert sink.calls[0]["url"] == "/v1/sessions/conv_1/events"
+    assert sink.calls[0]["payload"] == {
+        "type": "external_compaction_status",
+        "data": {"status": "completed"},
+    }
+
+
+async def test_migrated_posts_record_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(fwd, "_sleep", no_sleep, raising=False)
+    item = fwd._MirrorItem(
+        uuid="u1",
+        item_type="message",
+        item_data={"role": "user"},
+        response_id="qwen:u1",
+    )
+
+    for call, event_type in (
+        (
+            lambda: fwd._post_conversation_item(
+                _AlwaysConnectError(),  # type: ignore[arg-type]
+                session_id="conv_1",
+                item=item,
+            ),
+            "external_conversation_item",
+        ),
+        (
+            lambda: fwd._post_external_compaction_status(
+                _AlwaysConnectError(),  # type: ignore[arg-type]
+                session_id="conv_1",
+                status="completed",
+            ),
+            "external_compaction_status",
+        ),
+    ):
+        health.clear()
+        try:
+            response = await call()
+            assert response is None
+            detail = health.recent_post_failure(60.0)
+            assert detail is not None
+            assert event_type in detail
+            assert "No route to host" in detail
+        finally:
+            health.clear()
 
 
 async def test_forward_loop_posts_new_events_and_persists(
@@ -454,8 +546,9 @@ async def test_forward_loop_posts_new_events_and_persists(
 
     posted: list[str] = []
 
-    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> httpx.Response:
         posted.append(item.response_id)  # type: ignore[attr-defined]
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
 
     monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
 
@@ -483,6 +576,93 @@ async def test_forward_loop_posts_new_events_and_persists(
     state = _read_state(bridge)
     assert state.offset > 0
     assert "u1" in (state.seen_uuids or [])
+
+
+@pytest.mark.parametrize("failed_response", [503, None])
+async def test_forward_loop_does_not_advance_offset_past_failed_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_response: int | None,
+) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        _ev_bytes(_user_ev("u1", "one")) + _ev_bytes(_user_ev("u2", "two"))
+    )
+    calls = 0
+
+    async def _fake_post(
+        _client: object, *, session_id: str, item: fwd._MirrorItem
+    ) -> httpx.Response | None:
+        nonlocal calls
+        del session_id
+        calls += 1
+        if calls == 1:
+            return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+        assert item.uuid == "u2"
+        if failed_response is None:
+            return None
+        return httpx.Response(failed_response, request=httpx.Request("POST", "http://t/"))
+
+    async def stop_after_poll(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
+    monkeypatch.setattr(fwd.asyncio, "sleep", stop_after_poll)
+
+    with pytest.raises(asyncio.CancelledError):
+        await fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0,
+        )
+
+    state = _read_state(bridge)
+    assert calls == 2
+    assert state.offset == 0
+    assert state.seen_uuids == []
+
+
+async def test_forward_loop_advances_offset_after_successful_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        _ev_bytes(_user_ev("u1", "one")) + _ev_bytes(_user_ev("u2", "two"))
+    )
+    posted: list[str] = []
+
+    async def _fake_post(
+        _client: object, *, session_id: str, item: fwd._MirrorItem
+    ) -> httpx.Response:
+        del session_id
+        posted.append(item.uuid)
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+
+    async def stop_after_poll(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
+    monkeypatch.setattr(fwd.asyncio, "sleep", stop_after_poll)
+
+    with pytest.raises(asyncio.CancelledError):
+        await fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0,
+        )
+
+    state = _read_state(bridge)
+    assert posted == ["u1", "u2"]
+    assert state.offset == events_file_path(bridge).stat().st_size
+    assert set(state.seen_uuids or []) == {"u1", "u2"}
 
 
 async def test_compaction_mirror_seeds_at_eof_and_posts_new(

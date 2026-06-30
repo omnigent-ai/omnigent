@@ -29,6 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
+from omnigent._native_post_delivery import post_session_event_with_retry
 from omnigent.opencode_native_bridge import update_active_message_id, update_last_event_id
 from omnigent.opencode_native_client import OpenCodeClient, OpenCodeEvent
 from omnigent.opencode_native_permissions import (
@@ -66,10 +67,18 @@ _STATUS_IDLE = "idle"
 
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
+_POST_MAX_ATTEMPTS = 3
+_POST_RETRY_DELAY_SECONDS = 0.1
+_POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 # Policy verdict resolver: receives a normalized policy input and returns a
 # verdict mapping (or None when no policy is configured / reachable).
 PolicyEvaluator = Callable[[Mapping[str, Any]], Awaitable[Mapping[str, Any] | None]]
+
+
+async def _sleep(seconds: float) -> None:
+    """Stubbable indirection for the per-POST retry backoff."""
+    await asyncio.sleep(seconds)
 
 
 @dataclass
@@ -304,25 +313,27 @@ class OpenCodeNativeForwarder:
 
     async def _post_event(self, event_type: str, data: dict[str, Any]) -> httpx.Response | None:
         """
-        POST one Omnigent session event with a single retry.
+        POST one Omnigent session event with bounded transient retries.
 
         :param event_type: Omnigent event type, e.g.
             ``"external_session_status"``.
         :param data: Event data payload.
-        :returns: The HTTP response, or ``None`` on transport failure.
+        :returns: The final HTTP response, or ``None`` when all attempts raised
+            transport errors (or after an ambiguous conversation-item failure).
         """
         url = f"/v1/sessions/{quote(self._session_id, safe='')}/events"
         payload = {"type": event_type, "data": data}
-        try:
-            return await self._server.post(url, json=payload)
-        except httpx.HTTPError:
-            _logger.warning(
-                "OpenCode forwarder failed to post %s for session=%s",
-                event_type,
-                self._session_id,
-                exc_info=True,
-            )
-            return None
+        return await post_session_event_with_retry(
+            client=self._server,
+            url=url,
+            payload=payload,
+            event_type=event_type,
+            max_attempts=_POST_MAX_ATTEMPTS,
+            retry_status_codes=_POST_RETRY_STATUS_CODES,
+            sleep=_sleep,
+            retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+            logger_name=__name__,
+        )
 
     async def _post_status(self, status: str) -> None:
         """Publish a coarse session status edge."""

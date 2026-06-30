@@ -56,6 +56,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_session_event_with_retry
 from omnigent.qwen_native_bridge import events_file_path
 
 _logger = logging.getLogger(__name__)
@@ -64,6 +65,9 @@ _logger = logging.getLogger(__name__)
 #: sub-second cadence keeps the mirrored chat tracking the terminal step by step.
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
+_POST_MAX_ATTEMPTS = 3
+_POST_RETRY_DELAY_SECONDS = 0.1
+_POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 # Supervisor backoff (mirrors goose_native_forwarder.supervise_goose_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -251,11 +255,12 @@ def _read_new_events(
 
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
-) -> None:
+) -> httpx.Response | None:
     """POST one mirrored item as an ``external_conversation_item`` event."""
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={
             "type": "external_conversation_item",
             "data": {
                 "item_type": item.item_type,
@@ -263,8 +268,13 @@ async def _post_conversation_item(
                 "response_id": item.response_id,
             },
         },
+        event_type="external_conversation_item",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def forward_qwen_events_to_session(
@@ -308,10 +318,16 @@ async def forward_qwen_events_to_session(
                 items, new_offset = await asyncio.to_thread(
                     _read_new_events, target, offset, seen, agent_name
                 )
+                posted_all = True
                 for item in items:
-                    await _post_conversation_item(client, session_id=session_id, item=item)
+                    response = await _post_conversation_item(
+                        client, session_id=session_id, item=item
+                    )
+                    if response is None or response.status_code >= 400:
+                        posted_all = False
+                        break
                     seen.add(item.uuid)
-                if new_offset != offset or items:
+                if posted_all and (new_offset != offset or items):
                     offset = new_offset
                     _write_state(
                         bridge_dir,
@@ -331,6 +347,11 @@ async def forward_qwen_events_to_session(
 def _supervisor_monotonic() -> float:
     """Indirection so tests can stub the supervisor's clock."""
     return time.monotonic()
+
+
+async def _sleep(seconds: float) -> None:
+    """Stubbable indirection for the per-POST retry backoff."""
+    await asyncio.sleep(seconds)
 
 
 async def _supervisor_sleep(seconds: float) -> None:
@@ -461,13 +482,19 @@ def _read_new_compaction_statuses(recording: Path, offset: int) -> tuple[list[st
 
 async def _post_external_compaction_status(
     client: httpx.AsyncClient, *, session_id: str, status: str
-) -> None:
+) -> httpx.Response | None:
     """POST one ``external_compaction_status`` event; the server republishes the SSE."""
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_compaction_status", "data": {"status": status}},
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={"type": "external_compaction_status", "data": {"status": status}},
+        event_type="external_compaction_status",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def supervise_qwen_compaction_mirror(
