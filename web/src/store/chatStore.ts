@@ -1157,7 +1157,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // genuinely still running may briefly revert the sidebar dot — the helper's
     // "never fights the poller" contract doesn't hold here. Self-corrects on the
     // real idle event.
-    patchConversationStatusInCache(sessionId, "idle");
+    patchConversationStatusInCache(sessionId, "idle", get().backgroundTaskCount);
     // Mirror the session.status handler: a sub-agent's row lives in its parent's
     // child-sessions list, not the sidebar, so refresh the rail in lockstep.
     const snapshot = queryClient?.getQueryData<Session>(["session", sessionId]);
@@ -3599,19 +3599,21 @@ export function handleSessionEvent(event: StreamEvent): void {
         }
         const patch: Partial<ChatState> = { sessionStatus: event.status };
         // The background-shell tally is STICKY. Only the Stop-hook-derived
-        // status carries a count (the forwarder relabels its `idle` to
-        // `waiting` and attaches `background_task_count`); the PTY-activity
-        // watcher's running/idle edges carry none. A claude-native turn that
-        // ends with shells still running emits, in order: the Stop hook's
-        // `waiting`(+count), then — ~1s later, once the pane quiesces — a
-        // bare PTY-activity `idle`. If that trailing `idle` reset the count
-        // to 0 the "N background tasks still running" spinner would vanish a beat after
-        // it appeared. So: adopt a reported count, clear it only on a hard
-        // failure, and otherwise leave it untouched. A new turn clears it
-        // explicitly in `send()`.
-        if (event.backgroundTaskCount !== undefined && event.backgroundTaskCount > 0) {
+        // status carries an authoritative count (the forwarder relabels its
+        // `idle` to `waiting` and attaches `background_task_count`); the
+        // PTY-activity watcher's running/idle edges carry none (`undefined`).
+        // A claude-native turn that ends with shells still running emits, in
+        // order: the Stop hook's `waiting`(+count), then — ~1s later, once the
+        // pane quiesces — a bare PTY-activity `idle` (no count). If that
+        // trailing `idle` reset the count the spinner would vanish a beat
+        // after it appeared. So: an explicit count is authoritative (a Stop
+        // hook's `0` clears it, so a finished shell drops the indicator on the
+        // next turn end; a positive count sets it); `undefined` leaves it
+        // untouched; and a new turn (`running`) or a failure clears it —
+        // mirroring the server's `_publish_status`.
+        if (event.backgroundTaskCount !== undefined) {
           patch.backgroundTaskCount = event.backgroundTaskCount;
-        } else if (event.status === "failed") {
+        } else if (event.status === "running" || event.status === "failed") {
           patch.backgroundTaskCount = 0;
         }
         if (
@@ -3689,7 +3691,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       // chat's "Working…" indicator — the exact desync users hit on a
       // claude-native session (chat clears/sets working instantly while
       // the sidebar dot stays stale).
-      patchConversationStatusInCache(event.conversationId, event.status);
+      patchConversationStatusInCache(
+        event.conversationId,
+        event.status,
+        useChatStore.getState().backgroundTaskCount,
+      );
       // On turn completion, refresh the Agents-rail preview for this
       // conversation. A child (added agent) finishing a turn leaves a stale
       // last_message_preview in its parent's child-sessions list (the runner
@@ -3973,14 +3979,17 @@ export function handleSessionEvent(event: StreamEvent): void {
 function patchConversationStatusInCache(
   conversationId: string,
   sessionStatus: SessionStatus,
+  backgroundTaskCount = 0,
 ): void {
   if (queryClient === null) return;
+  // Mirror the in-chat working indicator: a claude-native session that has
+  // settled to `idle` but still has background shells running must keep the
+  // sidebar spinner lit, exactly as `computeShowsWorking` keeps the chat
+  // indicator visible. `failed` still wins (the count is cleared on failure).
+  const working =
+    sessionStatus === "running" || sessionStatus === "waiting" || backgroundTaskCount > 0;
   const listStatus: NonNullable<Conversation["status"]> =
-    sessionStatus === "running" || sessionStatus === "waiting"
-      ? "running"
-      : sessionStatus === "failed"
-        ? "failed"
-        : "idle";
+    sessionStatus === "failed" ? "failed" : working ? "running" : "idle";
   queryClient.setQueriesData<InfiniteData<ConversationsPage>>(
     { queryKey: ["conversations"] },
     (data) => {

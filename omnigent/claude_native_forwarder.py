@@ -2702,7 +2702,13 @@ async def _forward_available_status_events(
                 client,
                 session_id=session_id,
                 status=effective_status,
-                background_task_count=record.background_task_count,
+                # Only the ``Stop`` (idle/waiting) edge carries an authoritative
+                # background-shell count — ``0`` clears the tally, ``N`` sets it.
+                # ``StopFailure`` (failed) clears it on the server regardless, so
+                # leave its count off the wire.
+                background_task_count=(
+                    None if status == "failed" else record.background_task_count
+                ),
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
@@ -3681,7 +3687,7 @@ async def _post_external_session_status(
     session_id: str,
     status: str,
     output: str | None = None,
-    background_task_count: int = 0,
+    background_task_count: int | None = None,
 ) -> None:
     """
     Post one ``external_session_status`` event to the Sessions API.
@@ -3696,15 +3702,21 @@ async def _post_external_session_status(
         a bare "failed" (#1113). Ignored when falsy.
     :param background_task_count: Number of background tasks (shells)
         still running when the status edge fires. Forwarded to the SSE
-        stream so the web UI can display "N shells running" instead of
-        a generic spinner. ``0`` (the default) omits the field.
+        stream so the web UI can display "N background tasks still
+        running" instead of a generic spinner. ``None`` (the default)
+        omits the field, which the server treats as "no information" and
+        leaves the sticky tally untouched — used by the PTY-activity
+        watcher, whose ``idle`` knows nothing about background shells. A
+        ``Stop`` hook passes its authoritative count (``0`` to clear, ``N``
+        to set), so a finished background shell clears the indicator on the
+        next turn end.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, Any] = {"status": status}
     if output:
         data["output"] = output
-    if background_task_count > 0:
+    if background_task_count is not None:
         data["background_task_count"] = background_task_count
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",

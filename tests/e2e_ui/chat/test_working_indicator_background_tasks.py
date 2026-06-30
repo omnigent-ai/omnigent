@@ -113,3 +113,42 @@ def test_background_tasks_keep_indicator_then_send_then_clear(
     # 3. The turn finishes with no background tasks left → indicator gone.
     _release_gate(mock_llm_server_url)
     expect(working).to_have_count(0, timeout=30_000)
+
+
+def test_sidebar_spinner_tracks_background_tasks(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The sidebar row's running spinner tracks background shells too.
+
+    A claude-native turn settles to ``idle`` while shells keep running; the
+    sidebar row must show the grey running spinner (``SessionStateBadge``
+    ``data-state="running"``), matching the in-chat indicator — not fall idle.
+    When the last shell finishes, the ``Stop`` hook's authoritative ``0``
+    clears the tally and both the spinner and the chat indicator go out.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server
+        fixture.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    working = page.locator(_WORKING)
+    # The badge sits in the row's time-marker slot (a sibling of the row link),
+    # and `seeded_session` holds exactly one session — so the lone running badge
+    # is this session's. Idle rows render no badge at all.
+    running_badge = page.locator('[data-testid="session-state-badge"][data-state="running"]')
+
+    # 1. Background shells outlive the turn → both the chat indicator and the
+    #    sidebar row's running spinner light up.
+    _publish_status(base_url, session_id, "idle", background_task_count=1)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(working).to_contain_text("1 background task still running", timeout=15_000)
+    expect(running_badge).to_have_count(1, timeout=15_000)
+
+    # 2. The last shell finishes: the Stop hook reports an authoritative `0`,
+    #    which clears the tally — both the chat indicator and the sidebar
+    #    spinner go out (idle rows render no badge).
+    _publish_status(base_url, session_id, "idle", background_task_count=0)
+    expect(working).to_have_count(0, timeout=15_000)
+    expect(running_badge).to_have_count(0, timeout=15_000)

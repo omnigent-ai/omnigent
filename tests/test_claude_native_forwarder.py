@@ -1432,9 +1432,11 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # The first (and only) status POST is the Stop → idle. A ``running``
     # arriving first would mean UserPromptSubmit is still wrongly mapped.
     assert request["path"] == "/v1/sessions/conv_abc/events"
+    # The Stop hook carries its authoritative background-shell count (0 here,
+    # no background tasks) so a finished shell clears the indicator.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 
@@ -1600,7 +1602,7 @@ async def test_forwarder_ignores_subagent_stop_hook(
 
     assert first["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 

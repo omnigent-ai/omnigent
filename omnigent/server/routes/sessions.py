@@ -1871,6 +1871,12 @@ def _session_status_with_child_rollup(
     own_status = _session_status_from_cache(conversation_id)
     if own_status == "running":
         return "running"
+    # A claude-native session can settle to ``idle`` while background shells
+    # keep running; the sticky tally keeps the sidebar spinner lit, matching
+    # the in-chat "N background tasks still running" indicator. (``failed``
+    # clears the tally, so this never masks a failure.)
+    if own_status != "failed" and _session_background_task_count_cache.get(conversation_id, 0) > 0:
+        return "running"
     if any(
         _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
@@ -5240,11 +5246,17 @@ def _publish_status(
         return
     _session_status_cache[session_id] = status
     # Keep the background-shell tally sticky alongside the status (see the
-    # cache's declaration): adopt a reported count, clear it on a new turn or
-    # a failure, and otherwise leave it so the trailing PTY-activity ``idle``
-    # can't wipe the count the Stop hook just published.
-    if background_task_count is not None and background_task_count > 0:
-        _session_background_task_count_cache[session_id] = background_task_count
+    # cache's declaration). A ``Stop`` hook reports an authoritative count
+    # (``None`` is never sent by it): a positive count sets the tally, and
+    # an explicit ``0`` clears it so a finished background shell drops the
+    # indicator on the next turn end. ``None`` means "no information" (the
+    # trailing PTY-activity ``idle`` carries none) and must NOT wipe the
+    # count the Stop hook just published. A new turn or a failure clears it.
+    if background_task_count is not None:
+        if background_task_count > 0:
+            _session_background_task_count_cache[session_id] = background_task_count
+        else:
+            _session_background_task_count_cache.pop(session_id, None)
     elif status in ("running", "failed"):
         _session_background_task_count_cache.pop(session_id, None)
     event = SessionStatusEvent(
@@ -18322,8 +18334,18 @@ def create_sessions_router(
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            # ``None`` (field absent) = no information; leave the sticky
+            # tally untouched (the PTY-activity ``idle`` carries none). An
+            # explicit ``0`` from a ``Stop`` hook is authoritative and clears
+            # the tally, so a finished background shell drops the indicator.
             raw_bg_count = body.data.get("background_task_count")
-            bg_count = raw_bg_count if isinstance(raw_bg_count, int) and raw_bg_count > 0 else None
+            bg_count = (
+                raw_bg_count
+                if isinstance(raw_bg_count, int)
+                and not isinstance(raw_bg_count, bool)
+                and raw_bg_count >= 0
+                else None
+            )
             _publish_status(
                 session_id,
                 status,

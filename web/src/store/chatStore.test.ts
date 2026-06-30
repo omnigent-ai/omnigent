@@ -2333,6 +2333,47 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     expect(useChatStore.getState().backgroundTaskCount).toBe(0);
   });
 
+  it("clears the shell count when a Stop hook reports zero remaining shells", () => {
+    // The shell finished: the next turn-end Stop hook carries an authoritative
+    // `background_task_count: 0` (an explicit count, not an absent field), which
+    // must drop the "N background tasks still running" indicator. The earlier
+    // sticky-on-idle behavior — which only existed to survive the countless
+    // trailing PTY idle — must NOT swallow this authoritative zero.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+      backgroundTaskCount: 0,
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.backgroundTaskCount).toBe(0);
+  });
+
+  it("clears the shell count when a new turn starts (running edge)", () => {
+    // A `running` edge with no count means a fresh turn began; the prior
+    // turn's tally is stale and must clear, mirroring the server's
+    // `_publish_status`. (The PTY `running` carries no count.)
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      backgroundTaskCount: 2,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+    });
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+  });
+
   it("clears the sticky shell count when the user sends a new turn", async () => {
     // Asking another question while shells run supersedes the prior turn's
     // tally: the label must flip from "N background tasks still running" to "Working…"
@@ -3072,6 +3113,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "failed" });
       expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("failed");
       handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+      expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("idle");
+    });
+
+    it("keeps the sidebar row 'running' while background shells outlive the turn", () => {
+      // The claude-native turn settles to idle while shells keep running; the
+      // sticky tally must keep the sidebar spinner lit (the grey RunningDot),
+      // matching the in-chat "N background tasks still running" indicator — not
+      // fall idle the way it did before this fix.
+      seedConversationsCache([conv("conv_abc", "running")]);
+      useChatStore.setState({ conversationId: "conv_abc", backgroundTaskCount: 1 });
+      handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+      expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("running");
+    });
+
+    it("drops the sidebar row to 'idle' once the last background shell finishes", () => {
+      // The finishing Stop hook carries an authoritative `background_task_count: 0`,
+      // which clears the tally — the sidebar spinner must then go out.
+      seedConversationsCache([conv("conv_abc", "running")]);
+      useChatStore.setState({ conversationId: "conv_abc", backgroundTaskCount: 1 });
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "idle",
+        backgroundTaskCount: 0,
+      });
       expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("idle");
     });
   });
