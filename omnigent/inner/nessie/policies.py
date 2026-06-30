@@ -568,6 +568,57 @@ def worktree_guard(
     return _evaluate
 
 
+def read_only_os(
+    *,
+    deny_reason: str = (
+        "This agent is report-only: it may read files and run shell, but never "
+        "write or edit them. Describe the change in your report instead of applying it."
+    ),
+) -> Callable[[_Json, _Json], _Json]:
+    """
+    Factory: deny every file-mutating tool call (report-only agents).
+
+    DENIES ``sys_os_write`` / ``sys_os_edit`` and the Claude/Codex/Pi native
+    ``Write`` / ``Edit`` / ``MultiEdit`` aliases. Reads, searches, and shell
+    commands are left untouched — pair with :func:`blast_radius` to also bound
+    shell blast radius. Use on agents whose contract is to investigate and
+    report, never to change code (e.g. a security reviewer and its read-only
+    sub-agents): unlike prompt discipline alone, an accidental ``sys_os_edit``
+    is refused at the policy layer.
+
+    :param deny_reason: Reason text surfaced on a DENY decision.
+    :returns: An evaluator ``fn(event, config)`` returning DENY for any
+        write/edit tool call, ALLOW otherwise.
+    """
+
+    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit/
+    # MultiEdit, and Pi's native lowercase write/edit — the same tool set
+    # worktree_guard gates, so the two write policies stay in lockstep.
+    write_tools = {
+        "sys_os_write",
+        "sys_os_edit",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "write",
+        "edit",
+    }
+
+    def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
+        """
+        Deny any file-mutating tool call.
+
+        :param event: V0 ``tool_call`` event.
+        :param config: Runtime config dict (unused).
+        :returns: DENY for a write/edit tool, ALLOW otherwise.
+        """
+        if _tool_call(event, write_tools) is None:
+            return _ALLOW
+        return _decision("DENY", deny_reason)
+
+    return _evaluate
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -600,5 +651,13 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "description": "Blocks file writes (sys_os_write/edit, Claude/Codex native "
         "Write/Edit, and Pi native write/edit) outside the worker's git worktree to "
         "prevent cross-branch contamination",
+    },
+    {
+        "handler": "omnigent.inner.nessie.policies.read_only_os",
+        "kind": "factory",
+        "name": "Report-Only (Deny File Writes)",
+        "description": "Denies every file-mutating tool (sys_os_write/edit, Claude/Codex "
+        "native Write/Edit/MultiEdit, and Pi native write/edit) so a report-only agent "
+        "can read and run shell but never change code",
     },
 ]
