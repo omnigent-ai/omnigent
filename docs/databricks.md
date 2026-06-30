@@ -12,6 +12,21 @@ omnigent's fine standalone with any OTLP backend and any LLM
 provider. This guide's for the production deployment story where
 governance, audit, cost tracking, and managed scale matter.
 
+> **Databricks customer? Start with the managed offering.**
+> [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
+> (Beta) is a fully managed service: Databricks operates the omnigent
+> server for you, already wired to workspace identity, Foundation
+> Models, AI Gateway, and MLflow Tracing. You enable the **Omnigent**
+> preview in your workspace settings and follow the quickstart there.
+> No deploy tooling, no Lakebase bootstrap, no bundle to maintain. That
+> is the recommended path for most Databricks users.
+>
+> This guide covers the **self-managed** path: deploying and operating
+> the omnigent server yourself on Databricks Apps. Reach for it when the
+> managed service is not available in your region, or when you need
+> something it does not expose today (custom YAML policies, bring-your-own
+> provider API keys, custom egress controls).
+
 ## Who this is for
 
 This guide assumes you're new to both omnigent and Databricks. Each

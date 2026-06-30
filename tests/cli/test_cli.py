@@ -396,7 +396,7 @@ def test_claude_command_profile_startup_threads_profiler(
         _fake_run_claude_native_capture(captured),
     )
 
-    result = CliRunner(mix_stderr=False).invoke(
+    result = CliRunner().invoke(
         cli,
         ["claude", "--server", "https://example.com", "--profile-startup"],
     )
@@ -2577,7 +2577,9 @@ def test_removed_runner_flow_flags_are_rejected(flag: str) -> None:
     result = CliRunner().invoke(cli, ["run", "tests/resources/examples/hello_world.yaml", flag])
 
     assert result.exit_code != 0
-    assert f"No such option: {flag}" in result.output
+    # click 8.2 reworded this from "No such option: --x" to "No such option
+    # '--x'." (and may append a "Did you mean" suggestion), so match loosely.
+    assert "No such option" in result.output and flag in result.output
 
 
 def test_attach_without_server_errors_loud(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3525,7 +3527,7 @@ def test_config_set_local_writes_project_config(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", tmp_path / "global.yaml")
 
-    result = CliRunner(mix_stderr=False).invoke(cli, ["config", "set", "model=my-model"])
+    result = CliRunner().invoke(cli, ["config", "set", "model=my-model"])
 
     assert result.exit_code == 0, result.output
     local_path = tmp_path / ".omnigent" / "config.yaml"
@@ -4076,6 +4078,48 @@ def test_setup_no_internal_beta_runs_configure_flow(
     run_onboarding.assert_not_called()
 
 
+def test_setup_uses_compact_branding_on_short_terminals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A short first-run terminal should show the setup picker, not scroll past it."""
+    configure_flow = Mock()
+    print_landing = Mock()
+    print_brandmark = Mock()
+    monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure_flow)
+    monkeypatch.setattr("omnigent.inner.ui.print_landing", print_landing)
+    monkeypatch.setattr("omnigent.inner.ui.print_brandmark", print_brandmark)
+    monkeypatch.setattr(
+        "omnigent.cli.shutil.get_terminal_size",
+        lambda fallback: os.terminal_size((80, 24)),
+    )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
+
+    assert result.exit_code == 0, result.output
+    print_brandmark.assert_called_once_with("setup")
+    print_landing.assert_not_called()
+    configure_flow.assert_called_once_with()
+
+
+def test_setup_keeps_full_landing_on_tall_terminals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Roomy terminals keep the full first-run lockup."""
+    configure_flow = Mock()
+    print_landing = Mock()
+    print_brandmark = Mock()
+    monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure_flow)
+    monkeypatch.setattr("omnigent.inner.ui.print_landing", print_landing)
+    monkeypatch.setattr("omnigent.inner.ui.print_brandmark", print_brandmark)
+    monkeypatch.setattr(
+        "omnigent.cli.shutil.get_terminal_size",
+        lambda fallback: os.terminal_size((120, 40)),
+    )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
+
+    assert result.exit_code == 0, result.output
+    print_landing.assert_called_once_with(tagline="all your agents, one cli")
+    print_brandmark.assert_not_called()
+    configure_flow.assert_called_once_with()
+
+
 # ─── setup dependency preflight (Node / tmux) ─────────────────────────
 
 
@@ -4118,7 +4162,7 @@ def test_node_dependency_problem_missing(monkeypatch: pytest.MonkeyPatch) -> Non
     problem = _node_dependency_problem()
 
     assert problem is not None
-    assert "node not found on PATH" in problem
+    assert "node not found" in problem
     assert "Pi" in problem  # the harnesses that need it are named
 
 
@@ -4148,10 +4192,10 @@ def test_node_dependency_problem_too_old(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert problem is not None
     assert "too old" in problem
-    # The concrete version and the opaque error users actually see must
-    # both appear — that's what makes the warning recognizable.
+    # The concrete detected version and the required floor must both appear —
+    # that's what makes the compact warning recognizable and actionable.
     assert "v20.12.2" in problem
-    assert "markAsUncloneable" in problem
+    assert "Node.js 22 LTS" in problem
 
 
 def test_node_dependency_problem_probe_inconclusive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4225,7 +4269,7 @@ def test_warn_missing_harness_dependencies_lists_all_gaps(
 
     err = capsys.readouterr().err
     assert "Node.js is too old" in err
-    assert "tmux not found on PATH" in err
+    assert "tmux not found" in err
 
 
 def test_click_subcommands_allowlist_covers_registered_commands() -> None:

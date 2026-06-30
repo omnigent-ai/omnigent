@@ -232,15 +232,14 @@ def _populate_hermes_home(
     """
     hermes_home.mkdir(parents=True, exist_ok=True)
 
-    # Write the wrapper shell script that sets env vars and execs the hook.
+    # Write the wrapper shell script that sets env vars and execs the hook. It
+    # bakes a one-shot auth token + workspace-routing header, so it is
+    # owner-only (0o700) — the secret is never world-readable.
+    from omnigent.native_policy_hook import policy_hook_wrapper_script
+
     wrapper = hermes_home / "omnigent-policy-hook.sh"
-    wrapper.write_text(
-        f"#!/bin/sh\n"
-        f"export _OMNIGENT_SERVER_URL='{server_url}'\n"
-        f"export _OMNIGENT_SESSION_ID='{session_id}'\n"
-        f"exec '{sys.executable}' '{hook_script_path}'\n"
-    )
-    wrapper.chmod(0o755)
+    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.chmod(0o700)
 
     # Start from the user's config so model/provider/auth settings carry over.
     # Hermes scopes everything to HERMES_HOME, so without this merge it won't

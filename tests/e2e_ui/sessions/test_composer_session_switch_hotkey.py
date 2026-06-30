@@ -1,6 +1,6 @@
 """E2E: Cmd/Ctrl+↑/↓ switches sessions even while the composer is focused.
 
-Covers the composer fix in ``ap-web/src/pages/ChatPage.tsx``: the composer's
+Covers the composer fix in ``web/src/pages/ChatPage.tsx``: the composer's
 ArrowUp/ArrowDown draft-recall handler used to intercept *any* arrow keydown,
 so the global session-switch hotkey (``useSessionSwitchHotkey``, Cmd/Ctrl+↑/↓)
 appeared dead while typing — recall swallowed the keystroke and replaced the
@@ -17,7 +17,7 @@ ate the chord and the route never changed.
 No LLM turn is needed — this exercises pure client-side keyboard + routing —
 so it skips the nightly/real-agent markers the approval suites carry. Two
 runner-bound sessions come from the ``seeded_session_pair`` fixture; both
-render under the sidebar's "Recent" group, so both are in the hotkey's ordered
+render under the sidebar's "Chats" group, so both are in the hotkey's ordered
 list.
 """
 

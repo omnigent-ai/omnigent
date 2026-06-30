@@ -7,6 +7,7 @@ import json
 import secrets
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +29,11 @@ from omnigent.claude_native_bridge import (
 )
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.native_policy_hook import (
+    _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    policy_hook_reauth,
     post_evaluate_with_retry,
 )
 
@@ -394,7 +397,15 @@ def _create_clear_replacement_session(
     write_active_session_id(bridge_dir, new_session_id)
     clear_resp = client.patch(
         f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
+        json={
+            "runner_id": "",
+            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id
+            # so its later resume gets its own isolated dir instead of the new
+            # session's live one (which would double-mirror the transcript and
+            # trip the executor guard). Mirrors the async forwarder rotation;
+            # ``_auto_create_claude_terminal`` recognises this marker.
+            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
+        },
     )
     if clear_resp.status_code >= 400:
         print(
@@ -511,6 +522,7 @@ def _post_hook_with_reattach(
     headers: dict[str, str],
     payload: dict[str, Any],
     hook_label: str,
+    reauth: Callable[[], dict[str, str] | None] | None = None,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -530,6 +542,11 @@ def _post_hook_with_reattach(
         rides on a copy.
     :param hook_label: Diagnostic prefix for stderr lines, e.g.
         ``"permission"`` or ``"ask-user-question"``.
+    :param reauth: Optional callable that re-mints fresh auth headers when the
+        server bounces the POST to its OAuth login flow (Apps 302→``/oidc/``)
+        or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
+        Called at most once; new headers trigger an immediate retry with them.
+        ``None`` keeps the legacy behavior.
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
@@ -540,10 +557,30 @@ def _post_hook_with_reattach(
     deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
+    reauthed = False
     while True:
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=body)
+                if (
+                    reauth is not None
+                    and not reauthed
+                    and _is_login_redirect_or_unauthorized(resp)
+                ):
+                    # One-shot ``ap_auth_headers`` token lapsed (~1h OAuth
+                    # lifetime): re-mint and retry once rather than fail-asking
+                    # into a terminal prompt no one watches. Mirrors the
+                    # evaluate-policy hook and ``_RunnerDatabricksAuth``.
+                    refreshed = reauth()
+                    if refreshed:
+                        headers = refreshed
+                        reauthed = True
+                        print(
+                            f"omnigent {hook_label} hook: Omnigent auth expired "
+                            "(login redirect/401); re-minted token and retrying",
+                            file=sys.stderr,
+                        )
+                        continue
                 resp.raise_for_status()
                 return resp
         except httpx.HTTPStatusError as exc:
@@ -612,7 +649,13 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
     )
-    resp = _post_hook_with_reattach(url, headers, payload, "claude permission")
+    resp = _post_hook_with_reattach(
+        url,
+        headers,
+        payload,
+        "claude permission",
+        reauth=policy_hook_reauth(ap_server_url, headers),
+    )
     if resp is None:
         return 0
     if resp.content:
@@ -678,7 +721,13 @@ def _main_ask_user_question(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
     )
-    resp = _post_hook_with_reattach(url, headers, payload, "ask-user-question")
+    resp = _post_hook_with_reattach(
+        url,
+        headers,
+        payload,
+        "ask-user-question",
+        reauth=policy_hook_reauth(ap_server_url, headers),
+    )
     if resp is None or not resp.content:
         return 0
     # The Omnigent server returns a PermissionRequest-shaped response:
@@ -824,7 +873,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
 
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}/policies/evaluate"
     resp = post_evaluate_with_retry(
-        url, headers, eval_request, _EVALUATE_POLICY_TIMEOUT_S, "evaluate-policy hook"
+        url,
+        headers,
+        eval_request,
+        _EVALUATE_POLICY_TIMEOUT_S,
+        "evaluate-policy hook",
+        reauth=policy_hook_reauth(ap_server_url, headers),
     )
     if resp is None:
         return _fail_closed()

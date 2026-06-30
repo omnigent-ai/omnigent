@@ -1,0 +1,103 @@
+{
+  "name": "omnigent-desktop-electron",
+  "productName": "Omnigent",
+  "version": "0.3.0",
+  "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
+  "private": true,
+  "main": "src/main.js",
+  "author": "Databricks, Inc.",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "test": "node --test",
+    "build": "electron-builder",
+    "build:mac": "electron-builder --mac",
+    "build:mac:release": "electron-builder --mac -c.mac.notarize=true",
+    "build:linux": "electron-builder --linux",
+    "build:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^42.3.2",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "ai.omnigent.desktop",
+    "productName": "Omnigent",
+    "directories": {
+      "output": "dist"
+    },
+    "afterPack": "build/afterPack.js",
+    "files": [
+      "src/**/*",
+      "setup/**/*",
+      "find/**/*",
+      "icons/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../platform-assets",
+        "to": "platform-assets",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "icons/icon.icns",
+      "identity": "Databricks, Inc. (8RMX4WU6F8)",
+      "provisioningProfile": "signing/omnigent.provisionprofile",
+      "hardenedRuntime": true,
+      "entitlements": "signing/entitlements.mac.plist",
+      "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Omnigent uses the microphone for voice dictation in the message composer.",
+        "CFBundleIconName": "AppIcon"
+      },
+      "gatekeeperAssess": false,
+      "notarize": false,
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "background": "dmg/background.tiff",
+      "window": {
+        "width": 640,
+        "height": 465
+      },
+      "iconSize": 96,
+      "contents": [
+        {
+          "x": 170,
+          "y": 100
+        },
+        {
+          "x": 470,
+          "y": 100,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "linux": {
+      "icon": "icons/icon.png",
+      "category": "Development",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
+    "win": {
+      "icon": "icons/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    }
+  },
+  "dependencies": {
+    "js-yaml": "^4.2.0"
+  }
+}

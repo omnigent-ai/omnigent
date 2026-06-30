@@ -32,8 +32,10 @@ from omnigent.qwen_native_bridge import (
     write_tmux_target,
 )
 from omnigent.qwen_native_forwarder import (
+    _compaction_status_from_record,
     _event_to_item,
     _ForwardState,
+    _read_new_compaction_statuses,
     _read_new_events,
     _read_state,
     _write_state,
@@ -151,6 +153,61 @@ def test_malformed_line_tolerated(tmp_path: Path) -> None:
     assert [i.uuid for i in items] == ["u1"]
 
 
+# --- Compaction mirror (chat-recording tail) -------------------------------
+
+
+def _compression_record(status: int) -> dict:
+    """A qwen chat-recording ``chat_compression`` system event."""
+    return {
+        "type": "system",
+        "subtype": "chat_compression",
+        "systemPayload": {
+            "info": {
+                "originalTokenCount": 19398,
+                "newTokenCount": 17000,
+                "compressionStatus": status,
+            }
+        },
+    }
+
+
+def test_compaction_status_from_record() -> None:
+    assert _compaction_status_from_record(_compression_record(1)) == "completed"
+    # COMPRESSION_FAILED_* statuses → failed.
+    assert _compaction_status_from_record(_compression_record(2)) == "failed"
+    assert _compaction_status_from_record(_compression_record(3)) == "failed"
+    # Other recording lines are ignored.
+    assert _compaction_status_from_record({"type": "system", "subtype": "ui_telemetry"}) is None
+    assert _compaction_status_from_record(_user_ev("u1", "hi")) is None
+
+
+def test_read_new_compaction_statuses_incremental_and_ignores_other_lines(tmp_path: Path) -> None:
+    rec = tmp_path / "chat.jsonl"
+    # A transcript line + a successful compression record.
+    rec.write_bytes(_ev_bytes(_user_ev("u1", "hi")) + _ev_bytes(_compression_record(1)))
+    statuses, off = _read_new_compaction_statuses(rec, 0)
+    assert statuses == ["completed"]
+    assert off == rec.stat().st_size
+    # No new lines → nothing.
+    assert _read_new_compaction_statuses(rec, off) == ([], off)
+
+
+def test_read_new_compaction_statuses_detects_truncation(tmp_path: Path) -> None:
+    rec = tmp_path / "chat.jsonl"
+    rec.write_bytes(_ev_bytes(_user_ev("u1", "padding line, intentionally long " * 4)))
+    off = rec.stat().st_size
+    # A recreated (shorter) recording must rewind so a fresh compaction is seen.
+    rec.write_bytes(_ev_bytes(_compression_record(1)))
+    assert rec.stat().st_size < off
+    statuses, _ = _read_new_compaction_statuses(rec, off)
+    assert statuses == ["completed"]
+
+
+def test_read_new_compaction_statuses_missing_file(tmp_path: Path) -> None:
+    # Recording not created yet → no statuses, offset unchanged (retry next poll).
+    assert _read_new_compaction_statuses(tmp_path / "absent.jsonl", 0) == ([], 0)
+
+
 def test_wait_for_ready_times_out_without_boot_signal(tmp_path: Path) -> None:
     bridge = tmp_path / "bridge"
     prepare_bridge_files(bridge)
@@ -216,6 +273,19 @@ def test_qwen_session_recording_exists_is_workspace_scoped(
     assert qwen_session_recording_exists(sid, ws_b) is False
     # A different conversation's id under the same workspace is unaffected.
     assert qwen_session_recording_exists(qwen_session_id_for_conversation("conv_x"), ws_a) is False
+
+
+def test_qwen_session_recording_path_is_workspace_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.qwen_native_bridge import _qwen_project_slug, qwen_session_recording_path
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    sid = qwen_session_id_for_conversation("conv_rec")
+    expected = tmp_path / ".qwen" / "projects" / _qwen_project_slug(ws) / "chats" / f"{sid}.jsonl"
+    assert qwen_session_recording_path(sid, ws) == expected
 
 
 def test_bridge_submit_and_confirmation_append_jsonl(tmp_path: Path) -> None:
@@ -413,6 +483,45 @@ async def test_forward_loop_posts_new_events_and_persists(
     state = _read_state(bridge)
     assert state.offset > 0
     assert "u1" in (state.seen_uuids or [])
+
+
+async def test_compaction_mirror_seeds_at_eof_and_posts_new(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = tmp_path / "chat.jsonl"
+    # A pre-existing compression record (resume case): must NOT be re-posted.
+    rec.write_bytes(_ev_bytes(_compression_record(1)))
+
+    posted: list[str] = []
+
+    async def _fake_post(_client: object, *, session_id: str, status: str) -> None:
+        posted.append(status)
+
+    monkeypatch.setattr(fwd, "_post_external_compaction_status", _fake_post)
+
+    task = asyncio.create_task(
+        fwd.supervise_qwen_compaction_mirror(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            recording_path=rec,
+            poll_interval_s=0.01,
+        )
+    )
+    # Let it seed at EOF; the pre-existing record stays unposted.
+    await asyncio.sleep(0.05)
+    assert posted == []
+    # A new compression now lands and is mirrored.
+    with open(rec, "ab") as fh:
+        fh.write(_ev_bytes(_compression_record(1)))
+    for _ in range(200):
+        if posted:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+    assert posted == ["completed"]
 
 
 async def test_supervise_restarts_then_propagates_cancel(

@@ -137,13 +137,13 @@ jobs:
 
       - name: Set up Python
         if: steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version-file: ".python-version"
 
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
           enable-cache: true
 
@@ -156,7 +156,7 @@ jobs:
 
       - name: Cache virtualenv
         if: steps.creds.outputs.available == 'true'
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -466,9 +466,19 @@ jobs:
           # Execute the validated commands.
           bash /tmp/triage_commands.sh
 
+          # If the issue was filed by a maintainer, assign it to them directly.
+          author=$(jq -r '.author.login // empty' /tmp/issue.json)
+          maintainer_assigned=false
+          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
+            echo "Issue filed by maintainer $author — assigning to author"
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
+            maintainer_assigned=true
+          fi
+
           # Round-robin assign engineer for P0/P1 issues, with domain routing.
+          # Skip if already assigned to the maintainer-author above.
           priority=$(jq -r '.priority // empty' /tmp/triage_result.json)
-          if [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; then
+          if [ "$maintainer_assigned" = "false" ] && { [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; }; then
             python3 <<'PYEOF'
           import json, pathlib, os
 
@@ -509,7 +519,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: triage-logs-${{ github.run_id }}
           path: |

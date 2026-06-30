@@ -3369,7 +3369,7 @@ class TerminalHost:
 
     def _subagent_status_label(self, node: _SubagentNode) -> str:
         """Collapse a node to a short status word, mirroring the web UI
-        ``childStatus`` precedence (``ap-web SubagentsPanel.tsx``):
+        ``childStatus`` precedence (``web SubagentsPanel.tsx``):
 
         1. ``pending_elicitations > 0`` → ``Needs response`` (outranks busy: a
            sub-agent parked on an approval needs the user, not a generic badge).

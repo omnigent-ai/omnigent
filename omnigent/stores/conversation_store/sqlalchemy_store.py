@@ -25,6 +25,7 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlConversation,
     SqlConversationItem,
@@ -56,6 +57,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ConversationNotFoundError,
     ConversationStore,
@@ -262,11 +264,17 @@ def _upsert_labels(
         touched by this call.
     """
     dialect = session.bind.dialect.name if session.bind is not None else ""
+    # Defense-in-depth: clamp every value to the column width so no label
+    # writer can overflow ``String(256)`` and raise ``DataError`` on
+    # PostgreSQL. Callers (session error labels, client-supplied ``body.labels``
+    # on session create/patch, policy-author writes) all funnel through here,
+    # so this is the single point that guarantees the column constraint. The
+    # slice is character-based, matching Postgres ``VARCHAR(n)`` semantics.
     rows = [
         {
             "conversation_id": conversation_id,
             "key": key,
-            "value": value,
+            "value": value[:LABEL_VALUE_MAX_LEN],
             "updated_at": updated_at,
         }
         for key, value in updates.items()
@@ -469,6 +477,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        # Immediate session: used for read-modify-write operations that must be
+        # atomic. On SQLite, ``BEGIN IMMEDIATE`` acquires the write lock before
+        # the first read, preventing ``SQLITE_BUSY_SNAPSHOT`` under concurrent
+        # writers. On other dialects ``immediate=True`` is a no-op — those paths
+        # use ``SELECT … FOR UPDATE`` via ``_supports_for_update`` instead.
+        self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
         self._supports_for_update = self._engine.dialect.name != "sqlite"
         # SQLite rowid is monotonically increasing absent deletions; it serves
         # as an insertion-ordered tiebreaker for timestamp ties. Note: without
@@ -923,6 +937,53 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlConversation.id == conversation_id)
                 .values(session_usage=json.dumps(usage))
             )
+
+    def increment_session_usage(
+        self,
+        conversation_id: str,
+        delta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Atomically increment the session usage for one conversation.
+
+        Runs the read-modify-write in a single database transaction, serialising
+        concurrent writers via two complementary mechanisms:
+
+        - **PostgreSQL / MySQL / MariaDB**: ``SELECT … FOR UPDATE`` acquires an
+          exclusive row lock for the duration of the transaction; a concurrent
+          second writer blocks until this one commits.
+        - **SQLite**: the session is opened with ``BEGIN IMMEDIATE``
+          (``self._session_immediate``), which acquires SQLite's write lock
+          *before* the first read. A plain ``SELECT``-then-``UPDATE`` in a
+          deferred transaction would expose concurrent writers to
+          ``SQLITE_BUSY_SNAPSHOT`` because each writer takes a read snapshot
+          first; ``BEGIN IMMEDIATE`` prevents that by serialising at lock
+          acquisition time.
+
+        :param conversation_id: The conversation to update.
+        :param delta: Usage increments (see
+            :meth:`ConversationStore.increment_session_usage`).
+        :returns: The updated ``session_usage`` dict.
+        """
+        import json
+
+        from omnigent.stores.conversation_store import apply_session_usage_delta
+
+        with self._session_immediate() as session:
+            q = select(SqlConversation).where(SqlConversation.id == conversation_id)
+            if self._supports_for_update:
+                q = q.with_for_update()
+            row = session.scalars(q).first()
+            current: dict[str, Any] = (
+                dict(json.loads(row.session_usage)) if row and row.session_usage else {}
+            )
+            apply_session_usage_delta(current, delta)
+            session.execute(
+                update(SqlConversation)
+                .where(SqlConversation.id == conversation_id)
+                .values(session_usage=json.dumps(current))
+            )
+            return current
 
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """
@@ -1449,6 +1510,75 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return persisted
 
+    def list_projects(
+        self,
+        accessible_by: str | None = None,
+    ) -> list[str]:
+        """
+        Return all distinct project names, ordered alphabetically.
+
+        Projects are implicit: they exist as long as at least one
+        *non-archived* ``conversation_labels`` row with ``key="omni_project"``
+        references them. Archived sessions keep their project label (so
+        unarchiving restores a session to its original project), but a project
+        whose every member is archived drops out of this list — that is what
+        makes "Delete project" (which archives all members) remove the folder
+        while leaving the sessions recoverable. The label key is namespaced
+        (``omni_*``) to keep this internal storage key distinct from the
+        user-facing "project" term and from any future reserved keys; it is
+        never surfaced as a label in the UI.
+
+        :param accessible_by: When set, restrict to sessions that
+            ``accessible_by`` has a permission row for (mirrors the
+            ``list_conversations`` ACL filter).
+        :returns: List of project names ordered ascending.
+        """
+        with self._session() as session:
+            # Join to the conversation so archived sessions don't keep an
+            # otherwise-empty project alive in the sidebar.
+            stmt = (
+                select(SqlConversationLabel.value)
+                .join(
+                    SqlConversation,
+                    SqlConversation.id == SqlConversationLabel.conversation_id,
+                )
+                .where(
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                    SqlConversation.archived.is_(False),
+                )
+                .distinct()
+                .order_by(SqlConversationLabel.value)
+            )
+            if accessible_by is not None:
+                from omnigent.db.db_models import SqlSessionPermission
+
+                accessible_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.user_id == accessible_by
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
+            return [row[0] for row in session.execute(stmt).all()]
+
+    def delete_label(
+        self,
+        conversation_id: str,
+        key: str,
+    ) -> None:
+        """
+        Delete a single label key from a conversation.
+
+        No-op if the label does not exist.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key to remove, e.g. ``"omni_project"``.
+        """
+        with self._session() as session:
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == key,
+                )
+            )
+
     def list_conversations(
         self,
         limit: int = 20,
@@ -1465,6 +1595,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         search_query: str | None = None,
         accessible_by: str | None = None,
         include_archived: bool = False,
+        project: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1509,6 +1640,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
+        :param project: When set to a non-empty string, only return
+            sessions that have a ``conversation_labels`` row with
+            ``key="omni_project"`` and ``value=project``. When set to an
+            empty string ``""``, only return sessions with NO project
+            label (i.e., unfiled sessions). ``None`` disables the
+            filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -1558,6 +1695,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .distinct()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
+            if project is not None:
+                if project == "":
+                    # Unfiled: sessions with no project label at all.
+                    stmt = stmt.where(
+                        SqlConversation.id.not_in(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.key == PROJECT_LABEL_KEY
+                            )
+                        )
+                    )
+                else:
+                    # Specific project: session must have this project label.
+                    stmt = stmt.where(
+                        SqlConversation.id.in_(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                                SqlConversationLabel.value == project,
+                            )
+                        )
+                    )
             if after:
                 stmt = self._apply_cursor(
                     stmt,

@@ -238,6 +238,10 @@ def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
             "harness": ctx.harness,
             # Conversation labels (engine hot cache), empty when unpopulated.
             "labels": dict(ctx.labels) if ctx.labels is not None else {},
+            # Subtree-scoped cumulative cost (this conversation + its
+            # descendants only), injected by the engine only when a
+            # subagent_cost_budget policy is present; empty dict otherwise.
+            "subtree_usage": dict(ctx.subtree_usage) if ctx.subtree_usage else {},
         },
         # Mutable per-conversation state readable by the callable.
         # Empty dict when no policy has written state yet; the engine

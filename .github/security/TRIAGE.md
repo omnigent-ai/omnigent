@@ -80,4 +80,4 @@ findings in `spec/parser.py`, `tools/builtins/upload_file.py`, `spec/tar_utils.p
 etc. — most are trusted-input, but the extraction paths deserve a look.
 
 Serious (fix, don't dismiss): `starlette` and `cryptography` advisories (server
-runtime); the `undici` cluster in `ap-web`.
+runtime); the `undici` cluster in `web`.

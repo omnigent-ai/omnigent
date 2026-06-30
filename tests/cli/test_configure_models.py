@@ -1498,7 +1498,7 @@ def test_uninstalled_harness_shows_x_and_not_installed(isolated_config, monkeypa
     """A harness whose CLI isn't installed renders a red ✗ "Not installed" status.
 
     Overrides the installed-by-default fixture. The level-1 overview folds the
-    readiness into the row's right-aligned status: an absent CLI reads
+    readiness into the row's aligned status column: an absent CLI reads
     ``✗ Not installed`` inline (the exact install command is the selection-only
     description, surfaced when the row is highlighted, not in the always-visible
     row).
@@ -1547,7 +1547,7 @@ def test_overview_marks_unconfigured_with_x_and_configured_without_checkmark(
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
     assert result.exit_code == 0, result.output
     out = result.output
-    # Configured Claude: the green ✓ rides the right-aligned status, not the
+    # Configured Claude: the green ✓ rides the aligned status column, not the
     # name — so "✓ Claude" never appears, but the credential's "✓ …" does.
     assert "✓ Claude" not in out
     assert "✓ Anthropic API Key" in out
@@ -1558,14 +1558,15 @@ def test_overview_marks_unconfigured_with_x_and_configured_without_checkmark(
 
 def _capture_setup_overview(
     monkeypatch,
-) -> tuple[list[str], list[bool], list[str], bool]:
+) -> tuple[list[str], list[bool], list[str], bool, int | None]:
     """Render the level-1 setup overview once and capture the menu it builds.
 
     Monkeypatches the shared ``select`` so the picker records the rows it would
     draw, then returns ``-1`` (Esc) so setup exits after one frame. Returns the
-    captured ``(options, selectable, descriptions, compact)`` — enough to assert
-    the row set, ordering, single-line compactness, and the selection-only
-    install hints without driving a real TTY.
+    captured ``(options, selectable, descriptions, compact, max_visible)`` —
+    enough to assert the row set, ordering, single-line compactness, no
+    hidden/windowed rows, and the selection-only install hints without driving
+    a real TTY.
     """
     captured: dict[str, object] = {}
 
@@ -1576,6 +1577,7 @@ def _capture_setup_overview(
         selectable: list[bool] | None = None,
         descriptions: list[str] | None = None,
         compact: bool = False,
+        max_visible: int | None = None,
         clear_on_exit: bool = False,
         **_kwargs: object,
     ) -> int:
@@ -1587,6 +1589,7 @@ def _capture_setup_overview(
             selectable=selectable,
             descriptions=descriptions,
             compact=compact,
+            max_visible=max_visible,
         )
         return -1
 
@@ -1598,6 +1601,7 @@ def _capture_setup_overview(
         captured["selectable"],  # type: ignore[return-value]
         captured["descriptions"],  # type: ignore[return-value]
         captured["compact"],  # type: ignore[return-value]
+        captured["max_visible"],  # type: ignore[return-value]
     )
 
 
@@ -1605,7 +1609,7 @@ def _overview_row_names(options: list[str], selectable: list[bool]) -> list[str]
     """Extract the harness / Quit names from a captured overview frame.
 
     Each row label is ``"<name><padding>[<color>]<glyph> <status>[/]"``; the
-    name is the text before the 2-space status gutter, recovered after Rich
+    name is the text before the status gutter, recovered after Rich
     markup is stripped.
     """
     import re
@@ -1627,10 +1631,12 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
     No "More" folding: all twelve harnesses are visible at once, followed by
     Quit. A regression that hides a harness, reorders the core six, or
     reintroduces a collapse row fails here. The menu also opts into the compact
-    (underline-highlight) rendering.
+    top-level rendering.
     """
-    options, selectable, _descriptions, compact = _capture_setup_overview(monkeypatch)
-    assert _overview_row_names(options, selectable) == [
+    from omnigent.onboarding import interactive
+
+    options, selectable, descriptions, compact, max_visible = _capture_setup_overview(monkeypatch)
+    expected = [
         "Claude",
         "Codex",
         "Cursor",
@@ -1645,18 +1651,35 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Kimi Code",
         "Quit",
     ]
+    assert _overview_row_names(options, selectable) == expected
     assert compact is True
+    assert max_visible is None
+    rendered = interactive._render_menu(
+        "Configure harnesses",
+        options,
+        0,
+        descriptions=descriptions,
+        width=80,
+        selectable=selectable,
+        compact=compact,
+        max_visible=max_visible,
+    )
+    for row in expected:
+        assert row in rendered
+    assert "more" not in rendered.lower()
 
 
 def test_overview_rows_are_single_line(isolated_config, monkeypatch) -> None:
     """Every overview row is a single selectable line — no skipped sub-lines.
 
-    The compact layout folds each harness's status into its row (right-aligned)
+    The compact layout folds each harness's status into its row (aligned column)
     instead of a dim sub-line beneath it, so the cursor lands on every rendered
     row and each row carries a (possibly empty) description. A regression that
     brings back non-selectable sub-lines fails here.
     """
-    options, selectable, descriptions, _compact = _capture_setup_overview(monkeypatch)
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
     assert all(selectable)
     assert len(descriptions) == len(options)
 
@@ -1666,16 +1689,16 @@ def test_overview_lists_kiro_row(isolated_config, monkeypatch) -> None:
 
     Kiro (``kiro-native``) is a native CLI harness with its own auth
     (``kiro-cli login``). Absent the CLI the row reads ``✗ Not installed`` and
-    its selection-only description names the curl installer; installed, it reads
-    ``✓ Installed`` with the sign-in reminder. A regression that drops the Kiro
-    row fails here.
+    its selection-only description names the curl installer; installed, it still
+    reads ``✗ Not configured`` because there is no reliable auth probe. A
+    regression that drops the Kiro row or overstates readiness fails here.
     """
     from rich.text import Text
 
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
-    options, selectable, descriptions, _ = _capture_setup_overview(monkeypatch)
+    options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     kiro = names.index("Kiro")
     assert "Not installed" in Text.from_markup(options[kiro]).plain
@@ -1684,11 +1707,104 @@ def test_overview_lists_kiro_row(isolated_config, monkeypatch) -> None:
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
-    options, selectable, descriptions, _ = _capture_setup_overview(monkeypatch)
+    options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     kiro = names.index("Kiro")
-    assert "Installed" in Text.from_markup(options[kiro]).plain
+    assert "Not configured" in Text.from_markup(options[kiro]).plain
     assert "kiro-cli login" in Text.from_markup(descriptions[kiro]).plain
+
+
+def test_overview_hermes_row_reflects_configured_model(isolated_config, monkeypatch) -> None:
+    """Hermes reads ready (with its picked model) once ``hermes model`` has run.
+
+    Regression for the overview hardcoding an installed Hermes to
+    ``✗ Not configured`` regardless of ``~/.hermes/config.yaml``. With the
+    ``hermes`` binary present:
+
+    * a fresh scaffold (``model.provider: auto`` — nothing picked yet) still
+      reads a yellow ``✗ Not configured`` and points at ``hermes model``;
+    * a finished ``hermes model`` run (a concrete ``provider`` + ``default``
+      model) reads a green ✓ with ``"<provider> / <model>"``.
+
+    HOME is the isolated tmp dir (``isolated_config``), so the probe reads the
+    config written here, not the developer's real ``~/.hermes``. The probe
+    binds ``harness_cli_installed`` at import, so patch the ``hermes_auth``
+    symbol it actually calls rather than relying on the install fixture.
+    """
+    from rich.text import Text
+
+    monkeypatch.setattr("omnigent.onboarding.hermes_auth.hermes_cli_installed", lambda: True)
+    hermes_dir = os.path.join(isolated_config, ".hermes")
+    os.makedirs(hermes_dir, exist_ok=True)
+    hermes_config = os.path.join(hermes_dir, "config.yaml")
+
+    # Fresh scaffold: provider "auto" (auto-detect), nothing picked → unconfigured.
+    with open(hermes_config, "w") as f:
+        yaml.safe_dump({"model": {"default": "anthropic/claude-opus-4.6", "provider": "auto"}}, f)
+    options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
+    names = _overview_row_names(options, selectable)
+    hermes = names.index("Hermes")
+    assert "[yellow]✗ Not configured[/]" in options[hermes]
+    assert "hermes model" in Text.from_markup(descriptions[hermes]).plain
+
+    # Configured: a concrete provider + model picked → green ✓ with the model.
+    with open(hermes_config, "w") as f:
+        yaml.safe_dump({"model": {"default": "z-ai/glm-5.2", "provider": "openrouter"}}, f)
+    options, selectable, _descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
+    names = _overview_row_names(options, selectable)
+    hermes = names.index("Hermes")
+    assert "[green]✓" in options[hermes]
+    plain = Text.from_markup(options[hermes]).plain
+    assert "openrouter" in plain
+    assert "z-ai/glm-5.2" in plain
+
+
+def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, monkeypatch) -> None:
+    """Verbose ready statuses are capped from the terminal width before rendering.
+
+    The compact overview promises one row per harness. A fixed status cap still
+    lets rows wrap at the selector's 40-column minimum, so the cap must derive
+    from the actual terminal width. This forces a long OpenCode summary and a
+    40-column terminal, then renders the captured rows to prove the OpenCode row
+    remains within the terminal-cell width and carries an ellipsis. The summary
+    includes wide CJK / emoji text so this catches regressions back to Python
+    ``len()`` slicing.
+    """
+    import os
+    import re
+
+    from rich.cells import cell_len
+
+    from omnigent.onboarding import interactive
+    from omnigent.onboarding.opencode_auth import OpenCodeAuthSummary
+
+    monkeypatch.setattr(
+        "omnigent.cli.shutil.get_terminal_size", lambda fallback: os.terminal_size((40, 24))
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.opencode_auth.opencode_auth_summary",
+        lambda: OpenCodeAuthSummary(
+            installed=True,
+            stored_providers=("anthropic", "データブリックス", "🚀provider"),
+            env_providers=("OpenAI", "长模型供应商", "OpenRouter"),
+        ),
+    )
+
+    options, selectable, descriptions, compact, max_visible = _capture_setup_overview(monkeypatch)
+    rendered = interactive._render_menu(
+        "Configure harnesses",
+        options,
+        _overview_row_names(options, selectable).index("OpenCode"),
+        descriptions=descriptions,
+        width=40,
+        selectable=selectable,
+        compact=compact,
+        max_visible=max_visible,
+    )
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+    opencode_line = next(line for line in plain.splitlines() if "OpenCode" in line)
+    assert "…" in opencode_line
+    assert cell_len(opencode_line) <= 40
 
 
 @pytest.mark.parametrize(
@@ -1740,7 +1856,9 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
-    options, selectable, _descriptions, _compact = _capture_setup_overview(monkeypatch)
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
     codex = options[_overview_row_names(options, selectable).index("Codex")]
     assert "[yellow]✗ Not configured[/]" in codex
 
@@ -1748,9 +1866,93 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
-    options, selectable, _descriptions, _compact = _capture_setup_overview(monkeypatch)
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
     codex = options[_overview_row_names(options, selectable).index("Codex")]
     assert "[red]✗ Not installed[/]" in codex
+
+
+@pytest.mark.parametrize("name", ["Kiro", "Kimi Code"])
+def test_installed_native_cli_auth_unknown_rows_are_not_configured(
+    isolated_config, monkeypatch, name: str
+) -> None:
+    """Installed native CLIs with opaque auth/config state must not render ready.
+
+    Kiro and Kimi expose installation separately from their own provider/login
+    configuration. Since setup has no reliable local auth probe for them yet, an
+    installed binary should be yellow ``Not configured`` with a next-step hint —
+    not a green ``Installed`` row that implies the harness is ready to use.
+    (Hermes, like Goose, *does* have a config probe now — its ``model`` is read
+    from ``~/.hermes/config.yaml`` — so its ready/unconfigured split is covered
+    by ``test_overview_hermes_row_reflects_configured_model`` instead.)
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    row_index = _overview_row_names(options, selectable).index(name)
+    assert "[yellow]✗ Not configured[/]" in options[row_index]
+    assert "[green]✓ Installed[/]" not in options[row_index]
+    assert descriptions[row_index]
+
+
+def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -> None:
+    """Each compact row keeps the next-step hint attached to the same harness.
+
+    The visible overview is intentionally compact, so the row description is
+    where the user learns the specific next action. This pins representative
+    descriptions across provider-backed rows, SDK-extra rows, and native CLI
+    rows so a future row/description ordering slip can't put (for example)
+    Goose's hint under Qwen.
+    """
+    from rich.text import Text
+
+    from omnigent.onboarding.goose_auth import GooseConfigSummary
+    from omnigent.onboarding.hermes_auth import HermesConfigSummary
+    from omnigent.onboarding.opencode_auth import OpenCodeAuthSummary
+
+    monkeypatch.setattr("omnigent.onboarding.cursor_auth.cursor_sdk_installed", lambda: True)
+    monkeypatch.setattr(
+        "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed", lambda: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
+    monkeypatch.setattr(
+        "omnigent.onboarding.opencode_auth.opencode_auth_summary",
+        lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.goose_auth.goose_config_summary",
+        lambda: GooseConfigSummary(installed=True, provider=None, model=None),
+    )
+    # Installed but no provider picked → the "Open to configure" warn hint.
+    monkeypatch.setattr(
+        "omnigent.onboarding.hermes_auth.hermes_config_summary",
+        lambda: HermesConfigSummary(installed=True, provider=None, model=None),
+    )
+
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    desc_by_name = {
+        name: Text.from_markup(desc).plain
+        for name, desc in zip(_overview_row_names(options, selectable), descriptions, strict=True)
+    }
+    assert desc_by_name["Claude"] == "Open to add a credential."
+    assert desc_by_name["Codex"] == "Open to add a credential."
+    assert desc_by_name["Cursor"] == "Open to add the Cursor API key."
+    assert desc_by_name["OpenCode"] == "Open to sign in (opencode auth login)."
+    assert desc_by_name["Hermes"] == "Open to configure with `hermes model`."
+    assert desc_by_name["Pi"] == "Open to add a credential."
+    assert desc_by_name["Antigravity"] == "Open to add the Gemini API key."
+    assert desc_by_name["Qwen Code"] == "Open to set up auth (/auth or env vars)."
+    assert desc_by_name["Goose"] == "Open to run `goose configure`."
+    assert desc_by_name["Copilot"] == "Open to add the GitHub token."
+    assert desc_by_name["Kiro"] == "Sign in with `kiro-cli login`."
+    assert desc_by_name["Kimi Code"] == "Sign in with `kimi login`."
+    assert desc_by_name["Quit"] == ""
 
 
 def test_drill_into_uninstalled_installs_then_proceeds(isolated_config, monkeypatch) -> None:
@@ -2316,7 +2518,7 @@ def test_cursor_overview_install_command_is_selection_only(
     """
     from rich.text import Text
 
-    options, selectable, descriptions, _ = _capture_setup_overview(monkeypatch)
+    options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     cursor = names.index("Cursor")
     assert 'pip install "omnigent[cursor]"' in Text.from_markup(descriptions[cursor]).plain
@@ -2559,7 +2761,7 @@ def test_antigravity_overview_install_command_is_selection_only(
     """
     from rich.text import Text
 
-    options, selectable, descriptions, _ = _capture_setup_overview(monkeypatch)
+    options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     antigravity = names.index("Antigravity")
     assert (
@@ -2597,11 +2799,45 @@ def test_copilot_overview_install_command_is_selection_only(
     """
     from rich.text import Text
 
-    options, selectable, descriptions, _ = _capture_setup_overview(monkeypatch)
+    options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     copilot = names.index("Copilot")
     assert "omnigent[copilot]" in Text.from_markup(descriptions[copilot]).plain
     assert "pip install" not in Text.from_markup(options[copilot]).plain
+
+
+@pytest.mark.parametrize(
+    "choice,sdk_probe,unexpected_header",
+    [
+        ("3", "omnigent.onboarding.cursor_auth.cursor_sdk_installed", "Cursor — no API key yet"),
+        (
+            "7",
+            "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
+            "Antigravity — no Gemini API key yet",
+        ),
+        (
+            "10",
+            "omnigent.onboarding.copilot_auth.copilot_sdk_installed",
+            "Copilot — no GitHub token yet",
+        ),
+    ],
+)
+def test_soft_sdk_install_prompt_abort_returns_to_overview(
+    isolated_config, monkeypatch, choice: str, sdk_probe: str, unexpected_header: str
+) -> None:
+    """Esc/q on a soft-SDK install prompt backs out instead of entering key setup.
+
+    Cursor, Antigravity, and Copilot can store their key/token even when the SDK
+    extra is absent, but that should happen only when the user explicitly picks
+    "Set ... anyway". Aborting the install offer should return to the harness
+    overview, matching the other setup drill-ins' Esc behavior.
+    """
+    monkeypatch.setattr(sdk_probe, lambda: False)
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\nq\n")
+
+    assert result.exit_code == 0, result.output
+    assert unexpected_header not in result.output
 
 
 def test_antigravity_drillin_offers_install_when_sdk_missing(
