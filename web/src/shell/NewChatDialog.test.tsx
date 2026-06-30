@@ -954,7 +954,9 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
-    renderLanding();
+    // Land with `?project=` so the (otherwise-hidden) project chip renders and
+    // its truncate cap can be asserted alongside the other chips.
+    renderLanding({}, "/?project=docs");
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
@@ -1192,22 +1194,26 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
   });
 
-  it("files the new session under a project picked in the composer chip", async () => {
+  it("hides the project chip in the normal new-session flow (no project pre-selected)", async () => {
+    // Without a `?project=` param the session is unfiled, so the chip is
+    // hidden entirely — the fresh new-session flow stays project-free.
+    renderLanding();
+
+    await screen.findByTestId("new-chat-landing-input");
+    expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
+  });
+
+  it("files a pre-filled project chip's selection, and invalidates project sessions", async () => {
     // Both the create POST and the follow-up label PATCH read .ok / .json.
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
-    renderLanding();
+    // The chip only renders when a project is pre-selected (e.g. via the
+    // sidebar's per-project pencil), so land with `?project=`.
+    renderLanding({}, "/?project=docs");
 
-    // Open the project chip → "New project…" → type a name → commit.
-    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
-    fireEvent.click(screen.getByText("New project…"));
-    const nameInput = screen.getByPlaceholderText("Project name…");
-    fireEvent.change(nameInput, { target: { value: "docs" } });
-    fireEvent.keyDown(nameInput, { key: "Enter" });
-    // The chip reflects the pick.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
     );
@@ -1237,6 +1243,22 @@ describe("NewChatLandingScreen", () => {
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] }),
     );
     invalidateSpy.mockRestore();
+  });
+
+  it("hides the chip again when a pre-filled project is cleared to 'No project'", async () => {
+    // When shown, the picker still lets the user clear the selection; doing so
+    // empties `selectedProject` and the chip disappears (consistent with the
+    // "only show when selected" rule).
+    renderLanding({}, "/?project=docs");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
+    fireEvent.click(screen.getByText("No project"));
+
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull());
   });
 
   it("pre-fills the project chip from the ?project= query param", async () => {
