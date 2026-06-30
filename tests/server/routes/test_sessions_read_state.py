@@ -164,3 +164,18 @@ def test_read_state_is_scoped_per_user() -> None:
     assert bob_item.viewer_unread is False  # type: ignore[attr-defined]
     assert bob_item.viewer_last_seen is None  # type: ignore[attr-defined]
     del client, app
+
+
+def test_prune_clears_read_state_across_all_users() -> None:
+    """Pruning a session drops its read-state from every user's caches."""
+    sessions_mod._set_read_state("alice@example.com", "conv_a", 4_999, True)
+    sessions_mod._set_read_state("bob@example.com", "conv_a", 100, False)
+    sessions_mod._set_read_state("alice@example.com", "conv_b", 200, True)  # untouched
+
+    sessions_mod._prune_session_read_state("conv_a")
+
+    # conv_a is gone for both users...
+    assert sessions_mod._read_state_entry("alice@example.com", "conv_a") == (None, False)
+    assert sessions_mod._read_state_entry("bob@example.com", "conv_a") == (None, False)
+    # ...but other sessions are untouched.
+    assert sessions_mod._read_state_entry("alice@example.com", "conv_b") == (200, True)

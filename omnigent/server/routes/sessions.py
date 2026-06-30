@@ -905,6 +905,26 @@ def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread
             unread_set.discard(session_id)
 
 
+def _prune_session_read_state(session_id: str) -> None:
+    """
+    Drop a session's read-state from every user's caches.
+
+    Called when a session leaves the default view for good — on delete, and
+    on archive (archived sessions are hidden and never show the unread dot).
+    This bounds the otherwise-monotonic ``_read_last_seen`` growth to live,
+    non-archived sessions. Read-state is a session-level removal (the session
+    is gone/archived for everyone), so it clears across all users. Unarchiving
+    does NOT restore the prior state — the session reads as seen, which is the
+    intended "done with it" semantics of archiving.
+
+    :param session_id: Session/conversation identifier.
+    """
+    for seen in _read_last_seen.values():
+        seen.pop(session_id, None)
+    for unread in _read_explicit_unread.values():
+        unread.discard(session_id)
+
+
 # Sessions whose current turn was Stopped: the relay drops the turn's trailing
 # response.* output (no forward, no persist). The fence lifts on the next
 # turn's "running" status or on any terminal response.* event.
@@ -14873,6 +14893,11 @@ def create_sessions_router(
                 "Session not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        # Archiving hides the session from the default view (and its unread
+        # dot), so drop its per-user read-state to bound in-memory growth.
+        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
+        if body.archived is True:
+            _prune_session_read_state(session_id)
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries
         # (today: claude-native, whose ``claude`` binary has
@@ -19276,6 +19301,10 @@ def create_sessions_router(
         # failed-launch session would leak one entry for the process
         # lifetime.
         _session_sandbox_status_cache.pop(session_id, None)
+        # Drop the deleted session's per-user read-state from every user's
+        # caches so they don't accumulate orphan entries for the process
+        # lifetime.
+        _prune_session_read_state(session_id)
         # Same for the tracker's entry — a deleted session's launch can
         # never be rendezvoused again (access checks 404 first), so a
         # retained failure is dead weight. ``finish`` also settles a
