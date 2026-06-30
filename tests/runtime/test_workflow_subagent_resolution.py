@@ -53,7 +53,9 @@ def _coordinator_parent(*, web_fetch: bool = True) -> AgentSpec:
         spec_version=1,
         name="concordia",
         llm=LLMConfig(model="openai/gpt-5.4"),
-        executor=ExecutorSpec(max_iterations=40),
+        # A real bootable omnigent-executor coordinator carries a harness; the
+        # researcher inherits it so the reconstructed child is spawnable.
+        executor=ExecutorSpec(max_iterations=40, config={"harness": "claude-sdk"}),
         tools=ToolsConfig(builtins=builtins),
         sub_agents=[panelist],
     )
@@ -76,7 +78,9 @@ def _nested_web_fetch_parent() -> AgentSpec:
         spec_version=1,
         name="researcher_host",
         llm=LLMConfig(model="anthropic/claude-nested-7"),
-        executor=ExecutorSpec(max_iterations=40),
+        # The web_fetch owner needs a real harness so the reconstructed
+        # researcher (built from THIS owner) is bootable.
+        executor=ExecutorSpec(max_iterations=40, config={"harness": "claude-sdk"}),
         tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
     )
     return AgentSpec(

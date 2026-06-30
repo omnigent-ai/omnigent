@@ -24,6 +24,7 @@ import logging
 # has heterogeneous values.
 from typing import Any
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -33,6 +34,12 @@ from omnigent.spec.types import (
 from omnigent.tools.base import Tool
 
 _logger = logging.getLogger(__name__)
+
+# ``ExecutorSpec.type`` defaults to this. It is the executor *type*, never a
+# registered harness, so a spec whose ``harness_kind`` resolves to it cannot be
+# spawned — the runner aborts with ``unknown harness 'omnigent'`` (see
+# ``omnigent/runtime/harnesses/process_manager.py::_resolve_module_path``).
+_UNBOOTABLE_DEFAULT_HARNESS: str = "omnigent"
 
 # Internal sub-agent name. Double-underscore prefix prevents
 # collision with user-declared sub-agent names (which use
@@ -128,6 +135,13 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
 
     :param parent_spec: The parent agent's parsed spec.
     :returns: A complete AgentSpec for the web researcher sub-agent.
+    :raises OmnigentError: If the parent leg declares no bootable harness
+        (``executor.type == "omnigent"`` with no ``executor.config["harness"]``).
+        The researcher would otherwise spawn the unspawnable literal harness
+        ``"omnigent"``; failing here names the parent leg instead of surfacing
+        the cryptic runner-side ``unknown harness 'omnigent'`` crash. See the
+        guard at the end of this function for why the resolved harness is not
+        recoverable at this call site.
     """
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -170,6 +184,58 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
     child_executor_config = {
         key: value for key, value in parent_executor.config.items() if key != "os_env"
     }
+    child_executor = ExecutorSpec(
+        # Inherit the parent's executor type (e.g. "omnigent") so the
+        # harness/provider routing below is keyed off the same discriminator.
+        type=parent_executor.type,
+        # Low max_iterations to keep the sub-agent fast.
+        # 1 fetch + 1 retry = 2 tool calls max, plus the
+        # final response = ~3 iterations.
+        max_iterations=5,
+        # Routing-relevant config: ``harness`` (closes Layer 1) plus any
+        # ``permission_mode`` / ``use_responses`` / ``profile`` the spawn-env
+        # builders read. ``os_env`` is intentionally excluded (see above).
+        config=child_executor_config,
+        # The harness spawn-env builders resolve the model from
+        # ``executor.model`` (not ``llm.model``) and credentials from
+        # ``executor.auth`` / ``executor.connection`` — inherit all three so
+        # the researcher routes the parent's model through the parent's
+        # provider (closes Layer 2).
+        model=parent_executor.model,
+        connection=parent_executor.connection,
+        context_window=parent_executor.context_window,
+        auth=parent_executor.auth,
+        # Legacy Databricks profile (deprecated path) — carried for parity
+        # with parents that still rely on ``executor.profile``.
+        profile=parent_executor.profile,
+    )
+
+    # Fail loud if the inherited executor has no bootable harness. The child
+    # ``__web_researcher`` session is created WITHOUT a per-session
+    # ``harness_override`` (``_execute_web_fetch_tool`` passes only a prompt),
+    # so the runner resolves the child's harness SOLELY from this spec, exactly
+    # as it does for any session: ``executor.config["harness"] or executor.type``
+    # (``ExecutorSpec.harness_kind``; see ``runner/app.py`` create-session and
+    # ``_resolve_harness_and_spawn_env``). A parent whose real harness lives only
+    # in resolved session state — e.g. an API ``harness_override`` on a spec with
+    # no ``executor.config["harness"]`` — is NOT visible here: both call sites
+    # (``WebFetchTool.__init__`` and the ``_find_spec_by_name`` resolve-miss in
+    # ``runtime/workflow.py``) hand us only the static ``AgentSpec``, so the
+    # resolved harness cannot be recovered to inherit. Rather than emit a child
+    # that defaults to the unspawnable literal harness ``"omnigent"`` (which the
+    # runner aborts with ``unknown harness 'omnigent'`` — the original Layer-1
+    # crash), fail at build time with an actionable error naming the parent leg.
+    if child_executor.harness_kind == _UNBOOTABLE_DEFAULT_HARNESS:
+        raise OmnigentError(
+            f"web_fetch cannot build its {RESEARCHER_NAME} sub-agent: parent agent "
+            f"{parent_spec.name or '<unnamed>'!r} declares no bootable harness "
+            f"(executor.type={parent_executor.type!r} with no "
+            f"executor.config['harness']), so the researcher would spawn the "
+            f"unknown harness 'omnigent'. Set executor.config.harness on the parent "
+            f"(e.g. 'claude-sdk', 'codex', or 'pi') so the researcher runs on the "
+            f"parent's harness.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     return AgentSpec(
         spec_version=1,
@@ -180,31 +246,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         tools=ToolsConfig(),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,
-        executor=ExecutorSpec(
-            # Inherit the parent's executor type (e.g. "omnigent") so the
-            # harness/provider routing below is keyed off the same discriminator.
-            type=parent_executor.type,
-            # Low max_iterations to keep the sub-agent fast.
-            # 1 fetch + 1 retry = 2 tool calls max, plus the
-            # final response = ~3 iterations.
-            max_iterations=5,
-            # Routing-relevant config: ``harness`` (closes Layer 1) plus any
-            # ``permission_mode`` / ``use_responses`` / ``profile`` the spawn-env
-            # builders read. ``os_env`` is intentionally excluded (see above).
-            config=child_executor_config,
-            # The harness spawn-env builders resolve the model from
-            # ``executor.model`` (not ``llm.model``) and credentials from
-            # ``executor.auth`` / ``executor.connection`` — inherit all three so
-            # the researcher routes the parent's model through the parent's
-            # provider (closes Layer 2).
-            model=parent_executor.model,
-            connection=parent_executor.connection,
-            context_window=parent_executor.context_window,
-            auth=parent_executor.auth,
-            # Legacy Databricks profile (deprecated path) — carried for parity
-            # with parents that still rely on ``executor.profile``.
-            profile=parent_executor.profile,
-        ),
+        executor=child_executor,
     )
 
 

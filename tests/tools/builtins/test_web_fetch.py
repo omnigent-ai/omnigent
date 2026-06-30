@@ -26,10 +26,14 @@ def _make_parent_spec(
 
     :param model: The LLM model string.
     :param executor_type: Executor type override, or ``None``
-        for default (llm).
+        for default (omnigent executor on the claude-sdk harness).
     :returns: An AgentSpec suitable for constructing WebFetchTool.
     """
-    executor = ExecutorSpec()
+    # A real bootable ``type="omnigent"`` agent always carries a harness in
+    # ``executor.config`` — without one ``harness_kind`` is the unspawnable
+    # literal "omnigent". Default the helper to a real harness so fixtures build
+    # bootable parents (and ``build_researcher_spec`` does not fail loud).
+    executor = ExecutorSpec(config={"harness": "claude-sdk"})
     if executor_type is not None:
         executor = ExecutorSpec(type=executor_type)
     return AgentSpec(
@@ -129,6 +133,7 @@ def test_researcher_inherits_parent_sandbox_egress() -> None:
         spec_version=1,
         name="test-parent",
         llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
         os_env=OSEnvSpec(type="caller_process", sandbox=sandbox),
     )
 
@@ -273,7 +278,11 @@ def testbuild_researcher_spec_copies_llm() -> None:
         model="groq/llama-4-scout",
         connection={"api_key": "test-key"},
     )
-    parent = AgentSpec(spec_version=1, llm=llm)
+    parent = AgentSpec(
+        spec_version=1,
+        llm=llm,
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+    )
     researcher = build_researcher_spec(parent)
     # Same LLM config object (reference copy, not deep copy —
     # the researcher doesn't modify it).
@@ -282,10 +291,47 @@ def testbuild_researcher_spec_copies_llm() -> None:
 
 
 def testbuild_researcher_spec_default_executor() -> None:
-    """Researcher should use default executor (omnigent)."""
+    """Researcher inherits the parent's omnigent executor type AND harness."""
     parent = _make_parent_spec()
     researcher = build_researcher_spec(parent)
     assert researcher.executor.type == "omnigent"
+    # The harness carries from the parent so the child is bootable (not the
+    # unspawnable literal "omnigent").
+    assert researcher.executor.harness_kind == "claude-sdk"
+
+
+def test_researcher_build_fails_loud_when_parent_has_no_harness() -> None:
+    """
+    A parent with ``ExecutorSpec(type="omnigent", config={})`` (no harness)
+    must NOT silently produce an unbootable child whose
+    ``harness_kind == "omnigent"`` — it must fail loud at build time.
+
+    The child ``__web_researcher`` session is created without a per-session
+    ``harness_override``, so the runner resolves its harness solely from this
+    spec. A child carrying the literal ``"omnigent"`` would crash the runner
+    with ``unknown harness 'omnigent'`` (the original Layer-1 failure). The
+    resolved harness (e.g. an API ``harness_override`` on a spec with no
+    ``executor.config["harness"]``) is not visible at this call site, so
+    ``build_researcher_spec`` raises a clear, parent-naming error instead.
+    """
+    import pytest
+
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    parent = AgentSpec(
+        spec_version=1,
+        name="no-harness-leg",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(type="omnigent", config={}),
+    )
+
+    with pytest.raises(OmnigentError) as exc_info:
+        build_researcher_spec(parent)
+
+    # Actionable: names the offending parent leg and the missing harness.
+    assert exc_info.value.code == ErrorCode.INVALID_INPUT
+    assert "no-harness-leg" in str(exc_info.value)
+    assert "harness" in str(exc_info.value).lower()
 
 
 def test_researcher_inherits_parent_harness_auth_and_model() -> None:
