@@ -1874,40 +1874,42 @@ class PiExecutor(Executor):
             with open(models_path, "w") as f:
                 json.dump(models_json, f)
             env["PI_CODING_AGENT_DIR"] = tmp_dir
+            # Gateway mode relocates Pi's agent root — copy the user's global
+            # settings (extensions, packages, …) and symlink install trees so
+            # ``pi install`` packages still resolve. See #1423.
+            from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
+
+            prepare_managed_pi_agent_dir(
+                pathlib.Path(tmp_dir),
+                overlay=self._retry_policy.pi.settings(),
+            )
 
         # Pi natively supports retry config via ``.pi/settings.json``
-        # (see ``RetryPolicy.pi.settings()`` for schema). Write the
-        # retry block to ``<tmp_dir>/.pi/settings.json`` so Pi picks
-        # it up when spawned with ``cwd=tmp_dir`` (when the user
-        # didn't override cwd) or merge into ``<cwd>/.pi/settings.json``
-        # when they did. This sets max_retries, backoff base/cap from
-        # the spec policy.
-        retry_settings = self._retry_policy.pi.settings()
-        # Decide where to write. Project-level (cwd/.pi/settings.json)
-        # is Pi's documented project override; merge into existing
-        # file if present, else create.
-        settings_dir_root = self._cwd or tmp_dir
-        settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
-        try:
-            if os.path.exists(settings_path):
-                with open(settings_path) as f:
-                    existing_settings = json.load(f)
-                if not isinstance(existing_settings, dict):
+        # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
+        # path, merge the retry block into ``<cwd>/.pi/settings.json``.
+        # Gateway runs apply retry via :func:`prepare_managed_pi_agent_dir`
+        # into the managed agent dir instead.
+        if not self._gateway:
+            retry_settings = self._retry_policy.pi.settings()
+            settings_dir_root = self._cwd or tmp_dir
+            settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
+            try:
+                if os.path.exists(settings_path):
+                    with open(settings_path) as f:
+                        existing_settings = json.load(f)
+                    if not isinstance(existing_settings, dict):
+                        existing_settings = {}
+                else:
                     existing_settings = {}
-            else:
-                existing_settings = {}
-            existing_settings.update(retry_settings)
-            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-            with open(settings_path, "w") as f:
-                json.dump(existing_settings, f, indent=2)
-        except OSError:
-            # If we can't write to the user's cwd (read-only fs,
-            # permissions), fall back to tmp_dir; Pi will use its
-            # own defaults if neither location works.
-            fallback_path = os.path.join(tmp_dir, ".pi", "settings.json")
-            os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
-            with open(fallback_path, "w") as f:
-                json.dump(retry_settings, f, indent=2)
+                existing_settings.update(retry_settings)
+                os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+                with open(settings_path, "w") as f:
+                    json.dump(existing_settings, f, indent=2)
+            except OSError:
+                fallback_path = os.path.join(tmp_dir, ".pi", "settings.json")
+                os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+                with open(fallback_path, "w") as f:
+                    json.dump(retry_settings, f, indent=2)
 
         # Generate the Omnigent tool bridge extension if tools are available.
         if tools and tool_server_port is not None:

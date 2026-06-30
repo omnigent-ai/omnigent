@@ -767,6 +767,73 @@ async def _post_external_compaction_status(
     resp.raise_for_status()
 
 
+async def _persist_native_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    store_path: Path,
+) -> None:
+    """Persist a compaction boundary item to the conversation store."""
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    compacted_messages = None
+    try:
+        rows = _read_blob_rows(store_path, 0)
+        msgs = []
+        for _rowid, _blob_id, raw_data in rows:
+            if isinstance(raw_data, (bytes, bytearray)):
+                try:
+                    raw_data = raw_data.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+            if not isinstance(raw_data, str):
+                continue
+            try:
+                obj = json.loads(raw_data)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            role = obj.get("role")
+            content = obj.get("content")
+            if role in ("user", "assistant") and content:
+                text = content if isinstance(content, str) else _content_text(content).strip()
+                if text:
+                    block_type = "input_text" if role == "user" else "output_text"
+                    msgs.append(
+                        {
+                            "type": "message",
+                            "role": role,
+                            "content": [{"type": block_type, "text": text}],
+                        }
+                    )
+        if msgs:
+            compacted_messages = msgs
+    except Exception:  # noqa: BLE001
+        _logger.debug("Failed to read cursor store for compaction persist", exc_info=True)
+
+    compaction_data = {
+        "summary": "[Cursor compaction — context was compacted via /summarize]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted_messages:
+        compaction_data["compacted_messages"] = compacted_messages
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "compaction", "data": compaction_data},
+    )
+    resp.raise_for_status()
+
+
 async def forward_cursor_store_to_session(
     *,
     base_url: str,
@@ -933,6 +1000,19 @@ async def forward_cursor_store_to_session(
                                         "may linger; session=%s rowid=%s",
                                         session_id,
                                         item.rowid,
+                                        exc_info=True,
+                                    )
+                                try:
+                                    await _persist_native_compaction_item(
+                                        client,
+                                        session_id=session_id,
+                                        store_path=store_path,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    _logger.warning(
+                                        "cursor forwarder could not persist "
+                                        "compaction item; session=%s",
+                                        session_id,
                                         exc_info=True,
                                     )
                                 failed_rowid = failed_attempts = 0

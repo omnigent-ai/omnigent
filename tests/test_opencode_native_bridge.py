@@ -20,7 +20,12 @@ from omnigent.opencode_native_bridge import (
     read_bridge_state,
     update_active_message_id,
     update_last_event_id,
+    update_model_override,
+    user_opencode_config_path,
     write_bridge_state,
+    write_cost_popup_config,
+    write_opencode_policy_plugin,
+    write_relay_bridge_config,
     xdg_config_home_for_bridge_dir,
     xdg_data_home_for_bridge_dir,
 )
@@ -102,6 +107,70 @@ def test_update_active_message_id(bridge_dir: Path) -> None:
     assert loaded.status == "idle"
 
 
+def test_update_model_override(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir))
+    assert update_model_override(bridge_dir, "anthropic/claude-opus-4") is True
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.model_override == "anthropic/claude-opus-4"
+    # Blank clears the override.
+    assert update_model_override(bridge_dir, "  ") is True
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.model_override is None
+
+
+def test_update_model_override_no_state_returns_false(bridge_dir: Path) -> None:
+    # No bridge state written yet (server not launched).
+    assert update_model_override(bridge_dir, "x/y") is False
+
+
+def test_write_relay_bridge_config_writes_token_and_is_idempotent(bridge_dir: Path) -> None:
+    write_relay_bridge_config(bridge_dir)
+    config_path = bridge_dir / "bridge.json"
+    assert config_path.exists()
+    payload = json.loads(config_path.read_text())
+    token = payload["token"]
+    assert isinstance(token, str) and token
+    # Idempotent: a second call must NOT rotate the token (the relay HTTP server
+    # may already have been started with it).
+    write_relay_bridge_config(bridge_dir)
+    assert json.loads(config_path.read_text())["token"] == token
+
+
+def test_write_cost_popup_config_writes_ap_routing(bridge_dir: Path) -> None:
+    path = write_cost_popup_config(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:6767",
+        ap_auth_headers={"Authorization": "Bearer tok"},
+    )
+    payload = json.loads(path.read_text())
+    assert payload == {
+        "ap_server_url": "http://127.0.0.1:6767",
+        "ap_auth_headers": {"Authorization": "Bearer tok"},
+    }
+    # Rewritten (not skipped) so a later checkpoint gets a fresh token.
+    write_cost_popup_config(bridge_dir, ap_server_url="http://h:1", ap_auth_headers={})
+    assert json.loads(path.read_text()) == {"ap_server_url": "http://h:1", "ap_auth_headers": {}}
+
+
+def test_write_opencode_policy_plugin(bridge_dir: Path) -> None:
+    path = write_opencode_policy_plugin(bridge_dir)
+    assert path.name == "omnigent-policy.js"
+    src = path.read_text(encoding="utf-8")
+    # The two phase hooks the reactive permission path can't reach.
+    assert '"chat.message"' in src  # REQUEST phase
+    assert '"tool.execute.after"' in src  # TOOL_RESULT phase
+    # Posts the proto phases + reads its coordinates from env.
+    assert "PHASE_REQUEST" in src and "PHASE_TOOL_RESULT" in src
+    assert "OMNIGENT_POLICY_URL" in src and "OMNIGENT_SESSION_ID" in src
+    assert "/policies/evaluate" in src
+    # A function export so opencode's Object.values(mod) loader picks it up.
+    assert "export const OmnigentPolicyPlugin" in src
+    # Idempotent overwrite (re-launch ships fresh code, no error).
+    assert write_opencode_policy_plugin(bridge_dir) == path
+
+
 def test_update_last_event_id(bridge_dir: Path) -> None:
     write_bridge_state(bridge_dir, _state(bridge_dir))
     update_last_event_id(bridge_dir, "evt_42")
@@ -172,3 +241,57 @@ def test_seed_opencode_auth_noop_without_source(
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-share"))
     bridge_dir = bridge.prepare_bridge_dir("conv_noseed")
     assert bridge.seed_opencode_auth(bridge_dir) is None
+
+
+def test_user_opencode_config_path_default_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without XDG_CONFIG_HOME, looks at ~/.config/opencode/opencode.jsonc."""
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    fake_home = tmp_path / "fake_home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    # File does not exist → returns None.
+    assert user_opencode_config_path() is None
+    # Create the file and verify the path is as expected.
+    (fake_home / ".config" / "opencode").mkdir(parents=True)
+    (fake_home / ".config" / "opencode" / "opencode.jsonc").write_text("{}")
+    expected = fake_home / ".config" / "opencode" / "opencode.jsonc"
+    assert user_opencode_config_path() == expected
+
+
+def test_user_opencode_config_path_honors_xdg_config_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """XDG_CONFIG_HOME env var redirects the lookup."""
+    cfg_dir = tmp_path / "my-config" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "my-config"))
+    path = user_opencode_config_path()
+    assert path is not None and path.exists()
+    assert path.name == "opencode.jsonc"
+
+
+def test_user_opencode_config_path_falls_back_to_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When only opencode.json exists (no .jsonc), returns the .json path."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    path = user_opencode_config_path()
+    assert path is not None and path.name == "opencode.json"
+
+
+def test_user_opencode_config_path_prefers_jsonc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When both .jsonc and .json exist, .jsonc is preferred."""
+    cfg_dir = tmp_path / "pref" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
+    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "pref"))
+    path = user_opencode_config_path()
+    assert path is not None and path.name == "opencode.jsonc"

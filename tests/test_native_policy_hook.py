@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from omnigent import native_policy_hook
 from omnigent.native_policy_hook import (
+    _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    post_evaluate_with_retry,
 )
 
 
@@ -332,17 +336,31 @@ def test_fail_closed_pre_tool_use_denies() -> None:
     assert hook_specific["permissionDecisionReason"]
 
 
-@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PostToolUse"])
-def test_fail_closed_non_tool_call_phases_fail_open(hook_event: str) -> None:
+def test_fail_closed_user_prompt_submit_fails_closed() -> None:
     """
-    Off the tool-call gate, an unobtainable verdict fails OPEN (``None``).
+    ``UserPromptSubmit`` (``PHASE_REQUEST``) fails CLOSED on an unobtainable verdict.
 
-    The request gate is advisory (the tool-call gate still catches
-    dangerous actions) and PostToolUse runs after the tool has executed, so
-    denying there only blocks an already-incurred side effect. This mirrors
-    the runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    The request gate is the sole pre-turn enforcement point for native
+    sessions — a server hiccup must not let an over-budget or otherwise-
+    blocked request proceed. The output must be a top-level
+    ``decision: "block"`` with a non-empty reason (both Claude Code and
+    Codex drop a block with an empty reason).
     """
-    assert fail_closed_hook_output(hook_event) is None
+    output = fail_closed_hook_output("UserPromptSubmit")
+    assert output is not None
+    assert output["decision"] == "block"
+    assert output["reason"]
+
+
+def test_fail_closed_post_tool_use_fails_open() -> None:
+    """
+    ``PostToolUse`` (``PHASE_TOOL_RESULT``) fails OPEN (``None``).
+
+    The tool has already executed by this point, so denying would only
+    block an already-incurred side effect. Mirrors the runner-side
+    ``FAIL_CLOSED_PHASES``.
+    """
+    assert fail_closed_hook_output("PostToolUse") is None
 
 
 def test_fail_closed_unknown_event_fails_open() -> None:
@@ -354,3 +372,304 @@ def test_fail_closed_unknown_event_fails_open() -> None:
     accidentally blocking — the conservative default for an unknown gate.
     """
     assert fail_closed_hook_output("SomeNewEvent") is None
+
+
+def _resp(status: int, location: str | None = None) -> httpx.Response:
+    """Build a fake response for re-auth classification tests."""
+    headers = {"Location": location} if location else {}
+    return httpx.Response(status, headers=headers, request=httpx.Request("POST", "https://ap/x"))
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (_resp(401), True),
+        (_resp(302, "https://w.example.com/oidc/oauth2/v2.0/authorize"), True),
+        (_resp(302, "https://omnigents.example.databricksapps.com/.auth/callback"), True),
+        # Unrelated redirect / success must NOT trigger a wasted token round-trip.
+        (_resp(302, "https://w.example.com/some/other/page"), False),
+        (_resp(302, None), False),
+        (_resp(200), False),
+        (_resp(503), False),
+    ],
+)
+def test_is_login_redirect_or_unauthorized_classifies_reauth_signals(
+    response: httpx.Response, expected: bool
+) -> None:
+    """
+    401 and an Apps OAuth-login 302 are re-auth signals; nothing else is.
+
+    The Databricks Apps front door bounces an *expired* bearer with a
+    ``302 → /oidc/`` (or ``/.auth/``), NOT a ``401`` — so a hook that only
+    checked ``401`` silently failed closed once the one-shot token lapsed.
+    This is the classifier that lets the hook re-mint instead.
+    """
+    assert _is_login_redirect_or_unauthorized(response) is expected
+
+
+def _make_redirect_then_ok_client(
+    seen_headers: list[dict[str, str]],
+    *,
+    redirect: httpx.Response,
+    ok: httpx.Response,
+) -> type:
+    """Build an httpx.Client stub: redirect on attempt 1, ``ok`` thereafter."""
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del url, json
+            seen_headers.append(dict(self._headers))
+            return redirect if len(seen_headers) == 1 else ok
+
+    return _Client
+
+
+def test_post_evaluate_with_retry_reauths_on_login_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 302→/oidc/ re-mints the bearer and retries, returning the real verdict.
+
+    Regression guard for the production bug where an "old" native session
+    (token past the ~1h Databricks OAuth lifetime) failed CLOSED on every tool
+    call. The first attempt carries the lapsed token (302), the retry carries
+    the fresh token and gets the ALLOW verdict — exactly as the runner's
+    refresh-capable ``_RunnerDatabricksAuth`` does for its own callbacks.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=ok),
+    )
+    reauth_calls: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        reauth_calls.append(1)
+        return {"Authorization": "Bearer fresh", "X-Databricks-Org-Id": "o1"}
+
+    resp = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=_reauth,
+    )
+
+    assert resp is ok
+    assert reauth_calls == [1]  # re-minted exactly once
+    assert seen_headers[0]["Authorization"] == "Bearer stale"  # first attempt: lapsed token
+    assert seen_headers[1]["Authorization"] == "Bearer fresh"  # retry: fresh token
+
+
+def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no ``reauth`` callable, a login-redirect yields ``None`` (legacy).
+
+    Callers without a token source (e.g. codex/kimi today) see the same
+    behavior as before this change: ``raise_for_status`` rejects the 302 as a
+    non-retryable <500, the helper returns ``None``, and the caller fails
+    closed. Guards against the new branch altering that.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/x"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
+    )
+    resp = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "evaluate-policy hook")
+    assert resp is None
+    assert len(seen_headers) == 1  # one attempt; a 302 is not retried without reauth
+
+
+def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When re-mint yields no token, the helper returns ``None`` (caller fails closed).
+
+    Re-auth is best-effort: a ``reauth`` that returns ``None`` (no creds /
+    transient mint failure) must not loop — it falls through to
+    ``raise_for_status`` (302 → non-retryable) so the caller keeps the
+    fail-closed safety net.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/x"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
+    )
+    resp = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=lambda: None,
+    )
+    assert resp is None
+    assert len(seen_headers) == 1  # one attempt only; no retry loop
+
+
+# ── shared policy-hook header plumbing (writer + reader) ─────────────
+
+
+def test_policy_hook_request_headers_merges_baked_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reader merges the executor-baked auth + routing headers.
+
+    The import-free hook subprocess can't resolve credentials in-process, so
+    the executor bakes them into ``_OMNIGENT_AUTH_HEADERS``; the reader must
+    fold them onto ``Content-Type`` for the policy POST.
+    """
+    monkeypatch.setenv(
+        "_OMNIGENT_AUTH_HEADERS",
+        '{"Authorization": "Bearer tok", "X-Databricks-Org-Id": "org123"}',
+    )
+    assert native_policy_hook.policy_hook_request_headers() == {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer tok",
+        "X-Databricks-Org-Id": "org123",
+    }
+
+
+@pytest.mark.parametrize("raw", ["", "not json", "[1,2]"])
+def test_policy_hook_request_headers_tolerates_missing_or_bad_env(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Absent / malformed env → just ``Content-Type`` (local-unauth path).
+
+    A bad value must not crash the hook nor inject garbage headers — the
+    server simply decides without auth (a local unauthenticated server needs
+    none).
+    """
+    if raw:
+        monkeypatch.setenv("_OMNIGENT_AUTH_HEADERS", raw)
+    else:
+        monkeypatch.delenv("_OMNIGENT_AUTH_HEADERS", raising=False)
+    assert native_policy_hook.policy_hook_request_headers() == {"Content-Type": "application/json"}
+
+
+def test_policy_hook_wrapper_script_bakes_auth_and_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer bakes bearer + routing into the wrapper via the one builder.
+
+    A new harness wiring up its hook through this helper gets auth AND
+    workspace routing for free — the gap that left the cursor/hermes hooks
+    posting unauthenticated and unrouted.
+    """
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(
+        entry, "_make_auth_token_factory", lambda *, server_url=None: lambda: "tok"
+    )
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: "org123")
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "https://acme.databricks.com/api/2.0/omnigent", "conv_x", "/path/hook.py"
+    )
+
+    assert script.startswith("#!/bin/sh\n")
+    assert "_OMNIGENT_SERVER_URL=https://acme.databricks.com/api/2.0/omnigent" in script
+    assert "_OMNIGENT_SESSION_ID=conv_x" in script
+    # The baked headers carry BOTH the bearer and the routing header.
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("export _OMNIGENT_AUTH_HEADERS=")
+    )
+    assert "Bearer tok" in line
+    assert "X-Databricks-Org-Id" in line and "org123" in line
+
+
+def test_policy_hook_wrapper_script_omits_auth_when_unauthenticated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No token + no recorded selector → empty auth dict (local-unauth runs).
+
+    The wrapper still exports the (empty) header dict, so the reader yields
+    just ``Content-Type`` — non-workspace callers are unaffected.
+    """
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: None)
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "http://127.0.0.1:6767", "conv_local", "/path/hook.py"
+    )
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("export _OMNIGENT_AUTH_HEADERS=")
+    )
+    assert "Bearer" not in line
+    assert "X-Databricks-Org-Id" not in line
+
+
+def test_policy_hook_reauth_remints_and_preserves_routing_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared reauth re-mints the bearer and keeps the routing header.
+
+    When a baked one-shot token lapses, the four hooks (codex/kimi/cursor/
+    hermes) that wire this builder must mint a fresh bearer through the same
+    factory the refresh-capable runtime auth uses — without dropping the
+    workspace-routing header that travels alongside it.
+    """
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda _server_url: lambda: "fresh-token",
+    )
+    reauth = native_policy_hook.policy_hook_reauth(
+        "https://acme.databricks.com/api/2.0/omnigent",
+        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
+    )
+    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
+
+
+def test_policy_hook_reauth_returns_none_without_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No refresh mechanism (local/unauth) → ``None`` so the caller fails closed."""
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda _server_url: None,
+    )
+    reauth = native_policy_hook.policy_hook_reauth(
+        "http://127.0.0.1:6767", {"Content-Type": "application/json"}
+    )
+    assert reauth() is None

@@ -2988,6 +2988,12 @@ def test_fork_conversation_drops_instance_scoped_labels(
     longer active after /clear" because the bridge's active-session
     marker wasn't the clone. The fork must drop them (and re-bind its
     own runtime), while ordinary labels still copy.
+
+    The DANGEROUS codex full-bypass directive is in the same set for a
+    different reason: a fork is a new session + workspace, so re-arming
+    ``--dangerously-bypass-approvals-and-sandbox`` there with no typed
+    re-confirmation would violate the "impossible to enable accidentally"
+    contract (#657). It must be dropped so the clone opts in afresh.
     """
     agent_store.create(
         agent_id="ag_fork_instance",
@@ -3002,6 +3008,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            # The dangerous bypass opt-in must NOT ride into the fork.
+            "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -3478,6 +3486,39 @@ def test_fork_conversation_copy_model_settings_false_resets(
     assert reloaded_default.reasoning_effort == "high"
 
 
+def test_fork_conversation_model_override_wins_over_copy(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """An explicit ``model_override`` overrides the source's copied model.
+
+    The "restart with model" path: the fork must launch on the requested
+    model, not the source's. ``reasoning_effort`` still follows
+    ``copy_model_settings`` (a same-family model switch keeps the effort).
+    """
+    agent_store.create(
+        agent_id="ag_fork_mo",
+        name="fork-mo",
+        bundle_location="ag_fork_mo/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="ag_fork_mo")
+    conversation_store.update_conversation(
+        source.id, reasoning_effort="high", model_override="databricks-gpt-5-5"
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.id, model_override="databricks-gpt-5-4-mini"
+    )
+
+    reloaded = conversation_store.get_conversation(fork.id)
+    assert reloaded is not None
+    assert reloaded.model_override == "databricks-gpt-5-4-mini", (
+        "An explicit model_override must win over the source's copied model."
+    )
+    # reasoning_effort still copies (same-family switch keeps the effort).
+    assert reloaded.reasoning_effort == "high"
+
+
 def test_fork_conversation_carry_history_into_native_stamps_label(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -3583,6 +3624,10 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id,
         {
             instance_label: "1",
+            # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
+            # switch (a new agent/harness context) drops it rather than
+            # silently re-arming bypass without a fresh typed confirmation.
+            "omnigent.codex_native.bypass_sandbox": "1",
             UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
             WRAPPER_LABEL_KEY: "claude-code-native-ui",
         },
@@ -3637,6 +3682,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
     assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "ag_builtin_claude"
     assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
+    assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
+        "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"
+    )
     # Transcript is untouched (in place, not copied).
     assert len(conversation_store.list_items(conv_id).data) == 1
 
@@ -4249,3 +4297,154 @@ def test_append_many_batches_stay_contiguous(
     assert _stored_next_position(conversation_store, conv.id) == total
     listed = conversation_store.list_items(conv.id, limit=total)
     assert len(listed.data) == total
+
+
+# ── Projects (conversation_labels key="omni_project") ───────
+
+
+def test_list_projects_returns_distinct_names_sorted(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``list_projects`` returns each distinct project name once, ordered
+    alphabetically. Sessions with no project label don't create phantom
+    projects, and a project shared by two sessions appears a single time."""
+    a1 = conversation_store.create_conversation()
+    a2 = conversation_store.create_conversation()
+    b1 = conversation_store.create_conversation()
+    conversation_store.create_conversation()  # unfiled — must not appear
+
+    conversation_store.set_labels(a1.id, {"omni_project": "Sprint 42"})
+    conversation_store.set_labels(a2.id, {"omni_project": "Sprint 42"})
+    conversation_store.set_labels(b1.id, {"omni_project": "Customer X"})
+
+    # Alphabetical, de-duplicated. A missing DISTINCT would list "Sprint 42"
+    # twice.
+    assert conversation_store.list_projects() == ["Customer X", "Sprint 42"]
+
+
+def test_list_projects_empty_when_no_project_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Non-project labels (e.g. guardrail keys) never surface as projects."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"integrity": "1", "sensitivity": "public"})
+    assert conversation_store.list_projects() == []
+
+
+def test_list_projects_excludes_all_archived_projects(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A project whose every member is archived drops out of the list (this is
+    what makes "Delete project" — which archives all members — remove the
+    folder), while the label is preserved so unarchiving restores it.
+
+    A project with a mix of archived and active members still appears."""
+    solo = conversation_store.create_conversation()
+    mix_archived = conversation_store.create_conversation()
+    mix_active = conversation_store.create_conversation()
+
+    conversation_store.set_labels(solo.id, {"omni_project": "Gone"})
+    conversation_store.set_labels(mix_archived.id, {"omni_project": "Mixed"})
+    conversation_store.set_labels(mix_active.id, {"omni_project": "Mixed"})
+
+    # "Gone" has one member; archiving it empties the project. "Mixed" keeps a
+    # live member, so it stays.
+    conversation_store.update_conversation(solo.id, archived=True)
+    conversation_store.update_conversation(mix_archived.id, archived=True)
+
+    assert conversation_store.list_projects() == ["Mixed"]
+
+    # Unarchiving the lone member brings its project back — the label was kept.
+    conversation_store.update_conversation(solo.id, archived=False)
+    assert conversation_store.list_projects() == ["Gone", "Mixed"]
+
+
+def test_list_projects_scoped_by_accessible_by(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """When ``accessible_by`` is set, only projects on sessions the user has a
+    permission row for are returned — mirroring the list_conversations ACL."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    theirs = conversation_store.create_conversation()
+    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
+    conversation_store.set_labels(theirs.id, {"omni_project": "Theirs"})
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", theirs.id, 4)
+
+    # Alice only sees her project; Theirs is invisible to her.
+    assert conversation_store.list_projects(accessible_by="alice@example.com") == ["Mine"]
+
+
+def test_delete_label_removes_only_target_key(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``delete_label`` drops the named key and leaves siblings intact — so
+    removing a session from its project doesn't wipe guardrail labels."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"omni_project": "X", "integrity": "1"})
+
+    conversation_store.delete_label(conv.id, "omni_project")
+
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"integrity": "1"}
+
+
+def test_delete_label_is_noop_when_absent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a label that doesn't exist is a no-op, not an error."""
+    conv = conversation_store.create_conversation()
+    conversation_store.delete_label(conv.id, "omni_project")  # must not raise
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {}
+
+
+def test_list_conversations_filters_by_project(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``project="X"`` returns only sessions carrying that exact project label."""
+    filed = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    conversation_store.create_conversation()  # unfiled
+
+    conversation_store.set_labels(filed.id, {"omni_project": "X"})
+    conversation_store.set_labels(other.id, {"omni_project": "Y"})
+
+    ids = {c.id for c in conversation_store.list_conversations(project="X").data}
+    assert ids == {filed.id}
+
+
+def test_list_conversations_empty_project_returns_unfiled(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``project=""`` returns only sessions with NO project label (Unfiled)."""
+    filed = conversation_store.create_conversation()
+    unfiled = conversation_store.create_conversation()
+    conversation_store.set_labels(filed.id, {"omni_project": "X"})
+
+    ids = {c.id for c in conversation_store.list_conversations(project="").data}
+    assert unfiled.id in ids
+    assert filed.id not in ids
+
+
+def test_list_conversations_project_none_disables_filter(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``project=None`` (the default) returns filed and unfiled alike."""
+    filed = conversation_store.create_conversation()
+    unfiled = conversation_store.create_conversation()
+    conversation_store.set_labels(filed.id, {"omni_project": "X"})
+
+    ids = {c.id for c in conversation_store.list_conversations().data}
+    assert ids >= {filed.id, unfiled.id}

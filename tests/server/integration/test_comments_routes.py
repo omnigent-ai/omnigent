@@ -213,6 +213,31 @@ async def test_comments_created_by_reflects_request_user(
     )
 
 
+async def test_admin_cannot_add_comment_to_nonexistent_session(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Admin bypass must not allow orphan comments on missing sessions."""
+    admin = "admin@example.com"
+    missing_session_id = "conv_does_not_exist"
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user(admin, is_admin=True)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{missing_session_id}/comments",
+        json={
+            "path": "src/app.py",
+            "body": "Admin orphan probe",
+            "start_index": 0,
+            "end_index": 5,
+        },
+        headers={"X-Forwarded-Email": admin},
+    )
+
+    assert resp.status_code == 404
+    assert SqlAlchemyCommentStore(db_uri).list_for_conversation(missing_session_id) == []
+
+
 async def test_read_only_user_cannot_mutate_comments(
     auth_client: httpx.AsyncClient,
     db_uri: str,

@@ -389,3 +389,78 @@ def test_render_menu_without_max_visible_renders_all_rows() -> None:
     )
     assert "item-0" in out and "item-19" in out
     assert "more" not in out
+
+
+def test_render_menu_compact_uses_top_level_footer_and_no_title_gap() -> None:
+    """Compact menus hug the title to the list and say Esc exits.
+
+    ``omnigent setup`` uses this for the top-level harness overview: there is
+    no blank spacer below the title, and the footer must read as a compact
+    top-level action (``Esc exit``), not the nested-menu ``Esc back`` copy.
+    """
+    import re
+
+    out = interactive._render_menu(
+        "Configure harnesses",
+        ["Claude    ✓ Subscription", "Quit"],
+        0,
+        descriptions=["", ""],
+        width=80,
+        selectable=[True, True],
+        compact=True,
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    lines = plain.splitlines()
+    title_index = next(i for i, line in enumerate(lines) if "Configure harnesses" in line)
+    assert "❯  Claude" in lines[title_index + 1]
+    assert "↑/↓ nav" in plain
+    assert "Esc exit" in plain
+    assert "Esc back" not in plain
+
+
+def test_render_menu_default_keeps_nested_footer_and_title_gap() -> None:
+    """Non-compact menus keep the older nested-picker spacing and footer copy."""
+    import re
+
+    out = interactive._render_menu(
+        "Pick",
+        ["alpha", "beta"],
+        0,
+        descriptions=["", ""],
+        width=80,
+        selectable=[True, True],
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    lines = plain.splitlines()
+    title_index = next(i for i, line in enumerate(lines) if "Pick" in line)
+    assert lines[title_index + 1] == ""
+    assert "❯  alpha" in lines[title_index + 2]
+    assert "↑/↓ move" in plain
+    assert "Esc back" in plain
+    assert "Esc exit" not in plain
+
+
+def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
+    """Compact selected-row hints stay one physical line on narrow terminals."""
+    import re
+
+    out = interactive._render_menu(
+        "Configure harnesses",
+        ["Hermes    ✗ Not installed", "Quit"],
+        0,
+        descriptions=[
+            "Install with `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`",
+            "",
+        ],
+        width=40,
+        selectable=[True, True],
+        compact=True,
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    hint_lines = [line for line in plain.splitlines() if "Install with" in line]
+    assert len(hint_lines) == 1
+    assert "…" in hint_lines[0]
+    assert len(hint_lines[0]) <= 40

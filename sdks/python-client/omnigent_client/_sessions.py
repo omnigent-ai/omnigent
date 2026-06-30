@@ -35,7 +35,7 @@ from omnigent.server.schemas import ServerStreamEvent
 from ._child_status import child_summary_busy
 from ._errors import raise_for_status, require_json_object, response_body
 
-# Default recursion cap for the sub-agent tree helpers. Mirrors ap-web's
+# Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
 # rollup, the CLI ``↓`` tree, and the web Agents rail all walk the same depth.
 _DEFAULT_SUBTREE_DEPTH = 3
@@ -153,7 +153,7 @@ class Session:
     :param model_override: Per-session LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` when no override is active
         and the agent's ``llm_model`` applies. Set via the REPL's
-        ``/model`` command or the ap-web model picker; both write
+        ``/model`` command or the web model picker; both write
         the same column so the surfaces stay in sync.
     :param context_window: Context window size in tokens looked up
         server-side from litellm, e.g. ``200_000``. ``None`` when
@@ -724,7 +724,7 @@ class SessionsNamespace:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
         :meth:`child_sessions` is one level deep; this recurses it breadth-first
-        to *max_depth*, mirroring ap-web's ``useChildSessions`` per-node fetch.
+        to *max_depth*, mirroring web's ``useChildSessions`` per-node fetch.
         Each returned row is the raw ``ChildSessionSummary`` dict with an added
         ``parent_id`` recording the session it was queried under, so callers can
         reconstruct the hierarchy. *session_id* itself is not included.
@@ -890,6 +890,7 @@ class SessionsNamespace:
         *,
         title: str | None = None,
         up_to_response_id: str | None = None,
+        model_override: str | None = None,
     ) -> dict[str, Any]:
         """
         Fork an existing session into a new session.
@@ -906,19 +907,27 @@ class SessionsNamespace:
             ``"resp_abc123"``. When set, the fork copies history only
             up to and including that response; ``None`` copies the
             full history.
+        :param model_override: Optional model id to launch the fork on
+            ("restart with model"), e.g. ``"databricks-gpt-5-4-mini"``.
+            Overrides the model the fork inherits from the source; the
+            server validates and family-checks it. ``None`` keeps the
+            source's model.
         :returns: Raw response dict matching the ``SessionResponse``
             shape: ``id``, ``agent_id``, ``status``, ``created_at``,
             ``title``, ``labels``, ``reasoning_effort``, and
             ``items``.
         :raises OmnigentError: 404 if *source_session_id* does
-            not exist; 400 if the source has no agent binding or
-            *up_to_response_id* names no response in the source.
+            not exist; 400 if the source has no agent binding,
+            *up_to_response_id* names no response in the source, or
+            *model_override* is invalid / cross-family for the fork.
         """
         body: dict[str, Any] = {}
         if title is not None:
             body["title"] = title
         if up_to_response_id is not None:
             body["up_to_response_id"] = up_to_response_id
+        if model_override is not None:
+            body["model_override"] = model_override
         resp = await self._http.post(
             f"{self._base}/v1/sessions/{source_session_id}/fork",
             json=body,

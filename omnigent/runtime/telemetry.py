@@ -1,5 +1,5 @@
 """
-Agent-plane observability on top of the MLflow Tracing SDK.
+Agent-plane observability using the OpenTelemetry SDK directly.
 
 See ``designs/OBSERVABILITY.md`` for the full design. The module
 is intentionally thin — it holds only the omnigent-specific
@@ -8,15 +8,14 @@ concerns:
 * **Trace ID derivation from the response ID.** Agent-plane response
   IDs are ``resp_<32-char hex>``. We reuse the hex suffix as the
   W3C trace ID so operators can look up a trace by its response ID
-  without a lookup table. :func:`trace_context_for_response` wraps
-  MLflow's public distributed-tracing entry point.
+  without a lookup table. :func:`trace_context_for_response` injects
+  a synthetic ``traceparent`` via the W3C TraceContext propagator.
 
-* **Runtime init.** :func:`init` flips
-  ``MLFLOW_USE_DEFAULT_TRACER_PROVIDER=false`` so MLflow shares the
-  global ``TracerProvider`` with raw OTel instrumentation
-  (FastAPI / HTTPX) and flips ``MLFLOW_ENABLE_OTLP_EXPORTER=true``
-  when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set — vendor-neutral OTLP
-  export by default.
+* **Runtime init.** :func:`init` installs an OTLP ``TracerProvider``
+  when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set. When the endpoint is
+  absent, tracing is still enabled so operators who install their own
+  provider externally get spans for free; the default no-op provider
+  discards them silently.
 
 * **Subprocess trace propagation.** :func:`get_traceparent_env`
   serializes the current trace context into env vars the executor
@@ -26,57 +25,35 @@ concerns:
   (LLM usage normalization, cancellation tagging). Trivial
   operations like ``span.set_attribute(...)`` are called directly
   at instrumentation sites.
-
-Call sites import this module for init + the trace-context wrapper,
-and otherwise call ``mlflow`` / ``mlflow.entities.SpanType`` /
-``span.set_inputs`` / ``span.set_outputs`` directly.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
-    from mlflow.entities.span import LiveSpan
+    from opentelemetry.sdk._logs.export import LogExporter
     from opentelemetry.sdk.metrics.export import MetricExporter
-    from opentelemetry.sdk.trace import ReadableSpan, Span
+    from opentelemetry.trace import Span
 
 _logger = logging.getLogger(__name__)
 
 _RESP_PREFIX = "resp_"
 _HEX_LEN = 32
-_DUMMY_PARENT_SPAN_ID = "1000000000000001"
-_W3C_VERSION = "00"
-_W3C_FLAGS_SAMPLED = "01"
+# Sentinel span ID used in trace_context_for_response. start_agent_span
+# detects this value and strips the parent so the agent span is exported
+# as a true root span (parent_span_id absent in OTLP proto).
+SENTINEL_PARENT_SPAN_ID = 0x1000000000000001
 
 _capture_content: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
-
-
-class _RemoteParentTraceState:
-    """
-    Trace IDs registered by the MLflow OTLP compatibility patch.
-
-    :param lock: Lock protecting ``trace_ids``.
-    :param trace_ids: OpenTelemetry trace IDs whose local root span has
-        a remote parent.
-    """
-
-    def __init__(self) -> None:
-        """
-        Initialize empty remote-parent trace state.
-
-        :returns: ``None``.
-        """
-        self.lock = threading.Lock()
-        self.trace_ids: set[int] = set()
+_logs_initialized: bool = False
 
 
 def _env_bool(name: str) -> bool:
@@ -98,10 +75,9 @@ def should_capture_content() -> bool:
     Return whether message content should be included on spans.
 
     Controlled by ``OMNIGENT_OTEL_CAPTURE_CONTENT``. Call sites
-    read this flag before populating ``span.set_inputs`` /
-    ``set_outputs`` with user messages or tool results. Content
-    capture is off by default because messages may contain PII or
-    secrets.
+    read this flag before populating span inputs / outputs with user
+    messages or tool results. Content capture is off by default
+    because messages may contain PII or secrets.
 
     :returns: ``True`` when content capture is enabled.
     """
@@ -112,11 +88,9 @@ def instrument_fastapi_app(app: FastAPI) -> None:
     """
     Optionally install OpenTelemetry FastAPI instrumentation on an app.
 
-    FastAPI auto-instrumentation remains opt-in because MLflow's span
-    processor has historically mishandled raw OTel spans from
-    auto-instrumentors. Operators who want the standard FastAPI HTTP
-    server spans and metrics can set
-    ``OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION=true``.
+    FastAPI auto-instrumentation is opt-in because it adds HTTP server
+    spans and metrics that most deployments don't need. Set
+    ``OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION=true`` to enable.
 
     :param app: FastAPI app instance to instrument.
     """
@@ -128,122 +102,6 @@ def instrument_fastapi_app(app: FastAPI) -> None:
         FastAPIInstrumentor.instrument_app(app)
     except Exception:
         _logger.exception("failed to initialize FastAPI OpenTelemetry instrumentation")
-
-
-def _patch_mlflow_otel_remote_parent_spans() -> None:
-    """
-    Patch MLflow's OTLP span processor for auto-instrumented server spans.
-
-    MLflow 3.11.1 assumes that any span with a parent already has a
-    matching MLflow trace registered in ``InMemoryTraceManager``. That
-    assumption fails for FastAPI/ASGI auto-instrumented server spans
-    whose parent is remote, e.g. a platform-provided incoming
-    ``traceparent``. In that case the span is a child in the distributed
-    trace but the local root for this process. Without this patch,
-    MLflow passes ``trace_id=None`` into ``LiveSpan`` and request
-    handling fails.
-
-    The patch treats "parent exists but no local MLflow trace mapping"
-    as a remote-parent local root: register a trace on start and pop it
-    on end. Existing MLflow-managed traces continue through MLflow's
-    original path.
-    """
-    try:
-        from mlflow.entities.span import SpanType, create_mlflow_span
-        from mlflow.tracing.processor.otel import OtelSpanProcessor
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    except Exception:
-        _logger.debug("MLflow OTLP span processor patch skipped", exc_info=True)
-        return
-
-    if getattr(OtelSpanProcessor, "_omnigent_remote_parent_patch", False):
-        return
-
-    original_on_end = OtelSpanProcessor.on_end
-
-    def _remote_parent_state(processor: Any) -> _RemoteParentTraceState:
-        """
-        Return patch-owned trace state for one MLflow processor.
-
-        :param processor: MLflow ``OtelSpanProcessor`` instance.
-        :returns: Mutable trace state attached to ``processor``.
-        """
-        state = getattr(processor, "_omnigent_remote_parent_state", None)
-        if state is None:
-            state = _RemoteParentTraceState()
-            processor._omnigent_remote_parent_state = state
-        return state
-
-    def patched_on_start(
-        self: Any,
-        span: Span,
-        parent_context: Any = None,
-    ) -> None:
-        """
-        Register raw OTel spans before MLflow writes invalid metadata.
-
-        MLflow's implementation calls ``create_mlflow_span`` without
-        ``span_type`` for raw OTel spans, which writes
-        ``mlflow.spanType=None``. The OTLP exporter rejects ``None``
-        attribute values. Treat raw OTel spans as ``UNKNOWN`` spans so
-        they remain exportable.
-
-        :param self: MLflow ``OtelSpanProcessor`` instance.
-        :param span: OpenTelemetry span being started.
-        :param parent_context: Optional explicit parent context passed
-            by OpenTelemetry.
-        """
-        should_register = getattr(self, "_should_register_traces", False)
-        trace_manager = getattr(self, "_trace_manager", None)
-        if not should_register or trace_manager is None:
-            BatchSpanProcessor.on_start(self, span, parent_context=parent_context)
-            return
-
-        if not span.parent:
-            trace_info = self._create_trace_info(span)  # type: ignore[attr-defined]
-            trace_id = trace_info.trace_id
-            trace_manager.register_trace(span.context.trace_id, trace_info)
-        else:
-            trace_id = trace_manager.get_mlflow_trace_id_from_otel_id(span.context.trace_id)
-            if trace_id is None:
-                trace_info = self._create_trace_info(span)  # type: ignore[attr-defined]
-                trace_id = trace_info.trace_id
-                trace_manager.register_trace(
-                    span.context.trace_id,
-                    trace_info,
-                    is_remote_trace=True,
-                )
-                state = _remote_parent_state(self)
-                with state.lock:
-                    state.trace_ids.add(span.context.trace_id)
-
-        trace_manager.register_span(create_mlflow_span(span, trace_id, SpanType.UNKNOWN))
-        BatchSpanProcessor.on_start(self, span, parent_context=parent_context)
-
-    def patched_on_end(self: Any, span: ReadableSpan) -> None:
-        """
-        Pop remote-parent local roots after MLflow exports the span.
-
-        :param self: MLflow ``OtelSpanProcessor`` instance.
-        :param span: OpenTelemetry span being ended.
-        """
-        original_on_end(self, span)
-        state = getattr(self, "_omnigent_remote_parent_state", None)
-        if state is None:
-            return
-        should_pop = False
-        with state.lock:
-            if span.context.trace_id in state.trace_ids:
-                state.trace_ids.remove(span.context.trace_id)
-                should_pop = True
-        if should_pop:
-            trace_manager = getattr(self, "_trace_manager", None)
-            if trace_manager is not None:
-                trace_manager.pop_trace(span.context.trace_id)
-
-    OtelSpanProcessor.on_start = patched_on_start
-    OtelSpanProcessor.on_end = patched_on_end
-    OtelSpanProcessor._omnigent_remote_parent_patch = True
 
 
 def parse_provider_name(model: str) -> tuple[str, str]:
@@ -311,9 +169,9 @@ def trace_context_for_response(
     Set the active trace context for a workflow invocation.
 
     Derives the W3C trace ID from ``root_response_id`` (if set) or
-    ``response_id``, then calls MLflow's public distributed-tracing
-    API to register the trace and make it current. Any span started
-    inside the context manager inherits this trace ID.
+    ``response_id``, then injects a synthetic ``traceparent`` header via
+    the W3C TraceContext propagator to make any span started inside the
+    context manager inherit this trace ID.
 
     For root invocations pass only ``response_id``; the trace ID is
     derived from it so direct response-ID → trace-ID lookup works.
@@ -329,26 +187,41 @@ def trace_context_for_response(
     :raises ValueError: If ``response_id`` (or ``root_response_id``
         when set) cannot be parsed.
     """
-    from mlflow.tracing.distributed import (
-        set_tracing_context_from_http_request_headers,
-    )
+    from opentelemetry import context
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
     effective = root_response_id or response_id
     trace_id_hex = trace_id_from_response_id(effective)
-    traceparent = f"{_W3C_VERSION}-{trace_id_hex}-{_DUMMY_PARENT_SPAN_ID}-{_W3C_FLAGS_SAMPLED}"
-    with set_tracing_context_from_http_request_headers({"traceparent": traceparent}):
+
+    # Inject a synthetic traceparent to pin all spans to the response-derived
+    # trace ID. The dummy parent span ID (1000000000000001) is a sentinel —
+    # it never matches any real span so the agent span is effectively the
+    # root for display purposes, even though it has a non-null parent_id in
+    # the OTLP payload.
+    traceparent = f"00-{trace_id_hex}-{SENTINEL_PARENT_SPAN_ID:016x}-01"
+    ctx = TraceContextTextMapPropagator().extract({"traceparent": traceparent})
+    token = context.attach(ctx)
+    try:
         yield
+    finally:
+        context.detach(token)
 
 
-def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
+# OTel GenAI semantic convention attribute keys for token usage.
+_GEN_AI_INPUT_TOKENS = "gen_ai.usage.input_tokens"
+_GEN_AI_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
+_GEN_AI_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
+_GEN_AI_CACHE_READ_TOKENS = "gen_ai.usage.cache_read_input_tokens"
+_GEN_AI_CACHE_CREATION_TOKENS = "gen_ai.usage.cache_creation_input_tokens"
+
+
+def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
     """
     Record token usage on an LLM span.
 
-    MLflow stores usage as a single JSON dict under
-    ``mlflow.chat.tokenUsage`` and translates each field to the
-    corresponding ``gen_ai.usage.*`` attribute on OTLP export —
-    ``input_tokens``, ``output_tokens``, ``total_tokens``, plus
-    optional cache fields.
+    Uses OTel GenAI semantic convention attributes
+    (``gen_ai.usage.*``) so the data is readable by any OTel backend
+    without MLflow-specific translation.
 
     Cache breakdown attributes are recorded only when present.
     Their absence is meaningful (the provider did not report
@@ -360,51 +233,43 @@ def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
         ``"total_tokens"``, ``"cache_read_input_tokens"``,
         ``"cache_creation_input_tokens"``.
     """
-    from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
-
-    payload: dict[str, int] = {
-        TokenUsageKey.INPUT_TOKENS: int(usage.get("input_tokens", 0)),
-        TokenUsageKey.OUTPUT_TOKENS: int(usage.get("output_tokens", 0)),
-    }
+    input_tokens = int(usage.get("input_tokens", 0))
+    output_tokens = int(usage.get("output_tokens", 0))
     total = usage.get("total_tokens")
     if total is None:
-        total = payload[TokenUsageKey.INPUT_TOKENS] + payload[TokenUsageKey.OUTPUT_TOKENS]
-    payload[TokenUsageKey.TOTAL_TOKENS] = int(total)
+        total = input_tokens + output_tokens
+    span.set_attribute(_GEN_AI_INPUT_TOKENS, input_tokens)
+    span.set_attribute(_GEN_AI_OUTPUT_TOKENS, output_tokens)
+    span.set_attribute(_GEN_AI_TOTAL_TOKENS, int(total))
     if "cache_read_input_tokens" in usage:
-        payload[TokenUsageKey.CACHE_READ_INPUT_TOKENS] = int(usage["cache_read_input_tokens"])
+        span.set_attribute(_GEN_AI_CACHE_READ_TOKENS, int(usage["cache_read_input_tokens"]))
     if "cache_creation_input_tokens" in usage:
-        payload[TokenUsageKey.CACHE_CREATION_INPUT_TOKENS] = int(
-            usage["cache_creation_input_tokens"]
+        span.set_attribute(
+            _GEN_AI_CACHE_CREATION_TOKENS, int(usage["cache_creation_input_tokens"])
         )
-    span.set_attribute(SpanAttributeKey.CHAT_USAGE, payload)
 
 
-def record_error(span: LiveSpan, exc: BaseException) -> None:
+def record_error(span: Span, exc: BaseException) -> None:
     """
     Mark a span as failed with an ``error.type`` attribute.
 
-    MLflow's ``span.record_exception`` already captures the stack
-    trace and message; this helper adds the ``error.type``
-    attribute (exception class name) so operators can filter by
-    class in the trace backend without reading the exception event.
-
-    ``exc`` is typed ``Exception`` (not ``BaseException``) to match
-    MLflow's ``record_exception`` signature and because every
-    in-tree caller catches ``Exception`` or a subclass; we don't
-    report telemetry for ``KeyboardInterrupt`` / ``SystemExit``.
+    ``span.record_exception`` captures the stack trace and message;
+    this helper adds the ``error.type`` attribute (exception class
+    name) so operators can filter by class in the trace backend
+    without reading the exception event.
 
     :param span: The span to mark as failed.
     :param exc: The exception that caused the failure.
     """
-    from mlflow.entities.span_status import SpanStatusCode
+    from opentelemetry.trace import StatusCode
 
-    span.set_status(SpanStatusCode.ERROR)
+    span.set_status(StatusCode.ERROR, str(exc))
     span.set_attribute("error.type", type(exc).__name__)
     span.set_attribute("error.message", str(exc))
     span.record_exception(exc)
 
 
-def record_cancellation(span: LiveSpan) -> None:
+def record_cancellation(span: Span) -> None:
     """
     Mark a span as cancelled.
 
@@ -415,9 +280,9 @@ def record_cancellation(span: LiveSpan) -> None:
 
     :param span: The span to mark as cancelled.
     """
-    from mlflow.entities.span_status import SpanStatusCode
+    from opentelemetry.trace import StatusCode
 
-    span.set_status(SpanStatusCode.ERROR)
+    span.set_status(StatusCode.ERROR)
     span.set_attribute("error.type", "cancelled")
 
 
@@ -488,9 +353,26 @@ def _otlp_protocol() -> str:
     raise ValueError(f"Unsupported OTLP protocol for metrics export: {protocol!r}")
 
 
+def _create_otlp_span_exporter() -> Any:
+    """
+    Create an OTLP span exporter using standard OTel environment vars.
+
+    :returns: OTLP span exporter configured from the process environment.
+    :raises ValueError: If ``OTEL_EXPORTER_OTLP_PROTOCOL`` is not supported.
+    """
+    protocol = _otlp_protocol()
+    if protocol == "http/protobuf":
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+        return OTLPSpanExporter()
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+    return OTLPSpanExporter()
+
+
 def _create_otlp_metric_exporter() -> MetricExporter:
     """
-    Create an OTLP metric exporter using standard OTEL environment vars.
+    Create an OTLP metric exporter using standard OTel environment vars.
 
     :returns: OTLP metric exporter configured from the process
         environment.
@@ -509,6 +391,36 @@ def _create_otlp_metric_exporter() -> MetricExporter:
     )
 
     return OTLPMetricExporter()
+
+
+def _init_otel_traces(endpoint: str) -> None:
+    """
+    Initialize the OpenTelemetry SDK tracer provider.
+
+    When ``endpoint`` is set, installs a ``TracerProvider`` backed by
+    an OTLP ``BatchSpanProcessor``. When absent, tracing is still
+    enabled so operators who install their own provider externally get
+    spans; the default no-op provider discards them silently.
+
+    :param endpoint: ``OTEL_EXPORTER_OTLP_ENDPOINT`` value (may be empty).
+    """
+    try:
+        if endpoint:
+            from opentelemetry import trace
+            from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+            service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
+            provider = TracerProvider(resource=Resource.create({SERVICE_NAME: service_name}))
+            provider.add_span_processor(BatchSpanProcessor(_create_otlp_span_exporter()))
+            trace.set_tracer_provider(provider)
+
+        from omnigent.inner.tracing import enable_tracing
+
+        enable_tracing()
+    except Exception:
+        _logger.exception("failed to initialize OpenTelemetry tracing")
 
 
 def _init_otel_metrics() -> None:
@@ -556,33 +468,126 @@ def _init_otel_metrics() -> None:
         _metrics_initialized = True
 
 
+def _logs_exporter_name() -> str:
+    """
+    Return the configured OpenTelemetry logs exporter name.
+
+    ``OTEL_LOGS_EXPORTER`` is the standard OpenTelemetry knob. If
+    it is unset and an OTLP endpoint is configured, Omnigent uses
+    ``"otlp"`` so log records flow alongside traces and metrics.
+
+    :returns: Exporter name, e.g. ``"otlp"`` or ``"none"``.
+    """
+    configured = os.environ.get("OTEL_LOGS_EXPORTER")
+    if configured is not None:
+        return configured.strip().lower()
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip():
+        return "otlp"
+    return "none"
+
+
+def _create_otlp_log_exporter() -> LogExporter:
+    """
+    Create an OTLP log exporter using standard OTel environment vars.
+
+    :returns: OTLP log exporter configured from the process
+        environment.
+    :raises ValueError: If ``OTEL_EXPORTER_OTLP_PROTOCOL`` is not
+        supported.
+    """
+    protocol = _otlp_protocol()
+    if protocol == "http/protobuf":
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import (
+            OTLPLogExporter,
+        )
+
+        return OTLPLogExporter()
+    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+        OTLPLogExporter,
+    )
+
+    return OTLPLogExporter()
+
+
+def _init_otel_logs() -> None:
+    """
+    Initialize the OpenTelemetry LoggerProvider when configured.
+
+    Bridges Python ``logging`` to OTel so logs emitted inside an
+    active span carry ``trace_id`` and ``span_id`` automatically.
+    No-op when no OTLP endpoint is configured or
+    ``OTEL_LOGS_EXPORTER=none`` is set.
+
+    Mirrors :func:`_init_otel_metrics`: a ``LoggerProvider`` is
+    registered globally, an OTLP log exporter is attached via a
+    ``BatchLogRecordProcessor``, and a ``LoggingHandler`` is
+    installed on the root logger so any ``logging.getLogger`` call
+    in the runtime flows through the bridge.
+    """
+    global _logs_initialized
+
+    if _logs_initialized:
+        return
+
+    exporter_name = _logs_exporter_name()
+    if exporter_name == "none":
+        _logs_initialized = True
+        return
+    if exporter_name != "otlp":
+        _logger.warning(
+            "unsupported OTEL_LOGS_EXPORTER=%s; log bridge disabled",
+            exporter_name,
+        )
+        _logs_initialized = True
+        return
+
+    try:
+        from opentelemetry._logs import set_logger_provider
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+        from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+
+        service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
+        provider = LoggerProvider(
+            resource=Resource.create({SERVICE_NAME: service_name}),
+        )
+        exporter = _create_otlp_log_exporter()
+        provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
+        set_logger_provider(provider)
+
+        handler = LoggingHandler(logger_provider=provider)
+        root_logger = logging.getLogger()
+        # Mark the handler so re-init does not stack duplicates on
+        # the root logger when init() runs again after a flag reset.
+        handler.set_name("omnigent-otel-log-bridge")
+        for existing in root_logger.handlers:
+            if existing.get_name() == "omnigent-otel-log-bridge":
+                root_logger.removeHandler(existing)
+        root_logger.addHandler(handler)
+        _logs_initialized = True
+    except Exception:
+        _logger.exception("failed to initialize OpenTelemetry logs")
+        _logs_initialized = True
+
+
 def init() -> None:
     """
-    Initialize MLflow Tracing for the omnigent runtime.
+    Initialize OpenTelemetry tracing for the omnigent runtime.
 
     Safe to call multiple times; the second and subsequent calls
     refresh the content-capture flag but do not re-register providers.
 
-    Three modes based on the environment:
+    Two modes based on the environment:
 
     * **OTLP export to an external collector.** When
-      ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set, we flip
-      ``MLFLOW_ENABLE_OTLP_EXPORTER=true`` so MLflow exports via
-      OTLP to the operator's collector (Jaeger, Tempo, MLflow
-      tracking server's ``/v1/traces``, etc.) rather than to an
-      MLflow tracking server's internal store.
+      ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set, installs a
+      ``TracerProvider`` backed by an OTLP ``BatchSpanProcessor``
+      (Jaeger, Tempo, Grafana, etc.).
 
-    * **MLflow tracking server.** When ``OTEL_EXPORTER_OTLP_ENDPOINT``
-      is unset but ``MLFLOW_TRACKING_URI`` is set, MLflow exports
-      traces to the configured tracking server. We leave this path
-      untouched.
-
-    * **No-op.** When neither is set, MLflow emits no-op spans —
-      zero overhead on span creation.
-
-    Unified mode (``MLFLOW_USE_DEFAULT_TRACER_PROVIDER=false``) is
-    forced so the global OTel ``TracerProvider`` is shared between
-    MLflow and raw OTel instrumentation (FastAPI, HTTPX).
+    * **No-op / external provider.** When the endpoint is absent,
+      tracing is still enabled so operators who configure their own
+      ``TracerProvider`` externally get spans automatically. The
+      default OTel no-op provider discards spans silently.
     """
     global _capture_content, _initialized
 
@@ -591,48 +596,10 @@ def init() -> None:
     if _initialized:
         return
 
-    # Unified provider mode: MLflow shares the global TracerProvider
-    # with raw OTel instrumentation so FastAPI/HTTPX auto-instrumented
-    # spans live in the same trace as our MLflow spans.
-    os.environ.setdefault("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", "false")
-
-    # When an OTLP endpoint is configured, explicitly flip MLflow's
-    # OTLP exporter flag. MLflow requires this in addition to the
-    # standard OTel env vars (which it also respects).
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-    if endpoint:
-        os.environ.setdefault("MLFLOW_ENABLE_OTLP_EXPORTER", "true")
-
-    try:
-        _patch_mlflow_otel_remote_parent_spans()
-        import mlflow.tracing
-
-        mlflow.tracing.enable()
-
-        # Enable the inner tracing module so TracingContext spans are
-        # created for every agent turn. Without this, telemetry.init()
-        # sets up the OTel provider but no spans are emitted because the
-        # per-session tracing flag stays False.
-        from omnigent.inner.tracing import enable_tracing
-
-        enable_tracing()
-    except ImportError:
-        # mlflow is an optional dependency (`omnigent[tracing]`). When it
-        # is absent, tracing is simply disabled — degrade quietly rather
-        # than logging a full traceback on every server start.
-        _logger.info(
-            "MLflow not installed; tracing disabled. Install `omnigent[tracing]` to enable it."
-        )
-    except Exception:
-        _logger.exception("failed to initialize MLflow tracing")
-
+    _init_otel_traces(endpoint)
     _init_otel_metrics()
-
-    # NOTE: FastAPI auto-instrumentation remains opt-in via
-    # ``OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION=true``. MLflow's span
-    # processor has historically mishandled raw OTel spans from
-    # auto-instrumentors. See ``instrument_fastapi_app`` for the
-    # guarded integration point used by the server factory.
+    _init_otel_logs()
 
     _initialized = True
     _logger.info(

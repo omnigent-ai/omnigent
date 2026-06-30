@@ -6,13 +6,17 @@ name: Auto-assign Reviewer
 # runtime -- a custom, non-magic path (NOT .github/CODEOWNERS), so GitHub's
 # native CODEOWNERS auto-request never fires and this action is the sole
 # assigner. Non-fork / collaborator / maintainer PRs are left alone.
-# See auto-assign-reviewer.js.
+# It also keeps the PR reviewer and any linked ("closes #N") issue's assignee in
+# sync: a maintainer already assigned to a linked issue is adopted as the
+# reviewer, and the chosen reviewer is assigned onto any still-unassigned linked
+# issue. See auto-assign-reviewer.js.
 #
 # pull_request_target so it can manage reviewers on fork PRs (a fork's
 # pull_request token is read-only). Safe: it checks out only the trusted default
 # branch (.github), never PR head, and runs no PR code -- it reads .github/
-# reviewers + .github/MAINTAINER + the changed-file list and calls the reviewers
-# API. The offline unit test (auto-assign-reviewer.test.js) covers the logic.
+# reviewers + .github/MAINTAINER + the changed-file list, queries the PR's linked
+# issues, and calls the reviewers / assignees API. The offline unit test
+# (auto-assign-reviewer.test.js) covers the logic.
 
 on:
   pull_request_target:
@@ -41,7 +45,8 @@ jobs:
       # Job-level permissions REPLACE the workflow-level block (they don't
       # merge), so contents:read must be restated here for actions/checkout.
       contents: read
-      pull-requests: write   # request reviewers
+      pull-requests: write   # request reviewers + assign the PR
+      issues: write          # assign the PR's linked ("closes #N") issues
     steps:
       # Trusted default branch only (.github sparse). Never the PR head, so no
       # PR-authored code runs.
@@ -52,7 +57,7 @@ jobs:
           sparse-checkout: .github
           persist-credentials: false
       - name: Assign 1 balanced reviewer from the .github/reviewers pool
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           retries: 3
           script: |

@@ -7,13 +7,25 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_forwarder_health import (
+    note_post_success as note_native_post_success,
+)
+from omnigent._native_forwarder_health import (
+    record_post_failure as record_native_post_failure,
+)
+from omnigent._native_post_delivery import (
+    RepostResult,
+    append_dead_letter,
+    post_may_have_been_delivered,
+    replay_dead_letters,
+)
 from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
@@ -58,6 +70,15 @@ _EMPTY_ROLLOUT_FRAGMENT = "is empty"
 _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
+# or a slow/hung server cannot stall forwarder startup: each re-POST is a single
+# attempt (its natural retry is the next startup) with a short timeout (vs the
+# 30s live client default) so a hung server fails fast; at most
+# ``_REPLAY_MAX_RECORDS`` are sent and the whole drain is abandoned after
+# ``_REPLAY_DEADLINE_SECONDS``. Leftovers are deferred to a later startup.
+_REPLAY_MAX_RECORDS = 500
+_REPLAY_POST_TIMEOUT_SECONDS = 5.0
+_REPLAY_DEADLINE_SECONDS = 30.0
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
@@ -141,10 +162,13 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
 # shape varies by version, so detecting either keeps the fix robust.
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
-# ``Unauthorized``, ``UsageLimitExceeded``); auth-class values get a re-auth
-# hint. httpStatusCode 401/403 is treated as auth too.
+# ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
+# hint. httpStatusCode 401/403 is treated as auth too. Values are stored and
+# compared case-insensitively: the app-server enum serializes as lowercase
+# snake_case (``unauthorized``), but older/alternate spellings (``Unauthorized``)
+# are matched too.
 _CODEX_ERROR_ITEM_TYPE = "error"
-_CODEX_AUTH_ERROR_INFO = frozenset({"Unauthorized"})
+_CODEX_AUTH_ERROR_INFO = frozenset({"unauthorized"})
 _CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
 # Message-substring fallback for app-server versions that omit codexErrorInfo.
 # Surface-only, so recall is favored over precision: a false positive only
@@ -343,6 +367,10 @@ class _CodexForwarderState:
     # identical posts when Codex signals completion via both a
     # ``contextCompaction`` item and a ``thread/compacted`` notification.
     compaction_status_posted: str | None = None
+    # Whether the compaction item has already been persisted for the current
+    # compaction boundary.  Reset to ``False`` when a new ``"in_progress"``
+    # status is posted.
+    compaction_item_persisted: bool = False
     # Codex reasoning item id whose live deltas are currently being mirrored.
     # When a delta arrives for a different item, it opens a new reasoning
     # block (``started=True`` → ``response.reasoning.started``). Reset at each
@@ -766,9 +794,10 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     """
     Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
 
-    Prefers the structured ``codexErrorInfo`` (``Unauthorized`` or an
-    httpStatusCode of 401/403); falls back to substring matching against
-    :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes that omit it.
+    Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
+    case-insensitive, or an httpStatusCode of 401/403); falls back to substring
+    matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
+    that omit it.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -783,7 +812,8 @@ def _classify_codex_error(error: dict[str, Any], message: str) -> str:
     elif isinstance(info, dict):
         variant = info.get("type") or info.get("kind") or info.get("variant")
         http_status = info.get("httpStatusCode")
-    if variant in _CODEX_AUTH_ERROR_INFO or http_status in _CODEX_AUTH_HTTP_STATUS:
+    variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
+    if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
     lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
@@ -1554,6 +1584,8 @@ async def supervise_forwarder(
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
+    # Bind bridge dir so failed durable-event posts can be dead-lettered (#1120).
+    _dead_letter_dir.set(bridge_dir)
     if client is None:
         client = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
         await client.connect()
@@ -1564,6 +1596,11 @@ async def supervise_forwarder(
         timeout=httpx.Timeout(30.0),
         transport=ap_transport,
     ) as ap_client:
+        # Recover proven-undelivered dead-lettered forwards now that the
+        # server may be reachable again (host/server returned after an
+        # outage or restart). Runs before live forwarding begins, so no
+        # other writer races the dead-letter files (#1579).
+        await _replay_dead_letters_on_startup(ap_client, bridge_dir)
         target = _ForwarderTarget(
             session_id=session_id,
             thread_id=thread_id,
@@ -2315,6 +2352,7 @@ async def _handle_event(
             params=params,
             delta_coalescer=delta_coalescer if not is_child else None,
             forwarder_state=forwarder_state,
+            bridge_dir=bridge_dir,
         )
 
 
@@ -2684,6 +2722,18 @@ async def _maybe_handle_turn_event(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return True
     if method == "turn/diff/updated":
         _handle_turn_diff_updated(params, forwarder_state)
@@ -2759,6 +2809,7 @@ async def _handle_completed_event(
     params: dict[str, Any],
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     forwarder_state: _CodexForwarderState | None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -2776,7 +2827,9 @@ async def _handle_completed_event(
         await delta_coalescer.flush()
     if forwarder_state is not None:
         forwarder_state.record_completed_plan(params)
-    await _handle_completed_item(client, session_id, params, forwarder_state=forwarder_state)
+    await _handle_completed_item(
+        client, session_id, params, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+    )
 
 
 async def _handle_terminal_turn_boundary(
@@ -3658,6 +3711,7 @@ async def _handle_completed_item(
     params: dict[str, Any],
     *,
     forwarder_state: _CodexForwarderState | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -3701,6 +3755,18 @@ async def _handle_completed_item(
         await _post_compaction_status(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return
     if not _claim_completed_item(params, item, forwarder_state):
         return
@@ -5252,6 +5318,107 @@ async def _post_compaction_status(
     _log_failed_session_event_post(_EXTERNAL_COMPACTION_STATUS_TYPE, response)
     if forwarder_state is not None and response is not None and response.status_code < 400:
         forwarder_state.compaction_status_posted = status
+        if status == "in_progress":
+            forwarder_state.compaction_item_persisted = False
+
+
+async def _persist_codex_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path | None = None,
+) -> None:
+    """Persist a compaction boundary item to the conversation store.
+
+    Codex appends a ``Compacted`` entry to the rollout JSONL after
+    compaction. That entry carries ``replacement_history`` — the
+    post-compaction context. When ``bridge_dir`` is available, we
+    read the latest ``Compacted`` entry from the rollout and use
+    its ``replacement_history`` as ``compacted_messages``.
+    """
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    compacted = None
+    if bridge_dir is not None:
+        try:
+            state = read_bridge_state(bridge_dir)
+            if state is not None:
+                codex_home = Path(state.codex_home)
+                thread_id = state.thread_id
+                rollout_files = sorted(
+                    codex_home.glob(f"sessions/**/*rollout-*{thread_id}.jsonl"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if rollout_files:
+                    compacted = _read_compacted_history(rollout_files[0])
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Failed to read codex rollout for compaction persist",
+                exc_info=True,
+            )
+
+    data: dict[str, object] = {
+        "summary": "[Codex compaction — context was compacted in the terminal]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted is not None:
+        if compacted.get("replacement_history"):
+            data["compacted_messages"] = compacted["replacement_history"]
+        if compacted.get("window_id") is not None:
+            data["window_id"] = compacted["window_id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "compaction", "data": data},
+    )
+    resp.raise_for_status()
+
+
+def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
+    """Read the last ``Compacted`` entry from a rollout JSONL.
+
+    Codex appends a ``{type: "compacted", payload: {replacement_history: [...],
+    window_id: N}}`` entry after compaction. Returns a dict with
+    ``replacement_history`` and ``window_id`` for persistence, or ``None``.
+
+    :param rollout_path: Path to the rollout JSONL.
+    :returns: Dict with ``replacement_history`` and ``window_id``, or ``None``.
+    """
+    last_compacted = None
+    with rollout_path.open() as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if entry.get("type") == "compacted":
+                last_compacted = entry
+    if last_compacted is None:
+        return None
+    payload = last_compacted.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    history = payload.get("replacement_history")
+    if not isinstance(history, list) or not history:
+        return None
+    # Store the full replacement_history — messages + compaction
+    # tokens. Although the messages duplicate pre-compaction items
+    # in the conversation store, they are needed for rollout
+    # reconstruction (e.g. sandbox recovery where the rollout file
+    # is lost).
+    return {
+        "replacement_history": [item for item in history if isinstance(item, dict)],
+        "window_id": payload.get("window_id"),
+    }
 
 
 async def _handle_reasoning_delta(
@@ -5420,6 +5587,174 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     return data
 
 
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent session-event forwarding (#1120).
+
+    Network failures (connect timeouts, 503s, resets) make
+    ``_post_session_event`` drop transcript/usage events after its bounded
+    retries, previously visible only as scattered per-item warnings. This
+    tracks consecutive permanent failures so a sustained outage escalates
+    to a single loud signal instead of staying effectively silent.
+
+    :param consecutive_failures: Permanent post failures since the last
+        success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive permanent forward failures, sync is treated as
+# degraded and escalated once to ERROR. Small enough to fire during a real
+# outage, large enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+# Bridge dir for dead-lettering undeliverable durable events; set per-forwarder (#1120).
+_dead_letter_dir: ContextVar[Path | None] = ContextVar("_codex_dead_letter_dir", default=None)
+
+# Durable event types worth dead-lettering (not ephemeral deltas).
+_DEAD_LETTER_EVENT_TYPES = frozenset({"external_conversation_item", "external_session_usage"})
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful forward, clearing any degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "codex-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(event_type: str) -> None:
+    """
+    Record a permanent forward failure; escalate once when sync degrades.
+
+    :param event_type: Session event type that failed to post, e.g.
+        ``"external_conversation_item"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "codex-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest type=%s)",
+            _forward_health.consecutive_failures,
+            event_type,
+        )
+        _forward_health.degraded_logged = True
+
+
+async def _replay_dead_letters_on_startup(
+    ap_client: httpx.AsyncClient,
+    bridge_dir: Path,
+) -> None:
+    """
+    Re-POST proven-undelivered dead-lettered forwards on forwarder startup (#1579).
+
+    Best-effort recovery for the realistic case — the host/server returned after
+    an outage or a restart. Delegates to the shared
+    :func:`replay_dead_letters` drain, supplying a re-POST that routes each
+    record to its recorded session via :func:`_post_session_event_inner` (the
+    inner so a re-failure does not double dead-letter through the wrapper).
+    Never raises: a replay failure must not block live forwarding.
+
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param bridge_dir: Native Codex bridge directory holding the dead-letter files.
+    :returns: None.
+    """
+
+    async def _repost(record: dict[str, object]) -> RepostResult:
+        session_id = record["session_id"]
+        event_type = record["event_type"]
+        payload = record["payload"]
+        assert isinstance(session_id, str)
+        assert isinstance(event_type, str)
+        assert isinstance(payload, dict)
+        result = await _post_session_event_inner(
+            ap_client,
+            session_id,
+            event_type=event_type,
+            data=payload,
+            max_attempts=1,
+            timeout=_REPLAY_POST_TIMEOUT_SECONDS,
+        )
+        response = result.response
+        if response is None:
+            return RepostResult(
+                delivered=False,
+                delivered_ambiguous=result.delivered_ambiguous,
+                http_status=None,
+            )
+        delivered = response.status_code < 400
+        return RepostResult(
+            delivered=delivered,
+            delivered_ambiguous=False,
+            http_status=None if delivered else response.status_code,
+        )
+
+    try:
+        await replay_dead_letters(
+            bridge_dir,
+            repost=_repost,
+            retryable_status_codes=_POST_RETRY_STATUS_CODES,
+            logger_name=__name__,
+            max_records=_REPLAY_MAX_RECORDS,
+            deadline_seconds=_REPLAY_DEADLINE_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - replay must never block forwarder startup.
+        _logger.warning("Codex forwarder dead-letter replay failed", exc_info=True)
+
+
+@dataclass(frozen=True)
+class _PostResult:
+    """
+    Classified outcome of one :func:`_post_session_event_inner` call (#1579).
+
+    Surfaces *why* a POST failed so the caller can dead-letter with the
+    structured classification replay needs — distinguishing the two ``None``
+    cases the inner used to conflate: an ambiguous-skip (the item may already
+    be committed) from a proven-undelivered transport failure after retries.
+
+    :param response: Final HTTP response, or ``None`` when no response was
+        seen (a transport failure, or an ambiguous conversation-item skip).
+    :param delivered_ambiguous: ``True`` when the POST was abandoned after an
+        ambiguous transport failure (request sent, response lost), so the item
+        may already be committed server-side — never safe to replay.
+    :param transport_error: Transport-error class name when a POST raised
+        without a response, e.g. ``"ConnectError"``; ``None`` when the server
+        responded.
+    """
+
+    response: httpx.Response | None
+    delivered_ambiguous: bool = False
+    transport_error: str | None = None
+
+
 async def _post_session_event(
     client: httpx.AsyncClient,
     session_id: str,
@@ -5427,6 +5762,61 @@ async def _post_session_event(
     event_type: str,
     data: dict[str, Any],
 ) -> httpx.Response | None:
+    """
+    Post one Omnigent session event, tracking forward-sync health (#1120).
+
+    Thin wrapper over :func:`_post_session_event_inner` that classifies the
+    outcome — a sub-400 response is a success; ``None`` or a >=400 final
+    response is a permanent failure — and updates :data:`_forward_health`
+    so a sustained outage escalates to a single ERROR instead of silently
+    dropping events. On a durable-event failure it dead-letters the dropped
+    payload with the structured classification replay needs (#1579).
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param event_type: Session event type, e.g.
+        ``"external_conversation_item"``.
+    :param data: Event data payload, e.g. ``{"status": "running"}``.
+    :returns: The final HTTP response, or ``None`` (see
+        :func:`_post_session_event_inner`).
+    """
+    result = await _post_session_event_inner(client, session_id, event_type=event_type, data=data)
+    response = result.response
+    if response is not None and response.status_code < 400:
+        _note_forward_success()
+    else:
+        _note_forward_failure(event_type)
+        dl_dir = _dead_letter_dir.get()
+        if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
+            http_status = response.status_code if response is not None else None
+            if response is not None:
+                reason = f"http {response.status_code}"
+            elif result.delivered_ambiguous:
+                reason = "ambiguous transport failure (may already be committed)"
+            else:
+                reason = "proven-undelivered transport failure after retries"
+            append_dead_letter(
+                dl_dir,
+                session_id=session_id,
+                event_type=event_type,
+                payload=data,
+                reason=reason,
+                delivered_ambiguous=result.delivered_ambiguous,
+                http_status=http_status,
+                transport_error=result.transport_error,
+            )
+    return response
+
+
+async def _post_session_event_inner(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    event_type: str,
+    data: dict[str, Any],
+    max_attempts: int = _POST_MAX_ATTEMPTS,
+    timeout: float | None = None,
+) -> _PostResult:
     """
     Post one Omnigent session event with bounded transient retries.
 
@@ -5436,16 +5826,26 @@ async def _post_session_event(
         ``"external_conversation_item"``.
     :param data: Event data payload, e.g.
         ``{"status": "running"}``.
-    :returns: Final HTTP response, or ``None`` when all attempts raised
-        transport errors — or, for ``external_conversation_item``, after
-        a single ambiguous transport failure (the item may already be
-        committed server-side, so retrying risks a duplicate).
+    :param max_attempts: Maximum POST attempts before giving up, e.g. ``3``.
+        Startup dead-letter replay passes ``1`` — its natural retry cadence is
+        the next startup, so an in-call retry loop only adds latency (#1579).
+    :param timeout: Optional per-request timeout in seconds overriding the
+        client default, e.g. ``5.0``. Replay passes a short value so a hung
+        server fails fast instead of stalling startup on the 30s client default.
+    :returns: A :class:`_PostResult` carrying the final response, or — when no
+        response was seen — whether the POST was abandoned after an ambiguous
+        transport failure (``external_conversation_item`` only; the item may
+        already be committed, so retrying risks a duplicate) versus a
+        proven-undelivered transport failure after all retries.
     """
     url = f"/v1/sessions/{url_component(session_id)}/events"
     payload = {"type": event_type, "data": data}
-    for attempt in range(1, _POST_MAX_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
-            response = await client.post(url, json=payload)
+            if timeout is None:
+                response = await client.post(url, json=payload)
+            else:
+                response = await client.post(url, json=payload, timeout=timeout)
         except httpx.HTTPError as exc:
             # Conversation items persist with a random primary key and no
             # server-side dedup, so an ambiguous failure (request sent,
@@ -5461,58 +5861,75 @@ async def _post_session_event(
                     event_type,
                     exc,
                 )
-                return None
-            if _is_final_post_attempt(attempt):
-                _log_post_transport_failure(event_type, exc)
-                return None
+                return _PostResult(
+                    response=None,
+                    delivered_ambiguous=True,
+                    transport_error=type(exc).__name__,
+                )
+            if _is_final_post_attempt(attempt, max_attempts):
+                _log_post_transport_failure(event_type, exc, max_attempts)
+                return _PostResult(response=None, transport_error=type(exc).__name__)
             await _sleep(_post_retry_delay(attempt))
             continue
-        if _post_response_is_final(response, attempt):
-            return response
+        # An HTTP response (no transport error) proves the server is reachable,
+        # so clear any stale connectivity-failure record — otherwise a recovered
+        # connection could have an old failure misattributed to a later,
+        # unrelated idle-watchdog stall (issue #1119).
+        note_native_post_success()
+        if _post_response_is_final(response, attempt, max_attempts):
+            return _PostResult(response=response)
         await _sleep(_post_retry_delay(attempt))
-    return None
+    return _PostResult(response=None)
 
 
-def _post_response_is_final(response: httpx.Response, attempt: int) -> bool:
+def _post_response_is_final(response: httpx.Response, attempt: int, max_attempts: int) -> bool:
     """
     Return whether a session-event POST response should stop retries.
 
     :param response: HTTP response from AP.
     :param attempt: One-based attempt number, e.g. ``1``.
+    :param max_attempts: Maximum POST attempts allowed, e.g. ``3``.
     :returns: ``True`` when the caller should return ``response``.
     """
     if response.status_code < 400:
         return True
     if not _should_retry_post_status(response.status_code):
         return True
-    return _is_final_post_attempt(attempt)
+    return _is_final_post_attempt(attempt, max_attempts)
 
 
-def _is_final_post_attempt(attempt: int) -> bool:
+def _is_final_post_attempt(attempt: int, max_attempts: int) -> bool:
     """
     Return whether an Omnigent event POST attempt is the final try.
 
     :param attempt: One-based attempt number, e.g. ``3``.
+    :param max_attempts: Maximum POST attempts allowed, e.g. ``3``.
     :returns: ``True`` when no further retry is allowed.
     """
-    return attempt >= _POST_MAX_ATTEMPTS
+    return attempt >= max_attempts
 
 
-def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError) -> None:
+def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError, max_attempts: int) -> None:
     """
     Log an exhausted Omnigent session-event transport failure.
 
     :param event_type: Session event type, e.g.
         ``"external_conversation_item"``.
     :param exc: Final transport error.
+    :param max_attempts: Number of attempts that were made, e.g. ``3``.
     :returns: None.
     """
     _logger.warning(
         "failed to post Codex session event after retries: type=%s attempts=%s error=%r",
         event_type,
-        _POST_MAX_ATTEMPTS,
+        max_attempts,
         exc,
     )
+    # Surface this connectivity failure to the harness idle-turn watchdog: if
+    # the turn stalls because events can't reach the server, the watchdog
+    # attaches this cause to the failure reason instead of a generic
+    # "wedged LLM" message (issue #1119).
+    record_native_post_failure(event_type, exc)
 
 
 def _log_failed_session_event_post(

@@ -61,21 +61,54 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # so it survives across turns and is overwritten by each subsequent switch.
 SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 
-# Labels scoped to one running session instance — deliberately NOT copied
-# when forking. A fork is an independent session that re-binds its own
-# runtime, so inheriting these would point the clone at the SOURCE's
-# state: the native bridge-id labels would route the clone's terminal +
-# web injection to the source's claude/codex bridge (whose active-session
-# marker isn't the clone → "session no longer active"); the context-size
-# metrics would display the source's last usage. The literals mirror the
-# harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
-# cross-checks them so a rename in those modules fails loudly here.
+# Opt-in DANGEROUS launch directive for a codex-native session: when set to
+# ``"1"`` the runner launches Codex with
+# ``--dangerously-bypass-approvals-and-sandbox`` and puts the app-server
+# threads into the matching no-approval / no-sandbox stance (see
+# ``omnigent.runner.app._codex_native_launch_config`` and
+# ``codex_native_app_server.build_codex_remote_args``). Stored as a plain
+# conversation label (cheap thread metadata, like the fork directives above)
+# so it survives reload without a schema migration. The web UI gates turning
+# this on behind a typed confirmation + a persistent red warning banner; any
+# value other than ``"1"`` (incl. absent) leaves the session in Codex's
+# normal approval/sandbox stance. See issue #657.
+CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
+
+# Reserved label key that stores a session's sidebar "project" membership
+# (implicit collections — a project exists while ≥1 session carries this key).
+# Namespaced so it never collides with the user-facing "project" term or other
+# reserved keys, and is filtered out of generic label surfaces. Canonical home
+# is the store layer; the SQLAlchemy store and the server route both import it,
+# and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
+PROJECT_LABEL_KEY = "omni_project"
+
+# Labels that must NOT cross into a new session context — deliberately
+# dropped both when forking (not copied to the clone) and on an in-place
+# agent switch (deleted from the switched session). Two distinct reasons
+# put a key here:
+#
+#   * Runtime state bound to ONE running instance — the native bridge-id
+#     labels would route the new context's terminal + web injection to the
+#     SOURCE's claude/codex bridge (whose active-session marker isn't the
+#     clone → "session no longer active"); the context-size metrics would
+#     display the source's last usage. The bridge-id literals mirror the
+#     harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
+#     cross-checks them so a rename in those modules fails loudly here.
+#
+#   * Per-context safety opt-in — the DANGEROUS codex full-bypass directive
+#     (:data:`CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY`). Letting it ride into a
+#     fork (a new session + workspace) or survive an agent switch would
+#     silently re-arm ``--dangerously-bypass-approvals-and-sandbox`` with no
+#     typed re-confirmation and no banner, violating the "impossible to
+#     enable accidentally" contract (#657). Dropping it forces each session
+#     that runs bypass to make its own explicit opt-in.
 _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
 
@@ -143,6 +176,29 @@ class NameAlreadyExistsError(Exception):
     builtins) can surface a clean ``name_already_exists`` tool
     error to the LLM.
     """
+
+
+def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) -> None:
+    """
+    Apply a usage *delta* to *current* in place (add semantics, nested-aware).
+
+    Flat numeric keys are summed; ``"by_model"`` sub-dicts are merged by
+    model id, summing each model's sub-keys independently. Used by
+    :meth:`ConversationStore.increment_session_usage` implementations to
+    keep the merge logic in one place.
+
+    :param current: Existing ``session_usage`` dict (mutated in place).
+    :param delta: Increments to apply (same layout as ``session_usage``).
+    """
+    for key, value in delta.items():
+        if key == "by_model":
+            by_model = current.setdefault("by_model", {})
+            for model_id, model_delta in value.items():
+                bucket = by_model.setdefault(model_id, {})
+                for sub_key, sub_value in model_delta.items():
+                    bucket[sub_key] = bucket.get(sub_key, 0) + sub_value
+        else:
+            current[key] = current.get(key, 0) + value
 
 
 class ConversationStore(ABC):
@@ -426,6 +482,7 @@ class ConversationStore(ABC):
         search_query: str | None = None,
         accessible_by: str | None = None,
         include_archived: bool = False,
+        project: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -509,6 +566,12 @@ class ConversationStore(ABC):
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
             groups them). Powers the sidebar's "Show archived" toggle.
+        :param project: When set to a non-empty string, only return
+            sessions that have a ``conversation_labels`` row with
+            ``key="omni_project"`` and ``value=project`` (the sidebar's
+            per-project folder fetch). When set to an empty string
+            ``""``, only return sessions with NO project label (unfiled
+            sessions). ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -645,6 +708,50 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def delete_label(
+        self,
+        conversation_id: str,
+        key: str,
+    ) -> None:
+        """
+        Delete a single label key from a conversation.
+
+        No-op if the label does not exist. Counterpart to
+        :meth:`set_labels` for clearing one key — e.g. removing a
+        session from its sidebar project (deleting the
+        ``omni_project`` label).
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param key: The label key to remove, e.g. ``"omni_project"``.
+        """
+        ...
+
+    @abstractmethod
+    def list_projects(
+        self,
+        accessible_by: str | None = None,
+    ) -> list[str]:
+        """
+        Return all distinct sidebar "project" names, ordered ascending.
+
+        Projects are implicit: a project exists while at least one
+        *non-archived* conversation carries a
+        ``conversation_labels`` row with ``key="omni_project"``
+        naming it. Archived sessions keep their project label, but a
+        project whose every member is archived drops out of this list
+        (so "Delete project" — which archives all members — removes the
+        folder, while unarchiving a member restores it).
+
+        :param accessible_by: When set, restrict to projects on
+            sessions the user has a permission row for (mirrors the
+            ``list_conversations`` ACL filter). ``None`` returns
+            projects across all sessions.
+        :returns: List of project names ordered alphabetically.
+        """
+        ...
+
+    @abstractmethod
     def set_session_state(
         self,
         conversation_id: str,
@@ -686,6 +793,43 @@ class ConversationStore(ABC):
             ``{"input_tokens": 1500, "output_tokens": 350,
             "total_tokens": 1850}``. May carry a nested ``"by_model"``
             sub-dict (per-model token/cost buckets), hence ``Any``.
+        """
+        ...
+
+    @abstractmethod
+    def increment_session_usage(
+        self,
+        conversation_id: str,
+        delta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Atomically apply a usage delta to a conversation's ``session_usage``.
+
+        Reads the current JSON, applies *delta* (adding each key's value to the
+        existing value, with ``by_model`` merged recursively), and writes back —
+        all within a single database transaction. Concurrent writers are
+        serialised via dialect-appropriate locking: ``SELECT FOR UPDATE`` on
+        PostgreSQL / MySQL / MariaDB; ``BEGIN IMMEDIATE`` (write lock before
+        the first read) on SQLite, which avoids ``SQLITE_BUSY_SNAPSHOT`` that
+        a plain deferred ``SELECT``-then-``UPDATE`` would raise under concurrent
+        writers. This prevents the read-modify-write
+        race that caused concurrent relay completions to silently drop each
+        other's cost / token deltas (#9).
+
+        *delta* uses the same key layout as ``session_usage``:
+        - flat numeric keys (``"input_tokens"``, ``"total_cost_usd"``, …) are
+          added to the existing value (``0`` when absent).
+        - ``"by_model"`` is a nested dict ``{model_id: {sub_key: value}}``; each
+          model's sub-keys are added independently, creating the bucket on first
+          use.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param delta: Usage increments to apply, e.g.
+            ``{"input_tokens": 1000, "total_cost_usd": 0.05,
+            "by_model": {"claude-sonnet-4-6": {"input_tokens": 1000,
+            "total_cost_usd": 0.05}}}``.
+        :returns: The updated ``session_usage`` dict after the increment.
         """
         ...
 
@@ -1055,6 +1199,7 @@ class ConversationStore(ABC):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -1098,6 +1243,10 @@ class ConversationStore(ABC):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param model_override: When set, the fork's ``model_override`` is
+            this value instead of the source's copied one — the "restart
+            with model" path. Wins over the ``copy_model_settings`` copy;
+            ``None`` (default) leaves the copy behavior unchanged.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's

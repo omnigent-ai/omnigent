@@ -1,6 +1,6 @@
 """E2E: a pending approval surfaces on the /inbox page and resolves there.
 
-The Inbox page (``ap-web/src/pages/InboxPage.tsx``) gathers every pending
+The Inbox page (``web/src/pages/InboxPage.tsx``) gathers every pending
 ``response.elicitation_request`` across the user's sessions and renders each
 as the same ``ApprovalCard`` the chat uses, with a local submit handler that
 posts the verdict to the owning session. This test raises a gated-push

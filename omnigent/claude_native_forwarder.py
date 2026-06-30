@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_post_delivery import append_dead_letter, post_may_have_been_delivered
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeHookRecord,
@@ -249,6 +249,88 @@ _HOOK_EVENT_TO_STATUS: dict[str, str] = {
 }
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent transcript/usage forwarding (#1120).
+
+    Network trouble (connect timeouts, 503s, resets) makes the forwarder's
+    event posts fail. Transient failures are retried indefinitely and
+    permanent ones are eventually dropped, but either way a sustained
+    outage previously surfaced only as scattered per-item warnings. This
+    tracks consecutive post failures so a real outage escalates to a
+    single loud signal instead of staying effectively silent.
+
+    Unlike the codex forwarder (which counts only its bounded-retry give-ups),
+    the claude forwarder retries transient failures forever, so every failed
+    post is counted here — that is what makes the indicator fire for the
+    503/connect-timeout outages #1120 is about, not just permanent 4xx drops.
+
+    :param consecutive_failures: Post failures since the last success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive post failures, sync is treated as degraded and
+# escalated once to ERROR. Small enough to fire during a real outage, large
+# enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful (or ambiguously-delivered) forward, clearing any
+    degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "claude-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(retry_key: str) -> None:
+    """
+    Record a forward post failure; escalate once when sync degrades.
+
+    :param retry_key: Stable retry key of the failed post, e.g.
+        ``"item:source-1"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "claude-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest key=%s)",
+            _forward_health.consecutive_failures,
+            retry_key,
+        )
+        _forward_health.degraded_logged = True
 
 
 @dataclass(frozen=True)
@@ -550,6 +632,9 @@ class _PostRetryTracker:
         :returns: None.
         """
         self._entries.pop(key, None)
+        # A cleared key means the post got through (or was ambiguously
+        # delivered); reset process-level forward-sync health (#1120).
+        _note_forward_success()
 
     def record_failure(self, key: str, exc: httpx.HTTPError) -> _PostRetryDecision:
         """
@@ -559,6 +644,9 @@ class _PostRetryTracker:
         :param exc: HTTP exception raised while posting the event.
         :returns: Retry decision for this failure.
         """
+        # Count every failed post (transient or permanent) so a sustained
+        # outage escalates once to a degraded-sync signal (#1120).
+        _note_forward_failure(key)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
@@ -688,6 +776,22 @@ async def forward_claude_transcript_to_session(
                     state=hook_state,
                 )
                 if rotation is not None:
+                    # Tell the superseded (old) conversation it was cleared:
+                    # persist a notice linking to the rotated-to session and
+                    # emit a live redirect event. Use the loop's ``session_id``
+                    # (the session being forwarded BEFORE this poll), NOT
+                    # ``current_session_id``: when the hook rotated the bridge's
+                    # active session synchronously, ``current_session_id`` already
+                    # reads the NEW id, whereas ``session_id`` is not reassigned
+                    # to ``rotation`` until below. The call is fully best-effort
+                    # (swallows its own errors) so the state reset below always
+                    # runs.
+                    await _post_clear_supersession(
+                        client,
+                        old_session_id=session_id,
+                        new_session_id=rotation,
+                        agent_name=agent_name,
+                    )
                     session_id = rotation
                     state = None
                     hook_state = None
@@ -1176,6 +1280,24 @@ async def _forward_available_subagents(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
+                # Dead-letter the dropped payload for recovery (#1120; replay #1579).
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=parent_session_id,
+                    event_type="external_subagent_start",
+                    payload={
+                        "subagent_id": subagent_id,
+                        "agent_type": meta["agentType"],
+                        "description": meta["description"],
+                        "tool_use_id": meta["toolUseId"],
+                    },
+                    reason="permanent HTTP failure after retries",
+                    # Claude only dead-letters permanent 4xx (it retries
+                    # transient failures forever), so the server proved it
+                    # rejected the item: never ambiguous, never replayable (#1579).
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
+                )
                 # Park this sub-agent: insert a sentinel entry so we
                 # don't keep retrying. ``child_conversation_id=""``
                 # is filtered out by the tail / status loops below.
@@ -1271,6 +1393,23 @@ async def _forward_available_subagents(
                         item.source_id,
                         decision.attempts,
                         _http_status_for_log(exc),
+                    )
+                    # Dead-letter the dropped item for recovery (#1120; replay #1579).
+                    append_dead_letter(
+                        bridge_dir,
+                        session_id=entry.child_conversation_id,
+                        event_type="external_conversation_item",
+                        payload={
+                            "item_type": item.item_type,
+                            "item_data": item.data,
+                            "response_id": item.response_id,
+                        },
+                        reason="permanent HTTP failure after retries",
+                        # Claude only dead-letters permanent 4xx (it retries
+                        # transient failures forever), so the server proved it
+                        # rejected the item: never ambiguous, never replayable (#1579).
+                        delivered_ambiguous=False,
+                        http_status=_http_status_for_log(exc),
                     )
                     # Skip this item and continue — alternative is to
                     # block the whole sub-agent forever on one poison
@@ -1818,10 +1957,9 @@ async def _maybe_rotate_session_on_clear(
         ``"conv_old"``.
     :param bridge_dir: Native Claude bridge directory.
     :param state: Current hook cursor state.
-    :returns: New active session id when rotation occurred, otherwise
-        ``None``.
-    :raises httpx.HTTPError: If Omnigent rejects the create, bind, transfer,
-        or old-session clear calls.
+    :returns: New active session id when rotation succeeded, otherwise
+        ``None`` (no clear pending, or the rotation failed and was consumed
+        to avoid a re-rotation loop).
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     clear_record = next(
@@ -1835,14 +1973,13 @@ async def _maybe_rotate_session_on_clear(
     if clear_record is None:
         return None
 
-    if clear_record.clear_rotated_to:
-        new_session_id = clear_record.clear_rotated_to
-    else:
-        new_session_id = await _create_clear_replacement_session(
-            client=client,
-            old_session_id=session_id,
-            bridge_dir=bridge_dir,
-        )
+    # Consume this clear hook EXACTLY ONCE. If the rotation raises partway
+    # (e.g. the terminal transfer returns 400 because the target already owns a
+    # terminal), we must still advance the cursor: otherwise the forwarder's
+    # next poll re-reads the same clear record and re-rotates — creating a fresh
+    # replacement session every poll, unbounded. A single /clear rotates at most
+    # once; a failed rotation is logged and skipped (the old session simply
+    # keeps running) rather than retried forever.
     durable = HookForwardState(
         event_cursor=clear_record.event_cursor,
         byte_offset=clear_record.byte_offset,
@@ -1851,6 +1988,24 @@ async def _maybe_rotate_session_on_clear(
             clear_record.byte_offset,
         ),
     )
+    new_session_id: str | None = None
+    try:
+        if clear_record.clear_rotated_to:
+            new_session_id = clear_record.clear_rotated_to
+        else:
+            new_session_id = await _create_clear_replacement_session(
+                client=client,
+                old_session_id=session_id,
+                bridge_dir=bridge_dir,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.exception(
+            "Claude /clear rotation failed; consuming the clear hook to avoid a "
+            "re-rotation loop. old_session=%s",
+            session_id,
+        )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
     return new_session_id
@@ -1950,7 +2105,20 @@ async def _create_clear_replacement_session(
     write_active_session_id(bridge_dir, new_session_id)
     clear_resp = await client.patch(
         f"/v1/sessions/{url_component(old_session_id)}",
-        json={"runner_id": ""},
+        json={
+            "runner_id": "",
+            # Re-key the superseded session onto a DISTINCT "-cleared" bridge id.
+            # The new session keeps the original bridge id (set above) and owns
+            # the live terminal/pane in D(original); the old session must NOT
+            # share that dir, or resuming it (host wake-on-message /
+            # ``omnigent claude --resume``) would put a second forwarder on the
+            # live transcript (duplicate items) and trip the executor's
+            # "no longer active after /clear" guard. ``_auto_create_claude_terminal``
+            # recognises this exact marker and cold-resumes the old session in
+            # its own isolated D("{id}-cleared"); the executor spawn_env resolves
+            # the same label, so both agree.
+            "labels": {BRIDGE_ID_LABEL_KEY: f"{old_session_id}-cleared"},
+        },
     )
     if clear_resp.status_code >= 400:
         _logger.warning(
@@ -1984,24 +2152,20 @@ async def _maybe_rotate_session_on_fork(
         ``"conv_old"``.
     :param bridge_dir: Native Claude bridge directory.
     :param state: Current hook cursor state.
-    :returns: New active session id when fork rotation occurred,
-        otherwise ``None``.
-    :raises httpx.HTTPError: If Omnigent rejects the fork, bind, transfer,
-        or old-session clear calls.
+    :returns: New active session id when fork rotation succeeded, otherwise
+        ``None`` (no fork pending, or the rotation failed and was consumed to
+        avoid a re-rotation loop).
     """
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     fork_record = next((record for record in result.records if _is_fork_hook_record(record)), None)
     if fork_record is None:
         return None
 
-    if fork_record.fork_rotated_to:
-        new_session_id = fork_record.fork_rotated_to
-    else:
-        new_session_id = await _create_fork_replacement_session(
-            client=client,
-            old_session_id=session_id,
-            bridge_dir=bridge_dir,
-        )
+    # Consume this fork hook EXACTLY ONCE — see the matching guard in
+    # _maybe_rotate_session_on_clear. A rotation that raises partway (e.g. a
+    # terminal-transfer 400) must still advance the cursor so the next poll does
+    # not re-read the same fork record and create another replacement session
+    # without bound.
     durable = HookForwardState(
         event_cursor=fork_record.event_cursor,
         byte_offset=fork_record.byte_offset,
@@ -2010,6 +2174,24 @@ async def _maybe_rotate_session_on_fork(
             fork_record.byte_offset,
         ),
     )
+    new_session_id: str | None = None
+    try:
+        if fork_record.fork_rotated_to:
+            new_session_id = fork_record.fork_rotated_to
+        else:
+            new_session_id = await _create_fork_replacement_session(
+                client=client,
+                old_session_id=session_id,
+                bridge_dir=bridge_dir,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.exception(
+            "Claude /fork rotation failed; consuming the fork hook to avoid a "
+            "re-rotation loop. old_session=%s",
+            session_id,
+        )
     await _write_hook_state_async(bridge_dir, durable)
     await _seed_fork_transcript_forward_state(
         bridge_dir=bridge_dir,
@@ -2706,6 +2888,23 @@ async def _forward_available_items(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
+                # Dead-letter the dropped item for recovery (#1120; replay #1579).
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=session_id,
+                    event_type="external_conversation_item",
+                    payload={
+                        "item_type": item.item_type,
+                        "item_data": item.data,
+                        "response_id": item.response_id,
+                    },
+                    reason="permanent HTTP failure after retries",
+                    # Claude only dead-letters permanent 4xx (it retries
+                    # transient failures forever), so the server proved it
+                    # rejected the item: never ambiguous, never replayable (#1579).
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
+                )
                 await _post_forwarder_failed_status(
                     client,
                     session_id=session_id,
@@ -3035,6 +3234,109 @@ def _validated_transcript_state(
         cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, end_offset),
         seen_source_ids=state.seen_source_ids,
     )
+
+
+async def _post_clear_supersession(
+    client: httpx.AsyncClient,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    agent_name: str,
+) -> None:
+    """
+    Notify the superseded session that a ``/clear`` rotated it away.
+
+    Posts three best-effort events to the OLD conversation, in order:
+
+    1. An ``external_session_status: idle`` so the old conversation's
+       "Working…" spinner stops — its terminal moved to the new session,
+       so it will never receive the turn-end edge that would normally
+       clear it.
+    2. A persisted assistant ``message`` item linking to the new
+       conversation, so a later reload of the cleared conversation
+       explains what happened and offers the continuation link. This is
+       the durable record — it survives reconnects.
+    3. A transient ``external_session_superseded`` event the server
+       republishes as ``session.superseded``, so a client *actively*
+       viewing the old conversation auto-redirects to the new one.
+
+    Each failure is logged and swallowed: the rotation has already
+    completed and reset forwarder state, and a notification error must
+    not disrupt the poll loop or stop the new session from forwarding.
+
+    :param client: Omnigent HTTP client (``base_url`` = AP server).
+    :param old_session_id: Superseded conversation id, e.g. ``"conv_old"``.
+    :param new_session_id: Rotated-to conversation id, e.g. ``"conv_new"``.
+    :param agent_name: Agent name to stamp on the notice message — an
+        assistant ``message`` item requires one.
+    :returns: None.
+    """
+    if old_session_id == new_session_id:
+        # Defensive: never address the notice/redirect at the live session.
+        # The caller resolves the old id from the pre-rotation forwarder
+        # state, but if that ever collapses to the new id, posting here
+        # would dump the "you were cleared" banner onto the active chat.
+        return
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle"},
+            },
+        )
+        status_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+    notice = (
+        "This conversation was ended by `/clear`. "
+        f"Continue in [the new chat](/c/{new_session_id}). "
+        "You can also send a message here to resume this conversation."
+    )
+    try:
+        item_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": agent_name,
+                        "content": [{"type": "output_text", "text": notice}],
+                    },
+                },
+            },
+        )
+        item_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession notice; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
+    try:
+        event_resp = await client.post(
+            f"/v1/sessions/{url_component(old_session_id)}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": new_session_id},
+            },
+        )
+        event_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
 
 
 async def _post_external_conversation_item(
@@ -3374,6 +3676,7 @@ async def _post_external_session_status(
     *,
     session_id: str,
     status: str,
+    output: str | None = None,
 ) -> None:
     """
     Post one ``external_session_status`` event to the Sessions API.
@@ -3382,14 +3685,21 @@ async def _post_external_session_status(
     :param session_id: Omnigent session/conversation id.
     :param status: Session status value, e.g. ``"idle"`` or
         ``"failed"``.
+    :param output: Optional text attached to the event ``data``. On a
+        ``"failed"`` edge the server surfaces it as the session's failure
+        reason (``last_task_error``) so the UI renders a detail instead of
+        a bare "failed" (#1113). Ignored when falsy.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, Any] = {"status": status}
+    if output:
+        data["output"] = output
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": status},
+            "data": data,
         },
     )
     resp.raise_for_status()
@@ -3596,7 +3906,9 @@ async def _post_forwarder_failed_status(
     :returns: None.
     """
     try:
-        await _post_external_session_status(client, session_id=session_id, status="failed")
+        await _post_external_session_status(
+            client, session_id=session_id, status="failed", output=reason
+        )
     except httpx.HTTPError:
         _logger.warning(
             "Failed to publish Claude forwarder failure status; "

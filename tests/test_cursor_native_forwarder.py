@@ -16,11 +16,13 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
 from omnigent import cursor_native_forwarder as fwd
+from omnigent.cursor_native_forwarder import _persist_native_compaction_item
 
 # Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
 # persist side (forwarder) and the resume side (runner's strict
@@ -1187,3 +1189,67 @@ class TestCompactionCompletedForwarding:
         # cursor advanced past both — no wedge, no infinite re-post.
         assert [it.rowid for it in poster.delivered] == [2]
         assert fwd._read_state(bridge).last_rowid == 2
+
+
+# ---------------------------------------------------------------------------
+# _persist_native_compaction_item
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_native_compaction_item_posts_compaction_event() -> None:
+    """Compaction event is posted with last_item_id and compacted_messages."""
+    client = MagicMock()
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_789"}]}
+    get_resp.raise_for_status = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    fake_rows = [
+        (1, "b1", '{"role":"user","content":[{"type":"text","text":"hello"}]}'),
+        (2, "b2", '{"role":"assistant","content":[{"type":"text","text":"hi back"}]}'),
+    ]
+
+    with patch.object(fwd, "_read_blob_rows", return_value=fake_rows):
+        await _persist_native_compaction_item(
+            client, session_id="conv_cursor", store_path=Path("/fake")
+        )
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_789"
+    assert len(body["data"]["compacted_messages"]) == 2
+    assert body["data"]["compacted_messages"][0]["role"] == "user"
+    assert body["data"]["compacted_messages"][1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_persist_native_compaction_item_no_store_skips_messages() -> None:
+    """When the store can't be read, POST has no compacted_messages key."""
+    client = MagicMock()
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_abc"}]}
+    get_resp.raise_for_status = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    with patch.object(fwd, "_read_blob_rows", side_effect=sqlite3.Error("no db")):
+        await _persist_native_compaction_item(
+            client, session_id="conv_cursor", store_path=Path("/fake")
+        )
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_abc"
+    assert "compacted_messages" not in body["data"]

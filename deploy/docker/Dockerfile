@@ -58,10 +58,10 @@ ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=20
 
 # ── Web UI builder ──────────────────────────────────────
-# Builds the ap-web SPA so `docker build` works from a clean checkout —
-# no separate `cd ap-web && npm run build` step, no "SPA bundle missing"
+# Builds the web SPA so `docker build` works from a clean checkout —
+# no separate `cd web && npm run build` step, no "SPA bundle missing"
 # hard-fail. vite.config emits to ../omnigent/server/static/web-ui
-# (relative to ap-web/), so from /web/ap-web the bundle lands at
+# (relative to web/), so from /web/web the bundle lands at
 # /web/omnigent/server/static/web-ui, which the server builder overlays.
 # Server-only: the host target never reaches this stage.
 #
@@ -70,11 +70,11 @@ ARG NODE_VERSION=20
 FROM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
-WORKDIR /web/ap-web
+WORKDIR /web/web
 # Manifests first so the install layer caches across pure source edits.
-COPY ap-web/package.json ap-web/package-lock.json ./
+COPY web/package.json web/package-lock.json ./
 RUN npm install --no-audit --no-fund
-COPY ap-web/ ./
+COPY web/ ./
 RUN npm run build
 
 # ── Python builder (shared: server + host) ──────────────
@@ -139,7 +139,7 @@ ARG PYPI_INDEX_URL=https://pypi.org/simple
 # complete image. This replaces the old "prebuild or hard-fail" check.
 COPY --from=web-builder /web/omnigent/server/static/web-ui ./omnigent/server/static/web-ui
 RUN test -f ./omnigent/server/static/web-ui/index.html \
-    || (echo "ERROR: SPA bundle missing after web-builder stage — check the ap-web build." && exit 1)
+    || (echo "ERROR: SPA bundle missing after web-builder stage — check the web build." && exit 1)
 
 # psycopg[binary] is not a baseline dep — pulled in by the
 # [databricks] extra in pyproject — so add it explicitly here.
@@ -246,48 +246,87 @@ RUN npm install -g --no-audit --no-fund \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
 
-# Kiro CLI is not published as an npm package; use its official installer and
-# copy the resulting root-local binaries onto the global PATH for all sandbox
-# users.
-RUN curl -fsSL https://cli.kiro.dev/install | bash \
- && install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
- && if [ -f /root/.local/bin/kiro-cli-chat ]; then \
+# Kiro CLI is not published as an npm package, and its installer has NO version
+# flag — `curl …/install | bash` always fetches `latest`, so the image was
+# non-deterministic. The kiro-native harness is behaviorally coupled to a
+# specific kiro-cli build (Escape-interrupt leaves an empty composer, the
+# bracketed-paste multi-line path, the session-JSONL layout — all verified
+# against 2.10.0; grep `kiro-cli 2.10.0`). So pin it the same way as `agy` below:
+# fetch the immutable per-arch zip from the versioned CDN path and verify its
+# sha256, run the package's own (network-free) install.sh, then copy the binaries
+# onto a system PATH dir every sandbox user shares. A trailing `kiro-cli
+# --version` check asserts the unpacked binary really is the pinned version — a
+# cheap sanity guard atop the sha256. To adopt a new kiro-cli: re-verify the
+# coupled behavior, then bump KIRO_CLI_VERSION + both
+# SHA256s (the `sha256` fields in
+# https://prod.download.cli.kiro.dev/stable/latest/manifest.json). Keep in sync
+# with deploy/docker/Dockerfile.ubi.
+ARG KIRO_CLI_VERSION=2.10.0
+ARG KIRO_CLI_SHA256_AMD64=be9d8b6d7c44f93a83ca22466043d98ad058e6ed3c12fffd068f3fb8a60b3b70
+ARG KIRO_CLI_SHA256_ARM64=0afb37399b9e2847c2f2e3f5d9052c8bc52bbf1e30401ea284a602661bce34bc
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64)  asset="kirocli-x86_64-linux.zip";  sha="$KIRO_CLI_SHA256_AMD64" ;; \
+      aarch64) asset="kirocli-aarch64-linux.zip"; sha="$KIRO_CLI_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$(uname -m)' for kiro-cli" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/kiro.zip" | sha256sum -c -; \
+    unzip -q /tmp/kiro.zip -d /tmp/kiro; \
+    KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
+    install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli; \
+    if [ -f /root/.local/bin/kiro-cli-chat ]; then \
       install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
-    fi
+    fi; \
+    rm -rf /tmp/kiro /tmp/kiro.zip; \
+    installed="$(/usr/local/bin/kiro-cli --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
+      echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
+    echo "kiro-cli ${KIRO_CLI_VERSION} pinned (sha256 verified)"
 # Antigravity CLI (`agy`) — the antigravity-native harness shells out to `agy`
 # on the host, launching it in a tmux pane (see omnigent/antigravity_native*.py),
 # so a managed host image must carry it. It is NOT an npm package
 # (harness_install.py lists agy as a non-npm, installer-script harness), so it
-# can't join the `npm install -g` set above: the official bootstrapper fetches
-# the platform-native binary. The bootstrapper's ``--dir`` flag is a no-op in
-# agy 1.0.10 (it always installs to ``$HOME/.local/bin`` regardless — verified),
-# and that dir is NOT on the venv PATH and is per-user (root's, not the uid-1000
-# runtime user's). So install to the default, then move the single self-contained
-# binary onto a system PATH dir every user shares. ``test -x`` fails the build
-# loudly if the layout ever changes again.
+# can't join the `npm install -g` set above. The tarball holds a single
+# self-contained ``antigravity`` binary; install it as ``agy`` on a system PATH
+# dir every user shares (its bootstrapper default ~/.local/bin is per-user and
+# off the venv PATH). ``test -x`` fails the build loudly if the layout changes.
 #
-# Version pin: the native harness is behaviorally coupled to a specific agy build
-# (its out-of-order transcript writes, connect-RPC quirks, and TUI injection are
-# all verified against 1.0.10 — grep ``agy 1.0.10`` under omnigent/antigravity_native*).
-# The official bootstrapper has NO version flag — it always fetches the LATEST
-# build from its auto-updater manifest (verified: only ``-d/--dir`` and ``-h`` are
-# accepted; it does SHA512-verify the payload, but only against that latest-pointing
-# manifest). So the DOWNLOAD itself cannot be pinned here. Instead we pin the
-# ACCEPTED version and FAIL THE BUILD if the installer served a different one —
-# turning a future silent harness break (a newer agy whose behavior diverged) into
-# a visible, conscious bump. To adopt a new agy: re-verify the coupled behavior,
-# then bump AGY_EXPECTED_VERSION (override at build with --build-arg if needed).
-ARG AGY_EXPECTED_VERSION=1.0.10
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
- && install -m 0755 "${HOME:-/root}/.local/bin/agy" /usr/local/bin/agy \
- && test -x /usr/local/bin/agy \
- && installed_agy_version="$(/usr/local/bin/agy --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)" \
- && if [ "$installed_agy_version" != "$AGY_EXPECTED_VERSION" ]; then \
-      echo "ERROR: agy installer served version '${installed_agy_version:-<unparseable>}', but the native harness is pinned to '$AGY_EXPECTED_VERSION'." >&2; \
-      echo "       The bootstrapper has no version flag (always latest). Re-verify the harness against the new agy, then bump AGY_EXPECTED_VERSION." >&2; \
+# Version + integrity pin: the native harness is behaviorally coupled to a
+# specific agy build (out-of-order transcript writes, connect-RPC quirks, and TUI
+# injection are all verified against 1.0.10 — grep ``agy 1.0.10`` under
+# omnigent/antigravity_native*). The official ``install.sh`` bootstrapper has NO
+# version flag — it always fetches the LATEST build from an auto-updater manifest
+# and old builds are not retained at any stable, reconstructable URL — so it
+# cannot pin anything. Instead we fetch the exact, immutable per-arch release
+# asset from GitHub and verify its SHA256: this both holds the verified version
+# AND fails the build if the bytes ever change underneath us, which is the actual
+# supply-chain control (a version-string check alone is not). To adopt a new agy:
+# re-verify the coupled behavior, then bump AGY_VERSION and both SHA256s (from
+# https://github.com/google-antigravity/antigravity-cli/releases).
+ARG AGY_VERSION=1.0.10
+ARG AGY_SHA256_AMD64=6547cf9a37227f26004fa4b805418b1df96f54c57b9723ca7d10864d2610bb0f
+ARG AGY_SHA256_ARM64=4674fabc3681221e54c90d15077c9a97a25ea71222001dabe44bf1576e888593
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="agy_cli_linux_x64.tar.gz"; sha="$AGY_SHA256_AMD64" ;; \
+      arm64) asset="agy_cli_linux_arm64.tar.gz"; sha="$AGY_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$arch' for agy" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${asset}"; \
+    curl -fsSL -o /tmp/agy.tar.gz "$url"; \
+    echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/agy.tar.gz -C /tmp antigravity; \
+    install -m 0755 /tmp/antigravity /usr/local/bin/agy; \
+    rm -f /tmp/agy.tar.gz /tmp/antigravity; \
+    test -x /usr/local/bin/agy; \
+    installed="$(/usr/local/bin/agy --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    if [ "$installed" != "$AGY_VERSION" ]; then \
+      echo "ERROR: agy reports '${installed:-<unparseable>}', expected '$AGY_VERSION'." >&2; \
       exit 1; \
-    fi \
- && echo "agy ${AGY_EXPECTED_VERSION} pinned and verified"
+    fi; \
+    echo "agy ${AGY_VERSION} pinned (sha256 verified)"
 
 # Preserve /build/ — the venv's editable install .pth files reference
 # /build/omnigent and /build/sdks/* by absolute path. Copying these to

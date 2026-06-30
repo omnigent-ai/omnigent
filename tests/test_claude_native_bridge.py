@@ -3592,6 +3592,61 @@ async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
 
 
 @pytest.mark.asyncio
+async def test_start_tool_relay_accepts_opencode_native_bridge_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Relay startup accepts OpenCode-native's persistent bridge root.
+
+    opencode-native reuses the Claude MCP relay but stores bridge files in
+    ``~/.omnigent/opencode-native`` (the same ``$HOME/.omnigent/<harness>``
+    shape codex/antigravity use). The missing allowlist entry made ``serve-mcp``
+    crash on startup (``_ensure_secure_dir`` → "not under an allowed bridge
+    root"), which opencode surfaced as ``MCP error -32000: Connection closed``
+    and the wrapped opencode got no ``sys_*`` tools. Guards the regression.
+
+    :param tmp_path: Pytest temp directory used as an isolated user state parent.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent import opencode_native_bridge
+
+    opencode_root = tmp_path / ".omnigent" / "opencode-native"
+    monkeypatch.setattr("omnigent.opencode_native_bridge._BRIDGE_ROOT", opencode_root)
+    bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+
+    async def _executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        """Return an empty result for the unused relay tool callback."""
+        del name, arguments
+        return {}
+
+    relay = None
+    try:
+        relay = start_tool_relay(
+            bridge_dir=bridge_dir,
+            tools=[
+                {
+                    "name": "sys_session_list",
+                    "description": "List Omnigent sessions.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_executor=_executor,
+            loop=asyncio.get_running_loop(),
+        )
+        assert relay_file.exists(), (
+            "OpenCode-native relay did not write tool_relay.json under the persistent bridge root"
+        )
+        relay_info = json.loads(relay_file.read_text(encoding="utf-8"))
+        assert relay_info["tools"][0]["name"] == "sys_session_list"
+    finally:
+        if relay is not None:
+            relay.close()
+
+
+@pytest.mark.asyncio
 async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3716,7 +3771,7 @@ def test_usage_from_transcript_entry_sums_context_tokens() -> None:
     """
     Context-token count must sum the three input-side fields.
 
-    The "context tokens" exposed to ap-web's input-composer ring is
+    The "context tokens" exposed to web's input-composer ring is
     ``input_tokens + cache_creation_input_tokens +
     cache_read_input_tokens``. ``output_tokens`` is generated within
     the same call and does NOT count toward the next prompt's size,
@@ -4631,6 +4686,45 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     assert captured["kwargs"]["stdin"] == subprocess.DEVNULL
     assert captured["kwargs"]["stdout"] == subprocess.DEVNULL
     assert captured["kwargs"]["stderr"] == subprocess.DEVNULL
+
+
+def test_display_cost_approval_popup_honors_config_file_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``config_file`` override is forwarded instead of permission_hook.json.
+
+    The runner passes a freshly-minted AP-routing snapshot here so a cost gate
+    firing late in a session reads a live bearer, not the stale launch token in
+    permission_hook.json. Without honoring the override the verdict POST would
+    401 and silently lose the approval.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/x.sock", "tmux_target": "claude:0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: ["/dev/pts/9"])
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda args, **kwargs: captured.setdefault("args", args)
+    )
+    fresh = bridge_dir / "cost_popup.json"
+
+    display_cost_approval_popup(
+        bridge_dir,
+        session_id="conv_abc123",
+        elicitation_id="elicit_deadbeef",
+        message="continue?",
+        timeout_s=1.0,
+        config_file=fresh,
+    )
+
+    inner = shlex.split(captured["args"][-1])
+    cfg = inner[inner.index("--config-file") + 1]
+    assert cfg == str(fresh)
+    assert not cfg.endswith("permission_hook.json")
 
 
 def test_display_cost_approval_popup_skips_when_no_client_attached(

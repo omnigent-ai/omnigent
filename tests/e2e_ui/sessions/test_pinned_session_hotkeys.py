@@ -6,7 +6,7 @@ pinned sessions in render order — 1–9 to the first nine, 0 to the tenth
 reserves ``Cmd/Ctrl+digit`` for native tab-switching, so the hook is inert
 outside the Electron shell (gated on ``isNativeShell()`` ->
 ``window.omnigentDesktop.kind === "electron"`` — see
-``ap-web/src/lib/nativeBridge.ts``).
+``web/src/lib/nativeBridge.ts``).
 
 The e2e_ui harness runs the SPA in a plain Chromium browser, not Electron,
 so by default ``isNativeShell()`` is false and this behavior can't fire. To
@@ -74,7 +74,7 @@ def _section(page: Page, title: str) -> Locator:
 
     Each ``ConversationSection`` renders an ``<h2>`` with a collapse button
     whose accessible name is the section title (e.g. "Pinned"). Scoping
-    lookups to the matching section keeps them off the "Recent" rows.
+    lookups to the matching section keeps them off the "Chats" rows.
 
     :param page: Playwright page with the sidebar open.
     :param title: Section header text, e.g. ``"Pinned"``.

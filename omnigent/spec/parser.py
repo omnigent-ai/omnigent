@@ -2229,6 +2229,17 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
+        # Optional per-server tool allow-list (the YAML ``tools:`` whitelist) —
+        # only these tool names are exposed to the model; ``None`` exposes all.
+        # Mirrors ``MCPTool.tools`` and is filtered downstream in
+        # server/mcp_pool.py + runner/mcp_manager.py.
+        raw_allow = val.get("tools")
+        if raw_allow is not None and not isinstance(raw_allow, list):
+            raise OmnigentError(
+                f"Inline MCP server {name!r} 'tools' must be a list of tool names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        tool_allowlist = [str(t) for t in raw_allow] if raw_allow else None
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2243,6 +2254,7 @@ def _parse_inline_mcp_servers(
                 headers=headers,
                 env=env,
                 databricks_profile=databricks_profile,
+                tools=tool_allowlist,
             )
         )
     return servers

@@ -33,6 +33,19 @@ def test_stored_providers_reads_auth_json_keys(tmp_path: Path) -> None:
     assert set(oc._stored_providers()) == {"anthropic", "openai"}
 
 
+def test_stored_providers_ignores_empty_entries(tmp_path: Path) -> None:
+    """An empty provider object is config shape, not a usable stored credential."""
+    _write_auth(
+        tmp_path,
+        {
+            "anthropic": {"type": "api", "key": "x"},
+            "openai": {},
+            "groq": "",
+        },
+    )
+    assert oc._stored_providers() == ("anthropic",)
+
+
 def test_stored_providers_empty_when_missing_or_invalid(tmp_path: Path) -> None:
     assert oc._stored_providers() == ()  # no file
     oc.opencode_auth_path().parent.mkdir(parents=True, exist_ok=True)

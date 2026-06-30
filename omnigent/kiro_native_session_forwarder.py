@@ -106,18 +106,66 @@ def _same_workspace(left: object, right: str) -> bool:
         return left == right
 
 
+# Competing-candidate sets already warned about, so the ambiguous branch logs
+# once per distinct collision instead of every poll tick for the session's life.
+# ponytail: grows by one entry per distinct concurrent collision — too rare to
+# bound; add a cap only if a pathological churn ever shows up.
+_ambiguous_discovery_warned: set[frozenset[str]] = set()
+
+
+def _warn_ambiguous_discovery(workspace: str, session_ids: list[str]) -> None:
+    """Warn once per distinct set of competing same-workspace Kiro sessions.
+
+    Discovery returns ``None`` for both "no candidate yet" (transient) and ">=2
+    candidates" (won't ever bind until one goes away). This makes the latter
+    diagnosable without flooding logs on every ~0.7s poll.
+    """
+    key = frozenset(session_ids)
+    if key in _ambiguous_discovery_warned:
+        return
+    _ambiguous_discovery_warned.add(key)
+    _logger.warning(
+        "kiro session discovery ambiguous; %d same-workspace sessions above the "
+        "launch floor, binding none to avoid cross-talk; workspace=%s sessions=%s",
+        len(session_ids),
+        workspace,
+        sorted(session_ids),
+    )
+
+
 def _discover_kiro_session_jsonl(
     *,
     workspace: str,
     launch_epoch_ms: int,
     sessions_dir: Path | None = None,
 ) -> tuple[str, Path] | None:
-    """Find this Omnigent session's Kiro JSONL file."""
+    """Find this Omnigent session's Kiro JSONL file — only when it's unambiguous.
+
+    Candidates are Kiro sessions in the same workspace (``cwd``) with a parseable
+    ``created_at`` at/after the launch floor (``launch_epoch_ms`` minus a small
+    skew, which already drops pre-existing sessions). We bind **only when exactly
+    one** session qualifies.
+
+    Each Kiro session is its own JSONL keyed by Kiro's minted id, so two fresh
+    sessions launched in the same workspace within the skew window both qualify.
+    Picking newest-by-``updated_at`` (the old behaviour) would latch onto
+    whichever session most recently emitted a turn — i.e. it can bind the *other*
+    session's transcript and silently cross-talk it into this conversation. With
+    two or more candidates we can't tell which JSONL is ours, so we return
+    ``None`` and retry rather than guess (logged once via
+    :func:`_warn_ambiguous_discovery` so the ambiguous case is distinct from "not
+    written yet"). A brief delay is safe; mirroring the wrong conversation is not.
+    Mirrors cursor-native's "bind only when exactly one chat qualifies"
+    (:func:`omnigent.cursor_native_forwarder._discover_store`).
+
+    The resume/fork path doesn't reach here: when the Kiro id is already known the
+    caller binds it directly via :func:`_kiro_session_jsonl_for_id`.
+    """
     root = sessions_dir or _kiro_cli_sessions_dir()
     if not root.is_dir():
         return None
     floor_ms = max(0, launch_epoch_ms - _DISCOVERY_SKEW_MS)
-    best: tuple[int, str, Path] | None = None
+    candidates: list[tuple[str, Path]] = []
     for metadata_path in root.glob("*.json"):
         session_id = metadata_path.stem
         jsonl_path = root / f"{session_id}.jsonl"
@@ -130,15 +178,17 @@ def _discover_kiro_session_jsonl(
         if not isinstance(metadata, dict) or not _same_workspace(metadata.get("cwd"), workspace):
             continue
         created_ms = _parse_iso_epoch_ms(metadata.get("created_at"))
-        updated_ms = _parse_iso_epoch_ms(metadata.get("updated_at"))
-        if created_ms and created_ms < floor_ms:
+        # Require a parseable created_at at/after the floor. A fresh session always
+        # stamps created_at, so a missing/garbled one can't be confirmed in-window;
+        # dropping it stops an undateable straggler from poisoning the "exactly one"
+        # count and silently blocking discovery forever.
+        if not created_ms or created_ms < floor_ms:
             continue
-        sort_ms = updated_ms or created_ms
-        if best is None or sort_ms > best[0]:
-            best = (sort_ms, session_id, jsonl_path)
-    if best is None:
+        candidates.append((session_id, jsonl_path))
+    if len(candidates) > 1:
+        _warn_ambiguous_discovery(workspace, [session_id for session_id, _ in candidates])
         return None
-    return best[1], best[2]
+    return candidates[0] if candidates else None
 
 
 def _kiro_session_jsonl_for_id(
@@ -270,24 +320,6 @@ async def _post_conversation_message(
     resp.raise_for_status()
 
 
-async def _post_session_status(
-    client: httpx.AsyncClient,
-    *,
-    session_id: str,
-    status: str,
-    response_id: str | None = None,
-) -> None:
-    """POST one Kiro turn-status edge as an external session status."""
-    data: dict[str, str] = {"status": status}
-    if response_id is not None:
-        data["response_id"] = response_id
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": data},
-    )
-    resp.raise_for_status()
-
-
 async def _patch_external_session_id(
     client: httpx.AsyncClient,
     *,
@@ -371,25 +403,19 @@ async def forward_kiro_session_to_omnigent(
                         state.byte_offset,
                     )
                     for message in messages:
+                        # Mirror the transcript only. Running/idle status for
+                        # kiro-native is owned by the PTY watcher's ``emit_status``
+                        # (``runner/resource_registry.py``), matching the other
+                        # forwarder-backed native harnesses (goose/qwen/hermes),
+                        # whose forwarders mirror the transcript, not the
+                        # running/idle session status. Posting status here too
+                        # double-sourced it (#1137).
                         await _post_conversation_message(
                             client,
                             session_id=session_id,
                             agent_name=agent_name,
                             message=message,
                         )
-                        if message.role == "user":
-                            await _post_session_status(
-                                client,
-                                session_id=session_id,
-                                status="running",
-                            )
-                        elif message.role == "assistant":
-                            await _post_session_status(
-                                client,
-                                session_id=session_id,
-                                status="idle",
-                                response_id=f"kiro:{message.message_id}",
-                            )
                     if byte_offset != state.byte_offset:
                         state.byte_offset = byte_offset
                         _write_state(bridge_dir, state)
