@@ -4579,6 +4579,42 @@ def _is_codex_native_subagent(conv: Conversation) -> bool:
     )
 
 
+def _subagent_delivery_status(
+    status: str,
+    background_task_count: int | None,
+    conv: Conversation,
+) -> str:
+    """Collapse a sub-agent's background-task ``waiting`` back to ``idle``.
+
+    A claude-native session running as an Omnigent sub-agent relabels its
+    ``Stop`` turn-end ``idle`` to ``waiting`` (in the forwarder) when
+    background shells linger, purely so its own UI shows a spinner. But the
+    sub-agent terminal-delivery branch in ``post_event`` keys off
+    ``idle``/``failed``: a ``waiting`` edge would never deliver the child's
+    result to the parent, hanging the orchestrator with no follow-up ``Stop``
+    to recover. The ``background_task_count`` alone already drives the child's
+    spinner at ``idle`` (the in-chat indicator and the sidebar rollup both
+    treat a positive tally as working), so for a sub-agent the turn genuinely
+    ended — deliver ``idle``. Top-level sessions are returned unchanged so the
+    web UI keeps its ``waiting`` shimmer.
+
+    :param status: The incoming external status, e.g. ``"waiting"``.
+    :param background_task_count: Parsed background-shell tally, or ``None``.
+    :param conv: The conversation the status is for.
+    :returns: ``"idle"`` for a non-codex sub-agent's background-task
+        ``waiting``; otherwise ``status`` unchanged.
+    """
+    if (
+        status == "waiting"
+        and background_task_count is not None
+        and background_task_count > 0
+        and conv.kind == "sub_agent"
+        and not _is_codex_native_subagent(conv)
+    ):
+        return "idle"
+    return status
+
+
 def _codex_subagent_labels_from_body(
     thread_id: str,
     body: SessionEventInput,
@@ -18346,6 +18382,13 @@ def create_sessions_router(
                 and raw_bg_count >= 0
                 else None
             )
+            # A sub-agent's background-task ``waiting`` must deliver as ``idle``
+            # so the parent's terminal-delivery branch below fires (otherwise
+            # the orchestrator hangs); the tally still drives the child spinner.
+            effective_status = _subagent_delivery_status(status, bg_count, conv)
+            if effective_status != status:
+                status = effective_status
+                body.data["status"] = status
             _publish_status(
                 session_id,
                 status,

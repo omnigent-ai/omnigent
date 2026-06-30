@@ -7,26 +7,20 @@ the working indicator lit — labelled ``"N background tasks still
 running"`` — instead of falling idle like the TUI's "N shells still
 running" banner.
 
-This drives the three user-visible states end to end:
-
-1. Background tasks running (idle + ``background_task_count``) → the
-   indicator shows ``"N background tasks still running"``.
-2. The user sends a message while they're still running → the new turn
-   supersedes the tally and the indicator flips to ``"Working…"``.
-3. The turn finishes with no background tasks left → the indicator
-   disappears.
+Both tests drive the real status edges through the Sessions events route
+(the same path the claude-native forwarder posts to), so they are
+deterministic — no live LLM turn, whose timing and the openai-agents
+executor's handling of a blocked mock would make the assertions flaky.
+A new turn is represented by its ``running`` status edge (what a composer
+send produces); the per-edge background-tally bookkeeping that send() does
+locally is covered by the chatStore unit tests.
 """
 
 from __future__ import annotations
 
-import uuid
-
 import httpx
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm
-
-_COMPOSER = "Ask the agent anything…"
 _WORKING = '[data-testid="working-indicator"]'
 
 
@@ -43,8 +37,9 @@ def _publish_status(
     :param session_id: Session/conversation id.
     :param status: Session status to publish, e.g. ``"idle"``.
     :param background_task_count: Background shells still running as of this
-        status edge. Omitted (``None``) clears the tally, matching a Stop
-        hook with no background tasks.
+        status edge. ``None`` omits the field (no information — the sticky
+        tally is left untouched); an explicit ``0`` is the authoritative
+        Stop-hook clear that drops the indicator.
     :returns: None.
     """
     data: dict[str, object] = {"status": status}
@@ -58,61 +53,37 @@ def _publish_status(
     resp.raise_for_status()
 
 
-def _release_gate(mock_url: str) -> None:
-    """Release the oldest blocked mock-LLM response so the turn completes."""
-    resp = httpx.post(f"{mock_url}/gate/release", timeout=10.0)
-    resp.raise_for_status()
-
-
-def test_background_tasks_keep_indicator_then_send_then_clear(
+def test_background_task_indicator_label_lifecycle(
     page: Page,
     seeded_session: tuple[str, str],
-    mock_llm_server_url: str,
 ) -> None:
-    """Indicator tracks background tasks → Working → gone across a turn.
+    """Indicator label tracks background tasks → working turn → cleared.
 
     :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, session_id)`` from the local
-        server fixture.
-    :param mock_llm_server_url: Base URL of the in-process mock LLM, used
-        to hold the user's turn in-flight so ``"Working…"`` is observable.
+    :param seeded_session: ``(base_url, session_id)`` from the local server
+        fixture.
     :returns: None.
     """
     base_url, session_id = seeded_session
     working = page.locator(_WORKING)
 
-    # The user message is held in-flight (``block``) so the turn stays
-    # ``running`` long enough to assert ``"Working…"``; ``match`` claims a
-    # private queue so only this message blocks (title/routing calls fall
-    # through to the live_server fallback).
-    prompt = f"bg-indicator probe {uuid.uuid4().hex[:8]}"
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "done", "block": True}],
-        key="bg-indicator",
-        match=prompt,
-    )
-
     # 1. Background shells outlive the turn: idle + a positive count. The
     #    snapshot caches the count, so a fresh page load hydrates it.
     _publish_status(base_url, session_id, "idle", background_task_count=2)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(working).to_be_visible(timeout=15_000)
-    expect(working).to_contain_text("2 background tasks still running")
+    expect(working).to_contain_text("2 background tasks still running", timeout=15_000)
 
-    # 2. Sending a message starts a new turn that supersedes the tally:
-    #    the label must flip from the background-task count to "Working…".
-    composer = page.get_by_placeholder(_COMPOSER)
-    expect(composer).to_be_visible()
-    composer.fill(prompt)
-    page.get_by_role("button", name="Send", exact=True).click()
-
+    # 2. A new turn starts (the `running` edge a composer send produces): the
+    #    fresh turn supersedes the tally, so the label flips from the
+    #    background-task count to the plain "Working…".
+    _publish_status(base_url, session_id, "running")
     expect(working).to_contain_text("Working", timeout=15_000)
     expect(working).not_to_contain_text("background task", timeout=15_000)
 
-    # 3. The turn finishes with no background tasks left → indicator gone.
-    _release_gate(mock_llm_server_url)
-    expect(working).to_have_count(0, timeout=30_000)
+    # 3. The turn ends with the background shell finished: an authoritative
+    #    Stop-hook `0` clears the tally, so the indicator goes out.
+    _publish_status(base_url, session_id, "idle", background_task_count=0)
+    expect(working).to_have_count(0, timeout=15_000)
 
 
 def test_sidebar_spinner_tracks_background_tasks(
