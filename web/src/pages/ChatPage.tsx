@@ -202,8 +202,18 @@ function extractUserText(content: MessageContentBlock[]): string {
  * `input_image`/`input_file` block (rendered as the image / a file chip), so
  * surfacing them again here would double-render — as the path of an internal
  * bridge temp dir, no less. "@"-mention paths are always workspace-relative
- * while upload markers are absolute, so skip absolute paths.
+ * while upload markers are absolute, so skip absolute paths (see
+ * {@link isAbsolutePath}).
  */
+// An absolute filesystem path in any form a native executor might materialize
+// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
+// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
+// reliably tells a materialized upload apart from a tagged workspace file
+// regardless of the host OS the runner happens to be on.
+function isAbsolutePath(p: string): boolean {
+  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+}
+
 function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
   const text = content
     .filter(
@@ -216,7 +226,7 @@ function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
     const raw = m[1].trim();
     if (!raw) continue;
     // Absolute path → a materialized upload, already shown via its file block.
-    if (raw.startsWith("/")) continue;
+    if (isAbsolutePath(raw)) continue;
     // Split a trailing ":start-end" line span back out so the chip can show
     // it without truncation (it's the whole point of a partial-file attach).
     const range = /^(.*):(\d+)-(\d+)$/.exec(raw);

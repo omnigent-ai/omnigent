@@ -158,6 +158,19 @@ describe("UserBubble @-mention attachment chips", () => {
     expect(screen.getByText("what is this")).toBeInTheDocument();
   });
 
+  // The absolute-path heuristic is OS-agnostic so it still suppresses the
+  // chip if an executor ever materializes an upload on a Windows host
+  // (drive-letter or UNC root), where the marker wouldn't start with "/".
+  it.each([
+    ["C:\\Users\\me\\AppData\\Local\\Temp\\omnigent\\uploads\\image.png", "drive (backslash)"],
+    ["C:/Users/me/AppData/Local/Temp/omnigent/uploads/image.png", "drive (forward slash)"],
+    ["\\\\host\\share\\omnigent\\uploads\\image.png", "UNC"],
+  ])("does not chip a Windows-style absolute upload marker (%s)", (path) => {
+    renderBubble(userBubble(`[Attached: ${path}]\n\nwhat is this`));
+    expect(screen.queryByText(/uploads/)).toBeNull();
+    expect(screen.getByText("what is this")).toBeInTheDocument();
+  });
+
   it("chips a relative @-mention but not an absolute upload in the same message", () => {
     renderBubble(
       userBubble(
