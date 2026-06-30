@@ -1587,6 +1587,10 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         use_responses = spec.executor.config.get("use_responses")
         if use_responses is not None:
             env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = "true" if use_responses else "false"
+
+        from omnigent.runtime.telemetry import get_otel_subprocess_env
+
+        env.update(get_otel_subprocess_env())
         return env
 
     # Global config auth is only consulted when the spec declares NO
