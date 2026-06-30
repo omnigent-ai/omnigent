@@ -24,11 +24,16 @@ fun originOf(url: String?): String? {
 }
 
 /**
- * True for the only two schemes the WebView loads inline (http/https). Callers
- * pass an already-lowercased scheme; everything else (mailto:, intent:, about:,
- * chrome-error://, null) is handed off to the system or ignored.
+ * True for the only two schemes the WebView loads inline (http/https). This
+ * gates a security boundary (which navigations load in the bridged WebView vs.
+ * trigger login / hand off to the system), so it lowercases internally rather
+ * than trust callers to pre-normalize — `"HTTPS"` counts. Everything else
+ * (mailto:, intent:, about:, chrome-error://, null) is handed off or ignored.
  */
-fun isHttpScheme(scheme: String?): Boolean = scheme == "http" || scheme == "https"
+fun isHttpScheme(scheme: String?): Boolean {
+    val normalized = scheme?.lowercase() ?: return false
+    return normalized == "http" || normalized == "https"
+}
 
 /**
  * Normalize user-entered server text into a loadable URL, or null if it isn't a
