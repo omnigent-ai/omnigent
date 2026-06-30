@@ -610,6 +610,14 @@ async def _receive_loop(
             )
             continue
         if isinstance(resp_frame, PongFrame):
+            # Tunnel keepalive round-trip. DEBUG because pings are frequent —
+            # opt in via log level. ``ts`` is epoch-ms stamped when the server
+            # pinged, so now - ts is the runner round-trip latency.
+            _logger.debug(
+                "runner %s tunnel keepalive: pong rtt=%dms",
+                runner_id,
+                int(time.time() * 1000) - resp_frame.ts,
+            )
             continue
         if isinstance(resp_frame, (WSFrame, WSCloseFrame)):
             registry.route_ws_inbound(runner_id, resp_frame, session=session)

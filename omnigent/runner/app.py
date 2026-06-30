@@ -7774,6 +7774,13 @@ def create_runner_app(
 
     app = FastAPI(title="omnigent-runner")
 
+    # Instrument the runner ASGI app so HTTP requests tunneled in from
+    # the server (whose headers are forwarded verbatim) continue the
+    # caller's trace instead of starting a new one.
+    from omnigent.runtime import telemetry
+
+    telemetry.instrument_fastapi_app(app)
+
     # Runner-side auth middleware.
     if auth_token is not None:
         _expected_token = auth_token

@@ -3076,7 +3076,7 @@ def server(
     # designs/OBSERVABILITY.md for the env var reference.
     from omnigent.runtime import telemetry
 
-    telemetry.init()
+    telemetry.init("omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally

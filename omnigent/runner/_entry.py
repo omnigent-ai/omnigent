@@ -899,7 +899,7 @@ async def _run_tunnel_from_env() -> None:
     try:
         from omnigent.runtime import telemetry
 
-        telemetry.init()
+        telemetry.init("omni-runner")
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
         _logger.debug("telemetry init failed in runner", exc_info=True)
 

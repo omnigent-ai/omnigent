@@ -868,6 +868,12 @@ class HarnessApp:
             be served by ``omnigent.runtime.harnesses._runner``.
         """
         app = FastAPI(title="omnigent-harness", lifespan=self._lifespan)
+        # Instrument the harness ASGI app so HTTP calls from the runner
+        # (over the per-conversation Unix socket) continue the caller's
+        # trace rather than rooting a fresh one.
+        from omnigent.runtime import telemetry
+
+        telemetry.instrument_fastapi_app(app)
         # FastAPI / Starlette types add_exception_handler narrowly
         # (Callable[[Request, Exception], ...]) — the OmnigentError
         # subclass annotation is what we actually want at runtime, but
