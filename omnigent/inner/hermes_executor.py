@@ -295,6 +295,7 @@ def _build_hermes_args(
     *,
     model: str | None = None,
     session_id: str | None = None,
+    skills_filter: str | list[str] | None = None,
 ) -> list[str]:
     """
     Build the argument list for a Hermes subprocess call.
@@ -303,6 +304,7 @@ def _build_hermes_args(
     :param message: The user message text.
     :param model: Optional model override (``-m`` flag).
     :param session_id: Optional session ID to resume (``--resume``).
+    :param skills_filter: Optional skill filter forwarded to Hermes.
     :returns: A list of CLI arguments.
     """
     args = [
@@ -316,6 +318,10 @@ def _build_hermes_args(
     ]
     if model:
         args.extend(["-m", model])
+    if skills_filter == "none":
+        args.append("--ignore-rules")
+    elif isinstance(skills_filter, list) and skills_filter:
+        args.extend(["-s", ",".join(skills_filter)])
     if session_id:
         args.extend(["--resume", session_id])
     return args
@@ -470,6 +476,7 @@ class HermesExecutor(Executor):
             message=user_text,
             model=model,
             session_id=hermes_sid,
+            skills_filter=self._skills_filter,
         )
 
         # Build subprocess env with per-session HERMES_HOME for policy hooks.
