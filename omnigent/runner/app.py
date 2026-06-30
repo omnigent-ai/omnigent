@@ -16681,17 +16681,29 @@ def create_runner_app(
             e.g. ``"default"``.
         :returns: JSON list of changed file entries with ``status`` field.
         """
+        from omnigent.runtime.filesystem_registry import GitStatusUnavailable
+
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
-        raw_changes = (
-            session_registry.list_changed_files(
-                session_id,
-                limit=10_000,
+        try:
+            raw_changes = (
+                session_registry.list_changed_files(
+                    session_id,
+                    limit=10_000,
+                )
+                if session_registry is not None
+                else []
             )
-            if session_registry is not None
-            else []
-        )
+        except GitStatusUnavailable as exc:
+            # The working-tree read itself failed (e.g. `git status` timed out
+            # on a huge repo, or exited non-zero). Surface it as an error so
+            # the UI shows a failure state instead of an empty list that is
+            # indistinguishable from a genuinely clean tree.
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": "git_status_failed", "message": exc.reason}},
+            )
         data = [
             {
                 "object": "session.environment.filesystem.entry",
@@ -16771,11 +16783,23 @@ def create_runner_app(
             )
 
         # Check the file is tracked in the changed-files registry.
-        record = (
-            session_registry.get_changed_file(session_id, relative_path)
-            if session_registry is not None
-            else None
-        )
+        from omnigent.runtime.filesystem_registry import GitStatusUnavailable
+
+        try:
+            record = (
+                session_registry.get_changed_file(session_id, relative_path)
+                if session_registry is not None
+                else None
+            )
+        except GitStatusUnavailable as exc:
+            # The working-tree read itself failed (timeout / spawn error /
+            # non-zero exit). Surface it like the /changes endpoint does,
+            # rather than letting a swallowed failure masquerade as a 404
+            # "not in the changed-files registry".
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": "git_status_failed", "message": exc.reason}},
+            )
         if record is None:
             return JSONResponse(
                 status_code=404,
