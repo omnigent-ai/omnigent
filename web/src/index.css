@@ -108,7 +108,11 @@
    *
    * Three inputs combine:
    *   1. OS safe area  — `env(safe-area-inset-*)`, nonzero only on notched /
-   *      home-indicator devices (and only when `viewport-fit=cover`).
+   *      home-indicator devices (and only when `viewport-fit=cover`). The
+   *      Android shell can't rely on `env()` alone (unreliable across WebView
+   *      versions / nav modes), so it also injects measured insets as
+   *      `--omnigent-android-safe-area-*`; we fold those in with `max()` so the
+   *      var stays universal and contributes nothing off the Android shell.
    *   2. Native bar footprint — the pixel height of the iOS shell's floating
    *      server switcher (top) and chat/terminal bar (bottom). The native
    *      layer owns these dimensions and pushes them over the bridge (see
@@ -124,8 +128,14 @@
    * tracked here for symmetry/introspection but is intentionally NOT added to
    * the content top inset to avoid double-counting the header band. */
   --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
-  --omnigent-safe-top: env(safe-area-inset-top, 0px);
-  --omnigent-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --omnigent-safe-top: max(
+    env(safe-area-inset-top, 0px),
+    var(--omnigent-android-safe-area-top, 0px)
+  );
+  --omnigent-safe-bottom: max(
+    env(safe-area-inset-bottom, 0px),
+    var(--omnigent-android-safe-area-bottom, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */

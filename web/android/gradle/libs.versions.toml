@@ -1,0 +1,19 @@
+# Versions are pinned to the compileSdk-35 / Gradle-8.9 / JDK-17 toolchain this
+# module builds against. AGP 9.x and the newest androidx libs require Gradle 9 /
+# compileSdk 36, so lint's "newer version available" advisories are expected
+# here and deliberately not chased — bump the whole toolchain together instead.
+[versions]
+agp = "8.6.1"
+kotlin = "2.0.20"
+androidxCore = "1.13.1"
+androidxActivity = "1.9.2"
+androidxWebkit = "1.12.1"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "androidxCore" }
+androidx-activity = { group = "androidx.activity", name = "activity-ktx", version.ref = "androidxActivity" }
+androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "androidxWebkit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
