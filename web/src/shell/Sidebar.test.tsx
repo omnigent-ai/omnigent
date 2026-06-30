@@ -52,6 +52,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
+  useSetSessionLabel: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   // Project feature: the sidebar reads the project list to build project
   // sections, and rows fire useMoveToProject from the kebab menu. Both must
@@ -185,7 +186,12 @@ describe("Sidebar session list", () => {
     // bottom "Archived" section. A regression to false would make that
     // section perpetually empty.
     expect(useConvMock.mock.calls).toHaveLength(1);
-    expect(useConvMock.mock.calls[0]).toEqual(["", true, { reconcileWhileConnected: true }]);
+    expect(useConvMock.mock.calls[0]).toEqual([
+      "",
+      true,
+      { reconcileWhileConnected: true },
+      undefined,
+    ]);
   });
 
   it("swaps the card content to the settings section nav on /settings", () => {

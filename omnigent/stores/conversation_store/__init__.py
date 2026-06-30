@@ -460,6 +460,7 @@ class ConversationStore(ABC):
         accessible_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        label: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -549,6 +550,9 @@ class ConversationStore(ABC):
             per-project folder fetch). When set to an empty string
             ``""``, only return sessions with NO project label (unfiled
             sessions). ``None`` disables the filter.
+        :param label: When set, only return conversations that have
+            a ``user.label`` entry in ``conversation_labels`` whose
+            value matches exactly. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """

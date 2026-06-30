@@ -39,6 +39,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
+  useSetSessionLabel: () => ({ mutate: vi.fn() }),
 }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
