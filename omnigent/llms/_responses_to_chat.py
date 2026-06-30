@@ -365,6 +365,17 @@ async def chat_stream_to_response_events(
                 accumulated_text += text
                 yield ResponseTextDeltaEvent(delta=text)
 
+        # xAI Grok and DeepSeek emit chain-of-thought as a sibling
+        # ``delta.reasoning_content`` string while ``delta.content`` is
+        # null during the thinking phase.  Read it here so reasoning
+        # tokens are not silently dropped.
+        reasoning_content = delta.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            if not reasoning_started:
+                yield ResponseReasoningStartedEvent()
+                reasoning_started = True
+            yield ResponseReasoningTextDeltaEvent(delta=reasoning_content)
+
         # Tool call deltas — accumulate across chunks
         for tc_delta in delta.get("tool_calls") or []:
             idx = tc_delta.get("index", 0)
