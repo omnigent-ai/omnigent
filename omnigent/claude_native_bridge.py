@@ -53,6 +53,7 @@ from urllib import error, request
 
 from omnigent._platform import stable_user_id
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
 if TYPE_CHECKING:
     from omnigent.llms.context_window import ModelPricing
@@ -269,10 +270,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = opencode_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    kiro_root = _absolute_syntactic_path(kiro_bridge_root())
+    if target.is_relative_to(kiro_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/kiro-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(kiro_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s})"
+        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
+        f"{kiro_root!s})"
     )
 
 

@@ -77,6 +77,16 @@ _CHILD_ENV_ALLOWLIST = [
 ]
 
 
+def bridge_root() -> Path:
+    """Return the uid-scoped Kiro-native bridge root.
+
+    Mirrors the sibling harnesses' ``bridge_root`` accessor so the shared
+    ``serve-mcp`` / relay infrastructure in ``claude_native_bridge`` can
+    recognize Kiro bridge dirs as a trusted root.
+    """
+    return _BRIDGE_ROOT
+
+
 def bridge_dir_for_session_id(session_id: str) -> Path:
     """Return the per-session Kiro bridge directory."""
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
