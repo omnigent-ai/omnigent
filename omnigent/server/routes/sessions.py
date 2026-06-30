@@ -8496,6 +8496,7 @@ async def _forward_event_to_runner(
     if (
         effective_runner_override is None
         and conv.cost_control_mode_override == "on"
+        and conv.parent_conversation_id is None
         and body.type == "message"
     ):
         from omnigent.server.smart_routing import route_turn
@@ -8705,7 +8706,11 @@ async def _dispatch_session_event_to_runner(
         # the toggle is on and no model_override is set, call the
         # judge and persist the chosen model on the conversation row.
         # The native CLI reads model_override from the session.
-        if conv.model_override is None and conv.cost_control_mode_override == "on":
+        if (
+            conv.model_override is None
+            and conv.cost_control_mode_override == "on"
+            and conv.parent_conversation_id is None
+        ):
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
