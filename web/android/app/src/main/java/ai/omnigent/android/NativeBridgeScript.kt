@@ -47,6 +47,41 @@ object NativeBridgeScript {
           if (document.head) ensureViewportFit();
           else document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
 
+          // Apply the OS safe area to the layout from the native side. emitInsets
+          // feeds --omnigent-safe-top/bottom (the app's own inset vars), but on a
+          // server whose web build predates the Android shell the inset-aware rules
+          // lose the cascade: their semantic selectors (.chat-conversation-content
+          // etc., specificity 0,1,0) tie with the Tailwind utility classes on the
+          // same elements and lose on source order, so the OS inset is dropped and
+          // content bleeds under the status bar / behind the gesture nav. Re-assert
+          // the inset paddings here with !important so they win regardless, keyed to
+          // the same vars (mirrors the [data-android-native] rules in index.css).
+          // The header additionally reads a raw env(safe-area-inset-top), which
+          // Android WebView reports as 0, so it needs the override even pre-Tailwind.
+          const ensureInsetStyles = () => {
+            if (document.getElementById("omnigent-android-insets")) return;
+            const T = "var(--omnigent-safe-top, 0px)";
+            const B = "var(--omnigent-safe-bottom, 0px)";
+            const style = document.createElement("style");
+            style.id = "omnigent-android-insets";
+            style.textContent = [
+              ".chat-header{top:max(0px, calc(" + T + " - 0.5rem)) !important}",
+              ".chat-conversation-content{padding-top:calc(var(--omnigent-header-height, 3.5rem) + 1.5rem + " + T + ") !important}",
+              ".main-terminal-view{padding-top:calc(3.25rem + " + T + ") !important}",
+              // Bottom inset belongs on whichever element is bottom-most per mode:
+              // the composer in regular chat, the switcher pill in terminal-first
+              // (its composer sits above the pill, so it must NOT also add it).
+              ".chat-composer-form{padding-bottom:calc(0.75rem + " + B + ") !important}",
+              ".chat-composer-form.terminal-first-composer-form{padding-bottom:0.25rem !important}",
+              ".terminal-first-switcher-container{padding-bottom:calc(0.35rem + " + B + ") !important}",
+              // Drawers/panels span full height — clear both bars.
+              ":is(.conversations-sidebar,[data-testid=\"file-viewer\"],[data-testid=\"files-panel-drawer\"],[data-testid=\"terminals-panel\"],[data-testid=\"subagents-panel-drawer\"],[data-testid=\"todos-panel-drawer\"]){padding-top:" + T + " !important;padding-bottom:" + B + " !important}",
+            ].join("");
+            (document.head || document.documentElement).appendChild(style);
+          };
+          if (document.head) ensureInsetStyles();
+          else document.addEventListener("DOMContentLoaded", ensureInsetStyles, { once: true });
+
           const post = (payload) => {
             try {
               const bridge = window.${OmnigentBridgeListener.JS_OBJECT_NAME};

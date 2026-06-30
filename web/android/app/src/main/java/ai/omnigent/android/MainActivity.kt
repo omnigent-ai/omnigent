@@ -138,7 +138,14 @@ class MainActivity : ComponentActivity() {
         // alone (unreliable < API 30 and across OEM builds). Cached so the first
         // post-load emit (in onPageReady) isn't lost to the pre-load race.
         ViewCompat.setOnApplyWindowInsetsListener(webView) { _, insets ->
-            lastInsets = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            // When the soft keyboard is up it sits over the nav bar, so the bottom
+            // safe area must collapse to 0 — otherwise the composer (which
+            // adjustResize already keeps above the IME) floats a nav-bar height
+            // above the keyboard. Subtracting the IME inset does exactly that and
+            // is a no-op when the keyboard is hidden.
+            lastInsets = Insets.of(bars.left, bars.top, bars.right, maxOf(0, bars.bottom - ime.bottom))
             emitInsets()
             insets
         }
@@ -325,20 +332,34 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun emitInsets() {
-        // We push the OS safe area straight into `--omnigent-android-safe-area-*`
-        // (folded via max() in index.css). We deliberately do NOT call
-        // `__omnigentNativeEmitInsets` — that path feeds the iOS *floating-bar*
-        // footprints (--omnigent-native-*-bar; nativeInsets.ts is a "no-op off
-        // the iOS shell"), and Android has no such bars. Routing the safe area
-        // there would mis-assign it to a bar-footprint variable.
+        // Feed the OS safe area into the web layer two ways, because the shell
+        // pins to a user-supplied server whose web build may PRE-DATE the Android
+        // shell's CSS — it can't be assumed to carry the `[data-android-native]`
+        // fold:
+        //   1. `--omnigent-safe-top/bottom` — the app's OWN base inset vars. Every
+        //      build already derives `--omnigent-inset-*` and its layout from
+        //      these, defaulting them to `env(safe-area-inset-*)`, which Android
+        //      WebView reports as 0. Setting them inline (highest priority)
+        //      overrides that 0 everywhere the layout already reads them.
+        //   2. `--omnigent-android-safe-area-*` — consumed by the shell's own
+        //      `[data-android-native]` rules when the server IS up to date (folded
+        //      via max() in index.css); a harmless no-op otherwise.
+        // We deliberately do NOT call `__omnigentNativeEmitInsets` — that feeds the
+        // iOS *floating-bar* footprints (--omnigent-native-*-bar; nativeInsets.ts
+        // is a "no-op off the iOS shell"), and Android has no such bars. Routing
+        // the safe area there would mis-assign it to a bar-footprint variable.
         val bars = lastInsets ?: return
         val d = resources.displayMetrics.density
         val js =
             """
             (() => {
               const s = document.documentElement.style;
-              s.setProperty('--omnigent-android-safe-area-top', '${bars.top / d}px');
-              s.setProperty('--omnigent-android-safe-area-bottom', '${bars.bottom / d}px');
+              const top = '${bars.top / d}px';
+              const bottom = '${bars.bottom / d}px';
+              s.setProperty('--omnigent-safe-top', top);
+              s.setProperty('--omnigent-safe-bottom', bottom);
+              s.setProperty('--omnigent-android-safe-area-top', top);
+              s.setProperty('--omnigent-android-safe-area-bottom', bottom);
               s.setProperty('--omnigent-android-safe-area-left', '${bars.left / d}px');
               s.setProperty('--omnigent-android-safe-area-right', '${bars.right / d}px');
             })();
