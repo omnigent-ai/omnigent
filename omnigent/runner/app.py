@@ -45,7 +45,11 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    is_native_harness,
+    native_terminal_name,
+)
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -7671,6 +7675,21 @@ def get_session_agent_id(session_id: str) -> str | None:
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 
 
+class _BodyRequest:
+    """Minimal stand-in for a Starlette ``Request`` exposing only ``json()``.
+
+    Lets internal callers reuse a route handler that consumes the request
+    solely for its JSON body (e.g. ``create_session_terminal``) without
+    constructing a real ASGI ``Request``. Not a general Request substitute.
+    """
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    async def json(self) -> dict[str, Any]:
+        return self._body
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -13641,6 +13660,14 @@ def create_runner_app(
             and name not in _spec_names
         )
 
+        # Self-heal (#1349): the native-pane idle reaper may have reclaimed this
+        # conversation's pane while it sat idle. The native forward below assumes
+        # a live pane, so re-create it first when missing — otherwise a turn that
+        # arrives without a client handshake (sub-agent / API forward) injects
+        # into a dead tmux target and the message is lost. No-op for SDK harnesses
+        # and when the pane is already live; resumes via the vendor ``--resume``.
+        await _ensure_native_terminal_for_turn(conv, harness_name)
+
         # Fallback for native sessions whose terminal was launched
         # outside the runner terminal route (e.g. tests, UI-launched
         # terminals): make sure the comment-tool relay is running before the
@@ -16102,6 +16129,65 @@ def create_runner_app(
             status_code=200,
             content=session_resource_view_to_dict(resource_view),
         )
+
+    async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
+        """Re-create a reaped native pane before forwarding a turn (#1349 self-heal).
+
+        The native-pane idle reaper may reclaim an idle pane while a session sits
+        between turns. ``NativeServerHarness.run_turn`` forwards into the live
+        pane and assumes it exists, so a turn arriving WITHOUT a client handshake
+        (a sub-agent or API forward to a long-idle session) would otherwise inject
+        into a dead tmux target and lose the message. This re-ensures the pane
+        first. Idempotent: a no-op when the harness is not a native CLI harness or
+        the pane is already live. Reuses ``create_session_terminal``'s
+        ``ensure_native_terminal`` path, so the pane resumes via the vendor CLI's
+        own ``--resume`` (no fresh-start, no lost history).
+
+        Detection relies on the reaper POPPING the registry entry when it reaps
+        (``registry.close()`` -> ``get()`` returns ``None``) — exactly the
+        reaped-pane window this targets. The membership check stays cheap and
+        in-memory on purpose: no per-turn tmux probe, and it doesn't perturb the
+        normal native turn path (a registered pane short-circuits). A
+        crashed-but-registered pane (tmux killed externally without ``close()``)
+        is out of scope here. Every native short-name this can target has a
+        matching ``ensure_native_terminal`` branch in ``create_session_terminal``
+        (kept in lockstep with ``harness_aliases.NATIVE_HARNESSES``).
+        """
+        terminal_name = native_terminal_name(harness_name)
+        if terminal_name is None:
+            return
+        terminal_registry = resource_registry.terminal_registry if resource_registry else None
+        if terminal_registry is None:
+            return
+        if terminal_registry.get(conv_id, terminal_name, "main") is not None:
+            return  # a pane is still registered — nothing to heal
+        _logger.info(
+            "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
+            conv_id,
+            harness_name,
+        )
+        try:
+            resp = await create_session_terminal(
+                conv_id,
+                _BodyRequest(
+                    {
+                        "terminal": terminal_name,
+                        "session_key": "main",
+                        "ensure_native_terminal": True,
+                    }
+                ),
+            )
+        except Exception:
+            _logger.exception("native pane self-heal failed for conv=%s", conv_id)
+            return
+        status = getattr(resp, "status_code", 200)
+        if status >= 400:
+            _logger.warning(
+                "native pane self-heal returned status %s for conv=%s (%s)",
+                status,
+                conv_id,
+                terminal_name,
+            )
 
     @app.get("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
     async def get_session_terminal(
