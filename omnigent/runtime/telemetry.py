@@ -35,6 +35,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+from opentelemetry import trace as otel_trace
+
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.sdk._logs.export import LogExporter
@@ -284,6 +286,56 @@ def record_cancellation(span: Span) -> None:
 
     span.set_status(StatusCode.ERROR)
     span.set_attribute("error.type", "cancelled")
+
+
+def record_llm_retry(
+    *,
+    attempt: int,
+    max_attempts: int,
+    error_type: str,
+    error_message: str,
+    backoff_seconds: float | None = None,
+) -> None:
+    """
+    Record a retry attempt as a ``gen_ai.retry`` event on the
+    currently-active OTel span.
+
+    Called from the LLM retry loop after a failed attempt and before
+    the backoff sleep. Reads ``otel_trace.get_current_span()`` so the
+    event lands on whatever span wraps the LLM call (an mlflow span,
+    a raw OTel span, an inspect_ai span, etc.) without coupling the
+    omnigent runtime to any specific tracing library.
+
+    No-ops silently when no span is active (background batch jobs,
+    smoke tests) via ``get_current_span()`` returning a non-recording
+    span. Callers do not need to guard.
+
+    :param attempt: 1-based attempt number that just failed.
+    :param max_attempts: Total attempts allowed by the retry policy.
+    :param error_type: Exception class name, e.g. ``"TimeoutException"``.
+    :param error_message: Short error message from the failed attempt.
+    :param backoff_seconds: Sleep duration before the next attempt,
+        or ``None`` when no backoff applies (e.g. the last attempt).
+    """
+    span = otel_trace.get_current_span()
+    if not span.is_recording():
+        return
+
+    attrs: dict[str, Any] = {
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "error.type": error_type,
+    }
+    # Gate error.message behind the content-capture flag for parity with
+    # the rest of this module: provider error bodies can echo prompt
+    # fragments, request details, or response payloads, so they are
+    # treated as content. error.type is always recorded so operators can
+    # triage the retry-error class without needing message content.
+    if should_capture_content():
+        attrs["error.message"] = error_message
+    if backoff_seconds is not None:
+        attrs["backoff_seconds"] = backoff_seconds
+    span.add_event(name="gen_ai.retry", attributes=attrs)
 
 
 def get_traceparent_env() -> dict[str, str]:
