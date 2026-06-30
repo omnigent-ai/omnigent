@@ -81,6 +81,7 @@
     "zustand": "^5.0.12"
   },
   "overrides": {
+    "linkify-it": "5.0.1",
     "@tiptap/core": "3.23.4",
     "@tiptap/extension-blockquote": "3.23.4",
     "@tiptap/extension-bold": "3.23.4",
