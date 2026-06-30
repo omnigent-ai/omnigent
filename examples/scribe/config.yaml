@@ -128,7 +128,29 @@ os_env:
 # everything else — including the read-only git/gh Scribe relies on — runs
 # without an ASK (`gate_pushes: false`), since a headless orchestrator can't
 # answer an approval prompt.
+#
+# Cost-budget guardrails:
+#
+#   session_cost_cap — per-session hard spending cap.
+#     A single Scribe session is blocked once it has spent $0.50.  A soft
+#     warning fires at $0.20 so the user can decide whether to continue before
+#     the cap is reached.  No expensive_models list is given: the default blocks
+#     ALL models once the cap is hit (a true hard stop, not just a downgrade
+#     gate).  Pass an explicit list such as expensive_models: ["opus", "gpt-5"]
+#     to get a downgrade gate instead — only those tiers are blocked and the
+#     session can continue on a cheaper model.
+#
+#   user_daily_cost_budget — per-user daily cap across all sessions.
+#     The session owner's total spend across ALL their sessions today is capped
+#     at $2.00.  Soft warnings at $0.50 and $1.00 prompt the user before the
+#     daily limit is exhausted.  Approvals are sticky per user+day: approving
+#     the $0.50 checkpoint here means it won't re-ask in any other session the
+#     same day.
 guardrails:
+  # How long an ASK approval card stays open before the turn is denied.
+  # 86400s = 24 hours — lets a user come back to an approval prompt later.
+  ask_timeout: 86400
+
   policies:
     blast_radius:
       type: function
@@ -137,6 +159,29 @@ guardrails:
         path: omnigent.inner.nessie.policies.blast_radius
         arguments:
           gate_pushes: false
+
+    # Per-session hard cap: block this session once it has spent $0.50.
+    session_cost_cap:
+      type: function
+      function:
+        path: omnigent.policies.builtins.cost.cost_budget
+        arguments:
+          max_cost_usd: 0.50
+          ask_thresholds_usd: [0.20]
+          # Omit expensive_models (or pass []) → hard stop for ALL models once
+          # the cap is reached.  Uncomment for a downgrade gate instead:
+          # expensive_models: ["opus", "gpt-5"]
+
+    # Per-user daily cap: block the owner's sessions once they've spent $2.00
+    # across all their sessions today.
+    user_daily_cost_cap:
+      type: function
+      function:
+        path: omnigent.policies.builtins.cost.user_daily_cost_budget
+        arguments:
+          max_cost_usd: 2.00
+          ask_thresholds_usd: [0.50, 1.00]
+          # Same expensive_models semantics as cost_budget above.
 
 tools:
   # The two sub-agents — see agents/<name>/. `researcher` explores read-only on
