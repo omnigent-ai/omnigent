@@ -179,13 +179,11 @@ class ToolManager:
         # Comment tools are always auto-registered so agents can
         # list and update review comments without the spec opting in.
         self._register_comment_tools()
-        # Work-item (#3), schedule/loop (#6), and canvas (#2) builtins are
-        # likewise always auto-registered, so an agent — and the Omnigent MCP
-        # surface — can create/track work items, manage loops & monitors, and
-        # set the conversation canvas without the spec opting in (#12).
-        # Registered directly (like the comment tools) rather than declared in
-        # ``tools.builtins``, which sidesteps the function-tool callable-
-        # recovery translation path.
+        # Work-item builtins (#3, #12) are likewise always auto-registered, so
+        # an agent — and the Omnigent MCP surface — can create and track work
+        # items without the spec opting in. Registered directly (like the
+        # comment tools) rather than declared in ``tools.builtins``, which
+        # sidesteps the function-tool callable-recovery translation path.
         self._register_work_management_tools()
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
