@@ -219,6 +219,22 @@ function ArchivedToast() {
   );
 }
 
+/**
+ * Compute the set of IDs to add for a shift-click range selection.
+ * Returns null when the range can't be computed (missing anchor or id).
+ */
+export function computeShiftSelectRange(
+  visibleIds: readonly string[],
+  anchorId: string,
+  targetId: string,
+): string[] | null {
+  const anchorIdx = visibleIds.indexOf(anchorId);
+  const targetIdx = visibleIds.indexOf(targetId);
+  if (anchorIdx === -1 || targetIdx === -1) return null;
+  const [start, end] = anchorIdx < targetIdx ? [anchorIdx, targetIdx] : [targetIdx, anchorIdx];
+  return visibleIds.slice(start, end + 1);
+}
+
 /** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
 function showArchivedToast() {
   showToast(<ArchivedToast />);
@@ -231,11 +247,22 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  const toggleSelected = useCallback((id: string) => {
+  const lastSelectedIdRef = useRef<string | null>(null);
+  const visibleIdsRef = useRef<string[]>([]);
+
+  const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
+      if (shiftKey && lastSelectedIdRef.current != null) {
+        const range = computeShiftSelectRange(visibleIdsRef.current, lastSelectedIdRef.current, id);
+        if (range) {
+          for (const rid of range) next.add(rid);
+          return next;
+        }
+      }
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      lastSelectedIdRef.current = id;
       return next;
     });
   }, []);
@@ -251,6 +278,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const exitSelectionMode = useCallback(() => {
     setSelectionMode(false);
     setSelectedIds(new Set());
+    lastSelectedIdRef.current = null;
   }, []);
 
   // Debounce search input so we don't fire a server request on every
@@ -550,6 +578,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
+              visibleIdsRef={visibleIdsRef}
             />
           </nav>
 
@@ -691,7 +720,7 @@ function ProjectFolder({
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
 }) {
   const query = useProjectSessions(name, expanded);
@@ -780,7 +809,8 @@ interface ConversationListProps {
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
+  visibleIdsRef: RefObject<string[]>;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -799,6 +829,7 @@ function ConversationList({
   selectionMode,
   selectedIds,
   onToggleSelected,
+  visibleIdsRef,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -1116,6 +1147,7 @@ function ConversationList({
       ...visible("Shared with me", sections.shared),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
+  visibleIdsRef.current = orderedConversationIds;
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
@@ -1654,7 +1686,7 @@ function ConversationSection({
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   /** Placeholder shown when expanded with no rows (e.g. an empty project). */
   emptyMessage?: string;
   /** Indent the rows one extra step (used to nest a project's chats). */
@@ -2062,7 +2094,7 @@ function ConversationRow({
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   isSelected: boolean;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
@@ -2367,7 +2399,7 @@ function ConversationRow({
         if (selectionMode) {
           e.preventDefault();
           e.stopPropagation();
-          onToggleSelected(conversation.id);
+          onToggleSelected(conversation.id, e.shiftKey);
           return;
         }
         onClick(e);
