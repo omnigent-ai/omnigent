@@ -2282,6 +2282,115 @@ describe("chatStore — send while streaming (queueing)", () => {
   });
 });
 
+describe("chatStore — background-shell tally (claude-native)", () => {
+  it("adopts the shell count from a Stop-derived waiting status", () => {
+    useChatStore.setState({ conversationId: "conv_abc", backgroundTaskCount: 0 });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundTaskCount: 2,
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("waiting");
+    expect(state.backgroundTaskCount).toBe(2);
+  });
+
+  it("keeps the sticky shell count when a trailing PTY idle lands", () => {
+    // The claude-native turn-end sequence: the Stop hook publishes
+    // waiting(+count), then ~1s later the PTY-activity watcher publishes a
+    // bare `idle` once the pane quiesces. That trailing idle carries no
+    // count and must NOT wipe the "N background tasks still running" signal — only
+    // the status settles to idle.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 2,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.backgroundTaskCount).toBe(2);
+  });
+
+  it("clears the shell count on a hard failure", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 2,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "failed",
+    });
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+  });
+
+  it("clears the shell count when a Stop hook reports zero remaining shells", () => {
+    // The shell finished: the next turn-end Stop hook carries an authoritative
+    // `background_task_count: 0` (an explicit count, not an absent field), which
+    // must drop the "N background tasks still running" indicator. The earlier
+    // sticky-on-idle behavior — which only existed to survive the countless
+    // trailing PTY idle — must NOT swallow this authoritative zero.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+      backgroundTaskCount: 0,
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.backgroundTaskCount).toBe(0);
+  });
+
+  it("clears the shell count when a new turn starts (running edge)", () => {
+    // A `running` edge with no count means a fresh turn began; the prior
+    // turn's tally is stale and must clear, mirroring the server's
+    // `_publish_status`. (The PTY `running` carries no count.)
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      backgroundTaskCount: 2,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+    });
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+  });
+
+  it("clears the sticky shell count when the user sends a new turn", async () => {
+    // Asking another question while shells run supersedes the prior turn's
+    // tally: the label must flip from "N background tasks still running" to "Working…"
+    // immediately, not linger until the next status edge.
+    seedSession("conv_abc");
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 2,
+      status: "idle",
+      activeResponse: null,
+    });
+    await useChatStore.getState().send("another question", "agent_xyz");
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+  });
+});
+
 describe("chatStore — send (cross-session routing)", () => {
   it("delivers a queued send to the session it was composed in, not the now-active session", async () => {
     // Repro for the cross-session message-routing leak.
@@ -3004,6 +3113,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "failed" });
       expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("failed");
       handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+      expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("idle");
+    });
+
+    it("keeps the sidebar row 'running' while background shells outlive the turn", () => {
+      // The claude-native turn settles to idle while shells keep running; the
+      // sticky tally must keep the sidebar spinner lit (the grey RunningDot),
+      // matching the in-chat "N background tasks still running" indicator — not
+      // fall idle the way it did before this fix.
+      seedConversationsCache([conv("conv_abc", "running")]);
+      useChatStore.setState({ conversationId: "conv_abc", backgroundTaskCount: 1 });
+      handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+      expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("running");
+    });
+
+    it("drops the sidebar row to 'idle' once the last background shell finishes", () => {
+      // The finishing Stop hook carries an authoritative `background_task_count: 0`,
+      // which clears the tally — the sidebar spinner must then go out.
+      seedConversationsCache([conv("conv_abc", "running")]);
+      useChatStore.setState({ conversationId: "conv_abc", backgroundTaskCount: 1 });
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "idle",
+        backgroundTaskCount: 0,
+      });
       expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("idle");
     });
   });

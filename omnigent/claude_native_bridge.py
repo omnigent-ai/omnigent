@@ -384,6 +384,11 @@ class ClaudeHookRecord:
         ``TaskCompleted`` (``"completed"``), or
         ``PostToolUse``/``TaskUpdate`` event (``"in_progress"`` or
         ``"completed"``). ``None`` for all other events.
+    :param background_task_count: Number of background tasks still running
+        when a ``Stop`` hook fires — entries in the payload's
+        ``background_tasks`` array whose per-task ``status`` is not terminal
+        (see :data:`_TERMINAL_BACKGROUND_TASK_STATUSES`). ``0`` for all other
+        events or when absent.
     """
 
     event_cursor: int
@@ -402,6 +407,7 @@ class ClaudeHookRecord:
     task_id: str | None = None
     task_subject: str | None = None
     task_status: str | None = None
+    background_task_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -2116,6 +2122,21 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     return False
 
 
+# Terminal per-task ``status`` values in a ``Stop`` hook's ``background_tasks``
+# array. Claude Code retains finished/stopped shells in that array rather than
+# reaping them (claude-code issues #67895, #59456, #14049), so counting the raw
+# length would over-count and leave the "N background tasks still running"
+# indicator stuck after a shell exited. We exclude these known terminal states
+# and count everything else as live — unknown/absent statuses count as running
+# so a payload variant can never UNDER-count and re-hide a genuinely running
+# shell (the bug this whole feature fixes). ``"running"`` / ``"completed"`` /
+# ``"failed"`` are the documented values (CHANGELOG v2.1.145+); ``"stopped"`` /
+# ``"killed"`` appear in the codebase/issues but are not formally documented.
+_TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "stopped", "killed"}
+)
+
+
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     """
     Convert one complete hook JSONL line into a hook record.
@@ -2190,6 +2211,21 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_task_id, str) and raw_task_id:
             task_id = raw_task_id
         task_status = "completed"
+    background_task_count = 0
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_bg = payload.get("background_tasks")
+        if isinstance(raw_bg, list):
+            # Count only shells still running: Claude Code leaves finished
+            # shells in the array (see _TERMINAL_BACKGROUND_TASK_STATUSES), so a
+            # raw len() over-counts and pins the indicator after they exit.
+            background_task_count = sum(
+                1
+                for task in raw_bg
+                if not (
+                    isinstance(task, dict)
+                    and task.get("status") in _TERMINAL_BACKGROUND_TASK_STATUSES
+                )
+            )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -2231,6 +2267,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_id=task_id,
         task_subject=task_subject,
         task_status=task_status,
+        background_task_count=background_task_count,
     )
 
 

@@ -447,6 +447,7 @@ export interface SessionStatusEvent {
   conversationId: string;
   status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
+  backgroundTaskCount?: number;
 }
 
 /**

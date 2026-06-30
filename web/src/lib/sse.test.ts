@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { parseEvent } from "./sse";
-import type { SessionSupersededEvent, TextDelta } from "./events";
+import type { SessionStatusEvent, SessionSupersededEvent, TextDelta } from "./events";
 
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {
@@ -82,5 +82,34 @@ describe("parseEvent — session.superseded", () => {
 
   it("returns null when the carrier conversation id is missing", () => {
     expect(parseEvent("session.superseded", { target_conversation_id: "conv_new" })).toBeNull();
+  });
+});
+
+describe("parseEvent — session.status (background_task_count)", () => {
+  function bgCount(data: Record<string, unknown>): number | undefined {
+    const ev = parseEvent("session.status", { conversation_id: "conv_a", status: "idle", ...data });
+    return (ev as SessionStatusEvent | null)?.backgroundTaskCount;
+  }
+
+  it("threads a positive count so the indicator can show 'N background tasks still running'", () => {
+    expect(bgCount({ background_task_count: 3 })).toBe(3);
+  });
+
+  it("keeps an explicit 0 (authoritative clear) rather than collapsing it to undefined", () => {
+    // A Stop hook reporting zero remaining shells must reach the store as `0`
+    // so the sticky tally clears; `undefined` would leave a finished shell's
+    // indicator stuck on screen.
+    expect(bgCount({ background_task_count: 0 })).toBe(0);
+  });
+
+  it("leaves the count undefined when the field is absent (no information)", () => {
+    // The PTY-activity `idle` carries no count; absent must stay sticky-safe
+    // (undefined), distinct from an authoritative 0.
+    expect(bgCount({})).toBeUndefined();
+  });
+
+  it("ignores a non-numeric or negative count", () => {
+    expect(bgCount({ background_task_count: "2" })).toBeUndefined();
+    expect(bgCount({ background_task_count: -1 })).toBeUndefined();
   });
 });

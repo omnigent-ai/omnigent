@@ -271,6 +271,7 @@ export interface ChatState {
    * for the rest of the session lifetime.
    */
   sessionStatus: SessionStatus;
+  backgroundTaskCount: number;
   /**
    * Whether the active session is a native-terminal wrapper
    * (claude-native / codex-native), derived from the `omnigent.wrapper`
@@ -739,6 +740,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   interruptedResponseIds: [],
   status: "idle",
   sessionStatus: "idle",
+  backgroundTaskCount: 0,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
   boundAgentId: null,
@@ -810,6 +812,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ...s.pendingUserMessages,
         { tempId, content, ...(selfAuthor !== null ? { author: selfAuthor } : {}) },
       ],
+      // A new turn supersedes the prior turn's background-shell tally: the
+      // "N background tasks still running" label must give way to "Working…" the
+      // moment the user sends, not linger until the next status edge. The
+      // count is sticky (see the `session_status` handler) precisely so a
+      // trailing idle can't wipe it, so it has to be cleared explicitly here.
+      backgroundTaskCount: 0,
     }));
 
     // Pin the destination before joining the send chain: a stalled prior
@@ -904,6 +912,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
+            patch.backgroundTaskCount = 0;
           }
           return patch;
         });
@@ -1058,6 +1067,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
+            patch.backgroundTaskCount = 0;
           }
           return patch;
         });
@@ -1131,6 +1141,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         pendingUserMessages: [],
         status: "idle",
         sessionStatus: "idle",
+        backgroundTaskCount: 0,
       };
       if (s.activeResponse?.state === "streaming") {
         patch.activeResponse = {
@@ -1146,7 +1157,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // genuinely still running may briefly revert the sidebar dot — the helper's
     // "never fights the poller" contract doesn't hold here. Self-corrects on the
     // real idle event.
-    patchConversationStatusInCache(sessionId, "idle");
+    patchConversationStatusInCache(sessionId, "idle", get().backgroundTaskCount);
     // Mirror the session.status handler: a sub-agent's row lives in its parent's
     // child-sessions list, not the sidebar, so refresh the rail in lockstep.
     const snapshot = queryClient?.getQueryData<Session>(["session", sessionId]);
@@ -1220,6 +1231,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         interruptedResponseIds: [],
         status: "idle",
         sessionStatus: "idle",
+        backgroundTaskCount: 0,
         isNativeTerminalSession: false,
         nativeVendorOwnsModel: false,
         boundAgentId: null,
@@ -2032,6 +2044,10 @@ async function bindStream(
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
         sessionStatus: session.status,
+        // Re-show "N background tasks still running" after a reload/navigate-back: the
+        // live SSE edge that set this is long gone, so the count rides in on
+        // the snapshot (server keeps it sticky past the trailing PTY `idle`).
+        backgroundTaskCount: session.backgroundTaskCount ?? 0,
         selectedEffort: effectiveEffort,
         selectedModel: effectiveModel,
         // Session truth for the `/model` readout — overrides the snapshot
@@ -2162,6 +2178,9 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  */
 function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState> {
   const patch: Partial<ChatState> = { sessionStatus: session.status };
+  // Recover the background-shell tally across the gap too, so the spinner
+  // returns to "N background tasks still running" rather than vanishing on reconnect.
+  patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -3579,6 +3598,24 @@ export function handleSessionEvent(event: StreamEvent): void {
           return {};
         }
         const patch: Partial<ChatState> = { sessionStatus: event.status };
+        // The background-shell tally is STICKY. Only the Stop-hook-derived
+        // status carries an authoritative count (the forwarder relabels its
+        // `idle` to `waiting` and attaches `background_task_count`); the
+        // PTY-activity watcher's running/idle edges carry none (`undefined`).
+        // A claude-native turn that ends with shells still running emits, in
+        // order: the Stop hook's `waiting`(+count), then — ~1s later, once the
+        // pane quiesces — a bare PTY-activity `idle` (no count). If that
+        // trailing `idle` reset the count the spinner would vanish a beat
+        // after it appeared. So: an explicit count is authoritative (a Stop
+        // hook's `0` clears it, so a finished shell drops the indicator on the
+        // next turn end; a positive count sets it); `undefined` leaves it
+        // untouched; and a new turn (`running`) or a failure clears it —
+        // mirroring the server's `_publish_status`.
+        if (event.backgroundTaskCount !== undefined) {
+          patch.backgroundTaskCount = event.backgroundTaskCount;
+        } else if (event.status === "running" || event.status === "failed") {
+          patch.backgroundTaskCount = 0;
+        }
         if (
           event.responseId !== undefined &&
           (event.status === "running" || event.status === "waiting")
@@ -3654,7 +3691,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       // chat's "Working…" indicator — the exact desync users hit on a
       // claude-native session (chat clears/sets working instantly while
       // the sidebar dot stays stale).
-      patchConversationStatusInCache(event.conversationId, event.status);
+      patchConversationStatusInCache(
+        event.conversationId,
+        event.status,
+        useChatStore.getState().backgroundTaskCount,
+      );
       // On turn completion, refresh the Agents-rail preview for this
       // conversation. A child (added agent) finishing a turn leaves a stale
       // last_message_preview in its parent's child-sessions list (the runner
@@ -3938,14 +3979,17 @@ export function handleSessionEvent(event: StreamEvent): void {
 function patchConversationStatusInCache(
   conversationId: string,
   sessionStatus: SessionStatus,
+  backgroundTaskCount = 0,
 ): void {
   if (queryClient === null) return;
+  // Mirror the in-chat working indicator: a claude-native session that has
+  // settled to `idle` but still has background shells running must keep the
+  // sidebar spinner lit, exactly as `computeShowsWorking` keeps the chat
+  // indicator visible. `failed` still wins (the count is cleared on failure).
+  const working =
+    sessionStatus === "running" || sessionStatus === "waiting" || backgroundTaskCount > 0;
   const listStatus: NonNullable<Conversation["status"]> =
-    sessionStatus === "running" || sessionStatus === "waiting"
-      ? "running"
-      : sessionStatus === "failed"
-        ? "failed"
-        : "idle";
+    sessionStatus === "failed" ? "failed" : working ? "running" : "idle";
   queryClient.setQueriesData<InfiniteData<ConversationsPage>>(
     { queryKey: ["conversations"] },
     (data) => {

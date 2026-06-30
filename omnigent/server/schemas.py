@@ -1489,6 +1489,10 @@ class SessionResponse(BaseModel):
         before building this snapshot; the literal stays a superset
         of what the runtime can produce so a server that forwards
         the raw status never 500s on serialization.
+    :param background_task_count: Background shells (claude-native) still
+        running as of the last status edge, so a reload re-shows "N shells
+        still running" even though the session has settled to ``"idle"``.
+        ``None`` (the default / omitted) when no shells are tracked.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1692,6 +1696,7 @@ class SessionResponse(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    background_task_count: int | None = None
     created_at: int
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -2281,6 +2286,7 @@ class SessionStatusEvent(_SSEEventBase):
     status: Literal["idle", "launching", "running", "waiting", "failed"]
     response_id: str | None = None
     error: ErrorDetail | None = None
+    background_task_count: int | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):

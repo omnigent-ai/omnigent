@@ -835,6 +835,26 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 # Used by _get_session_snapshot.
 _session_status_cache: dict[str, str] = {}
 
+# Per-session background-shell tally (claude-native), kept in lockstep with
+# ``_session_status_cache`` so a snapshot/reload re-shows "N background tasks
+# still running" after the live SSE edge is gone. The authoritative source is
+# the ``Stop`` hook's ``background_tasks`` count: a positive count sets the
+# tally, an explicit ``0`` clears it (so a finished shell drops the indicator
+# at the next turn end), and a new turn (``running``) or a failure also clears
+# it. The trailing PTY-activity ``idle`` carries no count and must NOT clear it.
+#
+# KNOWN LIMITATION — the tally only refreshes at a turn boundary. Claude Code
+# emits no background-shell-completion hook, so a ``0`` is only ever posted by
+# the next ``Stop``. If a shell exits while the session is already idle and the
+# user never sends another message, no ``Stop`` fires and the indicator (chat,
+# sidebar, and reloads via ``_get_session_snapshot``) can read "N background
+# tasks still running" until the next turn. In practice the agent usually
+# narrates the shell's completion — which IS a turn, so its ``Stop`` clears the
+# tally — bounding the stale window to the next interaction. This mirrors the
+# TUI's own turn-boundary update of its "N shells still running" banner.
+# In-memory only — repopulates from live edges, exactly like the status cache.
+_session_background_task_count_cache: dict[str, int] = {}
+
 # Sessions whose current turn was Stopped: the relay drops the turn's trailing
 # response.* output (no forward, no persist). The fence lifts on the next
 # turn's "running" status or on any terminal response.* event.
@@ -1862,6 +1882,12 @@ def _session_status_with_child_rollup(
     own_status = _session_status_from_cache(conversation_id)
     if own_status == "running":
         return "running"
+    # A claude-native session can settle to ``idle`` while background shells
+    # keep running; the sticky tally keeps the sidebar spinner lit, matching
+    # the in-chat "N background tasks still running" indicator. (``failed``
+    # clears the tally, so this never masks a failure.)
+    if own_status != "failed" and _session_background_task_count_cache.get(conversation_id, 0) > 0:
+        return "running"
     if any(
         _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
@@ -2252,6 +2278,7 @@ def _build_session_response(
     items: list[ConversationItem],
     status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
+    background_task_count: int | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
     last_total_tokens: int | None = None,
@@ -2277,6 +2304,10 @@ def _build_session_response(
         order, each a :class:`ConversationItem`.
     :param status: Derived session lifecycle status,
         e.g. ``"running"``.
+    :param background_task_count: Background shells still running as of the
+        last status edge (claude-native), so a reload re-shows "N shells
+        still running" even after the session settles to ``"idle"``. ``None``
+        when none are tracked.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -2353,6 +2384,7 @@ def _build_session_response(
         agent_id=conv.agent_id,
         agent_name=agent_name,
         status=status,
+        background_task_count=background_task_count,
         created_at=conv.created_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
@@ -4579,6 +4611,42 @@ def _is_codex_native_subagent(conv: Conversation) -> bool:
     )
 
 
+def _subagent_delivery_status(
+    status: str,
+    background_task_count: int | None,
+    conv: Conversation,
+) -> str:
+    """Collapse a sub-agent's background-task ``waiting`` back to ``idle``.
+
+    A claude-native session running as an Omnigent sub-agent relabels its
+    ``Stop`` turn-end ``idle`` to ``waiting`` (in the forwarder) when
+    background shells linger, purely so its own UI shows a spinner. But the
+    sub-agent terminal-delivery branch in ``post_event`` keys off
+    ``idle``/``failed``: a ``waiting`` edge would never deliver the child's
+    result to the parent, hanging the orchestrator with no follow-up ``Stop``
+    to recover. The ``background_task_count`` alone already drives the child's
+    spinner at ``idle`` (the in-chat indicator and the sidebar rollup both
+    treat a positive tally as working), so for a sub-agent the turn genuinely
+    ended — deliver ``idle``. Top-level sessions are returned unchanged so the
+    web UI keeps its ``waiting`` shimmer.
+
+    :param status: The incoming external status, e.g. ``"waiting"``.
+    :param background_task_count: Parsed background-shell tally, or ``None``.
+    :param conv: The conversation the status is for.
+    :returns: ``"idle"`` for a non-codex sub-agent's background-task
+        ``waiting``; otherwise ``status`` unchanged.
+    """
+    if (
+        status == "waiting"
+        and background_task_count is not None
+        and background_task_count > 0
+        and conv.kind == "sub_agent"
+        and not _is_codex_native_subagent(conv)
+    ):
+        return "idle"
+    return status
+
+
 def _codex_subagent_labels_from_body(
     thread_id: str,
     body: SessionEventInput,
@@ -5201,6 +5269,7 @@ def _publish_status(
     status: str,
     error: ErrorDetail | None = None,
     response_id: str | None = None,
+    background_task_count: int | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5244,16 +5313,33 @@ def _publish_status(
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         return
     _session_status_cache[session_id] = status
+    # Keep the background-shell tally sticky alongside the status (see the
+    # cache's declaration). A ``Stop`` hook reports an authoritative count
+    # (``None`` is never sent by it): a positive count sets the tally, and
+    # an explicit ``0`` clears it so a finished background shell drops the
+    # indicator on the next turn end. ``None`` means "no information" (the
+    # trailing PTY-activity ``idle`` carries none) and must NOT wipe the
+    # count the Stop hook just published. A new turn or a failure clears it.
+    if background_task_count is not None:
+        if background_task_count > 0:
+            _session_background_task_count_cache[session_id] = background_task_count
+        else:
+            _session_background_task_count_cache.pop(session_id, None)
+    elif status in ("running", "failed"):
+        _session_background_task_count_cache.pop(session_id, None)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
         status=status,  # type: ignore[arg-type]
         response_id=response_id,
         error=error,
+        background_task_count=background_task_count,
     )
     payload = event.model_dump()
     if response_id is None:
         payload.pop("response_id", None)
+    if background_task_count is None:
+        payload.pop("background_task_count", None)
     session_stream.publish(session_id, payload)
 
 
@@ -18316,7 +18402,32 @@ def create_sessions_router(
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
-            _publish_status(session_id, status, status_error, response_id=response_id)
+            # ``None`` (field absent) = no information; leave the sticky
+            # tally untouched (the PTY-activity ``idle`` carries none). An
+            # explicit ``0`` from a ``Stop`` hook is authoritative and clears
+            # the tally, so a finished background shell drops the indicator.
+            raw_bg_count = body.data.get("background_task_count")
+            bg_count = (
+                raw_bg_count
+                if isinstance(raw_bg_count, int)
+                and not isinstance(raw_bg_count, bool)
+                and raw_bg_count >= 0
+                else None
+            )
+            # A sub-agent's background-task ``waiting`` must deliver as ``idle``
+            # so the parent's terminal-delivery branch below fires (otherwise
+            # the orchestrator hangs); the tally still drives the child spinner.
+            effective_status = _subagent_delivery_status(status, bg_count, conv)
+            if effective_status != status:
+                status = effective_status
+                body.data["status"] = status
+            _publish_status(
+                session_id,
+                status,
+                status_error,
+                response_id=response_id,
+                background_task_count=bg_count,
+            )
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
@@ -20198,6 +20309,7 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
+        background_task_count=_session_background_task_count_cache.get(session_id),
         llm_model=llm_model,
         context_window=context_window,
         last_total_tokens=last_total_tokens,

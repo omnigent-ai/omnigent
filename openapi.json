@@ -4208,6 +4208,18 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "background_task_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
+            "title": "Background Task Count"
+          },
           "context_window": {
             "anyOf": [
               {
@@ -4705,6 +4717,18 @@
       "SessionStatusEvent": {
         "description": "Session lifecycle status transition.\n\nEmitted by the runtime / session route handler at every\ntransition between `launching` / `running` / `waiting` /\n`idle` / `failed`. Wire shape is\nFLAT (not enveloped): `{\"type\": \"session.status\", \"conversation_id\": \"...\", \"status\": \"...\", \"sequence_number\": null}`.\n\nThe `waiting` value is emitted by the runtime's parent agent\nloop when it parks on the `async_work_complete` drain\n(`_drain_async_completions(block_for_one=True)` in\n`omnigent/runtime/workflow.py`) \u2014 i.e. while the parent\nturn is suspended waiting for background tools or sub-agents\nto complete. Per the session-rearchitecture spec \u00a73\n(\"Event types and direction\"), `waiting` is the\nsession-status companion of the spec's `turn.waiting`\ntransient \u2014 clients should render the session as actively\nblocked-on-async-work, distinct from `running`. When the\ndrain wakes (a child completed), the runtime emits a follow-up\n`running` to resume.",
         "properties": {
+          "background_task_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Background Task Count"
+          },
           "conversation_id": {
             "description": "The conversation/session identifier whose status changed, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",

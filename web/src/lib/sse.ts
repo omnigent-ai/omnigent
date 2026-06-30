@@ -420,11 +420,19 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         status === "failed")
     ) {
       const responseId = typeof data.response_id === "string" ? data.response_id : undefined;
+      // `undefined` (field absent) = no information; the sticky tally is
+      // left untouched. An explicit `0` from a Stop hook is authoritative
+      // and clears it, so a finished background shell drops the indicator.
+      const backgroundTaskCount =
+        typeof data.background_task_count === "number" && data.background_task_count >= 0
+          ? data.background_task_count
+          : undefined;
       return {
         type: "session_status",
         conversationId,
         status,
         responseId,
+        backgroundTaskCount,
       } satisfies SessionStatusEvent;
     }
     return null;

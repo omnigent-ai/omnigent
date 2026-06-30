@@ -108,6 +108,12 @@ interface SessionResponseWire {
    */
   host_resumable?: boolean;
   status: SessionStatus;
+  /**
+   * Background shells (claude-native) still running as of the last status
+   * edge, so a reload re-shows "N background tasks still running" after the session
+   * has settled to ``"idle"``. Absent/0 when none are tracked.
+   */
+  background_task_count?: number | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -260,6 +266,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostId: wire.host_id ?? null,
     hostResumable: wire.host_resumable ?? false,
     status: wire.status,
+    backgroundTaskCount: wire.background_task_count ?? undefined,
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
