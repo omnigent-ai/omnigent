@@ -97,10 +97,18 @@ loop endlessly. If nothing works, say so.
 
 def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
     """
-    Build the ``__web_researcher`` AgentSpec using the parent's LLM config.
+    Build the ``__web_researcher`` AgentSpec from the parent's spec.
 
     The researcher gets:
     - The parent's ``llm`` config (model + connection + extras)
+    - The parent's executor harness, ``auth``, ``model``, and
+      ``connection`` (with ``max_iterations`` capped low) — the
+      researcher runs on the SAME harness leg as its parent and routes
+      through the parent's provider. Without this the child defaults to
+      ``type="omnigent"`` with no harness, which the runner rejects as
+      ``unknown harness 'omnigent'`` before any model routing, and
+      (latently) drops the parent's provider so a gateway model hits the
+      native router with an ``Unknown provider`` error.
     - An ``os_env`` block — registers ``sys_os_shell`` for one-shot
       bash commands (curl, python3 one-liners). The previous
       implementation used ``terminal_run``; that family was deleted
@@ -136,6 +144,33 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         sandbox=parent_os_env.sandbox if parent_os_env is not None else None,
     )
 
+    # Inherit the parent leg's executor so the researcher runs on the SAME
+    # harness, with the SAME credentials and model, as its parent. The prior
+    # implementation copied only ``llm`` and built a bare
+    # ``ExecutorSpec(max_iterations=5)``, which defaults ``type`` to
+    # ``"omnigent"`` with an empty ``config``. Two failures followed:
+    #
+    # - Layer 1 (active): with no ``config["harness"]``, ``harness_kind``
+    #   resolves to the literal executor type ``"omnigent"``, so the runner
+    #   aborts every researcher spawn with ``RuntimeError: unknown harness
+    #   'omnigent'`` before any model routing — every ``web_fetch`` fails on
+    #   all legs.
+    # - Layer 2 (latent): dropping the parent's harness and ``auth`` also
+    #   strips the researcher off the parent's provider. A gateway model such
+    #   as ``z-ai/glm-5.2`` then hits the in-process native router, which has
+    #   no provider for the ``z-ai`` prefix (``Unknown provider 'z-ai'``), and
+    #   the codex / claude legs fail on missing credentials.
+    #
+    # Carrying the parent's harness / auth / model / connection routes the
+    # researcher through the parent's harness to the parent's provider —
+    # closing both layers. ``os_env`` carried inside ``executor.config`` is an
+    # inline-sub-spec translation artifact and is superseded by the explicit
+    # ``os_env`` above, so it is dropped to avoid re-deriving the sandbox.
+    parent_executor = parent_spec.executor
+    child_executor_config = {
+        key: value for key, value in parent_executor.config.items() if key != "os_env"
+    }
+
     return AgentSpec(
         spec_version=1,
         name=RESEARCHER_NAME,
@@ -145,10 +180,31 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         tools=ToolsConfig(),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,
-        # Low max_iterations to keep the sub-agent fast.
-        # 1 fetch + 1 retry = 2 tool calls max, plus the
-        # final response = ~3 iterations.
-        executor=ExecutorSpec(max_iterations=5),
+        executor=ExecutorSpec(
+            # Inherit the parent's executor type (e.g. "omnigent") so the
+            # harness/provider routing below is keyed off the same discriminator.
+            type=parent_executor.type,
+            # Low max_iterations to keep the sub-agent fast.
+            # 1 fetch + 1 retry = 2 tool calls max, plus the
+            # final response = ~3 iterations.
+            max_iterations=5,
+            # Routing-relevant config: ``harness`` (closes Layer 1) plus any
+            # ``permission_mode`` / ``use_responses`` / ``profile`` the spawn-env
+            # builders read. ``os_env`` is intentionally excluded (see above).
+            config=child_executor_config,
+            # The harness spawn-env builders resolve the model from
+            # ``executor.model`` (not ``llm.model``) and credentials from
+            # ``executor.auth`` / ``executor.connection`` — inherit all three so
+            # the researcher routes the parent's model through the parent's
+            # provider (closes Layer 2).
+            model=parent_executor.model,
+            connection=parent_executor.connection,
+            context_window=parent_executor.context_window,
+            auth=parent_executor.auth,
+            # Legacy Databricks profile (deprecated path) — carried for parity
+            # with parents that still rely on ``executor.profile``.
+            profile=parent_executor.profile,
+        ),
     )
 
 

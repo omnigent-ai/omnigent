@@ -6,6 +6,7 @@ from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
     LLMConfig,
+    ProviderAuth,
 )
 from omnigent.tools.builtins.web_fetch import (
     RESEARCHER_NAME,
@@ -285,6 +286,96 @@ def testbuild_researcher_spec_default_executor() -> None:
     parent = _make_parent_spec()
     researcher = build_researcher_spec(parent)
     assert researcher.executor.type == "omnigent"
+
+
+def test_researcher_inherits_parent_harness_auth_and_model() -> None:
+    """
+    Regression: the reconstructed ``__web_researcher`` must run on the
+    PARENT LEG's harness with the parent's credentials and model.
+
+    ``build_researcher_spec`` previously copied only ``llm`` and built a
+    bare ``ExecutorSpec(max_iterations=5)``. That bare spec defaults
+    ``type`` to ``"omnigent"`` with an empty ``config``, so:
+
+    - Layer 1 (active): ``executor.harness_kind`` resolves to the literal
+      ``"omnigent"`` (no ``config["harness"]``), and the runner aborts the
+      researcher spawn with ``RuntimeError: unknown harness 'omnigent'``
+      before any model routing — every ``web_fetch`` fails on all legs.
+    - Layer 2 (latent): dropping the parent's ``auth`` and model strips the
+      researcher off the parent's provider, so a gateway model such as
+      ``z-ai/glm-5.2`` hits the native router with ``Unknown provider
+      'z-ai'`` and the codex / claude legs fail on missing credentials.
+
+    The harness spawn-env builders read ``executor.config["harness"]``
+    (harness selection), ``executor.model`` (NOT ``llm.model``), and
+    ``executor.auth`` / ``executor.connection`` (credentials), so all of
+    these must carry from the parent.
+    """
+    parent_auth = ProviderAuth(name="openrouter")
+    parent = AgentSpec(
+        spec_version=1,
+        name="pi-parent",
+        llm=LLMConfig(model="z-ai/glm-5.2"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "pi"},
+            model="z-ai/glm-5.2",
+            connection={"base_url": "https://openrouter.ai/api/v1"},
+            auth=parent_auth,
+        ),
+    )
+
+    researcher = build_researcher_spec(parent)
+
+    # Layer 1: the child must NOT be the bare "unknown harness 'omnigent'"
+    # spec — it carries the parent's harness selector.
+    assert researcher.executor.config.get("harness") == "pi", (
+        "Researcher dropped the parent's harness — the runner would abort "
+        f"with unknown harness {researcher.executor.harness_kind!r}."
+    )
+    assert researcher.executor.harness_kind == "pi", (
+        "harness_kind must resolve to the parent's harness, not the literal "
+        f"executor type; got {researcher.executor.harness_kind!r}."
+    )
+    assert researcher.executor.harness_kind != "omnigent"
+
+    # Layer 2: credentials + model must carry so the parent's provider routes
+    # the parent's model.
+    assert researcher.executor.auth is parent_auth, (
+        "Researcher dropped the parent's auth — the gateway model would hit "
+        "the native router (Unknown provider 'z-ai')."
+    )
+    assert researcher.executor.model == "z-ai/glm-5.2"
+    assert researcher.executor.connection == {"base_url": "https://openrouter.ai/api/v1"}
+
+    # The fast-cap is preserved.
+    assert researcher.executor.max_iterations == 5
+
+
+def test_researcher_drops_inline_os_env_from_executor_config() -> None:
+    """
+    ``executor.config["os_env"]`` is an inline-sub-spec translation artifact;
+    the researcher declares its own top-level ``os_env``. Carrying the config
+    ``os_env`` would re-introduce a stale sandbox mapping, so it is dropped
+    while every other routing key (e.g. ``harness``) is preserved.
+    """
+    parent = AgentSpec(
+        spec_version=1,
+        name="codex-parent",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex", "os_env": {"type": "caller_process"}},
+            model="openai/gpt-5.4",
+        ),
+    )
+
+    researcher = build_researcher_spec(parent)
+
+    assert researcher.executor.config.get("harness") == "codex"
+    assert "os_env" not in researcher.executor.config
+    # The explicit top-level os_env (which registers sys_os_shell) is intact.
+    assert researcher.os_env is not None
 
 
 def test_web_fetch_is_sync_in_sessions_native_mode() -> None:
