@@ -65,6 +65,10 @@ _DISCOVERY_SKEW_S = 10.0
 
 _STATE_FILE = "hermes_forwarder.json"
 
+#: Event type for a one-shot reasoning (thinking) mirror, matching the
+#: codex-/opencode-native forwarders' transient reasoning contract.
+_EXTERNAL_OUTPUT_REASONING_DELTA = "external_output_reasoning_delta"
+
 # A sibling session's persisted claim (naming the same ``hermes_session_id``)
 # counts as a LIVE owner only if its heartbeat was refreshed within this window;
 # an older claim is treated as a dead session and may be taken over. Generous
@@ -411,13 +415,17 @@ def _message_to_items(
     tool_calls: object,
     tool_call_id: object,
     tool_name: object,  # noqa: ARG001 — reserved for future use (e.g. logging)
+    reasoning_content: object,
+    reasoning: object,
     agent_name: str,
 ) -> list[_MirrorItem]:
     """Convert one ``messages`` row to mirror items.
 
-    An assistant row with ``tool_calls`` emits a ``function_call`` item per
-    call, followed by a ``message`` item if it also has prose content. A tool
-    row emits a ``function_call_output`` item. Returns an empty list to skip.
+    An assistant row with reasoning emits a one-shot
+    ``external_output_reasoning_delta`` item first, then a ``function_call``
+    item per call, followed by a ``message`` item if it also has prose content.
+    A tool row emits a ``function_call_output`` item. Returns an empty list to
+    skip.
     """
     if not isinstance(role, str):
         return []
@@ -445,6 +453,25 @@ def _message_to_items(
 
     if role == "assistant":
         items: list[_MirrorItem] = []
+        # Mirror the agent's thinking once: Hermes persists completed rows (not
+        # deltas), so a single one-shot delta is correct. Prefer reasoning_content
+        # then reasoning; skip structured codex_reasoning_items (raw, not dumped).
+        thinking = ""
+        for raw in (reasoning_content, reasoning):
+            if isinstance(raw, str):
+                stripped = _ATTACHMENT_MARKER_RE.sub("", raw).strip()
+                if stripped:
+                    thinking = stripped
+                    break
+        if thinking:
+            items.append(
+                _MirrorItem(
+                    msg_id=msg_id,
+                    item_type=_EXTERNAL_OUTPUT_REASONING_DELTA,
+                    item_data={"delta": thinking, "started": True},
+                    response_id=response_id,
+                )
+            )
         # Parse tool_calls JSON — assistant rows may include tool call requests.
         if isinstance(tool_calls, str) and tool_calls:
             try:
@@ -519,7 +546,8 @@ def _read_new_items(
         return []
     try:
         rows = con.execute(
-            "SELECT id, role, content, tool_calls, tool_call_id, tool_name "
+            "SELECT id, role, content, tool_calls, tool_call_id, tool_name, "
+            "reasoning_content, reasoning "
             "FROM messages "
             "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
             (hermes_session_id, last_id),
@@ -530,9 +558,26 @@ def _read_new_items(
     finally:
         con.close()
     items: list[_MirrorItem] = []
-    for msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val in rows:
+    for (
+        msg_id,
+        role,
+        content,
+        tool_calls_json,
+        tool_call_id,
+        tool_name_val,
+        reasoning_content,
+        reasoning,
+    ) in rows:
         converted = _message_to_items(
-            msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val, agent_name
+            msg_id,
+            role,
+            content,
+            tool_calls_json,
+            tool_call_id,
+            tool_name_val,
+            reasoning_content,
+            reasoning,
+            agent_name,
         )
         if converted:
             items.extend(converted)
@@ -544,7 +589,22 @@ def _read_new_items(
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
 ) -> None:
-    """POST one mirrored item as an ``external_conversation_item`` event."""
+    """POST one mirrored item as the appropriate session event.
+
+    Reasoning items post a transient ``external_output_reasoning_delta`` (the
+    web finalizes the block when the assistant message lands); all others post
+    an ``external_conversation_item``.
+    """
+    if item.item_type == _EXTERNAL_OUTPUT_REASONING_DELTA:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": _EXTERNAL_OUTPUT_REASONING_DELTA,
+                "data": item.item_data,
+            },
+        )
+        resp.raise_for_status()
+        return
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
