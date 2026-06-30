@@ -818,32 +818,6 @@
   }
 }
 
-/* "Running / working" status indicator — a single brand-pink dot that fades
- * between faint and full opacity. Subtle yet noticeable, and cheaper than a
- * spinner. Shared by the sidebar SessionStateBadge and the SubagentsPanel. */
-@keyframes running-pulse {
-  0%,
-  100% {
-    opacity: 0.35;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-.running-pulse-dot {
-  animation: running-pulse 1.4s ease-in-out infinite;
-}
-
-/* Reduced-motion: hold the dot at a steady mid-opacity so the state is still
- * legible without motion. */
-@media (prefers-reduced-motion: reduce) {
-  .running-pulse-dot {
-    animation: none;
-    opacity: 0.8;
-  }
-}
-
 /* ── Intelligent model router — composer sparkle toggle ──────────────────
  * (components/CostRoutingControl.tsx.) Two stacked sparkle layers cross-fade
  * with a slight spring as the toggle flips; a soft monochrome halo backs the

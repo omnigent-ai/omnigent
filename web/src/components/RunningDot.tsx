@@ -1,10 +1,12 @@
+import { Loader2Icon } from "lucide-react";
+
 export function RunningDot() {
   return (
-    <span
+    <Loader2Icon
       aria-hidden
       role="presentation"
       data-testid="running-dot"
-      className="running-pulse-dot size-2 shrink-0 rounded-full bg-brand-accent"
+      className="size-3 shrink-0 animate-spin text-muted-foreground"
     />
   );
 }

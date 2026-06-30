@@ -850,11 +850,13 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel();
 
-    // Working reuses the sidebar RunningDot in the brand-pink tone —
+    // Working reuses the sidebar RunningDot in the grey tone —
     // identical to the sidebar's running indicator; a wrong tone drops
-    // bg-brand-accent.
+    // text-muted-foreground.
     expect(
-      childRow(container, "c_work").querySelector('[data-testid="running-dot"].bg-brand-accent'),
+      childRow(container, "c_work").querySelector(
+        '[data-testid="running-dot"].text-muted-foreground',
+      ),
     ).not.toBeNull();
     // Terminal states use design tokens, not raw 500-weight Tailwind. "done"
     // is a quiet, expected outcome, so it reads as a muted dot (not green);
