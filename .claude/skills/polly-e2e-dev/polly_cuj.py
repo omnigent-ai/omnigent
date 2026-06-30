@@ -124,9 +124,7 @@ def _mock_reset(mock_url: str) -> None:
     _post_json(f"{mock_url}/mock/reset", {})
 
 
-def _mock_configure(
-    mock_url: str, responses: list[dict], *, key: str = "default"
-) -> None:
+def _mock_configure(mock_url: str, responses: list[dict], *, key: str = "default") -> None:
     """Load a keyed response queue on the mock server."""
     _post_json(f"{mock_url}/mock/configure", {"key": key, "responses": responses})
 
@@ -164,9 +162,7 @@ def _sys_os_shell_call(command: str, *, call_id: str = "call_sh") -> dict:
 # ── Bundle rewrite (inlined from tests/e2e/test_polly_e2e.py) ─────────────────
 
 
-def _mock_polly_bundle(
-    tmp: Path, mock_url: str, *, rewrite_subagents: bool = False
-) -> Path:
+def _mock_polly_bundle(tmp: Path, mock_url: str, *, rewrite_subagents: bool = False) -> Path:
     """Copy ``examples/polly`` into *tmp* and rewrite it to use the mock LLM.
 
     Switches the brain harness from ``claude-sdk`` to ``openai-agents``, pins the
@@ -419,9 +415,7 @@ def _latest_session_id(server_url: str) -> str | None:
 
 def _session_items(server_url: str, session_id: str) -> list[dict]:
     """All items in a session, chronological."""
-    page = _get_json(
-        f"{server_url}/v1/sessions/{session_id}/items?order=asc&limit=300"
-    )
+    page = _get_json(f"{server_url}/v1/sessions/{session_id}/items?order=asc&limit=300")
     data = page.get("data", []) if isinstance(page, dict) else []
     return [item for item in data if isinstance(item, dict)]
 
@@ -566,9 +560,7 @@ def _guardrail_scenario(
     # Drain any stray sub-agent child LLM calls with a trivial fallback.
     _mock_set_fallback(s.mock_url, "default", "ok")
     _mock_configure(s.mock_url, responses, key=_BRAIN_MODEL)
-    bundle = _mock_polly_bundle(
-        ctx.tmp / name, s.mock_url, rewrite_subagents=rewrite_subagents
-    )
+    bundle = _mock_polly_bundle(ctx.tmp / name, s.mock_url, rewrite_subagents=rewrite_subagents)
     proc = _run_polly(bundle, s.server_url, prompt, s.mock_url)
     _add_exit_check(res, proc)
 
