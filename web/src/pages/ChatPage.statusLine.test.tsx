@@ -15,6 +15,29 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   };
 });
 
+// HostBadge now lives in the status-line tray (left of the worktree branch).
+// It reads the session's host binding via these hooks; stub them so the badge
+// renders deterministically without a QueryClient / RunnerHealth provider. The
+// default is "not host-bound", so the badge self-hides and the existing branch/
+// ring/harness assertions are unchanged; host-aware tests override per case.
+const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
+  useSessionMock: vi.fn(),
+  useHostsMock: vi.fn(),
+  useSessionHostOnlineMock: vi.fn(),
+}));
+vi.mock("@/hooks/useSession", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  useSession: (id: string | null | undefined) => useSessionMock(id),
+}));
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  useHosts: (opts: unknown) => useHostsMock(opts),
+}));
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
+}));
+
 import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
@@ -64,8 +87,31 @@ function statusLine(): Element | null {
   return document.querySelector('[data-testid="composer-status-line"]');
 }
 
+/** Bind the active session to an online host named `name` so HostBadge shows. */
+function bindHost(name: string) {
+  useSessionMock.mockReturnValue({
+    session: { hostId: "host_a1b2" },
+    isLoading: false,
+    error: null,
+  });
+  useHostsMock.mockReturnValue({
+    data: [
+      { host_id: "host_a1b2", name, owner: "alice", status: "online", sandbox_provider: null },
+    ],
+  });
+  useSessionHostOnlineMock.mockReturnValue(true);
+}
+
 describe("Composer status line (branch + context ring)", () => {
   beforeEach(() => {
+    // Default: no host bound, so HostBadge renders nothing.
+    useSessionMock.mockReset().mockReturnValue({
+      session: { hostId: null },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReset().mockReturnValue({ data: [] });
+    useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
     useChatStore.setState({
       conversationId: "conv_test",
       skills: [],
@@ -246,6 +292,32 @@ describe("Composer status line (branch + context ring)", () => {
     expect(plan.compareDocumentPosition(harness) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+  });
+
+  it("shows the host badge to the left of the worktree branch", () => {
+    // The host indicator moved out of the chat header into this tray; it
+    // sits immediately left of the worktree branch.
+    bindHost("mac-laptop");
+    useChatStore.setState({ gitBranch: "geist" });
+    renderComposer();
+
+    const host = screen.getByTestId("host-badge");
+    const branch = screen.getByTestId("composer-git-branch");
+    expect(host).toHaveTextContent("mac-laptop");
+    expect(host.compareDocumentPosition(branch) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("hides the host badge on a sub-agent session", () => {
+    // A child session repurposes the header's left slot for the back
+    // affordance, so the host badge stays hidden there as it did before.
+    bindHost("mac-laptop");
+    useChatStore.setState({ gitBranch: "geist" });
+    renderComposer({ subAgentLabel: "check-eligibility" });
+
+    expect(screen.queryByTestId("host-badge")).toBeNull();
+    expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
   });
 });
 
