@@ -402,6 +402,12 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         # Claude native Edit also uses ``file_path``.
         ("Edit", "file_path", "main.py", "ALLOW"),
         ("Edit", "file_path", "~/.bashrc", "DENY"),
+        # Claude native MultiEdit also uses ``file_path``. Without it in the
+        # gated set, an unsandboxed worker could escape its worktree via a
+        # multi-file edit -- the gap these cases pin.
+        ("MultiEdit", "file_path", "src/app.py", "ALLOW"),
+        ("MultiEdit", "file_path", "/etc/passwd", "DENY"),
+        ("MultiEdit", "file_path", "../escape.py", "DENY"),
         # Pi native write/edit (lowercase) use ``path`` (Omnigent convention).
         ("write", "path", "src/app.py", "ALLOW"),
         ("write", "path", "/etc/passwd", "DENY"),
@@ -413,6 +419,9 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         "Write-escape",
         "Edit-in-tree",
         "Edit-home-escape",
+        "MultiEdit-in-tree",
+        "MultiEdit-absolute",
+        "MultiEdit-escape",
         "pi-write-in-tree",
         "pi-write-absolute",
         "pi-edit-escape",

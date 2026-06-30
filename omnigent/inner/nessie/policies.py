@@ -538,12 +538,13 @@ def worktree_guard(
     :returns: An evaluator ``fn(event, config)`` returning a V0 decision.
     """
 
-    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit
-    # (surfaced via the PreToolUse hook), and Pi's native lowercase
+    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit/
+    # MultiEdit (surfaced via the PreToolUse hook), and Pi's native lowercase
     # write/edit (surfaced via the pi ``tool_call`` hook). Pi uses the same
     # ``path`` argument key as the Omnigent tools, so no Pi-specific arg
-    # branch is needed below.
-    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "write", "edit"}
+    # branch is needed below. ``MultiEdit`` carries ``file_path`` like the
+    # other Claude native edit tools, so the extraction below already covers it.
+    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "MultiEdit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
