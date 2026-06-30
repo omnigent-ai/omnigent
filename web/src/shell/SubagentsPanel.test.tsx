@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
-import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
+import { iconForAgentType, sortSiblingsByActivity, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
@@ -462,8 +462,11 @@ describe("SubagentsPanel", () => {
     expect(screen.getByTestId("subagent-main-row")).toBeInTheDocument();
     const rows = screen.getAllByTestId("subagent-row");
     expect(rows).toHaveLength(2);
-    expect(rows[0]).toHaveAttribute("href", "/c/conv_child_a");
-    expect(rows[1]).toHaveAttribute("href", "/c/conv_child_b");
+    // The rail orders rows by activity (#1410): the working child
+    // (conv_child_b) sorts above the completed one (conv_child_a) regardless of
+    // input order — see the "sibling ordering (#1410)" suite below.
+    expect(rows[0]).toHaveAttribute("href", "/c/conv_child_b");
+    expect(rows[1]).toHaveAttribute("href", "/c/conv_child_a");
     // Status-word display (which states show a word vs. a bare dot) is owned
     // by the dedicated "shows the status word only for notable states" test.
   });
@@ -1196,5 +1199,90 @@ describe("SubagentsPanel", () => {
 
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
+  });
+});
+
+describe("SubagentsPanel sibling ordering (#1410)", () => {
+  // Each builder yields a child the panel collapses (via childStatus)
+  // to exactly one AgentActivity, so the ordering is unambiguous.
+  const awaiting = (id: string) => childInfo({ id, pending_elicitations_count: 1 });
+  const working = (id: string) => childInfo({ id, busy: true });
+  const launching = (id: string) => childInfo({ id, current_task_status: "launching" });
+  const idle = (id: string) => childInfo({ id });
+  const other = (id: string) => childInfo({ id, current_task_status: "cancelled" });
+  const done = (id: string) => childInfo({ id, current_task_status: "completed" });
+  const failed = (id: string) => childInfo({ id, current_task_status: "failed" });
+
+  const ids = (children: ChildSessionInfo[]) => children.map((c) => c.id);
+
+  /** Ordered child-session ids as actually rendered in the rail DOM. */
+  function renderedChildOrder(container: HTMLElement): string[] {
+    return Array.from(container.querySelectorAll<HTMLElement>('[data-testid="subagent-row"]')).map(
+      (el) => el.getAttribute("data-child-session-id") ?? "",
+    );
+  }
+
+  it("ranks attention-needing and live agents above settled ones", () => {
+    // Each id is named for its activity, supplied worst-first, so the
+    // expected array reads as the priority order and a no-op sort fails.
+    const sorted = sortSiblingsByActivity([
+      failed("failed"),
+      done("done"),
+      other("other"),
+      idle("idle"),
+      launching("launching"),
+      working("working"),
+      awaiting("awaiting"),
+    ]);
+    expect(ids(sorted)).toEqual([
+      "awaiting",
+      "working",
+      "launching",
+      "idle",
+      "other",
+      "done",
+      "failed",
+    ]);
+  });
+
+  it("breaks ties by created_at, newest child first", () => {
+    // Two working rows supplied oldest-first; the newer one must lead.
+    const input = [
+      childInfo({ id: "w_old", busy: true, created_at: 100 }),
+      childInfo({ id: "w_new", busy: true, created_at: 200 }),
+    ];
+    expect(ids(sortSiblingsByActivity(input))).toEqual(["w_new", "w_old"]);
+  });
+
+  it("falls back to original order when created_at is absent (deterministic)", () => {
+    // With no created_at the tiebreak drops to the original index, so
+    // same-status rows never reshuffle across TREE_POLL_MS re-polls.
+    const input = [done("d1"), working("w1"), working("w2"), done("d2")];
+    expect(ids(sortSiblingsByActivity(input))).toEqual(["w1", "w2", "d1", "d2"]);
+  });
+
+  it("returns a new array and does not mutate its input", () => {
+    const input = [done("d"), working("w")];
+    const before = ids(input);
+    sortSiblingsByActivity(input);
+    expect(ids(input)).toEqual(before);
+  });
+
+  it("renders the top-level rows in priority order", () => {
+    mockChildTree({
+      conv_parent: [done("c_done"), awaiting("c_awaiting"), working("c_working")],
+    });
+    const { container } = renderPanel();
+    expect(renderedChildOrder(container)).toEqual(["c_awaiting", "c_working", "c_done"]);
+  });
+
+  it("sorts each sibling group independently, including grandchildren", () => {
+    mockChildTree({
+      conv_parent: [working("c_parent")],
+      c_parent: [done("g_done"), awaiting("g_awaiting")],
+    });
+    const { container } = renderPanel();
+    // Parent row first, then its grandchildren in priority order beneath it.
+    expect(renderedChildOrder(container)).toEqual(["c_parent", "g_awaiting", "g_done"]);
   });
 });

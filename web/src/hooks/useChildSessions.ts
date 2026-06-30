@@ -51,6 +51,13 @@ export interface ChildSessionInfo {
    * the Agents rail renders an "awaiting input" badge for it.
    */
   pending_elicitations_count: number;
+  /**
+   * Unix-epoch creation time of the child session. Surfaced only as a
+   * stable tiebreak for the Agents rail's activity sort (newest first).
+   * Optional: cached entries written before this field shipped, and
+   * unit-test fixtures, may omit it.
+   */
+  created_at?: number;
 }
 
 /**
@@ -69,6 +76,7 @@ interface ChildSessionWire {
   busy: boolean;
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
+  created_at?: number;
 }
 
 interface ChildSessionsResponse {
@@ -180,6 +188,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     busy: row.busy,
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
+    created_at: row.created_at,
   }));
 }
 
