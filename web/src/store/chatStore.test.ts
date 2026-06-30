@@ -6734,6 +6734,59 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
+  it("does not double-render pi-native text when the harness response completes before the deltas", async () => {
+    // Faithful replay of a real pi-native turn (captured from a live
+    // `omnigent pi` server). The harness PiNativeExecutor completes its
+    // Omnigent response the instant it enqueues the user message — so
+    // `response.in_progress` + `response.completed` arrive BEFORE Pi's
+    // extension streams the assistant text deltas and the authoritative
+    // item. The early `response.completed` (response_end) is the missing
+    // ingredient the other tests never exercised.
+    useChatStore.setState({
+      conversationId: "conv_pi",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_pi");
+
+    // Harness turn opens and immediately completes (enqueue → TurnComplete).
+    sink.push(
+      sse("response.in_progress", {
+        id: "resp_harness",
+        status: "in_progress",
+        model: "pi-native-ui",
+        output: [],
+      }),
+    );
+    sink.push(
+      sse("response.completed", {
+        id: "resp_harness",
+        status: "completed",
+        model: "pi-native-ui",
+        output: [],
+      }),
+    );
+    await tick();
+
+    // Pi then streams the assistant text and posts the authoritative item.
+    sink.push(nativeDelta("pi-turn-0:msg:0", 0, "PONG", false));
+    sink.push(nativeDelta("pi-turn-0:msg:0", 1, "", true));
+    await tick();
+    sink.push(messageDone("msg_real", "pi-turn-0", "PONG"));
+    await tick();
+
+    // The provisional preview must be retired and replaced — exactly one
+    // assistant text bubble, not the preview AND the authoritative item.
+    expect(provisional()).toBeUndefined();
+    const dones = useChatStore
+      .getState()
+      .blocks.filter((b): b is Extract<AnyBlock, { type: "text_done" }> => b.type === "text_done");
+    expect(dones.map((b) => b.ctx.itemId)).toEqual(["msg_real"]);
+    expect(dones).toHaveLength(1);
+
+    controller.abort();
+  });
+
   it("keeps an interrupted native partial item marked cancelled", async () => {
     useChatStore.setState({
       conversationId: "conv_interrupt",
