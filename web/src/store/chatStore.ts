@@ -271,6 +271,7 @@ export interface ChatState {
    * for the rest of the session lifetime.
    */
   sessionStatus: SessionStatus;
+  backgroundTaskCount: number;
   /**
    * Whether the active session is a native-terminal wrapper
    * (claude-native / codex-native), derived from the `omnigent.wrapper`
@@ -739,6 +740,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   interruptedResponseIds: [],
   status: "idle",
   sessionStatus: "idle",
+  backgroundTaskCount: 0,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
   boundAgentId: null,
@@ -904,6 +906,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
+            patch.backgroundTaskCount = 0;
           }
           return patch;
         });
@@ -1058,6 +1061,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
+            patch.backgroundTaskCount = 0;
           }
           return patch;
         });
@@ -1131,6 +1135,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         pendingUserMessages: [],
         status: "idle",
         sessionStatus: "idle",
+        backgroundTaskCount: 0,
       };
       if (s.activeResponse?.state === "streaming") {
         patch.activeResponse = {
@@ -1220,6 +1225,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         interruptedResponseIds: [],
         status: "idle",
         sessionStatus: "idle",
+        backgroundTaskCount: 0,
         isNativeTerminalSession: false,
         nativeVendorOwnsModel: false,
         boundAgentId: null,
@@ -3578,7 +3584,10 @@ export function handleSessionEvent(event: StreamEvent): void {
           // prior turn's working signal; response_end owns that lifecycle.
           return {};
         }
-        const patch: Partial<ChatState> = { sessionStatus: event.status };
+        const patch: Partial<ChatState> = {
+          sessionStatus: event.status,
+          backgroundTaskCount: event.backgroundTaskCount ?? 0,
+        };
         if (
           event.responseId !== undefined &&
           (event.status === "running" || event.status === "waiting")

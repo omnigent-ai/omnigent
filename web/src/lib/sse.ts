@@ -420,11 +420,16 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         status === "failed")
     ) {
       const responseId = typeof data.response_id === "string" ? data.response_id : undefined;
+      const backgroundTaskCount =
+        typeof data.background_task_count === "number" && data.background_task_count > 0
+          ? data.background_task_count
+          : undefined;
       return {
         type: "session_status",
         conversationId,
         status,
         responseId,
+        backgroundTaskCount,
       } satisfies SessionStatusEvent;
     }
     return null;

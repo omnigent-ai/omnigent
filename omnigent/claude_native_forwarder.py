@@ -2702,6 +2702,7 @@ async def _forward_available_status_events(
                 client,
                 session_id=session_id,
                 status=effective_status,
+                background_task_count=record.background_task_count,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
@@ -3680,6 +3681,7 @@ async def _post_external_session_status(
     session_id: str,
     status: str,
     output: str | None = None,
+    background_task_count: int = 0,
 ) -> None:
     """
     Post one ``external_session_status`` event to the Sessions API.
@@ -3692,12 +3694,18 @@ async def _post_external_session_status(
         ``"failed"`` edge the server surfaces it as the session's failure
         reason (``last_task_error``) so the UI renders a detail instead of
         a bare "failed" (#1113). Ignored when falsy.
+    :param background_task_count: Number of background tasks (shells)
+        still running when the status edge fires. Forwarded to the SSE
+        stream so the web UI can display "N shells running" instead of
+        a generic spinner. ``0`` (the default) omits the field.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, Any] = {"status": status}
     if output:
         data["output"] = output
+    if background_task_count > 0:
+        data["background_task_count"] = background_task_count
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={

@@ -1635,20 +1635,7 @@ function MainAgentSurface({
                     Suppressed when the last bubble is a compaction spinner —
                     that bubble already owns the "in-progress" slot. aria-hidden:
                     the pinned pill owns the single aria-live region (see WorkingStatusPin). */}
-                {showWorkingIndicator && (
-                  <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-                    <MessageContent>
-                      {/* py-0.5 = headroom for the bob: MessageContent is overflow-hidden
-                          and would clip otto's head at the top of the bounce. */}
-                      <div className="flex items-center gap-1.5 py-0.5">
-                        <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-                        <Shimmer className="text-xs font-mono" duration={1.5}>
-                          Working…
-                        </Shimmer>
-                      </div>
-                    </MessageContent>
-                  </Message>
-                )}
+                {showWorkingIndicator && <WorkingIndicator />}
                 {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
                     runner-online send gate), but `showWorkingIndicator` stays
@@ -2301,6 +2288,28 @@ function hasInProgressAssistantBubble(bubbles: Bubble[]): boolean {
  *   least one item, or a compaction-loading bubble already represents the
  *   busy state.
  */
+function WorkingIndicator() {
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const label =
+    bgCount > 0
+      ? bgCount === 1
+        ? "1 shell still running"
+        : `${bgCount} shells still running`
+      : "Working…";
+  return (
+    <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
+      <MessageContent>
+        <div className="flex items-center gap-1.5 py-0.5">
+          <OttoIcon className="otto-working h-4 w-auto shrink-0" />
+          <Shimmer className="text-xs font-mono" duration={1.5}>
+            {label}
+          </Shimmer>
+        </div>
+      </MessageContent>
+    </Message>
+  );
+}
+
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
   if (hasInProgressAssistantBubble(bubbles)) return false;
