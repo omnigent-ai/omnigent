@@ -118,6 +118,19 @@ export interface Conversation {
    * detection only — never displayed. See `comments_count`.
    */
   comments_updated_at?: number | null;
+  /**
+   * The requesting user's "last seen" wall-clock baseline (seconds) for
+   * this session, or null/undefined when they've never seen it. Per-viewer,
+   * served by the per-user read-state cache; the sidebar's unread dot shows
+   * when `updated_at > viewer_last_seen` and the session is finished. The
+   * client seeds {@link useUnseenConversations}'s mirror from this on load.
+   */
+  viewer_last_seen?: number | null;
+  /**
+   * Whether the requesting user explicitly marked this session unread.
+   * Per-viewer; lifts the active-row dot suppression on the client.
+   */
+  viewer_unread?: boolean;
 }
 
 export interface ConversationsPage {

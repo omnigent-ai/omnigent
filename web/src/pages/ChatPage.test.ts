@@ -25,6 +25,7 @@ import {
   splitSlashCommand,
   stripPendingElicitations,
   subAgentComposerLabel,
+  workingIndicatorLabel,
 } from "./ChatPage";
 
 // The Composer's read-only and disabled states are derived from
@@ -639,6 +640,25 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("running", opts({ runnerOnline: undefined }))).toBe(true);
     expect(computeShowsWorking("waiting", opts({ runnerOnline: undefined }))).toBe(true);
   });
+
+  it("background shells keep the indicator lit after the turn settles to idle", () => {
+    // A claude-native turn ends at `idle` (the PTY-activity watcher's edge)
+    // even while background shells run. The shell count keeps the indicator
+    // visible so "N background tasks still running" stays on screen.
+    expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 1 }))).toBe(true);
+  });
+
+  it("a zero shell count at idle stays idle", () => {
+    expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 0 }))).toBe(false);
+  });
+
+  it("a known-offline runner suppresses the indicator even with background shells", () => {
+    // Offline beats every other signal: a stale shell count must not keep a
+    // dead session spinning.
+    expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
+      false,
+    );
+  });
 });
 
 // ── shouldShowWorkingIndicator ──────────────────────────────────────────────
@@ -695,6 +715,28 @@ describe("shouldShowWorkingIndicator", () => {
     expect(
       shouldShowWorkingIndicator(true, [{ kind: "compaction_loading", itemId: "cmp_1" }]),
     ).toBe(false);
+  });
+});
+
+// ── workingIndicatorLabel ───────────────────────────────────────────────────
+
+describe("workingIndicatorLabel", () => {
+  it("shows the plain Working label when no background tasks remain", () => {
+    expect(workingIndicatorLabel(0)).toBe("Working…");
+  });
+
+  it("treats a negative count as no background tasks", () => {
+    // Defensive: the store seeds 0, but a stale/negative tally must never
+    // produce a nonsensical "-1 background tasks" label.
+    expect(workingIndicatorLabel(-1)).toBe("Working…");
+  });
+
+  it("uses the singular noun for exactly one background task", () => {
+    expect(workingIndicatorLabel(1)).toBe("1 background task still running");
+  });
+
+  it("pluralizes the noun for more than one background task", () => {
+    expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
   });
 });
 

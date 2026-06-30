@@ -20,7 +20,7 @@ describe("RoutingDecisionChip — intelligent model router", () => {
     // through the block pipeline.
     expect(chip).toHaveTextContent("Intelligent model router");
     expect(chip).toHaveTextContent("opus");
-    expect(chip).toHaveTextContent("(expensive)");
+    expect(chip.textContent).not.toContain("(expensive)");
     // The rationale shows as a muted second line (not hover-only).
     expect(chip).toHaveTextContent("multi-file refactor needs deep reasoning");
     expect(chip.getAttribute("data-applied")).toBe("true");
@@ -58,7 +58,7 @@ describe("RoutingDecisionChip — intelligent model router", () => {
     // Empty rationale still renders the primary line, just no second line —
     // a stray empty <span> would add visual noise to the transcript.
     expect(chip).toHaveTextContent("sonnet");
-    expect(chip).toHaveTextContent("(medium)");
+    expect(chip.textContent).not.toContain("(medium)");
   });
 
   it("never uses the old 'model control' vocabulary (rename sweep)", () => {

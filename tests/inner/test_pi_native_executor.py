@@ -104,3 +104,47 @@ async def test_enqueue_session_message_queues_steering(tmp_path: Path, monkeypat
     # Empty content is a no-op (nothing queued, returns False).
     assert await ex.enqueue_session_message("main", "") is False
     assert seen == ["steer"]
+
+
+async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
+    """Each turn re-mints the bearer into the config the extension re-reads.
+
+    The token baked into ``config.json`` at launch dies with the ~1h
+    Databricks OAuth lifetime; without a per-turn refresh the resident
+    extension's policy/MCP POSTs fail closed once the session outlives it.
+    Both turn paths (``run_turn`` and live steering) must refresh.
+    """
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: lambda: "tok")
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
+    refreshed: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        pne,
+        "refresh_config_auth_headers",
+        lambda bridge_dir, headers: bool(refreshed.append(headers)),
+    )
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+
+    [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    assert await ex.enqueue_session_message("main", "steer") is True
+    assert refreshed == [{"Authorization": "Bearer tok"}, {"Authorization": "Bearer tok"}]
+
+
+async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
+    """A mint failure never blocks the turn (best-effort refresh)."""
+    import omnigent.runner._entry as entry
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("sdk down")
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", _boom)
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
+    called: list[object] = []
+    monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: called.append(a))
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+
+    events = [e async for e in ex.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    # Turn still completes; the swallowed mint error means no rewrite was tried.
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
+    assert called == []

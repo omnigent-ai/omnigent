@@ -21,6 +21,7 @@ from omnigent.pi_native_bridge import (
     PI_NATIVE_BRIDGE_DIR_ENV_VAR,
     PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     enqueue_user_message,
+    refresh_config_auth_headers,
 )
 
 
@@ -68,6 +69,7 @@ class PiNativeExecutor(Executor):
         text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
+        self._refresh_auth_headers()
         enqueue_user_message(self._bridge_dir, text)
         return True
 
@@ -95,8 +97,37 @@ class PiNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Pi native turn had no user text to send")
             return
+        self._refresh_auth_headers()
         enqueue_user_message(self._bridge_dir, text)
         yield TurnComplete(response=None)
+
+    def _refresh_auth_headers(self) -> None:
+        """
+        Re-mint the extension's bearer so a long session survives token expiry.
+
+        The bearer baked into ``config.json`` at launch dies with the ~1h
+        Databricks OAuth lifetime, and the resident extension re-reads the
+        config per request (``freshAuthHeaders``). Refreshing it at each turn
+        keeps its policy/MCP POSTs authenticated instead of failing closed —
+        the same outcome the refresh-capable runtime auth and the native
+        policy hooks already get via re-mint. Minting runs in-runner through
+        the same factory those use. Best-effort: any failure (no factory in
+        local/unauthenticated runs, transient SDK error) leaves the existing
+        headers in place rather than blocking the turn.
+
+        ponytail: refreshes per turn, so a *single* turn running past ~1h
+        still risks expiry mid-turn; add a background refresh task keyed to
+        the pi terminal if that case ever bites.
+        """
+        try:
+            from omnigent.runner._entry import _make_auth_token_factory
+
+            factory = _make_auth_token_factory()
+            token = factory() if factory is not None else None
+            if token:
+                refresh_config_auth_headers(self._bridge_dir, {"Authorization": f"Bearer {token}"})
+        except Exception:  # noqa: BLE001 — best-effort refresh; never block a turn
+            pass
 
 
 def _bridge_dir_from_env() -> Path:

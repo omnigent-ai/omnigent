@@ -21,6 +21,7 @@ from omnigent.tools.builtins import (
     ListCommentsTool,
     LoadSkillTool,
     ReadSkillFileTool,
+    SysAdviseModelsTool,
     SysAgentDownloadTool,
     SysAgentGetTool,
     SysAgentListTool,
@@ -454,6 +455,11 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
+        # Advise-models is registered unconditionally alongside the
+        # dispatch grant — same pattern as sys_list_models. The server's
+        # MCP intercept returns router_on:false when routing is off,
+        # giving the model a clear signal without hiding the tool.
+        self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents
         # by id, or custom bundles via config_path) requires the

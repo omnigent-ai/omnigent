@@ -27,7 +27,10 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.context_window import fetch_model_pricing
 from omnigent.policies.base import Policy
 from omnigent.policies.function import resolve_function_policy
-from omnigent.policies.schema import SESSION_COST_ASK_APPROVED_STATE_KEY
+from omnigent.policies.schema import (
+    SESSION_COST_ASK_APPROVED_STATE_KEY,
+    SESSION_COST_UNPRICED_APPROVED_KEY,
+)
 from omnigent.policies.types import PolicyLLMClient
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.runtime.policies.engine import PolicyEngine
@@ -328,10 +331,12 @@ def build_policy_engine(
     # inheritance — reuse them here.)
     if root_conversation_id != conversation_id:
         root_state = _load_session_state(root_conversation_id, conversation_store)
-        if SESSION_COST_ASK_APPROVED_STATE_KEY in root_state:
-            initial_session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] = root_state[
-                SESSION_COST_ASK_APPROVED_STATE_KEY
-            ]
+        for _root_key in (
+            SESSION_COST_ASK_APPROVED_STATE_KEY,
+            SESSION_COST_UNPRICED_APPROVED_KEY,
+        ):
+            if _root_key in root_state:
+                initial_session_state[_root_key] = root_state[_root_key]
     # Gating is SESSION-wide: seed from the whole spawn-tree total so a
     # sub-agent gates against the session's full spend (parent + siblings),
     # not just its own subtree. The cost read is the enforcement total

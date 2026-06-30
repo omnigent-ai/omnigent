@@ -1060,7 +1060,18 @@ function FileViewerBody({
               )}
             </div>
           ) : viewMode === "diff" ? (
-            // Wait for the diff payload before mounting Monaco. useFileDiff uses
+            // A failed diff fetch (e.g. the diff endpoint returned a
+            // git_status_failed 500) surfaces the server's reason instead of
+            // hanging on "Loading diff…" forever — diffQuery.data stays
+            // undefined on error, which would otherwise read as still-loading.
+            diffQuery.isError ? (
+              <div className="flex items-center justify-center p-8 text-destructive text-sm">
+                Failed to load:{" "}
+                {diffQuery.error instanceof Error
+                  ? diffQuery.error.message
+                  : String(diffQuery.error)}
+              </div>
+            ) : // Wait for the diff payload before mounting Monaco. useFileDiff uses
             // null to mean new (before=null) / deleted (after=null) file, so
             // collapsing the not-yet-loaded state into null would mount with the
             // wrong content and mis-set EOL (onMount runs once). Once data is

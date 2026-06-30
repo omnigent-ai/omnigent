@@ -344,6 +344,95 @@ async def _patch_external_session_id(
         return
 
 
+def _read_kiro_cumulative_credits(metadata_path: Path) -> tuple[float | None, str | None]:
+    """Sum the per-turn credit metering from a Kiro session ``.json`` snapshot.
+
+    kiro-cli meters in credits, not tokens: each turn under
+    ``session_state.conversation_metadata.user_turn_metadatas`` carries a
+    ``metering_usage`` list of ``{"value": <float>, "unit": "credit"}`` entries
+    (token counts are 0), and the CLI shows a per-turn ``Credits:`` line. The
+    cumulative session cost is the sum of every turn's credit values. This data
+    lives only in the ``.json`` snapshot, not the ``.jsonl`` transcript the
+    forwarder tails.
+
+    :returns: ``(cumulative_credits, model_id)``, or ``(None, None)`` when the
+        file is missing/unparseable or carries no metering yet.
+    """
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    session_state = data.get("session_state")
+    if not isinstance(session_state, dict):
+        return None, None
+    conversation_metadata = session_state.get("conversation_metadata")
+    turns = (
+        conversation_metadata.get("user_turn_metadatas")
+        if isinstance(conversation_metadata, dict)
+        else None
+    )
+    if not isinstance(turns, list):
+        return None, None
+    total = 0.0
+    saw_credit = False
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        metering = turn.get("metering_usage")
+        if not isinstance(metering, list):
+            continue
+        for entry in metering:
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get("value")
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                total += float(value)
+                saw_credit = True
+    if not saw_credit:
+        return None, None
+    model_id: str | None = None
+    rts_model_state = session_state.get("rts_model_state")
+    if isinstance(rts_model_state, dict):
+        model_info = rts_model_state.get("model_info")
+        if isinstance(model_info, dict):
+            candidate = model_info.get("model_id")
+            if isinstance(candidate, str) and candidate:
+                model_id = candidate
+    return total, model_id
+
+
+async def _post_session_cost(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    cumulative_cost_usd: float,
+    model: str | None,
+) -> None:
+    """POST Kiro's cumulative credit spend as authoritative session cost.
+
+    kiro-cli reports cost in credits and there is no credit->USD conversion
+    available, so credits are forwarded 1:1 into ``cumulative_cost_usd`` (the
+    same convention the Copilot relay uses for its AI-credit total). The server
+    treats this value as authoritative and monotonic, in preference to
+    token x catalog pricing, via the ``external_session_usage`` event used by
+    the claude-/codex-native forwarders.
+    """
+    data: dict[str, object] = {"cumulative_cost_usd": cumulative_cost_usd}
+    if model:
+        data["model"] = model
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    resp.raise_for_status()
+
+
 async def forward_kiro_session_to_omnigent(
     *,
     base_url: str,
@@ -362,6 +451,7 @@ async def forward_kiro_session_to_omnigent(
     jsonl_path: Path | None = None
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     mirrored_external_session_id: str | None = None
+    last_posted_cost: float | None = None
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -420,6 +510,24 @@ async def forward_kiro_session_to_omnigent(
                         state.byte_offset = byte_offset
                         _write_state(bridge_dir, state)
                     write_forwarder_ready(bridge_dir)
+                    # Forward kiro's credit metering as authoritative session
+                    # cost. It lives in the ``.json`` snapshot (sibling of the
+                    # tailed ``.jsonl``), not the transcript, and is cumulative;
+                    # the server treats ``cumulative_cost_usd`` as monotonic, so
+                    # only post when it advances.
+                    cumulative_cost, cost_model = await asyncio.to_thread(
+                        _read_kiro_cumulative_credits, jsonl_path.with_suffix(".json")
+                    )
+                    if cumulative_cost is not None and (
+                        last_posted_cost is None or cumulative_cost > last_posted_cost
+                    ):
+                        await _post_session_cost(
+                            client,
+                            session_id=session_id,
+                            cumulative_cost_usd=cumulative_cost,
+                            model=cost_model,
+                        )
+                        last_posted_cost = cumulative_cost
             except asyncio.CancelledError:
                 raise
             except Exception:

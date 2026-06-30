@@ -14,6 +14,21 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     useWorkspaceDirectory: () => ({ data: undefined }),
   };
 });
+// HostBadge now renders in the composer's status-line tray and reads the
+// session's host binding via TanStack Query. Stub the hooks so it self-hides
+// (no host bound) without needing a QueryClient provider around these renders.
+vi.mock("@/hooks/useSession", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
+}));
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  useHosts: () => ({ data: [] }),
+}));
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  useSessionHostOnline: () => undefined,
+}));
 import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer } from "./ChatPage";
@@ -1067,6 +1082,57 @@ describe("Composer reply-quote focus", () => {
     expect(document.activeElement).not.toBe(ta);
 
     rerender(<Composer {...composerProps({ replyQuotes: ["first"] })} />);
+    expect(document.activeElement).not.toBe(ta);
+  });
+});
+
+// Attaching a file via the paperclip button routes through the hidden file
+// <input>, whose click (and the OS file dialog) pulls focus off the composer.
+// The change handler must hand focus back so the user can keep typing the
+// message that goes with the attachment — without this the caret is lost and
+// the next keystroke does nothing until the chat box is clicked again.
+describe("Composer file-attachment focus", () => {
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  /** The hidden attachment file <input> (the paperclip button proxies to it). */
+  function fileInput(): HTMLInputElement {
+    const el = document.querySelector('input[type="file"]') as HTMLInputElement | null;
+    if (!el) throw new Error("file input not found");
+    return el;
+  }
+
+  it("focuses the textarea after a file is attached", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // The mount effect focuses on conversation bind; blur so the assertion
+    // proves the attach handler re-focused, not the leftover mount focus.
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.change(fileInput(), { target: { files: [file] } });
+
+    expect(document.activeElement).toBe(ta);
+  });
+
+  it("does not focus the textarea when the attachment is rejected", () => {
+    // An unsupported type is dropped by validateAttachments, so no file is
+    // added — and with nothing attached there's no reason to yank focus back.
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(fileInput(), { target: { files: [bad] } });
+
     expect(document.activeElement).not.toBe(ta);
   });
 });

@@ -1,3 +1,4 @@
+import { BrainCircuitIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { relativeTime } from "@/lib/relativeTime";
 import { Button } from "@/components/ui/button";
@@ -101,78 +102,41 @@ export function shortModelName(model: string): string {
   return lower.startsWith("databricks-") ? model.slice("databricks-".length) : model;
 }
 
-// Lucide "waypoints" geometry — a routing topology: four nodes joined by
-// connectors. Split so the on state fills the nodes and stages the
-// connector traces in separately.
-const WAYPOINT_NODES = [
-  { cx: 12, cy: 4.5 },
-  { cx: 4.5, cy: 12 },
-  { cx: 19.5, cy: 12 },
-  { cx: 12, cy: 19.5 },
-] as const;
-const WAYPOINT_TRACE_PATHS = ["m10.2 6.3-3.9 3.9", "M7 12h10", "m15.7 17.7-3.9-3.9"] as const;
-
-/** Muted outline waypoints — the resting (off) face of the toggle. */
-function SparkleOutline() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      className="size-4"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      {WAYPOINT_NODES.map((n) => (
-        <circle key={`${n.cx}-${n.cy}`} cx={n.cx} cy={n.cy} r={2.5} />
-      ))}
-    </svg>
-  );
-}
-
 /**
- * Lit waypoints — solid-filled nodes with connector traces that stage in
- * just after the nodes land (see the `.imc-spark` delay in index.css).
+ * Inline pill showing a model's short name and tier — shared between the
+ * routing decision chip (StatusBlocks) and the SmartRoutingCard plan rows.
+ *
+ * @param model Model id, e.g. `"databricks-claude-haiku-4-5"`.
+ * @param tier Difficulty tier the router assigned, e.g. `"cheap"`.
  */
-function SparkleLit() {
+export function ModelTierPill({ model, tier }: { model: string; tier: string }) {
   return (
-    <svg viewBox="0 0 24 24" className="size-4" fill="none" aria-hidden="true">
-      {WAYPOINT_NODES.map((n) => (
-        <circle
-          key={`${n.cx}-${n.cy}`}
-          cx={n.cx}
-          cy={n.cy}
-          r={2.5}
-          fill="currentColor"
-          stroke="currentColor"
-          strokeWidth={0.75}
-        />
-      ))}
-      {WAYPOINT_TRACE_PATHS.map((d) => (
-        <path
-          key={d}
-          className="imc-spark"
-          d={d}
-          stroke="currentColor"
-          strokeWidth={1.5}
-          strokeLinecap="round"
-        />
-      ))}
-    </svg>
+    <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] leading-none">
+      <span className="font-medium text-foreground">{shortModelName(model)}</span>
+      <span className="text-muted-foreground">· {tier}</span>
+    </span>
   );
 }
 
 /**
- * Intelligent model router — a binary sparkle toggle in the composer.
+ * The router glyph — Lucide's `brain-circuit` icon: a brain wired into
+ * circuit nodes, reading as "model intelligence picks the route".
+ * Rendered in both toggle layers; the off→on cross-fade and the brand-pink
+ * lit color come from the `.imc-*` rules in index.css.
+ */
+function RouterGlyph() {
+  return <BrainCircuitIcon className="size-4" aria-hidden="true" />;
+}
+
+/**
+ * Intelligent model router — a binary router-glyph toggle in the composer.
  *
  * Click flips on ↔ off (an unset `null` presents — and flips — as off;
  * the control never emits `null`). Hovering reveals a two-line tooltip:
  * the control's name, plus the advisor's latest pick when the control is
  * on and a verdict exists.
  *
- * Visuals: two stacked sparkle layers cross-fade with a slight spring on
+ * Visuals: two stacked glyph layers cross-fade with a slight spring on
  * toggle, a soft halo backs the lit glyph, and a fresh verdict landing
  * mid-session replays a one-shot ring ping (CSS only — see the `imc-*`
  * block in index.css; the global reduced-motion gate covers all of it).
@@ -232,7 +196,7 @@ export function IntelligentModelControl({
             aria-pressed={isOn}
             data-testid="cost-toggle-trigger"
             data-mode={isOn ? "on" : "off"}
-            className="imc-toggle relative size-9 text-muted-foreground md:size-8"
+            className="imc-toggle relative size-9 text-muted-foreground hover:bg-transparent dark:hover:bg-transparent md:size-8"
             onClick={() => onChange(isOn ? "off" : "on")}
           >
             <span className="imc-halo" aria-hidden="true" />
@@ -245,10 +209,10 @@ export function IntelligentModelControl({
               />
             )}
             <span className="imc-layer imc-layer-off" aria-hidden="true">
-              <SparkleOutline />
+              <RouterGlyph />
             </span>
             <span className="imc-layer imc-layer-on" aria-hidden="true">
-              <SparkleLit />
+              <RouterGlyph />
             </span>
           </Button>
         </TooltipTrigger>

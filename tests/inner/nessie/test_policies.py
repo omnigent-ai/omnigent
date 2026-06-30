@@ -16,6 +16,7 @@ import pytest
 from omnigent.inner.nessie.policies import (
     blast_radius,
     headless_subagent_purpose_guard,
+    read_only_os,
     spawn_bounds,
     worktree_guard,
 )
@@ -401,6 +402,12 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         # Claude native Edit also uses ``file_path``.
         ("Edit", "file_path", "main.py", "ALLOW"),
         ("Edit", "file_path", "~/.bashrc", "DENY"),
+        # Claude native MultiEdit also uses ``file_path``. Without it in the
+        # gated set, an unsandboxed worker could escape its worktree via a
+        # multi-file edit -- the gap these cases pin.
+        ("MultiEdit", "file_path", "src/app.py", "ALLOW"),
+        ("MultiEdit", "file_path", "/etc/passwd", "DENY"),
+        ("MultiEdit", "file_path", "../escape.py", "DENY"),
         # Pi native write/edit (lowercase) use ``path`` (Omnigent convention).
         ("write", "path", "src/app.py", "ALLOW"),
         ("write", "path", "/etc/passwd", "DENY"),
@@ -412,6 +419,9 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         "Write-escape",
         "Edit-in-tree",
         "Edit-home-escape",
+        "MultiEdit-in-tree",
+        "MultiEdit-absolute",
+        "MultiEdit-escape",
         "pi-write-in-tree",
         "pi-write-absolute",
         "pi-edit-escape",
@@ -449,3 +459,41 @@ def test_worktree_guard_only_guards_writes() -> None:
     """
     evaluate = worktree_guard()
     assert _result(evaluate(_tool_call("sys_os_read", path="/etc/hosts"), {})) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        # Omnigent built-in write/edit.
+        ("sys_os_write", {"path": "a.py", "content": "x"}),
+        ("sys_os_edit", {"path": "a.py", "old": "x", "new": "y"}),
+        # Claude/Codex native aliases.
+        ("Write", {"file_path": "a.py", "content": "x"}),
+        ("Edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"}),
+        ("MultiEdit", {"file_path": "a.py", "edits": []}),
+        # Pi native lowercase.
+        ("write", {"path": "a.py", "content": "x"}),
+        ("edit", {"path": "a.py"}),
+    ],
+)
+def test_read_only_os_denies_every_write_tool(tool: str, args: dict[str, Any]) -> None:
+    """
+    read_only_os DENIES every file-mutating tool regardless of path.
+
+    A report-only agent (e.g. Sentinel and its sub-agents) carries the bundled
+    sys_os_write / sys_os_edit tools but must never use them; if this returns
+    anything but DENY, an "auto-fix" slips past the policy layer.
+    """
+    assert _result(read_only_os()(_tool_call(tool, **args), {})) == "DENY"
+
+
+def test_read_only_os_allows_reads_and_shell() -> None:
+    """
+    Reads, searches, and shell pass through — read_only_os gates only writes.
+    Fails if it broadened to reads (a reviewer couldn't open files to
+    fact-check) or to shell (pair blast_radius for that, not this policy).
+    """
+    evaluate = read_only_os()
+    assert _result(evaluate(_tool_call("sys_os_read", path="a.py"), {})) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_os_shell", command="rg secret"), {})) == "ALLOW"
+    assert _result(evaluate(_tool_call("Read", file_path="a.py"), {})) == "ALLOW"

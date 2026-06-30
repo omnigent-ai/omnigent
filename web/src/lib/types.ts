@@ -256,6 +256,12 @@ export interface Session {
    */
   hostResumable?: boolean;
   status: SessionStatus;
+  /**
+   * Background shells (claude-native) still running as of the last status
+   * edge, so a reload re-shows "N background tasks still running" even though the
+   * session has settled to ``"idle"``. Absent/0 when none are tracked.
+   */
+  backgroundTaskCount?: number;
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a

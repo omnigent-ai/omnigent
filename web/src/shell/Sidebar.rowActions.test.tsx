@@ -8,7 +8,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -50,6 +50,7 @@ vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { __resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -88,13 +89,23 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => dataResult);
 }
 
-function renderSidebar() {
+// `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
+// Route so `useParams` populates), making that row the active one — the
+// rest of the suite renders at `/` where no row is active.
+function renderSidebar(activeId?: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
+        <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+          {activeId ? (
+            <Routes>
+              <Route path="/c/:conversationId" element={sidebar} />
+            </Routes>
+          ) : (
+            sidebar
+          )}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -104,7 +115,9 @@ function renderSidebar() {
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   useConvMock.mockReset();
-  localStorage.clear();
+  // The read-state mirror is module-level (in-memory), so reset it between
+  // tests to avoid a mark-unread leaking into later rows.
+  __resetReadStateForTests();
   mockConversations([CONV]);
 });
 
@@ -233,6 +246,64 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("mark as unread", () => {
+  it("re-lights the row's unread dot via an explicit mark-unread", () => {
+    renderSidebar();
+
+    // The row starts seen (no baseline) — no unread marker.
+    expect(screen.queryByText("(unread)")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("mark-unread-conversation"));
+
+    // The dot's accessible label appears immediately (in-tab tick on the
+    // optimistic mirror write); the baseline is also synced to the server.
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+  });
+
+  it("holds the dot on a running session until the turn finishes", () => {
+    mockConversations([{ ...CONV, status: "running" }]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("mark-unread-conversation"));
+
+    // The dot stays suppressed mid-turn (the explicit override lifts the
+    // active-row suppression, not the running one).
+    expect(screen.queryByText("(unread)")).toBeNull();
+
+    // Once the turn finishes (row re-renders as idle), the dot lights — the
+    // baseline (kept in the in-memory mirror) now reads unseen for a
+    // finished session.
+    cleanup();
+    mockConversations([{ ...CONV, status: "idle" }]);
+    renderSidebar();
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+  });
+
+  it("lights the dot on the active thread you're currently viewing", () => {
+    // The active row normally suppresses the dot (you're reading it), but an
+    // explicit mark-unread is a deliberate flag, so the dot must show.
+    renderSidebar("conv_1");
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("mark-unread-conversation"));
+
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+  });
+
+  it("is hidden once the row is already unread", () => {
+    // Seed a baseline below updated_at (as the conversation list would) so
+    // the row is already unseen.
+    seedReadState([{ id: "conv_1", viewer_last_seen: CONV.updated_at - 1 }]);
+    renderSidebar();
+
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.queryByTestId("mark-unread-conversation")).toBeNull();
   });
 });
 

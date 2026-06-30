@@ -220,3 +220,56 @@ def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
 
     payload = json.loads(cfg.read_text(encoding="utf-8"))
     assert payload["tools"] == []
+
+
+def test_refresh_config_auth_headers_replaces_only_auth(tmp_path: Path) -> None:
+    """Refreshing the bearer rewrites only ``authHeaders``, leaving the rest.
+
+    The baked launch token dies with the ~1h Databricks OAuth lifetime; the
+    runner re-mints it into ``config.json`` each turn and the extension
+    re-reads per request. The rewrite must touch only ``authHeaders`` so
+    ``serverUrl`` / ``tools`` (read once at startup) stay intact.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={"Authorization": "Bearer stale"},
+        tools=[{"name": "t"}],
+    )
+
+    assert (
+        pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"Authorization": "Bearer fresh"})
+        is True
+    )
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    assert payload["authHeaders"] == {"Authorization": "Bearer fresh"}
+    # Untouched: the static fields the extension reads once at startup.
+    assert payload["serverUrl"] == "http://omnigent.test"
+    assert payload["tools"] == [{"name": "t"}]
+
+
+def test_refresh_config_auth_headers_noops(tmp_path: Path) -> None:
+    """No-op (returns False) on empty headers, a missing config, or no change."""
+    bridge_dir = tmp_path / "bridge"
+    # Missing config: nothing to rewrite.
+    assert pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"a": "b"}) is False
+
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={"Authorization": "Bearer x"},
+    )
+    # Empty headers (local/unauthenticated) must never blank out a live token.
+    assert pi_native_bridge.refresh_config_auth_headers(bridge_dir, {}) is False
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    assert payload["authHeaders"] == {"Authorization": "Bearer x"}
+    # Identical headers: skip the rewrite.
+    assert (
+        pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"Authorization": "Bearer x"})
+        is False
+    )
