@@ -431,6 +431,45 @@ async def test_seed_dedupe_from_history_swallows_errors() -> None:
     assert fwd._msg_role == {}
 
 
+async def test_seed_dedupe_from_history_seeds_usage() -> None:
+    """Resume seeding rebuilds cumulative usage and re-posts it immediately."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [
+        {
+            "info": {
+                "id": "msg_1",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-5",
+                "providerID": "anthropic",
+                "cost": 0.01,
+                "tokens": {"input": 1000, "output": 50, "cache": {"read": 200, "write": 0}},
+            },
+            "parts": [],
+        },
+        {
+            "info": {
+                "id": "msg_2",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-5",
+                "providerID": "anthropic",
+                "cost": 0.02,
+                "tokens": {"input": 2000, "output": 100, "cache": {"read": 300, "write": 0}},
+            },
+            "parts": [],
+        },
+        {"info": {"id": "msg_u", "role": "user"}, "parts": []},
+    ]
+    fwd = _forwarder(server, opencode)
+    await fwd.seed_dedupe_from_history()
+    # Usage is rebuilt per assistant message id (user messages contribute none).
+    assert set(fwd._usage_by_message) == {"msg_1", "msg_2"}
+    usage = next(b for _u, b in server.posts if b["type"] == "external_session_usage")["data"]
+    assert usage["cumulative_cost_usd"] == 0.03  # 0.01 + 0.02
+    assert usage["cumulative_input_tokens"] == 3000  # 1000 + 2000
+    assert usage["cumulative_output_tokens"] == 150  # 50 + 100
+    assert usage["cumulative_cache_read_input_tokens"] == 500  # 200 + 300
+
+
 async def test_compaction_started_posts_in_progress() -> None:
     """`session.next.compaction.started` → external_compaction_status in_progress."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()

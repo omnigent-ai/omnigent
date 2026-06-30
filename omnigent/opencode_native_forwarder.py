@@ -192,6 +192,8 @@ class OpenCodeNativeForwarder:
             role = info.get("role") if isinstance(info, Mapping) else None
             if isinstance(message_id, str) and isinstance(role, str):
                 self._msg_role[message_id] = role
+                if role == "assistant" and isinstance(info, Mapping):
+                    self._record_assistant_usage(message_id, info)
             parts = message.get("parts") if isinstance(message, Mapping) else None
             if isinstance(parts, list):
                 for part in parts:
@@ -214,6 +216,12 @@ class OpenCodeNativeForwarder:
                             self.state.mark(self._key("tool-out", call_id))
             if isinstance(message_id, str):
                 self.state.mark(self._key("message", message_id))
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after seeding", exc_info=True
+            )
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
