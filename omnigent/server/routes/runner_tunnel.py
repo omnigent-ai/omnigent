@@ -362,9 +362,7 @@ def create_runner_tunnel_router(
             # 32-byte binding token reaches this branch, so an
             # attacker-chosen token cannot map to a victim's runner_id.
             if resolve_managed_runner_owner is not None:
-                tunnel_owner = await asyncio.to_thread(
-                    resolve_managed_runner_owner, runner_id
-                )
+                tunnel_owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
             if tunnel_owner is None:
                 # No managed-launch record either: a genuinely
                 # unauthenticated non-loopback peer. Refuse the handshake
