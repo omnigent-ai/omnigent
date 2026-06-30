@@ -56,12 +56,12 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
 };
 
 /**
- * Host indicator for the open conversation, rendered at the top of the
- * chat window (ChatHeader's left slot). Reads its own data and renders
- * nothing when the session isn't host-bound — same self-contained shape
- * as PresenceAvatars. Shows the friendly host name (or sandbox-provider
- * label) plus a status circle: green online, red offline, neutral while
- * liveness is still unknown.
+ * Host indicator for the open conversation, rendered in the composer's
+ * status-line tray, immediately left of the worktree branch
+ * (ComposerStatusLine). Reads its own data and renders nothing when the
+ * session isn't host-bound — same self-contained shape as PresenceAvatars.
+ * Shows the friendly host name (or sandbox-provider label) plus a status
+ * circle: green online, red offline, neutral while liveness is still unknown.
  */
 export function HostBadge({ sessionId }: { sessionId: string }) {
   const { session } = useSession(sessionId);
