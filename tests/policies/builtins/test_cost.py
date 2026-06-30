@@ -266,6 +266,122 @@ def test_over_budget_unknown_model_denies_fail_closed() -> None:
     assert policy(_tool(6.0, model=None))["result"] == "DENY"
 
 
+def _unpriced_tool(input_tokens: int = 1000, model: str = "unpriced-model") -> PolicyEvent:
+    """Build a ``tool_call`` event with token usage but no ``total_cost_usd``.
+
+    Simulates a session that has consumed tokens on a model absent from the
+    pricing catalog: ``total_cost_usd`` is never written, so the key is absent
+    from the usage dict even though real spend has occurred.
+
+    :param input_tokens: Cumulative input tokens to place in the usage dict.
+    :param model: Active model id, e.g. ``"unpriced-model"``.
+    :returns: A ``tool_call`` event with tokens but no cost key.
+    """
+    return {
+        "type": "tool_call",
+        "target": "sys_os_shell",
+        "data": {"name": "sys_os_shell", "arguments": {}},
+        "context": {
+            "actor": {},
+            "usage": {"input_tokens": input_tokens, "total_tokens": input_tokens},
+            "model": model,
+        },
+        "session_state": {},
+    }
+
+
+def test_unpriced_session_asks_fail_closed() -> None:
+    """Token usage without ``total_cost_usd`` → ASK (fail closed with user bypass).
+
+    A model absent from the pricing catalog never writes ``total_cost_usd``
+    to the session, so the gate would score the session at $0 and never
+    fire. After the fix, the gate detects tokens-present / cost-absent and
+    returns ASK rather than silently treating unknown spend as $0. The
+    ASK reason must name the model-pricing gap. The state_updates must
+    carry the unpriced-approved key so an approval is remembered.
+    """
+    from omnigent.policies.schema import SESSION_COST_UNPRICED_APPROVED_KEY
+
+    policy = cost_budget(max_cost_usd=5.0)
+    result = policy(_unpriced_tool())
+    assert result["result"] == "ASK"
+    assert "pricing" in result["reason"].lower()
+    keys = [u["key"] for u in result["state_updates"]]
+    assert SESSION_COST_UNPRICED_APPROVED_KEY in keys
+
+
+def test_unpriced_session_asks_both_phases() -> None:
+    """Unpriced fail-closed fires on both tool_call and request phases."""
+    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[1.0])
+    unpriced_request: PolicyEvent = {
+        "type": "request",
+        "target": None,
+        "data": "hello",
+        "context": {
+            "actor": {},
+            "usage": {"input_tokens": 500, "total_tokens": 500},
+            "model": "unpriced-model",
+        },
+        "session_state": {},
+    }
+    assert policy(_unpriced_tool())["result"] == "ASK"
+    assert policy(unpriced_request)["result"] == "ASK"
+
+
+def test_unpriced_session_allows_after_approval() -> None:
+    """Once the user approves the unpriced-model ASK, subsequent turns ALLOW.
+
+    The state_updates key is recorded in session_state on approval. The
+    next gate evaluation sees it and skips the unpriced check so the
+    turn proceeds without re-asking.
+    """
+    from omnigent.policies.schema import SESSION_COST_UNPRICED_APPROVED_KEY
+
+    policy = cost_budget(max_cost_usd=5.0)
+    approved_event = _unpriced_tool()
+    approved_event["session_state"] = {SESSION_COST_UNPRICED_APPROVED_KEY: True}
+    assert policy(approved_event)["result"] == "ALLOW"
+
+
+def test_no_tokens_yet_allows_first_turn() -> None:
+    """No tokens in session_usage → ALLOW (first turn, nothing unpriced yet).
+
+    The unpriced check must not fire when the session is brand new (no
+    prior turns). The gate can only detect unpriced spend after at least
+    one turn has written tokens; the very first turn on any model must
+    be allowed so the gate is not infinitely recursive.
+    """
+    policy = cost_budget(max_cost_usd=5.0)
+    # cost=None + no token keys → brand-new session, nothing spent
+    result = policy(_tool(None))
+    assert result["result"] == "ALLOW"
+
+
+def test_priced_zero_cost_allows() -> None:
+    """``total_cost_usd = 0.0`` (explicitly priced at zero) → not an unpriced session.
+
+    A free model that IS in the catalog and reports $0 should behave
+    normally — the key is present, the cost is zero, the gate allows.
+    Confusing this with the absent-key case would block free catalog models.
+    """
+    policy = cost_budget(max_cost_usd=5.0)
+    event: PolicyEvent = {
+        "type": "tool_call",
+        "target": "sys_os_shell",
+        "data": {"name": "sys_os_shell", "arguments": {}},
+        "context": {
+            "actor": {},
+            "usage": {
+                "input_tokens": 1000,
+                "total_cost_usd": 0.0,  # explicitly priced at $0 (free model)
+            },
+            "model": "free-model",
+        },
+        "session_state": {},
+    }
+    assert policy(event)["result"] == "ALLOW"
+
+
 def test_hard_limit_wins_over_checkpoint_approval() -> None:
     """Over the hard limit on an expensive model → DENY even if approved.
 
@@ -446,12 +562,13 @@ def test_request_approval_carries_over_to_tool_call() -> None:
     assert policy(_tool(2.0, model="opus", session_state=state)) == {"result": "ALLOW"}
 
 
-def test_unpriced_session_never_trips() -> None:
-    """No ``total_cost_usd`` (pricing unavailable) → ALLOW, never blocks.
+def test_no_usage_at_all_allows() -> None:
+    """No ``total_cost_usd`` AND no token counters → ALLOW (first turn).
 
-    Defaults to ``0.0``; the policy cannot budget what it cannot price,
-    so it must abstain rather than block every tool call at $0 — even on
-    an expensive model.
+    When session_usage has no tokens yet the session is brand new — the
+    first turn on any model must be allowed because there's nothing to
+    price yet. The unpriced-model ASK only fires once tokens have been
+    written (i.e. after the first turn completes).
     """
     policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
     assert policy(_tool(None, model="opus")) == {"result": "ALLOW"}

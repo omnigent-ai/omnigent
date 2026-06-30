@@ -32,9 +32,13 @@ It reads cumulative spend from
 total maintained server-side (token-priced for relay/codex sessions,
 billed directly for claude-native) — and the active model from
 ``event["context"]["model"]`` (the conversation's ``model_override`` or
-the agent spec's ``llm.model``, resolved by the policy engine). When
-pricing is unavailable the cost stays ``0.0`` and the policy never trips
-(it cannot budget what it cannot price).
+the agent spec's ``llm.model``, resolved by the policy engine). When a
+model has no catalog pricing, ``total_cost_usd`` is never written to the
+session, so the policy would score the session at ``$0`` and never
+enforce the budget. To prevent unpriced spend silently bypassing the cap,
+the gate **fails closed** when token usage is present but
+``total_cost_usd`` is absent: it returns DENY with a message asking the
+user to switch to a priced model.
 
 On the ``tool_call`` phase a DENY/ASK blocks that specific tool call
 (the native hook returns ``deny`` / parks for approval) rather than
@@ -69,6 +73,7 @@ from typing import Any
 
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
+    SESSION_COST_UNPRICED_APPROVED_KEY,
     USER_DAILY_ASK_APPROVED_STATE_KEY,
     PolicyCallable,
     PolicyEvent,
@@ -76,6 +81,60 @@ from omnigent.policies.schema import (
 )
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
+
+# session_state key recording that the user has acknowledged and approved
+# continuing a session whose active model has no catalog pricing. Routed to
+# the ROOT conversation (like SESSION_COST_ASK_APPROVED_STATE_KEY) so a
+# single approval on the parent covers the whole spawn tree.
+_UNPRICED_APPROVED_KEY = SESSION_COST_UNPRICED_APPROVED_KEY
+
+# ASK response emitted when the session has consumed tokens on a model with
+# no catalog pricing and the user has not yet acknowledged it. The gate
+# cannot enforce a budget it cannot measure — asking rather than denying lets
+# the operator or user make an informed choice, while still preventing silent
+# pass-through at $0.
+_UNPRICED_ASK: PolicyResponse = {
+    "result": "ASK",
+    "reason": (
+        "The active model has no catalog pricing so cumulative spend cannot be "
+        "tracked. Continuing will allow untracked spend that counts against "
+        "neither the cap nor the warning thresholds. Switch to a priced model "
+        "to restore budget enforcement, or approve to continue without it."
+    ),
+    "state_updates": [
+        {
+            "key": _UNPRICED_APPROVED_KEY,
+            "action": "set",
+            "value": True,
+        }
+    ],
+}
+
+
+def _usage_is_unpriced(usage: dict[str, Any]) -> bool:
+    """Return ``True`` when token usage is present but cost is unpriced.
+
+    The session has had at least one turn (token counters are non-zero) yet
+    ``total_cost_usd`` is absent — meaning no turn was ever priced by the
+    catalog. The gate cannot enforce a budget against this session: it would
+    score every check at ``$0`` and never fire. Callers use this to fail
+    closed (DENY) rather than fail open.
+
+    Returns ``False`` when ``total_cost_usd`` is already present (priced) or
+    when no tokens have been consumed yet (first request, nothing to price).
+    The first turn on an unpriced model still runs — the gate only has
+    post-turn data at check time — but every subsequent turn is denied.
+
+    :param usage: ``event["context"]["usage"]`` or equivalent subtree dict.
+    :returns: ``True`` when enforcement should fail closed due to missing
+        pricing.
+    """
+    if "total_cost_usd" in usage:
+        return False
+    return bool(
+        usage.get("input_tokens") or usage.get("output_tokens") or usage.get("total_tokens")
+    )
+
 
 # Phases the budget gate fires on. ``tool_call`` is the native ``PreToolUse``
 # block point; ``request`` runs before the LLM turn so text-only turns (no
@@ -438,6 +497,11 @@ def cost_budget(
         phase = event.get("type")
         if phase not in _GATED_PHASES:
             return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
+            return _ALLOW
         cost = _session_cost_usd(event)
         if cfg.hard_cap_enabled and cost >= max_cost_usd:
             if _model_blocked_over_budget(
@@ -608,6 +672,11 @@ def user_daily_cost_budget(
         phase = event.get("type")
         if phase not in _GATED_PHASES:
             return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
+            return _ALLOW
         cost = _user_daily_cost_usd(event)
         owner = _user_daily_owner(event)
         if cfg.hard_cap_enabled and cost >= max_cost_usd:
@@ -746,6 +815,11 @@ def subagent_cost_budget(
         """
         phase = event.get("type")
         if phase not in _GATED_PHASES:
+            return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("subtree_usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
             return _ALLOW
         cost = _subtree_cost_usd(event)
         # Check hard limit if max_cost_usd is set.
