@@ -1118,7 +1118,22 @@ class HarnessProcessManager:
                     "reaping idle harness subprocess for conversation %s",
                     conv_id,
                 )
-                await self.release(conv_id)
+                try:
+                    await self.release(conv_id)
+                except Exception:
+                    # A release failure (e.g. ``client.aclose()`` on a broken
+                    # transport, or ``process.wait()`` raising) must not escape
+                    # the loop: an unguarded raise here exits the reaper task
+                    # permanently — and silently, since nothing awaits it — so
+                    # the instance never reclaims another idle subprocess for
+                    # the rest of its lifetime (FD / memory / socket leak). Log
+                    # and continue; the entry stays registered and is retried
+                    # on a later pass.
+                    _logger.exception(
+                        "failed to reap idle harness subprocess for "
+                        "conversation %s; will retry on a later pass",
+                        conv_id,
+                    )
 
     async def _sweep_orphans(self) -> None:
         """
