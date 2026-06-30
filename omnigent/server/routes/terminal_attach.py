@@ -182,8 +182,19 @@ def create_terminal_attach_router(
                 )
                 return
             try:
-                async with runner_cm as runner_ws:
-                    await _shuttle_ws_frames(websocket, runner_ws)
+                from omnigent.runtime import telemetry
+
+                with telemetry.span(
+                    "terminal.attach",
+                    attributes={
+                        "session.id": session_id,
+                        "terminal.id": terminal_id,
+                        "terminal.read_only": read_only,
+                        "terminal.mode": "runner-proxy",
+                    },
+                ):
+                    async with runner_cm as runner_ws:
+                        await _shuttle_ws_frames(websocket, runner_ws)
             except _RunnerWSClosed as closed:
                 code = (
                     closed.code
@@ -224,12 +235,23 @@ def create_terminal_attach_router(
             )
             return
 
-        await bridge_tmux_pty_to_websocket(
-            websocket,
-            socket_path=str(entry.instance.socket_path),
-            tmux_target=entry.instance.tmux_target,
-            read_only=read_only,
-        )
+        from omnigent.runtime import telemetry
+
+        with telemetry.span(
+            "terminal.attach",
+            attributes={
+                "session.id": session_id,
+                "terminal.id": terminal_id,
+                "terminal.read_only": read_only,
+                "terminal.mode": "in-process",
+            },
+        ):
+            await bridge_tmux_pty_to_websocket(
+                websocket,
+                socket_path=str(entry.instance.socket_path),
+                tmux_target=entry.instance.tmux_target,
+                read_only=read_only,
+            )
 
     return router
 

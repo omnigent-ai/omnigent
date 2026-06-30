@@ -332,8 +332,15 @@ class ExecutorAdapter(HarnessApp):
         # trace ID from the response_id so operators can look up
         # traces by response ID without a mapping table.
         tracing = is_tracing_enabled()
+        from omnigent.runtime.telemetry import current_session_id, session_scope
+
+        # Prefer the conversation id the request hook already bound
+        # (authoritative, from the /sessions/<conv>/events path); fall back to
+        # the adapter session key, which can be a random uuid for harnesses
+        # built without one.
+        turn_session_id = current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
-            self._tracing_ctx = TracingContext()
+            self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
         agent_span = None
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
@@ -371,7 +378,11 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with trace_cm:
+            # Bind the session for the whole turn so every span the harness
+            # creates (agent/LLM/tool, the native tmux inject, DB/httpx child
+            # spans) is tagged with session.id by the span processor — no
+            # per-harness code. (session_scope imported above with current_session_id.)
+            with session_scope(turn_session_id), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",

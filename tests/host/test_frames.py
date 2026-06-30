@@ -30,6 +30,43 @@ from omnigent.host.frames import (
 )
 
 
+def test_encode_injects_traceparent_under_active_span() -> None:
+    """
+    Encoding a host frame inside an active span stamps a W3C
+    ``traceparent`` into the JSON envelope so the Host Daemon ↔ Server
+    boundary joins the distributed trace; with no span active the wire
+    form is unchanged (byte-for-byte wire-compatible), and decode always
+    ignores the extra envelope key.
+    """
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_1",
+        binding_token="tok",
+        workspace="/tmp/ws",
+        harness="claude-sdk",
+    )
+
+    # No active span: no traceparent added.
+    assert "traceparent" not in json.loads(encode_host_frame(frame))
+
+    provider = TracerProvider()
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    tracer = otel_trace.get_tracer("tests.host.frames")
+    with tracer.start_as_current_span("rest"):
+        encoded = encode_host_frame(frame)
+
+    payload = json.loads(encoded)
+    assert "traceparent" in payload
+    # The extra envelope key must not break decoding back to the dataclass.
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.request_id == "req_1"
+    assert decoded.workspace == "/tmp/ws"
+
+
 def test_hello_frame_round_trip() -> None:
     """
     Verify HostHelloFrame survives encode → decode.

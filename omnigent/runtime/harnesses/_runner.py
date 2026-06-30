@@ -360,7 +360,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         from omnigent.runtime import telemetry
 
-        telemetry.init()
+        telemetry.init("omni-harness")
     except Exception:
         pass  # tracing init failed; continue without tracing
 

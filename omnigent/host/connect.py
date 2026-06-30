@@ -9,6 +9,7 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -313,13 +314,22 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # not match what the host owner configured (e.g. a non-standard
         # kubeconfig location or a colon-separated multi-file list).
         "KUBECONFIG",
+        # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
+        # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
+        # telemetry.init() no-ops there and omni-runner / omni-harness export
+        # nothing — inheriting OTEL_* alone is no longer enough now that
+        # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
+        # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
+        "OMNIGENT_TELEMETRY_ENABLED",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
     | set(WINDOWS_ENV_PASSTHROUGH)
 )
-# Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")
+# Allowed by prefix: locale family (``LC_*``), MLflow, and OpenTelemetry config —
+# both the standard ``OTEL_*`` vars and Omnigent's ``OMNIGENT_OTEL_*`` knobs
+# (capture-content, FastAPI toggle) so they reach the runner/harness too.
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "OMNIGENT_OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
@@ -1526,7 +1536,22 @@ class HostProcess:
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
             return
-        await self._dispatch_host_frame(ws, frame)
+        # Handle the frame inside a CONSUMER span parented on the trace
+        # context the server stamped into the frame envelope, so the
+        # host's work (and the result frame it sends back) nests under
+        # the server request that triggered it.
+        from omnigent.runtime import telemetry
+
+        try:
+            carrier = json.loads(raw)
+        except ValueError:
+            carrier = {}
+        if not isinstance(carrier, dict):
+            carrier = {}
+        raw_kind = carrier.get("kind")
+        kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
+        with telemetry.consume_frame_span(kind, carrier):
+            await self._dispatch_host_frame(ws, frame)
 
     async def _dispatch_host_frame(
         self,
@@ -1574,6 +1599,14 @@ def run_host_process(
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
+    # Initialize tracing so the host daemon exports its own spans
+    # (e.g. handling launch_runner / stat / list_dir frames) into the
+    # same distributed trace as the server that requested them. The
+    # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
+    from omnigent.runtime import telemetry
+
+    telemetry.init("omni-host")
+
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH
