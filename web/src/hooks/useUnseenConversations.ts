@@ -7,9 +7,15 @@
 // Conversations with no stored entry are treated as seen (no
 // baseline) so first-deploy doesn't light up every row.
 
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 
 const STORAGE_KEY = "omnigent:last-seen-timestamps";
+// Persisted alongside the timestamps so an explicit "Mark as unread"
+// survives a page reload — including on the thread you were viewing,
+// where the auto mark-seen would otherwise clear it on remount. Like
+// the timestamps, this is per-device (localStorage); cross-device
+// unread would need server-side state.
+const UNREAD_KEY = "omnigent:explicit-unread-ids";
 
 // Bumped whenever the last-seen map is written, so in-tab subscribers
 // (the sidebar rows, the dock badge) can recompute unseen state right
@@ -23,6 +29,28 @@ function notifySubscribers(): void {
   for (const cb of subscribers) cb();
 }
 
+function readExplicitUnread(): Set<string> {
+  if (typeof window === "undefined") return new Set();
+  try {
+    const raw = window.localStorage.getItem(UNREAD_KEY);
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((x): x is string => typeof x === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+function writeExplicitUnread(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(UNREAD_KEY, JSON.stringify([...explicitlyUnread]));
+  } catch {
+    // localStorage quota or access errors shouldn't break the app.
+  }
+}
+
 // Conversations the user explicitly marked unread. While an id is in
 // this set, the automatic "active view is being read" mark-seen
 // (mount / poll / focus / navigation-away in useMarkConversationSeen)
@@ -30,16 +58,21 @@ function notifySubscribers(): void {
 // would be clobbered the instant the user navigates away or the list
 // polls. The flag is cleared by a genuine re-open (see
 // clearUnreadOverride), which then lets the normal mark-seen run.
-const explicitlyUnread = new Set<string>();
+// Hydrated from localStorage so an explicit unread survives a reload.
+const explicitlyUnread = readExplicitUnread();
 
 /**
  * Clears the explicit-unread override for a conversation, re-enabling
  * automatic mark-seen. Called when the user genuinely (re)opens a
- * thread, since opening it *is* reading it. Notifies subscribers when
- * it actually removed an override so the dot clears immediately.
+ * thread, since opening it *is* reading it. Persists the change and
+ * notifies subscribers when it actually removed an override so the dot
+ * clears immediately.
  */
 export function clearUnreadOverride(conversationId: string): void {
-  if (explicitlyUnread.delete(conversationId)) notifySubscribers();
+  if (explicitlyUnread.delete(conversationId)) {
+    writeExplicitUnread();
+    notifySubscribers();
+  }
 }
 
 /**
@@ -119,10 +152,12 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
  * Setting {@link explicitlyUnread} keeps the flag from being instantly
  * undone by the automatic mark-seen on the *active* thread (navigation
  * away, polls, focus) — so marking the conversation you're looking at
- * sticks. The override clears when you reopen the thread.
+ * sticks. The override is persisted, so it also survives a reload; it
+ * clears when you reopen the thread.
  */
 export function markConversationUnread(conversationId: string, updatedAt: number): void {
   explicitlyUnread.add(conversationId);
+  writeExplicitUnread();
   const map = readLastSeenMap();
   map[conversationId] = updatedAt - 1;
   writeLastSeenMap(map);
@@ -193,8 +228,19 @@ export function useMarkConversationSeen(
   // markConversationSeen isn't no-op'd by a stale override). Keyed on
   // the id alone: a poll bumping `updatedAt` while the thread stays
   // open must NOT re-clear an override the user just set on it.
+  //
+  // The very first mount is skipped: an initial page load / reload while
+  // sitting on a thread must NOT clear a *persisted* explicit-unread
+  // override (otherwise the dot you set silently vanishes on refresh).
+  // ChatPage stays mounted across in-app /c/:id navigations, so this ref
+  // only resets on a real reload — genuine reopens (the id changing while
+  // mounted) still clear, matching "reopen = read".
+  const isInitialMount = useRef(true);
   useEffect(() => {
+    const wasInitial = isInitialMount.current;
+    isInitialMount.current = false;
     if (!conversationId) return;
+    if (wasInitial) return;
     clearUnreadOverride(conversationId);
   }, [conversationId]);
 

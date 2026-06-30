@@ -12,6 +12,7 @@ import {
 } from "./useUnseenConversations";
 
 const STORAGE_KEY = "omnigent:last-seen-timestamps";
+const UNREAD_KEY = "omnigent:explicit-unread-ids";
 
 beforeEach(() => {
   localStorage.clear();
@@ -94,6 +95,15 @@ describe("markConversationUnread", () => {
     markConversationUnread("conv-1", 5_000);
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
     expect(stored["conv-1"]).toBe(4_999);
+  });
+
+  it("persists the override to localStorage (survives a reload)", () => {
+    markConversationUnread("conv-1", 5_000);
+    const ids = JSON.parse(localStorage.getItem(UNREAD_KEY)!);
+    expect(ids).toContain("conv-1");
+    // Clearing it removes the id from the persisted set.
+    clearUnreadOverride("conv-1");
+    expect(JSON.parse(localStorage.getItem(UNREAD_KEY)!)).not.toContain("conv-1");
   });
 
   it("survives an automatic mark-seen (the active-thread clobber guard)", () => {
@@ -306,17 +316,37 @@ describe("useMarkConversationSeen", () => {
     expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
   });
 
-  it("re-marks seen when the thread is reopened (override cleared on mount)", () => {
+  it("preserves a persisted explicit-unread on reload (a fresh mount does not clear)", () => {
+    // A reload landing back on /c/conv-1 is a fresh mount. It must NOT clear
+    // a persisted override — otherwise the dot the user set silently vanishes
+    // on refresh. The first-mount skip + the markConversationSeen guard keep
+    // the baseline pinned below updated_at.
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 9_000_000 });
+    markConversationUnread("conv-1", 5_000);
+
+    renderHook(() => useMarkConversationSeen("conv-1", 5_000));
+
+    expect(storedBaseline("conv-1")).toBe(4_999);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+
+  it("clears the override on a genuine in-app reopen (id changes while mounted)", () => {
+    // ChatPage stays mounted across /c/:id navigations, so a real reopen is
+    // the id changing on the live hook — not a remount. Navigating away and
+    // back marks the thread seen again.
     setWindowFocused(true);
     vi.useFakeTimers({ now: 1_000_000 });
-    const first = renderHook(() => useMarkConversationSeen("conv-1", 5_000));
+    const { rerender } = renderHook(({ id }) => useMarkConversationSeen(id, 5_000), {
+      initialProps: { id: "conv-1" as string },
+    });
     act(() => markConversationUnread("conv-1", 5_000));
-    first.unmount();
     expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
 
-    // Reopening clears the override on mount, so the thread reads seen again.
+    rerender({ id: "conv-2" }); // navigate away to another thread
     vi.setSystemTime(9_000_000);
-    renderHook(() => useMarkConversationSeen("conv-1", 5_000));
+    rerender({ id: "conv-1" }); // reopen conv-1 → override cleared, marked seen
+
     expect(storedBaseline("conv-1")).toBe(9_000);
     expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
   });
