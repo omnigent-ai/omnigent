@@ -3150,8 +3150,13 @@ export function NewChatLandingScreen() {
               )}
 
               {/* Project chip — files the session under a named project on
-                create. Sits after the worktree chip. */}
-              <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
+                create. Sits after the worktree chip. Only shown when a project
+                is already selected (e.g. quick-starting from an existing
+                project's "new session" pencil, which passes `?project=`);
+                otherwise the new-session flow stays unfiled. */}
+              {selectedProject && (
+                <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
+              )}
             </div>
             {/* The agent / harness picker moved out of the tray and into the
                 composer's right action cluster (next to Send) — see
