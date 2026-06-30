@@ -628,12 +628,12 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
   });
 
-  it("resets the shared approval mode to default when switching codex-native → opencode-native", async () => {
-    // codex-native and opencode-native share a single approvalMode state. A
-    // codex pick must NOT linger after switching to OpenCode (which has no
-    // stored pick) — otherwise a more-permissive mode would silently flow
-    // into the OpenCode launch args. Regression test for the seeding effect's
-    // reset-on-no-stored-value branch.
+  it("posts no launch args for opencode-native, even after a codex full-access pick", async () => {
+    // OpenCode declares no mode capability (no permission picker) — `opencode
+    // attach` has no permission/sandbox CLI flag, and emitting Codex's
+    // `--sandbox`/`--ask-for-approval` presets is exactly what crashed the TUI.
+    // So a "Full access" pick on Codex must NOT bleed into OpenCode's launch:
+    // switching to OpenCode posts no terminal_launch_args at all.
     setAgents([
       agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" }),
       agent({ id: "ag_opencode", name: "opencode-native-ui", display_name: "OpenCode" }),
@@ -649,12 +649,10 @@ describe("NewChatLandingScreen create flow", () => {
     openAgentConfig("ag_codex");
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
 
-    // Switch the picker to OpenCode by clicking its row (commits the pick).
+    // Switch to OpenCode by clicking its row (a plain row — no config submenu,
+    // since it has no mode knobs).
     selectAgent("ag_opencode");
 
-    // OpenCode has no stored pick → the shared approval knob must reset to
-    // Default, not keep Codex's "Full access". Proven by the launch args:
-    // a default preset posts no sandbox/approval flags.
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
