@@ -2626,6 +2626,10 @@ async def _execute_work_management_tool(
                 )
                 if args.get(k) is not None
             }
+            # Default the item to the current session so an agent-created work
+            # item links back to where it came from (overridable via args).
+            if conversation_id and body.get("conversation_id") is None:
+                body["conversation_id"] = conversation_id
             return _result(await server_client.post("/v1/work-items", json=body, timeout=30.0))
 
         if tool_name == "list_work_items":
@@ -2634,9 +2638,7 @@ async def _execute_work_management_tool(
                 for k in ("status", "conversation_id", "limit")
                 if args.get(k) is not None
             }
-            return _result(
-                await server_client.get("/v1/work-items", params=params, timeout=30.0)
-            )
+            return _result(await server_client.get("/v1/work-items", params=params, timeout=30.0))
 
         if tool_name == "update_work_item":
             work_item_id = args.get("work_item_id")
