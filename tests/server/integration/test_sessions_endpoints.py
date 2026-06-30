@@ -4407,6 +4407,52 @@ async def test_accumulate_session_usage_unpriced_model_has_tokens_no_cost(
     assert "total_cost_usd" not in usage["by_model"]["free-model"]
 
 
+async def test_accumulate_session_usage_sequential_calls_accumulate_both_deltas(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two sequential _accumulate_session_usage calls each persist their delta.
+
+    Regression guard for the read-modify-write lost-update bug (#9): previously
+    the function read current usage in a separate transaction from the write, so
+    two concurrent completions could each overwrite the other's delta. The fix
+    uses increment_session_usage (single atomic transaction), ensuring both
+    deltas are preserved.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-6, output_per_token=2e-6),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+
+    # First completion.
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "m1"}},
+        session["id"],
+        store,
+    )
+    # Second completion (simulates a concurrent relay completion).
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 200, "output_tokens": 100, "model": "m1"}},
+        session["id"],
+        store,
+    )
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["input_tokens"] == 1200  # 1000 + 200
+    assert usage["output_tokens"] == 600  # 500 + 100
+    assert usage["total_tokens"] == 0  # not reported → still 0
+    # cost = (1000+200)*1e-6 + (500+100)*2e-6 = 0.0012 + 0.0012 = 0.0024
+    assert usage.get("total_cost_usd") == pytest.approx(0.0024)
+    assert usage["by_model"]["m1"]["input_tokens"] == 1200
+    assert usage["by_model"]["m1"]["total_cost_usd"] == pytest.approx(0.0024)
+
+
 async def test_external_session_usage_records_per_model_breakdown(
     client: httpx.AsyncClient,
     db_uri: str,

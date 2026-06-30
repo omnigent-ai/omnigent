@@ -932,6 +932,48 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(session_usage=json.dumps(usage))
             )
 
+    def increment_session_usage(
+        self,
+        conversation_id: str,
+        delta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Atomically increment the session usage for one conversation.
+
+        Runs the read-modify-write in a single SQLAlchemy session (one DB
+        transaction). On PostgreSQL, ``SELECT ... FOR UPDATE`` locks the row
+        for the duration of the transaction so a concurrent second writer
+        blocks until this one commits, preventing lost updates (#9). On SQLite
+        the single-writer exclusive write lock serialises concurrent writers
+        naturally — no explicit ``FOR UPDATE`` is needed (and SQLite does not
+        support it).
+
+        :param conversation_id: The conversation to update.
+        :param delta: Usage increments (see
+            :meth:`ConversationStore.increment_session_usage`).
+        :returns: The updated ``session_usage`` dict.
+        """
+        import json
+
+        from omnigent.stores.conversation_store import apply_session_usage_delta
+
+        with self._session() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            q = select(SqlConversation).where(SqlConversation.id == conversation_id)
+            if dialect == "postgresql":
+                q = q.with_for_update()
+            row = session.scalars(q).first()
+            current: dict[str, Any] = (
+                dict(json.loads(row.session_usage)) if row and row.session_usage else {}
+            )
+            apply_session_usage_delta(current, delta)
+            session.execute(
+                update(SqlConversation)
+                .where(SqlConversation.id == conversation_id)
+                .values(session_usage=json.dumps(current))
+            )
+            return current
+
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """
         Atomically add *delta_usd* to a user's spend for one UTC day.
