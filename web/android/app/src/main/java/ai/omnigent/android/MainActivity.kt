@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
 import android.webkit.URLUtil
@@ -38,6 +39,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
+    private val loginManager = OidcLoginManager()
     private var pinnedOrigin: String? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
@@ -114,6 +116,7 @@ class MainActivity : ComponentActivity() {
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
                         onPageReady = ::onPageReady,
+                        onLoginRequired = ::startLogin,
                     )
                 webChromeClient =
                     OmnigentWebChromeClient(
@@ -174,12 +177,51 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Run the RFC 8252 login flow: authenticate in a Custom Tab (Google/passkey
+     * work there, not in a WebView), then [onSessionToken] injects the session.
+     * Triggered by [OmnigentWebViewClient] when the server redirects to the IdP.
+     */
+    private fun startLogin() {
+        val origin = pinnedOrigin ?: return
+        loginManager.start(this, origin, ::onSessionToken)
+    }
+
+    /**
+     * Bridge the session from the Custom Tab into the WebView: the polled JWT is
+     * exactly the session-cookie value, so set it as the cookie (the WebView's
+     * cookie store is isolated from the Custom Tab's), then reload authenticated
+     * and bring this activity back over the Custom Tab.
+     */
+    private fun onSessionToken(token: String) {
+        val origin = pinnedOrigin ?: return
+        val secure = origin.startsWith("https://")
+        // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
+        val name = if (secure) "__Host-ap_session" else "ap_session"
+        val cookie = buildString {
+            append(name).append('=').append(token).append("; Path=/")
+            if (secure) append("; Secure")
+            append("; SameSite=Lax")
+        }
+        val cookies = CookieManager.getInstance()
+        cookies.setAcceptCookie(true)
+        cookies.setCookie(origin, cookie) {
+            cookies.flush()
+            webView.loadUrl(origin)
+        }
+        startActivity(
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        )
+    }
+
     override fun onDestroy() {
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
         pendingMicRequest?.deny()
         pendingMicRequest = null
+        loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) webView.destroy() // releases the bridge chain
         super.onDestroy()
