@@ -8493,10 +8493,22 @@ async def _forward_event_to_runner(
     # the entire session.  The verdict is persisted as model_override
     # on the conversation so subsequent turns reuse it without another
     # judge call.
+    # Route if: top-level session with toggle on, OR sub-agent session
+    # with no explicit model (routing is globally enabled server-side).
+    try:
+        from omnigent.runtime._globals import _caps as _routing_caps
+
+        _server_routing_on = _routing_caps is not None and _routing_caps.routing_client is not None
+    except ImportError:
+        _server_routing_on = False
+    _routing_enabled = (
+        conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+    ) or (
+        conv.parent_conversation_id is not None and _server_routing_on
+    )
     if (
         effective_runner_override is None
-        and conv.cost_control_mode_override == "on"
-        and conv.parent_conversation_id is None
+        and _routing_enabled
         and body.type == "message"
     ):
         from omnigent.server.smart_routing import route_turn
@@ -8706,11 +8718,18 @@ async def _dispatch_session_event_to_runner(
         # the toggle is on and no model_override is set, call the
         # judge and persist the chosen model on the conversation row.
         # The native CLI reads model_override from the session.
-        if (
-            conv.model_override is None
-            and conv.cost_control_mode_override == "on"
-            and conv.parent_conversation_id is None
-        ):
+        try:
+            from omnigent.runtime._globals import _caps as _routing_caps_n
+
+            _server_routing_on_n = (
+                _routing_caps_n is not None and _routing_caps_n.routing_client is not None
+            )
+        except ImportError:
+            _server_routing_on_n = False
+        _native_routing_enabled = (
+            conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+        ) or (conv.parent_conversation_id is not None and _server_routing_on_n)
+        if conv.model_override is None and _native_routing_enabled:
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
