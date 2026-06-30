@@ -10,7 +10,7 @@ executor adapter uses, then asserts on the exported span attributes.
 
 from __future__ import annotations
 
-import json
+import contextlib
 from collections.abc import Iterator
 
 import pytest
@@ -42,10 +42,8 @@ def exporter() -> Iterator[InMemorySpanExporter]:
         yield in_mem
     finally:
         in_mem.clear()
-        try:
+        with contextlib.suppress(Exception):
             provider.shutdown()
-        except Exception:
-            pass
         otel_trace._TRACER_PROVIDER = previous  # type: ignore[attr-defined]
         otel_trace._TRACER_PROVIDER_SET_ONCE._done = previous_done  # type: ignore[attr-defined]
 
@@ -103,9 +101,7 @@ def test_agent_span_provider_only_omits_request_model(
     returns empty provider; the gen_ai.provider.name attr is omitted.
     """
     ctx = TracingContext()
-    span = ctx.start_agent_span(
-        agent_name="my-agent", user_message="hi", model="gpt-5.1"
-    )
+    span = ctx.start_agent_span(agent_name="my-agent", user_message="hi", model="gpt-5.1")
     ctx.end_agent_span(span, response="ok")
 
     attrs = dict(_spans_by_name(exporter, "agent:")[0].attributes or {})
@@ -150,30 +146,18 @@ def test_content_capture_off_by_default_drops_input_and_output(
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
 
     ctx = TracingContext()
-    agent = ctx.start_agent_span(
-        agent_name="a", user_message="PII: user@example.com"
-    )
-    tool = ctx.start_tool_span(
-        tool_name="cred-store", tool_args={"secret": "PII: sk-abcdef"}
-    )
+    agent = ctx.start_agent_span(agent_name="a", user_message="PII: user@example.com")
+    tool = ctx.start_tool_span(tool_name="cred-store", tool_args={"secret": "PII: sk-abcdef"})
     ctx.end_tool_span(tool, result={"value": "PII: leaked@example.com"})
     ctx.end_agent_span(agent, response="PII: response with email@example.com")
 
     for span in exporter.get_finished_spans():
         attrs = dict(span.attributes or {})
-        assert "input.value" not in attrs, (
-            f"input.value leaked on {span.name}: {attrs}"
-        )
-        assert "output.value" not in attrs, (
-            f"output.value leaked on {span.name}: {attrs}"
-        )
+        assert "input.value" not in attrs, f"input.value leaked on {span.name}: {attrs}"
+        assert "output.value" not in attrs, f"output.value leaked on {span.name}: {attrs}"
         for v in attrs.values():
-            assert "@example.com" not in str(v), (
-                f"PII string leaked via {span.name}: {attrs}"
-            )
-            assert "sk-abcdef" not in str(v), (
-                f"secret leaked via {span.name}: {attrs}"
-            )
+            assert "@example.com" not in str(v), f"PII string leaked via {span.name}: {attrs}"
+            assert "sk-abcdef" not in str(v), f"secret leaked via {span.name}: {attrs}"
 
 
 def test_content_capture_on_includes_input_and_output(

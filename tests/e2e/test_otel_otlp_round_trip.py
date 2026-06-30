@@ -35,7 +35,6 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from omnigent.inner.tracing import TracingContext, enable_tracing
 from omnigent.runtime import telemetry
-
 from tests.e2e._otlp_receiver import (
     OTLPReceiver,
     attrs_to_dict,
@@ -73,9 +72,7 @@ def real_otel_pipeline(
     tracer_provider.add_span_processor(span_processor)
 
     metric_exporter = OTLPMetricExporter(endpoint=f"{receiver.endpoint}/v1/metrics")
-    metric_reader = PeriodicExportingMetricReader(
-        metric_exporter, export_interval_millis=100
-    )
+    metric_reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=100)
     meter_provider = MeterProvider(metric_readers=[metric_reader])
 
     previous_tracer = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
@@ -212,9 +209,7 @@ def test_operation_and_tool_duration_metrics_export_over_real_otlp(
     data points. Verify they land on the wire with the expected attrs.
     """
     ctx = TracingContext()
-    agent = ctx.start_agent_span(
-        agent_name="m", user_message="hi", model="openai/gpt-5.1"
-    )
+    agent = ctx.start_agent_span(agent_name="m", user_message="hi", model="openai/gpt-5.1")
     tool = ctx.start_tool_span(tool_name="calculator", tool_args={"x": 1})
     ctx.end_tool_span(tool, result={"r": 1}, duration_ms=15.0)
     ctx.end_agent_span(agent, response="done")
@@ -222,9 +217,7 @@ def test_operation_and_tool_duration_metrics_export_over_real_otlp(
     _wait_for_metric(real_otel_pipeline, "gen_ai.client.operation.duration")
     _wait_for_metric(real_otel_pipeline, "omnigent.tool.duration")
 
-    op_points = real_otel_pipeline.all_metric_data_points(
-        "gen_ai.client.operation.duration"
-    )
+    op_points = real_otel_pipeline.all_metric_data_points("gen_ai.client.operation.duration")
     assert len(op_points) >= 1
     op_attrs = attrs_to_dict(op_points[0].attributes)
     assert op_attrs["gen_ai.operation.name"] == "invoke_agent"

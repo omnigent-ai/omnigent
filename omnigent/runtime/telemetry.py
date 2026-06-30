@@ -31,6 +31,7 @@ concerns:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 from collections.abc import Iterator
@@ -417,7 +418,6 @@ def shutdown_metrics() -> None:
             provider.shutdown(timeout_millis=5000)
     except Exception:
         _logger.debug("MeterProvider shutdown failed", exc_info=True)
-
 
 
 def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
@@ -891,10 +891,6 @@ def init() -> None:
     )
 
 
-# Atexit registration so PeriodicExportingMetricReader flushes
-# its buffer on process exit (default 60s interval would drop on
-# SIGTERM otherwise). Idempotent — shutdown_metrics swallows
-# double-call errors.
-import atexit as _atexit
-_atexit.register(shutdown_metrics)
-
+# Flush PeriodicExportingMetricReader buffer on process exit (default
+# 60s interval would drop accumulated data points on SIGTERM otherwise).
+atexit.register(shutdown_metrics)

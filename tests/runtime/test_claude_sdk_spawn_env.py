@@ -291,7 +291,8 @@ def test_no_telemetry_env_leaks_when_unset(
 
     env = _build_claude_sdk_spawn_env(_make_spec(auth=ApiKeyAuth(api_key="x")), workdir=None)
 
-    for key in (        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    for key in (
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
         "CLAUDE_CODE_ENABLE_TELEMETRY",
         "OTEL_TRACES_EXPORTER",
     ):

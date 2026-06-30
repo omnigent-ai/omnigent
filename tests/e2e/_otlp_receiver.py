@@ -29,9 +29,9 @@ from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
 class _OTLPHandler(BaseHTTPRequestHandler):
     """Minimal OTLP/HTTP receiver: parses POSTed protobufs into captures."""
 
-    server: "OTLPReceiver"  # populated by HTTPServer
+    server: OTLPReceiver  # populated by HTTPServer
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b""
         if self.headers.get("Content-Encoding") == "gzip":
@@ -63,7 +63,7 @@ class _OTLPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body_bytes)
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+    def log_message(self, format: str, *args: Any) -> None:
         return  # Silence default access log to keep test output clean.
 
 
