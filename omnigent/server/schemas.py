@@ -566,6 +566,47 @@ class SessionResourcePaginatedList(BaseModel):
     has_more: bool = False
 
 
+class SessionEnvironmentFilesystemChangeObject(BaseModel):
+    """
+    API representation of a changed file in a session environment.
+
+    :param object: Fixed resource type, always
+        ``"session.environment.filesystem.entry"``.
+    :param path: Path relative to the environment root.
+    :param name: Base filename derived from ``path``.
+    :param status: Change operation: ``"created"``, ``"modified"``, or
+        ``"deleted"``.
+    :param bytes: File size in bytes, or ``None`` for deleted/stat-failed
+        entries.
+    :param modified_at: Unix epoch seconds of last modification, or ``None``
+        for deleted/stat-failed entries.
+    :param staged: Whether the change is staged in the git index. Optional so
+        clients can tolerate older runners that do not send staging metadata.
+    :param unstaged: Whether the change exists in the working tree. Optional
+        so clients can tolerate older runners that do not send staging
+        metadata.
+    """
+
+    object: Literal["session.environment.filesystem.entry"]
+    path: str
+    name: str
+    status: Literal["created", "modified", "deleted"]
+    bytes: int | None = None
+    modified_at: int | None = None
+    staged: bool | None = None
+    unstaged: bool | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class SessionEnvironmentFilesystemChangeList(BaseModel):
+    """Public flat list of changed files in a session environment."""
+
+    object: Literal["list"] = "list"
+    data: list[SessionEnvironmentFilesystemChangeObject] = Field(default_factory=list)
+    has_more: bool = False
+
+
 # ── Conversations ───────────────────────────────────────────────
 
 

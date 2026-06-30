@@ -754,6 +754,8 @@ async def test_filesystem_changes_modified(
     entries_by_path = {e["path"]: e for e in body["data"]}
     assert "hello.txt" in entries_by_path, "Modified file must appear in changes"
     assert entries_by_path["hello.txt"]["status"] == "modified"
+    assert entries_by_path["hello.txt"]["staged"] is False
+    assert entries_by_path["hello.txt"]["unstaged"] is True
 
 
 @pytest.mark.asyncio
@@ -773,6 +775,8 @@ async def test_filesystem_changes_deleted(
     entries_by_path = {e["path"]: e for e in body["data"]}
     assert "gone.py" in entries_by_path, "Deleted file must appear in changes"
     assert entries_by_path["gone.py"]["status"] == "deleted"
+    assert entries_by_path["gone.py"]["staged"] is False
+    assert entries_by_path["gone.py"]["unstaged"] is True
 
 
 @pytest.mark.asyncio

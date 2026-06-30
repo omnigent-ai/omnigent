@@ -8969,7 +8969,7 @@
     },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/changes": {
       "get": {
-        "description": "List all files changed since session start (flat, registry-backed).\n\nReturns the watchdog change set for the session \u2014 every file\ncreated, modified, or deleted since the session began, regardless\nof directory depth.  Use for the flat \"changed files\" view.\n\n**Returns:** Flat list of changed filesystem entries with `status`.",
+        "description": "List all files changed since session start (flat, registry-backed).\n\nReturns the watchdog change set for the session \u2014 every file\ncreated, modified, or deleted since the session began, regardless\nof directory depth.  Use for the flat \"changed files\" view.\n\n**Returns:** Flat list of changed filesystem entries with `status` and optional `staged` / `unstaged` fields.",
         "operationId": "list_environment_filesystem_changes_v1_sessions__session_id__resources_environments__environment_id__changes_get",
         "parameters": [
           {
