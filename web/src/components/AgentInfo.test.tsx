@@ -3,9 +3,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
-import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
-import { COST_CONTROL_PLAN_LABEL } from "./CostRoutingControl";
 
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
@@ -104,30 +102,15 @@ function renderButton(agent: Agent | undefined) {
  * policies section (react-query), so wrap in a QueryClientProvider with
  * retries off — the policy fetch failing in jsdom is irrelevant to the
  * cost row under test and must not crash the render.
- *
- * @param session Optional snapshot seeded into the shared
- *   ``["session", id]`` cache the intelligent-routing section reads
- *   (``staleTime: Infinity`` keeps the seed authoritative — no fetch).
  */
-function renderButtonWithSession(
-  agent: Agent | undefined,
-  sessionId: string,
-  session?: Session,
-  // The routing tests opt in; production defaults to dark until the go-ahead.
-  showIntelligentRouting = false,
-) {
+function renderButtonWithSession(agent: Agent | undefined, sessionId: string) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  if (session) qc.setQueryData(["session", sessionId], session);
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <AgentInfoButton
-          agent={agent}
-          sessionId={sessionId}
-          showIntelligentRouting={showIntelligentRouting}
-        />
+        <AgentInfoButton agent={agent} sessionId={sessionId} />
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -739,188 +722,5 @@ describe("AgentInfoContent restart-with-model trigger", () => {
   it("hides the trigger when the harness is unknown (not yet loaded)", () => {
     renderContentForAgent({ id: "ag_x", name: "mystery" }, "conv_x");
     expect(screen.queryByTestId("restart-with-model-trigger")).not.toBeInTheDocument();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Intelligent routing section
-// ---------------------------------------------------------------------------
-
-/** Minimal session snapshot carrying the given labels. */
-function sessionWithLabels(
-  id: string,
-  labels: Record<string, string>,
-  // The gate keys on the snapshot's agentName (isCostRoutingSession).
-  agentName = "polly",
-): Session {
-  return {
-    id,
-    agentId: `agent_${agentName}`,
-    agentName,
-    status: "idle",
-    createdAt: 0,
-    title: null,
-    items: [],
-    labels,
-    permissionLevel: null,
-    parentSessionId: null,
-    subAgentName: null,
-  };
-}
-
-/** Serialize a v3 plan payload into the labels dict the server returns. */
-function planLabels(payload: Record<string, unknown>): Record<string, string> {
-  return { [COST_CONTROL_PLAN_LABEL]: JSON.stringify(payload) };
-}
-
-/** A fully-populated valid v3 plan; rationale is judge prose. */
-const APPLIED_PLAN = {
-  version: 3,
-  tier: "cheap",
-  model: "databricks-claude-haiku-4-5",
-  applied: true,
-  rationale: "Routine lookup; a small model suffices.",
-  turn_anchor: "2026-06-10T12:00:00+00:00",
-};
-
-describe("AgentInfoButton intelligent routing section", () => {
-  it("never renders on a sub-agent (child) session, even with a verdict", () => {
-    // The advisor governs only the orchestrator's brain; children inherit
-    // the parent's agentName, so the guard must key on parentSessionId.
-    const child = {
-      ...sessionWithLabels("conv_child", planLabels(APPLIED_PLAN)),
-      parentSessionId: "conv_parent",
-    };
-    renderButtonWithSession(AGENT_WITH_BOTH, "conv_child", child, true);
-    fireEvent.click(screen.getByTestId("agent-info-trigger"));
-    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
-    expect(screen.queryByTestId("intelligent-routing-section")).toBeNull();
-  });
-
-  beforeEach(() => {
-    // Mode comes from the store; capability comes from the snapshot.
-    useChatStore.setState({
-      sessionCostUsd: null,
-      costControlModeOverride: null,
-    });
-  });
-
-  function openInfo() {
-    fireEvent.click(screen.getByTestId("agent-info-trigger"));
-  }
-
-  it("shows routing section for any top-level agent (not polly-specific)", () => {
-    renderButtonWithSession(
-      AGENT_WITH_BOTH,
-      "conv_r1",
-      sessionWithLabels("conv_r1", {}, "databricks_coding_agent"),
-      true,
-    );
-    openInfo();
-    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
-    // Any top-level agent now shows the routing section (server-side routing).
-    expect(screen.getByTestId("intelligent-routing-section")).toBeInTheDocument();
-  });
-
-  it("shows On plus the quiet no-decision line before the first verdict", () => {
-    renderButtonWithSession(AGENT_WITH_BOTH, "conv_r2", sessionWithLabels("conv_r2", {}), true);
-    openInfo();
-    // Renamed from "Intelligent routing" — the agreed product name.
-    expect(screen.getByTestId("intelligent-routing-section").textContent).toContain(
-      "Intelligent model router",
-    );
-    expect(screen.getByTestId("intelligent-routing-state")).toHaveTextContent("On");
-    expect(screen.getByTestId("intelligent-routing-section").textContent).toContain(
-      "No decision yet this session.",
-    );
-    expect(screen.queryByTestId("intelligent-routing-verdict")).toBeNull();
-  });
-
-  it("reads Off when the user disabled routing for the session", () => {
-    useChatStore.setState({ costControlModeOverride: "off" });
-    renderButtonWithSession(AGENT_WITH_BOTH, "conv_r3", sessionWithLabels("conv_r3", {}), true);
-    openInfo();
-    expect(screen.getByTestId("intelligent-routing-state")).toHaveTextContent("Off");
-  });
-
-  it("shows the applied decision in full: mono model, tier suffix, Applied, rationale, time", () => {
-    const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
-    renderButtonWithSession(
-      AGENT_WITH_BOTH,
-      "conv_r4",
-      sessionWithLabels("conv_r4", planLabels({ ...APPLIED_PLAN, turn_anchor: fiveMinAgo })),
-      true,
-    );
-    openInfo();
-    const model = screen.getByTestId("intelligent-routing-model");
-    // The full id (not the short pill hint) in mono — this is the
-    // detail surface the hover tooltip no longer carries.
-    expect(model).toHaveTextContent("databricks-claude-haiku-4-5");
-    expect(model.getAttribute("class")).toContain("font-mono");
-    const verdict = screen.getByTestId("intelligent-routing-verdict").textContent ?? "";
-    expect(verdict).toContain("cheap");
-    expect(verdict).toContain("Applied");
-    expect(verdict).toContain("Routine lookup; a small model suffices.");
-    expect(verdict).toContain("5m");
-  });
-
-  it("labels a shadow decision as would-have-picked, never Applied", () => {
-    renderButtonWithSession(
-      AGENT_WITH_BOTH,
-      "conv_r5",
-      sessionWithLabels("conv_r5", planLabels({ ...APPLIED_PLAN, applied: false })),
-      true,
-    );
-    openInfo();
-    const verdict = screen.getByTestId("intelligent-routing-verdict").textContent ?? "";
-    expect(verdict).toContain("Would have picked");
-    expect(verdict).not.toContain("Applied");
-  });
-
-  it("keeps the section when a decision exists even if the agent gate misses", () => {
-    // Data presence is proof of capability: deployments that force
-    // routing on must surface decisions regardless of the agent name.
-    renderButtonWithSession(
-      AGENT_WITH_BOTH,
-      "conv_r6",
-      sessionWithLabels("conv_r6", planLabels(APPLIED_PLAN), "renamed_orchestrator"),
-      true,
-    );
-    openInfo();
-    expect(screen.getByTestId("intelligent-routing-verdict")).toBeInTheDocument();
-  });
-
-  it("omits the timestamp for an unparseable turn_anchor (never NaN)", () => {
-    // v2 docs allowed an item id as the anchor — never render NaN.
-    renderButtonWithSession(
-      AGENT_WITH_BOTH,
-      "conv_r7",
-      sessionWithLabels("conv_r7", planLabels({ ...APPLIED_PLAN, turn_anchor: "item_abc123" })),
-      true,
-    );
-    openInfo();
-    const verdict = screen.getByTestId("intelligent-routing-verdict").textContent ?? "";
-    expect(verdict).toContain("databricks-claude-haiku-4-5");
-    expect(verdict).not.toContain("NaN");
-  });
-
-  it("never renders the banned vocabulary, with or without a decision", () => {
-    // Copy rule: the user-facing vocabulary is "Intelligent model router" —
-    // "cost", "routing:", "Auto", and "Spec default" must not appear.
-    const banned = [/cost/i, /routing:/i, /\bauto\b/i, /spec default/i];
-    renderButtonWithSession(
-      AGENT_WITH_BOTH,
-      "conv_r8",
-      sessionWithLabels("conv_r8", planLabels(APPLIED_PLAN)),
-      true,
-    );
-    openInfo();
-    const withVerdict = screen.getByTestId("intelligent-routing-section").textContent ?? "";
-    for (const re of banned) expect(withVerdict).not.toMatch(re);
-    cleanup();
-    renderButtonWithSession(AGENT_WITH_BOTH, "conv_r9", sessionWithLabels("conv_r9", {}), true);
-    openInfo();
-    const withoutVerdict = screen.getByTestId("intelligent-routing-section").textContent ?? "";
-    for (const re of banned) expect(withoutVerdict).not.toMatch(re);
   });
 });

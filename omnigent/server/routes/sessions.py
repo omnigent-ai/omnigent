@@ -8478,38 +8478,6 @@ async def _emit_server_routing_decision(
         )
         persisted_id = None
 
-    # Persist the verdict as a session label so the AgentInfo popover's
-    # "Intelligent model router" section can read it (it uses
-    # parseCostRoutingVerdict which reads the cost_control.plan label).
-    try:
-        import datetime
-
-        from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL
-
-        label_value = json.dumps(
-            {
-                "version": 3,
-                "tier": item_data["tier"],
-                "model": model,
-                "applied": True,
-                "rationale": item_data["rationale"],
-                "turn_anchor": datetime.datetime.now(tz=datetime.UTC).isoformat(),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {COST_CONTROL_PLAN_LABEL: label_value},
-        )
-    except (OSError, ValueError):
-        _logger.warning(
-            "Server routing: failed to persist verdict label for session=%s",
-            session_id,
-            exc_info=True,
-        )
-
     # Publish live event so the web UI renders the chip immediately.
     session_stream.publish(
         session_id,
@@ -12857,7 +12825,7 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import infer_tiers
+    from omnigent.server.smart_routing import infer_models
 
     # Resolve the parent agent spec to look up sub-agent harnesses.
     spec: Any | None = None
@@ -12901,43 +12869,57 @@ async def _handle_advise_models_mcp(
         if not isinstance(task, dict):
             continue
         title = task.get("title", "")
-        agent = task.get("agent", "")
         task_text = task.get("task", "")
-        harness = _resolve_harness_for_worker(agent)
-        tiers = infer_tiers(harness) if harness else None
-        if tiers is None:
+        agents_spec = task.get("agents")
+        if not isinstance(agents_spec, list) or not agents_spec:
+            continue
+
+        # Build a combined model list from all agent entries,
+        # preserving cheapest→powerful order. Map chosen model → agent.
+        model_to_agent: dict[str, str] = {}
+        combined_models: list[str] = []
+        for agent_entry in agents_spec:
+            if not isinstance(agent_entry, dict):
+                continue
+            agent = agent_entry.get("agent", "")
+            explicit_models: list[str] | None = agent_entry.get("models")
+            if explicit_models is not None and not isinstance(explicit_models, list):
+                explicit_models = None
+            if explicit_models:
+                candidates = explicit_models
+            else:
+                harness = _resolve_harness_for_worker(agent)
+                candidates = infer_models(harness) or []
+            for m in candidates:
+                if m not in model_to_agent:
+                    model_to_agent[m] = agent
+                    combined_models.append(m)
+
+        if not combined_models:
             recommendations.append(
-                {
-                    "title": title,
-                    "agent": agent,
-                    "model": None,
-                    "rationale": f"no tiers available for harness {harness!r}",
-                }
+                {"title": title, "agent": None, "model": None, "rationale": "no candidates"}
             )
             continue
         try:
-            verdict = await routing_client.route(task_text, tiers)
+            verdict = await routing_client.route(task_text, combined_models)
         except Exception:  # routing failures must not crash the advisor
-            _logger.exception(
-                "_handle_advise_models_mcp: routing_client.route failed for task %r agent %r",
-                title,
-                agent,
-            )
+            _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
             verdict = None
         if verdict is None:
             recommendations.append(
                 {
                     "title": title,
-                    "agent": agent,
+                    "agent": None,
                     "model": None,
                     "rationale": "router returned no verdict",
                 }
             )
         else:
+            chosen_agent = model_to_agent.get(verdict.model)
             recommendations.append(
                 {
                     "title": title,
-                    "agent": agent,
+                    "agent": chosen_agent,
                     "model": verdict.model,
                     "rationale": verdict.rationale,
                 }

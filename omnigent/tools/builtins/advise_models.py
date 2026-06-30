@@ -45,13 +45,12 @@ class SysAdviseModelsTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Recommend the best model for each sub-agent task before "
-            "fan-out. Pass the list of tasks you are about to dispatch "
-            "and receive a per-task {model, tier, rationale}. Use the "
-            "returned model as args.model in the matching sys_session_send "
-            "call. Advisory only — the recommendation is not enforced. "
-            "Available when the server routing client is configured "
-            "(OMNIGENT_SMART_ROUTING=1 + llm: config)."
+            "Recommend the best model per worker per task before fan-out. "
+            "Each task specifies one or more agents to get recommendations "
+            "for, plus an optional model list to constrain the pick. "
+            "Returns one {agent, model, rationale} entry per agent entry. "
+            "Use the returned model as args.model in sys_session_send. "
+            "Advisory only. Available when OMNIGENT_SMART_ROUTING=1."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -82,22 +81,49 @@ class SysAdviseModelsTool(Tool):
                                         "type": "string",
                                         "description": "Short human label, e.g. 'auth-refactor'.",
                                     },
-                                    "agent": {
-                                        "type": "string",
+                                    "agents": {
+                                        "type": "array",
                                         "description": (
-                                            "Sub-agent name as declared in the spec, "
-                                            "e.g. 'claude_code'."
+                                            "The workers to get recommendations for. "
+                                            "One recommendation is returned per entry."
                                         ),
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "agent": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Sub-agent name as declared in the spec, "
+                                                        "e.g. 'claude_code'."
+                                                    ),
+                                                },
+                                                "models": {
+                                                    "description": (
+                                                        "Model ids to pick from; "
+                                                        "null = server defaults."
+                                                    ),
+                                                    "oneOf": [
+                                                        {
+                                                            "type": "array",
+                                                            "items": {"type": "string"},
+                                                        },
+                                                        {"type": "null"},
+                                                    ],
+                                                },
+                                            },
+                                            "required": ["agent"],
+                                            "additionalProperties": False,
+                                        },
                                     },
                                     "task": {
                                         "type": "string",
                                         "description": (
                                             "Full task description — the text you will "
-                                            "send to the worker as args.input."
+                                            "send to the workers as args.input."
                                         ),
                                     },
                                 },
-                                "required": ["title", "agent", "task"],
+                                "required": ["title", "agents", "task"],
                                 "additionalProperties": False,
                             },
                         }
