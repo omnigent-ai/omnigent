@@ -153,18 +153,18 @@ guardrails:
       type: function
       on: [tool_call]
       function:
-        path: omnigent.inner.nessie.policies.blast_radius
+        path: omnigent.policies.builtins.orchestration.blast_radius
         arguments:
           gate_pushes: false
     read_only_os:
       type: function
       on: [tool_call]
       function:
-        path: omnigent.inner.nessie.policies.read_only_os
+        path: omnigent.policies.builtins.orchestration.read_only_os
     headless_subagent_purpose_guard:
       type: function
       function:
-        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
+        path: omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [explore, search, review]
 
