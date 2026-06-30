@@ -836,12 +836,23 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 _session_status_cache: dict[str, str] = {}
 
 # Per-session background-shell tally (claude-native), kept in lockstep with
-# ``_session_status_cache`` so a snapshot/reload re-shows "N shells still
-# running" after the live SSE edge is gone. Sticky like the status: only the
-# Stop-hook-derived status carries a count (its ``idle`` is relabeled
-# ``waiting``); the trailing PTY-activity ``idle`` carries none and must not
-# clear it. A new turn (``running``) or a failure clears it. In-memory only —
-# repopulates from live edges, exactly like the status cache.
+# ``_session_status_cache`` so a snapshot/reload re-shows "N background tasks
+# still running" after the live SSE edge is gone. The authoritative source is
+# the ``Stop`` hook's ``background_tasks`` count: a positive count sets the
+# tally, an explicit ``0`` clears it (so a finished shell drops the indicator
+# at the next turn end), and a new turn (``running``) or a failure also clears
+# it. The trailing PTY-activity ``idle`` carries no count and must NOT clear it.
+#
+# KNOWN LIMITATION — the tally only refreshes at a turn boundary. Claude Code
+# emits no background-shell-completion hook, so a ``0`` is only ever posted by
+# the next ``Stop``. If a shell exits while the session is already idle and the
+# user never sends another message, no ``Stop`` fires and the indicator (chat,
+# sidebar, and reloads via ``_get_session_snapshot``) can read "N background
+# tasks still running" until the next turn. In practice the agent usually
+# narrates the shell's completion — which IS a turn, so its ``Stop`` clears the
+# tally — bounding the stale window to the next interaction. This mirrors the
+# TUI's own turn-boundary update of its "N shells still running" banner.
+# In-memory only — repopulates from live edges, exactly like the status cache.
 _session_background_task_count_cache: dict[str, int] = {}
 
 # Sessions whose current turn was Stopped: the relay drops the turn's trailing
