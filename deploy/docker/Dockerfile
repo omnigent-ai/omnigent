@@ -246,14 +246,43 @@ RUN npm install -g --no-audit --no-fund \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
 
-# Kiro CLI is not published as an npm package; use its official installer and
-# copy the resulting root-local binaries onto the global PATH for all sandbox
-# users.
-RUN curl -fsSL https://cli.kiro.dev/install | bash \
- && install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli \
- && if [ -f /root/.local/bin/kiro-cli-chat ]; then \
+# Kiro CLI is not published as an npm package, and its installer has NO version
+# flag — `curl …/install | bash` always fetches `latest`, so the image was
+# non-deterministic. The kiro-native harness is behaviorally coupled to a
+# specific kiro-cli build (Escape-interrupt leaves an empty composer, the
+# bracketed-paste multi-line path, the session-JSONL layout — all verified
+# against 2.10.0; grep `kiro-cli 2.10.0`). So pin it the same way as `agy` below:
+# fetch the immutable per-arch zip from the versioned CDN path and verify its
+# sha256, run the package's own (network-free) install.sh, then copy the binaries
+# onto a system PATH dir every sandbox user shares. A trailing `kiro-cli
+# --version` check asserts the unpacked binary really is the pinned version — a
+# cheap sanity guard atop the sha256. To adopt a new kiro-cli: re-verify the
+# coupled behavior, then bump KIRO_CLI_VERSION + both
+# SHA256s (the `sha256` fields in
+# https://prod.download.cli.kiro.dev/stable/latest/manifest.json). Keep in sync
+# with deploy/docker/Dockerfile.ubi.
+ARG KIRO_CLI_VERSION=2.10.0
+ARG KIRO_CLI_SHA256_AMD64=be9d8b6d7c44f93a83ca22466043d98ad058e6ed3c12fffd068f3fb8a60b3b70
+ARG KIRO_CLI_SHA256_ARM64=0afb37399b9e2847c2f2e3f5d9052c8bc52bbf1e30401ea284a602661bce34bc
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64)  asset="kirocli-x86_64-linux.zip";  sha="$KIRO_CLI_SHA256_AMD64" ;; \
+      aarch64) asset="kirocli-aarch64-linux.zip"; sha="$KIRO_CLI_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$(uname -m)' for kiro-cli" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/kiro.zip" | sha256sum -c -; \
+    unzip -q /tmp/kiro.zip -d /tmp/kiro; \
+    KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
+    install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli; \
+    if [ -f /root/.local/bin/kiro-cli-chat ]; then \
       install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
-    fi
+    fi; \
+    rm -rf /tmp/kiro /tmp/kiro.zip; \
+    installed="$(/usr/local/bin/kiro-cli --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
+      echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
+    echo "kiro-cli ${KIRO_CLI_VERSION} pinned (sha256 verified)"
 # Antigravity CLI (`agy`) — the antigravity-native harness shells out to `agy`
 # on the host, launching it in a tmux pane (see omnigent/antigravity_native*.py),
 # so a managed host image must carry it. It is NOT an npm package
