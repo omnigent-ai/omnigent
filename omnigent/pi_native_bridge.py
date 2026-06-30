@@ -256,6 +256,39 @@ def write_extension_files(
     return extension_path(bridge_dir), config_path(bridge_dir)
 
 
+def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:
+    """
+    Rewrite only the ``authHeaders`` of an existing extension config.
+
+    The bearer baked into ``config.json`` at launch dies with the ~1h
+    Databricks OAuth lifetime. The resident extension re-reads the config on
+    every outbound request (``freshAuthHeaders``), so refreshing this one key
+    — e.g. at the start of each turn — keeps its ``/policies/evaluate`` and
+    ``/mcp`` POSTs authenticated instead of failing closed mid-session.
+    Best-effort and behavior-preserving: it touches only ``authHeaders``,
+    leaving ``serverUrl`` / ``tools`` / etc. intact.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param auth_headers: Fresh outbound auth headers, e.g.
+        ``{"Authorization": "Bearer <token>"}``.
+    :returns: ``True`` when the config was rewritten; ``False`` when
+        *auth_headers* is empty (local/unauthenticated), the config is
+        missing/unreadable, or the headers already match.
+    """
+    if not auth_headers:
+        return False
+    path = config_path(bridge_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("authHeaders") == auth_headers:
+        return False
+    payload["authHeaders"] = auth_headers
+    _atomic_json(path, payload)
+    return True
+
+
 def _extension_source() -> str:
     """
     Return the packaged Pi extension source.

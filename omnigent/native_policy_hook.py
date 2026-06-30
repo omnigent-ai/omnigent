@@ -61,6 +61,10 @@ _EVAL_UNAVAILABLE_REASON = (
     "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
     "Omnigent server); failing closed for this tool call."
 )
+_EVAL_UNAVAILABLE_REQUEST_REASON = (
+    "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
+    "Omnigent server); failing closed for this request."
+)
 
 
 # Env var carrying the one-shot auth + workspace-routing headers from the
@@ -398,15 +402,18 @@ def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
     - ``PreToolUse`` (``PHASE_TOOL_CALL``) fails CLOSED → ``deny``. This is
       the authoritative pre-execution gate; an unevaluable policy must not
       let the call through.
-    - ``UserPromptSubmit`` (``PHASE_REQUEST``) and ``PostToolUse``
-      (``PHASE_TOOL_RESULT``) fail OPEN → ``None``. The request gate is
-      advisory (the tool-call gate still catches dangerous actions) and by
-      the result phase the tool has already executed, so denying would only
-      block an already-incurred side effect.
+    - ``UserPromptSubmit`` (``PHASE_REQUEST``) fails CLOSED →
+      ``{"decision": "block", ...}``. This is the sole pre-turn enforcement
+      point for native sessions; a server hiccup must not let an over-budget
+      or otherwise-blocked request proceed.
+    - ``PostToolUse`` (``PHASE_TOOL_RESULT``) fails OPEN → ``None``. By the
+      result phase the tool has already executed, so denying would only block
+      an already-incurred side effect.
 
     :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
     :returns: A ``permissionDecision: "deny"`` hook output for
-        ``PreToolUse``; ``None`` for every other event (fail open).
+        ``PreToolUse``; a ``decision: "block"`` output for
+        ``UserPromptSubmit``; ``None`` for every other event (fail open).
     """
     if hook_event == _PRE_TOOL_USE:
         return {
@@ -415,6 +422,11 @@ def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
                 "permissionDecision": "deny",
                 "permissionDecisionReason": _EVAL_UNAVAILABLE_REASON,
             },
+        }
+    if hook_event == _USER_PROMPT_SUBMIT:
+        return {
+            "decision": "block",
+            "reason": _EVAL_UNAVAILABLE_REQUEST_REASON,
         }
     return None
 
