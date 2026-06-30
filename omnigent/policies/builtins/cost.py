@@ -414,34 +414,35 @@ def _resolve_expensive_models(expensive_models: list[str] | None) -> _ExpensiveM
 
 
 def cost_budget(
-    max_cost_usd: float,
+    max_cost_usd: float | None = None,
     ask_thresholds_usd: list[float] | None = None,
     expensive_models: list[str] | None = None,
 ) -> PolicyCallable:
     """Factory: gate a session on cumulative LLM spend (USD).
 
-    The hard limit gates BOTH the ``request`` phase (blocking the whole
-    turn before the LLM runs, so text-only turns are budgeted too) and
-    the ``tool_call`` phase: once the limit is reached, DENY while the
-    session is still on an expensive model — telling the user to
-    ``/model`` to a cheaper one. The soft warning checkpoints (ASK
+    The hard limit (when set) gates BOTH the ``request`` phase (blocking
+    the whole turn before the LLM runs, so text-only turns are budgeted
+    too) and the ``tool_call`` phase: once the limit is reached, DENY
+    while the session is still on an expensive model — telling the user
+    to ``/model`` to a cheaper one. The soft warning checkpoints (ASK
     "continue?"; recorded on approve so they don't re-prompt, re-asked
     after a decline) fire on BOTH the ``request`` and ``tool_call``
     phases — both have a server-side approval round-trip (see
     ``evaluate``). Abstains (ALLOW) on every other phase and whenever
     cost is unpriced (``0.0``).
 
-    :param max_cost_usd: Hard limit in USD. Once cumulative session cost
-        reaches this, tool calls are DENYed while the session is on an
-        expensive model, e.g. ``5.0``. Must be ``> 0``.
+    :param max_cost_usd: Optional hard limit in USD. Once cumulative
+        session cost reaches this, tool calls are DENYed while the
+        session is on an expensive model, e.g. ``5.0``. Must be ``> 0``
+        if provided. Either this or *ask_thresholds_usd* must be set.
     :param ask_thresholds_usd: Optional soft warning checkpoints in USD,
         e.g. ``[1.0, 2.5]``. Each ASKs for approval the first time
         cumulative cost crosses it (approval remembered via
         ``session_state``, so an approved checkpoint prompts at most
         once; a decline blocks the one turn / tool call and re-asks next
         time). ``None`` or ``[]`` disables the soft gate. Every value must be
-        ``> 0`` and strictly less than *max_cost_usd*. Order does not
-        matter — they are sorted internally.
+        ``> 0`` and strictly less than *max_cost_usd* when both are set.
+        Order does not matter — they are sorted internally.
     :param expensive_models: Optional case-insensitive substring tokens
         identifying the model tiers blocked once over *max_cost_usd*,
         e.g. ``["opus", "gpt-5"]``. A token matches when it is a
@@ -453,15 +454,19 @@ def cost_budget(
         the named tiers, letting cheaper models continue over budget.
         Each value must be a non-empty string.
     :returns: A policy callable implementing the budget gate.
-    :raises ValueError: If *max_cost_usd* is not positive, any
-        *ask_thresholds_usd* value is not in ``(0, max_cost_usd)``, or
-        any *expensive_models* entry is not a non-empty string.
+    :raises ValueError: If neither *max_cost_usd* nor *ask_thresholds_usd*
+        is provided, *max_cost_usd* is not positive, any
+        *ask_thresholds_usd* value is not in ``(0, max_cost_usd)`` when
+        both are set, or any *expensive_models* entry is not a non-empty
+        string.
     """
-    if max_cost_usd <= 0:
+    if max_cost_usd is None and not ask_thresholds_usd:
+        raise ValueError("cost_budget requires max_cost_usd and/or ask_thresholds_usd")
+    if max_cost_usd is not None and max_cost_usd <= 0:
         raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")
     thresholds = sorted({float(t) for t in (ask_thresholds_usd or [])})
     for t in thresholds:
-        if not (0 < t < max_cost_usd):
+        if max_cost_usd is not None and not (0 < t < max_cost_usd):
             raise ValueError(
                 f"each ask_thresholds_usd value must be in "
                 f"(0, max_cost_usd={max_cost_usd}), got {t!r}"
@@ -503,7 +508,7 @@ def cost_budget(
                 return _UNPRICED_ASK
             return _ALLOW
         cost = _session_cost_usd(event)
-        if cfg.hard_cap_enabled and cost >= max_cost_usd:
+        if max_cost_usd is not None and cfg.hard_cap_enabled and cost >= max_cost_usd:
             if _model_blocked_over_budget(
                 _current_model(event),
                 cfg.expensive_tokens,
@@ -530,11 +535,12 @@ def cost_budget(
                 state = event.get("session_state") or {}
                 approved_up_to = float(state.get(_ASK_APPROVED_KEY, 0.0) or 0.0)
                 if crossed > approved_up_to:
+                    limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd is not None else ""
                     return {
                         "result": "ASK",
                         "reason": (
                             f"Session cost ${cost:.2f} passed the ${crossed:.2f} "
-                            f"warning threshold (limit ${max_cost_usd:.2f}). Continue?"
+                            f"warning threshold{limit_str}. Continue?"
                         ),
                         # Applied only on approve → this and every lower
                         # checkpoint won't re-prompt; higher ones still will.
@@ -888,15 +894,16 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
             "properties": {
                 "max_cost_usd": {
                     "type": "number",
-                    "description": "Hard limit in USD; once cumulative session cost reaches "
-                    "it, tool calls are blocked while the session is on an expensive model.",
+                    "description": "Optional hard limit in USD; once cumulative session cost "
+                    "reaches it, tool calls are blocked while the session is on an expensive "
+                    "model. Either this or ask_thresholds_usd must be set.",
                 },
                 "ask_thresholds_usd": {
                     "type": "array",
                     "items": {"type": "number"},
                     "description": "Optional soft warning checkpoints in USD; the session asks "
                     "for approval the first time spend crosses each (every value must be < "
-                    "max_cost_usd).",
+                    "max_cost_usd when both are set).",
                 },
                 "expensive_models": {
                     "type": "array",
@@ -907,7 +914,6 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                     "only blocks the named tiers.",
                 },
             },
-            "required": ["max_cost_usd"],
         },
     },
     {

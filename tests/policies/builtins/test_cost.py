@@ -577,6 +577,7 @@ def test_no_usage_at_all_allows() -> None:
 @pytest.mark.parametrize(
     "kwargs",
     [
+        {},  # neither max_cost_usd nor ask_thresholds_usd
         {"max_cost_usd": 0.0},  # non-positive hard limit
         {"max_cost_usd": -1.0},  # negative hard limit
         {"max_cost_usd": 5.0, "ask_thresholds_usd": [5.0]},  # not strictly below max
@@ -590,13 +591,29 @@ def test_no_usage_at_all_allows() -> None:
 def test_factory_rejects_invalid_config(kwargs: dict[str, Any]) -> None:
     """Bad config fails loud at factory time (ValueError), not silently.
 
-    A non-positive limit, a checkpoint outside ``(0, max_cost_usd)``, or a
-    non-string / empty ``expensive_models`` entry is a misconfiguration
-    that could never enforce correctly, so it must raise rather than build
-    a dead gate.
+    Neither limit nor thresholds, a non-positive limit, a checkpoint outside
+    ``(0, max_cost_usd)``, or a non-string / empty ``expensive_models`` entry
+    is a misconfiguration that could never enforce correctly, so it must raise
+    rather than build a dead gate.
     """
     with pytest.raises(ValueError):
         cost_budget(**kwargs)
+
+
+def test_ask_thresholds_only_no_hard_cap() -> None:
+    """cost_budget with only ask_thresholds_usd never denies, only asks."""
+    policy = cost_budget(ask_thresholds_usd=[1.0, 3.0])
+    # Below threshold — allow.
+    assert policy(_tool(0.5, model="opus")) == {"result": "ALLOW"}
+    # Crossed threshold — ask.
+    result = policy(_tool(2.0, model="opus"))
+    assert result["result"] == "ASK"
+    assert "1.00" in result["reason"]
+    # No hard-cap message (no max_cost_usd in reason).
+    assert "limit" not in result["reason"]
+    # Way over threshold — still only asks, never denies.
+    result = policy(_tool(100.0, model="opus"))
+    assert result["result"] == "ASK"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -725,8 +742,9 @@ def test_registry_discovers_cost_budget() -> None:
 def test_registry_validates_factory_params() -> None:
     """The registry schema accepts good params and rejects bad ones."""
     load_registry()
-    # Valid: required hard limit alone, with the soft gate, and with models.
+    # Valid: hard limit alone, soft gate alone, both together, and with models.
     assert validate_factory_params(_HANDLER, {"max_cost_usd": 5.0}) is None
+    assert validate_factory_params(_HANDLER, {"ask_thresholds_usd": [1.0]}) is None
     assert (
         validate_factory_params(_HANDLER, {"max_cost_usd": 5.0, "ask_thresholds_usd": [2.0]})
         is None
@@ -745,8 +763,6 @@ def test_registry_validates_factory_params() -> None:
         validate_factory_params(_HANDLER, {"max_cost_usd": 5.0, "expensive_models": "opus"})
         is not None
     )
-    # Missing the required hard limit.
-    assert validate_factory_params(_HANDLER, {}) is not None
     # Unknown param.
     err_unknown = validate_factory_params(_HANDLER, {"max_cost_usd": 5.0, "bogus": 1})
     assert err_unknown is not None and "bogus" in err_unknown
