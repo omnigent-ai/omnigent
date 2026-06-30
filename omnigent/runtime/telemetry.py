@@ -456,8 +456,9 @@ def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
     # spans. The provider + model attributes come from the agent span's
     # gen_ai.provider.name / gen_ai.request.model which the executor
     # adapter set in start_agent_span (PR #1050 wiring).
-    provider = span.attributes.get("gen_ai.provider.name") if span.attributes else None
-    model = span.attributes.get("gen_ai.request.model") if span.attributes else None
+    attrs = getattr(span, "attributes", None) or {}
+    provider = attrs.get("gen_ai.provider.name")
+    model = attrs.get("gen_ai.request.model")
     record_token_usage_metric(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
