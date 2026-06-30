@@ -27,6 +27,7 @@ import {
   InboxIcon,
   ListChecksIcon,
   Loader2Icon,
+  MailIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -116,7 +117,12 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
-import { isConversationUnseen } from "@/hooks/useUnseenConversations";
+import {
+  isConversationUnseen,
+  isExplicitlyUnread,
+  markConversationUnread,
+  useUnseenTick,
+} from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -1783,8 +1789,10 @@ function ConversationMenuItems({
   canEdit,
   canManage,
   canStop,
+  canMarkUnread,
   currentProject,
   onTogglePinned,
+  onMarkUnread,
   onProjectAssigned,
   moveToProject,
   stopSession,
@@ -1804,8 +1812,12 @@ function ConversationMenuItems({
   canEdit: boolean;
   canManage: boolean;
   canStop: boolean;
+  // Whether "Mark as unread" applies: any row not already showing the
+  // unread dot (the active thread and running sessions included).
+  canMarkUnread: boolean;
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
+  onMarkUnread: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
@@ -1873,6 +1885,21 @@ function ConversationMenuItems({
             You need edit permissions to rename this session
           </TooltipContent>
         </Tooltip>
+      )}
+      {/* Mark as unread — re-lights the row's pink dot so a session can
+          be flagged to revisit, including the one you're currently
+          viewing. Hidden only when the row already shows the dot. */}
+      {canMarkUnread && (
+        <C.Item
+          data-testid="mark-unread-conversation"
+          onSelect={() => {
+            onMarkUnread();
+            setMenuOpen(false);
+          }}
+        >
+          <MailIcon className="size-3.5" />
+          Mark as unread
+        </C.Item>
       )}
       {canEdit && (
         <C.Sub>
@@ -2120,9 +2147,22 @@ function ConversationRow({
   const currentProject = conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
 
   const label = conversationDisplayLabel(conversation);
+  // Recompute unseen state the moment the last-seen map changes (e.g. the
+  // user picks "Mark as unread" on this row) rather than waiting for the
+  // next conversations poll.
+  useUnseenTick();
+  // The dot shows when the conversation is content-unseen AND either the
+  // row isn't the one you're viewing OR you explicitly marked it unread.
+  // `isConversationUnseen` still gates on status, so a *running* turn never
+  // shows the dot — marking a working session unread is recorded but stays
+  // invisible until the turn finishes (then the dot lights like any unseen
+  // row). The explicit override only lifts the active-row suppression, so
+  // flagging the thread you're currently viewing surfaces the dot at once.
   const hasUnseenMessages =
-    !isActive &&
-    isConversationUnseen(conversation.id, conversation.updated_at, conversation.status);
+    isConversationUnseen(conversation.id, conversation.updated_at, conversation.status) &&
+    (!isActive || isExplicitlyUnread(conversation.id));
+  // "Mark as unread" is offered on any row not already showing the dot.
+  const canMarkUnread = !hasUnseenMessages;
   // Badge precedence: a pending approval ("Needs response") outranks the
   // unread dot — a session that's both unread and awaiting input should
   // surface the actionable approval tag. The row still renders bold (the
@@ -2291,8 +2331,10 @@ function ConversationRow({
     canEdit,
     canManage,
     canStop,
+    canMarkUnread,
     currentProject,
     onTogglePinned,
+    onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
     stopSession,

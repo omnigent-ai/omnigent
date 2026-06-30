@@ -1,16 +1,26 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import {
+  clearUnreadOverride,
   isConversationUnseen,
+  isExplicitlyUnread,
   markConversationSeen,
+  markConversationUnread,
   nowSeconds,
   useMarkConversationSeen,
+  useUnseenTick,
 } from "./useUnseenConversations";
 
 const STORAGE_KEY = "omnigent:last-seen-timestamps";
+const UNREAD_KEY = "omnigent:explicit-unread-ids";
 
 beforeEach(() => {
   localStorage.clear();
+  // The explicit-unread override set is module-level (in-memory, not
+  // localStorage), so clear the ids these tests use to avoid leaking
+  // a mark-unread from one test into the next.
+  clearUnreadOverride("conv-1");
+  clearUnreadOverride("conv-2");
   vi.restoreAllMocks();
 });
 
@@ -68,6 +78,76 @@ describe("markConversationSeen", () => {
     markConversationSeen("conv-1", 5_000);
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
     expect(stored["conv-1"]).toBe(10_000);
+  });
+});
+
+describe("markConversationUnread", () => {
+  it("flags a previously-seen conversation as unseen", () => {
+    markConversationSeen("conv-1", 5_000);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    markConversationUnread("conv-1", 5_000);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+
+  it("writes a baseline just below updated_at (not a cleared entry)", () => {
+    // A missing entry reads as *seen*, so unread must pin the baseline
+    // strictly below updated_at rather than delete it.
+    markConversationUnread("conv-1", 5_000);
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+    expect(stored["conv-1"]).toBe(4_999);
+  });
+
+  it("persists the override to localStorage (survives a reload)", () => {
+    markConversationUnread("conv-1", 5_000);
+    const ids = JSON.parse(localStorage.getItem(UNREAD_KEY)!);
+    expect(ids).toContain("conv-1");
+    // Clearing it removes the id from the persisted set.
+    clearUnreadOverride("conv-1");
+    expect(JSON.parse(localStorage.getItem(UNREAD_KEY)!)).not.toContain("conv-1");
+  });
+
+  it("survives an automatic mark-seen (the active-thread clobber guard)", () => {
+    // Marking the thread you're viewing unread must stick: the automatic
+    // mark-seen (navigation away / poll / focus) is suppressed until an
+    // explicit clearUnreadOverride. Without the override, mark-seen below
+    // would immediately undo the unread.
+    markConversationUnread("conv-1", 5_000);
+    markConversationSeen("conv-1", 6_000);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+
+  it("is reversed by mark-seen once the override is cleared (reopen)", () => {
+    markConversationUnread("conv-1", 5_000);
+    // Reopening the thread clears the override, then mark-seen takes hold.
+    clearUnreadOverride("conv-1");
+    markConversationSeen("conv-1", 5_000);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+
+  it("still defers to status — a running session shows no dot", () => {
+    markConversationUnread("conv-1", 5_000);
+    expect(isConversationUnseen("conv-1", 5_000, "running")).toBe(false);
+  });
+});
+
+describe("isExplicitlyUnread", () => {
+  it("tracks the explicit-unread override and clears on reopen", () => {
+    expect(isExplicitlyUnread("conv-1")).toBe(false);
+    markConversationUnread("conv-1", 5_000);
+    // True even though the row may be active/running — the explicit flag
+    // overrides those suppressions so the dot shows.
+    expect(isExplicitlyUnread("conv-1")).toBe(true);
+    clearUnreadOverride("conv-1");
+    expect(isExplicitlyUnread("conv-1")).toBe(false);
+  });
+});
+
+describe("useUnseenTick", () => {
+  it("re-renders subscribers when the last-seen map is written", () => {
+    const { result } = renderHook(() => useUnseenTick());
+    const before = result.current;
+    act(() => markConversationUnread("conv-1", 5_000));
+    expect(result.current).not.toBe(before);
   });
 });
 
@@ -216,5 +296,58 @@ describe("useMarkConversationSeen", () => {
     const blurred = renderHook(() => useMarkConversationSeen("conv-2", 500));
     blurred.unmount();
     expect(storedBaseline("conv-2")).toBeUndefined();
+  });
+
+  it("does not re-mark seen after the active thread is marked unread", () => {
+    // User views conv-1 (marked seen on mount), then marks it unread from
+    // the kebab. Navigating away (unmount) must NOT re-mark it seen, so the
+    // dot lights once the row is no longer active.
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 1_000_000 });
+    const view = renderHook(() => useMarkConversationSeen("conv-1", 5_000));
+    expect(storedBaseline("conv-1")).toBe(1_000);
+
+    act(() => markConversationUnread("conv-1", 5_000));
+    expect(storedBaseline("conv-1")).toBe(4_999);
+
+    // Navigation away while focused would normally advance the baseline.
+    view.unmount();
+    expect(storedBaseline("conv-1")).toBe(4_999);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+
+  it("preserves a persisted explicit-unread on reload (a fresh mount does not clear)", () => {
+    // A reload landing back on /c/conv-1 is a fresh mount. It must NOT clear
+    // a persisted override — otherwise the dot the user set silently vanishes
+    // on refresh. The first-mount skip + the markConversationSeen guard keep
+    // the baseline pinned below updated_at.
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 9_000_000 });
+    markConversationUnread("conv-1", 5_000);
+
+    renderHook(() => useMarkConversationSeen("conv-1", 5_000));
+
+    expect(storedBaseline("conv-1")).toBe(4_999);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+
+  it("clears the override on a genuine in-app reopen (id changes while mounted)", () => {
+    // ChatPage stays mounted across /c/:id navigations, so a real reopen is
+    // the id changing on the live hook — not a remount. Navigating away and
+    // back marks the thread seen again.
+    setWindowFocused(true);
+    vi.useFakeTimers({ now: 1_000_000 });
+    const { rerender } = renderHook(({ id }) => useMarkConversationSeen(id, 5_000), {
+      initialProps: { id: "conv-1" as string },
+    });
+    act(() => markConversationUnread("conv-1", 5_000));
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+
+    rerender({ id: "conv-2" }); // navigate away to another thread
+    vi.setSystemTime(9_000_000);
+    rerender({ id: "conv-1" }); // reopen conv-1 → override cleared, marked seen
+
+    expect(storedBaseline("conv-1")).toBe(9_000);
+    expect(isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
   });
 });

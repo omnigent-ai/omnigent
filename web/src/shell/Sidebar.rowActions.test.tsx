@@ -8,7 +8,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -50,6 +50,7 @@ vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { clearUnreadOverride } from "@/hooks/useUnseenConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -88,13 +89,23 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => dataResult);
 }
 
-function renderSidebar() {
+// `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
+// Route so `useParams` populates), making that row the active one — the
+// rest of the suite renders at `/` where no row is active.
+function renderSidebar(activeId?: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
+        <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+          {activeId ? (
+            <Routes>
+              <Route path="/c/:conversationId" element={sidebar} />
+            </Routes>
+          ) : (
+            sidebar
+          )}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -105,6 +116,9 @@ beforeEach(() => {
   mocks.rename.mutate.mockReset();
   useConvMock.mockReset();
   localStorage.clear();
+  // The explicit-unread override is module-level (in-memory), so reset it
+  // between tests to avoid a mark-unread leaking into later rows.
+  clearUnreadOverride("conv_1");
   mockConversations([CONV]);
 });
 
@@ -233,6 +247,72 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("mark as unread", () => {
+  it("re-lights the row's unread dot and persists the baseline below updated_at", () => {
+    renderSidebar();
+
+    // The row starts seen (no baseline) — no unread marker.
+    expect(screen.queryByText("(unread)")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("mark-unread-conversation"));
+
+    // The dot's accessible label appears immediately (in-tab tick), and the
+    // baseline is pinned just under updated_at so the dot survives a reload.
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+    const stored = JSON.parse(localStorage.getItem("omnigent:last-seen-timestamps")!);
+    expect(stored.conv_1).toBe(CONV.updated_at - 1);
+  });
+
+  it("records the baseline on a running session but holds the dot until the turn finishes", () => {
+    mockConversations([{ ...CONV, status: "running" }]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("mark-unread-conversation"));
+
+    // The unread baseline is persisted...
+    const stored = JSON.parse(localStorage.getItem("omnigent:last-seen-timestamps")!);
+    expect(stored.conv_1).toBe(CONV.updated_at - 1);
+    // ...but the dot stays suppressed mid-turn (the explicit override lifts
+    // the active-row suppression, not the running one).
+    expect(screen.queryByText("(unread)")).toBeNull();
+
+    // Once the turn finishes (row re-renders as idle), the dot lights — the
+    // persisted baseline now reads unseen for a finished session.
+    cleanup();
+    mockConversations([{ ...CONV, status: "idle" }]);
+    renderSidebar();
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+  });
+
+  it("lights the dot on the active thread you're currently viewing", () => {
+    // The active row normally suppresses the dot (you're reading it), but an
+    // explicit mark-unread is a deliberate flag, so the dot must show.
+    renderSidebar("conv_1");
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("mark-unread-conversation"));
+
+    const stored = JSON.parse(localStorage.getItem("omnigent:last-seen-timestamps")!);
+    expect(stored.conv_1).toBe(CONV.updated_at - 1);
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+  });
+
+  it("is hidden once the row is already unread", () => {
+    // Seed a baseline below updated_at so the row is already unseen.
+    localStorage.setItem(
+      "omnigent:last-seen-timestamps",
+      JSON.stringify({ conv_1: CONV.updated_at - 1 }),
+    );
+    renderSidebar();
+
+    expect(screen.getByText("(unread)")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.queryByTestId("mark-unread-conversation")).toBeNull();
   });
 });
 

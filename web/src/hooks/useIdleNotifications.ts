@@ -45,7 +45,7 @@ import {
   detectIdleTransitions,
   detectNewElicitations,
 } from "@/lib/idleTransitions";
-import { isConversationUnseen } from "@/hooks/useUnseenConversations";
+import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
@@ -168,6 +168,23 @@ export function useIdleNotifications(activeConversationId?: string): void {
     // pushBadge only touches refs, so the once-mounted listener stays fresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Marking a row read/unread in the sidebar rewrites the last-seen map;
+  // recompute the dock badge from the current list so it agrees with the
+  // dot immediately, without waiting for the next conversations poll.
+  const unseenTick = useUnseenTick();
+  useEffect(() => {
+    if (latestConversations.current === null) return;
+    const next = computeUnreadBadgeIds(
+      latestConversations.current,
+      activeIdRef.current,
+      isWindowFocused(),
+      isConversationUnseen,
+    );
+    pushBadge(next.size);
+    // pushBadge/isWindowFocused read refs; rerun only when the map changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unseenTick]);
 
   useEffect(() => {
     // Still loading — don't compute a badge from an absent list (and don't
