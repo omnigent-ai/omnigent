@@ -18,6 +18,7 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 from omnigent.inner.tracing import TracingContext, enable_tracing
 
@@ -52,9 +53,9 @@ def _spans_by_name(exporter: InMemorySpanExporter, name_prefix: str):
     return [s for s in exporter.get_finished_spans() if s.name.startswith(name_prefix)]
 
 
-# ─────────────────────────────────────────────────────────────────
+# ---
 # AGENT span gen_ai semconv attributes
-# ─────────────────────────────────────────────────────────────────
+# ---
 
 
 def test_agent_span_carries_gen_ai_invoke_agent_attrs(exporter: InMemorySpanExporter):
@@ -97,7 +98,7 @@ def test_agent_span_provider_only_omits_request_model(
     exporter: InMemorySpanExporter,
 ):
     """
-    Bare model name without provider prefix — parse_provider_name
+    Bare model name without provider prefix. parse_provider_name
     returns empty provider; the gen_ai.provider.name attr is omitted.
     """
     ctx = TracingContext()
@@ -110,9 +111,9 @@ def test_agent_span_provider_only_omits_request_model(
     assert attrs["gen_ai.request.model"] == "gpt-5.1"
 
 
-# ─────────────────────────────────────────────────────────────────
+# ---
 # TOOL span gen_ai semconv attributes
-# ─────────────────────────────────────────────────────────────────
+# ---
 
 
 def test_tool_span_carries_gen_ai_execute_tool_attrs(exporter: InMemorySpanExporter):
@@ -127,11 +128,14 @@ def test_tool_span_carries_gen_ai_execute_tool_attrs(exporter: InMemorySpanExpor
     attrs = dict(tool_spans[0].attributes or {})
     assert attrs["gen_ai.operation.name"] == "execute_tool"
     assert attrs["tool.name"] == "calculator"
+    # GenAI semconv key for tool identity, emitted alongside the legacy
+    # OpenInference tool.name so spec-aware backends find it too.
+    assert attrs["gen_ai.tool.name"] == "calculator"
 
 
-# ─────────────────────────────────────────────────────────────────
+# ---
 # Content-capture gate
-# ─────────────────────────────────────────────────────────────────
+# ---
 
 
 def test_content_capture_off_by_default_drops_input_and_output(
@@ -185,9 +189,54 @@ def test_content_capture_on_includes_input_and_output(
     assert "X is" in tool_attrs["output.value"]
 
 
-# ─────────────────────────────────────────────────────────────────
+def test_content_capture_off_drops_error_message(
+    exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    Error text can echo user input or tool payloads, so with content
+    capture off it must NOT land on the span (neither as error.message
+    nor in the status description). but the span is still flagged
+    ERROR so failures stay visible.
+    """
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
+
+    ctx = TracingContext()
+    agent = ctx.start_agent_span(agent_name="a", user_message="hi")
+    tool = ctx.start_tool_span(tool_name="t", tool_args={"q": "hi"})
+    ctx.end_tool_span(tool, error="tool blew up on user@example.com")
+    ctx.end_agent_span(agent, response=None, error="agent failed: sk-abcdef")
+
+    for span in exporter.get_finished_spans():
+        attrs = dict(span.attributes or {})
+        assert "error.message" not in attrs, f"error.message leaked on {span.name}: {attrs}"
+        for v in attrs.values():
+            assert "@example.com" not in str(v), f"PII leaked via {span.name}: {attrs}"
+            assert "sk-abcdef" not in str(v), f"secret leaked via {span.name}: {attrs}"
+        assert span.status.status_code == StatusCode.ERROR
+        description = span.status.description or ""
+        assert "@example.com" not in description
+        assert "sk-abcdef" not in description
+
+
+def test_content_capture_on_includes_error_message(
+    exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With content capture on, the error text is recorded on the span."""
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+
+    ctx = TracingContext()
+    agent = ctx.start_agent_span(agent_name="a", user_message="hi")
+    ctx.end_agent_span(agent, response=None, error="boom")
+
+    attrs = dict(_spans_by_name(exporter, "agent:")[0].attributes or {})
+    assert attrs["error.message"] == "boom"
+
+
+# ---
 # Dead-helper deletion: start_llm_span / end_llm_span removed
-# ─────────────────────────────────────────────────────────────────
+# ---
 
 
 def test_dead_llm_helpers_removed():
@@ -201,7 +250,7 @@ def test_dead_llm_helpers_removed():
     assert not hasattr(ctx, "start_llm_span"), (
         "start_llm_span was deleted as dead-for-production. If you need "
         "LLM-level instrumentation, wire it from where LLM calls actually "
-        "happen — inside the spawned subprocess via the SDK, or from "
+        "happen. inside the spawned subprocess via the SDK, or from "
         "record_llm_usage in TurnComplete."
     )
     assert not hasattr(ctx, "end_llm_span")

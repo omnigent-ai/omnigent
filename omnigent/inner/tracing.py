@@ -25,13 +25,14 @@ Or per-session::
 Span hierarchy for a typical turn::
 
     agent:<name>  (openinference.span.kind=AGENT)
-    ├── llm_call  (openinference.span.kind=LLM)
     ├── tool:<tool_name>  (openinference.span.kind=TOOL)
     │   └── agent:<sub_agent>  (openinference.span.kind=AGENT)
-    │       ├── llm_call
     │       └── tool:<sub_tool>
-    ├── policy:<policy_name>  (openinference.span.kind=GUARDRAIL)
-    └── llm_call
+    └── policy:<policy_name>  (openinference.span.kind=GUARDRAIL)
+
+LLM-level spans are not emitted from this module. Real ``llm_call``
+spans originate inside the spawned executor subprocess via the SDK's
+own tracing.
 """
 
 from __future__ import annotations
@@ -43,7 +44,10 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
-from .executor import Message
+from omnigent.runtime.telemetry import (
+    parse_provider_name,
+    should_capture_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +71,12 @@ _GEN_AI_OP_NAME = "gen_ai.operation.name"
 _GEN_AI_AGENT_NAME = "gen_ai.agent.name"
 _GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
 _GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+_GEN_AI_TOOL_NAME = "gen_ai.tool.name"
 _TOOL_NAME = "tool.name"
+
+# Error text can echo user input or tool payloads, so it is gated behind
+# content capture just like input.value / output.value.
+_ERROR_MESSAGE = "error.message"
 
 # ---------------------------------------------------------------------------
 # Global enable/disable
@@ -112,7 +121,7 @@ class TracingContext:
     """Holds the active span stack for a single session/turn.
 
     Spans are created with an explicit parent reference so we are not tied to
-    thread-local or async-context-var storage — the Session explicitly
+    thread-local or async-context-var storage. the Session explicitly
     passes its ``TracingContext`` to every helper that needs to create
     child spans.
     """
@@ -150,8 +159,6 @@ class TracingContext:
             if not parent.is_recording():
                 parent_ended = True
 
-        from omnigent.runtime.telemetry import parse_provider_name
-
         attrs: dict[str, str] = {
             _SPAN_KIND_ATTR: _SPAN_KIND_AGENT,
             "agent.name": agent_name,
@@ -177,7 +184,7 @@ class TracingContext:
             # No explicit parent span. Check if the current OTel context
             # contains the sentinel parent injected by trace_context_for_response.
             # If so, build a context that carries the trace ID but has no
-            # parent span — this makes the agent span a true root span in
+            # parent span. this makes the agent span a true root span in
             # the OTLP export (parent_span_id absent), so MLflow finalizes
             # the trace status to OK instead of leaving it IN_PROGRESS.
             from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
@@ -205,8 +212,6 @@ class TracingContext:
             context=ctx_carrier,
             attributes=attrs,
         )
-        from omnigent.runtime.telemetry import should_capture_content
-
         if should_capture_content():
             span.set_attribute(_INPUT_VALUE, _truncate_str(user_message))
         if self._root_span is None:
@@ -225,13 +230,16 @@ class TracingContext:
             return
         from opentelemetry.trace import StatusCode
 
-        from omnigent.runtime.telemetry import should_capture_content
-
         if response is not None and should_capture_content():
             span.set_attribute(_OUTPUT_VALUE, _truncate_str(response))
         if error:
-            span.set_attribute("error.message", error)
-            span.set_status(StatusCode.ERROR, error)
+            # Always mark the span errored, but record the (potentially
+            # PII-bearing) error text only when content capture is on.
+            if should_capture_content():
+                span.set_attribute(_ERROR_MESSAGE, error)
+                span.set_status(StatusCode.ERROR, error)
+            else:
+                span.set_status(StatusCode.ERROR)
         else:
             span.set_status(StatusCode.OK)
         span.end()
@@ -261,9 +269,8 @@ class TracingContext:
         )
         if self.session_id:
             span.set_attribute("session.id", self.session_id)
-        from omnigent.runtime.telemetry import should_capture_content
-
         span.set_attribute(_TOOL_NAME, tool_name)
+        span.set_attribute(_GEN_AI_TOOL_NAME, tool_name)
         span.set_attribute(_GEN_AI_OP_NAME, "execute_tool")
         if should_capture_content():
             span.set_attribute(_INPUT_VALUE, _safe_serialize_str(tool_args))
@@ -282,15 +289,18 @@ class TracingContext:
             return
         from opentelemetry.trace import StatusCode
 
-        from omnigent.runtime.telemetry import should_capture_content
-
         if should_capture_content():
             span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(result))
         if duration_ms:
             span.set_attribute("duration_ms", duration_ms)
         if error:
-            span.set_attribute("error.message", error)
-            span.set_status(StatusCode.ERROR, error)
+            # Always mark the span errored, but record the (potentially
+            # PII-bearing) error text only when content capture is on.
+            if should_capture_content():
+                span.set_attribute(_ERROR_MESSAGE, error)
+                span.set_status(StatusCode.ERROR, error)
+            else:
+                span.set_status(StatusCode.ERROR)
         else:
             span.set_status(StatusCode.OK)
         span.end()
@@ -322,8 +332,6 @@ class TracingContext:
         )
         if self.session_id:
             span.set_attribute("session.id", self.session_id)
-        from omnigent.runtime.telemetry import should_capture_content
-
         if should_capture_content():
             span.set_attribute(_INPUT_VALUE, _safe_serialize_str(content))
         return span
@@ -339,7 +347,9 @@ class TracingContext:
         from opentelemetry.trace import StatusCode
 
         span.set_attribute("policy.action", action)
-        if reason is not None:
+        # policy.reason can echo flagged user content, so gate it behind
+        # content capture like the other I/O attributes.
+        if reason is not None and should_capture_content():
             span.set_attribute("policy.reason", reason)
         if action == "deny":
             span.set_status(StatusCode.ERROR)
@@ -403,25 +413,3 @@ def _truncate_str(value: str, max_len: int = 4000) -> str:
     if len(value) > max_len:
         return value[:max_len] + "...(truncated)"
     return value
-
-
-def _truncate_messages(
-    messages: list[Message] | None,
-    max_messages: int = 20,
-) -> list[Message]:
-    """Keep the last N messages for LLM span inputs."""
-    if not messages:
-        return []
-    truncated = messages[-max_messages:]
-    result = []
-    for m in truncated:
-        content = m.get("content")
-        if isinstance(content, str) and len(content) > 2000:
-            content = content[:2000] + "...(truncated)"
-        result.append(
-            {
-                "role": m.get("role", "unknown"),
-                "content": content if content is not None else "",
-            }
-        )
-    return result
