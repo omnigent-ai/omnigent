@@ -6653,6 +6653,53 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
 
 
 @pytest.mark.asyncio
+async def test_sys_session_get_info_hides_native_ui_wrapper_agent_name() -> None:
+    """A native-UI session describes itself with its clean public name.
+
+    Regression for the leak where ``sys_session_get_info`` returned the raw
+    bound ``agent_name`` ``"pi-native-ui"``, which the Pi agent then repeated to
+    the user ("I'm pi (agent name: pi-native-ui)"). The projection must map the
+    internal ``-native-ui`` wrapper name to its display name (``"Pi"``) so the
+    implementation detail never reaches the model.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_pi":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_pi",
+                    "agent_id": "ag_pi",
+                    "agent_name": "pi-native-ui",
+                    "status": "running",
+                    "title": "hi what agent are you?",
+                    "runner_id": "runner_1",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/runners/runner_1/status":
+            return httpx.Response(200, json={"runner_id": "runner_1", "online": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_pi"}),
+            server_client=server_client,
+            conversation_id="conv_pi",
+        )
+
+    info = json.loads(output)
+    # The internal wrapper name is rewritten to the public display name; the
+    # raw ``pi-native-ui`` must not appear anywhere in the tool output.
+    assert info["agent_name"] == "Pi"
+    assert "pi-native-ui" not in output
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_session_id_posts_to_direct_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
