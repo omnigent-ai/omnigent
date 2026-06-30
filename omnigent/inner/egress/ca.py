@@ -11,7 +11,6 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-import ssl
 from pathlib import Path
 
 from cryptography import x509
@@ -174,17 +173,9 @@ def _system_ca_bundle() -> bytes:
     Prefers the OS trust store (``ssl.get_default_verify_paths``) so
     that CAs added by corporate MDM, IT policy, or the user are
     included. Falls back to the certifi (Mozilla) bundle when the OS
-    path doesn't exist or is empty.
+    path doesn't exist or is empty. Path resolution is shared with
+    :func:`omnigent.tls.resolve_ca_file` (single source of truth).
     """
-    paths = ssl.get_default_verify_paths()
-    for candidate in (paths.cafile, paths.openssl_cafile):
-        if candidate:
-            p = Path(candidate)
-            if p.is_file() and p.stat().st_size > 0:
-                logger.debug("Using system CA bundle: %s", p)
-                return p.read_bytes()
+    from omnigent.tls import resolve_ca_file
 
-    import certifi
-
-    logger.debug("System CA bundle not found, falling back to certifi")
-    return Path(certifi.where()).read_bytes()
+    return Path(resolve_ca_file()).read_bytes()
