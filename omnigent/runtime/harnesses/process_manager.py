@@ -1110,7 +1110,10 @@ class HarnessProcessManager:
         ``last_used_at`` is older than ``idle_timeout_s`` AND
         has no in-flight response on the harness. Sleeps for
         ``reaper_interval_s`` between passes. Terminates on
-        :class:`asyncio.CancelledError` from :meth:`shutdown`.
+        :class:`asyncio.CancelledError` from :meth:`shutdown`. A
+        non-positive ``idle_timeout_s`` (e.g.
+        ``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``) disables reaping — each
+        pass is a no-op.
 
         Two safety guards beyond raw ``last_used_at`` checks:
 
@@ -1144,6 +1147,12 @@ class HarnessProcessManager:
                 await asyncio.sleep(self._reaper_interval_s)
             except asyncio.CancelledError:
                 return
+            # ``idle_timeout_s <= 0`` disables harness reaping entirely
+            # (``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``). Without this guard a 0
+            # window makes ``cutoff == now``, so every entry (``last_used_at``
+            # always <= now) is reaped on each pass — the inverse of "disabled".
+            if self._idle_timeout_s <= 0:
+                continue
             now = time.monotonic()
             cutoff = now - self._idle_timeout_s
             stale: list[str] = []

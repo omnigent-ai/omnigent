@@ -570,6 +570,37 @@ async def test_idle_reaper_skips_in_flight_turn(
         await fast.shutdown()
 
 
+async def test_idle_reaper_disabled_when_timeout_zero(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+) -> None:
+    """A non-positive idle window disables reaping (``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``).
+
+    Regression: ``0`` must mean "never reap", not "reap everything". Without the
+    ``idle_timeout_s <= 0`` guard the reaper computes ``cutoff = now - 0 == now``,
+    and since every ``last_used_at`` is <= now it reaps every entry on the first
+    pass. The spawned entry must survive many fast reaper passes.
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=0.0,
+        reaper_interval_s=0.05,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+        # ~20 reaper passes at 0.05 s. With the bug the socket is gone almost
+        # immediately; with the guard it survives because reaping is disabled.
+        await asyncio.sleep(1.0)
+        assert socket_path.exists(), (
+            "idle_timeout_s=0 must DISABLE reaping, not reap every entry each pass"
+        )
+    finally:
+        await fast.shutdown()
+
+
 async def test_orphan_sweep_removes_dead_omnigent_dirs(
     short_tmp_parent: Path,
 ) -> None:
