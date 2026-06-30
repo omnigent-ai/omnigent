@@ -1531,22 +1531,40 @@ describe("SubagentsPanel sibling ordering (#1410)", () => {
   }
 
   it("ranks attention-needing and live agents above settled ones", () => {
-    // Supplied worst-first so an identity (no-op) sort would fail.
+    // Each id is named for its activity, supplied worst-first, so the
+    // expected array reads as the priority order and a no-op sort fails.
     const sorted = sortSiblingsByActivity([
-      failed("f"),
-      done("d"),
-      other("o"),
-      idle("i"),
-      launching("l"),
-      working("w"),
-      awaiting("a"),
+      failed("failed"),
+      done("done"),
+      other("other"),
+      idle("idle"),
+      launching("launching"),
+      working("working"),
+      awaiting("awaiting"),
     ]);
-    expect(ids(sorted)).toEqual(["a", "w", "l", "i", "o", "d", "f"]);
+    expect(ids(sorted)).toEqual([
+      "awaiting",
+      "working",
+      "launching",
+      "idle",
+      "other",
+      "done",
+      "failed",
+    ]);
   });
 
-  it("is stable: equal-status rows keep their original (creation) order", () => {
-    // Matters because every list re-polls on TREE_POLL_MS; a non-stable
-    // tiebreak would make same-status rows reshuffle on each refresh.
+  it("breaks ties by created_at, newest child first", () => {
+    // Two working rows supplied oldest-first; the newer one must lead.
+    const input = [
+      childInfo({ id: "w_old", busy: true, created_at: 100 }),
+      childInfo({ id: "w_new", busy: true, created_at: 200 }),
+    ];
+    expect(ids(sortSiblingsByActivity(input))).toEqual(["w_new", "w_old"]);
+  });
+
+  it("falls back to original order when created_at is absent (deterministic)", () => {
+    // With no created_at the tiebreak drops to the original index, so
+    // same-status rows never reshuffle across TREE_POLL_MS re-polls.
     const input = [done("d1"), working("w1"), working("w2"), done("d2")];
     expect(ids(sortSiblingsByActivity(input))).toEqual(["w1", "w2", "d1", "d2"]);
   });
