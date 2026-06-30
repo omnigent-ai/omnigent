@@ -5248,6 +5248,54 @@ def test_hook_record_parses_stop_background_tasks() -> None:
     assert record.background_task_count == 2
 
 
+def test_hook_record_stop_counts_only_running_background_tasks() -> None:
+    """Terminal-status entries are excluded so a finished shell can't over-count.
+
+    Claude Code retains finished/stopped shells in the ``background_tasks``
+    array (claude-code #67895/#59456/#14049). Counting the raw length would
+    keep the "N background tasks still running" indicator lit after they exit,
+    so only non-terminal entries are counted — and an unknown/absent status
+    counts as running so a genuinely-live shell is never dropped.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {"id": "a", "type": "shell", "status": "running"},
+                    {"id": "b", "type": "shell", "status": "completed"},
+                    {"id": "c", "type": "shell", "status": "failed"},
+                    {"id": "d", "type": "shell", "status": "stopped"},
+                    {"id": "e", "type": "shell", "status": "killed"},
+                    # Unknown and absent statuses count as live (conservative —
+                    # never under-count and re-hide a running shell).
+                    {"id": "f", "type": "shell", "status": "queued"},
+                    {"id": "g", "type": "shell"},
+                ],
+            }
+        )
+    )
+    assert record.event_name == "Stop"
+    # running + queued + no-status = 3; completed/failed/stopped/killed excluded.
+    assert record.background_task_count == 3
+
+
+def test_hook_record_stop_all_background_tasks_terminal_counts_zero() -> None:
+    """Every shell finished → count is 0, dropping the indicator."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {"id": "a", "type": "shell", "status": "completed"},
+                    {"id": "b", "type": "shell", "status": "killed"},
+                ],
+            }
+        )
+    )
+    assert record.background_task_count == 0
+
+
 def test_hook_record_stop_without_background_tasks() -> None:
     """
     ``Stop`` without ``background_tasks`` → ``background_task_count`` is 0.
