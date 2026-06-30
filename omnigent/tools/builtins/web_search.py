@@ -5,12 +5,12 @@ Backend selection is fully determined by the agent spec:
 - **OpenAI model** → passthrough to OpenAI's native
   ``web_search_preview`` (server-side, uses the LLM API key).
 - **Other models** → use the ``search_provider`` named in the spec:
-  ``"duckduckgo"`` (keyless, no API key) or ``"google"`` / ``"perplexity"`` /
-  ``"nimble"`` / ``"tavily"`` with credentials for a sturdier / higher-rate
-  backend. ``web_search`` never picks an engine for you — with no
-  ``search_provider`` set it returns an error naming the options, so it is
-  always explicit which engine ran. No env var fallbacks — the spec is
-  self-contained.
+  ``"duckduckgo"`` or ``"keenable"`` (both keyless, no API key) or
+  ``"google"`` / ``"perplexity"`` / ``"nimble"`` / ``"tavily"`` with
+  credentials for a sturdier / higher-rate backend. ``web_search`` never
+  picks an engine for you — with no ``search_provider`` set it returns an
+  error naming the options, so it is always explicit which engine ran. No
+  env var fallbacks — the spec is self-contained.
 
 Usage in config.yaml::
 
@@ -181,10 +181,11 @@ def _search(query: str, config: dict[str, str]) -> str:
     :param query: The search query string.
     :param config: Spec-level config. Required keys:
 
-        - ``search_provider`` (required; no default): ``"duckduckgo"``
-          (keyless), ``"google"``, ``"perplexity"``, ``"nimble"``, or
-          ``"tavily"``
-        - ``api_key``: API key for the chosen backend (not for duckduckgo)
+        - ``search_provider`` (required; no default): ``"duckduckgo"`` or
+          ``"keenable"`` (keyless), ``"google"``, ``"perplexity"``,
+          ``"nimble"``, or ``"tavily"``
+        - ``api_key``: API key for the chosen backend (not for duckduckgo;
+          optional for keenable)
         - ``engine_id``: Required for Google only
 
     :returns: Search results, or an error message (including when no
@@ -207,18 +208,21 @@ def _search(query: str, config: dict[str, str]) -> str:
     if backend == "duckduckgo":
         return _run_duckduckgo(query, config)
 
+    if backend == "keenable":
+        return _run_keenable(query, config)
+
     # Fail loudly instead of silently picking an engine, so the user always
     # knows which engine ran and opts in explicitly (per maintainer review).
     if backend:
         return (
             f"web_search error: unknown search_provider {backend!r}. "
-            "Set search_provider to one of: duckduckgo (keyless, no API key), "
-            "google, perplexity, nimble, tavily."
+            "Set search_provider to one of: duckduckgo or keenable (keyless, "
+            "no API key), google, perplexity, nimble, tavily."
         )
     return (
         "web_search error: no search_provider configured. Set one in the "
-        "web_search tool config — e.g. search_provider: duckduckgo (keyless, "
-        "no API key), or google / perplexity / nimble / tavily with "
+        "web_search tool config — e.g. search_provider: duckduckgo or keenable "
+        "(keyless, no API key), or google / perplexity / nimble / tavily with "
         "credentials for a sturdier, higher-rate backend."
     )
 
@@ -317,3 +321,22 @@ def _run_duckduckgo(query: str, config: dict[str, str]) -> str:
     )
 
     return _search_duckduckgo(query, config)
+
+
+def _run_keenable(query: str, config: dict[str, str]) -> str:
+    """
+    Run a Keenable web search query.
+
+    Keyless by default: unlike the other backends, ``api_key`` is optional.
+    Without it the keyless public endpoint is used; with it the
+    authenticated endpoint is used and rate limits are lifted.
+
+    :param query: The search query.
+    :param config: May contain ``api_key`` and ``max_results`` (both optional).
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_keenable import (
+        _search_keenable,
+    )
+
+    return _search_keenable(query, config)
