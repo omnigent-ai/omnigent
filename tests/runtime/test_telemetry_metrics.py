@@ -9,6 +9,7 @@ asserts on the captured data points.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterator
 
 import pytest
@@ -42,10 +43,8 @@ def metric_reader() -> Iterator[InMemoryMetricReader]:
     try:
         yield reader
     finally:
-        try:
+        with contextlib.suppress(Exception):
             provider.shutdown()
-        except Exception:
-            pass
         otel_metrics._internal._METER_PROVIDER_SET_ONCE._done = False  # type: ignore[attr-defined]
         otel_metrics.set_meter_provider(previous)
         telemetry._reset_instrument_cache_for_tests()
@@ -129,9 +128,7 @@ def test_record_operation_duration_metric_emits_one_data_point(
 def test_record_operation_duration_metric_records_error_type(
     metric_reader: InMemoryMetricReader,
 ):
-    telemetry.record_operation_duration_metric(
-        duration_seconds=0.5, error_type="timeout"
-    )
+    telemetry.record_operation_duration_metric(duration_seconds=0.5, error_type="timeout")
     points = _datapoints_by_metric(metric_reader, "gen_ai.client.operation.duration")
     assert points[0].attributes["error.type"] == "timeout"
 

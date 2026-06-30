@@ -227,7 +227,7 @@ class TracingContext:
                     model=str(model) if model else None,
                     error_type="error" if error else None,
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.debug("operation duration metric emission failed", exc_info=True)
 
         if span is self._root_span:
@@ -338,7 +338,7 @@ class TracingContext:
                 duration_seconds=duration_s,
                 error_type="error" if error else None,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.debug("tool duration metric emission failed", exc_info=True)
 
         if span is self._current_span:
