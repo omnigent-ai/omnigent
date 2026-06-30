@@ -9,10 +9,10 @@
 
 import {
   AlertCircleIcon,
+  BrainCircuitIcon,
   RotateCcwIcon,
   ShieldXIcon,
   ShrinkIcon,
-  WaypointsIcon,
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
@@ -120,7 +120,7 @@ interface RoutingDecisionChipProps {
 
 /**
  * Muted inline chip announcing the intelligent model router's pick at
- * the start of a turn. Precision-grayscale, tiny waypoints glyph, a primary
+ * the start of a turn. Precision-grayscale, tiny brain-circuit glyph, a primary
  * line `Intelligent model router · <short model> (<tier>)`, and the
  * router's rationale as a muted second line (also the `title` for hover).
  * When the verdict was not applied (advise/shadow or a user model pin
@@ -144,7 +144,7 @@ export function RoutingDecisionChip({ model, tier, applied, rationale }: Routing
       title={rationale || summary}
     >
       <span className="flex items-center gap-1.5">
-        <WaypointsIcon className="size-3 shrink-0" />
+        <BrainCircuitIcon className="size-3 shrink-0" />
         <span>
           Intelligent model router{" · "}
           {!applied && <span>would have picked </span>}

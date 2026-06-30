@@ -428,34 +428,50 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "ls"},
-            "tool_output": "ok",
-        },
-        {"hook_event_name": "UserPromptSubmit", "prompt": "hello"},
-    ],
-)
-def test_non_tool_call_phases_fail_open_on_error(
+def test_user_prompt_submit_fails_closed_on_error(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    payload: dict[str, object],
 ) -> None:
     """
-    Off the tool-call gate, an unobtainable verdict stays fail-open.
+    A governed UserPromptSubmit blocks when no usable verdict is returned.
 
-    PostToolUse runs after the tool executed and the request gate is
-    advisory, so neither denies on a transport error — mirroring the
-    runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    The request gate is the sole pre-turn enforcement point for native
+    sessions — a server outage must not let a blocked request proceed.
     """
     write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
+
+    payload: dict[str, object] = {"hook_event_name": "UserPromptSubmit", "prompt": "hello"}
+    exit_code = _run_hook(bridge_dir, payload, monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert result["reason"]
+
+
+def test_post_tool_use_fails_open_on_error(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    PostToolUse fails OPEN on a transport error — the tool already ran.
+
+    Mirroring the runner-side ``FAIL_CLOSED_PHASES``.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
+    payload: dict[str, object] = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "tool_output": "ok",
+    }
 
     exit_code = _run_hook(bridge_dir, payload, monkeypatch)
 

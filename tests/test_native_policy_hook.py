@@ -336,17 +336,31 @@ def test_fail_closed_pre_tool_use_denies() -> None:
     assert hook_specific["permissionDecisionReason"]
 
 
-@pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PostToolUse"])
-def test_fail_closed_non_tool_call_phases_fail_open(hook_event: str) -> None:
+def test_fail_closed_user_prompt_submit_fails_closed() -> None:
     """
-    Off the tool-call gate, an unobtainable verdict fails OPEN (``None``).
+    ``UserPromptSubmit`` (``PHASE_REQUEST``) fails CLOSED on an unobtainable verdict.
 
-    The request gate is advisory (the tool-call gate still catches
-    dangerous actions) and PostToolUse runs after the tool has executed, so
-    denying there only blocks an already-incurred side effect. This mirrors
-    the runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    The request gate is the sole pre-turn enforcement point for native
+    sessions — a server hiccup must not let an over-budget or otherwise-
+    blocked request proceed. The output must be a top-level
+    ``decision: "block"`` with a non-empty reason (both Claude Code and
+    Codex drop a block with an empty reason).
     """
-    assert fail_closed_hook_output(hook_event) is None
+    output = fail_closed_hook_output("UserPromptSubmit")
+    assert output is not None
+    assert output["decision"] == "block"
+    assert output["reason"]
+
+
+def test_fail_closed_post_tool_use_fails_open() -> None:
+    """
+    ``PostToolUse`` (``PHASE_TOOL_RESULT``) fails OPEN (``None``).
+
+    The tool has already executed by this point, so denying would only
+    block an already-incurred side effect. Mirrors the runner-side
+    ``FAIL_CLOSED_PHASES``.
+    """
+    assert fail_closed_hook_output("PostToolUse") is None
 
 
 def test_fail_closed_unknown_event_fails_open() -> None:

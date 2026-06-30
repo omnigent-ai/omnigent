@@ -2881,10 +2881,13 @@ def _accumulate_session_usage(
     Increment the session's cumulative token counters from a
     ``response.completed`` event's usage data.
 
-    Called synchronously from the relay loop. Reads the current
-    persisted ``session_usage``, adds the delta from the
-    response's ``usage`` field, and writes the updated totals
-    back. No-op when the response carries no usage data.
+    Called synchronously from the relay loop. Builds a usage delta from
+    the response's ``usage`` field and atomically applies it to the
+    persisted ``session_usage`` via a single database transaction
+    (``SELECT FOR UPDATE`` on PostgreSQL, SQLite's single-writer lock
+    otherwise). This prevents the read-modify-write race that caused
+    concurrent relay completions to silently drop each other's cost /
+    token deltas (#9). No-op when the response carries no usage data.
 
     Cost is computed when the model's per-token pricing is
     available from the MLflow catalog (looked up once per call
@@ -2920,20 +2923,10 @@ def _accumulate_session_usage(
     cache_read_input_tokens = usage_obj.get("cache_read_input_tokens", 0)
     cache_creation_input_tokens = usage_obj.get("cache_creation_input_tokens", 0)
 
-    # Load current cumulative usage from the store.
+    # Load conversation metadata for pricing only (NOT for reading session_usage —
+    # the atomic increment_session_usage call below handles that separately to
+    # avoid the read-modify-write race).
     conv = conversation_store.get_conversation(session_id)
-    current = dict(conv.session_usage) if conv else {}
-    current.setdefault("input_tokens", 0)
-    current.setdefault("output_tokens", 0)
-    current.setdefault("total_tokens", 0)
-    current.setdefault("cache_read_input_tokens", 0)
-    current.setdefault("cache_creation_input_tokens", 0)
-
-    current["input_tokens"] += input_tokens
-    current["output_tokens"] += output_tokens
-    current["total_tokens"] += total_tokens
-    current["cache_read_input_tokens"] += cache_read_input_tokens
-    current["cache_creation_input_tokens"] += cache_creation_input_tokens
 
     # Compute cost delta if pricing is available for the model. Resolve
     # the model to price with, most-specific first:
@@ -2948,6 +2941,7 @@ def _accumulate_session_usage(
     # created only on this priced branch, so an unpriced session never
     # gains a (misleading $0.00) cost key.
     cost_delta = 0.0
+    priced = False
     # Prefer an authoritative harness-reported cost over the catalog estimate.
     provider_cost = usage_obj.get("cost_usd")
     has_provider_cost = isinstance(provider_cost, (int, float))
@@ -2971,29 +2965,42 @@ def _accumulate_session_usage(
                 # token counts when the harness reports them; compute_llm_cost
                 # prices them at their own (cheaper read / pricier write) rates.
                 cost_delta = compute_llm_cost(usage_obj, pricing)
-        if priced:
-            current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + cost_delta
-        # Per-model attribution (ADD). Tokens are attributed whenever the
-        # model is known — including unpriced turns — so the per-model token
-        # view is complete; cost is attributed only when this model's turn
-        # was priced (passing ``None`` otherwise keeps the model's cost key
-        # absent, matching the flat "priced ⟺ key present" contract).
-        _add_model_usage_delta(
-            _model_usage_bucket(current, llm_model),
-            {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-            },
-            cost_delta if priced else None,
-        )
 
-    conversation_store.set_session_usage(session_id, current)
+    # Build the delta dict and atomically apply it to the persisted
+    # session_usage in a single DB transaction (SELECT FOR UPDATE on
+    # PostgreSQL; SQLite's exclusive write lock on SQLite). This is the fix
+    # for the read-modify-write race that caused concurrent completions to
+    # overwrite each other's deltas (#9).
+    delta: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+    }
+    if priced:
+        delta["total_cost_usd"] = cost_delta
+    if llm_model:
+        # Per-model attribution. Tokens are attributed whenever the model is
+        # known — including unpriced turns — so the per-model token view is
+        # complete; cost is attributed only when this model's turn was priced
+        # (keeping the model's cost key absent otherwise, matching the flat
+        # "priced ⟺ key present" contract).
+        model_delta: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+        }
+        if priced:
+            model_delta["total_cost_usd"] = cost_delta
+        delta["by_model"] = {llm_model: model_delta}
+
+    new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
-    return _priced_cost_for_display(current)
+    return _priced_cost_for_display(new_current)
 
 
 def _persist_native_cumulative_usage(
