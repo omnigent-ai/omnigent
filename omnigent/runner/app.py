@@ -7831,6 +7831,14 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Turn sequencing (SESSION_REARCHITECTURE Step 5 / SESSION_STEERING_MIGRATION Step 1)
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
+    # Latest working status per session ("running"/"idle"/...), mirrored from
+    # every session.status edge at the _publish_event chokepoint (so it covers the
+    # PTY watcher's roles AND codex/antigravity/opencode, whose edges are published
+    # directly). The native-pane idle reaper (#1349) reads this as its "currently
+    # working" signal: native turns clear _active_turns right after the prompt is
+    # pasted, so for a long autonomous turn this status is the only reliable
+    # in-memory liveness signal.
+    _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     # Per-conversation message-ingest ordering (RUNNER_MESSAGE_INGEST.md
     # Part A). Each inbound ``message`` event takes a monotonic arrival
@@ -7922,6 +7930,18 @@ def create_runner_app(
             queue = asyncio.Queue()
             _session_event_queues[session_id] = queue
         queue.put_nowait(event)
+        # Mirror the latest session.status edge so the native-pane idle reaper
+        # (#1349) can tell a pane working autonomously ("running") from an idle
+        # one. This is the single chokepoint every session.status publish flows
+        # through, so it covers BOTH the PTY watcher's roles (via
+        # _publish_session_status) AND codex/antigravity/opencode, whose
+        # running/idle edges are published here directly rather than by the PTY
+        # watcher. Recorded for every session (SDK too); the reaper only consults
+        # it for native panes.
+        if event.get("type") == "session.status":
+            _status_value = event.get("status")
+            if isinstance(_status_value, str):
+                _native_pane_status[session_id] = _status_value
         # Mirror a child sub-agent's status / preview deltas onto the
         # PARENT's stream. No-op for non-child sessions. Single chokepoint
         # so every session.status publish is covered.
@@ -8158,6 +8178,8 @@ def create_runner_app(
             ``"conv_abc123"``.
         :param status: New working status, ``"running"`` or ``"idle"``.
         """
+        # (The native-pane reaper's status mirror is recorded centrally in
+        # _publish_event, which this routes through — see #1349.)
         _publish_event(
             session_id,
             {"type": "session.status", "status": status},
@@ -9663,6 +9685,7 @@ def create_runner_app(
                 await turn_task
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
+        _native_pane_status.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -18298,6 +18321,83 @@ def create_runner_app(
 
     # Expose catch-up scan so _entry.py can wire it as on_reconnect.
     app.state.catch_up_scan = _catch_up_scan
+
+    # Native-pane idle reaper (#1349): reclaim idle native CLI panes
+    # (claude/codex/... + their MCP fleets), which — unlike the SDK harness
+    # proxies the process manager reaps — would otherwise be held for the whole
+    # conversation lifetime and OOM a shared runner. Started/stopped by the runner
+    # lifespan (_entry.py). ``app.state.native_pane_reaper`` is ``None`` for the
+    # registry-less lightweight app factory and minimal test doubles
+    # (``getattr`` + ``native_panes`` capability check, not a bare access, so the
+    # ``_CapturingResourceRegistry`` / ``_TrackingTerminalRegistry`` doubles
+    # don't break app construction — they just get no reaper).
+    _pane_reaper_registry = getattr(resource_registry, "terminal_registry", None)
+    if (
+        resource_registry is not None
+        and _pane_reaper_registry is not None
+        and hasattr(_pane_reaper_registry, "native_panes")
+    ):
+        # NB: do NOT import terminal_resource_id locally here — it is a
+        # module-level import (top of file) used by handlers defined far above
+        # (e.g. create_session_terminal). A function-local ``from ... import``
+        # would rebind it as a create_runner_app local for the WHOLE function,
+        # leaving those earlier uses unbound on any path where this branch does
+        # not run (registry-less app factory / test doubles) → NameError.
+        from omnigent.native_cost_popup import _list_tmux_clients
+        from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+        from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
+
+        def _native_panes_for_reaper() -> list[PaneRef]:
+            panes: list[PaneRef] = []
+            for conv_id, name, socket_path in _pane_reaper_registry.native_panes():
+                terminal_id = terminal_resource_id(name, "main")
+                # Role gate (not just the name match native_panes does): only a
+                # terminal whose resource ROLE is a native harness is reapable, so
+                # a user terminal that merely shares a harness name is never
+                # reclaimed.
+                if is_native_harness(
+                    resource_registry.terminal_resource_role(conv_id, terminal_id)
+                ):
+                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
+            return panes
+
+        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+            conv_id = pane.conversation_id
+            if conv_id in _active_turns or (
+                process_manager is not None and process_manager.has_active_turn(conv_id)
+            ):
+                return True
+            # The vendor CLI working autonomously between runner turns (native
+            # turns clear _active_turns right after the prompt is pasted).
+            if _native_pane_status.get(conv_id) == "running":
+                return True
+            # A human attached to the pane. The tmux probe is a blocking
+            # subprocess, so run it off the event loop.
+            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
+            return bool(clients)
+
+        async def _reap_native_pane(pane: PaneRef) -> None:
+            # Pane-scoped teardown: close ONLY this native terminal (its MCP
+            # children die by parent-death), leaving the conversation's other
+            # terminals + primary OSEnv intact. The next message re-creates it and
+            # the vendor CLI resumes via --resume.
+            try:
+                await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
+            finally:
+                _publish_terminal_deleted_event(
+                    conversation_id=pane.conversation_id,
+                    terminal_name=pane.terminal_name,
+                    session_key="main",
+                    publish_event=_publish_event,
+                )
+
+        app.state.native_pane_reaper = NativePaneReaper(
+            list_native_panes=_native_panes_for_reaper,
+            is_busy=_native_pane_is_busy,
+            reap=_reap_native_pane,
+        )
+    else:
+        app.state.native_pane_reaper = None
 
     return app
 

@@ -840,12 +840,19 @@ def create_app(
                 )
             except Exception:
                 _logger.exception("runner MCP prewarm failed for %s", prewarm_path)
+        # Native-pane idle reaper (#1349): reclaims idle native CLI panes.
+        _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if _pane_reaper is not None:
+            await _pane_reaper.start()
 
     async def _stop_pm() -> None:
         """Stop runner-owned resources for graceful process exit.
 
         :returns: None.
         """
+        _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if _pane_reaper is not None:
+            await _pane_reaper.shutdown()
         await pm.shutdown()
         await _terminal_registry.shutdown()
         if mcp_manager is not None:
