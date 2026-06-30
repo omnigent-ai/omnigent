@@ -213,6 +213,7 @@ from omnigent.server.schemas import (
     PaginatedList,
     PermissionObject,
     PolicySummary,
+    ReadStatePutRequest,
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
     ResponseObject,
@@ -854,6 +855,54 @@ _session_status_cache: dict[str, str] = {}
 # TUI's own turn-boundary update of its "N shells still running" banner.
 # In-memory only — repopulates from live edges, exactly like the status cache.
 _session_background_task_count_cache: dict[str, int] = {}
+
+# Per-user read tracking, keyed by the user's discovery key (user id, or
+# the shared key in single-user mode) then by session id. Mirrors the two
+# values the web client used to keep in localStorage: a "last seen"
+# wall-clock baseline and an explicit "marked unread" override set.
+# In-memory only — like _session_status_cache it does NOT survive a server
+# restart. Unlike status (rederivable from the runner), read state has no
+# durable source, so a restart resets it; this is an accepted tradeoff for
+# keeping it server-side (shared across a user's devices while up) without
+# a DB. Entries are never pruned on session delete (bounded by churn,
+# wiped on restart).
+_read_last_seen: dict[str, dict[str, int]] = {}
+_read_explicit_unread: dict[str, set[str]] = {}
+
+
+def _read_state_entry(user_id: str | None, session_id: str) -> tuple[int | None, bool]:
+    """
+    Read the caller's read-state for one session, for embedding in the
+    per-user ``GET /v1/sessions`` list items.
+
+    :param user_id: Authenticated user id, or ``None`` in single-user mode.
+    :param session_id: Session/conversation identifier.
+    :returns: ``(last_seen, unread)`` — the wall-clock baseline (or ``None``
+        when the user has never seen the session) and the explicit-unread flag.
+    """
+    key = _discovery_key(user_id)
+    last_seen = _read_last_seen.get(key, {}).get(session_id)
+    unread = session_id in _read_explicit_unread.get(key, set())
+    return last_seen, unread
+
+
+def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread: bool) -> None:
+    """
+    Set the caller's read-state for one session.
+
+    :param user_id: Authenticated user id, or ``None`` in single-user mode.
+    :param session_id: Session/conversation identifier.
+    :param last_seen: Wall-clock baseline in seconds.
+    :param unread: Whether the session is explicitly flagged unread.
+    """
+    key = _discovery_key(user_id)
+    _read_last_seen.setdefault(key, {})[session_id] = last_seen
+    if unread:
+        _read_explicit_unread.setdefault(key, set()).add(session_id)
+    else:
+        unread_set = _read_explicit_unread.get(key)
+        if unread_set is not None:
+            unread_set.discard(session_id)
 
 # Sessions whose current turn was Stopped: the relay drops the turn's trailing
 # response.* output (no forward, no persist). The fence lifts on the next
@@ -1998,6 +2047,10 @@ def _build_session_list_item(
     assert conv.agent_id is not None
     level = _permission_level_from_grants(user_id, grants, user_is_admin)
     owner = _owner_from_grants(grants) if permissions_enabled else None
+    # Per-viewer read tracking, embedded so the client hydrates the unread
+    # dots straight from the list (no separate fetch). Built per-user here —
+    # `user_id` is the requesting caller, never broadcast to other viewers.
+    viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -2021,6 +2074,8 @@ def _build_session_list_item(
         comments_updated_at=(
             comments_fingerprint.last_updated_at if comments_fingerprint else None
         ),
+        viewer_last_seen=viewer_last_seen,
+        viewer_unread=viewer_unread,
     )
 
 
@@ -13843,6 +13898,45 @@ def create_sessions_router(
             conversation_store.list_projects,
             accessible_by=user_id,
         )
+
+    # ── PUT /sessions/{session_id}/read-state ─────────────────────
+    #
+    # The per-user read-state *write* path. The *read* path is the
+    # per-viewer ``viewer_last_seen`` / ``viewer_unread`` fields embedded in
+    # the ``GET /v1/sessions`` list items — no separate read endpoint.
+
+    @router.put(
+        "/sessions/{session_id}/read-state",
+        status_code=204,
+    )
+    async def put_read_state(
+        request: Request,
+        session_id: str,
+        body: ReadStatePutRequest,
+    ) -> Response:
+        """
+        Set the calling user's read-state for one session.
+
+        Requires ``LEVEL_READ`` on the session in multi-user mode — you can
+        only track read-state for sessions you can see. Stores the values
+        verbatim (the client enforces the baseline's monotonicity and the
+        unread semantics); the server does not interpret them against
+        session status. Returns ``204`` — the client already has the
+        optimistic state and re-reads the authoritative value on the next
+        ``GET /v1/sessions`` poll.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param body: The validated :class:`ReadStatePutRequest`.
+        :returns: An empty ``204 No Content`` response.
+        :raises OmnigentError: 403 if the caller lacks read access.
+        """
+        user_id = _require_user(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        _set_read_state(user_id, session_id, body.last_seen, body.unread)
+        return Response(status_code=204)
 
     # ── GET /sessions/{session_id} ───────────────────────────────
 
