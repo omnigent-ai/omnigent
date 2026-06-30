@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import time
@@ -390,6 +391,7 @@ def lowered_idle_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(terminal_module, "_IDLE_MARKER_SUBSTRINGS", [])
     monkeypatch.setattr(terminal_module, "_IDLE_MARKER_THRESHOLD_SECONDS", 0.4)
 
+
 @pytest.fixture
 def _otel_in_memory_exporter():
     """
@@ -449,10 +451,8 @@ def _otel_in_memory_exporter():
         # parallel test workers in the same interpreter. omnigent's test
         # suite runs single-process so this is fine; flag if that changes.
         exporter.clear()
-        try:
+        with contextlib.suppress(Exception):
             provider.shutdown()
-        except Exception:
-            pass
         otel_trace._TRACER_PROVIDER = original_provider  # type: ignore[attr-defined]
         otel_trace._TRACER_PROVIDER_SET_ONCE._done = original_set_once_done  # type: ignore[attr-defined]
         mlflow_provider_wrapper._global_provider_init_once._done = original_mlflow_once_done  # type: ignore[attr-defined]

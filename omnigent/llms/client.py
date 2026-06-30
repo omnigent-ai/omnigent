@@ -294,9 +294,7 @@ async def _execute_with_retry(
                 raise classified from exc
             last_error = classified
             if attempt + 1 < total_tries:
-                delay = retry_config.compute_backoff_delay(
-                    retry_index=attempt + 1
-                )
+                delay = retry_config.compute_backoff_delay(retry_index=attempt + 1)
                 telemetry.record_llm_retry(
                     attempt=attempt + 1,
                     max_attempts=total_tries,
