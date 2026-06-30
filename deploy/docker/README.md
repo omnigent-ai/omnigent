@@ -41,56 +41,29 @@ docker compose down -v
 
 ## Runtime policies
 
-Policy CRUD uses the same Postgres database as sessions, agents, and
-files. The entrypoint reads `DATABASE_URL`, runs Alembic `upgrade head`
-before building any stores, then wires `SqlAlchemyPolicyStore` into the
-runtime and API app. There is no separate policy-store environment
-variable.
+The Docker stack uses the same policy store as the rest of the server.
+On startup the entrypoint reads `DATABASE_URL`, runs Alembic
+`upgrade head`, and wires `SqlAlchemyPolicyStore` into the runtime and
+API app. There is no separate policy-store environment variable; policy
+rows follow the same database backup and volume lifecycle as sessions,
+agents, and files.
 
-The startup migration path creates or upgrades the `policies` table on
-fresh and existing databases. If the migration fails, the container
-fails startup before serving traffic.
+Policy configuration has two homes:
 
-Local end-to-end check:
+- `config.yaml` (`/data/config.yaml` by default, or `OMNIGENT_CONFIG`)
+  owns non-secret startup settings such as `policy_modules` and
+  declarative server-wide `policies`.
+- The policy CRUD API persists mutable default policies (`/v1/policies`)
+  and session-scoped policies (`/v1/sessions/{session_id}/policies`) in
+  Postgres.
 
-```bash
-cd deploy/docker
-./bootstrap.sh
-OMNIGENT_AUTH_ENABLED=0 docker compose down -v
-OMNIGENT_AUTH_ENABLED=0 docker compose up -d --build
-curl -fsS http://localhost:8000/health
-curl -fsS http://localhost:8000/openapi.json \
-  | jq -r '.paths | keys[] | select(test("polic"))'
+Enabled session policies run before agent policies. Server-wide admin
+policies run after agent policies, with YAML `policies` followed by
+persisted defaults from `/v1/policies`. If migrations or policy config
+parsing fail, the container exits before serving traffic.
 
-docker compose exec -T postgres sh -lc \
-'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-INSERT INTO users (id, is_admin) VALUES ('\''local'\'', true)
-ON CONFLICT (id) DO UPDATE SET is_admin = true;
-"'
-
-BASE=http://localhost:8000
-HANDLER=omnigent.policies.builtins.safety.ask_on_os_tools
-
-curl -fsS -X POST http://localhost:8000/v1/policies \
-  -H 'content-type: application/json' \
-  -d "{\"name\":\"local_default_policy\",\"type\":\"python\",\"handler\":\"$HANDLER\"}"
-curl -fsS http://localhost:8000/v1/policies | jq '.data'
-
-AGENT_ID=$(curl -fsS "$BASE/v1/agents" | jq -r '.data[0].id')
-SESSION_ID=$(curl -fsS -X POST "$BASE/v1/sessions" \
-  -H 'content-type: application/json' \
-  -d "{\"agent_id\":\"$AGENT_ID\",\"title\":\"policy crud smoke\"}" \
-  | jq -r '.id')
-curl -fsS -X POST "$BASE/v1/sessions/$SESSION_ID/policies" \
-  -H 'content-type: application/json' \
-  -d "{\"name\":\"local_session_policy\",\"type\":\"python\",\"handler\":\"$HANDLER\"}"
-curl -fsS "$BASE/v1/sessions/$SESSION_ID/policies" | jq '.data'
-
-docker compose restart omnigent
-curl -fsS http://localhost:8000/v1/policies | jq '.data'
-docker compose exec -T postgres sh -lc \
-'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\d+ policies"'
-```
+For the local Docker policy-store smoke test, use
+[`SKILL.md`](SKILL.md#runtime-policies).
 
 ## Multi-user mode (accounts — default)
 

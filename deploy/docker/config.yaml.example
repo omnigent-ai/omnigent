@@ -38,13 +38,14 @@ allowed_domains:
 # database_uri: postgresql+psycopg://user:pw@host:5432/omnigent
 
 # Extra Python modules scanned for POLICY_REGISTRY lists at startup.
+# Restart the server after changing this file.
 # policy_modules:
 #   - myorg.policies.safety
 
-# Server-wide runtime policies appended to every session. These are parsed with
-# the same grammar as an agent spec's guardrails.policies block. Policy CRUD
-# endpoints persist default and session-scoped policies in the Postgres
-# database selected by DATABASE_URL.
+# Declarative server-wide runtime policies loaded at startup and appended to
+# every session. Use the same grammar as an agent spec's guardrails.policies
+# block. Mutable default and session-scoped policies created through the CRUD
+# API live in the Postgres database selected by DATABASE_URL, not in this file.
 # policies:
 #   block_bash_rm:
 #     type: function

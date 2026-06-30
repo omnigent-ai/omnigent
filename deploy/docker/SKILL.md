@@ -66,13 +66,36 @@ cluster.
 
 ## Runtime policies
 
-Runtime policy persistence uses the same Postgres database as the rest
-of the server. The Docker entrypoint reads `DATABASE_URL`, runs Alembic
-`upgrade head` before store construction, and then wires
-`SqlAlchemyPolicyStore` into both the runtime and FastAPI app. There is
-no separate policy-store environment variable.
+This is the canonical Docker policy-store verification section; keep
+the README operator-facing and `config.yaml.example` focused on config
+keys.
 
-To verify policy CRUD locally:
+Behavior to preserve:
+
+- `DATABASE_URL` selects the policy store database. There is no
+  policy-store-specific environment variable.
+- `main()` runs Alembic `upgrade head` before `build_app()` constructs
+  `SqlAlchemyPolicyStore`.
+- `build_app()` passes the same policy store to runtime initialization
+  and `create_app()`.
+- `config.yaml` can register `policy_modules` and declarative
+  server-wide `policies` at startup.
+- Persisted defaults from `/v1/policies` join the admin policy layer
+  after YAML `policies`; session-scoped policies from
+  `/v1/sessions/{session_id}/policies` run before agent and admin
+  policies.
+
+Completion criteria for a Docker policy-store change:
+
+- `/health` returns success after `docker compose up -d --build`.
+- `/openapi.json` includes default and session policy routes.
+- A default policy created through `/v1/policies` can be listed and
+  still exists after `docker compose restart omnigent`.
+- A session-scoped policy created through
+  `/v1/sessions/{session_id}/policies` can be listed for that session.
+- The `policies` table exists in the compose Postgres database.
+
+Local smoke test:
 
 ```bash
 cd deploy/docker
@@ -92,12 +115,13 @@ ON CONFLICT (id) DO UPDATE SET is_admin = true;
 BASE=http://localhost:8000
 HANDLER=omnigent.policies.builtins.safety.ask_on_os_tools
 
-curl -fsS -X POST http://localhost:8000/v1/policies \
+curl -fsS -X POST "$BASE/v1/policies" \
   -H 'content-type: application/json' \
   -d "{\"name\":\"local_default_policy\",\"type\":\"python\",\"handler\":\"$HANDLER\"}"
-curl -fsS http://localhost:8000/v1/policies | jq '.data'
+curl -fsS "$BASE/v1/policies" | jq '.data'
 
-AGENT_ID=$(curl -fsS "$BASE/v1/agents" | jq -r '.data[0].id')
+AGENT_ID=$(curl -fsS "$BASE/v1/agents" | jq -r '.data[0].id // empty')
+test -n "$AGENT_ID"
 SESSION_ID=$(curl -fsS -X POST "$BASE/v1/sessions" \
   -H 'content-type: application/json' \
   -d "{\"agent_id\":\"$AGENT_ID\",\"title\":\"policy crud smoke\"}" \
@@ -108,7 +132,7 @@ curl -fsS -X POST "$BASE/v1/sessions/$SESSION_ID/policies" \
 curl -fsS "$BASE/v1/sessions/$SESSION_ID/policies" | jq '.data'
 
 docker compose restart omnigent
-curl -fsS http://localhost:8000/v1/policies | jq '.data'
+curl -fsS "$BASE/v1/policies" | jq '.data'
 docker compose exec -T postgres sh -lc \
 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\d+ policies"'
 ```
@@ -120,6 +144,7 @@ docker compose exec -T postgres sh -lc \
 | Root URL returns `{"service":"omnigent",…}` instead of the SPA | npm build didn't produce the bundle inside the container | `docker compose exec omnigent ls /build/omnigent/server/static/web-ui/` — empty = the `web-builder` stage didn't run cleanly. Rebuild with `--no-cache`. |
 | `ModuleNotFoundError: No module named 'uvicorn'` at startup | venv copy didn't pick up the install | Sanity-check the Dockerfile's `VIRTUAL_ENV=/opt/venv` is set before the `uv pip install` calls. |
 | `psycopg.OperationalError: password authentication failed` | `POSTGRES_PASSWORD` changed in `.env` after the data volume was initialized | `docker compose down -v` then `up -d` (wipes the DB). |
+| `/v1/policies` is missing from OpenAPI | App was built without a policy store | Check that `entrypoint.py` passes `policy_store` to both `init_runtime()` and `create_app()`. |
 | Web UI loads but new chats hang forever | Expected — runners are external. The UI's landing page prints the CLI command to launch a runner. |
 
 ## Extending to a new platform
