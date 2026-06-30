@@ -11,7 +11,9 @@ What breaks if this fails:
   independent),
 - a sub-agent silently pins a model (re-coupling it to one provider),
 - the ``security-audit`` skill is dropped or renamed,
-- the report-only purpose guard starts allowing ``implement`` dispatches.
+- the report-only purpose guard starts allowing ``implement`` dispatches,
+- the ``read_only_os`` write-deny policy is dropped from the orchestrator or a
+  sub-agent (report-only stops being enforced at the policy layer).
 """
 
 from __future__ import annotations
@@ -63,7 +65,7 @@ def test_sentinel_has_os_env(sentinel_spec: AgentSpec) -> None:  # DoC-9
 
 def test_sentinel_orchestrator_guardrails(sentinel_spec: AgentSpec) -> None:  # DoC-5
     names = {p.name for p in sentinel_spec.guardrails.policies}
-    assert {"blast_radius", "headless_subagent_purpose_guard"} <= names
+    assert {"blast_radius", "read_only_os", "headless_subagent_purpose_guard"} <= names
     guard = next(
         p for p in sentinel_spec.guardrails.policies if p.name == "headless_subagent_purpose_guard"
     )
@@ -82,14 +84,20 @@ def test_sentinel_policy_paths_importable(sentinel_spec: AgentSpec) -> None:  # 
 def test_sentinel_function_policies_have_nonempty_arguments(
     sentinel_spec: AgentSpec,
 ) -> None:  # DoC-7
+    # ``read_only_os`` is intentionally argument-free (its deny set is fixed), so
+    # it is exempt; every other policy must carry the arguments it needs.
     for agent in (sentinel_spec, *sentinel_spec.sub_agents):
         for policy in agent.guardrails.policies:
+            if policy.name == "read_only_os":
+                assert policy.function.arguments is None, (agent, policy.name)
+                continue
             assert policy.function.arguments, (agent, policy.name)
 
 
 def test_sentinel_subagent_guardrails(sentinel_spec: AgentSpec) -> None:  # DoC-8
     for agent in sentinel_spec.sub_agents:
-        assert any(p.name == "blast_radius" for p in agent.guardrails.policies), agent.name
+        names = {p.name for p in agent.guardrails.policies}
+        assert {"blast_radius", "read_only_os"} <= names, agent.name
 
 
 def test_sentinel_findings_template_present(sentinel_spec: AgentSpec) -> None:  # DoC-10

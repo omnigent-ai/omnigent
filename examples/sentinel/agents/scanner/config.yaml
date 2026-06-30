@@ -15,15 +15,17 @@ executor:
 
 # Filesystem access so the scanner can read files, grep, and inspect git
 # history. `sandbox: type: none` runs unsandboxed in the caller's repo. The
-# read-only discipline is enforced by the prompt, not the sandbox — this agent
-# is only ever dispatched with `purpose: explore` / `search`.
+# `sys_os_write` / `sys_os_edit` tools come bundled with `os_env`; the
+# `read_only_os` policy below denies them, so read-only is enforced by policy
+# rather than left to the prompt.
 os_env:
   type: caller_process
   cwd: .
   sandbox:
     type: none
 
-# Same blast-radius guardrail the rest of the bundle uses.
+# Same guardrails the rest of the bundle uses: blast_radius bounds shell, and
+# read_only_os denies every file-mutating tool so the scanner can never edit.
 guardrails:
   policies:
     blast_radius:
@@ -33,6 +35,11 @@ guardrails:
         path: omnigent.inner.nessie.policies.blast_radius
         arguments:
           gate_pushes: false
+    read_only_os:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.read_only_os
 
 prompt: |
   You are Sentinel's scanner: a read-only security explorer. You answer audit
