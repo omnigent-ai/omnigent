@@ -195,32 +195,30 @@ def test_declined_checkpoint_reasks_until_approved() -> None:
     assert second["result"] == "ASK"  # not recorded → re-asks
 
 
-def test_over_budget_on_expensive_model_denies() -> None:
-    """Over the hard limit on an expensive model → DENY (force downgrade).
+def test_over_budget_denies_all_models_by_default() -> None:
+    """Over the hard limit → DENY for any model when expensive_models is unset.
 
-    The default expensive set includes Opus; an over-budget tool call on
-    Opus must be blocked, and the reason must surface the spend figure and
-    the high-cost model tokens so the user knows what to avoid. If this
-    ALLOWed, the budget would never bite on the costly model it targets.
+    The default (None) is a true hard stop: every model is blocked once
+    the limit is reached, not just named expensive tiers. The reason must
+    surface the spend figure and say all model calls are blocked.
     """
     policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
-    result = policy(_tool(6.0, model="databricks-claude-opus-4-8"))
-    assert result["result"] == "DENY"
-    assert "6.00" in result["reason"]  # current cost surfaced
-    # The high-cost tokens are listed so the user knows which to avoid.
-    assert "opus" in result["reason"]
-    assert "gpt-5" in result["reason"]
+    for model in ("databricks-claude-opus-4-8", "claude-sonnet-4-6", "gpt-5-mini", "haiku"):
+        result = policy(_tool(6.0, model=model))
+        assert result["result"] == "DENY", f"expected DENY for {model}"
+        assert "6.00" in result["reason"]
+        assert "All model calls are blocked" in result["reason"]
 
 
 def test_deny_reason_for_codex_points_to_terminal() -> None:
     """A codex-native session's deny reason says to switch in the terminal.
 
     Codex has no web model picker — the only way to switch is the terminal
-    TUI's ``/model`` — so the verbatim instruction must name both. If this
-    regressed to the surface-agnostic wording, a codex user would not be
-    told the one mechanism that actually works for them.
+    TUI's ``/model`` — so the verbatim instruction must name both. Uses an
+    explicit expensive_models list (downgrade-gate mode) so a cheaper model
+    is possible and the switch hint applies.
     """
-    policy = cost_budget(max_cost_usd=5.0)
+    policy = cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
     result = policy(_tool(6.0, model="opus", harness="codex-native"))
     assert result["result"] == "DENY"
     assert "in the terminal" in result["reason"]
@@ -232,10 +230,10 @@ def test_deny_reason_for_non_codex_omits_terminal() -> None:
 
     Claude / web / API sessions are not terminal-only (they have a model
     picker), so the message must NOT tell them to use the terminal or
-    ``/model`` — it would be wrong/confusing. This is the regression guard
-    for "only codex says in the terminal".
+    ``/model`` — it would be wrong/confusing. Uses explicit expensive_models
+    (downgrade-gate mode) so the switch hint is present but terminal-agnostic.
     """
-    policy = cost_budget(max_cost_usd=5.0)
+    policy = cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
     # harness=None mirrors the web/API path (no native hook stamped it).
     result = policy(_tool(6.0, model="opus", harness=None))
     assert result["result"] == "DENY"
@@ -244,14 +242,14 @@ def test_deny_reason_for_non_codex_omits_terminal() -> None:
     assert "switch to a cheaper model" in result["reason"]
 
 
-def test_over_budget_on_cheaper_model_allows() -> None:
-    """Over the hard limit on a cheaper model → ALLOW (downgrade satisfied).
+def test_over_budget_on_cheaper_model_allows_with_explicit_list() -> None:
+    """Over the hard limit on a cheaper model → ALLOW when using an explicit expensive list.
 
-    Once the session has switched off an expensive model, the budget
-    becomes a no-op — the whole point of a "downgrade gate" rather than a
-    hard stop. A DENY here would trap the user even after they complied.
+    With explicit expensive_models (downgrade-gate mode), once the session
+    has switched off a named expensive model, the budget becomes a no-op.
+    A DENY here would trap the user even after they complied.
     """
-    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    policy = cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0], expensive_models=["opus"])
     assert policy(_tool(6.0, model="claude-sonnet-4-6")) == {"result": "ALLOW"}
 
 
@@ -281,47 +279,31 @@ def test_hard_limit_wins_over_checkpoint_approval() -> None:
 
 
 @pytest.mark.parametrize(
-    "model,expected",
+    "model",
     [
-        # Opus — concrete deployment id and the bare picker alias.
-        ("databricks-claude-opus-4-8", "DENY"),
-        ("opus", "DENY"),
-        # GPT-5 family: the broad "gpt-5" token covers bare gpt-5, the
-        # dot-spelled 5.5, and the dash-spelled deployment id.
-        ("gpt-5", "DENY"),
-        ("gpt-5.5", "DENY"),
-        ("databricks-gpt-5-5", "DENY"),
-        # Fable is the costliest tier (above Opus at 2x its price); both the
-        # concrete id and the bare picker alias must be gated, or switching to
-        # Fable becomes a budget bypass for a session downgraded off Opus.
-        ("claude-fable-5", "DENY"),
-        ("fable", "DENY"),
-        # Cheap GPT-5 variants are carved out by the -mini / -nano excludes,
-        # even though they contain the "gpt-5" substring → ALLOW over budget.
-        ("gpt-5-mini", "ALLOW"),
-        ("gpt-5-nano", "ALLOW"),
-        ("databricks-gpt-5-mini", "ALLOW"),
-        # A non-listed model is treated as cheap → allowed over budget.
-        ("databricks-claude-haiku-4-5", "ALLOW"),
-        # "gemini" contains the substring "mini" but NOT "-mini"; the
-        # leading dash in the exclude token keeps it from being wrongly
-        # carved out (it's simply not an expensive token either) → ALLOW.
-        ("databricks-gemini-2-5-pro", "ALLOW"),
+        "databricks-claude-opus-4-8",
+        "opus",
+        "gpt-5",
+        "gpt-5.5",
+        "databricks-gpt-5-5",
+        "claude-fable-5",
+        "fable",
+        # Cheap variants that used to be exempted are now also blocked.
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "databricks-gpt-5-mini",
+        "databricks-claude-haiku-4-5",
+        "databricks-gemini-2-5-pro",
     ],
 )
-def test_default_expensive_set_matches_and_excludes(model: str, expected: str) -> None:
-    """The default set blocks Fable/Opus/GPT-5 but exempts -mini/-nano.
+def test_default_blocks_every_model(model: str) -> None:
+    """The default (expensive_models=None) blocks every model over budget.
 
-    Substring + case-insensitive matching must hit the deployment ids in
-    this stack (``databricks-claude-opus-4-8``, ``databricks-gpt-5-5``)
-    while the cheap ``gpt-5-mini`` / ``gpt-5-nano`` variants — which share
-    the ``gpt-5`` substring — are carved back out so they are NOT blocked.
-    A miss either way would mis-budget the zero-config default: blocking a
-    cheap variant traps users needlessly; letting Opus/GPT-5 through lets
-    the costliest models run past budget.
+    The default is now a true hard stop — no model tier is "cheap enough"
+    to continue once the limit is reached. Every model id must DENY.
     """
     policy = cost_budget(max_cost_usd=5.0)
-    assert policy(_tool(6.0, model=model))["result"] == expected
+    assert policy(_tool(6.0, model=model))["result"] == "DENY"
 
 
 def test_custom_expensive_models_substring_case_insensitive() -> None:
@@ -383,36 +365,33 @@ def test_abstains_on_non_gated_phases(phase: str) -> None:
     assert policy(_event(phase, 9.99)) == {"result": "ALLOW"}
 
 
-def test_request_phase_over_budget_on_expensive_model_denies() -> None:
-    """Over the hard limit on an expensive model DENYs at the request phase.
+def test_request_phase_over_budget_denies_any_model() -> None:
+    """Over the hard limit DENYs at the request phase for any model (default hard stop).
 
-    The request phase fires before the LLM turn, so a text-only turn (no
-    tool call) is now budgeted: an over-budget request on Opus must be
-    blocked. The reason must be the USER-FACING variant (the turn never
-    reaches the model), so it must NOT carry the tool-call directive
-    ("re-issue the tool call" / "Relay this to the user verbatim"). If
-    this regressed, text-only turns would bypass the budget entirely, or
-    the user would see model-directed instructions meant for the agent.
+    The request phase fires before the LLM turn, so a text-only turn is
+    budgeted. With the default (all-models-blocked), both expensive and
+    cheap model ids must be denied. The reason must be the USER-FACING
+    variant (no tool-call directive) and must say all calls are blocked.
     """
     policy = cost_budget(max_cost_usd=5.0)
-    result = policy(_request(6.0, model="databricks-claude-opus-4-8"))
-    assert result["result"] == "DENY"
-    assert "6.00" in result["reason"]  # current cost surfaced to the user
-    # User-facing phrasing only — no tool-call directive leaks through.
-    assert "re-issue the tool call" not in result["reason"]
-    assert "Relay this to the user verbatim" not in result["reason"]
-    # Still names the limit + how to recover so the user can act.
-    assert "switch to a cheaper model" in result["reason"]
+    for model in ("databricks-claude-opus-4-8", "claude-sonnet-4-6"):
+        result = policy(_request(6.0, model=model))
+        assert result["result"] == "DENY", f"expected DENY for {model}"
+        assert "6.00" in result["reason"]
+        assert "All model calls are blocked" in result["reason"]
+        assert "re-issue the tool call" not in result["reason"]
+        assert "Relay this to the user verbatim" not in result["reason"]
 
 
-def test_request_phase_over_budget_on_cheaper_model_allows() -> None:
-    """Over the hard limit on a cheaper model ALLOWs at the request phase.
+def test_request_phase_over_budget_on_cheaper_model_allows_with_explicit_list() -> None:
+    """Over the hard limit on a cheaper model ALLOWs when using an explicit expensive list.
 
-    Mirrors the tool-call downgrade gate: once the session is off an
-    expensive model, an over-budget request must proceed. A DENY here
-    would trap a downgraded user out of starting any new turn.
+    With an explicit expensive_models list (downgrade-gate mode), once the
+    session is off a named expensive model, an over-budget request must
+    proceed. A DENY here would trap a downgraded user out of starting any
+    new turn.
     """
-    policy = cost_budget(max_cost_usd=5.0)
+    policy = cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
     assert policy(_request(6.0, model="claude-sonnet-4-6")) == {"result": "ALLOW"}
 
 
@@ -553,14 +532,16 @@ async def test_resolve_from_spec_denies_over_budget_on_expensive_model() -> None
 async def test_resolve_from_spec_allows_over_budget_on_cheaper_model() -> None:
     """Over-budget on a cheaper model ALLOWs through the engine boundary.
 
-    The model on ``EvaluationContext.model`` must let a downgraded session
-    through — proving the model gate (not just the cost) crosses the
-    boundary.
+    With an explicit expensive_models list (downgrade-gate mode), the model
+    on ``EvaluationContext.model`` lets a downgraded session through —
+    proving the model gate (not just the cost) crosses the boundary.
     """
     spec = FunctionPolicySpec(
         name="cost",
         on=None,
-        function=FunctionRef(path=_HANDLER, arguments={"max_cost_usd": 5.0}),
+        function=FunctionRef(
+            path=_HANDLER, arguments={"max_cost_usd": 5.0, "expensive_models": ["opus"]}
+        ),
     )
     policy: FunctionPolicy = resolve_function_policy(spec)
     result = await policy.evaluate(_tool_ctx(6.0, "claude-sonnet-4-6"), {})

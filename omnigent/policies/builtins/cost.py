@@ -90,28 +90,6 @@ _GATED_PHASES = frozenset({"request", "tool_call"})
 # as its own conversation).
 _ASK_APPROVED_KEY = SESSION_COST_ASK_APPROVED_STATE_KEY
 
-# Default substring tokens (case-insensitive) identifying the "expensive"
-# model tiers that must be downgraded once the session passes
-# ``max_cost_usd``. Matched as substrings of the active model id so a single
-# token hits every deployment spelling AND the tier aliases the native
-# ``/model`` command stores: ``"opus"`` matches ``claude-opus-4-8``,
-# ``databricks-claude-opus-4-7``, and the bare alias ``"opus"``; ``"gpt-5"``
-# matches the whole GPT-5 family (``gpt-5``, ``gpt-5.5``, the dash spelling
-# ``databricks-gpt-5-5``, …) EXCEPT the cheap variants carved out by
-# ``_DEFAULT_EXPENSIVE_EXCLUDES`` below. Fable (``claude-fable-5``, the tier
-# above Opus at 2x its price), Opus, and GPT-5 are the costly tiers today.
-_DEFAULT_EXPENSIVE_MODELS = ("fable", "opus", "gpt-5")
-
-# Default substring tokens (case-insensitive) that OVERRIDE a match in
-# ``_DEFAULT_EXPENSIVE_MODELS`` back to "not expensive". The broad ``"gpt-5"``
-# token above also matches the cheap ``gpt-5-mini`` / ``gpt-5-nano`` variants,
-# which should NOT be budget-blocked, so they are excluded here. The leading
-# dash is deliberate: a bare ``"mini"`` would also match unrelated models like
-# ``gemini``. Applied only to the built-in default set — when the caller passes
-# an explicit ``expensive_models`` list, those tokens are matched literally
-# with no exclusions (the caller controls the set exactly).
-_DEFAULT_EXPENSIVE_EXCLUDES = ("-mini", "-nano")
-
 
 def _session_cost_usd(event: PolicyEvent) -> float:
     """Read cumulative session cost (USD) from a policy event.
@@ -346,42 +324,29 @@ def _resolve_expensive_models(expensive_models: list[str] | None) -> _ExpensiveM
     Shared by :func:`cost_budget` and :func:`user_daily_cost_budget` so
     both treat the argument identically:
 
-    - ``None`` → the built-in default set
-      (:data:`_DEFAULT_EXPENSIVE_MODELS`) with the cheap-variant
-      exclusions (:data:`_DEFAULT_EXPENSIVE_EXCLUDES`) applied; hard gate
-      on.
+    - ``None`` or ``[]`` → **all models blocked** once over budget
+      (``block_all_models=True``, hard gate on). This is a true hard
+      stop: no model can continue once the limit is reached.
     - a non-empty list → those tokens (lowercased), matched literally
-      with NO exclusions (the caller controls the set exactly); hard gate
-      on.
-    - ``[]`` → **all models blocked** once over budget (``block_all_models=True``,
-      hard gate on). This is a true hard stop: no model can continue once
-      the limit is reached, instead of just being a downgrade gate.
+      with no exclusions (the caller controls the set exactly); hard gate
+      on (downgrade gate — cheaper models still allowed over budget).
 
     :param expensive_models: The factory argument, e.g.
         ``["opus", "gpt-5"]``, ``None``, or ``[]``.
     :returns: The resolved :class:`_ExpensiveModelConfig`.
     :raises ValueError: If any entry is not a non-empty string.
     """
-    if expensive_models is None:
-        return _ExpensiveModelConfig(
-            expensive_tokens=_DEFAULT_EXPENSIVE_MODELS,
-            exclude_tokens=_DEFAULT_EXPENSIVE_EXCLUDES,
-            hard_cap_enabled=True,
-        )
-    for m in expensive_models:
-        if not isinstance(m, str) or not m:
-            raise ValueError(f"each expensive_models value must be a non-empty string, got {m!r}")
-    expensive_tokens = tuple(m.lower() for m in expensive_models)
-    if not expensive_tokens:
-        # Empty list → block all models once over budget (hard stop, not just a
-        # downgrade gate). hard_cap_enabled stays True; block_all_models signals
-        # _model_blocked_over_budget to short-circuit to True for any model.
+    if expensive_models is None or len(expensive_models) == 0:
         return _ExpensiveModelConfig(
             expensive_tokens=(),
             exclude_tokens=(),
             hard_cap_enabled=True,
             block_all_models=True,
         )
+    for m in expensive_models:
+        if not isinstance(m, str) or not m:
+            raise ValueError(f"each expensive_models value must be a non-empty string, got {m!r}")
+    expensive_tokens = tuple(m.lower() for m in expensive_models)
     return _ExpensiveModelConfig(
         expensive_tokens=expensive_tokens,
         exclude_tokens=(),
@@ -423,12 +388,11 @@ def cost_budget(
         e.g. ``["opus", "gpt-5"]``. A token matches when it is a
         substring of the active model id (so ``"opus"`` matches both
         ``"databricks-claude-opus-4-8"`` and the alias ``"opus"``).
-        ``None`` uses the built-in default (Fable + Opus + GPT-5,
-        excluding the cheap ``-mini`` / ``-nano`` variants). An explicit
-        list is matched literally with no exclusions. ``[]`` makes the
-        hard cap a true hard stop: **all** models are blocked once the
-        limit is reached (not just a downgrade gate). Each value must be
-        a non-empty string.
+        ``None`` (the default) or ``[]`` makes the hard cap a true hard
+        stop: **all** models are blocked once the limit is reached. Pass
+        an explicit non-empty list for a downgrade gate that only blocks
+        the named tiers, letting cheaper models continue over budget.
+        Each value must be a non-empty string.
     :returns: A policy callable implementing the budget gate.
     :raises ValueError: If *max_cost_usd* is not positive, any
         *ask_thresholds_usd* value is not in ``(0, max_cost_usd)``, or
@@ -610,11 +574,10 @@ def user_daily_cost_budget(
         ``< max_cost_usd``. ``None`` / ``[]`` disables the soft gate.
     :param expensive_models: Optional case-insensitive substring tokens
         for the model tiers blocked once over the daily limit. ``None``
-        uses the built-in default (Fable + Opus + GPT-5, excluding the
-        cheap ``-mini`` / ``-nano`` variants); an explicit list is
-        matched literally with no exclusions; ``[]`` makes the hard cap a
-        true hard stop — all models are blocked once the limit is
-        reached.
+        (the default) or ``[]`` makes the hard cap a true hard stop —
+        all models are blocked once the limit is reached. Pass an
+        explicit non-empty list for a downgrade gate that only blocks the
+        named tiers.
     :returns: A policy callable implementing the per-user daily budget.
     :raises ValueError: Same validation as :func:`cost_budget`.
     """
@@ -865,9 +828,9 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional case-insensitive substring tokens for the model "
-                    "tiers blocked once over budget (default: Fable + Opus + GPT-5, excluding "
-                    "the cheap -mini/-nano variants). An empty list blocks all models once the "
-                    "limit is reached (true hard stop, not just a downgrade gate).",
+                    "tiers blocked once over budget. Omit (or pass []) for a true hard stop "
+                    "that blocks all models; pass a non-empty list for a downgrade gate that "
+                    "only blocks the named tiers.",
                 },
             },
             "required": ["max_cost_usd"],
@@ -902,9 +865,9 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional case-insensitive substring tokens for the model "
-                    "tiers blocked once over the daily budget (default: Fable + Opus + GPT-5, "
-                    "excluding the cheap -mini/-nano variants). An empty list blocks all models "
-                    "once the limit is reached (true hard stop, not just a downgrade gate).",
+                    "tiers blocked once over the daily budget. Omit (or pass []) for a true "
+                    "hard stop that blocks all models; pass a non-empty list for a downgrade "
+                    "gate that only blocks the named tiers.",
                 },
             },
             "required": ["max_cost_usd"],
