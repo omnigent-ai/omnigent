@@ -1442,8 +1442,9 @@ class ClaudeSDKExecutor(Executor):
         same_loop = state.loop is None or current_loop is state.loop
         same_task = state.task is None or current_task is state.task
         if not (same_loop and same_task):
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different event loop/task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different event loop/task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -1453,8 +1454,9 @@ class ClaudeSDKExecutor(Executor):
         except RuntimeError as exc:
             if "different task" not in str(exc):
                 raise
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)

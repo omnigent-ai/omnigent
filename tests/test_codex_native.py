@@ -9173,3 +9173,106 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
         {"type": "external_compaction_status", "data": {"status": "in_progress"}},
         {"type": "external_compaction_status", "data": {"status": "completed"}},
     ]
+
+
+def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
+    """Compaction items emit a Compacted rollout record and discard prior items."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi there"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "compaction summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": "gAAAA_encrypted",
+                },
+            ],
+            "window_id": 2,
+            "response_id": "compact_1",
+        },
+        {
+            "id": "msg_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    # Should have: session_meta, compacted, turn_context, response_item (msg_3), event_msg
+    types = [r["type"] for r in records]
+    assert "session_meta" in types
+    assert "compacted" in types
+    # Pre-compaction response_items should be gone
+    pre_compaction_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "hello"}]
+    ]
+    assert len(pre_compaction_items) == 0, "Pre-compaction items should be discarded"
+    # The compacted record should have replacement_history and window_id
+    compacted_records = [r for r in records if r["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    cp = compacted_records[0]["payload"]
+    assert cp["window_id"] == 2
+    assert len(cp["replacement_history"]) == 2
+    assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
+    # Post-compaction message should still be present
+    post_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
+    ]
+    assert len(post_items) == 1
+
+
+def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> None:
+    """Sessions without compaction produce no Compacted rollout record."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    types = [r["type"] for r in records]
+    assert "compacted" not in types

@@ -21,9 +21,12 @@ model sees it).
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import shlex
 import sys
 import time
+from collections.abc import Callable
 
 import httpx
 
@@ -55,8 +58,141 @@ _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 # body). Mirrors the runner-side fail-closed default in
 # ``omnigent.runner.app._evaluate_policy_via_omnigent`` (PR #163).
 _EVAL_UNAVAILABLE_REASON = (
-    "Omnigent policy evaluation unavailable; failing closed for this tool call."
+    "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
+    "Omnigent server); failing closed for this tool call."
 )
+_EVAL_UNAVAILABLE_REQUEST_REASON = (
+    "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
+    "Omnigent server); failing closed for this request."
+)
+
+
+# Env var carrying the one-shot auth + workspace-routing headers from the
+# executor (which writes the hook wrapper) to the hook subprocess. The hook
+# is import-free of the runner, so the headers are passed in rather than
+# resolved in-process — the same reason ``ap_auth_headers`` is baked for the
+# claude/codex/kimi hooks.
+_AUTH_HEADERS_ENV = "_OMNIGENT_AUTH_HEADERS"
+
+
+def policy_hook_request_headers() -> dict[str, str]:
+    """Build the headers for a policy-hook subprocess's POST to the server.
+
+    Always carries ``Content-Type``, and merges the one-shot auth +
+    workspace-routing headers the executor baked into :data:`_AUTH_HEADERS_ENV`
+    at launch (see :func:`policy_hook_wrapper_script`). Without them the POST
+    is unauthenticated and unrouted — it 401s on an authenticated server and
+    misroutes to the account on a unified-account workspace. Missing or
+    malformed env → just ``Content-Type`` (a local unauthenticated server
+    needs no auth).
+
+    :returns: Request headers for ``post_evaluate_with_retry``.
+    """
+    headers = {"Content-Type": "application/json"}
+    raw = os.environ.get(_AUTH_HEADERS_ENV, "")
+    if raw:
+        try:
+            extra = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            extra = None
+        if isinstance(extra, dict):
+            headers.update({str(k): str(v) for k, v in extra.items()})
+    return headers
+
+
+def policy_hook_wrapper_script(server_url: str, session_id: str, hook_script_path: str) -> str:
+    """Build the ``/bin/sh`` wrapper a native policy hook is launched as.
+
+    Resolves a one-shot Omnigent-server token and bakes the auth +
+    workspace-routing headers (via
+    :func:`omnigent.cli_auth.databricks_request_headers`) into
+    :data:`_AUTH_HEADERS_ENV`, so the hook's POST authenticates and routes to
+    the workspace. The token is a secret, so callers MUST write the returned
+    wrapper ``0o700`` (owner-only) — it is never world-readable.
+
+    :param server_url: Omnigent server base URL the hook posts to.
+    :param session_id: Session / conversation id for policy evaluation.
+    :param hook_script_path: Absolute path to the hook's Python entrypoint.
+    :returns: Shell-script text for the wrapper (write it ``0o700``).
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner._entry import _make_auth_token_factory
+
+    factory = _make_auth_token_factory(server_url=server_url)
+    token = factory() if factory is not None else None
+    auth_headers = databricks_request_headers(server_url, bearer_token=token)
+    return (
+        "#!/bin/sh\n"
+        f"export _OMNIGENT_SERVER_URL={shlex.quote(server_url)}\n"
+        f"export _OMNIGENT_SESSION_ID={shlex.quote(session_id)}\n"
+        f"export {_AUTH_HEADERS_ENV}={shlex.quote(json.dumps(auth_headers))}\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(hook_script_path)}\n"
+    )
+
+
+def policy_hook_reauth(
+    server_url: str, headers: dict[str, str]
+) -> Callable[[], dict[str, str] | None]:
+    """Build a callable that re-mints the Omnigent bearer for *server_url*.
+
+    The baked one-shot token dies with the ~1h Databricks OAuth lifetime; on a
+    lapsed-token signal (401 or Apps ``302→/oidc/``) ``post_evaluate_with_retry``
+    calls this once to mint a fresh bearer through the same factory the
+    refresh-capable runtime auth uses, keeping the other headers (e.g.
+    ``X-Databricks-Org-Id``) so routing survives. Returns ``None`` when no
+    refresh mechanism is available, so the caller fails closed.
+
+    :param server_url: Omnigent server base URL the hook POSTs to.
+    :param headers: Current (lapsed) headers; the fresh bearer is merged over
+        a copy so routing headers survive.
+    :returns: A zero-arg callable returning fresh headers, or ``None``.
+    """
+
+    def _reauth() -> dict[str, str] | None:
+        # Lazy import: paid only on the rare re-auth path, off the hot path.
+        try:
+            from omnigent.runner._entry import _make_auth_token_factory
+        except Exception:  # noqa: BLE001 — best-effort; fail closed if unavailable
+            return None
+        factory = _make_auth_token_factory(server_url)
+        if factory is None:
+            return None
+        try:
+            token = factory()
+        except Exception:  # noqa: BLE001 — transient mint failure; fail closed
+            return None
+        if not token:
+            return None
+        return {**headers, "Authorization": f"Bearer {token}"}
+
+    return _reauth
+
+
+def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
+    """
+    Return ``True`` when a response means "the bearer is no good — re-auth".
+
+    Mirrors :func:`omnigent.runner._entry._is_login_redirect_or_unauthorized`,
+    duplicated here so the dependency-light hook need not import the runner
+    package. The Databricks Apps front door bounces an *expired* bearer with a
+    ``302`` to the OAuth login flow (``/oidc/`` or ``/.auth/``) — **not** a
+    ``401`` — so a hook that only treats ``401`` as auth failure silently fails
+    closed once the one-shot ``ap_auth_headers`` token (snapshotted at launch by
+    ``build_hook_settings``) lapses with the ~1h Databricks OAuth lifetime.
+    Treat both the 401 and the OAuth-login redirect as a re-auth signal.
+
+    Unrelated 3xx (an application-level redirect to another resource) return
+    ``False`` so the caller does not waste a token round-trip on every redirect.
+
+    :param response: The hook's POST response to classify.
+    :returns: ``True`` when the caller should re-mint a token and retry.
+    """
+    if response.status_code == 401:
+        return True
+    if not response.is_redirect:
+        return False
+    location = response.headers.get("location", "")
+    return "/oidc/" in location or "/.auth/" in location
 
 
 def hook_payload_to_evaluation_request(
@@ -266,15 +402,18 @@ def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
     - ``PreToolUse`` (``PHASE_TOOL_CALL``) fails CLOSED → ``deny``. This is
       the authoritative pre-execution gate; an unevaluable policy must not
       let the call through.
-    - ``UserPromptSubmit`` (``PHASE_REQUEST``) and ``PostToolUse``
-      (``PHASE_TOOL_RESULT``) fail OPEN → ``None``. The request gate is
-      advisory (the tool-call gate still catches dangerous actions) and by
-      the result phase the tool has already executed, so denying would only
-      block an already-incurred side effect.
+    - ``UserPromptSubmit`` (``PHASE_REQUEST``) fails CLOSED →
+      ``{"decision": "block", ...}``. This is the sole pre-turn enforcement
+      point for native sessions; a server hiccup must not let an over-budget
+      or otherwise-blocked request proceed.
+    - ``PostToolUse`` (``PHASE_TOOL_RESULT``) fails OPEN → ``None``. By the
+      result phase the tool has already executed, so denying would only block
+      an already-incurred side effect.
 
     :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
     :returns: A ``permissionDecision: "deny"`` hook output for
-        ``PreToolUse``; ``None`` for every other event (fail open).
+        ``PreToolUse``; a ``decision: "block"`` output for
+        ``UserPromptSubmit``; ``None`` for every other event (fail open).
     """
     if hook_event == _PRE_TOOL_USE:
         return {
@@ -283,6 +422,11 @@ def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
                 "permissionDecision": "deny",
                 "permissionDecisionReason": _EVAL_UNAVAILABLE_REASON,
             },
+        }
+    if hook_event == _USER_PROMPT_SUBMIT:
+        return {
+            "decision": "block",
+            "reason": _EVAL_UNAVAILABLE_REQUEST_REASON,
         }
     return None
 
@@ -293,6 +437,7 @@ def post_evaluate_with_retry(
     eval_request: dict[str, object],
     read_timeout: float,
     hook_label: str,
+    reauth: Callable[[], dict[str, str] | None] | None = None,
 ) -> httpx.Response | None:
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
@@ -326,6 +471,15 @@ def post_evaluate_with_retry(
         large (e.g. one day) to accommodate long-polling ASK gates.
     :param hook_label: Diagnostic label used in stderr messages,
         e.g. ``"evaluate-policy hook"`` or ``"codex evaluate-policy hook"``.
+    :param reauth: Optional callable that re-mints fresh auth headers when
+        the server bounces the request to its OAuth login flow (the Apps
+        front door 302→``/oidc/``) or returns ``401`` — i.e. the one-shot
+        ``ap_auth_headers`` token lapsed. Called at most once; returning new
+        headers triggers an immediate retry with them, mirroring the runner's
+        refresh-capable :class:`~omnigent.runner._entry._RunnerDatabricksAuth`.
+        ``None`` (the default) keeps the legacy behavior for callers that have
+        no token source. Returning ``None`` from it falls through to the
+        normal failure handling (the caller fails closed).
     :returns: Successful :class:`httpx.Response`, or ``None`` when retries
         are exhausted or the error is non-retryable.
     """
@@ -338,10 +492,34 @@ def post_evaluate_with_retry(
     deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
+    reauthed = False
     while True:
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=request_body)
+                if (
+                    reauth is not None
+                    and not reauthed
+                    and _is_login_redirect_or_unauthorized(resp)
+                ):
+                    # The one-shot ``ap_auth_headers`` token lapsed (~1h
+                    # Databricks OAuth lifetime): the Apps front door bounces
+                    # an expired bearer with a 302→/oidc/ (or a 401). Re-mint
+                    # and retry once with the fresh token instead of failing
+                    # closed — exactly as ``_RunnerDatabricksAuth`` does for the
+                    # runner's own callbacks. Without this, every tool call on a
+                    # session older than the token lifetime fails CLOSED while
+                    # chat (refresh-capable) keeps working.
+                    refreshed = reauth()
+                    if refreshed:
+                        headers = refreshed
+                        reauthed = True
+                        print(
+                            f"omnigent {hook_label}: Omnigent auth expired "
+                            "(login redirect/401); re-minted token and retrying",
+                            file=sys.stderr,
+                        )
+                        continue
                 resp.raise_for_status()
                 return resp
         except httpx.HTTPStatusError as exc:

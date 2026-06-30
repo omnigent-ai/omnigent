@@ -62,6 +62,7 @@ from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
 )
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.entities import (
     Agent,
@@ -490,7 +491,7 @@ def _publish_collaboration_mode(session_id: str, mode: str) -> None:
 
 # Display name fallback when neither nickname nor role is available.
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
-# Labels read by ``_get_session_snapshot`` to seed the ap-web ring on
+# Labels read by ``_get_session_snapshot`` to seed the web ring on
 # reload for sessions where no Omnigent task carries usage (claude-native).
 _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
@@ -499,6 +500,9 @@ _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 # by. Empty string clears a stale value because labels are upsert-only.
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
+# Hard limit matching the ``conversation_labels.value`` column width. Sourced
+# from the schema so the truncation and the column can never drift apart.
+_LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 # Todo-list update from the claude-native forwarder. Carries the raw
 # todo items captured from PostToolUse/TodoWrite hook events. Payload
@@ -2246,7 +2250,7 @@ def _pending_elicitation_snapshot_for_session(
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
-    status: Literal["idle", "running", "failed"],
+    status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
@@ -2877,17 +2881,24 @@ def _accumulate_session_usage(
     Increment the session's cumulative token counters from a
     ``response.completed`` event's usage data.
 
-    Called synchronously from the relay loop. Reads the current
-    persisted ``session_usage``, adds the delta from the
-    response's ``usage`` field, and writes the updated totals
-    back. No-op when the response carries no usage data.
+    Called synchronously from the relay loop. Builds a usage delta from
+    the response's ``usage`` field and atomically applies it to the
+    persisted ``session_usage`` via a single database transaction
+    (``SELECT FOR UPDATE`` on PostgreSQL, SQLite's single-writer lock
+    otherwise). This prevents the read-modify-write race that caused
+    concurrent relay completions to silently drop each other's cost /
+    token deltas (#9). No-op when the response carries no usage data.
 
     Cost is computed when the model's per-token pricing is
     available from the MLflow catalog (looked up once per call
-    from the response's ``model`` field). The ``total_cost_usd`` key is
-    written **only when pricing is available** — an unpriced session
-    leaves it absent (its presence is what distinguishes a priced
-    ``$0.00`` from "unpriced"; see :func:`_priced_cost_for_display`).
+    from the response's ``model`` field). When the harness instead
+    reports an authoritative per-turn ``cost_usd`` (e.g. Copilot's
+    AI-credit total), that value is used directly in preference to
+    the catalog estimate. The ``total_cost_usd`` key is written
+    **only when the turn is priced** (catalog pricing available or a
+    harness-reported cost) — an unpriced session leaves it absent
+    (its presence is what distinguishes a priced ``$0.00`` from
+    "unpriced"; see :func:`_priced_cost_for_display`).
 
     :param resp_obj: The ``response`` dict from the
         ``response.completed`` SSE event.
@@ -2912,20 +2923,10 @@ def _accumulate_session_usage(
     cache_read_input_tokens = usage_obj.get("cache_read_input_tokens", 0)
     cache_creation_input_tokens = usage_obj.get("cache_creation_input_tokens", 0)
 
-    # Load current cumulative usage from the store.
+    # Load conversation metadata for pricing only (NOT for reading session_usage —
+    # the atomic increment_session_usage call below handles that separately to
+    # avoid the read-modify-write race).
     conv = conversation_store.get_conversation(session_id)
-    current = dict(conv.session_usage) if conv else {}
-    current.setdefault("input_tokens", 0)
-    current.setdefault("output_tokens", 0)
-    current.setdefault("total_tokens", 0)
-    current.setdefault("cache_read_input_tokens", 0)
-    current.setdefault("cache_creation_input_tokens", 0)
-
-    current["input_tokens"] += input_tokens
-    current["output_tokens"] += output_tokens
-    current["total_tokens"] += total_tokens
-    current["cache_read_input_tokens"] += cache_read_input_tokens
-    current["cache_creation_input_tokens"] += cache_creation_input_tokens
 
     # Compute cost delta if pricing is available for the model. Resolve
     # the model to price with, most-specific first:
@@ -2940,6 +2941,10 @@ def _accumulate_session_usage(
     # created only on this priced branch, so an unpriced session never
     # gains a (misleading $0.00) cost key.
     cost_delta = 0.0
+    priced = False
+    # Prefer an authoritative harness-reported cost over the catalog estimate.
+    provider_cost = usage_obj.get("cost_usd")
+    has_provider_cost = isinstance(provider_cost, (int, float))
     usage_model = usage_obj.get("model")
     llm_model = (
         usage_model
@@ -2947,37 +2952,55 @@ def _accumulate_session_usage(
         else (conv.model_override if conv and conv.model_override else _resolve_llm_model(conv))
     )
     if llm_model:
-        from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+        if has_provider_cost:
+            cost_delta = float(provider_cost)
+            priced = True
+        else:
+            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
 
-        pricing = fetch_model_pricing(llm_model)
-        priced = pricing is not None
-        if pricing is not None:
-            # Cache-aware: usage_obj carries cache_read/cache_creation
-            # token counts when the harness reports them; compute_llm_cost
-            # prices them at their own (cheaper read / pricier write) rates.
-            cost_delta = compute_llm_cost(usage_obj, pricing)
-            current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + cost_delta
-        # Per-model attribution (ADD). Tokens are attributed whenever the
-        # model is known — including unpriced turns — so the per-model token
-        # view is complete; cost is attributed only when this model's turn
-        # was priced (passing ``None`` otherwise keeps the model's cost key
-        # absent, matching the flat "priced ⟺ key present" contract).
-        _add_model_usage_delta(
-            _model_usage_bucket(current, llm_model),
-            {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-            },
-            cost_delta if priced else None,
-        )
+            pricing = fetch_model_pricing(llm_model)
+            priced = pricing is not None
+            if pricing is not None:
+                # Cache-aware: usage_obj carries cache_read/cache_creation
+                # token counts when the harness reports them; compute_llm_cost
+                # prices them at their own (cheaper read / pricier write) rates.
+                cost_delta = compute_llm_cost(usage_obj, pricing)
 
-    conversation_store.set_session_usage(session_id, current)
+    # Build the delta dict and atomically apply it to the persisted
+    # session_usage in a single DB transaction (SELECT FOR UPDATE on
+    # PostgreSQL; SQLite's exclusive write lock on SQLite). This is the fix
+    # for the read-modify-write race that caused concurrent completions to
+    # overwrite each other's deltas (#9).
+    delta: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+    }
+    if priced:
+        delta["total_cost_usd"] = cost_delta
+    if llm_model:
+        # Per-model attribution. Tokens are attributed whenever the model is
+        # known — including unpriced turns — so the per-model token view is
+        # complete; cost is attributed only when this model's turn was priced
+        # (keeping the model's cost key absent otherwise, matching the flat
+        # "priced ⟺ key present" contract).
+        model_delta: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+        }
+        if priced:
+            model_delta["total_cost_usd"] = cost_delta
+        delta["by_model"] = {llm_model: model_delta}
+
+    new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
-    return _priced_cost_for_display(current)
+    return _priced_cost_for_display(new_current)
 
 
 def _persist_native_cumulative_usage(
@@ -3542,7 +3565,7 @@ def _handle_external_session_todos(
     Updates the in-memory ``_session_todos_cache`` so subsequent
     ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
     field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected ap-web clients update their todo panel immediately.
+    so connected web clients update their todo panel immediately.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -4294,7 +4317,7 @@ def _publish_session_created(
     """
     Emit ``session.created`` on the parent's stream for a child session.
 
-    Clients watching the parent (e.g. the ap-web Subagents rail tab)
+    Clients watching the parent (e.g. the web Subagents rail tab)
     invalidate their ``child_sessions`` cache and re-fetch on this
     event.
 
@@ -4460,7 +4483,7 @@ async def _persist_external_subagent_start(
             raise
         await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
         # The POST that created this orphan died before reaching the
-        # ``session.created`` publish below, so live clients (the ap-web
+        # ``session.created`` publish below, so live clients (the web
         # Subagents rail) have never heard about the child — emit it now.
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
@@ -4993,6 +5016,98 @@ def _require_external_status_forward(
         )
 
 
+# How long the terminal sub-agent-status forward waits for the parent's
+# runner tunnel to (re)connect before giving up. A relaunch/redeploy
+# reconnect gap is normally sub-second; a few seconds bridges it without
+# holding the POST open long. The runner re-posts on a 503 regardless, so
+# this is a best-effort fast path, not the only delivery chance.
+_SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
+
+
+async def _recover_subagent_status_forward_via_parent(
+    child_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    conversation_store: ConversationStore,
+    forward_body: dict[str, Any],
+) -> _RunnerForwardResult | None:
+    """
+    Re-deliver a sub-agent terminal status through the parent's live runner.
+
+    A native sub-agent child copies its parent's ``runner_id`` once, at
+    creation (``create_conversation(..., runner_id=parent_conv.runner_id)`` —
+    see :func:`_persist_external_subagent_start`). It is never repointed when
+    the runner is later relaunched under a freshly minted ``runner_id`` (a host
+    relaunch after a tunnel drop / server redeploy / crash mints a new binding
+    token; only the *parent* conversation is rebound, via the PATCH path on its
+    next message). The child then points at a permanently offline ``runner_id``,
+    so its terminal ``idle``/``failed`` forward resolves no runner client and
+    503s forever (``_forward_session_change_to_runner`` → ``None`` →
+    :func:`_require_external_status_forward`). The parent never receives the
+    child's inbox result and hangs with no timeout.
+
+    A child always runs on its parent's runner, so the live binding is the
+    parent's. This re-resolves the forward through the parent/root
+    conversation's *current* ``runner_id``: it waits briefly for that runner's
+    tunnel to (re)connect (covering the reconnect gap right after a relaunch),
+    heals the child's stale ``runner_id`` so future forwards and
+    ``_on_runner_connect`` resolve it correctly, and retries the forward.
+
+    :param child_conv: The sub-agent child conversation whose terminal-status
+        forward could not reach its pinned runner.
+    :param runner_router: Router used to resolve the bound runner client, or
+        ``None`` in in-process setups.
+    :param tunnel_registry: Runner-tunnel registry used to await the parent
+        runner's (re)connect, or ``None`` in setups without runner tunnels.
+    :param conversation_store: Store used to look up the parent and persist the
+        child's healed ``runner_id``.
+    :param forward_body: The ``external_session_status`` event body to re-POST.
+    :returns: The retry's :class:`_RunnerForwardResult` when a live parent
+        runner was resolved, or ``None`` when none could be (the caller then
+        fails the forward as before).
+    """
+    parent_id = child_conv.parent_conversation_id or child_conv.root_conversation_id
+    if not parent_id or parent_id == child_conv.id:
+        return None
+    parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+    if parent is None or parent.runner_id is None:
+        return None
+    parent_runner_id = parent.runner_id
+    # Wait for the parent's runner tunnel to be live before re-resolving. When
+    # no registry is wired (in-process / tests) skip the wait and retry
+    # best-effort against whatever the router resolves.
+    if tunnel_registry is not None:
+        client = await _wait_for_runner_client(
+            parent_id,
+            runner_router,
+            tunnel_registry,
+            runner_id=parent_runner_id,
+            timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
+        )
+        if client is None:
+            return None
+    if parent_runner_id != child_conv.runner_id:
+        # Heal the divergence so this child's id matches the live runner: the
+        # next forward resolves directly and a future ``_on_runner_connect``
+        # (which rebinds by matching runner_id) can recover it.
+        try:
+            await asyncio.to_thread(
+                conversation_store.replace_runner_id, child_conv.id, parent_runner_id
+            )
+        except ConversationNotFoundError:
+            # The child was deleted between ``post_event`` reading it and this
+            # heal (e.g. the session was removed mid-teardown). Recovery is
+            # strictly best-effort — degrade to ``None`` so the caller falls
+            # through to the existing 503/no-op rather than surfacing this
+            # benign race as an unhandled 500.
+            return None
+    return await _forward_session_change_to_runner(
+        child_conv.id,
+        runner_router,
+        forward_body,
+    )
+
+
 def _require_collaboration_mode_forward(
     session_id: str,
     enabled: bool,
@@ -5128,6 +5243,25 @@ def _publish_status(
     session_stream.publish(session_id, payload)
 
 
+def _truncate_label(value: str) -> str:
+    """Truncate a label value to fit the ``conversation_labels.value`` column.
+
+    Long failure messages (tracebacks, 5xx bodies) overflow the column and
+    cause a ``DataError`` that silently drops the error reason. Error messages
+    front-load their signal, so keeping the head and appending an ellipsis
+    preserves the useful part while flagging that more was dropped. The store
+    clamps again as a final guard, but truncating here keeps the marker and
+    makes the call site directly testable.
+
+    :param value: The raw string to truncate.
+    :returns: ``value`` unchanged if it already fits, else the head trimmed to
+        the column width with a trailing ``…`` to signal truncation.
+    """
+    if len(value) <= _LABEL_VALUE_MAX_LEN:
+        return value
+    return value[: _LABEL_VALUE_MAX_LEN - 1] + "…"
+
+
 async def _persist_session_status_error_labels(
     session_id: str,
     error: ErrorDetail | None,
@@ -5149,8 +5283,8 @@ async def _persist_session_status_error_labels(
     """
     updates = (
         {
-            _LAST_TASK_ERROR_CODE_LABEL_KEY: error.code,
-            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: error.message,
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_label(error.message),
         }
         if error is not None
         else {
@@ -8997,7 +9131,7 @@ async def _flush_relay_text(
     text has already been closed/committed client-side (by the
     function_call item or interleaved reasoning) before this publish
     arrives. The web stamps the id onto the matching streamed
-    ``text_done`` block in place (ap-web ``chatStore.ts``
+    ``text_done`` block in place (web ``chatStore.ts``
     ``pumpStreamEvents``); the TUI consumes a byte-equal committed
     segment (``_repl.py`` ``_TurnProseTracker``).
 
@@ -9865,6 +9999,11 @@ _FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
         "hermes-native",
         "native-hermes",
         "pi-native",
+        # qwen-native rebuilds qwen's on-disk chat recording (+ runtime/meta
+        # sidecars) from the copied items, so a fork carries history into the
+        # qwen TUI (see _build_qwen_fork_recording / write_qwen_session_recording).
+        # Only the canonical id is needed — "native-qwen" is aliased to it.
+        "qwen-native",
     }
 )
 
@@ -11496,7 +11635,7 @@ def _native_subagent_wrapper_labels(
     render with the Chat/Terminal pill in the web UI, exactly like a
     top-level ``claude-native-ui`` / ``codex-native-ui`` wrapper session.
     The pill is gated on the conversation's ``omnigent.wrapper`` +
-    ``omnigent.ui`` labels (see ``ap-web`` ``TerminalFirstContext``), but
+    ``omnigent.ui`` labels (see ``web`` ``TerminalFirstContext``), but
     the sub-agent create path never stamps them. This resolves the child
     sub-agent's spec from the parent bundle and returns the labels to stamp,
     or an empty dict when the sub-agent is not native (e.g. ``claude-sdk``).
@@ -18181,6 +18320,23 @@ def create_sessions_router(
                 # Codex-internal children are tracked inside the same
                 # app-server thread tree; they have no runner inbox entry
                 # to forward terminal status to.
+                if runner_result is None:
+                    # The child's pinned runner_id is stale — its runner was
+                    # relaunched under a new id and only the parent was
+                    # rebound, so the child points at a dead runner forever and
+                    # this terminal status would 503 indefinitely while the
+                    # parent hangs waiting for the child's inbox result. Heal
+                    # the binding and re-deliver through the parent's live
+                    # runner before failing.
+                    recovered = await _recover_subagent_status_forward_via_parent(
+                        conv,
+                        runner_router,
+                        getattr(request.app.state, "tunnel_registry", None),
+                        conversation_store,
+                        forward_body,
+                    )
+                    if recovered is not None:
+                        runner_result = recovered
                 _require_external_status_forward(
                     session_id,
                     status,

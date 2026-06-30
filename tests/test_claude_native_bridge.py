@@ -3771,7 +3771,7 @@ def test_usage_from_transcript_entry_sums_context_tokens() -> None:
     """
     Context-token count must sum the three input-side fields.
 
-    The "context tokens" exposed to ap-web's input-composer ring is
+    The "context tokens" exposed to web's input-composer ring is
     ``input_tokens + cache_creation_input_tokens +
     cache_read_input_tokens``. ``output_tokens`` is generated within
     the same call and does NOT count toward the next prompt's size,
@@ -4686,6 +4686,45 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     assert captured["kwargs"]["stdin"] == subprocess.DEVNULL
     assert captured["kwargs"]["stdout"] == subprocess.DEVNULL
     assert captured["kwargs"]["stderr"] == subprocess.DEVNULL
+
+
+def test_display_cost_approval_popup_honors_config_file_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``config_file`` override is forwarded instead of permission_hook.json.
+
+    The runner passes a freshly-minted AP-routing snapshot here so a cost gate
+    firing late in a session reads a live bearer, not the stale launch token in
+    permission_hook.json. Without honoring the override the verdict POST would
+    401 and silently lose the approval.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "tmux.json").write_text(
+        json.dumps({"socket_path": "/tmp/x.sock", "tmux_target": "claude:0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: ["/dev/pts/9"])
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda args, **kwargs: captured.setdefault("args", args)
+    )
+    fresh = bridge_dir / "cost_popup.json"
+
+    display_cost_approval_popup(
+        bridge_dir,
+        session_id="conv_abc123",
+        elicitation_id="elicit_deadbeef",
+        message="continue?",
+        timeout_s=1.0,
+        config_file=fresh,
+    )
+
+    inner = shlex.split(captured["args"][-1])
+    cfg = inner[inner.index("--config-file") + 1]
+    assert cfg == str(fresh)
+    assert not cfg.endswith("permission_hook.json")
 
 
 def test_display_cost_approval_popup_skips_when_no_client_attached(

@@ -29,21 +29,21 @@ updates:
         applies-to: security-updates
         patterns: ["*"]
 
-  # ── ap-web (React frontend) ──────────────────────────────────────────────
+  # ── web (React frontend) ──────────────────────────────────────────────
   - package-ecosystem: npm
-    directory: "/ap-web"
+    directory: "/web"
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 0
     groups:
-      ap-web-security:
+      web-security:
         applies-to: security-updates
         patterns: ["*"]
 
-  # ── ap-web Electron shell ────────────────────────────────────────────────
+  # ── web Electron shell ────────────────────────────────────────────────
   - package-ecosystem: npm
-    directory: "/ap-web/electron"
+    directory: "/web/electron"
     schedule:
       interval: weekly
       day: monday
@@ -79,7 +79,7 @@ updates:
 
   # ── iOS app (CocoaPods/Bundler Gemfile) ──────────────────────────────────
   - package-ecosystem: bundler
-    directory: "/ap-web/ios"
+    directory: "/web/ios"
     schedule:
       interval: weekly
       day: monday

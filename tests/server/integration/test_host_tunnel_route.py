@@ -17,6 +17,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     encode_host_frame,
 )
+from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.stores.host_store import HostStore
@@ -426,6 +427,131 @@ async def test_host_tunnel_routes_launch_result_to_future(
     assert result["status"] == "launched"
     assert result["runner_id"] == "runner_token_xyz"
     assert result["error"] is None
+
+
+# ── Cross-owner re-registration rejection ───────────────────
+
+
+class _FixedAuthProvider(AuthProvider):
+    """Auth provider that resolves every request to one fixed user.
+
+    :param user_id: The user id ``get_user_id`` always returns.
+    """
+
+    def __init__(self, user_id: str) -> None:
+        self._user_id = user_id
+
+    def get_user_id(self, request: object) -> str:
+        """Return the fixed user id regardless of the request."""
+        del request
+        return self._user_id
+
+
+def _owned_app(
+    db_uri: str,
+    *,
+    authed_user: str,
+) -> tuple[FastAPI, HostRegistry, HostStore]:
+    """Build a host-tunnel app whose auth resolves to ``authed_user``.
+
+    Wires a multi-user posture (``local_single_user=False``), so the
+    host-hijack boundary that the cross-owner check enforces is active.
+
+    :param db_uri: SQLite URI from the shared fixture.
+    :param authed_user: Identity the connecting peer authenticates as.
+    :returns: Tuple of (app, host_registry, host_store).
+    """
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            auth_provider=_FixedAuthProvider(authed_user),
+            local_single_user=False,
+        ),
+        prefix="/v1",
+    )
+    return app, registry, store
+
+
+async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:
+    """A host_id owned by another user is refused with HTTP 409 pre-accept.
+
+    Reproduces the stranded-host trap: a machine first registered under
+    one identity (e.g. the single-user ``local`` owner) and later dialing
+    in under a different account must NOT silently complete the handshake
+    and then have its registration dropped by the host_id UNIQUE
+    collision. The server detects the conflict before ``accept()`` and
+    answers the upgrade with a 409 denial response, so the host can
+    surface a specific, actionable error instead of looping.
+    """
+    app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
+    # The host_id is already owned by someone else.
+    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", owner="alice@example.com")
+
+    scope = _websocket_scope(_TUNNEL_PATH)
+    # Advertise the denial-response extension, as uvicorn does in prod.
+    scope["extensions"] = {"websocket.http.response": {}}
+    comm = ApplicationCommunicator(app, scope)
+    await comm.send_input({"type": "websocket.connect"})
+
+    start = await comm.receive_output(timeout=1.0)
+    assert start["type"] == "websocket.http.response.start"
+    assert start["status"] == 409
+    body = await comm.receive_output(timeout=1.0)
+    assert body["type"] == "websocket.http.response.body"
+    assert b"already registered to a different account" in body["body"]
+
+    # Bob never registered, and Alice's row is untouched (no cross-user
+    # takeover, and her host was not flipped offline).
+    assert registry.get(_HOST_ID) is None
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.owner == "alice@example.com"
+    assert host.status == "online"
+
+
+async def test_cross_owner_refused_with_close_when_no_denial_extension(db_uri: str) -> None:
+    """Without the denial-response extension, the refusal falls back to a close.
+
+    The ASGI server may not advertise ``websocket.http.response``; the
+    rejection must still land (as a pre-accept close → 403 on the client),
+    just with the less specific message.
+    """
+    app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", owner="alice@example.com")
+
+    # No "extensions" key in the scope → fallback path.
+    comm = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
+    await comm.send_input({"type": "websocket.connect"})
+
+    closed = await comm.receive_output(timeout=1.0)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4009
+    assert registry.get(_HOST_ID) is None
+
+
+async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
+    """The cross-owner guard does not block a legitimate same-owner reconnect.
+
+    A host owned by Bob that reconnects as Bob must accept and register —
+    otherwise the new check would break normal reconnection.
+    """
+    app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="bobs-laptop", owner="bob@example.com")
+
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry, name="bobs-laptop")
+
+    assert _HOST_ID in registry.online_host_ids()
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.owner == "bob@example.com"
+    assert host.status == "online"
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
 # ── Managed-host launch-token auth ──────────────────────────

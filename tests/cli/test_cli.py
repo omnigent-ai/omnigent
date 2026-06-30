@@ -396,7 +396,7 @@ def test_claude_command_profile_startup_threads_profiler(
         _fake_run_claude_native_capture(captured),
     )
 
-    result = CliRunner(mix_stderr=False).invoke(
+    result = CliRunner().invoke(
         cli,
         ["claude", "--server", "https://example.com", "--profile-startup"],
     )
@@ -2577,7 +2577,9 @@ def test_removed_runner_flow_flags_are_rejected(flag: str) -> None:
     result = CliRunner().invoke(cli, ["run", "tests/resources/examples/hello_world.yaml", flag])
 
     assert result.exit_code != 0
-    assert f"No such option: {flag}" in result.output
+    # click 8.2 reworded this from "No such option: --x" to "No such option
+    # '--x'." (and may append a "Did you mean" suggestion), so match loosely.
+    assert "No such option" in result.output and flag in result.output
 
 
 def test_attach_without_server_errors_loud(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3525,7 +3527,7 @@ def test_config_set_local_writes_project_config(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", tmp_path / "global.yaml")
 
-    result = CliRunner(mix_stderr=False).invoke(cli, ["config", "set", "model=my-model"])
+    result = CliRunner().invoke(cli, ["config", "set", "model=my-model"])
 
     assert result.exit_code == 0, result.output
     local_path = tmp_path / ".omnigent" / "config.yaml"
