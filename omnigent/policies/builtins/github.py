@@ -581,12 +581,44 @@ _GH_WRITE_ACTIONS: dict[str, frozenset[str]] = {
     "secret": frozenset({"set", "delete"}),
     "label": frozenset({"create", "delete", "edit"}),
     "gist": frozenset({"create", "edit", "delete"}),
+    "cache": frozenset({"delete"}),
+    "codespace": frozenset({"create", "delete", "stop", "rebuild"}),
+    "project": frozenset(
+        {
+            "create",
+            "delete",
+            "edit",
+            "close",
+            "mark-template",
+            "field-create",
+            "field-delete",
+            "item-add",
+            "item-archive",
+            "item-create",
+            "item-delete",
+            "item-edit",
+        }
+    ),
+    "variable": frozenset({"set", "delete"}),
+    "ssh-key": frozenset({"add", "delete"}),
+    "gpg-key": frozenset({"add", "delete"}),
 }
 
 # gh groups that are GitHub-aware but never touch a specific repo's contents —
 # ignore them (auth, local config, etc.).
 _GH_IGNORE_GROUPS: frozenset[str] = frozenset(
-    {"auth", "config", "alias", "extension", "completion"}
+    {
+        "auth",
+        "config",
+        "alias",
+        "extension",
+        "completion",
+        "browse",
+        "copilot",
+        "licenses",
+        "search",
+        "status",
+    }
 )
 
 
