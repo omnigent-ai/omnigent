@@ -1055,3 +1055,65 @@ def test_list_for_sessions_no_grants(store: SqlAlchemyPermissionStore, db_uri: s
     conv = _create_conversation(db_uri)
     result = store.list_for_sessions([conv])
     assert result == {conv: []}
+
+
+# ── __members__ sentinel ──────────────────────────────────────────────────────
+
+
+def test_check_access_members_grant_authenticated(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A __members__ grant resolves for any authenticated user."""
+    from omnigent.server.auth import RESERVED_USER_MEMBERS
+
+    _ensure_user(store, "alice")
+    _ensure_user(store, RESERVED_USER_MEMBERS)
+    conv = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_MEMBERS, conv, level=1)
+
+    assert store.check_access("alice", conv, required_level=1) is True
+    assert store.check_access("alice", conv, required_level=2) is False
+
+
+def test_check_access_members_grant_not_for_anonymous(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A __members__ grant never resolves for an anonymous (None) caller."""
+    from omnigent.server.auth import RESERVED_USER_MEMBERS
+
+    _ensure_user(store, RESERVED_USER_MEMBERS)
+    conv = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_MEMBERS, conv, level=1)
+
+    assert store.check_access(None, conv, required_level=1) is False
+
+
+def test_resolve_access_populates_members_grant_level(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """resolve_access surfaces the __members__ grant level separately."""
+    from omnigent.server.auth import RESERVED_USER_MEMBERS
+
+    _ensure_user(store, "alice")
+    _ensure_user(store, RESERVED_USER_MEMBERS)
+    conv = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_MEMBERS, conv, level=1)
+
+    access = store.resolve_access("alice", conv)
+    assert access.user_grant_level is None
+    assert access.public_grant_level is None
+    assert access.members_grant_level == 1
+
+
+def test_get_permission_level_members_fallback(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """get_permission_level falls back to the __members__ grant."""
+    from omnigent.server.auth import RESERVED_USER_MEMBERS
+
+    _ensure_user(store, "alice")
+    _ensure_user(store, RESERVED_USER_MEMBERS)
+    conv = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_MEMBERS, conv, level=1)
+
+    assert store.get_permission_level("alice", conv) == 1

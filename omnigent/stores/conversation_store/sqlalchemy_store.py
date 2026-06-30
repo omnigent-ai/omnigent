@@ -1193,9 +1193,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         (4) grant outranks any read (1) / edit (2) / manage (3)
         grant, so ``ORDER BY level DESC LIMIT 1`` yields the owner
         without hardcoding the owner-level integer. The
-        ``"__public__"`` public-access sentinel is excluded, so a
-        session that only carries a public grant (and no real
-        owner) returns ``None`` rather than the sentinel.
+        ``"__public__"`` and ``"__members__"`` access sentinels are
+        excluded, so a session that only carries a public/members
+        grant (and no real owner) returns ``None`` rather than a
+        sentinel.
 
         :param conversation_id: The session to look up, e.g.
             ``"conv_abc123"``.
@@ -1204,13 +1205,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             permission grants.
         """
         from omnigent.db.db_models import SqlSessionPermission
-        from omnigent.server.auth import RESERVED_USER_PUBLIC
+        from omnigent.server.auth import RESERVED_USER_MEMBERS, RESERVED_USER_PUBLIC
 
         with self._session() as session:
             return session.execute(
                 select(SqlSessionPermission.user_id)
                 .where(SqlSessionPermission.conversation_id == conversation_id)
-                .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+                .where(
+                    SqlSessionPermission.user_id.notin_(
+                        (RESERVED_USER_PUBLIC, RESERVED_USER_MEMBERS)
+                    )
+                )
                 .order_by(SqlSessionPermission.level.desc())
                 .limit(1)
             ).scalar_one_or_none()
@@ -1551,9 +1556,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if accessible_by is not None:
                 from omnigent.db.db_models import SqlSessionPermission
+                from omnigent.server.auth import RESERVED_USER_MEMBERS
 
+                # A ``__members__`` grant makes the session visible to every
+                # authenticated user, so an authenticated caller's accessible
+                # set is their own grants ∪ the members-shared sessions.
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.user_id == accessible_by
+                    SqlSessionPermission.user_id.in_((accessible_by, RESERVED_USER_MEMBERS))
                 )
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
             return [row[0] for row in session.execute(stmt).all()]
@@ -1681,9 +1690,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if accessible_by is not None:
                 from omnigent.db.db_models import SqlSessionPermission
+                from omnigent.server.auth import RESERVED_USER_MEMBERS
 
+                # ``__members__`` grants are visible to every authenticated
+                # user, so fold them into the caller's accessible set.
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.user_id == accessible_by
+                    SqlSessionPermission.user_id.in_((accessible_by, RESERVED_USER_MEMBERS))
                 )
                 stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
             if search_query:

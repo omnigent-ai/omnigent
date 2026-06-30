@@ -9,7 +9,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from omnigent.db.db_models import SqlSessionPermission, SqlUser
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import ResolvedAccess, SessionPermission
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_MEMBERS, RESERVED_USER_PUBLIC
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -253,6 +253,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if public_grant is not None and public_grant.level >= required_level:
             return True
 
+        # ``user_id is None`` already returned above, so reaching here means an
+        # authenticated user — a ``__members__`` grant resolves for them.
+        members_grant = self.get(RESERVED_USER_MEMBERS, conversation_id)
+        if members_grant is not None and members_grant.level >= required_level:
+            return True
+
         return False
 
     def get_permission_level(
@@ -271,6 +277,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
         if public_grant is not None:
             return public_grant.level
+        members_grant = self.get(RESERVED_USER_MEMBERS, conversation_id)
+        if members_grant is not None:
+            return members_grant.level
         return None
 
     def resolve_access(
@@ -297,10 +306,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
             public_grant = session.get(
                 SqlSessionPermission, (RESERVED_USER_PUBLIC, conversation_id)
             )
+            members_grant = session.get(
+                SqlSessionPermission, (RESERVED_USER_MEMBERS, conversation_id)
+            )
             return ResolvedAccess(
                 is_admin=user_row is not None and user_row.is_admin,
                 user_grant_level=user_grant.level if user_grant is not None else None,
                 public_grant_level=public_grant.level if public_grant is not None else None,
+                members_grant_level=members_grant.level if members_grant is not None else None,
             )
 
     def has_any_grants(self, conversation_id: str) -> bool:

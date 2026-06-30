@@ -2217,6 +2217,84 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "ProjectMember": {
+        "description": "One grantee on a project, aggregated across the project's sessions.",
+        "properties": {
+          "level": {
+            "description": "The highest grant level the grantee holds on any session in the project (1=read, 2=edit, 3=manage, 4=owner).",
+            "title": "Level",
+            "type": "integer"
+          },
+          "session_count": {
+            "description": "How many sessions in the project carry a grant for this user.",
+            "title": "Session Count",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "The grantee \u2014 a real user id, or the `\"__members__\"` / `\"__public__\"` sentinel.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "level",
+          "session_count"
+        ],
+        "title": "ProjectMember",
+        "type": "object"
+      },
+      "ProjectShareStatus": {
+        "description": "Result of a project-wide share/unshare, and the share state of a project.\n\nProjects are implicit collections of sessions carrying the same\n`omni_project` label, so \"sharing a project\" fans a single grant out\nacross every session in the project that the caller can manage. This\nobject reports how that fan-out resolved (or, for the read endpoint, the\ncurrent aggregate state).\n\nTwo independent share scopes are tracked, matching the two UI toggles:\n`members` (every signed-in user, via the `__members__` sentinel) and\n`public` (anyone with the link, via `__public__`).",
+        "properties": {
+          "manageable_count": {
+            "description": "Sessions in the project the caller can manage (and therefore the count a share/unshare acted on).",
+            "title": "Manageable Count",
+            "type": "integer"
+          },
+          "members": {
+            "description": "`True` when every manageable session carries a `__members__` read grant \u2014 shared with all signed-in members.",
+            "title": "Members",
+            "type": "boolean"
+          },
+          "project": {
+            "description": "The project name, e.g. `\"Q3 launch\"`.",
+            "title": "Project",
+            "type": "string"
+          },
+          "public": {
+            "description": "`True` when every manageable session carries a `__public__` read grant \u2014 anyone with a chat's link can view it.",
+            "title": "Public",
+            "type": "boolean"
+          },
+          "shared_count": {
+            "description": "Sessions whose grant was created/updated by the action that produced this status (`0` for the read endpoint).",
+            "title": "Shared Count",
+            "type": "integer"
+          },
+          "total_count": {
+            "description": "Total non-archived sessions in the project visible to the caller, including ones they cannot manage.",
+            "title": "Total Count",
+            "type": "integer"
+          },
+          "viewer_is_member": {
+            "description": "`True` when the caller holds a removable (non-owner) direct grant on at least one session \u2014 i.e. they can \"leave\" the project.",
+            "title": "Viewer Is Member",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project",
+          "members",
+          "public",
+          "manageable_count",
+          "shared_count",
+          "total_count",
+          "viewer_is_member"
+        ],
+        "title": "ProjectShareStatus",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -7106,6 +7184,248 @@
           }
         },
         "summary": "List Session Projects",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/projects/{project_name}/members": {
+      "get": {
+        "description": "List everyone with a grant on a project, aggregated across sessions.\n\nConsiders only the sessions the caller can manage (mirrors the\nper-session `GET \u2026/permissions` manage requirement). Each grantee \u2014\nreal users plus the `__members__` / `__public__` sentinels \u2014 is\ncollapsed to their highest level and the count of sessions they hold a\ngrant on, so the share modal can render one row per member.\n\n**Returns:** One `ProjectMember` per distinct grantee, ordered by descending level then user id.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the project has no visible sessions.",
+        "operationId": "list_project_members_v1_sessions_projects__project_name__members_get",
+        "parameters": [
+          {
+            "description": "The project label value, e.g. `\"Q3 launch\"`.",
+            "in": "path",
+            "name": "project_name",
+            "required": true,
+            "schema": {
+              "title": "Project Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectMember"
+                  },
+                  "title": "Response 200 List Project Members V1 Sessions Projects  Project Name  Members Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Project Members",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/projects/{project_name}/membership": {
+      "delete": {
+        "description": "Leave a project: drop the caller's own grants across its sessions.\n\nLets a member who a project was shared *with* remove themselves\nwithout needing the owner. Only the caller's own non-owner grants are\nrevoked \u2014 an owner cannot accidentally orphan their own project this\nway (their owner grants are left intact). Idempotent.\n\n**Returns:** A `ProjectShareStatus` reflecting the post-leave state (typically empty once the caller no longer sees the project).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the project has no visible sessions.",
+        "operationId": "leave_project_v1_sessions_projects__project_name__membership_delete",
+        "parameters": [
+          {
+            "description": "The project label value, e.g. `\"Q3 launch\"`.",
+            "in": "path",
+            "name": "project_name",
+            "required": true,
+            "schema": {
+              "title": "Project Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectShareStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Leave Project",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/projects/{project_name}/share": {
+      "get": {
+        "description": "Report a project's aggregate share state for the caller.\n\nWalks the project's sessions and reports whether the manageable ones\nare shared with all members and/or publicly, plus whether the caller\nis a removable member (can leave).\n\n**Returns:** A `ProjectShareStatus` snapshot.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the project has no visible sessions.",
+        "operationId": "get_project_share_v1_sessions_projects__project_name__share_get",
+        "parameters": [
+          {
+            "description": "The project label value, e.g. `\"Q3 launch\"`.",
+            "in": "path",
+            "name": "project_name",
+            "required": true,
+            "schema": {
+              "title": "Project Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectShareStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Share",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "put": {
+        "description": "Grant a permission across every session in a project.\n\nApplies `body` (`user_id` + `level`) to each session in the\nproject the caller can manage, upserting the grant \u2014 the same shape as\nthe per-session `PUT /sessions/{id}/permissions` endpoint, fanned\nout. The web modal passes `\"__members__\"` (share with all signed-in\nmembers) or `\"__public__\"` (anyone with the link), each at\n`level=1`; a real `user_id` invites one person to the whole\nproject.\n\nSessions the caller can only read (e.g. ones shared *with* them) are\nskipped rather than failing the whole call, so sharing a\nmixed-ownership project still shares the parts you own.\n\n**Parameters**\n\n- `body` \u2014 The grant to fan out (`user_id` and `level`).\n\n**Returns:** A `ProjectShareStatus` summarising the fan-out.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the project has no visible sessions, 400 if a members/public grant requests more than read, 403 when the caller targets their own grant.",
+        "operationId": "share_project_v1_sessions_projects__project_name__share_put",
+        "parameters": [
+          {
+            "description": "The project label value, e.g. `\"Q3 launch\"`.",
+            "in": "path",
+            "name": "project_name",
+            "required": true,
+            "schema": {
+              "title": "Project Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantPermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectShareStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Share Project",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/projects/{project_name}/share/{target_user_id}": {
+      "delete": {
+        "description": "Revoke a grant from every session in a project.\n\nThe inverse of `share_project`: removes `target_user_id`'s\ngrant from each session in the project the caller can manage. Owner\ngrants are left intact and the caller cannot revoke their own grant\n(to *leave* a project use `DELETE \u2026/membership`). Idempotent \u2014\nsessions without the grant are simply untouched.\n\n**Returns:** A `ProjectShareStatus` reflecting the post-revoke state.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the project has no visible sessions, 403 when the caller targets their own grant.",
+        "operationId": "unshare_project_v1_sessions_projects__project_name__share__target_user_id__delete",
+        "parameters": [
+          {
+            "description": "The project label value, e.g. `\"Q3 launch\"`.",
+            "in": "path",
+            "name": "project_name",
+            "required": true,
+            "schema": {
+              "title": "Project Name",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Grantee to revoke (`\"__members__\"` / `\"__public__\"` to turn a scope off, or a real user id).",
+            "in": "path",
+            "name": "target_user_id",
+            "required": true,
+            "schema": {
+              "title": "Target User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectShareStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unshare Project",
         "tags": [
           "sessions"
         ]

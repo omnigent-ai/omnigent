@@ -2177,6 +2177,62 @@ class PermissionObject(BaseModel):
     level: int
 
 
+class ProjectShareStatus(BaseModel):
+    """
+    Result of a project-wide share/unshare, and the share state of a project.
+
+    Projects are implicit collections of sessions carrying the same
+    ``omni_project`` label, so "sharing a project" fans a single grant out
+    across every session in the project that the caller can manage. This
+    object reports how that fan-out resolved (or, for the read endpoint, the
+    current aggregate state).
+
+    Two independent share scopes are tracked, matching the two UI toggles:
+    ``members`` (every signed-in user, via the ``__members__`` sentinel) and
+    ``public`` (anyone with the link, via ``__public__``).
+
+    :param project: The project name, e.g. ``"Q3 launch"``.
+    :param members: ``True`` when every manageable session carries a
+        ``__members__`` read grant — shared with all signed-in members.
+    :param public: ``True`` when every manageable session carries a
+        ``__public__`` read grant — anyone with a chat's link can view it.
+    :param manageable_count: Sessions in the project the caller can manage
+        (and therefore the count a share/unshare acted on).
+    :param shared_count: Sessions whose grant was created/updated by the
+        action that produced this status (``0`` for the read endpoint).
+    :param total_count: Total non-archived sessions in the project visible
+        to the caller, including ones they cannot manage.
+    :param viewer_is_member: ``True`` when the caller holds a removable
+        (non-owner) direct grant on at least one session — i.e. they can
+        "leave" the project.
+    """
+
+    project: str
+    members: bool
+    public: bool
+    manageable_count: int
+    shared_count: int
+    total_count: int
+    viewer_is_member: bool
+
+
+class ProjectMember(BaseModel):
+    """
+    One grantee on a project, aggregated across the project's sessions.
+
+    :param user_id: The grantee — a real user id, or the ``"__members__"`` /
+        ``"__public__"`` sentinel.
+    :param level: The highest grant level the grantee holds on any session in
+        the project (1=read, 2=edit, 3=manage, 4=owner).
+    :param session_count: How many sessions in the project carry a grant for
+        this user.
+    """
+
+    user_id: str
+    level: int
+    session_count: int
+
+
 # ─────────────────────────────────────────────────────────────────────
 # STREAM EVENTS — typed Pydantic union for SSE event boundary
 # ─────────────────────────────────────────────────────────────────────

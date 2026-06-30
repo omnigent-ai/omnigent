@@ -2999,3 +2999,211 @@ async def test_stream_presence_spans_subagent_conversations(
         await asyncio.gather(alice_task, return_exceptions=True)
         await root_collector.stop()
         await child_collector.stop()
+
+
+# ── Project share endpoints ──────────────────────────────────
+#
+# A project is the set of sessions carrying the same ``omni_project``
+# label; the ``/v1/sessions/projects/{name}/…`` endpoints fan a single
+# grant out across that set. These exercise the two share scopes
+# (``__members__`` = all signed-in users, ``__public__`` = anyone with
+# the link), the members list, and the self-service "leave".
+
+
+async def _set_project(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    user: str,
+    project: str,
+) -> None:
+    """File a session under a project via the label PATCH path."""
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omni_project": project}},
+        headers={"X-Forwarded-Email": user},
+    )
+    assert resp.status_code == 200, f"set project failed: {resp.status_code} {resp.text}"
+
+
+async def _make_project(
+    client: httpx.AsyncClient,
+    *,
+    owner: str,
+    project: str,
+    count: int = 2,
+) -> list[str]:
+    """Create *count* sessions owned by *owner*, all filed under *project*."""
+    ids: list[str] = []
+    for i in range(count):
+        sess = await _create_session_as(client, "", owner, title=f"{project} {i}")
+        await _set_project(client, sess["id"], user=owner, project=project)
+        ids.append(sess["id"])
+    return ids
+
+
+async def _share_project(
+    client: httpx.AsyncClient,
+    project: str,
+    *,
+    sharer: str,
+    target_user: str,
+    level: int,
+) -> httpx.Response:
+    return await client.put(
+        f"/v1/sessions/projects/{project}/share",
+        json={"user_id": target_user, "level": level},
+        headers={"X-Forwarded-Email": sharer},
+    )
+
+
+async def _project_status(
+    client: httpx.AsyncClient,
+    project: str,
+    *,
+    user: str,
+) -> dict[str, Any]:
+    resp = await client.get(
+        f"/v1/sessions/projects/{project}/share",
+        headers={"X-Forwarded-Email": user},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_share_project_members_fans_out_to_all_sessions(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Sharing with members grants ``__members__`` on every project session."""
+    ids = await _make_project(auth_client, owner="alice", project="Proj", count=2)
+
+    resp = await _share_project(
+        auth_client, "Proj", sharer="alice", target_user="__members__", level=LEVEL_READ
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["members"] is True
+    assert body["public"] is False
+    assert body["shared_count"] == 2
+    assert body["manageable_count"] == 2
+
+    # Each session now carries the members grant.
+    for sid in ids:
+        perms = (await _list_permissions(auth_client, sid, user="alice")).json()
+        assert any(p["user_id"] == "__members__" and p["level"] == LEVEL_READ for p in perms)
+
+
+async def test_members_share_makes_project_visible_to_any_user(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A never-invited user sees a members-shared project in their list."""
+    await _make_project(auth_client, owner="alice", project="Shared", count=1)
+
+    # Carol can't see it before the share.
+    before = await auth_client.get("/v1/sessions/projects", headers={"X-Forwarded-Email": "carol"})
+    assert "Shared" not in before.json()
+
+    await _share_project(
+        auth_client, "Shared", sharer="alice", target_user="__members__", level=LEVEL_READ
+    )
+
+    after = await auth_client.get("/v1/sessions/projects", headers={"X-Forwarded-Email": "carol"})
+    assert "Shared" in after.json()
+
+
+async def test_share_project_members_rejects_above_read(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The members/public sentinels are capped at read-only."""
+    await _make_project(auth_client, owner="alice", project="Cap", count=1)
+    resp = await _share_project(
+        auth_client, "Cap", sharer="alice", target_user="__members__", level=LEVEL_EDIT
+    )
+    assert resp.status_code == 400
+
+
+async def test_list_project_members_aggregates_grants(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The members endpoint collapses grants across sessions, highest level wins."""
+    await _make_project(auth_client, owner="alice", project="Team", count=2)
+    await _share_project(auth_client, "Team", sharer="alice", target_user="bob", level=LEVEL_READ)
+
+    resp = await auth_client.get(
+        "/v1/sessions/projects/Team/members",
+        headers={"X-Forwarded-Email": "alice"},
+    )
+    assert resp.status_code == 200, resp.text
+    by_user = {m["user_id"]: m for m in resp.json()}
+    assert by_user["alice"]["level"] == LEVEL_OWNER
+    assert by_user["alice"]["session_count"] == 2
+    assert by_user["bob"]["level"] == LEVEL_READ
+    assert by_user["bob"]["session_count"] == 2
+
+
+async def test_leave_project_drops_callers_own_grants(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A member can leave; their grants vanish but owner grants survive."""
+    ids = await _make_project(auth_client, owner="alice", project="Leave", count=2)
+    await _share_project(auth_client, "Leave", sharer="alice", target_user="bob", level=LEVEL_READ)
+
+    # Bob sees himself as a removable member.
+    status = await _project_status(auth_client, "Leave", user="bob")
+    assert status["viewer_is_member"] is True
+
+    leave = await auth_client.delete(
+        "/v1/sessions/projects/Leave/membership",
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert leave.status_code == 200, leave.text
+    assert leave.json()["viewer_is_member"] is False
+
+    # Bob's grants are gone; alice still owns every session.
+    for sid in ids:
+        perms = (await _list_permissions(auth_client, sid, user="alice")).json()
+        assert not any(p["user_id"] == "bob" for p in perms)
+        assert any(p["user_id"] == "alice" and p["level"] == LEVEL_OWNER for p in perms)
+
+
+async def test_leave_project_is_noop_for_owner(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """An owner 'leaving' keeps their owner grants (no self-orphaning)."""
+    ids = await _make_project(auth_client, owner="alice", project="Own", count=1)
+    resp = await auth_client.delete(
+        "/v1/sessions/projects/Own/membership",
+        headers={"X-Forwarded-Email": "alice"},
+    )
+    assert resp.status_code == 200, resp.text
+    perms = (await _list_permissions(auth_client, ids[0], user="alice")).json()
+    assert any(p["user_id"] == "alice" and p["level"] == LEVEL_OWNER for p in perms)
+
+
+async def test_unshare_project_turns_scope_off(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Revoking the members sentinel flips the project back to private."""
+    await _make_project(auth_client, owner="alice", project="Toggle", count=2)
+    await _share_project(
+        auth_client, "Toggle", sharer="alice", target_user="__members__", level=LEVEL_READ
+    )
+    assert (await _project_status(auth_client, "Toggle", user="alice"))["members"] is True
+
+    off = await auth_client.delete(
+        "/v1/sessions/projects/Toggle/share/__members__",
+        headers={"X-Forwarded-Email": "alice"},
+    )
+    assert off.status_code == 200, off.text
+    assert off.json()["members"] is False
+
+
+async def test_get_project_share_unknown_project_404(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Status for a project with no visible sessions is a 404."""
+    resp = await auth_client.get(
+        "/v1/sessions/projects/Nope/share",
+        headers={"X-Forwarded-Email": "alice"},
+    )
+    assert resp.status_code == 404

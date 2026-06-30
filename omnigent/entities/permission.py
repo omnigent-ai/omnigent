@@ -39,8 +39,14 @@ class ResolvedAccess:
     :param public_grant_level: The ``"__public__"`` sentinel grant level
         on the conversation (same ``1``–``4`` scale), or ``None`` if the
         session is not public.
+    :param members_grant_level: The ``"__members__"`` sentinel grant level
+        (same scale), or ``None`` if the session is not shared with all
+        members. Only populated for an authenticated user — it is ``None``
+        for an anonymous resolution, so anonymous viewers never gain access
+        through it.
     """
 
     is_admin: bool
     user_grant_level: int | None
     public_grant_level: int | None
+    members_grant_level: int | None = None

@@ -81,6 +81,8 @@ def resolved_allows(access: ResolvedAccess, required_level: int) -> bool:
         return True
     if access.public_grant_level is not None and access.public_grant_level >= required_level:
         return True
+    if access.members_grant_level is not None and access.members_grant_level >= required_level:
+        return True
     return False
 
 
@@ -102,7 +104,9 @@ def resolved_level(access: ResolvedAccess) -> int | None:
         return LEVEL_OWNER
     if access.user_grant_level is not None:
         return access.user_grant_level
-    return access.public_grant_level
+    if access.public_grant_level is not None:
+        return access.public_grant_level
+    return access.members_grant_level
 
 
 def check_is_manager(

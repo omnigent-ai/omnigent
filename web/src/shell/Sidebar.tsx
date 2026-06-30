@@ -27,6 +27,7 @@ import {
   InboxIcon,
   ListChecksIcon,
   Loader2Icon,
+  LogOutIcon,
   MailIcon,
   Maximize2Icon,
   Minimize2Icon,
@@ -109,8 +110,10 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
+import { ShareProjectModal } from "@/components/ShareProjectModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useLeaveProject, useProjectShareStatus } from "@/hooks/useProjectShare";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
@@ -2821,8 +2824,18 @@ function ProjectFolderActions({
  */
 function ProjectFolderMenu({ projectName }: { projectName: string }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [leaveOpen, setLeaveOpen] = useState(false);
   const deleteProject = useDeleteProject();
+  const leaveProject = useLeaveProject(projectName);
+  // Resolve the caller's relationship to the project only while the menu is
+  // open, so closed folders don't each fire a status request. Until it loads
+  // (undefined) we optimistically show Share — the common owner case — and the
+  // backend enforces manage access regardless.
+  const { data: shareStatus } = useProjectShareStatus(menuOpen ? projectName : null);
+  const canManage = shareStatus === undefined || shareStatus.manageable_count > 0;
+  const canLeave = shareStatus?.viewer_is_member ?? false;
 
   return (
     <>
@@ -2841,6 +2854,18 @@ function ProjectFolderMenu({ projectName }: { projectName: string }) {
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+          {canManage && (
+            <DropdownMenuItem data-testid="share-project" onSelect={() => setShareOpen(true)}>
+              <ShareIcon className="size-3.5" />
+              Share project
+            </DropdownMenuItem>
+          )}
+          {canLeave && (
+            <DropdownMenuItem data-testid="leave-project" onSelect={() => setLeaveOpen(true)}>
+              <LogOutIcon className="size-3.5" />
+              Leave project
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem
             data-testid="delete-project"
             variant="destructive"
@@ -2851,6 +2876,50 @@ function ProjectFolderMenu({ projectName }: { projectName: string }) {
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <ShareProjectModal projectName={projectName} open={shareOpen} onOpenChange={setShareOpen} />
+      <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
+        <DialogContent onClick={(e) => e.stopPropagation()}>
+          <DialogHeader>
+            <DialogTitle>Leave project?</DialogTitle>
+            <DialogDescription>
+              You'll lose access to the chats in{" "}
+              <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
+                {projectName}
+              </span>{" "}
+              that were shared with you. The owner can re-share them later.
+            </DialogDescription>
+          </DialogHeader>
+          {leaveProject.isError && (
+            <p className="text-sm text-destructive" role="alert">
+              Couldn't leave the project. Please try again.
+            </p>
+          )}
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setLeaveOpen(false)}
+              disabled={leaveProject.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={leaveProject.isPending}
+              onClick={() => {
+                leaveProject.mutate(undefined, {
+                  onSuccess: () => {
+                    setLeaveOpen(false);
+                    setMenuOpen(false);
+                  },
+                });
+              }}
+            >
+              {leaveProject.isPending ? "Leaving…" : "Leave project"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>

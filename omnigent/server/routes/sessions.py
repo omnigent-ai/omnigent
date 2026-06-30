@@ -149,6 +149,7 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_MEMBERS,
     RESERVED_USER_PUBLIC,
     AuthProvider,
     local_single_user_enabled,
@@ -213,6 +214,8 @@ from omnigent.server.schemas import (
     PaginatedList,
     PermissionObject,
     PolicySummary,
+    ProjectMember,
+    ProjectShareStatus,
     ReadStatePutRequest,
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
@@ -1001,6 +1004,42 @@ def _announce_session_added(user_id: str | None, session_id: str) -> None:
     user_session_stream.publish(
         _discovery_key(user_id), {"type": "session_added", "session_id": session_id}
     )
+
+
+def _list_project_sessions(
+    conversation_store: ConversationStore,
+    project_name: str,
+    user_id: str | None,
+) -> list[Conversation]:
+    """
+    Return every non-archived session in *project_name* the caller can see.
+
+    Projects are implicit: a session belongs to a project while it carries a
+    ``conversation_labels`` row with ``key="omni_project"`` and the project's
+    name as the value. This pages through the full set (the project-share
+    fan-out must act on all of them, not just the first page) and filters to
+    sessions ``user_id`` has at least read access to.
+
+    :param conversation_store: Store to query.
+    :param project_name: The project label value, e.g. ``"Q3 launch"``.
+    :param user_id: The authenticated caller, or ``None`` in single-user mode.
+    :returns: All matching conversations, oldest page first.
+    """
+    sessions: list[Conversation] = []
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            limit=100,
+            after=after,
+            project=project_name,
+            accessible_by=user_id,
+            include_archived=False,
+        )
+        sessions.extend(page.data)
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    return sessions
 
 
 # Per-session todo cache updated by external_session_todos events from the
@@ -14065,6 +14104,288 @@ def create_sessions_router(
             conversation_store.list_projects,
             accessible_by=user_id,
         )
+
+    # ── Project share endpoints ───────────────────────────────────
+    #
+    # MUST be registered before ``/sessions/{session_id}`` for the same
+    # reason as ``GET /sessions/projects`` above: the literal ``projects``
+    # segment would otherwise be captured by the ``{session_id}`` path
+    # param. Projects have no rows of their own — a project share fans a
+    # single grant out across every session carrying the project's
+    # ``omni_project`` label that the caller can manage, reusing the
+    # per-session permission machinery (and the existing public ``/c/{id}``
+    # viewer) wholesale.
+
+    def _require_permissions_enabled() -> PermissionStore:
+        if permission_store is None:
+            raise OmnigentError(
+                "Permissions not enabled",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        return permission_store
+
+    async def _project_sessions_or_404(
+        project_name: str, user_id: str | None
+    ) -> list[Conversation]:
+        sessions = await asyncio.to_thread(
+            _list_project_sessions, conversation_store, project_name, user_id
+        )
+        if not sessions:
+            raise OmnigentError(
+                "Project not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        return sessions
+
+    async def _project_share_status(
+        store: PermissionStore,
+        project_name: str,
+        user_id: str | None,
+        sessions: list[Conversation],
+        shared_count: int,
+    ) -> ProjectShareStatus:
+        """Aggregate the share state of *sessions* for *user_id*.
+
+        ``members``/``public`` report whether *every* session the caller can
+        manage carries the matching sentinel grant, so a toggle reads as "the
+        whole project is shared". ``viewer_is_member`` reports whether the
+        caller holds a removable (non-owner) direct grant — the signal the UI
+        uses to offer "Leave project".
+        """
+        manageable = 0
+        members_shared = 0
+        public_shared = 0
+        viewer_is_member = False
+        for conv in sessions:
+            if user_id is not None:
+                own = await asyncio.to_thread(store.get, user_id, conv.id)
+                if own is not None and own.level < LEVEL_OWNER:
+                    viewer_is_member = True
+            level = await _get_permission_level(user_id, conv.id, permission_store)
+            if level is None or level < LEVEL_MANAGE:
+                continue
+            manageable += 1
+            members = await asyncio.to_thread(store.get, RESERVED_USER_MEMBERS, conv.id)
+            if members is not None and members.level >= LEVEL_READ:
+                members_shared += 1
+            public = await asyncio.to_thread(store.get, RESERVED_USER_PUBLIC, conv.id)
+            if public is not None and public.level >= LEVEL_READ:
+                public_shared += 1
+        return ProjectShareStatus(
+            project=project_name,
+            members=(manageable > 0 and members_shared == manageable),
+            public=(manageable > 0 and public_shared == manageable),
+            manageable_count=manageable,
+            shared_count=shared_count,
+            total_count=len(sessions),
+            viewer_is_member=viewer_is_member,
+        )
+
+    @router.put(
+        "/sessions/projects/{project_name}/share",
+        response_model=None,
+        responses={200: {"model": ProjectShareStatus}},
+    )
+    async def share_project(
+        request: Request,
+        project_name: str,
+        body: GrantPermissionRequest,
+    ) -> ProjectShareStatus:
+        """Grant a permission across every session in a project.
+
+        Applies ``body`` (``user_id`` + ``level``) to each session in the
+        project the caller can manage, upserting the grant — the same shape as
+        the per-session ``PUT /sessions/{id}/permissions`` endpoint, fanned
+        out. The web modal passes ``"__members__"`` (share with all signed-in
+        members) or ``"__public__"`` (anyone with the link), each at
+        ``level=1``; a real ``user_id`` invites one person to the whole
+        project.
+
+        Sessions the caller can only read (e.g. ones shared *with* them) are
+        skipped rather than failing the whole call, so sharing a
+        mixed-ownership project still shares the parts you own.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param project_name: The project label value, e.g. ``"Q3 launch"``.
+        :param body: The grant to fan out (``user_id`` and ``level``).
+        :returns: A :class:`ProjectShareStatus` summarising the fan-out.
+        :raises OmnigentError: 404 if the project has no visible sessions,
+            400 if a members/public grant requests more than read, 403 when
+            the caller targets their own grant.
+        """
+        user_id = _require_user(request, auth_provider)
+        store = _require_permissions_enabled()
+        if body.user_id == user_id:
+            raise OmnigentError(
+                "Cannot modify your own permissions",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if (
+            body.user_id in (RESERVED_USER_PUBLIC, RESERVED_USER_MEMBERS)
+            and body.level > LEVEL_READ
+        ):
+            raise OmnigentError(
+                "Shared-with-everyone access is limited to read-only (level 1)",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sessions = await _project_sessions_or_404(project_name, user_id)
+        shared = 0
+        for conv in sessions:
+            level = await _get_permission_level(user_id, conv.id, permission_store)
+            if level is None or level < LEVEL_MANAGE:
+                continue
+            existing = await asyncio.to_thread(store.get, body.user_id, conv.id)
+            if existing is not None and existing.level == LEVEL_OWNER:
+                continue
+            await asyncio.to_thread(store.ensure_user, body.user_id)
+            await asyncio.to_thread(store.grant, body.user_id, conv.id, body.level)
+            _announce_session_added(body.user_id, conv.id)
+            shared += 1
+        return await _project_share_status(store, project_name, user_id, sessions, shared)
+
+    @router.delete(
+        "/sessions/projects/{project_name}/share/{target_user_id}",
+        response_model=None,
+        responses={200: {"model": ProjectShareStatus}},
+    )
+    async def unshare_project(
+        request: Request,
+        project_name: str,
+        target_user_id: str,
+    ) -> ProjectShareStatus:
+        """Revoke a grant from every session in a project.
+
+        The inverse of :func:`share_project`: removes ``target_user_id``'s
+        grant from each session in the project the caller can manage. Owner
+        grants are left intact and the caller cannot revoke their own grant
+        (to *leave* a project use ``DELETE …/membership``). Idempotent —
+        sessions without the grant are simply untouched.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param project_name: The project label value, e.g. ``"Q3 launch"``.
+        :param target_user_id: Grantee to revoke (``"__members__"`` /
+            ``"__public__"`` to turn a scope off, or a real user id).
+        :returns: A :class:`ProjectShareStatus` reflecting the post-revoke
+            state.
+        :raises OmnigentError: 404 if the project has no visible sessions,
+            403 when the caller targets their own grant.
+        """
+        user_id = _require_user(request, auth_provider)
+        store = _require_permissions_enabled()
+        if target_user_id == user_id:
+            raise OmnigentError(
+                "Cannot modify your own permissions",
+                code=ErrorCode.FORBIDDEN,
+            )
+        sessions = await _project_sessions_or_404(project_name, user_id)
+        for conv in sessions:
+            level = await _get_permission_level(user_id, conv.id, permission_store)
+            if level is None or level < LEVEL_MANAGE:
+                continue
+            existing = await asyncio.to_thread(store.get, target_user_id, conv.id)
+            if existing is not None and existing.level == LEVEL_OWNER:
+                continue
+            await asyncio.to_thread(store.revoke, target_user_id, conv.id)
+        return await _project_share_status(store, project_name, user_id, sessions, 0)
+
+    @router.get(
+        "/sessions/projects/{project_name}/share",
+        response_model=None,
+        responses={200: {"model": ProjectShareStatus}},
+    )
+    async def get_project_share(
+        request: Request,
+        project_name: str,
+    ) -> ProjectShareStatus:
+        """Report a project's aggregate share state for the caller.
+
+        Walks the project's sessions and reports whether the manageable ones
+        are shared with all members and/or publicly, plus whether the caller
+        is a removable member (can leave).
+
+        :param request: The incoming FastAPI request (for auth).
+        :param project_name: The project label value, e.g. ``"Q3 launch"``.
+        :returns: A :class:`ProjectShareStatus` snapshot.
+        :raises OmnigentError: 404 if the project has no visible sessions.
+        """
+        user_id = _require_user(request, auth_provider)
+        store = _require_permissions_enabled()
+        sessions = await _project_sessions_or_404(project_name, user_id)
+        return await _project_share_status(store, project_name, user_id, sessions, 0)
+
+    @router.get(
+        "/sessions/projects/{project_name}/members",
+        response_model=None,
+        responses={200: {"model": list[ProjectMember]}},
+    )
+    async def list_project_members(
+        request: Request,
+        project_name: str,
+    ) -> list[ProjectMember]:
+        """List everyone with a grant on a project, aggregated across sessions.
+
+        Considers only the sessions the caller can manage (mirrors the
+        per-session ``GET …/permissions`` manage requirement). Each grantee —
+        real users plus the ``__members__`` / ``__public__`` sentinels — is
+        collapsed to their highest level and the count of sessions they hold a
+        grant on, so the share modal can render one row per member.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param project_name: The project label value, e.g. ``"Q3 launch"``.
+        :returns: One :class:`ProjectMember` per distinct grantee, ordered by
+            descending level then user id.
+        :raises OmnigentError: 404 if the project has no visible sessions.
+        """
+        user_id = _require_user(request, auth_provider)
+        store = _require_permissions_enabled()
+        sessions = await _project_sessions_or_404(project_name, user_id)
+        levels: dict[str, int] = {}
+        counts: dict[str, int] = {}
+        for conv in sessions:
+            level = await _get_permission_level(user_id, conv.id, permission_store)
+            if level is None or level < LEVEL_MANAGE:
+                continue
+            grants = await asyncio.to_thread(store.list_for_session, conv.id)
+            for g in grants:
+                levels[g.user_id] = max(levels.get(g.user_id, 0), g.level)
+                counts[g.user_id] = counts.get(g.user_id, 0) + 1
+        members = [
+            ProjectMember(user_id=uid, level=lvl, session_count=counts[uid])
+            for uid, lvl in levels.items()
+        ]
+        members.sort(key=lambda m: (-m.level, m.user_id))
+        return members
+
+    @router.delete(
+        "/sessions/projects/{project_name}/membership",
+        response_model=None,
+        responses={200: {"model": ProjectShareStatus}},
+    )
+    async def leave_project(
+        request: Request,
+        project_name: str,
+    ) -> ProjectShareStatus:
+        """Leave a project: drop the caller's own grants across its sessions.
+
+        Lets a member who a project was shared *with* remove themselves
+        without needing the owner. Only the caller's own non-owner grants are
+        revoked — an owner cannot accidentally orphan their own project this
+        way (their owner grants are left intact). Idempotent.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param project_name: The project label value, e.g. ``"Q3 launch"``.
+        :returns: A :class:`ProjectShareStatus` reflecting the post-leave
+            state (typically empty once the caller no longer sees the project).
+        :raises OmnigentError: 404 if the project has no visible sessions.
+        """
+        user_id = _require_user(request, auth_provider)
+        store = _require_permissions_enabled()
+        sessions = await _project_sessions_or_404(project_name, user_id)
+        for conv in sessions:
+            own = await asyncio.to_thread(store.get, user_id, conv.id)
+            if own is not None and own.level < LEVEL_OWNER:
+                await asyncio.to_thread(store.revoke, user_id, conv.id)
+        return await _project_share_status(store, project_name, user_id, sessions, 0)
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #
