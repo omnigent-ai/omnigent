@@ -7,7 +7,11 @@
 /* Streamdown ships utility classes pre-compiled in its dist; this @source
  * pragma tells Tailwind v4 to scan those files so the classes survive the
  * production build. Required by ai-elements/MessageResponse, which uses
- * Streamdown to render markdown (code blocks, math, GFM, mermaid). */
+ * Streamdown to render markdown (code blocks, math, GFM, mermaid).
+ *
+ * Runtime styles for Streamdown and KaTeX are imported in each app entrypoint.
+ * Keep those imports there so package-required CSS is loaded independently of
+ * app theme customization in this file. */
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
@@ -760,6 +764,20 @@
  * leave the default arrow cursor on links — force pointer to signal affordance. */
 [data-streamdown="link"] {
   cursor: pointer;
+}
+
+/* KaTeX lays out radicals/fractions with positioned spans. Display math can be
+ * both wider and taller than normal prose, so give it its own scroll surface
+ * instead of relying on the surrounding chat bubble to clip or wrap it. */
+.katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: visible;
+  padding-block: 0.25rem;
+}
+
+.katex {
+  max-width: 100%;
 }
 
 /* Flatten Streamdown's loud heading ramp (text-3xl..xl) to em sizes proportional to body. */

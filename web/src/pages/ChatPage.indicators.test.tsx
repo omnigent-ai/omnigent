@@ -200,6 +200,14 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 
+  it("uses full-width layout for assistant display math", () => {
+    render(<BubbleView bubble={assistantText(String.raw`$$d = \sqrt{x^2 + y^2}$$`)} />);
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-full");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+  });
+
   it("marks a cancelled assistant turn as Interrupted", () => {
     // WHY: the cancelled lifecycle branch surfaces an explicit Interrupted
     // note so a truncated turn doesn't read as a complete answer.

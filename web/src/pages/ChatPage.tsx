@@ -255,6 +255,7 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
+const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
 
 function isMarkdownTableRow(line: string): boolean {
   return line.trim().includes("|");
@@ -273,6 +274,10 @@ export function containsMarkdownTable(items: RenderItem[]): boolean {
         isMarkdownTableRow(lines[index + 1] ?? ""),
     );
   });
+}
+
+export function containsDisplayMath(items: RenderItem[]): boolean {
+  return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
 }
 
 /**
@@ -2925,7 +2930,8 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
-  const isWide = hasElicitation || containsMarkdownTable(bubble.items);
+  const isWide =
+    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
 
   const handleCopy = async () => {
     if (!markdownText || !navigator?.clipboard?.writeText) return;

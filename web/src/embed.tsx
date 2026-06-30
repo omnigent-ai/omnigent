@@ -42,6 +42,8 @@ import {
   reactRouterRouting,
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 
