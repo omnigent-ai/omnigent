@@ -179,6 +179,14 @@ class ToolManager:
         # Comment tools are always auto-registered so agents can
         # list and update review comments without the spec opting in.
         self._register_comment_tools()
+        # Work-item (#3), schedule/loop (#6), and canvas (#2) builtins are
+        # likewise always auto-registered, so an agent — and the Omnigent MCP
+        # surface — can create/track work items, manage loops & monitors, and
+        # set the conversation canvas without the spec opting in (#12).
+        # Registered directly (like the comment tools) rather than declared in
+        # ``tools.builtins``, which sidesteps the function-tool callable-
+        # recovery translation path.
+        self._register_work_management_tools()
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
@@ -521,6 +529,27 @@ class ToolManager:
         """
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
+
+    def _register_work_management_tools(self) -> None:
+        """
+        Auto-register the work-item builtins (#3, #12).
+
+        These are framework-owned and always available so an agent — and the
+        Omnigent MCP surface — can create and track work items without the spec
+        opting in. They're instantiated straight from the builtin registry
+        (like the comment tools) rather than declared in ``tools.builtins``,
+        which avoids the declared-builtin function-tool callable-recovery path.
+        Each tool returns a clear error at invoke time when its backing store
+        isn't configured, so registering them unconditionally is safe.
+        """
+        for name in (
+            "create_work_item",
+            "list_work_items",
+            "update_work_item",
+        ):
+            tool = get_builtin_tool(name)
+            if tool is not None:
+                self._tools[name] = tool
 
     def _register_os_env_tools(self) -> None:
         """
