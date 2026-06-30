@@ -1250,7 +1250,7 @@ async def _capture_connect_kwargs(
 
     captured: dict[str, Any] = {}
     monkeypatch.setattr(websockets, "connect", _StubConnect(captured))
-    monkeypatch.setattr("omnigent.cli_auth.databricks_auth_headers", lambda *_a, **_k: {})
+    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *_a, **_k: {})
     await _serve_tunnel_once(
         None,  # type: ignore[arg-type]  # app unused: the stub ws closes immediately
         tunnel_url=tunnel_url,
