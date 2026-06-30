@@ -5969,21 +5969,29 @@ async def _delete_native_bridge_dirs(
     """
     Remove any native-harness bridge dirs left behind by a session.
 
-    Each native harness (claude/codex/cursor/pi/opencode) keeps a
-    per-conversation bridge dir under ``/tmp/omnigent-<uid>/<harness>-native/
-    <digest>`` (codex/pi/opencode use ``~/.omnigent``) holding a bridge token /
-    auth secret + MCP config — secret material. Closing the pane does not remove
-    it, so without this they accumulate even on a clean session delete (issue
-    #1350). We don't know which harness this session used, so delete every
-    candidate dir; ``ignore_errors`` makes the wrong-harness / already-gone cases
-    a no-op. Claude/codex/opencode bridge ids can be rotated via a session label,
-    so resolve those too (falling back to *session_id*, the un-rotated key);
-    cursor/pi key purely on *session_id*.
+    Each native harness keeps a per-conversation bridge dir under
+    ``/tmp/omnigent-<uid>/<harness>-native/<digest>`` (some use ``~/.omnigent``)
+    holding a bridge token / auth secret + MCP config — secret material. Closing
+    the pane does not remove it, so without this they accumulate even on a clean
+    session delete (issue #1350). We don't know which harness this session used,
+    so delete every candidate dir for all 11 native families
+    (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
+    the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
+    cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
+    Antigravity/claude/codex/opencode bridge ids can be rotated via a session
+    label, so resolve those too (falling back to *session_id*, the un-rotated key);
+    the remaining families key purely on *session_id*.
 
     :param server_client: Omnigent server client used to resolve rotated bridge
         id labels. ``None`` skips label resolution (session_id keys only).
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     """
+    from omnigent.antigravity_native_bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.antigravity_native_bridge import (
+        bridge_dir_for_bridge_id as antigravity_bridge_dir,
+    )
     from omnigent.claude_native_bridge import (
         BRIDGE_ID_LABEL_KEY,
     )
@@ -5999,6 +6007,18 @@ async def _delete_native_bridge_dirs(
     from omnigent.cursor_native_bridge import (
         bridge_dir_for_session_id as cursor_bridge_dir,
     )
+    from omnigent.goose_native_bridge import (
+        bridge_dir_for_session_id as goose_bridge_dir,
+    )
+    from omnigent.hermes_native_bridge import (
+        bridge_dir_for_session_id as hermes_bridge_dir,
+    )
+    from omnigent.kimi_native_bridge import (
+        bridge_dir_for_session_id as kimi_bridge_dir,
+    )
+    from omnigent.kiro_native_bridge import (
+        bridge_dir_for_session_id as kiro_bridge_dir,
+    )
     from omnigent.opencode_native_bridge import (
         OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
     )
@@ -6007,6 +6027,9 @@ async def _delete_native_bridge_dirs(
     )
     from omnigent.pi_native_bridge import (
         bridge_dir_for_session_id as pi_bridge_dir,
+    )
+    from omnigent.qwen_native_bridge import (
+        bridge_dir_for_session_id as qwen_bridge_dir,
     )
 
     labels: dict[str, str] = {}
@@ -6017,17 +6040,36 @@ async def _delete_native_bridge_dirs(
         )
 
     targets = {
+        antigravity_bridge_dir(
+            labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
+        ),
+        antigravity_bridge_dir(session_id),
         claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
         claude_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
         cursor_bridge_dir(session_id),
+        goose_bridge_dir(session_id),
+        hermes_bridge_dir(session_id),
+        kimi_bridge_dir(session_id),
+        kiro_bridge_dir(session_id),
         opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         opencode_bridge_dir(session_id),
         pi_bridge_dir(session_id),
+        qwen_bridge_dir(session_id),
     }
     for target in targets:
-        shutil.rmtree(target, ignore_errors=True)
+        try:
+            shutil.rmtree(target, ignore_errors=False)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _logger.debug(
+                "Failed to remove native bridge dir %s for session %s: %s",
+                target,
+                session_id,
+                exc,
+            )
 
 
 async def _claude_native_bridge_id_for_session(
