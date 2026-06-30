@@ -48,6 +48,7 @@ class MainActivity : ComponentActivity() {
     private var lastInsets: Insets? = null
     private var pageLoaded = false
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
+    private var historyCleared = false // drop pre-auth/login-redirect history once
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -154,8 +155,36 @@ class MainActivity : ComponentActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    // TODO: close an open in-page drawer first once the SPA exposes that state.
-                    if (webView.canGoBack()) webView.goBack() else finish()
+                    // Ask the page to dismiss an open overlay first (drawer/dialog);
+                    // only navigate WebView history / leave the app if there was
+                    // nothing to dismiss. evaluateJavascript's result is JSON, so a
+                    // true return arrives as the string "true".
+                    //
+                    // This callback always consumes Back, but the JS round-trip is
+                    // async and its callback is silently dropped if the renderer is
+                    // gone (OOM-killed / hung) — which would strand the user with a
+                    // dead Back. So race a timeout fallback: whichever of the JS
+                    // result or the timer fires first navigates, the other no-ops.
+                    // Both run on the main thread, so the plain flag needs no lock.
+                    var acted = false
+                    // If the host is already going away when a late callback/timer
+                    // fires, don't touch the (possibly destroyed) WebView.
+                    val navigate = {
+                        if (!isDestroyed && !isFinishing && ::webView.isInitialized) {
+                            if (webView.canGoBack()) webView.goBack() else finish()
+                        }
+                    }
+                    val fallback = Runnable { if (!acted) { acted = true; navigate() } }
+                    webView.postDelayed(fallback, BACK_FALLBACK_MS)
+                    webView.evaluateJavascript(
+                        "!!(window.__omnigentNativeHandleBack && window.__omnigentNativeHandleBack())",
+                    ) { handled ->
+                        if (!acted) {
+                            acted = true
+                            webView.removeCallbacks(fallback)
+                            if (handled != "true") navigate()
+                        }
+                    }
                 }
             },
         )
@@ -206,6 +235,12 @@ class MainActivity : ComponentActivity() {
             return
         }
         loginAttempts++
+        // A re-login (session expired mid-use) bounces through the IdP again,
+        // leaving a stopped off-origin entry + stale pre-expiry pages on the back
+        // stack. Re-arm the one-shot history clear so the next authenticated
+        // page-ready purges them — otherwise Back walks into the stopped IdP entry
+        // and re-pops the login browser.
+        historyCleared = false
         loginManager.start(this, origin, ::onSessionToken)
     }
 
@@ -307,6 +342,15 @@ class MainActivity : ComponentActivity() {
         // page (chrome-error://) or a foreign redirect must NOT drain
         // pendingNavigatePath or push insets into a page that can't consume them.
         if (originOf(url) != pinnedOrigin) return
+        // First authenticated app page: drop everything before it from the
+        // back/forward list. Otherwise Back walks into the pre-auth root and the
+        // login-redirect reload (the `loadUrl(origin)` after the cookie injection),
+        // which bounces to login or shows a blank — "back lands on the wrong
+        // screen" / "exits the app". After this the SPA builds clean history.
+        if (!historyCleared) {
+            historyCleared = true
+            webView.clearHistory()
+        }
         pageLoaded = true
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
@@ -447,5 +491,10 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         const val MAX_LOGIN_ATTEMPTS = 3
+
+        // Back-press fallback: long enough that a healthy renderer's JS round-trip
+        // (a few ms) always wins the race, short enough to not feel stuck if it
+        // doesn't answer. Only the timer ever fires when the renderer is gone.
+        const val BACK_FALLBACK_MS = 600L
     }
 }

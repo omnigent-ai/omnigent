@@ -121,6 +121,86 @@ object NativeBridgeScript {
             },
           });
 
+          // Android hardware/gesture back: close an open in-page overlay first so
+          // back means "dismiss this drawer/dialog", not "leave the app" (the SPA
+          // doesn't put every overlay in history). Returns true only when it
+          // actually closed a VISIBLE modal/drawer — the native side falls back to
+          // WebView history / finish() otherwise, so this never traps the user.
+          Object.defineProperty(window, "__omnigentNativeHandleBack", {
+            configurable: false, enumerable: false, writable: false,
+            value() {
+              try {
+                // An overlay counts as open only if its CENTER is on-screen. The
+                // panel drawers stay in the DOM at full size when CLOSED — just
+                // translated off the side (e.g. left:524 on a 523px screen) — so a
+                // size + vertical test alone false-detects a closed drawer and
+                // swallows Back ("does nothing"). offsetParent is also null for the
+                // position:fixed overlays, so it can't be used either.
+                const onScreen = (el) => {
+                  if (!el) return false;
+                  const cs = getComputedStyle(el);
+                  if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) return false;
+                  const r = el.getBoundingClientRect();
+                  if (r.width < 24 || r.height < 24) return false;
+                  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                  return cx > 0 && cx < window.innerWidth && cy > 0 && cy < window.innerHeight;
+                };
+                // One dispatch on document — Radix/most libs listen there and close
+                // only the TOP layer per Escape. Dispatching twice (element-bubbled
+                // + direct) could collapse two stacked overlays in a single Back.
+                const fireEscape = () => {
+                  document.dispatchEvent(new KeyboardEvent("keydown", {
+                    key: "Escape", code: "Escape", keyCode: 27, which: 27,
+                    bubbles: true, cancelable: true,
+                  }));
+                };
+                // Below Tailwind's md breakpoint the side surfaces are DRAWERS
+                // (overlays) Back should dismiss; at md+ they dock as persistent
+                // rails (md:relative md:translate-x-0, still data-state="open")
+                // that Back must NOT close. Modal dialogs dismiss at any width.
+                const narrow = window.innerWidth < 768;
+                // 1. Conversations sidebar (a drawer only when narrow; closed =
+                // data-collapsed).
+                if (narrow) {
+                  const sb = document.querySelector(".conversations-sidebar");
+                  if (sb && sb.getAttribute("data-collapsed") !== "true" && onScreen(sb)) {
+                    const toggle = [...document.querySelectorAll("button")].find(
+                      (b) => /close sidebar/i.test(b.getAttribute("aria-label") || ""),
+                    );
+                    if (toggle) toggle.click(); else fireEscape();
+                    return true;
+                  }
+                }
+                // 2. Any open Radix-style overlay. data-state="open" is the
+                // authoritative open/closed signal; a closed one is "closed".
+                let target = null;
+                for (const el of document.querySelectorAll('[data-state="open"]')) {
+                  const testid = el.getAttribute("data-testid") || "";
+                  const isModal =
+                    el.getAttribute("role") === "dialog" ||
+                    el.getAttribute("aria-modal") === "true";
+                  const isDrawerPanel = /-(drawer|panel|sheet)${'$'}/.test(testid);
+                  // Modal dismisses at any width; a drawer/rail panel only while
+                  // it's actually a drawer (narrow), not a docked md+ rail.
+                  if ((isModal || (isDrawerPanel && narrow)) && onScreen(el)) { target = el; break; }
+                }
+                // File viewer / terminals panel may not carry data-state — drawers
+                // only when narrow (they're persistent rails at md+).
+                if (!target && narrow) {
+                  for (const el of document.querySelectorAll(
+                    '[data-testid="file-viewer"], [data-testid="terminals-panel"]',
+                  )) { if (onScreen(el)) { target = el; break; } }
+                }
+                if (!target) return false;
+                const closer = target.querySelector(
+                  '[aria-label*="lose" i], [data-testid${'$'}="-close"], [data-testid*="close" i], button[data-dismiss]',
+                );
+                if (closer) closer.click(); else fireEscape();
+                return true;
+              } catch (_) { return false; }
+            },
+          });
+
           window.omnigentNative = Object.freeze({
             kind: "android",
             setBadgeCount(count) {
