@@ -157,6 +157,33 @@ async def test_start_creates_instance_dir_with_sentinel(
         await manager.shutdown()
 
 
+async def test_start_fails_loud_on_sentinel_collision(
+    manager: HarnessProcessManager,
+) -> None:
+    """A pre-existing AP_PID sentinel makes start() fail loud, not clobber it.
+
+    The instance dir is uuid-named, so a sentinel already present at boot means
+    the uuid collided with a still-running instance. The docstring promises
+    strict ``"x"`` semantics ("fail loud") precisely so we don't silently
+    overwrite the live sibling's AP_PID — which records *our* pid over theirs
+    and breaks their orphan sweep (a later boot would misread the dir's owner).
+
+    Pre-seed the sentinel with a live pid (``os.getppid()`` — alive, so the
+    orphan sweep treats the dir as live and leaves it; distinct from this
+    process's pid so a clobber is detectable) and assert start() raises rather
+    than overwriting it.
+    """
+    live_pid = os.getppid()
+    manager.instance_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    sentinel = manager.instance_dir / _AP_PID_FILE
+    sentinel.write_text(str(live_pid), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="sentinel"):
+        await manager.start()
+    # The live sibling's sentinel must be untouched — not clobbered with our pid.
+    assert sentinel.read_text(encoding="utf-8").strip() == str(live_pid)
+
+
 async def test_start_is_idempotent(manager: HarnessProcessManager) -> None:
     """A second start() is a no-op; doesn't recreate / relaunch.
 
