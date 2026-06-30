@@ -103,6 +103,22 @@ export function shortModelName(model: string): string {
 }
 
 /**
+ * Inline pill showing a model's short name and tier — shared between the
+ * routing decision chip (StatusBlocks) and the SmartRoutingCard plan rows.
+ *
+ * @param model Model id, e.g. `"databricks-claude-haiku-4-5"`.
+ * @param tier Difficulty tier the router assigned, e.g. `"cheap"`.
+ */
+export function ModelTierPill({ model, tier }: { model: string; tier: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] leading-none">
+      <span className="font-medium text-foreground">{shortModelName(model)}</span>
+      <span className="text-muted-foreground">· {tier}</span>
+    </span>
+  );
+}
+
+/**
  * The router glyph — Lucide's `brain-circuit` icon: a brain wired into
  * circuit nodes, reading as "model intelligence picks the route".
  * Rendered in both toggle layers; the off→on cross-fade and the brand-pink

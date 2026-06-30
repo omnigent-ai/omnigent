@@ -1,4 +1,12 @@
-import { type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type DragEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -123,6 +131,16 @@ const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
 // session's terminal_launch_args. Keep in sync with `claude --help`.
+// Harnesses for which server-side smart routing is available.
+const _ROUTABLE_HARNESSES = new Set([
+  "claude-sdk",
+  "claude_sdk",
+  "claude-native",
+  "codex",
+  "codex-native",
+  "pi",
+]);
+
 const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
   { value: "default", label: "Default", description: "Prompts before edits and commands" },
@@ -1859,14 +1877,25 @@ export function NewChatLandingScreen() {
   // are omitted from the create, so Claude Code uses its own configured model.
   // An explicit pick rides along and is remembered (seeded back on a later visit
   // via the harness-seed effect below).
-  const [pickedModel, setPickedModel] = useState<string>(() => landingDraft?.pickedModel ?? "");
+  const [pickedModel, _setPickedModel] = useState<string>(() => landingDraft?.pickedModel ?? "");
   const [pickedEffort, setPickedEffort] = useState<string>(() => landingDraft?.pickedEffort ?? "");
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
-  const [costControlMode, setCostControlMode] = useState<CostControlMode>(
+  const [costControlMode, _setCostControlMode] = useState<CostControlMode>(
     () => landingDraft?.costControlMode ?? null,
   );
+  // Model selection and smart routing are mutually exclusive: enabling
+  // routing clears the explicit model pick, and picking a model turns
+  // routing off.
+  const setPickedModel = useCallback((model: string) => {
+    _setPickedModel(model);
+    if (model) _setCostControlMode(null);
+  }, []);
+  const setCostControlMode = useCallback((mode: CostControlMode) => {
+    _setCostControlMode(mode);
+    if (mode === "on") _setPickedModel("");
+  }, []);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -2867,9 +2896,14 @@ export function NewChatLandingScreen() {
                   setPickedEffort={setPickedEffort}
                   setPickedHarness={setPickedHarness}
                 />
-                {smartRoutingEnabled && selectedAgent && (
-                  <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
-                )}
+                {smartRoutingEnabled &&
+                  selectedAgent &&
+                  _ROUTABLE_HARNESSES.has(selectedAgent.harness ?? "") && (
+                    <IntelligentModelControl
+                      value={costControlMode}
+                      onChange={setCostControlMode}
+                    />
+                  )}
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>

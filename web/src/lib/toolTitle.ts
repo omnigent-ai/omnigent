@@ -58,6 +58,15 @@ const FORMATTERS: Record<string, ArgFormatter> = {
       ? verbOnly("Get session history")
       : { verb: "Get session history:", body: id };
   },
+  // Intelligent routing (normally rendered by SmartRoutingCard; this covers
+  // grouped/summary surfaces that fall back to the title).
+  sys_advise_models: (args) => {
+    const count = Array.isArray(args.tasks) ? args.tasks.length : null;
+    return count === null
+      ? verbOnly("Intelligent routing")
+      : { verb: "Intelligent routing:", body: `${count} task${count === 1 ? "" : "s"}` };
+  },
+
   sys_session_close: (args) => sessionTitle("Close child session:", args),
   sys_session_list: () => verbOnly("List child sessions"),
   sys_session_get_info: (args) => {

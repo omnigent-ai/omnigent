@@ -8593,11 +8593,20 @@ async def _forward_event_to_runner(
     # the entire session.  The verdict is persisted as model_override
     # on the conversation so subsequent turns reuse it without another
     # judge call.
-    if (
-        effective_runner_override is None
-        and conv.cost_control_mode_override == "on"
-        and body.type == "message"
-    ):
+    # Route if: toggle is on for this session (top-level), OR this is a
+    # sub-agent and its parent session has the toggle on.
+    _parent_routing_on = False
+    if conv.parent_conversation_id is not None:
+        _parent_conv = await asyncio.to_thread(
+            conversation_store.get_conversation, conv.parent_conversation_id
+        )
+        _parent_routing_on = (
+            _parent_conv is not None and _parent_conv.cost_control_mode_override == "on"
+        )
+    _routing_enabled = (
+        conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+    ) or _parent_routing_on
+    if effective_runner_override is None and _routing_enabled and body.type == "message":
         from omnigent.server.smart_routing import route_turn
 
         _harness = _resolve_harness(conv)
@@ -8805,7 +8814,19 @@ async def _dispatch_session_event_to_runner(
         # the toggle is on and no model_override is set, call the
         # judge and persist the chosen model on the conversation row.
         # The native CLI reads model_override from the session.
-        if conv.model_override is None and conv.cost_control_mode_override == "on":
+        _native_parent_routing_on = False
+        if conv.parent_conversation_id is not None:
+            _native_parent_conv = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+            _native_parent_routing_on = (
+                _native_parent_conv is not None
+                and _native_parent_conv.cost_control_mode_override == "on"
+            )
+        _native_routing_enabled = (
+            conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+        ) or _native_parent_routing_on
+        if conv.model_override is None and _native_routing_enabled:
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
@@ -12714,6 +12735,143 @@ async def _child_session_summaries_from_conversations(
 # factory so the factory closure stays compact.
 
 
+def _mcp_tool_result(rpc_id: int | str | None, text: str) -> Response:
+    """
+    Wrap a plain-text tool result in a JSON-RPC 2.0 MCP ``tools/call`` response.
+
+    :param rpc_id: The JSON-RPC request id (may be int, str, or ``None``
+        for notifications), e.g. ``1``.
+    :param text: The tool output text to embed in the ``content`` block.
+    :returns: A :class:`Response` with ``Content-Type: application/json``
+        carrying the JSON-RPC 2.0 envelope with a single ``text`` content block.
+    """
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": rpc_id, "result": {"content": [{"type": "text", "text": text}]}}
+    )
+    return Response(content=body, media_type="application/json")
+
+
+async def _handle_advise_models_mcp(
+    rpc_id: int | str | None,
+    conv: Any,
+    arguments: dict[str, Any],
+    agent_store: Any,
+) -> Response:
+    """
+    Server-side handler for ``sys_advise_models`` MCP tool calls.
+
+    Intercepts the call before the runner forward because
+    ``RuntimeCaps.routing_client`` lives in the server process.
+
+    :param rpc_id: The JSON-RPC request id.
+    :param conv: The :class:`Conversation` for this session.
+    :param arguments: Parsed tool arguments from the LLM.
+    :param agent_store: Store for agent lookup (used to resolve sub-agent harnesses).
+    :returns: A JSON-RPC 2.0 ``tools/call`` result response.
+    """
+    tasks = arguments.get("tasks")
+    if not isinstance(tasks, list):
+        return _mcp_tool_result(
+            rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
+        )
+
+    caps = get_caps()
+    routing_client = caps.routing_client
+    if routing_client is None:
+        return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
+
+    from omnigent.model_catalog import spec_harness
+    from omnigent.server.smart_routing import infer_tiers
+
+    # Resolve the parent agent spec to look up sub-agent harnesses.
+    spec: Any | None = None
+    if conv.agent_id is not None:
+        agent_obj = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent_obj is not None:
+            try:
+                spec = (
+                    get_agent_cache()
+                    .load(
+                        agent_obj.id,
+                        agent_obj.bundle_location,
+                        expand_env=agent_obj.session_id is None,
+                    )
+                    .spec
+                )
+            except Exception:  # noqa: BLE001
+                _logger.debug(
+                    "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
+                )
+
+    _WORKER_HARNESS: dict[str, str] = {
+        "claude_code": "claude-sdk",
+        "codex": "codex",
+        "pi": "pi",
+    }
+
+    def _resolve_harness_for_worker(agent: str) -> str | None:
+        if spec is not None:
+            sub_agents = getattr(spec, "sub_agents", None) or []
+            for sub in sub_agents:
+                if getattr(sub, "name", None) == agent:
+                    h = spec_harness(sub)
+                    if h:
+                        return h
+                    break
+        return _WORKER_HARNESS.get(agent)
+
+    recommendations: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        title = task.get("title", "")
+        agent = task.get("agent", "")
+        task_text = task.get("task", "")
+        harness = _resolve_harness_for_worker(agent)
+        tiers = infer_tiers(harness) if harness else None
+        if tiers is None:
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": agent,
+                    "model": None,
+                    "rationale": f"no tiers available for harness {harness!r}",
+                }
+            )
+            continue
+        try:
+            verdict = await routing_client.route(task_text, tiers)
+        except Exception:  # routing failures must not crash the advisor
+            _logger.exception(
+                "_handle_advise_models_mcp: routing_client.route failed for task %r agent %r",
+                title,
+                agent,
+            )
+            verdict = None
+        if verdict is None:
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": agent,
+                    "model": None,
+                    "rationale": "router returned no verdict",
+                }
+            )
+        else:
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": agent,
+                    "model": verdict.model,
+                    "rationale": verdict.rationale,
+                }
+            )
+
+    return _mcp_tool_result(
+        rpc_id, json.dumps({"router_on": True, "recommendations": recommendations})
+    )
+
+
 def _mcp_ok_response(rpc_id: int | str | None, result: dict[str, Any]) -> Response:
     """
     Wrap *result* in a JSON-RPC 2.0 success response.
@@ -13158,6 +13316,12 @@ async def _handle_mcp_tools_call(
         # PII-redacted args), use them instead of the originals.
         if call_result.data is not None:
             arguments = call_result.data
+
+    # ── Server-side sys_advise_models intercept ──────────────────────────
+    # After policy evaluation (DENY/ASK handled above); arguments may have
+    # been transformed. The advisor runs server-side where routing_client lives.
+    if namespaced_name in ("sys_advise_models", "mcp__omnigent__sys_advise_models"):
+        return await _handle_advise_models_mcp(rpc_id, conv, arguments, agent_store)
 
     # ── Execute on the runner via WS tunnel ──────────────────────────
     # The runner owns stdio subprocess spawning (correct machine, cwd,
