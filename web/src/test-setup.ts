@@ -21,6 +21,9 @@ vi.mock("@/components/icons/CursorIcon", () => ({
 vi.mock("@/components/icons/GooseIcon", () => ({
   GooseIcon: () => null,
 }));
+vi.mock("@/components/icons/KiroIcon", () => ({
+  KiroIcon: () => null,
+}));
 vi.mock("@/components/icons/AntigravityIcon", () => ({
   AntigravityIcon: () => null,
 }));
