@@ -1,0 +1,236 @@
+"""Admin routes: user list + an admin's view of any user's sessions.
+
+These power the OIDC/SSO admin surface — where the accounts-mode
+``Members`` page is not rendered, an operator still needs to see who
+has accounts and browse their sessions. Every route here is gated on
+the caller's ``is_admin`` flag (the same boolean the rest of the
+server uses); this is intentionally *not* a role system.
+
+Admins already hold owner-level access to any individual session
+(``check_session_access`` short-circuits for admins), so once a
+session id is listed here the existing session routes let the admin
+open and act on it. These routes only add *discovery*: enumerate
+users, and enumerate a chosen user's sessions.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from fastapi import APIRouter, Query, Request
+
+from omnigent.entities import SessionPermission
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import LEVEL_OWNER, AuthProvider
+from omnigent.server.routes._auth_helpers import get_user_id
+from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store import PermissionStore
+
+_logger = logging.getLogger(__name__)
+
+# Numeric permission level → role label shown to admins.
+_ROLE_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
+
+
+def _owner_of(grants: list[SessionPermission]) -> str | None:
+    """The owner (highest-level grantee at or above ``LEVEL_OWNER``), or None."""
+    owners = [g for g in grants if g.level >= LEVEL_OWNER]
+    if not owners:
+        return None
+    return max(owners, key=lambda g: g.level).user_id
+
+
+def _role_for(grants: list[SessionPermission], user_id: str) -> str | None:
+    """The role label for ``user_id`` on a session, from its grants."""
+    levels = [g.level for g in grants if g.user_id == user_id]
+    if not levels:
+        return None
+    return _ROLE_NAMES.get(max(levels))
+
+
+def create_admin_router(
+    permission_store: PermissionStore,
+    conversation_store: ConversationStore,
+    auth_provider: AuthProvider | None = None,
+    host_store: HostStore | None = None,
+) -> APIRouter:
+    """Build the admin router (mounted under ``/v1``).
+
+    :param permission_store: Backs the admin check and the user list.
+    :param conversation_store: Backs the per-user session listing.
+    :param auth_provider: Resolves the caller identity from the
+        request. ``None`` in single-user mode (admin routes are then
+        effectively unreachable — there is no multi-user surface).
+    :param host_store: Backs the per-user host counts on the user list.
+        ``None`` when host support is not wired — host counts are then
+        reported as zero rather than failing the request.
+    :returns: An :class:`APIRouter` with the admin discovery routes.
+    """
+    router = APIRouter()
+
+    async def _require_admin(request: Request) -> str:
+        """Authn + authz: resolve the caller and require ``is_admin``.
+
+        :raises OmnigentError: 401 if unauthenticated, 403 if the
+            authenticated user is not an admin.
+        """
+        user_id = get_user_id(request, auth_provider)
+        if user_id is None:
+            raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
+        if not await asyncio.to_thread(permission_store.is_admin, user_id):
+            raise OmnigentError(
+                "Admin privileges required",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return user_id
+
+    @router.get("/admin/users")
+    async def list_users(request: Request) -> dict[str, object]:
+        """List real users (admin only), each with an owned-usage rollup.
+
+        ``cost_usd`` / ``total_tokens`` / ``session_count`` cover the
+        sessions the user OWNS — cost is attributed to the owner, so a
+        user merely invited to a session is not credited its cost.
+
+        **Invite-only phantoms are hidden.** A row is created in the
+        ``users`` table whenever someone is granted access to a session
+        (the grant's FK requires it), even if that person never logged
+        in. Such an account — not an admin, owns no session, but holds an
+        invite (read/edit/manage) grant — is omitted here; ``hidden``
+        reports how many were filtered. A real user who logged in but has
+        not created anything (no grants at all) is kept, as are admins.
+
+        ``host_count`` / ``online_host_count`` are the hosts the user
+        owns (all registered, and the live subset) — zero when host
+        support is not wired.
+
+        :returns: ``{"users": [{"user_id", "is_admin", "cost_usd",
+            "total_tokens", "session_count", "host_count",
+            "online_host_count"}, ...], "hidden": N}``.
+        """
+        await _require_admin(request)
+
+        def _build() -> dict[str, object]:
+            out: list[dict[str, object]] = []
+            hidden = 0
+            for u in permission_store.list_users():
+                totals = conversation_store.usage_totals_for_user(u.user_id)
+                # Hide invite-only phantoms: own nothing, hold only invite
+                # grants, not an admin. Skip the grant lookup for users who
+                # already own a session (the common case).
+                if not u.is_admin and totals.session_count == 0:
+                    grants = permission_store.list_for_user(u.user_id)
+                    owns = any(g.level >= LEVEL_OWNER for g in grants)
+                    invited = any(g.level < LEVEL_OWNER for g in grants)
+                    if not owns and invited:
+                        hidden += 1
+                        continue
+                # Per-user host inventory (cheap at admin-list scale; the
+                # online subset reuses the same liveness gate as the sidebar).
+                hosts = host_store.list_hosts(u.user_id) if host_store is not None else []
+                online = (
+                    host_store.online_host_ids([h.host_id for h in hosts])
+                    if host_store is not None and hosts
+                    else set()
+                )
+                out.append(
+                    {
+                        "user_id": u.user_id,
+                        "is_admin": u.is_admin,
+                        "cost_usd": totals.cost_usd,
+                        "total_tokens": totals.total_tokens,
+                        "session_count": totals.session_count,
+                        "host_count": len(hosts),
+                        "online_host_count": len(online),
+                    }
+                )
+            return {"users": out, "hidden": hidden}
+
+        return await asyncio.to_thread(_build)
+
+    @router.get("/admin/users/{user_id}/sessions")
+    async def list_user_sessions(
+        request: Request,
+        user_id: str,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, object]:
+        """List the sessions a given user can access (admin only).
+
+        Uses the same ``accessible_by`` filter the user's own session
+        list uses, so an admin sees exactly what that user would —
+        top-level (``kind="default"``) sessions only.
+
+        :param user_id: The user whose sessions to list, e.g.
+            ``"alice@example.com"``.
+        :param limit: Maximum sessions to return (1–500).
+        :returns: ``{"user_id", "totals": {...}, "sessions": [{"id",
+            "title", "created_at", "updated_at", "cost_usd",
+            "total_tokens", "role", "owner", "is_owner", "host",
+            "host_online"}, ...]}``. ``role`` is the user's level on that
+            session (owner / manage / edit / read); ``owner`` is the
+            session's owner. ``host`` is the friendly name of the host the
+            session is bound to (the raw id if that host was deleted,
+            ``None`` if unbound); ``host_online`` is its liveness.
+            Per-session cost/tokens are the session's; ``totals`` is the
+            user's OWNED-session rollup (cost attributed to the owner), so
+            a session the user was merely invited to does not count toward
+            their total.
+        """
+        await _require_admin(request)
+
+        def _build() -> dict[str, object]:
+            paged = conversation_store.list_conversations(accessible_by=user_id, limit=limit)
+            totals = conversation_store.usage_totals_for_user(user_id)
+            grants_by_conv = permission_store.list_for_sessions([c.id for c in paged.data])
+            # Resolve each session's bound host to a name + liveness. Distinct
+            # host ids are few (a user has few hosts), so a small map over the
+            # distinct set avoids a per-session lookup.
+            host_ids = {c.host_id for c in paged.data if c.host_id}
+            hosts_by_id = {}
+            online_hosts: set[str] = set()
+            if host_store is not None and host_ids:
+                for hid in host_ids:
+                    host = host_store.get_host(hid)
+                    if host is not None:
+                        hosts_by_id[hid] = host
+                online_hosts = host_store.online_host_ids(list(host_ids))
+            sessions = []
+            for c in paged.data:
+                grants = grants_by_conv.get(c.id, [])
+                owner = _owner_of(grants)
+                # Prefer the host's friendly name; fall back to the raw id for a
+                # host that's been deleted but still bound on the session.
+                host_label = None
+                if c.host_id:
+                    known = hosts_by_id.get(c.host_id)
+                    host_label = known.name if known is not None else c.host_id
+                sessions.append(
+                    {
+                        "id": c.id,
+                        "title": c.title,
+                        "created_at": c.created_at,
+                        "updated_at": c.updated_at,
+                        "cost_usd": float(c.session_usage.get("total_cost_usd") or 0.0),
+                        "total_tokens": int(c.session_usage.get("total_tokens") or 0),
+                        "role": _role_for(grants, user_id),
+                        "owner": owner,
+                        "is_owner": owner == user_id,
+                        "host": host_label,
+                        "host_online": c.host_id in online_hosts if c.host_id else False,
+                    }
+                )
+            return {
+                "user_id": user_id,
+                "totals": {
+                    "cost_usd": totals.cost_usd,
+                    "total_tokens": totals.total_tokens,
+                    "session_count": totals.session_count,
+                },
+                "sessions": sessions,
+            }
+
+        return await asyncio.to_thread(_build)
+
+    return router

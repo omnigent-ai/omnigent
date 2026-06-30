@@ -7,7 +7,7 @@ sentinel user ID represents public read access.
 
 from abc import ABC, abstractmethod
 
-from omnigent.entities import ResolvedAccess, SessionPermission
+from omnigent.entities import ResolvedAccess, SessionPermission, UserRecord
 
 
 class PermissionStore(ABC):
@@ -135,6 +135,20 @@ class PermissionStore(ABC):
         :param user_id: The user to check, e.g. ``"local"``.
         :returns: ``True`` if the user exists and ``is_admin``
             is set, ``False`` otherwise.
+        """
+        ...
+
+    @abstractmethod
+    def list_users(self) -> list[UserRecord]:
+        """List all known users (for the admin user list).
+
+        Excludes the reserved sentinels — ``__public__`` (a grant
+        target) and ``local`` (the single-user fallback identity) —
+        which are not real accounts. Ordered by ``user_id`` for a
+        stable listing.
+
+        :returns: A list of :class:`UserRecord` (``user_id`` +
+            ``is_admin``), one per real row in the ``users`` table.
         """
         ...
 

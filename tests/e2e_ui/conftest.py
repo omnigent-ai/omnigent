@@ -932,6 +932,9 @@ def live_server(
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
     _server_state["mock_llm_url"] = mock_url
+    # Exposed so a test can seed rows the API can't (e.g. the admin flag,
+    # a host binding) directly into the spawned server's SQLite DB.
+    _server_state["db_path"] = str(db_path)
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
