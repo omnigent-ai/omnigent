@@ -242,6 +242,7 @@ async def _start_codex_goal_runner_on_bound_host(
             conversation_store,
             host_registry,
             host_conn,
+            auth_provider=getattr(app_state, "auth_provider", None),
         )
         if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
             raise OmnigentError(

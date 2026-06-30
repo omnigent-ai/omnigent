@@ -104,12 +104,20 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param auth_token: Bearer token the runner presents on its tunnel
+        handshake so the server resolves the session owner when
+        accounts/OIDC auth is enabled — a managed runner has no
+        logged-in user credential of its own. A short-lived owner JWT
+        the server mints at launch. ``None`` for single-user / no-auth
+        deployments (and from older servers): the runner then
+        authenticates with the binding token alone, as before.
     """
 
     request_id: str
     binding_token: str
     workspace: str
     harness: str | None = None
+    auth_token: str | None = None
 
 
 @dataclass
@@ -523,6 +531,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "binding_token": frame.binding_token,
                 "workspace": frame.workspace,
                 "harness": frame.harness,
+                "auth_token": frame.auth_token,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -791,6 +800,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         harness=_optional_nullable_str(msg, "harness"),
+        auth_token=_optional_nullable_str(msg, "auth_token"),
     )
 
 
