@@ -28,6 +28,7 @@ from omnigent.inner.cursor_executor import (
     _sdk_message_to_events,
 )
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     Message,
     ReasoningChunk,
@@ -208,6 +209,14 @@ def test_resolve_model_drops_databricks_and_defaults_to_auto() -> None:
     assert _resolve_model("databricks-claude-sonnet-4-6") == "auto"
     assert _resolve_model("databricks/kimi") == "auto"
     assert _resolve_model(None) == "auto"
+
+
+def test_resolve_model_maps_cursor_display_label_to_sdk_id() -> None:
+    # The web/free-text model switch path can persist a display label. Cursor
+    # SDK rejects "Composer" but accepts the catalog id.
+    assert _resolve_model("Composer") == "composer-2.5"
+    assert _resolve_model(" composer ") == "composer-2.5"
+    assert _resolve_model("composer-2.5") == "composer-2.5"
 
 
 def test_resolve_model_warns_when_dropping_a_pinned_model(
@@ -485,6 +494,38 @@ async def test_databricks_model_resolved_to_auto(monkeypatch: pytest.MonkeyPatch
     finally:
         await executor.close()
     assert state["create_models"] == ["auto"]
+
+
+async def test_cursor_display_label_model_resolved_before_agent_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor = CursorExecutor(model="Composer", api_key="crsr_x")
+    try:
+        _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+    assert state["create_models"] == ["composer-2.5"]
+
+
+async def test_cursor_display_label_config_override_resolved_before_agent_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    executor = CursorExecutor(model="default", api_key="crsr_x")
+    try:
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("hi")],
+                [],
+                "SYS",
+                config=ExecutorConfig(model="Composer"),
+            )
+        ]
+    finally:
+        await executor.close()
+    assert state["create_models"] == ["composer-2.5"]
 
 
 async def test_api_key_threaded_to_create(monkeypatch: pytest.MonkeyPatch) -> None:
