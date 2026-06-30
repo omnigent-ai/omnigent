@@ -367,3 +367,45 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+
+## Configuration of Policies
+
+Policies are a crucial part of managing agent behavior in Omnigent. You can define policies at the server-wide, agent, or session level. To set up a policy, use the following syntax in your agent YAML:
+
+```yaml
+policies:
+  my_policy:
+    type: function
+    handler: omnigent.policies.builtins.safety.max_tool_calls_per_session
+    factory_params:
+      limit: 100
+```
+
+For more details, refer to the [Policies Documentation](https://github.com/omnigent-ai/omnigent/blob/main/docs/POLICIES.md).
+
+## Examples of Agent Usage
+
+To run an agent, you can use the following command:
+
+```bash
+omnigent run path/to/agent.yaml
+```
+
+Here’s an example of an agent YAML file:
+
+```yaml
+name: my_agent
+prompt: You are a helpful assistant.
+executor:
+  harness: claude-sdk
+```
+
+For more examples, check the [examples directory](https://github.com/omnigent-ai/omnigent/tree/main/examples).
+
+## Frequently Asked Questions (FAQ)
+
+### How do I reset my password?
+You can reset your password by following the instructions in the web UI under the login section.
+
+### What should I do if I encounter an error?
+Refer to the issues section on GitHub or the documentation for troubleshooting steps.
