@@ -85,6 +85,20 @@ function readConfig() {
   }
 }
 
+// Re-read authHeaders from config.json on each outbound request. The bearer
+// baked at launch dies with the ~1h Databricks OAuth lifetime; the runner
+// re-mints it into config.json each turn (PiNativeExecutor), so re-reading
+// here keeps the policy/MCP/event POSTs authenticated instead of failing
+// closed mid-session. Falls back to the closed-over headers when the re-read
+// fails (a torn config) so a transient read can't drop auth.
+function freshAuthHeaders(fallback) {
+  const latest = readConfig();
+  if (latest && latest.authHeaders && typeof latest.authHeaders === "object") {
+    return latest.authHeaders;
+  }
+  return fallback || {};
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -156,7 +170,7 @@ async function evalNativePolicyHttp(config, toolName, args) {
   });
   const reqHeaders = {
     "content-type": "application/json",
-    ...(config.authHeaders || {}),
+    ...freshAuthHeaders(config.authHeaders),
   };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
@@ -398,7 +412,7 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(config.authHeaders || {}),
+        ...freshAuthHeaders(config.authHeaders),
       },
       body,
     });
@@ -661,7 +675,7 @@ function extractPiUsage(message) {
 function headers(config) {
   return {
     "content-type": "application/json",
-    ...(config.authHeaders || {}),
+    ...freshAuthHeaders(config.authHeaders),
   };
 }
 
