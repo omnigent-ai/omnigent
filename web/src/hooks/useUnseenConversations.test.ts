@@ -32,9 +32,8 @@ function lastPutBody(): { last_seen: number; unread: boolean } | undefined {
 }
 
 function putCount(): number {
-  return authFetch.mock.calls.filter(
-    ([, i]) => (i as { method?: string })?.method === "PUT",
-  ).length;
+  return authFetch.mock.calls.filter(([, i]) => (i as { method?: string })?.method === "PUT")
+    .length;
 }
 
 function setWindowFocused(focused: boolean): void {
