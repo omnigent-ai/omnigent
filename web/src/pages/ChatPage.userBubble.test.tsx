@@ -138,4 +138,49 @@ describe("UserBubble @-mention attachment chips", () => {
     expect(screen.getByText("@bob-max-gain/docker-compose.yml")).toBeInTheDocument();
     expect(screen.getByText(":2-9")).toBeInTheDocument();
   });
+
+  // An explicit upload is materialized to disk by the native executor, which
+  // injects an *absolute* "[Attached: <bridge>/uploads/…]" marker for the CLI.
+  // The upload already rides in as an input_image / input_file block, so the
+  // marker must NOT also surface as a path chip (it would double-render, and
+  // the path is an internal temp dir).
+  it("does not chip an absolute upload marker (already shown via its file block)", () => {
+    renderBubble(
+      userBubble(
+        "[Attached: /var/folders/x/omnigent-1/claude-native/abc/uploads/image.png]\n\nwhat is this",
+      ),
+    );
+    // No "@…" chip for the absolute upload path.
+    expect(screen.queryByText(/^@\//)).toBeNull();
+    expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
+    // The marker is still stripped from the body and the prose survives.
+    expect(screen.queryByText(/\[Attached:/)).toBeNull();
+    expect(screen.getByText("what is this")).toBeInTheDocument();
+  });
+
+  // The absolute-path heuristic is OS-agnostic so it still suppresses the
+  // chip if an executor ever materializes an upload on a Windows host
+  // (drive-letter or UNC root), where the marker wouldn't start with "/".
+  it.each([
+    ["C:\\Users\\me\\AppData\\Local\\Temp\\omnigent\\uploads\\image.png", "drive (backslash)"],
+    ["C:/Users/me/AppData/Local/Temp/omnigent/uploads/image.png", "drive (forward slash)"],
+    ["\\\\host\\share\\omnigent\\uploads\\image.png", "UNC"],
+  ])("does not chip a Windows-style absolute upload marker (%s)", (path) => {
+    renderBubble(userBubble(`[Attached: ${path}]\n\nwhat is this`));
+    expect(screen.queryByText(/uploads/)).toBeNull();
+    expect(screen.getByText("what is this")).toBeInTheDocument();
+  });
+
+  it("chips a relative @-mention but not an absolute upload in the same message", () => {
+    renderBubble(
+      userBubble(
+        "[Attached: /tmp/omnigent/claude-native/abc/uploads/image.png]\n" +
+          "[Attached: src/server.ts]\n\ncompare",
+      ),
+    );
+    // Workspace @-mention still chips...
+    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+    // ...the materialized upload does not.
+    expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
+  });
 });
