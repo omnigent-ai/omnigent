@@ -17,9 +17,11 @@ concerns:
   provider externally get spans for free; the default no-op provider
   discards them silently.
 
-* **Subprocess trace propagation.** :func:`get_traceparent_env`
-  serializes the current trace context into env vars the executor
-  subprocess launchers can merge into their child process env.
+* **Subprocess OTel exporter forwarding.** :func:`get_otel_subprocess_env`
+  builds the env-var dict an executor subprocess uses to ship its own
+  OTel spans to the same backend. :func:`get_traceparent_env` is
+  retained as a public utility for the future per-request
+  trace-correlation work tracked on PR #1070.
 
 * **A handful of record helpers** where the work is non-trivial
   (LLM usage normalization, cancellation tagging). Trivial
@@ -312,6 +314,69 @@ def get_traceparent_env() -> dict[str, str]:
         result["TRACEPARENT"] = carrier["traceparent"]
     if "tracestate" in carrier:
         result["TRACESTATE"] = carrier["tracestate"]
+    return result
+
+
+# Standard OTel env vars forwarded into executor subprocesses so the
+# child OTLP exporter targets the same collector as the parent. The
+# list is intentionally small: only the knobs needed to point a fresh
+# OTel SDK at the same endpoint with matching transport + auth.
+_OTEL_FORWARDED_ENV_VARS: tuple[str, ...] = (
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_SERVICE_NAME",
+)
+
+
+def get_otel_subprocess_env(*, claude_sdk: bool = False) -> dict[str, str]:
+    """
+    Build the env-var dict that lets an executor subprocess export its
+    own OTel spans to the same collector omnigent uses.
+
+    Forwards the standard OTel exporter knobs
+    (``OTEL_EXPORTER_OTLP_PROTOCOL`` / ``_ENDPOINT`` / ``_HEADERS``,
+    ``OTEL_SERVICE_NAME``) so a child process can spin up its own OTel
+    SDK and ship spans to the configured backend. Spawn-env builders
+    merge this dict into the per-spawn env overrides passed to the
+    harness wrap.
+
+    Returns an empty dict when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is
+    unset. Without a configured collector, the child has nowhere to
+    export to and the executor stays on its baked-in defaults so no
+    half-configured OTel state leaks into the subprocess.
+
+    **TRACEPARENT injection is intentionally NOT included.** omnigent's
+    executor subprocess is long-running per session and handles many
+    agent turns; the agent span is per-request and is created after
+    the subprocess has already started. A single TRACEPARENT set at
+    spawn time cannot represent the per-request parent context, so
+    subprocess spans land in their own traces rather than nested under
+    a per-request omnigent agent span. Per-request trace correlation
+    over the SDK channel is tracked separately; see the design
+    discussion on PR #1070.
+
+    :param claude_sdk: When ``True``, also set
+        ``CLAUDE_CODE_ENABLE_TELEMETRY=1`` and
+        ``OTEL_TRACES_EXPORTER=otlp`` so the Claude Agent SDK's
+        built-in telemetry hooks turn on. These are no-ops in other
+        executor subprocesses, so they're gated.
+    :returns: A dict suitable for merging into the env dict passed to
+        an executor subprocess. Empty when no OTLP endpoint is
+        configured.
+    """
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    if not endpoint:
+        return {}
+
+    result: dict[str, str] = {}
+    for name in _OTEL_FORWARDED_ENV_VARS:
+        value = os.environ.get(name)
+        if value is not None:
+            result[name] = value
+    if claude_sdk:
+        result["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1"
+        result["OTEL_TRACES_EXPORTER"] = "otlp"
     return result
 
 
