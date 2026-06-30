@@ -4208,6 +4208,18 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "background_task_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
+            "title": "Background Task Count"
+          },
           "context_window": {
             "anyOf": [
               {

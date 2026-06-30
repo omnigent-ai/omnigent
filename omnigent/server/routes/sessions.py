@@ -835,6 +835,15 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 # Used by _get_session_snapshot.
 _session_status_cache: dict[str, str] = {}
 
+# Per-session background-shell tally (claude-native), kept in lockstep with
+# ``_session_status_cache`` so a snapshot/reload re-shows "N shells still
+# running" after the live SSE edge is gone. Sticky like the status: only the
+# Stop-hook-derived status carries a count (its ``idle`` is relabeled
+# ``waiting``); the trailing PTY-activity ``idle`` carries none and must not
+# clear it. A new turn (``running``) or a failure clears it. In-memory only —
+# repopulates from live edges, exactly like the status cache.
+_session_background_task_count_cache: dict[str, int] = {}
+
 # Sessions whose current turn was Stopped: the relay drops the turn's trailing
 # response.* output (no forward, no persist). The fence lifts on the next
 # turn's "running" status or on any terminal response.* event.
@@ -2252,6 +2261,7 @@ def _build_session_response(
     items: list[ConversationItem],
     status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
+    background_task_count: int | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
     last_total_tokens: int | None = None,
@@ -2277,6 +2287,10 @@ def _build_session_response(
         order, each a :class:`ConversationItem`.
     :param status: Derived session lifecycle status,
         e.g. ``"running"``.
+    :param background_task_count: Background shells still running as of the
+        last status edge (claude-native), so a reload re-shows "N shells
+        still running" even after the session settles to ``"idle"``. ``None``
+        when none are tracked.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -2353,6 +2367,7 @@ def _build_session_response(
         agent_id=conv.agent_id,
         agent_name=agent_name,
         status=status,
+        background_task_count=background_task_count,
         created_at=conv.created_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
@@ -5224,6 +5239,14 @@ def _publish_status(
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         return
     _session_status_cache[session_id] = status
+    # Keep the background-shell tally sticky alongside the status (see the
+    # cache's declaration): adopt a reported count, clear it on a new turn or
+    # a failure, and otherwise leave it so the trailing PTY-activity ``idle``
+    # can't wipe the count the Stop hook just published.
+    if background_task_count is not None and background_task_count > 0:
+        _session_background_task_count_cache[session_id] = background_task_count
+    elif status in ("running", "failed"):
+        _session_background_task_count_cache.pop(session_id, None)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
@@ -20189,6 +20212,7 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
+        background_task_count=_session_background_task_count_cache.get(session_id),
         llm_model=llm_model,
         context_window=context_window,
         last_total_tokens=last_total_tokens,

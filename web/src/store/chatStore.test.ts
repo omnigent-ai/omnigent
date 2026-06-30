@@ -2282,6 +2282,74 @@ describe("chatStore — send while streaming (queueing)", () => {
   });
 });
 
+describe("chatStore — background-shell tally (claude-native)", () => {
+  it("adopts the shell count from a Stop-derived waiting status", () => {
+    useChatStore.setState({ conversationId: "conv_abc", backgroundTaskCount: 0 });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundTaskCount: 2,
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("waiting");
+    expect(state.backgroundTaskCount).toBe(2);
+  });
+
+  it("keeps the sticky shell count when a trailing PTY idle lands", () => {
+    // The claude-native turn-end sequence: the Stop hook publishes
+    // waiting(+count), then ~1s later the PTY-activity watcher publishes a
+    // bare `idle` once the pane quiesces. That trailing idle carries no
+    // count and must NOT wipe the "N background tasks still running" signal — only
+    // the status settles to idle.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 2,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.backgroundTaskCount).toBe(2);
+  });
+
+  it("clears the shell count on a hard failure", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 2,
+      activeResponse: null,
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "failed",
+    });
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+  });
+
+  it("clears the sticky shell count when the user sends a new turn", async () => {
+    // Asking another question while shells run supersedes the prior turn's
+    // tally: the label must flip from "N background tasks still running" to "Working…"
+    // immediately, not linger until the next status edge.
+    seedSession("conv_abc");
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 2,
+      status: "idle",
+      activeResponse: null,
+    });
+    await useChatStore.getState().send("another question", "agent_xyz");
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+  });
+});
+
 describe("chatStore — send (cross-session routing)", () => {
   it("delivers a queued send to the session it was composed in, not the now-active session", async () => {
     // Repro for the cross-session message-routing leak.

@@ -635,6 +635,7 @@ export function ChatPage() {
   useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -823,7 +824,11 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  const showsWorking = computeShowsWorking(sessionStatus, { hasPendingElicitation, runnerOnline });
+  const showsWorking = computeShowsWorking(sessionStatus, {
+    hasPendingElicitation,
+    runnerOnline,
+    backgroundTaskCount,
+  });
 
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
@@ -2288,14 +2293,21 @@ function hasInProgressAssistantBubble(bubbles: Bubble[]): boolean {
  *   least one item, or a compaction-loading bubble already represents the
  *   busy state.
  */
+/**
+ * The label shown next to the working spinner. When background shells outlive
+ * the turn (`bgCount > 0`) it names how many are still running; otherwise it's
+ * the plain "Working…" string.
+ */
+export function workingIndicatorLabel(bgCount: number): string {
+  if (bgCount <= 0) return "Working…";
+  return bgCount === 1
+    ? "1 background task still running"
+    : `${bgCount} background tasks still running`;
+}
+
 function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const label =
-    bgCount > 0
-      ? bgCount === 1
-        ? "1 shell still running"
-        : `${bgCount} shells still running`
-      : "Working…";
+  const label = workingIndicatorLabel(bgCount);
   return (
     <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
       <MessageContent>
@@ -4646,15 +4658,24 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
  *   known offline, ``undefined`` before the health poll resolves. Only known
  *   offline suppresses the indicator.
+ * @param options.backgroundTaskCount - Background shells still running after
+ *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
+ *   watcher's edge) even while shells run, so the bare status alone would hide
+ *   the indicator; a positive count keeps it lit so "N background tasks still running"
+ *   stays visible.
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
   sessionStatus: SessionStatus,
-  options: { hasPendingElicitation: boolean; runnerOnline: boolean | undefined },
+  options: {
+    hasPendingElicitation: boolean;
+    runnerOnline: boolean | undefined;
+    backgroundTaskCount?: number;
+  },
 ): boolean {
   if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus);
+  return computeIsWorking(sessionStatus) || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**

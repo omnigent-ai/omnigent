@@ -812,6 +812,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ...s.pendingUserMessages,
         { tempId, content, ...(selfAuthor !== null ? { author: selfAuthor } : {}) },
       ],
+      // A new turn supersedes the prior turn's background-shell tally: the
+      // "N background tasks still running" label must give way to "Working…" the
+      // moment the user sends, not linger until the next status edge. The
+      // count is sticky (see the `session_status` handler) precisely so a
+      // trailing idle can't wipe it, so it has to be cleared explicitly here.
+      backgroundTaskCount: 0,
     }));
 
     // Pin the destination before joining the send chain: a stalled prior
@@ -2038,6 +2044,10 @@ async function bindStream(
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
         sessionStatus: session.status,
+        // Re-show "N background tasks still running" after a reload/navigate-back: the
+        // live SSE edge that set this is long gone, so the count rides in on
+        // the snapshot (server keeps it sticky past the trailing PTY `idle`).
+        backgroundTaskCount: session.backgroundTaskCount ?? 0,
         selectedEffort: effectiveEffort,
         selectedModel: effectiveModel,
         // Session truth for the `/model` readout — overrides the snapshot
@@ -2168,6 +2178,9 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  */
 function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState> {
   const patch: Partial<ChatState> = { sessionStatus: session.status };
+  // Recover the background-shell tally across the gap too, so the spinner
+  // returns to "N background tasks still running" rather than vanishing on reconnect.
+  patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -3584,10 +3597,23 @@ export function handleSessionEvent(event: StreamEvent): void {
           // prior turn's working signal; response_end owns that lifecycle.
           return {};
         }
-        const patch: Partial<ChatState> = {
-          sessionStatus: event.status,
-          backgroundTaskCount: event.backgroundTaskCount ?? 0,
-        };
+        const patch: Partial<ChatState> = { sessionStatus: event.status };
+        // The background-shell tally is STICKY. Only the Stop-hook-derived
+        // status carries a count (the forwarder relabels its `idle` to
+        // `waiting` and attaches `background_task_count`); the PTY-activity
+        // watcher's running/idle edges carry none. A claude-native turn that
+        // ends with shells still running emits, in order: the Stop hook's
+        // `waiting`(+count), then — ~1s later, once the pane quiesces — a
+        // bare PTY-activity `idle`. If that trailing `idle` reset the count
+        // to 0 the "N background tasks still running" spinner would vanish a beat after
+        // it appeared. So: adopt a reported count, clear it only on a hard
+        // failure, and otherwise leave it untouched. A new turn clears it
+        // explicitly in `send()`.
+        if (event.backgroundTaskCount !== undefined && event.backgroundTaskCount > 0) {
+          patch.backgroundTaskCount = event.backgroundTaskCount;
+        } else if (event.status === "failed") {
+          patch.backgroundTaskCount = 0;
+        }
         if (
           event.responseId !== undefined &&
           (event.status === "running" || event.status === "waiting")
