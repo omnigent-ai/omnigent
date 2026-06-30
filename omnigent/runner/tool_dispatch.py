@@ -257,6 +257,11 @@ _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 
+# Priority 5f.3: sys_advise_models — runner-local fan-out advisor.
+# Reads RuntimeCaps.routing_client and calls async route(); only
+# registered when routing_client is configured.
+_ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
+
 # Priority 5g: Timer tools — runner-local asyncio.sleep tasks
 # (RUNNER_TIMER_DISPATCH.md).
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
@@ -320,6 +325,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -450,6 +456,7 @@ _ALL_LOCAL_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
@@ -1134,6 +1141,38 @@ async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
 
     catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
     return json.dumps(catalog)
+
+
+async def _execute_advise_models_tool(
+    args: dict[str, Any],
+    *,
+    conversation_id: str | None,
+    agent_spec: Any | None,
+) -> str:
+    """
+    Dispatch ``sys_advise_models``: fan-out model sizing recommendations.
+
+    Calls :func:`~omnigent.runner.fanout_advisor.advise_fanout` for
+    each task in the request and returns a JSON payload with the
+    recommendations and a ``router_on`` flag.
+
+    :param args: Parsed arguments from the LLM. Expected key:
+        ``tasks`` — list of ``{title, agent, task}`` dicts.
+    :param conversation_id: Parent conversation id.
+    :param agent_spec: The calling session's agent spec; used to resolve
+        sub-agent harnesses.
+    :returns: JSON ``{"recommendations": [...], "router_on": bool}``.
+    """
+    from omnigent.runner.fanout_advisor import advise_fanout
+    from omnigent.runtime._globals import _caps
+
+    tasks = args.get("tasks")
+    if not isinstance(tasks, list):
+        return json.dumps({"error": "tasks must be a list", "router_on": False})
+
+    router_on = _caps.routing_client is not None
+    recommendations = await advise_fanout(tasks, agent_spec, conversation_id)
+    return json.dumps({"recommendations": recommendations, "router_on": router_on})
 
 
 async def _execute_subagent_tool(
@@ -4078,6 +4117,12 @@ async def execute_tool(
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
+        elif tool_name in _ADVISE_MODELS_TOOLS:
+            output = await _execute_advise_models_tool(
+                args,
+                conversation_id=conversation_id,
+                agent_spec=agent_spec,
+            )
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,

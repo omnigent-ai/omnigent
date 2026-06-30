@@ -35,6 +35,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysReadInboxTool,
 )
 from omnigent.tools.builtins.list_comments import ListCommentsTool
+from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
     LoadSkillTool,
@@ -66,6 +67,7 @@ __all__ = [
     "BUILTIN_NAMES",
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
+    "SysAdviseModelsTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
     "SysAgentDownloadTool",
@@ -203,6 +205,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # and intercepted by name in the runner's tool dispatch — reserved
     # here so user specs cannot shadow it.
     "sys_list_models": None,
+    # ``sys_advise_models`` is auto-registered alongside ``sys_list_models``
+    # when ``RuntimeCaps.routing_client`` is configured. Intercepted by
+    # name in the runner's tool dispatch — reserved here so user specs
+    # cannot shadow it.
+    "sys_advise_models": None,
 }
 
 # Canonical set of every reserved builtin name. Derived from
