@@ -466,9 +466,19 @@ jobs:
           # Execute the validated commands.
           bash /tmp/triage_commands.sh
 
+          # If the issue was filed by a maintainer, assign it to them directly.
+          author=$(jq -r '.author.login // empty' /tmp/issue.json)
+          maintainer_assigned=false
+          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
+            echo "Issue filed by maintainer $author — assigning to author"
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
+            maintainer_assigned=true
+          fi
+
           # Round-robin assign engineer for P0/P1 issues, with domain routing.
+          # Skip if already assigned to the maintainer-author above.
           priority=$(jq -r '.priority // empty' /tmp/triage_result.json)
-          if [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; then
+          if [ "$maintainer_assigned" = "false" ] && { [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; }; then
             python3 <<'PYEOF'
           import json, pathlib, os
 
