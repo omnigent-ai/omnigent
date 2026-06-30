@@ -43,7 +43,11 @@ import {
 } from "@/lib/browserNotifications";
 import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
-import { markConversationSeen } from "@/hooks/useUnseenConversations";
+import {
+  __resetReadStateForTests,
+  markConversationSeen,
+  seedReadState,
+} from "@/hooks/useUnseenConversations";
 import { useIdleNotifications } from "./useIdleNotifications";
 
 const useConvMock = vi.mocked(useConversations);
@@ -109,10 +113,13 @@ beforeEach(() => {
   // "user looked away" case). Focus-specific tests override this.
   setWindowFocused(false);
   setConversations([]);
-  // The badge derivation reads the real last-seen baselines from
-  // localStorage (useUnseenConversations is intentionally NOT mocked);
-  // start each test with a clean slate.
-  window.localStorage.clear();
+  // The badge derivation reads the real last-seen baselines from the
+  // in-memory read-state mirror (useUnseenConversations is intentionally
+  // NOT mocked); start each test with a clean slate, and seed an empty list
+  // to flip `hydrated` so markConversationSeen writes (it is gated until the
+  // first seed to avoid the reload-clobber race).
+  __resetReadStateForTests();
+  seedReadState([]);
 });
 
 afterEach(() => {

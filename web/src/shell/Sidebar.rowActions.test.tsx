@@ -50,7 +50,7 @@ vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { clearUnreadOverride } from "@/hooks/useUnseenConversations";
+import { __resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -115,10 +115,9 @@ function renderSidebar(activeId?: string) {
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   useConvMock.mockReset();
-  localStorage.clear();
-  // The explicit-unread override is module-level (in-memory), so reset it
-  // between tests to avoid a mark-unread leaking into later rows.
-  clearUnreadOverride("conv_1");
+  // The read-state mirror is module-level (in-memory), so reset it between
+  // tests to avoid a mark-unread leaking into later rows.
+  __resetReadStateForTests();
   mockConversations([CONV]);
 });
 
@@ -251,7 +250,7 @@ describe("double-click to rename", () => {
 });
 
 describe("mark as unread", () => {
-  it("re-lights the row's unread dot and persists the baseline below updated_at", () => {
+  it("re-lights the row's unread dot via an explicit mark-unread", () => {
     renderSidebar();
 
     // The row starts seen (no baseline) — no unread marker.
@@ -260,29 +259,25 @@ describe("mark as unread", () => {
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
     fireEvent.click(screen.getByTestId("mark-unread-conversation"));
 
-    // The dot's accessible label appears immediately (in-tab tick), and the
-    // baseline is pinned just under updated_at so the dot survives a reload.
+    // The dot's accessible label appears immediately (in-tab tick on the
+    // optimistic mirror write); the baseline is also synced to the server.
     expect(screen.getByText("(unread)")).toBeInTheDocument();
-    const stored = JSON.parse(localStorage.getItem("omnigent:last-seen-timestamps")!);
-    expect(stored.conv_1).toBe(CONV.updated_at - 1);
   });
 
-  it("records the baseline on a running session but holds the dot until the turn finishes", () => {
+  it("holds the dot on a running session until the turn finishes", () => {
     mockConversations([{ ...CONV, status: "running" }]);
     renderSidebar();
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
     fireEvent.click(screen.getByTestId("mark-unread-conversation"));
 
-    // The unread baseline is persisted...
-    const stored = JSON.parse(localStorage.getItem("omnigent:last-seen-timestamps")!);
-    expect(stored.conv_1).toBe(CONV.updated_at - 1);
-    // ...but the dot stays suppressed mid-turn (the explicit override lifts
-    // the active-row suppression, not the running one).
+    // The dot stays suppressed mid-turn (the explicit override lifts the
+    // active-row suppression, not the running one).
     expect(screen.queryByText("(unread)")).toBeNull();
 
     // Once the turn finishes (row re-renders as idle), the dot lights — the
-    // persisted baseline now reads unseen for a finished session.
+    // baseline (kept in the in-memory mirror) now reads unseen for a
+    // finished session.
     cleanup();
     mockConversations([{ ...CONV, status: "idle" }]);
     renderSidebar();
@@ -297,17 +292,13 @@ describe("mark as unread", () => {
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
     fireEvent.click(screen.getByTestId("mark-unread-conversation"));
 
-    const stored = JSON.parse(localStorage.getItem("omnigent:last-seen-timestamps")!);
-    expect(stored.conv_1).toBe(CONV.updated_at - 1);
     expect(screen.getByText("(unread)")).toBeInTheDocument();
   });
 
   it("is hidden once the row is already unread", () => {
-    // Seed a baseline below updated_at so the row is already unseen.
-    localStorage.setItem(
-      "omnigent:last-seen-timestamps",
-      JSON.stringify({ conv_1: CONV.updated_at - 1 }),
-    );
+    // Seed a baseline below updated_at (as the conversation list would) so
+    // the row is already unseen.
+    seedReadState([{ id: "conv_1", viewer_last_seen: CONV.updated_at - 1 }]);
     renderSidebar();
 
     expect(screen.getByText("(unread)")).toBeInTheDocument();
