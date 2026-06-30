@@ -382,8 +382,14 @@ class SandboxLauncher(ABC):
         """
         Start *command* as a detached background process in the sandbox.
 
-        The default wraps the command in ``setsid nohup … & echo launched``
-        so it survives the exec session ending. Providers where backgrounded
+        The default wraps the command in ``setsid nohup sh -c '…' & echo
+        launched`` so it survives the exec session ending. The ``sh -c`` wrapper
+        is load-bearing: callers pass env-prefixed commands (e.g.
+        ``"ENV=val omnigent host …"``), and ``nohup`` does NOT honor shell
+        ``VAR=val`` assignment syntax — ``nohup ENV=val cmd`` makes nohup try to
+        exec a program literally named ``ENV=val`` ("No such file or directory").
+        Re-parsing the command under ``sh -c`` lets the inner shell apply the
+        assignments before running the program. Providers where backgrounded
         processes are reaped on exec return (e.g. OpenShell) override this
         to hold the exec stream open instead.
 
@@ -397,7 +403,8 @@ class SandboxLauncher(ABC):
         """
         return self.run(
             sandbox_id,
-            f"setsid nohup {command} > {log_path} 2>&1 < /dev/null & echo launched",
+            f"setsid nohup sh -c {shlex.quote(command)} "
+            f"> {log_path} 2>&1 < /dev/null & echo launched",
         )
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:

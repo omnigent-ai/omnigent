@@ -1292,6 +1292,11 @@ async def _forward_available_subagents(
                         "tool_use_id": meta["toolUseId"],
                     },
                     reason="permanent HTTP failure after retries",
+                    # Claude only dead-letters permanent 4xx (it retries
+                    # transient failures forever), so the server proved it
+                    # rejected the item: never ambiguous, never replayable (#1579).
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
                 )
                 # Park this sub-agent: insert a sentinel entry so we
                 # don't keep retrying. ``child_conversation_id=""``
@@ -1400,6 +1405,11 @@ async def _forward_available_subagents(
                             "response_id": item.response_id,
                         },
                         reason="permanent HTTP failure after retries",
+                        # Claude only dead-letters permanent 4xx (it retries
+                        # transient failures forever), so the server proved it
+                        # rejected the item: never ambiguous, never replayable (#1579).
+                        delivered_ambiguous=False,
+                        http_status=_http_status_for_log(exc),
                     )
                     # Skip this item and continue — alternative is to
                     # block the whole sub-agent forever on one poison
@@ -2889,6 +2899,11 @@ async def _forward_available_items(
                         "response_id": item.response_id,
                     },
                     reason="permanent HTTP failure after retries",
+                    # Claude only dead-letters permanent 4xx (it retries
+                    # transient failures forever), so the server proved it
+                    # rejected the item: never ambiguous, never replayable (#1579).
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
                 )
                 await _post_forwarder_failed_status(
                     client,
