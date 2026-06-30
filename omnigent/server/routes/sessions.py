@@ -9648,13 +9648,23 @@ async def _relay_runner_stream(
         )
         # Publish a failed status so the client's SSE stream sees a
         # clean error event instead of silent truncation (#1114).
-        _publish_status(
+        disconnect_error = ErrorDetail(
+            code="runner_disconnected",
+            message="Runner disconnected unexpectedly.",
+        )
+        _publish_status(session_id, "failed", disconnect_error)
+        # Persist the disconnect cause as durable labels so the
+        # distinction survives into snapshots and child-session
+        # summaries. Without this the relay-fed cache only carries a
+        # generic ``failed`` and ``last_task_error`` is dropped, leaving
+        # the UI unable to tell a benign runner disconnect from a real
+        # task failure (Option B: render a "Disconnected" pill, not the
+        # red "Failed" pill). Cleared on the next ``running`` edge by the
+        # session.status handler, exactly like other failure labels.
+        await _persist_session_status_error_labels(
             session_id,
-            "failed",
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
+            disconnect_error,
+            conversation_store,
         )
     except asyncio.CancelledError:
         raise
