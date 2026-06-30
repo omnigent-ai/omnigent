@@ -54,8 +54,8 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
-import { TitleBarServerPicker } from "./TitleBarServerPicker";
 import { SubagentsPanel } from "./SubagentsPanel";
+import { useSetTitleBarTitle } from "./titleBarTitleContext";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
   TerminalFirstContextProvider,
@@ -276,6 +276,17 @@ export function AppShell() {
   // is the only path through which the UI learns the user's permission
   // level. ``derivePermissionLevel`` prefers this over ``activeConv``.
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
+  // Feed the open thread's title to the macOS title-bar server picker, which
+  // now lives above the router (App.tsx) so it survives the unauthenticated
+  // login/setup pages. Mirrors the old inline
+  // `threadTitle={activeSession?.title ?? activeConv?.title}` prop; clearing on
+  // unmount drops the stale title when navigating off to an unauthed page (the
+  // undefined→value pair within one effect flush is batched, so no flicker).
+  const setTitleBarTitle = useSetTitleBarTitle();
+  useEffect(() => {
+    setTitleBarTitle(activeSession?.title ?? activeConv?.title);
+    return () => setTitleBarTitle(undefined);
+  }, [activeSession?.title, activeConv?.title, setTitleBarTitle]);
   // Same liveness the chat surface switches on (see ChatPage / useSessionLiveness).
   // AppShell reads it only to drive the Terminal pill's "loading" state: a session
   // in `starting` (a relaunch the moment a message is sent — `turnActive`) is
@@ -1058,17 +1069,12 @@ export function AppShell() {
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
           >
-            {/* Frameless-window titlebar stand-in (macOS Electron only): the
-          sidebar's electron top margin (see index.css) frees this strip of
-          canvas for the traffic lights, and the strip is the window's one
-          drag surface — content below and right stays fully clickable. */}
-            {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* Centered title + server picker in the freed title-bar strip. The
-          open thread's title (snapshot first — it's the only source for
-          child sessions — then the sidebar row) replaces the brand label. */}
-            {isMacElectronShell() && (
-              <TitleBarServerPicker threadTitle={activeSession?.title ?? activeConv?.title} />
-            )}
+            {/* The frameless-window title-bar chrome (drag strip + server
+          picker) is mounted once at the top level (App.tsx) so it survives the
+          unauthenticated login/setup pages where this shell isn't rendered;
+          AppShell only feeds it the open thread's title (see the
+          useSetTitleBarTitle effect above). `data-electron-mac` stays on this
+          element to scope the sidebar's top margin + traffic-light clearance. */}
             <Sidebar
               open={sidebarOpen}
               dragProgress={sidebarDragProgress}

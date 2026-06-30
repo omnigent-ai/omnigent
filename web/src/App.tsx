@@ -1,9 +1,12 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useState, type ReactNode } from "react";
 import { Route, Routes } from "react-router-dom";
 import { ChatPage } from "@/pages/ChatPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { TitleBarServerPicker } from "@/shell/TitleBarServerPicker";
+import { TitleBarTitleContext } from "@/shell/titleBarTitleContext";
+import { isMacElectronShell } from "@/lib/nativeBridge";
 
 // Lazy-load the three accounts pages so the bundle a header / OIDC
 // deploy ships (where accounts is off) doesn't include them in the
@@ -87,11 +90,45 @@ function App({ basename }: AppProps = {}) {
   // the original relative route table.
   const prefix = basename ?? "";
   const info = useServerInfo();
+  // Open thread's title, shown in the macOS title-bar picker as
+  // "<title> — <host>". Published by AppShell (the only place with a
+  // conversation in scope) through TitleBarTitleContext and held here, above
+  // the router, so the picker outlives AppShell on the unauthenticated pages.
+  // Undefined off those authed pages → the picker falls back to the brand.
+  const [threadTitle, setThreadTitle] = useState<string | null | undefined>(undefined);
   // While the probe is in flight, render nothing — first paint is
   // ~30ms after boot anyway, and flashing the chrome we may
   // immediately tear down once the probe returns is worse than a
   // tiny blank moment.
   if (info === "loading") return null;
+
+  // macOS Electron frameless-window title-bar chrome: the window-drag strip
+  // plus the server picker. Mounted by `withChrome` below so it wraps BOTH the
+  // authed AppShell subtree AND the unauthenticated /login · /register · setup
+  // branches — switching to a Railway (accounts-enabled) host lands on /login,
+  // and the picker must not vanish there (that was the bug). The picker talks
+  // only to the Electron shell over IPC (getServerPicker / switchServer), never
+  // to the Omnigent server, so it needs no identity/auth and is safe on
+  // unauthenticated pages. Hidden in plain browsers (isMacElectronShell() is
+  // false). The `data-electron-mac` wrapper re-supplies the index.css scope
+  // (drag strip geometry + the no-drag blanket that keeps the picker clickable)
+  // that the strip and picker relied on from AppShell's `.app-shell` element.
+  const titleBar = isMacElectronShell() ? (
+    <div data-electron-mac="true">
+      <div className="electron-drag-strip" aria-hidden="true" />
+      <TitleBarServerPicker threadTitle={threadTitle} />
+    </div>
+  ) : null;
+
+  // Wrap a route subtree with the (router-independent) title bar and the
+  // setter context AppShell uses to feed the picker its thread title. Suspense
+  // is centralized here so the lazy pages below have one boundary.
+  const withChrome = (children: ReactNode) => (
+    <TitleBarTitleContext.Provider value={setThreadTitle}>
+      {titleBar}
+      <Suspense fallback={null}>{children}</Suspense>
+    </TitleBarTitleContext.Provider>
+  );
 
   // First-run: accounts on but no admin claimed yet. Route EVERY path to
   // the Create-admin form so the first visitor lands on it no matter how
@@ -100,46 +137,42 @@ function App({ basename }: AppProps = {}) {
   // flips false the instant it succeeds — so this whole branch disappears
   // after the first admin exists.
   if (info.accounts_enabled && info.needs_setup) {
-    return (
-      <Suspense fallback={null}>
-        <Routes>
-          <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
-        </Routes>
-      </Suspense>
+    return withChrome(
+      <Routes>
+        <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
+      </Routes>,
     );
   }
 
-  return (
-    <Suspense fallback={null}>
-      <Routes>
-        {info.accounts_enabled && (
-          <>
-            <Route path={`${prefix}/login`} element={<LoginPage />} />
-            <Route path={`${prefix}/register`} element={<RegisterPage />} />
-          </>
-        )}
-        <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
-        <Route element={<AppShell />}>
-          <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
-          <Route path={`${prefix}/inbox`} element={<InboxPage />} />
-          {/* Settings renders into the chat outlet so the conversations
+  return withChrome(
+    <Routes>
+      {info.accounts_enabled && (
+        <>
+          <Route path={`${prefix}/login`} element={<LoginPage />} />
+          <Route path={`${prefix}/register`} element={<RegisterPage />} />
+        </>
+      )}
+      <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+      <Route element={<AppShell />}>
+        <Route path={prefix || "/"} element={<ChatPage />} />
+        <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+        <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+        {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
               defaults to Appearance. */}
-          <Route path={`${prefix}/settings`} element={<SettingsPage />} />
-          <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
-          {info.accounts_enabled && (
-            <>
-              <Route path={`${prefix}/members`} element={<MembersPage />} />
-              <Route path={`${prefix}/policies`} element={<PoliciesPage />} />
-            </>
-          )}
-          <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
-        </Route>
-      </Routes>
-    </Suspense>
+        <Route path={`${prefix}/settings`} element={<SettingsPage />} />
+        <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+        {info.accounts_enabled && (
+          <>
+            <Route path={`${prefix}/members`} element={<MembersPage />} />
+            <Route path={`${prefix}/policies`} element={<PoliciesPage />} />
+          </>
+        )}
+        <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
+      </Route>
+    </Routes>,
   );
 }
 
