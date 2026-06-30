@@ -19,14 +19,12 @@ const TWO_TASK_OUTPUT = JSON.stringify({
       title: "review-security",
       agent: "codex",
       model: "databricks-claude-haiku-4-5",
-      tier: "cheap",
       rationale: "Mechanical diff scan — cheap suffices.",
     },
     {
       title: "refactor-auth",
       agent: "claude_code",
       model: "databricks-claude-opus-4-8",
-      tier: "expensive",
       rationale: "Multi-file refactor needs deep reasoning.",
     },
   ],
@@ -59,14 +57,11 @@ describe("parsePlannedTasks", () => {
 });
 
 describe("parseRecommendations", () => {
-  it("maps titles to model/tier/rationale/agent", () => {
+  it("maps titles to model/rationale/agent (no tier)", () => {
     const recs = parseRecommendations(TWO_TASK_OUTPUT);
     expect(recs).not.toBeNull();
-    // Content equality proves the response fields actually thread through —
-    // a half-parsed entry would surface here as a missing/empty field.
     expect(recs!.get("refactor-auth")).toEqual({
       model: "databricks-claude-opus-4-8",
-      tier: "expensive",
       rationale: "Multi-file refactor needs deep reasoning.",
       agent: "claude_code",
     });
@@ -115,9 +110,7 @@ describe("SmartRoutingCard — sized (success)", () => {
     // Short model names from the shared pill — proves the recommendation
     // content (not just the row scaffolding) made it through the parse.
     expect(card()).toHaveTextContent("haiku");
-    expect(card()).toHaveTextContent("cheap");
     expect(card()).toHaveTextContent("opus");
-    expect(card()).toHaveTextContent("expensive");
     expect(card()).toHaveTextContent("Mechanical diff scan — cheap suffices.");
     expect(card()).toHaveTextContent("Multi-file refactor needs deep reasoning.");
   });

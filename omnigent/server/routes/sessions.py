@@ -12742,7 +12742,6 @@ async def _handle_advise_models_mcp(
                     "title": title,
                     "agent": agent,
                     "model": None,
-                    "tier": None,
                     "rationale": f"no tiers available for harness {harness!r}",
                 }
             )
@@ -12762,7 +12761,6 @@ async def _handle_advise_models_mcp(
                     "title": title,
                     "agent": agent,
                     "model": None,
-                    "tier": None,
                     "rationale": "router returned no verdict",
                 }
             )
@@ -12772,7 +12770,6 @@ async def _handle_advise_models_mcp(
                     "title": title,
                     "agent": agent,
                     "model": verdict.model,
-                    "tier": verdict.tier,
                     "rationale": verdict.rationale,
                 }
             )

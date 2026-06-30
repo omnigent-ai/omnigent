@@ -24,7 +24,6 @@ interface PlannedTask {
 /** One sized recommendation (from the tool's response JSON). */
 interface Recommendation {
   model: string;
-  tier: string;
   rationale: string;
   /** Target worker as echoed in the response; `""` when absent. */
   agent: string;
@@ -75,13 +74,10 @@ export function parseRecommendations(output: string): Map<string, Recommendation
       typeof rec.title === "string" &&
       rec.title.length > 0 &&
       typeof rec.model === "string" &&
-      rec.model.length > 0 &&
-      typeof rec.tier === "string" &&
-      rec.tier.length > 0
+      rec.model.length > 0
     ) {
       map.set(rec.title, {
         model: rec.model,
-        tier: rec.tier,
         rationale: typeof rec.rationale === "string" ? rec.rationale : "",
         agent: typeof rec.agent === "string" ? rec.agent : "",
       });
