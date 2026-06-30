@@ -386,6 +386,34 @@ def _discover_session_id(
     return None
 
 
+def _discover_child_session(db_path: Path, parent_session_id: str) -> str | None:
+    """Return the newest Hermes session whose parent is *parent_session_id*.
+
+    Hermes auto-compresses by ending the current session and forking a CHILD
+    (``sessions.parent_session_id`` points at the old id; present in hermes
+    v0.17.0 state.db). The forwarder pins one id for life, so after compaction it
+    keeps polling the dead parent and the chat goes silent. Re-discover the
+    newest child so the mirror re-pins. Mirrors :func:`_discover_session_id`'s
+    read-only connect + swallow-and-warn handling; returns ``None`` on any error.
+    """
+    con = _connect_ro(db_path)
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT id FROM sessions WHERE parent_session_id = ? ORDER BY started_at DESC LIMIT 1",
+            (parent_session_id,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("child discovery", exc)
+        return None
+    finally:
+        con.close()
+    if row and isinstance(row[0], str) and row[0]:
+        return row[0]
+    return None
+
+
 def _same_path(a: str, b: str) -> bool:
     """Return whether two filesystem paths resolve to the same realpath."""
     try:
@@ -765,6 +793,41 @@ async def forward_hermes_store_to_session(
                             except Exception:  # noqa: BLE001
                                 _logger.warning(
                                     "Failed to persist hermes compaction item for %s",
+                                    session_id,
+                                    exc_info=True,
+                                )
+                            # Compaction ends this Hermes session and forks a
+                            # child (parent_session_id chain). Re-pin to the
+                            # newest child so the mirror follows the live session
+                            # instead of polling the dead parent forever. Done at
+                            # most once per compaction (compaction_persisted resets
+                            # to False for the child, which carries no compacted
+                            # rows yet); if no child exists we stay on the parent.
+                            try:
+                                child = await asyncio.to_thread(
+                                    _discover_child_session, db, hermes_session_id
+                                )
+                                if child is not None and not await asyncio.to_thread(
+                                    _session_claimed_by_other, bridge_dir, child, launch_epoch_s
+                                ):
+                                    hermes_session_id = child
+                                    last_id = 0
+                                    compaction_persisted = False
+                                    _external_id_synced = False
+                                    _write_state(
+                                        bridge_dir,
+                                        _ForwardState(
+                                            hermes_session_id=child,
+                                            last_id=0,
+                                            launch_epoch_s=launch_epoch_s,
+                                        ),
+                                    )
+                                    continue
+                            except Exception:  # noqa: BLE001
+                                _logger.warning(
+                                    "hermes forwarder failed to re-pin to child session "
+                                    "after compaction; staying on %s; session=%s",
+                                    hermes_session_id,
                                     session_id,
                                     exc_info=True,
                                 )
