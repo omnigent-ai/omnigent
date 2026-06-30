@@ -142,3 +142,7 @@ Frontend changes follow the same expectation with a different toolchain:
 
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
 - Sign off your commits with `git commit -s` (Developer Certificate of Origin).
+- Fill in the PR template. For **UI / frontend changes**, check the
+  "UI / frontend change" box and attach a **video or images** in the `Demo`
+  section showing the new behaviour, so reviewers can see it without checking
+  out the branch.

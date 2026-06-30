@@ -1,10 +1,11 @@
 <!--
 For AI-written descriptions:
-- Follow this template (Related issue, Summary, Test Plan, Type of change, Test coverage, Coverage notes).
+- Follow this template (Related issue, Summary, Test Plan, Demo, Type of change, Test coverage, Coverage notes).
 - Keep it concise; reviewers skim long descriptions.
 - For non-trivial changes, include an ELI5 and a diagram (ASCII or mermaid).
-- Leave every checkbox in place. The PR Template check fails if required sections
-  or checkbox rows are removed.
+- Keep every section and checkbox row in place so reviewers can skim them.
+- For UI changes (the "UI / frontend change" box below), fill in the Demo
+  section: attach a screenshot or screen recording of the new behaviour.
 -->
 
 ## Related issue
@@ -27,10 +28,20 @@ Closes #
 
 <!-- How was this change tested? Describe the steps, commands, or scenarios used to verify it. Include a screenshot or recording where helpful. -->
 
+## Demo
+
+<!--
+Video or images demonstrating the change. Drag-and-drop a screenshot or screen
+recording, or paste a link. Expected for UI / frontend changes (check the
+"UI / frontend change" box below) — show the new behaviour. Optional otherwise;
+use `N/A` for non-visual changes.
+-->
+
 ## Type of change
 
 - [ ] Bug fix
 - [ ] Feature
+- [ ] UI / frontend change
 - [ ] Refactor / chore
 - [ ] Docs
 - [ ] Test / CI

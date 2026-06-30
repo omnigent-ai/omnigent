@@ -22,6 +22,7 @@ REQUIRED_HEADINGS = (
 TYPE_LABELS = (
     "Bug fix",
     "Feature",
+    "UI / frontend change",
     "Refactor / chore",
     "Docs",
     "Test / CI",
@@ -134,6 +135,19 @@ def validate_pr_body(body: str) -> ValidationResult:
     checked_types = _checked_labels(type_section, TYPE_LABELS)
     if not checked_types:
         errors.append("Check at least one Type of change checkbox.")
+
+    # The Demo section is mandatory for UI / frontend changes — reviewers need
+    # a screenshot or recording of the new behaviour. It stays optional for
+    # everything else.
+    if "UI / frontend change" in checked_types:
+        demo = _meaningful_text(_section(body, spans, "Demo"))
+        if not demo:
+            errors.append(
+                "Demo is required for UI / frontend changes — attach a screenshot "
+                "or screen recording demonstrating the new behaviour."
+            )
+        elif _contains_placeholder(demo):
+            errors.append("Demo still contains template placeholder text.")
 
     test_section = _section(body, spans, "Test coverage")
     missing_test_labels = _missing_labels(test_section, TEST_LABELS)

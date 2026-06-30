@@ -24,6 +24,7 @@ def _valid_body(
     type_checkboxes: str = """
 - [x] Bug fix
 - [ ] Feature
+- [ ] UI / frontend change
 - [ ] Refactor / chore
 - [ ] Docs
 - [ ] Test / CI
@@ -38,8 +39,10 @@ def _valid_body(
 - [ ] Not applicable
 """,
     coverage_notes: str | None = None,
+    demo: str | None = None,
 ) -> str:
     notes_section = "" if coverage_notes is None else f"\n## Coverage notes\n\n{coverage_notes}\n"
+    demo_section = "" if demo is None else f"\n## Demo\n\n{demo}\n"
     return f"""
 ## Summary
 
@@ -48,11 +51,22 @@ def _valid_body(
 ## Test Plan
 
 {test_plan}
-
+{demo_section}
 ## Type of change
 {type_checkboxes}
 ## Test coverage
 {test_checkboxes}{notes_section}"""
+
+
+_UI_CHANGE = """
+- [ ] Bug fix
+- [ ] Feature
+- [x] UI / frontend change
+- [ ] Refactor / chore
+- [ ] Docs
+- [ ] Test / CI
+- [ ] Breaking change
+"""
 
 
 _MANUAL_ONLY = """
@@ -194,3 +208,35 @@ def test_not_applicable_with_empty_coverage_notes_after_comment_is_rejected() ->
     result = module.validate_pr_body(body)
     assert not result.ok
     assert any(error.startswith("Coverage notes are required") for error in result.errors)
+
+
+def test_demo_optional_for_non_ui_change() -> None:
+    # Default body is a bug fix with no Demo section.
+    result = module.validate_pr_body(_valid_body())
+    assert result.ok, result.errors
+
+
+def test_ui_change_requires_demo() -> None:
+    body = _valid_body(type_checkboxes=_UI_CHANGE)
+    result = module.validate_pr_body(body)
+    assert not result.ok
+    assert any(error.startswith("Demo is required") for error in result.errors)
+
+
+def test_ui_change_with_empty_demo_after_comment_is_rejected() -> None:
+    body = _valid_body(
+        type_checkboxes=_UI_CHANGE,
+        demo="<!-- nothing meaningful here -->",
+    )
+    result = module.validate_pr_body(body)
+    assert not result.ok
+    assert any(error.startswith("Demo is required") for error in result.errors)
+
+
+def test_ui_change_with_demo_passes() -> None:
+    body = _valid_body(
+        type_checkboxes=_UI_CHANGE,
+        demo="![new settings panel](https://github.com/org/repo/assets/1/screenshot.png)",
+    )
+    result = module.validate_pr_body(body)
+    assert result.ok, result.errors
