@@ -75,155 +75,42 @@ harnesses, and credentials.
 
 ### Backend-only local development validation
 
-Use this recipe when you want to validate the Python backend and local API
-server from a source checkout without building `ap-web`, configuring provider
-credentials, creating sessions, or running agents. It is useful for quick
-server/API smoke checks on current `main`.
+Use this when you want to validate the Python backend and local API server from
+a source checkout without building the web UI, configuring provider
+credentials, creating sessions, or running agents -- a quick server/API smoke
+check on your working copy or current `main`.
 
-Prerequisites:
-
-- Linux or another POSIX-like shell environment.
-- Python 3.12+ available as `python3`.
-- `git`.
-- Network access to the Python package index for dependency resolution.
-- No provider credentials are required for this backend-only smoke test.
-
-The example below keeps the toolchain, project environment, database,
-artifacts, logs, and caches under one disposable runtime directory.
+[`scripts/backend-smoke.sh`](scripts/backend-smoke.sh) automates it:
 
 ```bash
-runtime_root="$(mktemp -d /tmp/omnigent_backend_XXXXXX)"
-runtime_checkout="$runtime_root/omnigent"
-toolchain_venv="$runtime_root/toolchain_venv"
-project_venv="$runtime_root/project_venv"
-runtime_home="$runtime_root/home"
-runtime_tmp="$runtime_root/tmp"
-runtime_config="$runtime_root/config"
-runtime_data="$runtime_root/data"
-runtime_cache="$runtime_root/cache"
-runtime_pip_cache="$runtime_cache/pip"
-runtime_uv_cache="$runtime_cache/uv"
-runtime_logs="$runtime_root/logs"
-runtime_artifacts="$runtime_root/artifacts"
-runtime_db="$runtime_data/omnigent/chat.db"
-
-mkdir -p \
-  "$runtime_home" \
-  "$runtime_tmp" \
-  "$runtime_config/xdg" \
-  "$runtime_data/xdg" \
-  "$runtime_cache/xdg" \
-  "$runtime_pip_cache" \
-  "$runtime_uv_cache" \
-  "$runtime_logs" \
-  "$runtime_artifacts" \
-  "$(dirname "$runtime_db")" \
-  "$runtime_config/omnigent" \
-  "$runtime_data/omnigent"
-
-git clone https://github.com/omnigent-ai/omnigent.git "$runtime_checkout"
-
-python3 -m venv "$toolchain_venv"
-python3 -m venv "$project_venv"
-
-HOME="$runtime_home" \
-TMPDIR="$runtime_tmp" \
-PIP_CACHE_DIR="$runtime_pip_cache" \
-"$toolchain_venv/bin/python" -m pip install "uv>=0.11.8"
-
-cd "$runtime_checkout"
-
-HOME="$runtime_home" \
-TMPDIR="$runtime_tmp" \
-XDG_CONFIG_HOME="$runtime_config/xdg" \
-XDG_DATA_HOME="$runtime_data/xdg" \
-XDG_CACHE_HOME="$runtime_cache/xdg" \
-PIP_CACHE_DIR="$runtime_pip_cache" \
-UV_CACHE_DIR="$runtime_uv_cache" \
-UV_PROJECT_ENVIRONMENT="$project_venv" \
-UV_PYTHON_DOWNLOAD=never \
-OMNIGENT_CONFIG_HOME="$runtime_config/omnigent" \
-OMNIGENT_DATA_DIR="$runtime_data/omnigent" \
-OMNIGENT_DATABASE_URI="sqlite:///$runtime_db" \
-OMNIGENT_SKIP_WEB_UI=true \
-"$toolchain_venv/bin/uv" sync --frozen
+scripts/backend-smoke.sh              # boots on port 18080
+PORT=18090 scripts/backend-smoke.sh   # override the port if 18080 is busy
 ```
 
-`UV_PROJECT_ENVIRONMENT` tells `uv` to use the already-created project
-virtualenv. `UV_PYTHON_DOWNLOAD=never` keeps `uv` from downloading Python
-interpreters. `OMNIGENT_SKIP_WEB_UI=true` skips the web UI build and leaves the
-server in API-only mode.
+It installs `uv` into a throwaway toolchain venv, runs `uv sync --frozen`,
+starts the server in API-only mode (`OMNIGENT_SKIP_WEB_UI=true`), waits for
+`/health`, and smoke-tests `/`, `/health`, `/docs`, `/v1/agents`, and
+`/v1/sessions` -- expecting HTTP `200` from all five. It exits non-zero if any
+check fails.
 
-Start the backend server with an explicit detached lifecycle. If port 18080 is
-already in use, choose another free local port and reuse it in the smoke
-checks.
+Notes:
 
-```bash
-selected_port=18080
-
-cd "$runtime_checkout"
-
-nohup env \
-  HOME="$runtime_home" \
-  TMPDIR="$runtime_tmp" \
-  XDG_CONFIG_HOME="$runtime_config/xdg" \
-  XDG_DATA_HOME="$runtime_data/xdg" \
-  XDG_CACHE_HOME="$runtime_cache/xdg" \
-  PIP_CACHE_DIR="$runtime_pip_cache" \
-  UV_CACHE_DIR="$runtime_uv_cache" \
-  UV_PROJECT_ENVIRONMENT="$project_venv" \
-  UV_PYTHON_DOWNLOAD=never \
-  OMNIGENT_CONFIG_HOME="$runtime_config/omnigent" \
-  OMNIGENT_DATA_DIR="$runtime_data/omnigent" \
-  OMNIGENT_DATABASE_URI="sqlite:///$runtime_db" \
-  OMNIGENT_SKIP_WEB_UI=true \
-  "$project_venv/bin/omnigent" server \
-    --host 127.0.0.1 \
-    --port "$selected_port" \
-    --database-uri "sqlite:///$runtime_db" \
-    --artifact-location "$runtime_artifacts" \
-  < /dev/null > "$runtime_logs/omnigent_server.log" 2>&1 &
-
-server_pid="$!"
-echo "$server_pid"
-```
-
-The important lifecycle details are `nohup`, stdin redirected from
-`/dev/null`, stdout/stderr redirected to a log file, and exact PID capture.
-
-Wait for the health endpoint before running smoke checks:
-
-```bash
-for i in {1..60}; do
-  code="$(curl -s -o /dev/null -w "%{http_code}" \
-    --max-time 2 "http://127.0.0.1:${selected_port}/health" || true)"
-  [ "$code" = "200" ] && break
-  sleep 0.5
-done
-```
-
-Smoke-test local API-only endpoints:
-
-```bash
-for path in / /health /docs /v1/agents /v1/sessions; do
-  printf "%s " "$path"
-  curl -s -o /dev/null -w "%{http_code}\n" \
-    --max-time 5 "http://127.0.0.1:${selected_port}${path}"
-done
-```
-
-Expected result: HTTP `200` for all five paths.
-
-Clean up only the process started by this recipe:
-
-```bash
-kill -TERM "$server_pid" 2>/dev/null || true
-wait "$server_pid" 2>/dev/null || true
-```
-
-This backend-only path does not validate the web UI, mobile access,
-human-in-the-loop approval flows, provider-backed sessions, or agent execution.
-Use the full local development flow above when working on those areas.
+- **Requires `bash` or `zsh`** (the script's `#!/usr/bin/env bash` shebang
+  guarantees this); it is not POSIX-`sh` portable. **Also needs** Python 3.12+
+  as `python3`, `git`, `curl`, and network access to PyPI. No provider
+  credentials are needed. **Works on Linux and macOS.**
+- **Fully isolated, disposable:** every artifact -- the toolchain and project
+  venvs, config, data, the SQLite database, artifacts, logs, and `pip`/`uv`
+  caches -- lives under one `mktemp -d` runtime directory removed on exit, so
+  the run never touches your real `~/.omnigent`, `~/.config` / `~/Library`, or
+  package caches. `HOME` is the primary isolation lever (it redirects
+  `~/.config` on Linux and `~/Library` on macOS); the explicit `UV_*` / `PIP_*`
+  / `OMNIGENT_*` overrides pin the toolchain and app state regardless of OS,
+  and `XDG_*` are set so an `XDG_*` already exported in your shell cannot
+  redirect state back to your real home.
+- **What it does not cover:** the web UI, mobile access, human-in-the-loop
+  approval flows, provider-backed sessions, or agent execution. Use the full
+  local development flow above when working on those areas.
 
 ## Tests
 
