@@ -103,6 +103,54 @@ export function shortModelName(model: string): string {
 }
 
 /**
+ * Inline pill showing a model's short name and tier — shared between the
+ * routing decision chip (StatusBlocks) and the SmartRoutingCard plan rows.
+ *
+ * @param model Model id, e.g. `"databricks-claude-haiku-4-5"`.
+ * @param tier Difficulty tier the router assigned, e.g. `"cheap"`.
+ */
+export function ModelTierPill({ model, tier }: { model: string; tier: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] leading-none">
+      <span className="font-medium text-foreground">{shortModelName(model)}</span>
+      <span className="text-muted-foreground">· {tier}</span>
+    </span>
+  );
+}
+
+// Lucide "waypoints" geometry — a routing topology: four nodes joined by
+// connectors. Split so the on state fills the nodes and stages the
+// connector traces in separately.
+const WAYPOINT_NODES = [
+  { cx: 12, cy: 4.5 },
+  { cx: 4.5, cy: 12 },
+  { cx: 19.5, cy: 12 },
+  { cx: 12, cy: 19.5 },
+] as const;
+const WAYPOINT_TRACE_PATHS = ["m10.2 6.3-3.9 3.9", "M7 12h10", "m15.7 17.7-3.9-3.9"] as const;
+
+/** Muted outline waypoints — the resting (off) face of the toggle. */
+function SparkleOutline() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="size-4"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {WAYPOINT_NODES.map((n) => (
+        <circle key={`${n.cx}-${n.cy}`} cx={n.cx} cy={n.cy} r={2.5} />
+      ))}
+    </svg>
+  );
+}
+
+
+/**
  * The router glyph — Lucide's `brain-circuit` icon: a brain wired into
  * circuit nodes, reading as "model intelligence picks the route".
  * Rendered in both toggle layers; the off→on cross-fade and the brand-pink
