@@ -113,9 +113,17 @@ export function seedReadState(conversations: readonly ReadStateSeed[]): void {
   if (changed) notifySubscribers();
 }
 
-/** Seeds the read-state mirror from the conversation list as it loads. */
-export function useSeedReadState(conversations: readonly ReadStateSeed[]): void {
+/**
+ * Seeds the read-state mirror from the conversation list once it loads.
+ * Pass `undefined` while the list query is still loading: until a real
+ * (possibly empty) list arrives we must NOT seed or flip `hydrated`, or the
+ * transient empty list on a deep-link/reload would release the mark-seen
+ * gate before the server's `viewer_*` read-state is known — clobbering a
+ * cross-device unread (the very race the gate guards).
+ */
+export function useSeedReadState(conversations: readonly ReadStateSeed[] | undefined): void {
   useEffect(() => {
+    if (conversations === undefined) return;
     seedReadState(conversations);
   }, [conversations]);
 }

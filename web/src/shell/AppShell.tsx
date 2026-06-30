@@ -257,8 +257,11 @@ export function AppShell() {
   useIdleNotifications(conversationId);
   // Seed the per-user read-state (unread/seen) mirror from the conversation
   // list, so the sidebar dots reflect what the user did on any device.
+  // `undefined` while the query is still loading (vs `[]` for a loaded-but-
+  // empty list) so the seed — and the `hydrated` gate it flips — waits for
+  // the real read-state, not the transient empty list on a deep-link/reload.
   const allConversations = useMemo(
-    () => conversationsData?.pages.flatMap((p) => p.data) ?? [],
+    () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
   );
   useSeedReadState(allConversations);

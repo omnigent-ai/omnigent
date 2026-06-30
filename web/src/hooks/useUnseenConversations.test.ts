@@ -70,6 +70,28 @@ describe("seedReadState", () => {
     mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000, viewer_unread: false }]);
     expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
   });
+
+  it("keeps the mark-seen gate closed while the list is still loading (undefined)", async () => {
+    // useSeedReadState(undefined) — the query hasn't loaded — must NOT flip
+    // `hydrated`, or an automatic mark-seen on a deep-link/reload would write
+    // a 'seen' baseline before the server's viewer_* arrives (clobbering a
+    // cross-device unread). Only a loaded list (even empty []) releases it.
+    const mod = await loadFresh();
+    vi.useFakeTimers({ now: 5_000_000 });
+    const { rerender } = renderHook(
+      ({ c }: { c: readonly { id: string }[] | undefined }) => mod.useSeedReadState(c),
+      { initialProps: { c: undefined as readonly { id: string }[] | undefined } },
+    );
+
+    // Loading: gate closed — mark-seen is a no-op (no baseline written).
+    mod.markConversationSeen("conv-1");
+    expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(false);
+
+    // Loaded (empty) list arrives: gate releases, mark-seen now writes.
+    rerender({ c: [] });
+    mod.markConversationSeen("conv-1");
+    expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(true); // 6000 > 5000 baseline
+  });
 });
 
 describe("isConversationUnseen", () => {
