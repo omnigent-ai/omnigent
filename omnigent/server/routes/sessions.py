@@ -8402,39 +8402,6 @@ async def _emit_server_routing_decision(
         )
         persisted_id = None
 
-    # Persist the verdict as a session label so the AgentInfo popover's
-    # "Intelligent model router" section can read it (it uses
-    # parseCostRoutingVerdict which reads the cost_control.plan label).
-    try:
-        import datetime
-
-        from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL
-
-        label_value = json.dumps(
-            {
-                "version": 3,
-                "tier": item_data["tier"],
-                "model": model,
-                "applied": True,
-                "rationale": item_data["rationale"],
-                "turn_anchor": datetime.datetime.now(tz=datetime.UTC).isoformat(),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {COST_CONTROL_PLAN_LABEL: label_value},
-        )
-        _logger.info("Server routing: persisted verdict label for session=%s", session_id)
-    except Exception:  # noqa: BLE001  # best-effort label; must not crash routing
-        _logger.warning(
-            "Server routing: failed to persist verdict label for session=%s",
-            session_id,
-            exc_info=True,
-        )
-
     # Publish live event so the web UI renders the chip immediately.
     session_stream.publish(
         session_id,
@@ -12874,12 +12841,12 @@ async def _handle_advise_models_mcp(
         else:
             chosen_agent = model_to_agent.get(verdict.model)
             recommendations.append(
-                    {
-                        "title": title,
-                        "agent": chosen_agent,
-                        "model": verdict.model,
-                        "rationale": verdict.rationale,
-                    }
+                {
+                    "title": title,
+                    "agent": chosen_agent,
+                    "model": verdict.model,
+                    "rationale": verdict.rationale,
+                }
             )
 
     return _mcp_tool_result(
