@@ -170,6 +170,25 @@ def native_coding_agent_for_agent_name(name: str | None) -> NativeCodingAgent | 
     return _BY_AGENT_NAME.get(name or "")
 
 
+def public_agent_name(name: str | None) -> str | None:
+    """Return a user-facing agent name, hiding internal native-UI wrapper names.
+
+    Native coding-agent wrappers carry an internal ``<tool>-native-ui`` agent
+    name (e.g. ``pi-native-ui``) that is an Omnigent implementation detail. When
+    such a name is projected into tool output the model reads — and may repeat
+    back to the user (``sys_session_get_info`` answering "what agent are you?")
+    — expose the clean public display name (e.g. ``Pi``) instead, so the
+    ``-native-ui`` wrapper name never leaks. Any non-wrapper name, including
+    ``None``, passes through unchanged.
+
+    :param name: The raw bound agent name from a session snapshot, or ``None``.
+    :returns: The wrapper's display name when *name* is a native-UI wrapper,
+        else *name* unchanged.
+    """
+    agent = native_coding_agent_for_agent_name(name)
+    return agent.display_name if agent is not None else name
+
+
 def native_coding_agent_for_harness(harness: str | None) -> NativeCodingAgent | None:
     """Return the native coding-agent metadata for *harness*, if any.
 
