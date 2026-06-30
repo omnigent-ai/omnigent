@@ -1,4 +1,12 @@
-import { type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type DragEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -123,6 +131,16 @@ const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
 // session's terminal_launch_args. Keep in sync with `claude --help`.
+// Harnesses for which server-side smart routing is available.
+const _ROUTABLE_HARNESSES = new Set([
+  "claude-sdk",
+  "claude_sdk",
+  "claude-native",
+  "codex",
+  "codex-native",
+  "pi",
+]);
+
 const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
   { value: "default", label: "Default", description: "Prompts before edits and commands" },
@@ -1630,6 +1648,40 @@ function AgentHarnessPicker({
   );
 }
 
+// In-memory draft for the new-session landing screen, so a half-composed
+// message, attachments and picker selections survive the unmount that happens
+// when the user navigates into an existing session and back. Module-scoped,
+// not persisted to storage (a page refresh starts clean); cleared on create.
+type LandingDraft = {
+  message: string;
+  files: File[];
+  pickedAgentId: string | null;
+  selectedHostId: string | null;
+  sandboxSelected: boolean;
+  sandboxRepoUrl: string;
+  sandboxRepoBranch: string;
+  workspace: string;
+  branchName: string;
+  baseBranch: string;
+  permissionMode: string;
+  approvalMode: string;
+  bypassSandbox: boolean;
+  cursorExecMode: string;
+  pickedHarness: string | null;
+  pickedModel: string;
+  pickedEffort: string;
+  costControlMode: CostControlMode;
+};
+
+let landingDraft: LandingDraft | null = null;
+
+// Test-only: clears the preserved landing draft so each case starts from a
+// clean module state (the draft is module-scoped and survives unmount by
+// design, which would otherwise leak between tests).
+export function resetLandingDraft(): void {
+  landingDraft = null;
+}
+
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -1674,7 +1726,7 @@ export function NewChatLandingScreen() {
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
-  const [message, setMessage] = useState<string>("");
+  const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
@@ -1684,7 +1736,7 @@ export function NewChatLandingScreen() {
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addFiles = (incoming: File[]) => setFiles((prev) => [...prev, ...incoming]);
   const removeFile = (index: number) => setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -1745,12 +1797,18 @@ export function NewChatLandingScreen() {
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default).
-  const [pickedAgentId, setPickedAgentId] = useState<string | null>(() => readLastAgentId());
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  const [pickedAgentId, setPickedAgentId] = useState<string | null>(
+    () => landingDraft?.pickedAgentId ?? readLastAgentId(),
+  );
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(
+    () => landingDraft?.selectedHostId ?? null,
+  );
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
-  const [sandboxSelected, setSandboxSelected] = useState(false);
+  const [sandboxSelected, setSandboxSelected] = useState(
+    () => landingDraft?.sandboxSelected ?? false,
+  );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
@@ -1762,11 +1820,15 @@ export function NewChatLandingScreen() {
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
-  const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>("");
-  const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>("");
-  const [workspace, setWorkspace] = useState<string>("");
-  const [branchName, setBranchName] = useState<string>("");
-  const [baseBranch, setBaseBranch] = useState<string>("");
+  const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(
+    () => landingDraft?.sandboxRepoUrl ?? "",
+  );
+  const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
+    () => landingDraft?.sandboxRepoBranch ?? "",
+  );
+  const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
+  const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
+  const [baseBranch, setBaseBranch] = useState<string>(() => landingDraft?.baseBranch ?? "");
   // Project to file the new session under (an implicit collection stored as a
   // conversation_labels row). Empty = unfiled. Applied right after create.
   // Pre-filled from a `?project=` query param so the sidebar's per-project
@@ -1783,42 +1845,95 @@ export function NewChatLandingScreen() {
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
   const [permissionMode, setPermissionMode] = useState<string>(
-    CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    () => landingDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
   // Approval mode for Codex (codex --approval-mode). Only meaningful for
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
-  const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
+  const [approvalMode, setApprovalMode] = useState<string>(
+    () => landingDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+  );
   // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
   // flippable on after the user types the confirmation phrase, so it can
   // never be enabled by an accidental click. Persisted as a conversation
   // label so it survives reload. When on, a persistent red banner warns and
   // the runner ignores the approval-mode preset's flags.
-  const [bypassSandbox, setBypassSandbox] = useState<boolean>(false);
+  const [bypassSandbox, setBypassSandbox] = useState<boolean>(
+    () => landingDraft?.bypassSandbox ?? false,
+  );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
-  const [cursorExecMode, setCursorExecMode] = useState<string>(CURSOR_NATIVE_DEFAULT_EXEC_MODE);
+  const [cursorExecMode, setCursorExecMode] = useState<string>(
+    () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+  );
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
-  const [pickedHarness, setPickedHarness] = useState<string | null>(null);
+  const [pickedHarness, setPickedHarness] = useState<string | null>(
+    () => landingDraft?.pickedHarness ?? null,
+  );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
   // are omitted from the create, so Claude Code uses its own configured model.
   // An explicit pick rides along and is remembered (seeded back on a later visit
   // via the harness-seed effect below).
-  const [pickedModel, setPickedModel] = useState<string>("");
-  const [pickedEffort, setPickedEffort] = useState<string>("");
+  const [pickedModel, _setPickedModel] = useState<string>(() => landingDraft?.pickedModel ?? "");
+  const [pickedEffort, setPickedEffort] = useState<string>(() => landingDraft?.pickedEffort ?? "");
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
-  const [costControlMode, setCostControlMode] = useState<CostControlMode>(null);
+  const [costControlMode, _setCostControlMode] = useState<CostControlMode>(
+    () => landingDraft?.costControlMode ?? null,
+  );
+  // Model selection and smart routing are mutually exclusive: enabling
+  // routing clears the explicit model pick, and picking a model turns
+  // routing off.
+  const setPickedModel = useCallback((model: string) => {
+    _setPickedModel(model);
+    if (model) _setCostControlMode(null);
+  }, []);
+  const setCostControlMode = useCallback((mode: CostControlMode) => {
+    _setCostControlMode(mode);
+    if (mode === "on") _setPickedModel("");
+  }, []);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
+
+  // Mirror the current draft fields into a ref every render so the unmount
+  // cleanup below can snapshot the latest values without re-subscribing.
+  // `submittedRef` is flipped just before we navigate to a freshly-created
+  // session so the snapshot is dropped instead of resurrected.
+  const submittedRef = useRef(false);
+  const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
+  draftRef.current = {
+    message,
+    files,
+    pickedAgentId,
+    selectedHostId,
+    sandboxSelected,
+    sandboxRepoUrl,
+    sandboxRepoBranch,
+    workspace,
+    branchName,
+    baseBranch,
+    permissionMode,
+    approvalMode,
+    bypassSandbox,
+    cursorExecMode,
+    pickedHarness,
+    pickedModel,
+    pickedEffort,
+    costControlMode,
+  };
+  useEffect(() => {
+    return () => {
+      landingDraft = submittedRef.current ? null : draftRef.current;
+    };
+  }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -2431,6 +2546,11 @@ export function NewChatLandingScreen() {
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
+      // The session was created — drop the preserved draft so the next visit
+      // to the landing screen starts clean (and the unmount cleanup below
+      // doesn't resurrect what we just sent).
+      submittedRef.current = true;
+      landingDraft = null;
       navigate(`/c/${data.id}`);
     } catch {
       setCreateError("Couldn't reach the server. Check your connection and try again.");
@@ -2776,9 +2896,14 @@ export function NewChatLandingScreen() {
                   setPickedEffort={setPickedEffort}
                   setPickedHarness={setPickedHarness}
                 />
-                {smartRoutingEnabled && selectedAgent && (
-                  <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
-                )}
+                {smartRoutingEnabled &&
+                  selectedAgent &&
+                  _ROUTABLE_HARNESSES.has(selectedAgent.harness ?? "") && (
+                    <IntelligentModelControl
+                      value={costControlMode}
+                      onChange={setCostControlMode}
+                    />
+                  )}
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -3150,8 +3275,13 @@ export function NewChatLandingScreen() {
               )}
 
               {/* Project chip — files the session under a named project on
-                create. Sits after the worktree chip. */}
-              <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
+                create. Sits after the worktree chip. Only shown when a project
+                is already selected (e.g. quick-starting from an existing
+                project's "new session" pencil, which passes `?project=`);
+                otherwise the new-session flow stays unfiled. */}
+              {selectedProject && (
+                <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
+              )}
             </div>
             {/* The agent / harness picker moved out of the tray and into the
                 composer's right action cluster (next to Send) — see

@@ -497,6 +497,30 @@ HostFrame = (
 # ── Encode / decode ──────────────────────────────────────
 
 
+def _encode_payload(payload: dict[str, Any]) -> str:
+    """Serialize a frame payload, injecting the active trace context.
+
+    Centralized so every host frame carries a W3C ``traceparent`` (and
+    ``tracestate`` when set) whenever it is encoded inside an active
+    span — the host tunnel is a JSON-frame transport no OTel
+    auto-instrumentor can see, so this is how the Host Daemon ↔ Server
+    boundary joins the distributed trace. When no span is active the
+    payload is unchanged. Decoders ignore the extra envelope keys, so
+    this stays wire-compatible with peers that do not read them.
+
+    :param payload: The frame fields about to be serialized.
+    :returns: The JSON wire string.
+    """
+    from omnigent.runtime import telemetry
+
+    # Record the outbound body on the active span (redacted, gated by
+    # content capture) before injecting propagation keys, so the span
+    # shows exactly what this side sent.
+    telemetry.record_message_payload(payload)
+    telemetry.inject_trace_context(payload)
+    return json.dumps(payload)
+
+
 def encode_host_frame(frame: HostFrame) -> str:
     """Serialize a host frame to its JSON wire form.
 
@@ -505,7 +529,7 @@ def encode_host_frame(frame: HostFrame) -> str:
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
     if isinstance(frame, HostHelloFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.HELLO.value,
                 "version": frame.version,
@@ -516,7 +540,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LAUNCH_RUNNER.value,
                 "request_id": frame.request_id,
@@ -526,7 +550,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LAUNCH_RUNNER_RESULT.value,
                 "request_id": frame.request_id,
@@ -537,7 +561,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STOP_RUNNER.value,
                 "request_id": frame.request_id,
@@ -545,7 +569,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStopRunnerResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STOP_RUNNER_RESULT.value,
                 "request_id": frame.request_id,
@@ -554,7 +578,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostRunnerExitedFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
@@ -562,7 +586,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStatFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STAT.value,
                 "request_id": frame.request_id,
@@ -570,7 +594,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStatResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STAT_RESULT.value,
                 "request_id": frame.request_id,
@@ -582,7 +606,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostListDirFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LIST_DIR.value,
                 "request_id": frame.request_id,
@@ -593,7 +617,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostListDirResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LIST_DIR_RESULT.value,
                 "request_id": frame.request_id,
@@ -613,7 +637,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostCreateWorktreeFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.CREATE_WORKTREE.value,
                 "request_id": frame.request_id,
@@ -623,7 +647,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.CREATE_WORKTREE_RESULT.value,
                 "request_id": frame.request_id,
@@ -634,7 +658,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostRemoveWorktreeFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.REMOVE_WORKTREE.value,
                 "request_id": frame.request_id,
@@ -644,7 +668,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostRemoveWorktreeResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.REMOVE_WORKTREE_RESULT.value,
                 "request_id": frame.request_id,
@@ -653,7 +677,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostCreateDirFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.CREATE_DIR.value,
                 "request_id": frame.request_id,
@@ -661,7 +685,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostCreateDirResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.CREATE_DIR_RESULT.value,
                 "request_id": frame.request_id,

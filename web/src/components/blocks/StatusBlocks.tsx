@@ -9,10 +9,10 @@
 
 import {
   AlertCircleIcon,
+  BrainCircuitIcon,
   RotateCcwIcon,
   ShieldXIcon,
   ShrinkIcon,
-  WaypointsIcon,
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
@@ -120,22 +120,12 @@ interface RoutingDecisionChipProps {
 
 /**
  * Muted inline chip announcing the intelligent model router's pick at
- * the start of a turn. Precision-grayscale, tiny waypoints glyph, a primary
- * line `Intelligent model router · <short model> (<tier>)`, and the
- * router's rationale as a muted second line (also the `title` for hover).
- * When the verdict was not applied (advise/shadow or a user model pin
- * won), the line reads "would have picked" instead of naming the active
- * model — visible without hovering anything, surviving reload.
- *
- * @param model Model id the router chose, e.g. `databricks-claude-opus-4-8`.
- * @param tier Difficulty tier the router assigned.
- * @param applied `true` when the brain ran on `model` this turn.
- * @param rationale One-line router explanation; hidden when empty.
+ * the start of a turn.
  */
-export function RoutingDecisionChip({ model, tier, applied, rationale }: RoutingDecisionChipProps) {
+export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisionChipProps) {
   const short = shortModelName(model);
   const lead = applied ? short : `would have picked ${short}`;
-  const summary = `Intelligent model router · ${lead} (${tier})`;
+  const summary = `Intelligent model router · ${lead}`;
   return (
     <div
       className="my-1 flex flex-col items-center gap-0.5 text-muted-foreground text-xs"
@@ -144,12 +134,11 @@ export function RoutingDecisionChip({ model, tier, applied, rationale }: Routing
       title={rationale || summary}
     >
       <span className="flex items-center gap-1.5">
-        <WaypointsIcon className="size-3 shrink-0" />
+        <BrainCircuitIcon className="size-3 shrink-0" />
         <span>
           Intelligent model router{" · "}
           {!applied && <span>would have picked </span>}
           <span className="font-medium text-foreground">{short}</span>
-          <span className="text-muted-foreground/80">{` (${tier})`}</span>
         </span>
       </span>
       {rationale ? <span className="text-muted-foreground/70">{rationale}</span> : null}

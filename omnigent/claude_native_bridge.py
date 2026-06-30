@@ -53,6 +53,7 @@ from urllib import error, request
 
 from omnigent._platform import stable_user_id
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
 if TYPE_CHECKING:
     from omnigent.llms.context_window import ModelPricing
@@ -269,10 +270,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = opencode_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    kiro_root = _absolute_syntactic_path(kiro_bridge_root())
+    if target.is_relative_to(kiro_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/kiro-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(kiro_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s})"
+        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
+        f"{kiro_root!s})"
     )
 
 
@@ -384,6 +393,11 @@ class ClaudeHookRecord:
         ``TaskCompleted`` (``"completed"``), or
         ``PostToolUse``/``TaskUpdate`` event (``"in_progress"`` or
         ``"completed"``). ``None`` for all other events.
+    :param background_task_count: Number of background tasks still running
+        when a ``Stop`` hook fires — entries in the payload's
+        ``background_tasks`` array whose per-task ``status`` is not terminal
+        (see :data:`_TERMINAL_BACKGROUND_TASK_STATUSES`). ``0`` for all other
+        events or when absent.
     """
 
     event_cursor: int
@@ -402,6 +416,7 @@ class ClaudeHookRecord:
     task_id: str | None = None
     task_subject: str | None = None
     task_status: str | None = None
+    background_task_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -2116,6 +2131,21 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     return False
 
 
+# Terminal per-task ``status`` values in a ``Stop`` hook's ``background_tasks``
+# array. Claude Code retains finished/stopped shells in that array rather than
+# reaping them (claude-code issues #67895, #59456, #14049), so counting the raw
+# length would over-count and leave the "N background tasks still running"
+# indicator stuck after a shell exited. We exclude these known terminal states
+# and count everything else as live — unknown/absent statuses count as running
+# so a payload variant can never UNDER-count and re-hide a genuinely running
+# shell (the bug this whole feature fixes). ``"running"`` / ``"completed"`` /
+# ``"failed"`` are the documented values (CHANGELOG v2.1.145+); ``"stopped"`` /
+# ``"killed"`` appear in the codebase/issues but are not formally documented.
+_TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "stopped", "killed"}
+)
+
+
 def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     """
     Convert one complete hook JSONL line into a hook record.
@@ -2190,6 +2220,21 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_task_id, str) and raw_task_id:
             task_id = raw_task_id
         task_status = "completed"
+    background_task_count = 0
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_bg = payload.get("background_tasks")
+        if isinstance(raw_bg, list):
+            # Count only shells still running: Claude Code leaves finished
+            # shells in the array (see _TERMINAL_BACKGROUND_TASK_STATUSES), so a
+            # raw len() over-counts and pins the indicator after they exit.
+            background_task_count = sum(
+                1
+                for task in raw_bg
+                if not (
+                    isinstance(task, dict)
+                    and task.get("status") in _TERMINAL_BACKGROUND_TASK_STATUSES
+                )
+            )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -2231,6 +2276,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_id=task_id,
         task_subject=task_subject,
         task_status=task_status,
+        background_task_count=background_task_count,
     )
 
 
@@ -2608,6 +2654,7 @@ def display_cost_approval_popup(
     policy_name: str | None = None,
     python_executable: str | None = None,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    config_file: Path | None = None,
 ) -> None:
     """
     Overlay a cost-budget approval modal on the Claude Code tmux pane.
@@ -2618,8 +2665,8 @@ def display_cost_approval_popup(
     checkpoint. The popup script resolves the **same** elicitation Future
     (via the same resolve endpoint the web card uses), so whichever
     surface answers first wins and the other clears. The popup reads AP
-    routing (base URL + auth headers) from this bridge's
-    ``permission_hook.json`` so no token lands on the command line.
+    routing (base URL + auth headers) from *config_file* so no token lands
+    on the command line.
 
     Fire-and-forget by design: ``tmux display-popup`` blocks its tmux
     client until the popup closes, so it is spawned **detached**
@@ -2629,16 +2676,15 @@ def display_cost_approval_popup(
     Claude-native resolver for the harness-agnostic
     :func:`omnigent.native_cost_popup.launch_cost_popup`: it reads the
     pane's tmux socket/target from this bridge's ``tmux.json`` and points
-    the popup at this bridge's ``permission_hook.json`` for Omnigent routing
-    (base URL + auth headers, so no token lands on the command line), then
-    delegates. The launcher pops the modal on every attached client and
-    skips silently when none is attached (e.g. the Terminal tab is closed)
-    — the web ``ApprovalCard`` remains the answer surface.
+    the popup at *config_file* for Omnigent routing (base URL + auth
+    headers, so no token lands on the command line), then delegates. The
+    launcher pops the modal on every attached client and skips silently when
+    none is attached (e.g. the Terminal tab is closed) — the web
+    ``ApprovalCard`` remains the answer surface.
 
     :param bridge_dir: Bridge directory path, e.g.
-        ``/tmp/omnigent/claude-native/<digest>``. Supplies both the
-        tmux target (``tmux.json``) and the AP-routing config
-        (``permission_hook.json``).
+        ``/tmp/omnigent/claude-native/<digest>``. Supplies the tmux target
+        (``tmux.json``); the AP-routing config comes from *config_file*.
     :param session_id: Omnigent session id that owns the elicitation, e.g.
         ``"conv_abc123"``. Used in the resolve URL the popup POSTs to.
     :param elicitation_id: Outstanding elicitation correlation id, e.g.
@@ -2652,6 +2698,11 @@ def display_cost_approval_popup(
         valid on the host the tmux server runs on).
     :param timeout_s: Seconds to wait for ``tmux.json`` to be advertised,
         e.g. ``30.0``.
+    :param config_file: AP-routing config the popup reads (base URL + auth
+        headers). ``None`` falls back to this bridge's ``permission_hook.json``
+        — but that carries the one-shot launch token, which dies with the ~1h
+        Databricks OAuth lifetime, so callers should pass a freshly-minted
+        snapshot to keep a late-firing verdict POST from 401-ing.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised within
         *timeout_s* (the pane isn't up yet); the caller treats this as a
@@ -2663,7 +2714,7 @@ def display_cost_approval_popup(
     launch_cost_popup(
         info["socket_path"],
         info["tmux_target"],
-        bridge_dir / _PERMISSION_HOOK_FILE,
+        config_file if config_file is not None else bridge_dir / _PERMISSION_HOOK_FILE,
         session_id=session_id,
         elicitation_id=elicitation_id,
         message=message,

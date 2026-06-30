@@ -62,11 +62,12 @@ dependencies = [
     "alembic>=1.0,<2",
     "anyio>=4.0,<5",
     "cachetools>=5.0,<7",
-    # <8.2: click 8.2 made Context.protected_args a read-only property,
-    # which breaks _HostGroup.parse_args's `ctx.protected_args = []`
-    # (omnigents/cli.py) with "property 'protected_args' of 'Context'
-    # object has no setter" on any `omni host ...` invocation.
-    "click>=8.0,<8.2",
+    # _HostGroup (omnigent/cli.py) rewrites a leading positional server URL
+    # into `--server` before Click parses it, so it no longer depends on
+    # Click's internal `protected_args` (made read-only in click 8.2, slated
+    # for removal in click 9). Upper bound `<10` only guards against an
+    # as-yet-unreleased click 10 with unknown breaking changes.
+    "click>=8.0,<10",
     "fastapi>=0.100,<1",
     # pexpect/pyte back the POSIX tmux/PTY terminal stack, which is disabled
     # on Windows (no usable PTY); omnigent never imports them on the core
@@ -80,6 +81,7 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0,<1",
     # The Claude Code and OpenAI Agents harnesses are part of the
     # baseline install — every CUJ command in the README depends on at
     # least one of them, so making them optional just forces every user

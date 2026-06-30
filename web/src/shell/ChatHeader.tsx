@@ -23,7 +23,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
-import { HostBadge } from "@/components/HostBadge";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
@@ -215,7 +214,6 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
-        {!isChildSession && conversationId && <HostBadge sessionId={conversationId} />}
         {isChildSession && parentSessionId && (
           <>
             {/* Back affordance. Ghost (not a filled pill) so it sits on the
@@ -272,9 +270,7 @@ export function ChatHeader({
             "Fork from here" action on assistant bubbles (ChatPage). */}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
-        {conversationId && (
-          <AgentInfoButton agent={boundAgent} sessionId={conversationId} showIntelligentRouting />
-        )}
+        {conversationId && <AgentInfoButton agent={boundAgent} sessionId={conversationId} />}
         {/* Mobile-only three-dot menu folding the action buttons above
             (Share · Agent info) so the header stays
             uncluttered on a phone. The right-panel/rail control is

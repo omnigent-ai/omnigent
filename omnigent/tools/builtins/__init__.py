@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
+from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
 from omnigent.tools.builtins.agents import (
     SysAgentDownloadTool,
     SysAgentGetTool,
@@ -68,6 +69,7 @@ __all__ = [
     "ListCommentsTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
+    "SysAdviseModelsTool",
     "SysAgentDownloadTool",
     "SysAgentGetTool",
     "SysAgentListTool",
@@ -203,6 +205,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # and intercepted by name in the runner's tool dispatch — reserved
     # here so user specs cannot shadow it.
     "sys_list_models": None,
+    # ``sys_advise_models`` is auto-registered alongside ``sys_list_models``
+    # when ``RuntimeCaps.routing_client`` is configured. Intercepted by
+    # name in the runner's tool dispatch — reserved here so user specs
+    # cannot shadow it.
+    "sys_advise_models": None,
 }
 
 # Canonical set of every reserved builtin name. Derived from

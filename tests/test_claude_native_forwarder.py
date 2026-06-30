@@ -1432,9 +1432,11 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # The first (and only) status POST is the Stop → idle. A ``running``
     # arriving first would mean UserPromptSubmit is still wrongly mapped.
     assert request["path"] == "/v1/sessions/conv_abc/events"
+    # The Stop hook carries its authoritative background-shell count (0 here,
+    # no background tasks) so a finished shell clears the indicator.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 
@@ -1600,7 +1602,7 @@ async def test_forwarder_ignores_subagent_stop_hook(
 
     assert first["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 
@@ -6629,3 +6631,71 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
     assert record["event_type"] == "external_subagent_start"
     assert record["payload"]["subagent_id"] == "dlstart1"
     assert record["payload"]["agent_type"] == "Explore"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
+    tmp_path: Path,
+) -> None:
+    """
+    ``Stop`` with ``background_tasks`` → ``waiting`` instead of ``idle``.
+
+    When Claude Code's Stop hook carries a non-empty ``background_tasks``
+    array (shells still running), the forwarder must publish ``waiting``
+    so the web UI keeps showing the spinner. Without this, the chat
+    interface shows "idle" while the terminal shows "1 shell running".
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [
+                {
+                    "id": "abc123",
+                    "type": "shell",
+                    "status": "running",
+                    "description": "Wait for CI",
+                    "command": "sleep 120",
+                },
+            ],
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert request["path"] == "/v1/sessions/conv_abc/events"
+    assert request["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "waiting", "background_task_count": 1},
+    }

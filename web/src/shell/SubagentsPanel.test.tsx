@@ -38,6 +38,9 @@ vi.mock("@/components/icons/CodexIcon", () => ({
 vi.mock("@/components/icons/OpenCodeIcon", () => ({
   OpenCodeIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="opencode" />,
 }));
+vi.mock("@/components/icons/KiroIcon", () => ({
+  KiroIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="kiro" />,
+}));
 // Same marker treatment for the local pi glyph so selection assertions stay uniform.
 vi.mock("@/components/icons/PiIcon", () => ({
   PiIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="pi" />,
@@ -513,7 +516,7 @@ describe("SubagentsPanel", () => {
     expect(within(row).queryByText("thread_child_alpha")).toBeNull();
   });
 
-  it("uses native logos for Claude Code, Codex, and OpenCode child rows", () => {
+  it("uses native logos for Claude Code, Codex, OpenCode, and Kiro child rows", () => {
     mockChildTree({
       conv_root: [
         childInfo({
@@ -537,6 +540,13 @@ describe("SubagentsPanel", () => {
           session_name: "review-auth-refactor",
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
         }),
+        childInfo({
+          id: "conv_kiro",
+          title: "kiro:harden-auth",
+          tool: "kiro",
+          session_name: "harden-auth",
+          labels: { "omnigent.wrapper": "kiro-native-ui" },
+        }),
       ],
     });
 
@@ -553,6 +563,10 @@ describe("SubagentsPanel", () => {
     const claudeRow = childRow(container, "conv_claude");
     expect(claudeRow.querySelector('[data-icon="claude"]')).not.toBeNull();
     expect(claudeRow.querySelector(".lucide-code-2")).toBeNull();
+
+    // Kiro renders its own glyph now, not the borrowed Cursor mark (#1137).
+    const kiroRow = childRow(container, "conv_kiro");
+    expect(kiroRow.querySelector('[data-icon="kiro"]')).not.toBeNull();
   });
 
   it("gives native sub-agent children role/Otto icons, not the brand logo", () => {
@@ -850,11 +864,13 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel();
 
-    // Working reuses the sidebar RunningDot in the brand-pink tone —
+    // Working reuses the sidebar RunningDot in the grey tone —
     // identical to the sidebar's running indicator; a wrong tone drops
-    // bg-brand-accent.
+    // text-muted-foreground.
     expect(
-      childRow(container, "c_work").querySelector('[data-testid="running-dot"].bg-brand-accent'),
+      childRow(container, "c_work").querySelector(
+        '[data-testid="running-dot"].text-muted-foreground',
+      ),
     ).not.toBeNull();
     // Terminal states use design tokens, not raw 500-weight Tailwind. "done"
     // is a quiet, expected outcome, so it reads as a muted dot (not green);

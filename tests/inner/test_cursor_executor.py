@@ -1511,9 +1511,14 @@ async def test_ensure_session_writes_hooks_json(
     wrapper = tmp_path / ".cursor" / "omnigent-hook.sh"
     assert wrapper.exists()
     wrapper_text = wrapper.read_text()
-    assert "_OMNIGENT_SERVER_URL='http://127.0.0.1:6767'" in wrapper_text
-    assert "_OMNIGENT_SESSION_ID='conv_test123'" in wrapper_text
+    # Values are shlex-quoted (shell-safe URLs/ids need no quotes).
+    assert "_OMNIGENT_SERVER_URL=http://127.0.0.1:6767" in wrapper_text
+    assert "_OMNIGENT_SESSION_ID=conv_test123" in wrapper_text
     assert "cursor_policy_hook.py" in wrapper_text
+    # The wrapper bakes a one-shot auth + workspace-routing header...
+    assert "_OMNIGENT_AUTH_HEADERS=" in wrapper_text
+    # ...so it must be owner-only (the baked token is never world-readable).
+    assert wrapper.stat().st_mode & 0o777 == 0o700
 
     # auto_review=True must be passed so cursor's own TUI approval prompts
     # are bypassed in favour of the executor's native elicitation card.

@@ -33,16 +33,16 @@ describe("SessionStateBadge — per-state rendering", () => {
     );
   });
 
-  it("renders running with a pulsing brand-pink dot", () => {
+  it("renders running with a spinning grey spinner", () => {
     const { container } = renderBadge({ kind: "running" });
     const badge = screen.getByTestId("session-state-badge");
     expect(badge).toHaveAttribute("data-state", "running");
-    // The running indicator is a single pulsing brand-pink dot; a missing dot
+    // The running indicator is a grey spinner; a missing spinner
     // (or the old success-tone dot grid) means it regressed.
-    const dot = container.querySelector('[data-testid="running-dot"]');
-    expect(dot).not.toBeNull();
-    expect(dot?.getAttribute("class")).toContain("running-pulse-dot");
-    expect(dot?.getAttribute("class")).toContain("bg-brand-accent");
+    const spinner = container.querySelector('[data-testid="running-dot"]');
+    expect(spinner).not.toBeNull();
+    expect(spinner?.getAttribute("class")).toContain("animate-spin");
+    expect(spinner?.getAttribute("class")).toContain("text-muted-foreground");
     expect(container.querySelector(".bg-success")).toBeNull();
   });
 

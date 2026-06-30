@@ -3076,7 +3076,7 @@ def server(
     # designs/OBSERVABILITY.md for the env var reference.
     from omnigent.runtime import telemetry
 
-    telemetry.init()
+    telemetry.init("omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally
@@ -6521,69 +6521,74 @@ class _HostGroup(click.Group):
         """
         Redirect a leading URL-like positional into ``--server``.
 
-        Click stashes the would-be subcommand name in
-        ``ctx.protected_args[0]`` after option parsing. When that token
-        is a URL-like positional server value, we feed it to the group
-        callback instead of trying to dispatch a subcommand. Interspersed
-        parsing is enabled only for that case so options may follow the
-        URL (``host <url> --server-arg``); for the subcommand or
-        unknown-command case it stays off so trailing options reach the
-        subcommand path untouched.
+        ``omnigent host <url>`` is shorthand for ``omnigent host --server
+        <url>``. We detect a leading URL-like positional with a throwaway
+        option parse and, when present, rewrite the argument list to inject
+        ``--server <url>`` *before* Click parses it -- so Click sees a normal
+        option and never treats the URL as a would-be subcommand.
+
+        This deliberately avoids Click's internal ``protected_args`` (made a
+        read-only property in click 8.2 and slated for removal in click 9),
+        so the shorthand keeps working across click versions. A leading token
+        that is a registered subcommand, or not URL-like, is left untouched
+        for Click's normal dispatch / unknown-command error.
 
         :param ctx: Click context for the ``host`` group.
         :param args: Raw argument tokens for the group.
         :returns: Remaining args after the group consumes its own.
         """
-        if self._leading_token_is_server(ctx, args):
-            ctx.allow_interspersed_args = True
-        super().parse_args(ctx, args)
-        # Resilient parsing (shell completion) must keep default behavior
-        # so subcommand names still complete.
-        if ctx.resilient_parsing or not ctx.protected_args:
-            return ctx.args
-        candidate = ctx.protected_args[0]
-        if candidate in self.commands:
-            return ctx.args
-        if not self._token_is_positional_server(candidate):
-            return ctx.args
-        # Leading token is URL-like: treat it as the server URL.
-        if ctx.params.get("server") is not None:
-            raise click.UsageError(
-                "Pass the server URL either positionally or via --server, not both."
-            )
-        leftover = ctx.protected_args[1:] + ctx.args
-        if leftover:
-            raise click.UsageError(f"Unexpected extra argument(s): {' '.join(leftover)}")
-        ctx.params["server"] = candidate
-        ctx.protected_args = []
-        ctx.args = []
-        return ctx.args
+        return super().parse_args(ctx, self._rewrite_positional_server(ctx, list(args)))
 
-    def _leading_token_is_server(self, ctx: click.Context, args: list[str]) -> bool:
+    def _rewrite_positional_server(self, ctx: click.Context, args: list[str]) -> list[str]:
         """
-        Decide whether the leading positional should be a server value.
+        Rewrite a leading URL-like positional into an explicit ``--server``.
 
-        Runs a throwaway parse of the group's own options to locate the
-        first positional token without committing any results to ``ctx``.
-        Returns ``True`` when that token exists, is not a registered
-        subcommand, and is a valid positional server value.
+        Runs a throwaway parse of the group's own options to find the first
+        positional token. When that token is URL-like (and not a registered
+        subcommand), removes it from *args* and prepends ``--server <token>``;
+        otherwise returns *args* unchanged so Click dispatches the subcommand
+        or raises its own unknown-command error. Raises when the positional
+        URL is combined with an explicit ``--server`` or with extra
+        positionals.
 
         :param ctx: Click context for the ``host`` group.
         :param args: Raw argument tokens for the group.
-        :returns: ``True`` if the leading positional is a server value.
+        :returns: Possibly-rewritten argument tokens.
         """
+        # Resilient parsing (shell completion) must keep default behavior so
+        # subcommand names still complete.
         if ctx.resilient_parsing or not args:
-            return False
+            return args
         try:
-            _, parsed, _ = self.make_parser(ctx).parse_args(list(args))
+            parser = self.make_parser(ctx)
+            # A click.Group defaults to allow_interspersed_args=False, which would
+            # treat an option *after* the positional URL (e.g.
+            # `host <url> --non-interactive`) as an extra positional. Enable
+            # interspersed parsing so trailing options are classified as options.
+            parser.allow_interspersed_args = True
+            opts, positionals, _ = parser.parse_args(list(args))
         except click.UsageError:
             # Malformed options: let the real parse surface the error.
-            return False
-        return (
-            bool(parsed)
-            and parsed[0] not in self.commands
-            and self._token_is_positional_server(parsed[0])
-        )
+            return args
+        if (
+            not positionals
+            or positionals[0] in self.commands
+            or not self._token_is_positional_server(positionals[0])
+        ):
+            return args
+        url = positionals[0]
+        if opts.get("server") is not None:
+            raise click.UsageError(
+                "Pass the server URL either positionally or via --server, not both."
+            )
+        if positionals[1:]:
+            raise click.UsageError(f"Unexpected extra argument(s): {' '.join(positionals[1:])}")
+        # remove() drops the first token equal to `url`. Safe because the only
+        # value-taking group option (--server) triggers the conflict error above,
+        # so the URL can't be some other option's value.
+        remaining = list(args)
+        remaining.remove(url)
+        return ["--server", url, *remaining]
 
     def _token_is_positional_server(self, token: str) -> bool:
         """

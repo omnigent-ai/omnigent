@@ -13,16 +13,16 @@ The process is launched by the runner-side popup helper (e.g.
 :func:`omnigent.claude_native_bridge.display_cost_approval_popup`) as::
 
     python -I -m omnigent.native_cost_popup \
-        --config-file <bridge_dir>/permission_hook.json \
+        --config-file <bridge_dir>/cost_popup.json \
         --session-id conv_abc123 \
         --elicitation-id elicit_deadbeef \
         --message "Session cost $0.12 crossed the $0.10 checkpoint. Continue?"
 
 AP routing (base URL + auth headers) is read from ``--config-file``
 rather than argv so the bearer token never lands in the process list /
-tmux command line. The file is the harness's existing AP-routing config
-(``permission_hook.json`` for claude-native, ``policy_hook.json`` for
-codex-native); both carry ``ap_server_url`` + ``ap_auth_headers``.
+tmux command line. The runner writes a freshly-minted ``cost_popup.json``
+snapshot at popup launch (a stale launch-token snapshot would 401 the
+verdict POST); the file carries ``ap_server_url`` + ``ap_auth_headers``.
 
 Dismissing the popup (Escape / Ctrl-C / EOF) exits **without** posting a
 verdict, leaving the elicitation outstanding so it can still be answered
@@ -150,8 +150,9 @@ def launch_cost_popup(
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux target of the pane, e.g. ``"main"``.
     :param config_file: AP-routing config the popup reads for
-        ``ap_server_url`` + ``ap_auth_headers`` — ``permission_hook.json``
-        for claude-native, ``policy_hook.json`` for codex-native.
+        ``ap_server_url`` + ``ap_auth_headers`` — the runner mints a fresh
+        ``cost_popup.json`` snapshot per launch so the verdict POST carries a
+        live bearer rather than the stale launch token.
     :param session_id: Omnigent session id that owns the elicitation, e.g.
         ``"conv_abc123"``. Used in the resolve URL the popup POSTs to.
     :param elicitation_id: Outstanding elicitation correlation id, e.g.

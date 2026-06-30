@@ -97,6 +97,13 @@ USER_DAILY_ASK_APPROVED_STATE_KEY = "_policy_user_daily_ask_approved_usd"
 # (emits it) and the engine (routes + seeds it).
 SESSION_COST_ASK_APPROVED_STATE_KEY = "_policy_cost_ask_approved_usd"
 
+# Reserved ``state_updates`` key the cost-budget policy emits when the user
+# approves continuing despite an unpriced model. Like
+# ``SESSION_COST_ASK_APPROVED_STATE_KEY``, routed to the ROOT conversation so
+# approving once on the parent covers the whole spawn tree. Value is ``True``
+# (a boolean flag, not a float checkpoint).
+SESSION_COST_UNPRICED_APPROVED_KEY = "_policy_cost_unpriced_approved"
+
 
 class UserDailyCostContext(TypedDict, total=False):
     """The session owner's per-UTC-day LLM cost rollup.

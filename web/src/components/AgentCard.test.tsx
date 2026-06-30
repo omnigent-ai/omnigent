@@ -19,6 +19,7 @@ vi.mock("@/components/icons/ClaudeIcon", () => ({ ClaudeIcon: stub("claude") }))
 vi.mock("@/components/icons/CodexIcon", () => ({ CodexIcon: stub("codex") }));
 vi.mock("@/components/icons/CursorIcon", () => ({ CursorIcon: stub("cursor") }));
 vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
+vi.mock("@/components/icons/KiroIcon", () => ({ KiroIcon: stub("kiro") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
 vi.mock("@/components/icons/OpenCodeIcon", () => ({ OpenCodeIcon: stub("opencode") }));
 vi.mock("@/components/icons/PiIcon", () => ({ PiIcon: stub("pi") }));
@@ -61,6 +62,11 @@ describe("AgentCard icon selection", () => {
     { name: "x", harness: "goose", expected: "goose" },
     // The SDK "cursor" harness also reads as Cursor via the harness fallback.
     { name: "x", harness: "cursor", expected: "cursor" },
+    // Kiro native + the bare "kiro" harness both read as the Kiro glyph
+    // (they previously borrowed Cursor's — see #1137).
+    { name: "kiro-native-ui", harness: "kiro-native", expected: "kiro" },
+    { name: "x", harness: "kiro-native", expected: "kiro" },
+    { name: "x", harness: "kiro", expected: "kiro" },
     { name: "antigravity-native-ui", harness: "antigravity-native", expected: "antigravity" },
     // The in-process Antigravity SDK harness shares the same glyph.
     { name: "x", harness: "antigravity", expected: "antigravity" },
