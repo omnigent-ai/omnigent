@@ -6,7 +6,9 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -19,6 +21,12 @@ _BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}
 _TMUX_FILE = "tmux.json"
 _FORWARDER_READY_FILE = "kiro_session_forwarder_ready.json"
 _ACP_RECORD_FILE = "kiro_acp_record.jsonl"
+# Shared Omnigent MCP relay (serve-mcp) registration for kiro.
+_MCP_SERVER_NAME = "omnigent"
+_MCP_BRIDGE_CONFIG_FILE = "bridge.json"
+# kiro reads workspace-scoped MCP servers from ``<workspace>/.kiro/settings/mcp.json``
+# (confirmed against kiro-cli 2.10.0). Mirrors cursor-native's ``.cursor/mcp.json``.
+_WORKSPACE_MCP_CONFIG_REL = Path(".kiro") / "settings" / "mcp.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
@@ -105,6 +113,90 @@ def prepare_bridge_dir(session_id: str) -> Path:
 def acp_record_path(bridge_dir: Path) -> Path:
     """Return the per-session Kiro TUI ACP recorder file path."""
     return bridge_dir / _ACP_RECORD_FILE
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config the shared Omnigent MCP bridge requires at boot.
+
+    ``serve-mcp`` (``omnigent.claude_native_bridge``) reads ``bridge.json`` and
+    refuses to start without a ``token``. Mirrors cursor-native's writer;
+    idempotent so a resume reuses the existing token.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config_path = bridge_dir / _MCP_BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_MCP_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
+
+
+def build_kiro_mcp_config(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, Any]:
+    """Build the kiro ``mcpServers`` entry for the Omnigent relay MCP server.
+
+    Reuses the shared stdio ``serve-mcp`` server (the same one cursor/claude use)
+    pointed at this session's bridge dir. kiro's mcp.json schema is
+    ``{"mcpServers": {name: {command, args, env}}}`` (kiro-cli 2.10.0); it has no
+    per-server auto-approve field, so Omnigent MCP tool calls surface through
+    kiro's approval prompt (mirrored to the web as elicitation cards) rather than
+    being auto-trusted here.
+    """
+    python = python_executable or sys.executable
+    return {
+        "mcpServers": {
+            _MCP_SERVER_NAME: {
+                "command": python,
+                "args": [
+                    "-I",
+                    "-m",
+                    "omnigent.claude_native_bridge",
+                    "serve-mcp",
+                    "--bridge-dir",
+                    str(bridge_dir),
+                ],
+                "env": {"TMPDIR": os.environ.get("TMPDIR", "/tmp")},
+            }
+        }
+    }
+
+
+def write_kiro_workspace_mcp_config(
+    workspace: Path,
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the workspace-scoped kiro MCP config declaring the Omnigent server.
+
+    kiro-cli has no launch-time mcp-config flag, so the server is declared in the
+    workspace's ``.kiro/settings/mcp.json`` (mirrors cursor-native's
+    ``.cursor/mcp.json``). The Omnigent entry is *merged* into any existing
+    workspace config so a user's own workspace MCP servers are preserved. Also
+    writes the bridge ``token`` ``serve-mcp`` needs. Returns the config path.
+    """
+    write_mcp_bridge_config(bridge_dir)
+    path = workspace / _WORKSPACE_MCP_CONFIG_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config: dict[str, Any] = {}
+    if path.exists():
+        with contextlib.suppress(OSError, ValueError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[_MCP_SERVER_NAME] = build_kiro_mcp_config(
+        bridge_dir, python_executable=python_executable
+    )["mcpServers"][_MCP_SERVER_NAME]
+    config["mcpServers"] = servers
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 def build_kiro_native_spawn_env(session_id: str) -> dict[str, str]:

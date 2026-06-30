@@ -2693,6 +2693,7 @@ async def _auto_create_kiro_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """Auto-create the Kiro TUI terminal for a kiro-native session."""
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -2701,6 +2702,7 @@ async def _auto_create_kiro_terminal(
         KIRO_NATIVE_ENV_UNSET,
         build_kiro_native_terminal_env,
         prepare_bridge_dir,
+        write_kiro_workspace_mcp_config,
     )
 
     launch_config = await _kiro_native_launch_config(
@@ -2712,6 +2714,12 @@ async def _auto_create_kiro_terminal(
         raise RuntimeError(f"Kiro workspace does not exist for session {session_id!r}.")
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
+    # Declare the Omnigent MCP server in the workspace-scoped kiro config so
+    # kiro-cli can call Omnigent tools. Only when the tool relay will actually
+    # start (server_client + ensure_comment_relay present), else serve-mcp would
+    # launch with no relay to route calls back to. Mirrors cursor-native.
+    if server_client is not None and ensure_comment_relay is not None:
+        write_kiro_workspace_mcp_config(workspace_path, bridge_dir)
     kiro_launch = build_kiro_launch(
         launch_config.terminal_launch_args or [],
         resume_id=launch_config.external_session_id,
@@ -2757,6 +2765,17 @@ async def _auto_create_kiro_terminal(
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    # Start the Omnigent builtin-tool relay (writes tool_relay.json into the kiro
+    # bridge dir) so the serve-mcp server declared in the workspace mcp.json can
+    # route Omnigent tool calls back through the session's policy/elicitation
+    # gate. Mirrors cursor-native.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
 
     from omnigent.kiro_native_permissions import supervise_kiro_permission_mirror
     from omnigent.kiro_native_session_forwarder import supervise_kiro_session_forwarder
@@ -9177,6 +9196,7 @@ def create_runner_app(
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -15809,6 +15829,7 @@ def create_runner_app(
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
                     )
                 except Exception as exc:
                     _logger.exception(
