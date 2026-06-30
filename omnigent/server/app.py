@@ -2112,6 +2112,26 @@ def create_app(
                 conversation_store,
             )
 
+    def _resolve_managed_runner_owner(runner_id: str) -> str | None:
+        """Owner for a server-managed sandbox runner, by its bound session.
+
+        Managed runners authenticate with a server-minted binding token,
+        not a user session, so the runner tunnel cannot resolve their
+        owner from the handshake. The server wrote ``runner_id`` onto the
+        session row at launch (``replace_runner_id``), so the bound
+        conversation's owner is authoritative — the runner-side analog of
+        the host tunnel's ``resolve_launch_token``.
+
+        :param runner_id: Token-bound runner id from the tunnel handshake.
+        :returns: The session owner's user id, or ``None`` when no session
+            is bound to this runner (the handshake is then refused).
+        """
+        for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+            owner = conversation_store.get_session_owner(conv.id)
+            if owner is not None:
+                return owner
+        return None
+
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
         create_runner_tunnel_router(
@@ -2121,6 +2141,7 @@ def create_app(
             on_runner_connect=_on_runner_connect,
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
+            resolve_managed_runner_owner=_resolve_managed_runner_owner,
         ),
         prefix="/v1",
         tags=["runners"],
