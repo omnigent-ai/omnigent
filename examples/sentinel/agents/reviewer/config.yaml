@@ -34,14 +34,14 @@ guardrails:
       type: function
       on: [tool_call]
       function:
-        path: omnigent.inner.nessie.policies.blast_radius
+        path: omnigent.policies.builtins.orchestration.blast_radius
         arguments:
           gate_pushes: false
     read_only_os:
       type: function
       on: [tool_call]
       function:
-        path: omnigent.inner.nessie.policies.read_only_os
+        path: omnigent.policies.builtins.orchestration.read_only_os
 
 prompt: |
   You are Sentinel's reviewer: an independent security fact-checker on a
