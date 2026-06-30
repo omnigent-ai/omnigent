@@ -2733,6 +2733,16 @@ def _record_daily_cost(
     from touching an absent ``user_daily_cost`` table is no longer needed
     now that the managed store backs it.)
 
+    Sub-agent conversations are created without a permission grant (the
+    internal runner POST carries no user context), so
+    ``get_session_owner(conv.id)`` returns ``None`` for them.  When
+    that happens, fall back to the spawn-tree root's owner: every
+    conversation carries ``root_conversation_id`` pointing to the
+    top-level session that *was* created with user context and therefore
+    always has an owner grant.  This ensures relay / SDK sub-agent spend
+    is attributed to the same user as the parent rather than silently
+    dropped from the daily rollup.
+
     :param conv: The conversation row for the session, or ``None``
         (a no-op — no owner to attribute to).
     :param delta_usd: The turn's cost in USD; ``<= 0`` is a no-op.
@@ -2742,6 +2752,10 @@ def _record_daily_cost(
     if conv is None or delta_usd <= 0:
         return
     owner = conversation_store.get_session_owner(conv.id)
+    if owner is None and conv.root_conversation_id != conv.id:
+        # Sub-agent: no direct owner grant — fall back to the root session's
+        # owner so sub-agent spend is attributed rather than silently dropped.
+        owner = conversation_store.get_session_owner(conv.root_conversation_id)
     if owner is None:
         return
     from omnigent.db.utils import now_epoch
