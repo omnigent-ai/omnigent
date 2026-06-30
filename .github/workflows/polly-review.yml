@@ -340,8 +340,11 @@ jobs:
           visual_item = [
               '**Missing visual demonstration** — see the "Visual demonstration" rule below. Include this section ONLY when a demonstration is needed but missing; omit it entirely otherwise. When present, it MUST be the first section so the author sees it.'
           ] if is_external else []
+          # No leading indent on items — the YAML block scalar dedents the prompt
+          # to column 0, and the `{review_sections}` placeholder supplies the line
+          # position, so items must align with the rest of the prompt text.
           review_sections = "\n".join(
-              f"          {i}. {text}" for i, text in enumerate(visual_item + standard_items, 1)
+              f"{i}. {text}" for i, text in enumerate(visual_item + standard_items, 1)
           )
 
           visual_demo_rule = """
