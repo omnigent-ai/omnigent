@@ -29,7 +29,11 @@ from omnigent.llms.types import (
     ResponseCompletedEvent,
     ResponseStreamEvent,
 )
-from omnigent.reasoning_effort import OPENAI_EFFORTS, validate_effort_or_llm_error
+from omnigent.reasoning_effort import (
+    OPENAI_EFFORTS,
+    provider_accepts_reasoning_effort,
+    validate_effort_or_llm_error,
+)
 from omnigent.runtime.llm_retry import classify_llm_error
 from omnigent.spec.types import RetryPolicy
 
@@ -225,7 +229,7 @@ class _ResponsesNamespace:
                     "type": "json_schema",
                     "json_schema": {k: v for k, v in fmt.items() if k != "type"},
                 }
-        if reasoning:
+        if reasoning and provider_accepts_reasoning_effort(routed.provider, routed.model):
             extra["reasoning_effort"] = reasoning.get("effort")
 
         if stream:

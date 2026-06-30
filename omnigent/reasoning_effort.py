@@ -21,6 +21,37 @@ ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
 # support is gated by the Copilot backend (``list_models()``).
 COPILOT_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
+# xAI / Grok accepts the OpenAI-compatible ``reasoning_effort`` parameter on only
+# a subset of models. Sending it to the others (e.g. ``grok-4``,
+# ``grok-code-fast-1``, ``grok-4-fast-reasoning``) is rejected with HTTP 400.
+# Gate on this allow-set of model-id prefixes; unknown grok ids default to NOT
+# sending the parameter. Refs: docs.x.ai reasoning docs (``reasoning_effort``
+# "Only supported by grok-4.3"; ``grok-4.20-multi-agent`` uses ``reasoning.effort``
+# for agent count; ``grok-3-mini`` historically supported it).
+XAI_REASONING_EFFORT_MODEL_PREFIXES = (
+    "grok-3-mini",
+    "grok-4.3",
+    "grok-4.20-multi-agent",
+)
+
+
+def provider_accepts_reasoning_effort(provider: str, model: str) -> bool:
+    """Return whether *provider*/*model* accepts the ``reasoning_effort`` param.
+
+    Only xAI restricts this per-model today; every other Chat Completions
+    provider is treated as accepting it, preserving existing behavior. xAI
+    rejects the parameter with HTTP 400 on models outside
+    :data:`XAI_REASONING_EFFORT_MODEL_PREFIXES`.
+
+    :param provider: The routed provider id, e.g. ``"xai"``.
+    :param model: The model name without provider prefix, e.g. ``"grok-4"``.
+    :returns: ``True`` if ``reasoning_effort`` may be sent for this model.
+    """
+    if provider == "xai":
+        normalized = model.lower()
+        return any(normalized.startswith(prefix) for prefix in XAI_REASONING_EFFORT_MODEL_PREFIXES)
+    return True
+
 
 def format_supported(values: Iterable[str]) -> str:
     """Return a stable comma-separated supported-values string."""
