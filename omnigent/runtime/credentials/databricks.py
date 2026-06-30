@@ -18,6 +18,15 @@ token) by checking, in order:
 3. The ``[DEFAULT]`` section of the same config file via raw
    configparser, used either when no profile is requested or when
    the requested profile is missing.
+4. The ``databricks`` CLI binary (``databricks auth describe`` for the
+   host, ``databricks auth token`` for the bearer). This mirrors the
+   per-request ``auth_command`` the harnesses run, so OAuth
+   (``auth_type = databricks-cli``) profiles — whose cfg sections carry
+   NO static ``token`` — still resolve when the Python ``databricks-sdk``
+   is not installed (it now lives in the optional ``databricks`` / ``all``
+   extra, so SDK-less installs are expected). Consulted only after the SDK
+   and the plaintext-cfg paths come up empty, so static-token profiles
+   never pay the subprocess cost.
 
 If none of the above yield both a host and a token, the resolver raises
 ``OSError`` with a message that lists every source it tried.
@@ -48,8 +57,11 @@ demand (which performs refresh-token handling transparently).
 from __future__ import annotations
 
 import configparser
+import json
 import logging
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -214,6 +226,106 @@ def _read_section(config: configparser.ConfigParser, section: str) -> WorkspaceC
     )
 
 
+# The `databricks` CLI mints OAuth tokens (and serves PATs) without the Python
+# SDK — the same `databricks auth token` path the harness `auth_command` runs.
+# Refreshing an OAuth access token can make a network round-trip, so allow a
+# few seconds (matches the auth-command budget elsewhere in the codebase).
+_CLI_AUTH_TIMEOUT_S: float = 15.0
+
+
+def _databricks_cli_json(args: list[str], *, timeout: float) -> dict[str, object] | None:
+    """Run a ``databricks`` CLI subcommand with ``--output json`` and parse it.
+
+    Total by contract: any failure (binary absent, non-zero exit, timeout,
+    non-JSON output) returns ``None`` so the credential resolver can fall
+    through cleanly rather than raising from a subprocess.
+
+    :param args: CLI args after the binary, e.g.
+        ``["auth", "token", "--profile", "oss"]``. ``--output json`` is
+        appended here.
+    :param timeout: Seconds to allow the subprocess before giving up.
+    :returns: The parsed JSON object, or ``None`` when the binary is
+        missing, the command fails/times out, or the output is not a
+        JSON object.
+    """
+    binary = shutil.which("databricks")
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, *args, "--output", "json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload: object = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _host_from_describe(described: dict[str, object]) -> str | None:
+    """Extract the workspace host from ``databricks auth describe`` JSON.
+
+    The CLI nests the host under ``details.host``; a flat top-level
+    ``host`` is accepted as a defensive fallback across CLI versions.
+
+    :param described: Parsed ``databricks auth describe --output json`` object.
+    :returns: The workspace host, or ``None`` when absent/empty.
+    """
+    details = described.get("details")
+    if isinstance(details, dict):
+        host = details.get("host")
+        if isinstance(host, str) and host:
+            return host
+    host = described.get("host")
+    return host if isinstance(host, str) and host else None
+
+
+def _try_resolve_via_cli(profile: str | None) -> WorkspaceCreds | None:
+    """Resolve credentials via the ``databricks`` CLI binary.
+
+    Mirrors the harness ``auth_command`` (``databricks auth token --profile
+    ...``), so OAuth (``databricks-cli``) profiles — whose cfg sections carry
+    no static ``token`` — resolve even when the Python ``databricks-sdk`` is
+    not installed. The host comes from ``databricks auth describe`` and the
+    bearer from ``databricks auth token``. Never raises (see
+    :func:`_databricks_cli_json`): any failure returns ``None`` so the caller
+    falls through to its final ``OSError``.
+
+    :param profile: The profile to authenticate against, e.g. ``"oss"``;
+        ``None`` lets the CLI use its own resolution order (``DEFAULT`` /
+        ``DATABRICKS_CONFIG_PROFILE`` env var).
+    :returns: A :class:`WorkspaceCreds`, or ``None`` when the CLI is
+        unavailable or cannot mint a token.
+    """
+    profile_args = ["--profile", profile] if profile else []
+    described = _databricks_cli_json(
+        ["auth", "describe", *profile_args], timeout=_CLI_AUTH_TIMEOUT_S
+    )
+    if described is None:
+        return None
+    host = _host_from_describe(described)
+    if host is None:
+        return None
+    minted = _databricks_cli_json(["auth", "token", *profile_args], timeout=_CLI_AUTH_TIMEOUT_S)
+    if minted is None:
+        return None
+    token = minted.get("access_token")
+    if not isinstance(token, str) or not token:
+        return None
+    _logger.debug(
+        "resolved Databricks workspace creds via the databricks CLI (profile=%r)", profile
+    )
+    return WorkspaceCreds(host=_strip_trailing_slash(host), token=token)
+
+
 def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
     """
     Call ``databricks-sdk``'s ``Config.authenticate()`` once and unpack
@@ -233,10 +345,13 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
     try:
         from databricks.sdk.config import Config
     except ImportError as exc:
-        # Pinned dep missing = real env bug, not routine auth failure.
-        _logger.warning(
-            "databricks-sdk is not importable: %s — OAuth profiles will be invisible "
-            "to the resolver, falling through to configparser path.",
+        # databricks-sdk now lives in an optional extra, so an SDK-less install
+        # is expected rather than a bug. OAuth profiles are still resolvable via
+        # the `databricks` CLI fallback in resolve_databricks_workspace, so this
+        # is INFO (kept in cli-*.log) rather than a stderr-bound WARNING.
+        _logger.info(
+            "databricks-sdk is not importable: %s — falling through to the "
+            "`databricks` CLI / configparser resolution path.",
             exc,
         )
         return None
@@ -363,7 +478,8 @@ def _build_resolution_error_message(profile: str | None, cfg_path: Path) -> str:
         "(1) databricks-sdk Config(profile="
         f"{profile!r}).authenticate(), "
         f"(2) {profile_clause}, "
-        f"(3) [DEFAULT] section in {cfg_path}."
+        f"(3) [DEFAULT] section in {cfg_path}, "
+        "(4) the `databricks` CLI (`databricks auth token`)."
     )
 
 
@@ -386,7 +502,11 @@ def resolve_databricks_workspace(profile: str | None) -> WorkspaceCreds:
        — no silent fallback to ``[DEFAULT]``.
     3. The ``[DEFAULT]`` section of the Databricks config file via raw
        configparser (only when *profile* is ``None``).
-    4. ``OSError`` listing every source tried.
+    4. The ``databricks`` CLI binary (``databricks auth describe`` +
+       ``databricks auth token``) — covers OAuth (``databricks-cli``)
+       profiles, which carry no static ``token``, when the Python SDK
+       (step 1) is not installed. Mirrors the harness ``auth_command``.
+    5. ``OSError`` listing every source tried.
 
     The config file path is ``$DATABRICKS_CONFIG_FILE`` when that env
     var is set, otherwise ``~/.databrickscfg``.
@@ -417,22 +537,38 @@ def resolve_databricks_workspace(profile: str | None) -> WorkspaceCreds:
     effective_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
 
     cfg_path = _databrickscfg_path()
+    malformed_exc: _SectionPresentButInvalid | None = None
     try:
         from_cfg = _try_resolve_from_cfg(effective_profile, cfg_path)
     except _SectionAbsent:
         # Named profile explicitly requested but not present in the
         # file — fail loud rather than silently routing to [DEFAULT]
-        # (a different workspace). This is the typo-in-profile guard.
+        # (a different workspace). This is the typo-in-profile guard:
+        # a nonexistent profile is a typo, not an OAuth login, so the
+        # CLI fallback below is deliberately NOT attempted here.
         raise OSError(
             f"Databricks profile [{effective_profile}] not found in {cfg_path}. "
             "Check that the section name matches exactly (case-sensitive) "
             "and that the file exists."
         ) from None
     except _SectionPresentButInvalid as exc:
-        raise OSError(
-            f"Databricks profile [{effective_profile}] in {cfg_path} is malformed: {exc}"
-        ) from exc
+        # Section exists with a host but no static token — the hallmark of an
+        # OAuth (`databricks-cli`) profile. Defer the malformed error so the
+        # `databricks` CLI fallback gets a chance to mint a token first.
+        from_cfg = None
+        malformed_exc = exc
     if from_cfg is not None:
         return from_cfg
 
+    # SDK + plaintext cfg both came up empty. Mint via the `databricks` CLI
+    # binary — the same path the harness `auth_command` uses — so OAuth
+    # profiles resolve without the Python SDK installed.
+    from_cli = _try_resolve_via_cli(effective_profile)
+    if from_cli is not None:
+        return from_cli
+
+    if malformed_exc is not None:
+        raise OSError(
+            f"Databricks profile [{effective_profile}] in {cfg_path} is malformed: {malformed_exc}"
+        ) from malformed_exc
     raise OSError(_build_resolution_error_message(effective_profile, cfg_path))

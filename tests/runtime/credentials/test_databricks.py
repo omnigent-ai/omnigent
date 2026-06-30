@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,12 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     this monkeypatch the suite takes ~35 minutes; with it, ~0.4s.
     Each test that wants to exercise the SDK path explicitly
     overrides this monkeypatch (see ``test_resolves_via_sdk_*``).
+
+    The ``databricks`` CLI fallback is neutralized for the same reason:
+    without this, OAuth/no-token cfg cases would shell out to a real
+    ``databricks`` binary (if installed) against the test's temp cfg,
+    making the suite slow and host-dependent. Tests that exercise the
+    CLI path override ``_databricks_cli_json`` explicitly.
     """
     for var in (
         "DATABRICKS_CONFIG_FILE",
@@ -40,6 +47,10 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         raise ValueError("SDK path disabled in tests by default")
 
     monkeypatch.setattr("databricks.sdk.config.Config", _raise_value_error)
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks._databricks_cli_json",
+        lambda *_args, **_kwargs: None,
+    )
 
 
 def _write_cfg(tmp_path: Path, body: str) -> Path:
@@ -410,3 +421,120 @@ def test_honors_databricks_config_file_env(
     # fails on the decoy host, the env var override is broken.
     assert creds.host == "https://real.example.com"
     assert creds.token == "real-token"
+
+
+def _fake_cli_json(
+    *, host: str | None, token: str | None
+) -> Callable[..., dict[str, object] | None]:
+    """Build a ``_databricks_cli_json`` stand-in keyed by the CLI subcommand.
+
+    ``databricks auth describe`` → ``{"details": {"host": host}}``;
+    ``databricks auth token`` → ``{"access_token": token}``. Passing ``None``
+    for either suppresses that subcommand's output, simulating a CLI that is
+    absent or cannot mint a token for it.
+
+    :param host: Host returned by the simulated ``auth describe``, or ``None``.
+    :param token: Token returned by the simulated ``auth token``, or ``None``.
+    :returns: A callable matching ``_databricks_cli_json``'s signature.
+    """
+
+    def _fake(args: list[str], *, timeout: float) -> dict[str, object] | None:
+        del timeout
+        if "describe" in args:
+            return {"details": {"host": host}} if host else None
+        if "token" in args:
+            return {"access_token": token} if token else None
+        return None
+
+    return _fake
+
+
+def test_resolves_oauth_profile_via_cli_when_no_static_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The exact bug this fixes: a `databricks-cli` (OAuth) profile has a host
+    # but NO static token, and the Python SDK is unavailable (autouse fixture
+    # disables it). The configparser path rejects the tokenless section as
+    # malformed; the `databricks` CLI fallback must mint a bearer so the
+    # profile resolves instead of raising.
+    cfg = _write_cfg(
+        tmp_path,
+        "[oss]\nhost = https://oss.example.com\nauth_type = databricks-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks._databricks_cli_json",
+        _fake_cli_json(host="https://oss.example.com/", token="cli-minted-token"),
+    )
+
+    creds = resolve_databricks_workspace(profile="oss")
+
+    # Host came from `auth describe` (trailing slash stripped), bearer from
+    # `auth token`. If this raises, the CLI fallback isn't wired in.
+    assert creds == WorkspaceCreds(host="https://oss.example.com", token="cli-minted-token")
+
+
+def test_resolves_default_oauth_via_cli_when_cfg_has_no_creds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # profile=None and no cfg file at all → configparser yields nothing. A
+    # `[DEFAULT]` OAuth login (no token in the file) must still resolve via
+    # the CLI binary rather than raising.
+    missing_cfg = tmp_path / "does-not-exist"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(missing_cfg))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks._databricks_cli_json",
+        _fake_cli_json(host="https://default-oauth.example.com", token="cli-token"),
+    )
+
+    creds = resolve_databricks_workspace(profile=None)
+
+    assert creds == WorkspaceCreds(host="https://default-oauth.example.com", token="cli-token")
+
+
+def test_oauth_profile_raises_malformed_when_cli_cannot_mint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Host present, no token, SDK disabled, AND the CLI cannot mint a token
+    # (binary absent or login expired → every subcommand returns None). The
+    # resolver must fall back to the malformed-profile OSError naming [oss].
+    cfg = _write_cfg(
+        tmp_path,
+        "[oss]\nhost = https://oss.example.com\nauth_type = databricks-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    # autouse already stubs the CLI to None; this is explicit for clarity.
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks._databricks_cli_json",
+        _fake_cli_json(host=None, token=None),
+    )
+
+    with pytest.raises(OSError) as excinfo:
+        resolve_databricks_workspace(profile="oss")
+
+    msg = str(excinfo.value)
+    assert "[oss]" in msg
+    assert "malformed" in msg.lower() or "token" in msg
+
+
+def test_cli_not_attempted_for_absent_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The CLI fallback is for OAuth profiles that EXIST but carry no static
+    # token — never for a typo'd/nonexistent profile. An absent section must
+    # still fail loud immediately (the typo guard), without shelling out.
+    cfg = _write_cfg(
+        tmp_path,
+        "[DEFAULT]\nhost = https://default.example.com\ntoken = default-token\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    def _boom(*_args: object, **_kwargs: object) -> dict[str, object] | None:
+        raise AssertionError("CLI fallback must not run for an absent profile")
+
+    monkeypatch.setattr("omnigent.runtime.credentials.databricks._databricks_cli_json", _boom)
+
+    with pytest.raises(OSError) as excinfo:
+        resolve_databricks_workspace(profile="ghost")
+
+    assert "ghost" in str(excinfo.value)
