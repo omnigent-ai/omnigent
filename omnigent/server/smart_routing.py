@@ -56,33 +56,6 @@ _HARNESS_FAMILY: dict[str, str] = {
     "agents_sdk": "gpt",
 }
 
-# Per-model capability descriptions embedded in the judge prompt.
-_MODEL_DESCRIPTIONS: dict[str, str] = {
-    "databricks-claude-haiku-4-5": (
-        "Fast and cheap. Best for: greetings, clarifications, conversational "
-        "follow-ups, one-line lookups, simple factual questions."
-    ),
-    "databricks-claude-sonnet-4-6": (
-        "Balanced. Best for: focused single-file changes, writing tasks, "
-        "moderate analysis, explaining code, standard debugging."
-    ),
-    "databricks-claude-opus-4-8": (
-        "Most capable Claude. Best for: multi-file refactors, architecture "
-        "design, security audits, deep reasoning, performance optimization."
-    ),
-    "databricks-gpt-5-4-mini": (
-        "Fast and cheap GPT. Best for: simple tasks, quick lookups, "
-        "conversational replies, lightweight code edits."
-    ),
-    "databricks-gpt-5-4": (
-        "Balanced GPT. Best for: moderate coding tasks, single-file changes, analysis, debugging."
-    ),
-    "databricks-gpt-5-5": (
-        "Most capable GPT. Best for: hard reasoning, complex multi-file work, "
-        "architecture decisions, broad codebase understanding."
-    ),
-}
-
 
 def infer_models(harness: str | None) -> list[str] | None:
     """Return available models for *harness*, or ``None`` if unroutable."""
@@ -133,11 +106,19 @@ _JUDGE_SYSTEM_TEMPLATE = """\
 You are a model router for a coding assistant. Given the user's message,
 pick the best model from the list below.
 
-Available models:
+Available models (ordered cheapest → most powerful):
 {model_menu}
 
-Choose the cheapest model that can handle the task well. Only use a
-more powerful model when the task genuinely requires it.
+Model naming conventions to help you choose:
+- Claude family: haiku < sonnet < opus (capability increases left to right)
+- GPT family: -mini < base < higher number suffix (e.g. gpt-5-4-mini < gpt-5-4 < gpt-5-5)
+- Higher version numbers indicate newer, more capable models
+- The list order reflects relative cost and capability for THIS deployment
+
+Pick the CHEAPEST model that can do the job well:
+- Trivial (greetings, clarifications, one-liners) → cheapest
+- Moderate (single-file changes, debugging, analysis) → middle
+- Complex (multi-file refactors, architecture, deep reasoning) → most powerful
 
 Return **strict JSON only**:
 {{"model": "<id>", "rationale": "<one sentence>"}}
@@ -145,11 +126,8 @@ Return **strict JSON only**:
 
 
 def _build_rubric(available_models: list[str]) -> str:
-    """Format the judge prompt with per-model capability descriptions."""
-    lines = []
-    for model_id in available_models:
-        desc = _MODEL_DESCRIPTIONS.get(model_id, "General-purpose model.")
-        lines.append(f"- {model_id}: {desc}")
+    """Format the judge prompt with the ordered model list."""
+    lines = [f"- {m}" for m in available_models]
     return _JUDGE_SYSTEM_TEMPLATE.format(model_menu="\n".join(lines))
 
 

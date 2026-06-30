@@ -62,11 +62,8 @@ class _FakeRoutingClient:
     def __init__(self, result: RoutingResult | None) -> None:
         self._result = result
 
-    async def route(
-        self,
-        message: str,
-        available_models: list[str],
-    ) -> RoutingResult | None:
+    async def route(self, message: str, available_models: list[str]) -> RoutingResult | None:
+        del message, available_models
         return self._result
 
 
@@ -123,8 +120,8 @@ def test_build_rubric_includes_all_models() -> None:
     assert "databricks-claude-haiku-4-5" in rubric
     assert "databricks-claude-opus-4-8" in rubric
     assert "strict JSON" in rubric
-    # Descriptions are included
-    assert "cheap" in rubric.lower() or "fast" in rubric.lower()
+    # Naming conventions are explained
+    assert "haiku < sonnet < opus" in rubric
 
 
 # ── LLMRoutingClient ───────────────────────────────────────────────
