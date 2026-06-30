@@ -1752,6 +1752,7 @@ class _ConnectSpy:
         """
         self._exceptions = exceptions
         self.call_count = 0
+        self.last_kwargs: dict[str, object] = {}
 
     def __call__(self, url: str, **kwargs: object) -> _HandshakeFailingConnect | _AcceptingConnect:
         """Return an async-CM scripting the handshake for this call.
@@ -1762,6 +1763,7 @@ class _ConnectSpy:
             queued exception, or completes the handshake for a ``None``
             entry.
         """
+        self.last_kwargs = kwargs
         exc = self._exceptions[min(self.call_count, len(self._exceptions) - 1)]
         self.call_count += 1
         if exc is None:
@@ -2152,3 +2154,44 @@ def test_run_host_process_announces_session_log_dir_on_start(
 
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/host-runner/" in out
+
+
+async def test_connect_disables_proxy_for_loopback_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host WS client disables proxy auto-detection for a loopback server.
+
+    websockets >=15 defaults to proxy auto-detection; on macOS a configured
+    system/env proxy is not bypassed for loopback, so a local-server tunnel
+    hangs until open_timeout (issue #1514). The connect must pass proxy=None
+    for a loopback server. Fails before the fix (default proxy=True).
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host("http://127.0.0.1:6767")
+
+    await host.run()
+
+    assert spy.call_count == 1
+    assert spy.last_kwargs.get("proxy") is None
+
+
+async def test_connect_keeps_proxy_for_remote_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host WS client keeps proxy auto-detection for a remote server.
+
+    A remote deploy may legitimately sit behind a corporate proxy, so the
+    loopback-only proxy bypass (issue #1514) must not disable proxy detection
+    for non-loopback servers.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host("https://app.example.databricks.com")
+
+    await host.run()
+
+    assert spy.call_count == 1
+    assert spy.last_kwargs.get("proxy") is True

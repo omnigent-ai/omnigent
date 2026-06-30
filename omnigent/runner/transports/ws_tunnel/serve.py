@@ -24,6 +24,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from websockets.exceptions import InvalidURI, WebSocketException
 
+from omnigent._platform import url_is_loopback
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -545,6 +546,11 @@ async def _serve_tunnel_once(
         additional_headers=headers,
         close_timeout=_RUNNER_TUNNEL_CLOSE_TIMEOUT_S,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        # See issue #1514: websockets >=15 auto-detects a system/env proxy, and
+        # macOS routes loopback through it, hanging the tunnel. The runner runs
+        # on the host machine and connects to the same server, so disable proxy
+        # for a loopback server and keep auto-detection for remote ones.
+        proxy=None if url_is_loopback(server_url) else True,
     ) as ws:
         await _send_hello(ws.send, runner_version)
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)

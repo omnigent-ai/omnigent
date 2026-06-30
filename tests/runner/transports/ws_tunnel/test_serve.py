@@ -568,6 +568,10 @@ async def test_serve_tunnel_once_sends_bearer_header(
         },
         "close_timeout": serve_module._RUNNER_TUNNEL_CLOSE_TIMEOUT_S,
         "max_size": serve_module.RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        # Remote server keeps websockets' proxy auto-detection (a corporate
+        # proxy may be required); loopback disables it — see issue #1514 and
+        # test_serve_tunnel_once_disables_proxy_for_loopback.
+        "proxy": True,
     }
     assert isinstance(captured["sent"], str)
 
@@ -626,6 +630,60 @@ async def test_serve_tunnel_once_sends_org_header(
     headers = captured["headers"]
     assert isinstance(headers, dict)
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+async def test_serve_tunnel_once_disables_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner WS client disables proxy auto-detection for a loopback server.
+
+    websockets >=15 defaults to proxy auto-detection; on macOS a configured
+    system/env proxy is not bypassed for loopback, so the runner tunnel to a
+    local server hangs until open_timeout (issue #1514). The connect must pass
+    proxy=None for a loopback server. Fails before the fix (default proxy=True).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    captured: dict[str, object] = {}
+
+    class _FakeWS:
+        async def send(self, data: str) -> None:
+            del data
+
+        def __aiter__(self) -> _FakeWS:
+            return self
+
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return _FakeWS()
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        captured["kwargs"] = kwargs
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+
+    await _serve_tunnel_once(
+        _noop_app,
+        tunnel_url="ws://127.0.0.1:6767/v1/runners/r/tunnel",
+        server_url="http://127.0.0.1:6767",
+        runner_id="r",
+        runner_version="0.1.0",
+    )
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["proxy"] is None
 
 
 @pytest.mark.parametrize(

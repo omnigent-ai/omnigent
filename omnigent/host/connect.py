@@ -21,7 +21,7 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import WINDOWS_ENV_PASSTHROUGH, url_is_loopback
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -164,27 +164,6 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
         message += "\n--- runner log tail ---\n" + "\n".join(lines)
     return message
-
-
-def _url_is_loopback(url: str) -> bool:
-    """Whether ``url``'s host is loopback (``127.0.0.1`` / ``localhost`` / ``::1``).
-
-    Used to distinguish a daemon-spawned local server (no proxy in
-    front) from a remote deploy behind the Databricks Apps ingress, so
-    the reconnect heuristic only treats an abrupt ``no close frame`` as
-    a benign ingress recycle when there actually IS an ingress.
-
-    :param url: A server or ws:// URL, e.g. ``"ws://127.0.0.1:49175"``.
-    :returns: ``True`` for a loopback host, ``False`` otherwise (incl.
-        unparseable URLs — fail toward "remote", the safer default for
-        the recycle heuristic).
-    """
-    from urllib.parse import urlparse
-
-    try:
-        return urlparse(url).hostname in ("127.0.0.1", "localhost", "::1")
-    except ValueError:
-        return False
 
 
 _RECONNECT_BASE_S = 0.5
@@ -1324,7 +1303,7 @@ class HostProcess:
                     )
                     ingress_recycle = any(t in reason for t in ("no close frame", "502"))
                     recycle = explicit_recycle or (
-                        ingress_recycle and not _url_is_loopback(self._server_url)
+                        ingress_recycle and not url_is_loopback(self._server_url)
                     )
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     _logger.warning(
@@ -1379,6 +1358,13 @@ class HostProcess:
                 url,
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
+                # websockets >=15 defaults to proxy auto-detection. macOS does
+                # not bypass loopback for a configured system/env proxy, so a
+                # local-server tunnel gets routed through the proxy and hangs
+                # until open_timeout (issue #1514). Disable proxy for loopback;
+                # keep auto-detection for remote servers, which may legitimately
+                # sit behind a corporate proxy.
+                proxy=None if url_is_loopback(self._server_url) else True,
             )
             ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:

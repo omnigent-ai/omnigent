@@ -117,6 +117,27 @@ def stable_user_id() -> str:
     return hashlib.sha256(name.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
+def url_is_loopback(url: str) -> bool:
+    """Whether ``url``'s host is loopback (``127.0.0.1`` / ``localhost`` / ``::1``).
+
+    Used to distinguish a daemon-spawned local server (no proxy in front) from a
+    remote deploy behind the Databricks Apps ingress. Two callers rely on it:
+    the reconnect heuristic (only an abrupt ``no close frame`` against a *remote*
+    server is a benign ingress recycle), and the WebSocket client connects, which
+    disable proxy auto-detection for loopback targets (see issue #1514).
+
+    :param url: A server or ws:// URL, e.g. ``"ws://127.0.0.1:49175"``.
+    :returns: ``True`` for a loopback host, ``False`` otherwise (incl.
+        unparseable URLs — fail toward "remote", the safer default).
+    """
+    from urllib.parse import urlparse
+
+    try:
+        return urlparse(url).hostname in ("127.0.0.1", "localhost", "::1")
+    except ValueError:
+        return False
+
+
 def resolve_repo_symlink(path: Path) -> Path:
     """
     Follow a Git symlink that a no-symlink Windows checkout left as a text file.

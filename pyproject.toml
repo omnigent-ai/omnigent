@@ -36,9 +36,13 @@ dependencies = [
     "mcp>=1.0,<2",
     "starlette>=1.0.1,<2",
     "uvicorn[standard]>=0.30,<1",
-    # websockets >=15 asyncio client hangs on macOS before emitting any handshake
-    # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
-    "websockets>=10.4,<15",
+    # websockets >=15 added proxy auto-detection (proxy=True default). macOS does
+    # not bypass loopback for a configured system/env proxy, so a local-server
+    # tunnel was routed through the proxy and hung until open_timeout (issue
+    # #1514). The host/runner WebSocket clients now pass proxy=None for loopback
+    # targets, so >=15 is safe; floor is 15.0.1 (the proxy kwarg only exists on
+    # >=15, and 15.0.1 also clears the open advisories from #1541's era).
+    "websockets>=15.0.1,<16",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
