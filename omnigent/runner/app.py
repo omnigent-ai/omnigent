@@ -16609,11 +16609,23 @@ def create_runner_app(
             )
 
         # Check the file is tracked in the changed-files registry.
-        record = (
-            session_registry.get_changed_file(session_id, relative_path)
-            if session_registry is not None
-            else None
-        )
+        from omnigent.runtime.filesystem_registry import GitStatusUnavailable
+
+        try:
+            record = (
+                session_registry.get_changed_file(session_id, relative_path)
+                if session_registry is not None
+                else None
+            )
+        except GitStatusUnavailable as exc:
+            # The working-tree read itself failed (timeout / spawn error /
+            # non-zero exit). Surface it like the /changes endpoint does,
+            # rather than letting a swallowed failure masquerade as a 404
+            # "not in the changed-files registry".
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": "git_status_failed", "message": exc.reason}},
+            )
         if record is None:
             return JSONResponse(
                 status_code=404,

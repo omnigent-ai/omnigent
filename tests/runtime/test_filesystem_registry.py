@@ -568,6 +568,64 @@ def test_git_list_changed_files_raises_on_nonzero_exit(tmp_path: Path, monkeypat
         reg.list_changed_files("any-conv", limit=100)
 
 
+def test_git_get_changed_file_raises_on_timeout(tmp_path: Path, monkeypatch) -> None:
+    """A ``git status`` timeout in the single-file lookup must raise, not return ``None``.
+
+    Swallowing it to ``None`` made the diff endpoint answer 404 — a state
+    indistinguishable from "this path has no changes" — for a read that
+    *could not run*. The failure must surface like the list path.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="git status", timeout=5)
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _raise_timeout)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    with pytest.raises(GitStatusUnavailable, match="timed out"):
+        reg.get_changed_file("any-conv", "a.txt")
+
+
+def test_git_get_changed_file_raises_on_nonzero_exit(tmp_path: Path, monkeypatch) -> None:
+    """A non-zero ``git status`` exit in the single-file lookup must raise, not return ``None``."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    def _nonzero(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args="git status",
+            returncode=128,
+            stdout=b"",
+            stderr=b"fatal: detected dubious ownership in repository",
+        )
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _nonzero)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    with pytest.raises(GitStatusUnavailable, match="exited 128"):
+        reg.get_changed_file("any-conv", "a.txt")
+
+
+def test_git_get_changed_file_returns_none_when_unchanged(tmp_path: Path) -> None:
+    """A clean ``git status`` (exit 0, no output) still means "no changes" → ``None``.
+
+    Guards against the raise paths swallowing the legitimate empty case: a
+    tracked, unmodified file must return ``None``, not raise.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "a.txt").write_text("hello\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    assert reg.get_changed_file("any-conv", "a.txt") is None
+
+
 def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> None:
     """A new file in a brand-new untracked directory tree returns its full path.
 

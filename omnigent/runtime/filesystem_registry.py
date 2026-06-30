@@ -791,21 +791,53 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
+        # Mirror list_changed_files: a read that *could not run* (timeout /
+        # spawn error / non-zero exit) raises so the diff endpoint surfaces it,
+        # instead of being swallowed to ``None`` — which the endpoint turns
+        # into a 404 indistinguishable from "this path has no changes".
+        argv = ["git", "status", "--porcelain", "--", git_path]
+        started = time.monotonic()
         try:
             result = subprocess.run(
-                ["git", "status", "--porcelain", "--", git_path],
+                argv,
                 cwd=str(self._git_root),
                 capture_output=True,
                 timeout=5,
             )
-        except Exception:
-            _logger.debug(
-                "GitFilesystemRegistry.get_changed_file: git status failed", exc_info=True
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s timed out after %.2fs",
+                argv,
+                self._git_root,
+                elapsed,
             )
-            return None
+            raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
+        except OSError as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s could not run after %.2fs: %s",
+                argv,
+                self._git_root,
+                elapsed,
+                exc,
+            )
+            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
+        elapsed = time.monotonic() - started
         if result.returncode != 0:
-            return None
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s exited %d after %.2fs: %s",
+                argv,
+                self._git_root,
+                result.returncode,
+                elapsed,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
 
         output = result.stdout.decode("utf-8", errors="replace")
         for line in output.splitlines():
