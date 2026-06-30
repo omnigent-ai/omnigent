@@ -137,6 +137,7 @@ import {
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { UserMessageNav } from "@/components/UserMessageNav";
+import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -3291,9 +3292,11 @@ export function composerHarnessLabel(
 function ComposerStatusLine({
   harnessLabel,
   codexGoal,
+  isSubAgentSession,
 }: {
   harnessLabel: string | null;
   codexGoal: CodexGoal | null;
+  isSubAgentSession: boolean;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
@@ -3305,6 +3308,12 @@ function ComposerStatusLine({
   const gitBranch = useChatStore((s) => s.gitBranch);
 
   const showBranch = !!conversationId && !!gitBranch;
+  // Host indicator (green/red dot + host name), left of the worktree branch.
+  // Hidden on sub-agent sessions — the header's child-session slot owns the
+  // back affordance there, mirroring where this badge used to live. HostBadge
+  // self-hides when the session isn't host-bound, so this is a visibility gate,
+  // not a host-presence claim.
+  const showHost = !!conversationId && !isSubAgentSession;
   // The harness/agent identity (e.g. "Claude", "Polly (Pi)") lives here now;
   // the picker trigger above owns the model/effort label since it's the
   // control that changes them.
@@ -3332,19 +3341,20 @@ function ComposerStatusLine({
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Left: worktree branch. Always holds the flex-1 slot so the
-          right cluster stays pinned right even with no branch, and
-          truncates to an ellipsis so the tray never wraps. */}
-      <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-muted-foreground">
+      {/* Left: host badge then worktree branch. Always holds the flex-1 slot
+          so the right cluster stays pinned right even when both are absent;
+          each item truncates to an ellipsis so the tray never wraps. */}
+      <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
+        {showHost && conversationId && <HostBadge sessionId={conversationId} />}
         {showBranch && (
-          <>
+          <span className="flex min-w-0 items-center gap-1.5">
             <GitBranchIcon className="size-3.5 shrink-0" />
             <span data-testid="composer-git-branch" className="min-w-0 truncate" title={gitBranch}>
               {gitBranch}
             </span>
-          </>
+          </span>
         )}
-      </span>
+      </div>
       {/* Right: model/effort and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
@@ -4614,7 +4624,11 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine harnessLabel={harnessLabel} codexGoal={codexGoal} />
+      <ComposerStatusLine
+        harnessLabel={harnessLabel}
+        codexGoal={codexGoal}
+        isSubAgentSession={subAgentLabel != null}
+      />
     </form>
   );
 }
