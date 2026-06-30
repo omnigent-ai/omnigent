@@ -3953,6 +3953,9 @@ export function Composer({
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
       dirtyRef.current = true;
+      // Return focus to the composer so the user can keep typing right
+      // after attaching (the file picker / paperclip button steals it).
+      if (!isMobileRef.current) textareaRef.current?.focus();
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
