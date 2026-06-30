@@ -67,6 +67,9 @@ class _FakeRoutingClient:
         self,
         message: str,
         available_tiers: dict[str, list[str]],
+        *,
+        session_id: str | None = None,
+        conversation_store: object | None = None,
     ) -> RoutingResult | None:
         return self._result
 

@@ -28,6 +28,7 @@ and :class:`PolicyResult` from here (or from the
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -353,12 +354,22 @@ class PolicyLLMClient:
         adapter defaults / env vars.
     :param _request_timeout: Request timeout in seconds from the
         server ``llm:`` config, e.g. ``300``.
+    :param _usage_callback: Optional callback invoked after every
+        successful ``create()`` call with ``(model, usage)`` so the
+        caller can record the policy LLM's token spend against the
+        session budget. ``model`` is the string model id used for this
+        call; ``usage`` is the response's usage object
+        (:class:`~omnigent.llms.types.Usage` or ``None`` when the
+        provider did not report it). ``None`` disables the callback
+        (the caller does not track policy LLM spend — the pre-fix
+        default).
     """
 
     _client: Any  # omnigent.llms.client.Client — Any to avoid import cycle
     _model: str
     _connection: dict[str, str] | None
     _request_timeout: int
+    _usage_callback: Callable[[str, Any], None] | None = None
 
     async def create(
         self,
@@ -373,7 +384,9 @@ class PolicyLLMClient:
         Thin wrapper around ``client.responses.create()`` that
         pre-fills ``model``, ``connection_params``, and ``timeout``
         from the server config. Callers can override any of these
-        via kwargs.
+        via kwargs. When ``_usage_callback`` is set, it is called
+        synchronously after the response returns with ``(model, usage)``
+        so the policy LLM's token spend can be attributed to the session.
 
         :param input: Messages in OpenAI Responses API format,
             e.g. ``[{"role": "user", "content": [{"type": "input_text",
@@ -383,14 +396,18 @@ class PolicyLLMClient:
             ``client.responses.create()``.
         :returns: A :class:`~omnigent.llms.types.Response`.
         """
-        return await self._client.responses.create(
+        effective_model: str = kwargs.pop("model", self._model)
+        response = await self._client.responses.create(
             input=input,
-            model=kwargs.pop("model", self._model),
+            model=effective_model,
             connection_params=kwargs.pop("connection_params", self._connection),
             timeout=kwargs.pop("timeout", self._request_timeout),
             instructions=instructions,
             **kwargs,
         )
+        if self._usage_callback is not None:
+            self._usage_callback(effective_model, getattr(response, "usage", None))
+        return response
 
 
 __all__ = [

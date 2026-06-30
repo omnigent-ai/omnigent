@@ -101,12 +101,17 @@ class RoutingClient(Protocol):
         self,
         message: str,
         available_tiers: dict[str, list[str]],
+        *,
+        session_id: str | None = None,
+        conversation_store: Any | None = None,
     ) -> RoutingResult | None:
         """Pick the best model for a session's initial message.
 
         :param message: The user's first message text.
         :param available_tiers: Tier name → model ids, e.g.
             ``{"cheap": ["databricks-claude-haiku-4-5"], ...}``.
+        :param session_id: Optional session id for usage attribution.
+        :param conversation_store: Optional store for usage attribution.
         :returns: A :class:`RoutingResult`, or ``None`` to skip
             routing (fail-open — the turn runs on the spec default).
         """
@@ -161,6 +166,58 @@ def _build_rubric(tiers: dict[str, list[str]]) -> str:
     return _JUDGE_SYSTEM_TEMPLATE.format(tier_menu="\n".join(lines))
 
 
+def _record_routing_usage(
+    response: Any,
+    session_id: str,
+    conversation_store: Any,
+) -> None:
+    """Attribute routing LLM token spend to the session budget.
+
+    Called after a successful :class:`LLMRoutingClient` call to record the
+    judge's token usage against the session so it counts toward the cost
+    cap and daily rollup (fixing issue #8 for smart routing).
+
+    Uses :meth:`~omnigent.stores.conversation_store.ConversationStore.increment_session_usage`
+    (atomic, same path as relay completions) with ADD-semantics delta so
+    routing spend is layered on top of whatever tokens the session has
+    already accumulated.
+
+    No-op when the response carries no usage (provider didn't report it).
+
+    :param response: LLM response with a ``.usage`` attribute.
+    :param session_id: Session to attribute the spend to.
+    :param conversation_store: Store for the atomic usage write.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    input_tokens: int = getattr(usage, "input_tokens", None) or 0
+    output_tokens: int = getattr(usage, "output_tokens", None) or 0
+    total_tokens: int = getattr(usage, "total_tokens", None) or 0
+    if not (input_tokens or output_tokens or total_tokens):
+        return
+    from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+
+    delta: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+    # Price the tokens if the routing model is in the catalog.
+    model_id: str = getattr(response, "model", "") or ""
+    pricing = fetch_model_pricing(model_id) if model_id else None
+    if pricing is not None:
+        delta["total_cost_usd"] = compute_llm_cost(delta, pricing)
+    try:
+        conversation_store.increment_session_usage(session_id, delta)
+    except Exception:  # noqa: BLE001 — attribution is best-effort; never block routing
+        _logger.warning(
+            "_record_routing_usage: failed to persist usage for session %s",
+            session_id,
+            exc_info=True,
+        )
+
+
 class LLMRoutingClient:
     """Default routing client that calls the server-level LLM.
 
@@ -177,6 +234,9 @@ class LLMRoutingClient:
         self,
         message: str,
         available_tiers: dict[str, list[str]],
+        *,
+        session_id: str | None = None,
+        conversation_store: Any | None = None,
     ) -> RoutingResult | None:
         rubric = _build_rubric(available_tiers)
         try:
@@ -208,6 +268,11 @@ class LLMRoutingClient:
         except Exception:  # noqa: BLE001  # fail-open: any LLM/parse error skips routing
             _logger.warning("LLMRoutingClient: judge call failed", exc_info=True)
             return None
+        # Attribute routing LLM spend to the session budget (#8).
+        if session_id is not None and conversation_store is not None:
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                _record_routing_usage(response, session_id, conversation_store)
 
         model = verdict.get("model")
         tier = verdict.get("tier")
@@ -241,11 +306,23 @@ class LLMRoutingClient:
 async def route_turn(
     harness: str | None,
     user_message: str,
+    *,
+    session_id: str | None = None,
+    conversation_store: Any | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Pick the best model for a turn via :attr:`RuntimeCaps.routing_client`.
 
+    When *session_id* and *conversation_store* are provided, the routing
+    LLM call's token usage is attributed to the session budget via
+    :meth:`~omnigent.stores.conversation_store.ConversationStore.increment_session_usage`
+    — fixing the gap where policy/judge LLM spend was not charged (#8).
+
     :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
     :param user_message: The user's message text.
+    :param session_id: Session to attribute routing LLM spend to. When
+        ``None`` the spend is not recorded (pre-fix behaviour).
+    :param conversation_store: Store for usage attribution. Ignored when
+        *session_id* is ``None``.
     :returns: ``(model_id, verdict_dict)`` or ``(None, None)``.
     """
     tiers = infer_tiers(harness)
@@ -260,7 +337,12 @@ async def route_turn(
     if _caps is None or _caps.routing_client is None:
         return None, None
 
-    result = await _caps.routing_client.route(user_message, tiers)
+    result = await _caps.routing_client.route(
+        user_message,
+        tiers,
+        session_id=session_id,
+        conversation_store=conversation_store,
+    )
     if result is None:
         return None, None
 

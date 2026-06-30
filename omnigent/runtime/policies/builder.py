@@ -370,7 +370,7 @@ def build_policy_engine(
     # Fall back to the server's gateway connection for prompt-policy
     # classifiers (else they default to api.openai.com).
     effective_connection_override = connection_override or server_connection
-    return PolicyEngine(
+    engine = PolicyEngine(
         policies=[
             _instantiate_policy(
                 s,
@@ -393,6 +393,12 @@ def build_policy_engine(
         root_conversation_id=root_conversation_id,
         llm_client=llm_client,
     )
+    # Wire the engine's usage recorder into the LLM client so every
+    # policy/judge LLM call is charged to the session budget alongside
+    # normal agent LLM spend (fixing issue #8).
+    if llm_client is not None:
+        llm_client._usage_callback = engine.record_usage_from_response
+    return engine
 
 
 def _resolve_server_llm_connection(

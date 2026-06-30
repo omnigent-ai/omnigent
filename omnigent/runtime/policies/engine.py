@@ -638,6 +638,36 @@ class PolicyEngine:
             self._subtree_usage["total_cost_usd"] += delta_cost
         self._store.set_session_usage(self._conversation_id, dict(self._usage))
 
+    def record_usage_from_response(self, _model: str, usage: Any) -> None:
+        """Record token usage from a policy LLM response.
+
+        Called by :class:`~omnigent.policies.types.PolicyLLMClient` after
+        each ``create()`` call via its ``_usage_callback``. Translates the
+        response's :class:`~omnigent.llms.types.Usage` object into the
+        counters :meth:`record_usage` expects and delegates to it so
+        policy/judge LLM spend is attributed to the session budget alongside
+        normal agent LLM spend.
+
+        No-op when *usage* is ``None`` (provider did not report token counts).
+
+        :param _model: The model id used for this call, e.g.
+            ``"openai/gpt-4o-mini"``. Currently unused (``record_usage``
+            does not attribute per-model; the engine prices via its
+            ``_token_pricing`` which is resolved at build time from the
+            session model, not the policy model). Kept for forward compat.
+        :param usage: The response's ``usage`` attribute — a
+            :class:`~omnigent.llms.types.Usage` dataclass or ``None``.
+        """
+        if usage is None:
+            return
+        self.record_usage(
+            input_tokens=getattr(usage, "input_tokens", None) or 0,
+            output_tokens=getattr(usage, "output_tokens", None) or 0,
+            total_tokens=getattr(usage, "total_tokens", None) or 0,
+            cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", None) or 0,
+            cache_creation_input_tokens=getattr(usage, "cache_creation_input_tokens", None) or 0,
+        )
+
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
         """
         Return a copy of *ctx* with ``usage`` populated.
