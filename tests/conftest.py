@@ -406,12 +406,6 @@ def _otel_in_memory_exporter():
     Use in tests that need to assert on `gen_ai.retry` events or other
     OTel-emitted span events across the production call path.
     """
-    import os
-
-    import mlflow
-    import mlflow.tracing
-    from mlflow.tracing.provider import provider as mlflow_provider_wrapper
-    from mlflow.tracing.trace_manager import InMemoryTraceManager
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -423,44 +417,26 @@ def _otel_in_memory_exporter():
 
     original_provider = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
     original_set_once_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
-    original_mlflow_once_done = mlflow_provider_wrapper._global_provider_init_once._done  # type: ignore[attr-defined]
     original_telemetry_initialized = runtime_telemetry._initialized  # type: ignore[attr-defined]
-    original_env_value = os.environ.get("MLFLOW_USE_DEFAULT_TRACER_PROVIDER")
 
-    os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = "false"
     runtime_telemetry._initialized = False  # type: ignore[attr-defined]
-
-    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
-    if trace_manager_instance is not None:
-        trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
-        trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
 
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
     otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
-    mlflow_provider_wrapper._global_provider_init_once._done = False  # type: ignore[attr-defined]
-    mlflow.tracing.enable()
 
     try:
         yield exporter
     finally:
-        # Process-serial only: the OTel and mlflow `Once` synchronization
-        # primitive mutations below are not safe under pytest-xdist
-        # parallel test workers in the same interpreter. omnigent's test
-        # suite runs single-process so this is fine; flag if that changes.
+        # Process-serial only: the private-attribute mutation below is not safe
+        # under pytest-xdist parallel test workers in the same interpreter.
+        # omnigent's test suite runs single-process so this is fine. Flag if
+        # that changes.
         exporter.clear()
         with contextlib.suppress(Exception):
             provider.shutdown()
         otel_trace._TRACER_PROVIDER = original_provider  # type: ignore[attr-defined]
         otel_trace._TRACER_PROVIDER_SET_ONCE._done = original_set_once_done  # type: ignore[attr-defined]
-        mlflow_provider_wrapper._global_provider_init_once._done = original_mlflow_once_done  # type: ignore[attr-defined]
         runtime_telemetry._initialized = original_telemetry_initialized  # type: ignore[attr-defined]
-        if original_env_value is None:
-            os.environ.pop("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", None)
-        else:
-            os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = original_env_value
-        if trace_manager_instance is not None:
-            trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
-            trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]

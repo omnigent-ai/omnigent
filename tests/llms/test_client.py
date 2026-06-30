@@ -938,8 +938,7 @@ async def test_create_with_retry_records_gen_ai_retry_on_active_span(
     current context. Verifies the async retry path is actually
     instrumented.
     """
-    import mlflow
-    from mlflow.entities import SpanType
+    from opentelemetry import trace as otel_trace
 
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
 
@@ -952,7 +951,7 @@ async def test_create_with_retry_records_gen_ai_retry_on_active_span(
     )
     _patch_client_deps(monkeypatch, mock_adapter)
 
-    with mlflow.start_span("agent_turn", span_type=SpanType.CHAIN):
+    with otel_trace.get_tracer("test").start_as_current_span("agent_turn"):
         result = await Client().responses.create(
             **_default_create_kwargs(),
             retry=retry_config,
@@ -986,8 +985,7 @@ async def test_create_with_retry_async_path_gates_error_message_on_content_captu
     land but error.message is NOT captured even when the upstream
     error body contains PII. error.type still is.
     """
-    import mlflow
-    from mlflow.entities import SpanType
+    from opentelemetry import trace as otel_trace
 
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
 
@@ -999,7 +997,7 @@ async def test_create_with_retry_async_path_gates_error_message_on_content_captu
     )
     _patch_client_deps(monkeypatch, mock_adapter)
 
-    with mlflow.start_span("agent_turn", span_type=SpanType.CHAIN):
+    with otel_trace.get_tracer("test").start_as_current_span("agent_turn"):
         result = await Client().responses.create(
             **_default_create_kwargs(),
             retry=retry_config,
@@ -1062,14 +1060,13 @@ async def test_create_with_retry_e2e_real_network_timeouts(
     No adapter mocks. No patched timeouts. Real connect attempts,
     real exceptions, real instrumentation.
     """
-    import mlflow
-    from mlflow.entities import SpanType
+    from opentelemetry import trace as otel_trace
 
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
 
     retry = RetryPolicy(max_retries=2, backoff_base_s=0.01, backoff_max_s=0.05)
 
-    with mlflow.start_span("agent_turn", span_type=SpanType.CHAIN):
+    with otel_trace.get_tracer("test").start_as_current_span("agent_turn"):
         with pytest.raises(RetryableLLMError):
             await Client().responses.create(
                 input=[{"role": "user", "content": "hello"}],

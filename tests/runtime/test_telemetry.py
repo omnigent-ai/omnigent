@@ -532,14 +532,13 @@ def test_record_llm_retry_adds_event_with_expected_attributes(
     attributes carry the attempt counters, error class, error
     message (when content capture is on), and backoff duration.
     """
-    import mlflow
-    from mlflow.entities import SpanType
+    from opentelemetry import trace as otel_trace
 
     # _capture_content is module-level cached. Force ON so error.message
     # is included in the assertion below.
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
 
-    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+    with otel_trace.get_tracer("test").start_as_current_span("llm_call"):
         telemetry.record_llm_retry(
             attempt=1,
             max_attempts=3,
@@ -570,12 +569,11 @@ def test_record_llm_retry_omits_backoff_when_none(
     ``backoff_seconds=None`` results in the key being absent on the
     event, not zero.
     """
-    import mlflow
-    from mlflow.entities import SpanType
+    from opentelemetry import trace as otel_trace
 
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
 
-    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+    with otel_trace.get_tracer("test").start_as_current_span("llm_call"):
         telemetry.record_llm_retry(
             attempt=3,
             max_attempts=3,
@@ -597,12 +595,11 @@ def test_record_llm_retry_gates_error_message_on_content_capture(
     When ``OMNIGENT_OTEL_CAPTURE_CONTENT`` is off (the default), the
     error.message is NOT included on the event. error.type still is.
     """
-    import mlflow
-    from mlflow.entities import SpanType
+    from opentelemetry import trace as otel_trace
 
     monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
 
-    with mlflow.start_span("llm_call", span_type=SpanType.CHAT_MODEL):
+    with otel_trace.get_tracer("test").start_as_current_span("llm_call"):
         telemetry.record_llm_retry(
             attempt=1,
             max_attempts=3,
