@@ -350,6 +350,18 @@ async def chat_stream_to_response_events(
 
         delta = choices[0].get("delta", {})
 
+        # Top-level reasoning content (xAI Grok, DeepSeek) arrives as a sibling
+        # ``reasoning_content`` string while ``content`` is null during the
+        # thinking phase. Surface it as reasoning so Grok thinking is not
+        # dropped — the typed-block path below only handles Kimi-style blocks
+        # nested inside ``content``.
+        reasoning_content = delta.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            if not reasoning_started:
+                yield ResponseReasoningStartedEvent()
+                reasoning_started = True
+            yield ResponseReasoningTextDeltaEvent(delta=reasoning_content)
+
         # Content delta — may be a plain string or a list of typed blocks
         # (Kimi and some Databricks models use typed blocks).
         content = delta.get("content")
