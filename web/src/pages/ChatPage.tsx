@@ -195,7 +195,25 @@ function extractUserText(content: MessageContentBlock[]): string {
  * user message, so the bubble can show what was attached (the marker text
  * itself is stripped from the rendered text by {@link extractUserText}). A
  * trailing "/" marks a folder. Returns [] for ordinary messages.
+ *
+ * Explicitly *uploaded* files share this marker wording: the native executor
+ * materializes the upload to disk and injects `[Attached: <abs-path>]` so the
+ * vendor CLI can read it. Those uploads already ride in as an
+ * `input_image`/`input_file` block (rendered as the image / a file chip), so
+ * surfacing them again here would double-render — as the path of an internal
+ * bridge temp dir, no less. "@"-mention paths are always workspace-relative
+ * while upload markers are absolute, so skip absolute paths (see
+ * {@link isAbsolutePath}).
  */
+// An absolute filesystem path in any form a native executor might materialize
+// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
+// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
+// reliably tells a materialized upload apart from a tagged workspace file
+// regardless of the host OS the runner happens to be on.
+function isAbsolutePath(p: string): boolean {
+  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+}
+
 function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
   const text = content
     .filter(
@@ -207,6 +225,8 @@ function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
   for (const m of text.matchAll(ATTACHED_RE)) {
     const raw = m[1].trim();
     if (!raw) continue;
+    // Absolute path → a materialized upload, already shown via its file block.
+    if (isAbsolutePath(raw)) continue;
     // Split a trailing ":start-end" line span back out so the chip can show
     // it without truncation (it's the whole point of a partial-file attach).
     const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
@@ -635,6 +655,7 @@ export function ChatPage() {
   useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -823,7 +844,11 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  const showsWorking = computeShowsWorking(sessionStatus, { hasPendingElicitation, runnerOnline });
+  const showsWorking = computeShowsWorking(sessionStatus, {
+    hasPendingElicitation,
+    runnerOnline,
+    backgroundTaskCount,
+  });
 
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
@@ -1635,20 +1660,7 @@ function MainAgentSurface({
                     Suppressed when the last bubble is a compaction spinner —
                     that bubble already owns the "in-progress" slot. aria-hidden:
                     the pinned pill owns the single aria-live region (see WorkingStatusPin). */}
-                {showWorkingIndicator && (
-                  <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-                    <MessageContent>
-                      {/* py-0.5 = headroom for the bob: MessageContent is overflow-hidden
-                          and would clip otto's head at the top of the bounce. */}
-                      <div className="flex items-center gap-1.5 py-0.5">
-                        <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-                        <Shimmer className="text-xs font-mono" duration={1.5}>
-                          Working…
-                        </Shimmer>
-                      </div>
-                    </MessageContent>
-                  </Message>
-                )}
+                {showWorkingIndicator && <WorkingIndicator />}
                 {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
                     runner-online send gate), but `showWorkingIndicator` stays
@@ -2301,6 +2313,35 @@ function hasInProgressAssistantBubble(bubbles: Bubble[]): boolean {
  *   least one item, or a compaction-loading bubble already represents the
  *   busy state.
  */
+/**
+ * The label shown next to the working spinner. When background shells outlive
+ * the turn (`bgCount > 0`) it names how many are still running; otherwise it's
+ * the plain "Working…" string.
+ */
+export function workingIndicatorLabel(bgCount: number): string {
+  if (bgCount <= 0) return "Working…";
+  return bgCount === 1
+    ? "1 background task still running"
+    : `${bgCount} background tasks still running`;
+}
+
+function WorkingIndicator() {
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const label = workingIndicatorLabel(bgCount);
+  return (
+    <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
+      <MessageContent>
+        <div className="flex items-center gap-1.5 py-0.5">
+          <OttoIcon className="otto-working h-4 w-auto shrink-0" />
+          <Shimmer className="text-xs font-mono" duration={1.5}>
+            {label}
+          </Shimmer>
+        </div>
+      </MessageContent>
+    </Message>
+  );
+}
+
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
   if (hasInProgressAssistantBubble(bubbles)) return false;
@@ -3953,6 +3994,9 @@ export function Composer({
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
       dirtyRef.current = true;
+      // Return focus to the composer so the user can keep typing right
+      // after attaching (the file picker / paperclip button steals it).
+      if (!isMobileRef.current) textareaRef.current?.focus();
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
@@ -4637,15 +4681,24 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
  *   known offline, ``undefined`` before the health poll resolves. Only known
  *   offline suppresses the indicator.
+ * @param options.backgroundTaskCount - Background shells still running after
+ *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
+ *   watcher's edge) even while shells run, so the bare status alone would hide
+ *   the indicator; a positive count keeps it lit so "N background tasks still running"
+ *   stays visible.
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
   sessionStatus: SessionStatus,
-  options: { hasPendingElicitation: boolean; runnerOnline: boolean | undefined },
+  options: {
+    hasPendingElicitation: boolean;
+    runnerOnline: boolean | undefined;
+    backgroundTaskCount?: number;
+  },
 ): boolean {
   if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus);
+  return computeIsWorking(sessionStatus) || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**

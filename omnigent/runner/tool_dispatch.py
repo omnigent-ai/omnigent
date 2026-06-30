@@ -261,6 +261,10 @@ _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 # (RUNNER_TIMER_DISPATCH.md).
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 
+# Priority 5f.3: sys_advise_models — server-side via MCP intercept;
+# included in the tool surface only when smart routing is enabled.
+_ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
+
 # Priority 5h: Task lifecycle tools — runner-local sys_cancel_task.
 # The only cancellable task ids visible to the LLM are async dispatches
 # and sub-agent handles; observation happens through sys_read_inbox.
@@ -320,6 +324,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -450,6 +455,7 @@ _ALL_LOCAL_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS

@@ -41,8 +41,8 @@ function describe(state: SessionState): Visual {
         render: () => <RunningDot />,
       };
     case "unseen":
-      // Solid (non-pulsing) brand-pink dot — distinguished from the running
-      // indicator, which is the same pink but pulsing.
+      // Solid brand-pink dot — distinguished from the running indicator,
+      // which is a grey spinner.
       return {
         kind: state.kind,
         ariaLabel: "New messages",

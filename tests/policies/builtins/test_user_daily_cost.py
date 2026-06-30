@@ -184,20 +184,21 @@ def test_approved_checkpoint_from_daily_store_does_not_reprompt() -> None:
     ]
 
 
-def test_over_daily_budget_on_expensive_model_denies() -> None:
-    """Over the hard daily limit on an expensive model → DENY (force downgrade).
+def test_over_daily_budget_denies_any_model() -> None:
+    """Over the hard daily limit → DENY for any model (default hard stop).
 
-    The reason must surface the spend and the high-cost tokens, and frame
-    it as the DAILY budget (not the session one) so the message is
-    accurate.
+    The default is a true hard stop — all models are blocked. The reason
+    must surface the spend, say all calls are blocked, and frame it as the
+    DAILY budget (not the session one).
     """
     policy = user_daily_cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
-    result = policy(_tool(6.0, model="databricks-claude-opus-4-8"))
-    assert result["result"] == "DENY"
-    assert "6.00" in result["reason"]
-    assert "opus" in result["reason"]
-    # Framed as the per-user daily budget, not the session one.
-    assert "daily" in result["reason"].lower()
+    for model in ("databricks-claude-opus-4-8", "databricks-claude-sonnet-4-6"):
+        result = policy(_tool(6.0, model=model))
+        assert result["result"] == "DENY", f"expected DENY for {model}"
+        assert "6.00" in result["reason"]
+        assert "All model calls are blocked" in result["reason"]
+        # Framed as the per-user daily budget, not the session one.
+        assert "daily" in result["reason"].lower()
 
 
 def test_ask_message_names_the_owner_when_present() -> None:
@@ -231,15 +232,13 @@ def test_deny_message_names_the_owner_when_present() -> None:
     assert "bob@example.com's spend $6.00 reached" in result["reason"]
 
 
-def test_over_daily_budget_on_cheaper_model_allows() -> None:
-    """Over the daily limit but already on a cheaper model → ALLOW (downgrade satisfied).
+def test_over_daily_budget_on_cheaper_model_allows_with_explicit_list() -> None:
+    """Over the daily limit on a cheaper model → ALLOW when using an explicit expensive list.
 
-    Sonnet is outside the default expensive set, so a downgraded session
-    proceeds even over the daily limit. (Note: ``gpt-5-4`` is NOT a cheap
-    model under the broad ``gpt-5`` default token — only the ``-mini`` /
-    ``-nano`` variants are carved out.)
+    With explicit expensive_models (downgrade-gate mode), Sonnet is not in
+    the list, so a downgraded session proceeds even over the daily limit.
     """
-    policy = user_daily_cost_budget(max_cost_usd=5.0)
+    policy = user_daily_cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
     assert policy(_tool(6.0, model="databricks-claude-sonnet-4-6")) == {"result": "ALLOW"}
 
 
@@ -290,10 +289,10 @@ def test_daily_deny_reason_for_codex_points_to_terminal() -> None:
     """The daily DENY reason is harness-aware: codex-native → terminal /model.
 
     Guards that the per-user daily factory wires the harness through to
-    the (shared) deny-reason builder, so a codex user is told the one
-    switch mechanism that works for them.
+    the (shared) deny-reason builder. Uses explicit expensive_models
+    (downgrade-gate mode) so a cheaper model exists and the switch hint applies.
     """
-    policy = user_daily_cost_budget(max_cost_usd=5.0)
+    policy = user_daily_cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
     result = policy(_tool(6.0, model="opus", harness="codex-native"))
     assert result["result"] == "DENY"
     assert "in the terminal" in result["reason"]

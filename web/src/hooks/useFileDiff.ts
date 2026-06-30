@@ -34,7 +34,19 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/diff/${encodedPath}`;
   const res = await authenticatedFetch(url);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    // Surface the server's reason (e.g. "git status timed out after 5.0s")
+    // so the diff view shows what actually went wrong rather than a bare
+    // status code — mirroring the changed-files panel.
+    let message = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { error?: { message?: string } };
+      if (body?.error?.message) message = body.error.message;
+    } catch {
+      // Non-JSON body (gateway/front-door error) — keep the status line.
+    }
+    throw new Error(message);
+  }
   return (await res.json()) as FileDiffResponse;
 }
 

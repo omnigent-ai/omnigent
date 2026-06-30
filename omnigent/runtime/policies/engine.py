@@ -490,6 +490,7 @@ class PolicyEngine:
             return
         from omnigent.policies.schema import (
             SESSION_COST_ASK_APPROVED_STATE_KEY,
+            SESSION_COST_UNPRICED_APPROVED_KEY,
             USER_DAILY_ASK_APPROVED_STATE_KEY,
         )
 
@@ -505,7 +506,7 @@ class PolicyEngine:
             if op.key == USER_DAILY_ASK_APPROVED_STATE_KEY:
                 self._record_user_daily_ask_approved(op.value)
             elif (
-                op.key == SESSION_COST_ASK_APPROVED_STATE_KEY
+                op.key in (SESSION_COST_ASK_APPROVED_STATE_KEY, SESSION_COST_UNPRICED_APPROVED_KEY)
                 and self._root_conversation_id != self._conversation_id
             ):
                 self._record_root_cost_ask_approved(op)

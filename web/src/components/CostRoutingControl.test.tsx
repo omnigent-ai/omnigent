@@ -172,24 +172,18 @@ describe("IntelligentModelControl — toggle semantics", () => {
     expect(trigger()).toHaveAttribute("data-mode", "on");
   });
 
-  it("renders the lit waypoints glyph monochrome — currentColor, no gradient defs", () => {
-    // Owner-approved restyle: the lit glyph inherits the toggle's foreground
-    // color; blue stays semantic elsewhere in the composer.
+  it("renders the lit router glyph monochrome — currentColor, no gradient defs", () => {
+    // The lit glyph inherits the toggle's foreground color (brand pink when
+    // on); blue stays semantic elsewhere in the composer.
     const { container } = renderControl({ value: "on" });
     const litSvg = container.querySelector(".imc-layer-on svg");
     expect(litSvg).not.toBeNull();
     expect(litSvg!.querySelector("defs")).toBeNull();
-    // Waypoints glyph: four filled nodes plus staged connector traces.
-    expect(litSvg!.querySelectorAll("circle").length).toBe(4);
-    for (const node of litSvg!.querySelectorAll("circle")) {
-      expect(node.getAttribute("fill")).toBe("currentColor");
-      expect(node.getAttribute("stroke")).toBe("currentColor");
-    }
-    const traces = litSvg!.querySelectorAll("path.imc-spark");
-    expect(traces.length).toBeGreaterThan(0);
-    for (const trace of traces) {
-      expect(trace.getAttribute("stroke")).toBe("currentColor");
-    }
+    // Lucide `brain-circuit` glyph: stroked paths + circuit-node circles,
+    // all inheriting currentColor with no fill.
+    expect(litSvg!.getAttribute("stroke")).toBe("currentColor");
+    expect(litSvg!.getAttribute("fill")).toBe("none");
+    expect(litSvg!.querySelectorAll("path").length).toBeGreaterThan(0);
   });
 
   it("presents off as unpressed and muted", () => {

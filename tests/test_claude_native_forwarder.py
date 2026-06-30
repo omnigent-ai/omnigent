@@ -1432,9 +1432,11 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # The first (and only) status POST is the Stop → idle. A ``running``
     # arriving first would mean UserPromptSubmit is still wrongly mapped.
     assert request["path"] == "/v1/sessions/conv_abc/events"
+    # The Stop hook carries its authoritative background-shell count (0 here,
+    # no background tasks) so a finished shell clears the indicator.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 
@@ -1600,7 +1602,7 @@ async def test_forwarder_ignores_subagent_stop_hook(
 
     assert first["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 
@@ -2825,7 +2827,8 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     A malformed transcript item that Omnigent rejects with a permanent 4xx
     should not be reposted forever at the poll interval. After the
     retry budget is exhausted, the forwarder emits a failed status,
-    marks the source id handled, and persists the new byte cursor.
+    marks the source id handled, persists the new byte cursor, and
+    dead-letters the dropped item to disk so it is recoverable (#1120).
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -2908,6 +2911,15 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     assert second.seen_source_ids == ("poison-item:0:message",)
     assert persisted["byte_offset"] == transcript_path.stat().st_size
     assert persisted["seen_source_ids"] == ["poison-item:0:message"]
+    # The dropped item is dead-lettered to disk so it is recoverable
+    # instead of silently lost (#1120).
+    dead_letter = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    assert len(dead_letter) == 1
+    record = json.loads(dead_letter[0])
+    assert record["session_id"] == "conv_abc"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["reason"] == "permanent HTTP failure after retries"
+    assert record["payload"]["item_type"] == "message"
 
 
 @pytest.mark.asyncio
@@ -6412,3 +6424,278 @@ async def test_post_external_session_status_attaches_failure_reason() -> None:
         "output": "transcript item item-1 rejected",
     }
     assert captured[1]["data"] == {"status": "idle"}
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    forwarder._reset_forward_health()
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
+        forwarder._note_forward_failure("item:source-1")
+    # Below threshold: not yet degraded.
+    assert forwarder._forward_health.degraded_logged is False
+
+    forwarder._note_forward_failure("item:source-1")  # crosses threshold
+    assert forwarder._forward_health.degraded_logged is True
+    assert forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    forwarder._note_forward_failure("item:source-1")
+    assert forwarder._forward_health.degraded_logged is True
+    assert (
+        forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD + 1
+    )
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    forwarder._reset_forward_health()
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        forwarder._note_forward_failure("status:idle")
+    assert forwarder._forward_health.degraded_logged is True
+
+    forwarder._note_forward_success()
+
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False
+
+
+def test_retry_tracker_transient_failures_escalate_degraded() -> None:
+    """
+    Transient failures escalate via the retry tracker boundary (#1120).
+
+    The claude forwarder retries transient errors (connect timeouts, 503s)
+    forever, so they never reach the permanent-drop ``exhausted`` path. This
+    proves the degraded indicator still fires for that case — the exact
+    503/connect-timeout outage #1120 is about — because every
+    ``record_failure`` counts, not just exhausted give-ups. A later
+    ``clear`` (a post that got through) re-arms the indicator.
+    """
+    forwarder._reset_forward_health()
+    tracker = forwarder._PostRetryTracker()
+    transient = httpx.ConnectError("connect timeout")
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        decision = tracker.record_failure("item:source-1", transient)
+        # Transient failures are retried, never dropped.
+        assert decision.exhausted is False
+        assert decision.permanent is False
+
+    assert forwarder._forward_health.degraded_logged is True
+
+    tracker.clear("item:source-1")
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False
+
+
+@pytest.mark.asyncio
+async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
+    """
+    A permanently-rejected sub-agent transcript item is dead-lettered (#1120).
+
+    Drives the real ``_forward_available_subagents`` drop path: the
+    ``external_subagent_start`` POST succeeds, the child item POST is rejected
+    with a permanent 400 (and the item tracker exhausts on the first failure),
+    so the dropped item is appended to ``{bridge_dir}/dead_letter.jsonl`` instead
+    of being silently lost.
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    forwarder._reset_forward_health()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="dl1",
+        agent_type="Explore",
+        description="dead-letter item flow",
+        tool_use_id="toolu_dl",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-assistant-dl",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "lost"}],
+                },
+            },
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Accept the start POST; permanently reject the child item POST.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_subagent_start":
+            return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
+        if body.get("type") == "external_conversation_item":
+            return httpx.Response(400, json={"error": "nope"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0, max_permanent_attempts=1
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    forwarder._reset_forward_health()
+    dl_path = bridge_dir / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_child_dl"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["payload"]["item_data"]["content"][0]["text"] == "lost"
+
+
+@pytest.mark.asyncio
+async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
+    """
+    A permanently-rejected sub-agent START is dead-lettered (#1120).
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    forwarder._reset_forward_health()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="dlstart1",
+        agent_type="Explore",
+        description="dead-letter start flow",
+        tool_use_id="toolu_dlstart",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Permanently reject the sub-agent start POST.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        return httpx.Response(400, json={"error": "nope"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0, max_permanent_attempts=1
+            ),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    forwarder._reset_forward_health()
+    dl_path = bridge_dir / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_parent"
+    assert record["event_type"] == "external_subagent_start"
+    assert record["payload"]["subagent_id"] == "dlstart1"
+    assert record["payload"]["agent_type"] == "Explore"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
+    tmp_path: Path,
+) -> None:
+    """
+    ``Stop`` with ``background_tasks`` → ``waiting`` instead of ``idle``.
+
+    When Claude Code's Stop hook carries a non-empty ``background_tasks``
+    array (shells still running), the forwarder must publish ``waiting``
+    so the web UI keeps showing the spinner. Without this, the chat
+    interface shows "idle" while the terminal shows "1 shell running".
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [
+                {
+                    "id": "abc123",
+                    "type": "shell",
+                    "status": "running",
+                    "description": "Wait for CI",
+                    "command": "sleep 120",
+                },
+            ],
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert request["path"] == "/v1/sessions/conv_abc/events"
+    assert request["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "waiting", "background_task_count": 1},
+    }

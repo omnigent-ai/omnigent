@@ -18,6 +18,7 @@ import {
   normalizeWorkspacePath,
   sessionsSharingDirectory,
   NewChatLandingScreen,
+  resetLandingDraft,
 } from "./NewChatDialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -548,6 +549,7 @@ function setupLandingMocks() {
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
   setOmnigentHostConfig({});
+  resetLandingDraft();
   localStorage.clear();
   // host_1's most-recent workspace seeds the field (so submit can enable
   // without manual picks). Tests that exercise the home fallback clear this.
@@ -646,6 +648,29 @@ describe("NewChatLandingScreen", () => {
     // the placeholder, the composer input would be absent and this fails.
     expect(screen.getByText("What should we do?")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+  });
+
+  it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
+    // Navigating into an existing session and back unmounts the landing
+    // screen; the draft is stashed at module scope so the half-composed
+    // message and its attachments survive the round-trip instead of being
+    // discarded.
+    const first = renderLanding();
+    const box = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "half-typed thought" } });
+    const file = new File(["data"], "diagram.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    expect(screen.getByText("diagram.png")).toBeTruthy();
+    first.unmount();
+
+    renderLanding();
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "half-typed thought",
+    );
+    // The attachment chip re-renders from the restored draft.
+    expect(screen.getByText("diagram.png")).toBeTruthy();
   });
 
   it("enables submit only once a message, host, agent and valid workspace are set", async () => {
@@ -954,7 +979,9 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
-    renderLanding();
+    // Land with `?project=` so the (otherwise-hidden) project chip renders and
+    // its truncate cap can be asserted alongside the other chips.
+    renderLanding({}, "/?project=docs");
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
@@ -1192,22 +1219,26 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
   });
 
-  it("files the new session under a project picked in the composer chip", async () => {
+  it("hides the project chip in the normal new-session flow (no project pre-selected)", async () => {
+    // Without a `?project=` param the session is unfiled, so the chip is
+    // hidden entirely — the fresh new-session flow stays project-free.
+    renderLanding();
+
+    await screen.findByTestId("new-chat-landing-input");
+    expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
+  });
+
+  it("files a pre-filled project chip's selection, and invalidates project sessions", async () => {
     // Both the create POST and the follow-up label PATCH read .ok / .json.
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as unknown as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
-    renderLanding();
+    // The chip only renders when a project is pre-selected (e.g. via the
+    // sidebar's per-project pencil), so land with `?project=`.
+    renderLanding({}, "/?project=docs");
 
-    // Open the project chip → "New project…" → type a name → commit.
-    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
-    fireEvent.click(screen.getByText("New project…"));
-    const nameInput = screen.getByPlaceholderText("Project name…");
-    fireEvent.change(nameInput, { target: { value: "docs" } });
-    fireEvent.keyDown(nameInput, { key: "Enter" });
-    // The chip reflects the pick.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
     );
@@ -1237,6 +1268,22 @@ describe("NewChatLandingScreen", () => {
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] }),
     );
     invalidateSpy.mockRestore();
+  });
+
+  it("hides the chip again when a pre-filled project is cleared to 'No project'", async () => {
+    // When shown, the picker still lets the user clear the selection; doing so
+    // empties `selectedProject` and the chip disappears (consistent with the
+    // "only show when selected" rule).
+    renderLanding({}, "/?project=docs");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain("docs"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
+    fireEvent.click(screen.getByText("No project"));
+
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull());
   });
 
   it("pre-fills the project chip from the ?project= query param", async () => {

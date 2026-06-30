@@ -176,7 +176,18 @@ async function fetchWorkspaceChangedFiles(
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    // Surface the server's reason (e.g. "git status timed out after 30s") so
+    // the panel shows what actually went wrong rather than a bare status code.
+    let message = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { error?: { message?: string } };
+      if (body?.error?.message) message = body.error.message;
+    } catch {
+      // Non-JSON body (gateway/front-door error) — keep the status line.
+    }
+    throw new Error(message);
+  }
   const json = (await res.json()) as ChangedFilesResponse;
   const data: WorkspaceChangedFile[] = json.data.map((e) => ({
     path: e.path,

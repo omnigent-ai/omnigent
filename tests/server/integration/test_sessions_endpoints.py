@@ -4407,6 +4407,68 @@ async def test_accumulate_session_usage_unpriced_model_has_tokens_no_cost(
     assert "total_cost_usd" not in usage["by_model"]["free-model"]
 
 
+async def test_accumulate_session_usage_concurrent_calls_accumulate_both_deltas(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent _accumulate_session_usage calls each persist their full delta.
+
+    Regression guard for the read-modify-write lost-update bug (#9): the old
+    implementation read session_usage in one transaction and wrote back in
+    another, so two concurrent completions could each read the same stale total,
+    compute their own delta, and overwrite the other's result — silently dropping
+    a delta. The fix (increment_session_usage — single atomic transaction with
+    SELECT FOR UPDATE on PostgreSQL/MySQL) serialises concurrent writers so both
+    deltas are always preserved.
+
+    The calls are dispatched from two threads simultaneously via
+    concurrent.futures.ThreadPoolExecutor so the race window genuinely exists:
+    the old non-atomic implementation would fail this test non-deterministically
+    (or always, if the two reads are forced to coincide).
+    """
+    import concurrent.futures
+
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-6, output_per_token=2e-6),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    def _call(input_tokens: int, output_tokens: int) -> None:
+        # Each thread gets its own store instance (its own DB connection) so
+        # the concurrency is real — not short-circuited by a shared connection.
+        store = SqlAlchemyConversationStore(db_uri)
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "model": "m1",
+                }
+            },
+            session["id"],
+            store,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_call, 1000, 500)
+        f2 = pool.submit(_call, 200, 100)
+        f1.result()
+        f2.result()
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["input_tokens"] == 1200  # 1000 + 200
+    assert usage["output_tokens"] == 600  # 500 + 100
+    # cost = (1000+200)*1e-6 + (500+100)*2e-6 = 0.0012 + 0.0012 = 0.0024
+    assert usage.get("total_cost_usd") == pytest.approx(0.0024)
+    assert usage["by_model"]["m1"]["input_tokens"] == 1200
+    assert usage["by_model"]["m1"]["total_cost_usd"] == pytest.approx(0.0024)
+
+
 async def test_external_session_usage_records_per_model_breakdown(
     client: httpx.AsyncClient,
     db_uri: str,

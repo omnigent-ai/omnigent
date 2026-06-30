@@ -1489,6 +1489,10 @@ class SessionResponse(BaseModel):
         before building this snapshot; the literal stays a superset
         of what the runtime can produce so a server that forwards
         the raw status never 500s on serialization.
+    :param background_task_count: Background shells (claude-native) still
+        running as of the last status edge, so a reload re-shows "N shells
+        still running" even though the session has settled to ``"idle"``.
+        ``None`` (the default / omitted) when no shells are tracked.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1692,6 +1696,7 @@ class SessionResponse(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    background_task_count: int | None = None
     created_at: int
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1952,6 +1957,31 @@ class SessionForkRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ReadStatePutRequest(BaseModel):
+    """
+    Request body for ``PUT /v1/sessions/{session_id}/read-state``.
+
+    Sets the *calling user's* read tracking for one session. Mirrors the
+    two values the web client keeps per session: a "last seen" wall-clock
+    baseline (seconds since epoch) and an explicit "marked unread"
+    override. The unread dot shows when ``updated_at > last_seen`` and the
+    session is finished; ``unread`` separately pins the override so the
+    thread the user is *viewing* (or a running one) still surfaces the dot
+    where the automatic "seen" logic would otherwise suppress it.
+
+    :param last_seen: Wall-clock baseline in seconds, e.g. ``1717000000``.
+        Marking seen sets this to "now"; marking unread pins it to
+        ``updated_at - 1`` so the row reads unseen.
+    :param unread: Whether this session is explicitly flagged unread for
+        the caller.
+    """
+
+    last_seen: int
+    unread: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class SessionSwitchAgentRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{id}/switch-agent``.
@@ -2055,6 +2085,16 @@ class SessionListItem(BaseModel):
         distinguishable while staying an exact integer in JavaScript;
         clients only compare it for change. ``None`` when the session
         has no comments or the server has no comment store wired.
+    :param viewer_last_seen: The *requesting user's* "last seen"
+        wall-clock baseline in seconds for this session, or ``None``
+        when they have never seen it. Per-viewer (built from the
+        server's in-memory per-user read-state, written by
+        ``PUT /v1/sessions/{id}/read-state``); the unread dot shows
+        when ``updated_at > viewer_last_seen`` and the session is
+        finished. In-memory only — resets on a server restart.
+    :param viewer_unread: Whether the *requesting user* explicitly
+        marked this session unread. Per-viewer; lifts the active-row
+        dot suppression on the client. ``False`` by default.
     """
 
     id: str
@@ -2079,6 +2119,8 @@ class SessionListItem(BaseModel):
     archived: bool = False
     comments_count: int = 0
     comments_updated_at: int | None = None
+    viewer_last_seen: int | None = None
+    viewer_unread: bool = False
 
 
 class SessionList(BaseModel):
@@ -2281,6 +2323,7 @@ class SessionStatusEvent(_SSEEventBase):
     status: Literal["idle", "launching", "running", "waiting", "failed"]
     response_id: str | None = None
     error: ErrorDetail | None = None
+    background_task_count: int | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):

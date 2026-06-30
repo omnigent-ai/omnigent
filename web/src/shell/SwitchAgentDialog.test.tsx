@@ -103,6 +103,46 @@ describe("SwitchAgentDialog", () => {
     expect(screen.getByTestId("switch-agent-option-ag_codex_native")).toBeInTheDocument();
   });
 
+  it("hides fork-only preamble targets (cursor/opencode) but offers hermes", () => {
+    // cursor/opencode carry history only as a FORK preamble; an in-place
+    // switch has no first-message injection point, so it would start fresh —
+    // they must be hidden here. hermes is a native-rebuild target, so offered.
+    useAvailableAgentsMock.mockReturnValue({
+      data: [
+        {
+          id: "ag_cursor",
+          name: "cursor-native-ui",
+          display_name: "Cursor",
+          description: null,
+          harness: "cursor-native",
+        },
+        {
+          id: "ag_opencode",
+          name: "opencode-native-ui",
+          display_name: "OpenCode",
+          description: null,
+          harness: "opencode-native",
+        },
+        {
+          id: "ag_hermes",
+          name: "hermes-native-ui",
+          display_name: "Hermes",
+          description: null,
+          harness: "hermes-native",
+        },
+      ],
+    } as unknown as ReturnType<typeof useAvailableAgents>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_source", name: "source", harness: "claude-sdk" },
+    } as unknown as ReturnType<typeof useSessionAgent>);
+    renderDialog();
+    openAgentSelect();
+
+    expect(screen.queryByTestId("switch-agent-option-ag_cursor")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("switch-agent-option-ag_opencode")).not.toBeInTheDocument();
+    expect(screen.getByTestId("switch-agent-option-ag_hermes")).toBeInTheDocument();
+  });
+
   it("excludes the session's own agent even when it's a '(switch …)' clone", () => {
     // The bound agent is a session-scoped clone named "<builtin> (switch
     // ag_…)". The dedup strips the suffix so the built-in it derives from is

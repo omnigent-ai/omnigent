@@ -16,7 +16,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -220,9 +220,9 @@ class _RunnerDatabricksAuth(httpx.Auth):
         # account (the forwarder's POST /events otherwise 403s). Empty when
         # none recorded. Set once here; it persists across the retry yield.
         if self._server_url:
-            from omnigent.cli_auth import databricks_org_id_headers
+            from omnigent.cli_auth import databricks_request_headers
 
-            request.headers.update(databricks_org_id_headers(self._server_url))
+            request.headers.update(databricks_request_headers(self._server_url))
         if self._factory is not None:
             token = self._factory()
             if not token:
@@ -670,7 +670,7 @@ def create_app(
         a second time during runner boot.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
-    from omnigent.cli_auth import databricks_org_id_headers
+    from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -727,7 +727,7 @@ def create_app(
         #
         # The workspace-routing header (empty unless a ?o= selector was
         # recorded for this server) routes these callbacks to the workspace.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_org_id_headers(server_url)},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
@@ -840,12 +840,19 @@ def create_app(
                 )
             except Exception:
                 _logger.exception("runner MCP prewarm failed for %s", prewarm_path)
+        # Native-pane idle reaper (#1349): reclaims idle native CLI panes.
+        _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if _pane_reaper is not None:
+            await _pane_reaper.start()
 
     async def _stop_pm() -> None:
         """Stop runner-owned resources for graceful process exit.
 
         :returns: None.
         """
+        _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if _pane_reaper is not None:
+            await _pane_reaper.shutdown()
         await pm.shutdown()
         await _terminal_registry.shutdown()
         if mcp_manager is not None:
@@ -858,9 +865,16 @@ def create_app(
 
         shutil.rmtree(_spec_cache_root, ignore_errors=True)
 
-    app.add_event_handler("startup", _start_pm)
-    app.add_event_handler("shutdown", _stop_pm)
+    # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await _start_pm()
+        try:
+            yield
+        finally:
+            await _stop_pm()
 
+    app.router.lifespan_context = _lifespan
     return app
 
 
@@ -893,7 +907,9 @@ async def _run_tunnel_from_env() -> None:
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory)
     idle_timeout_s = _load_runner_idle_timeout_s_from_config()
-    await app.router.startup()
+    # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
+    _lifespan_cm = app.router.lifespan_context(app)
+    await _lifespan_cm.__aenter__()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
@@ -989,7 +1005,7 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
-        await app.router.shutdown()
+        await _lifespan_cm.__aexit__(None, None, None)
 
 
 def _install_signal_handlers(

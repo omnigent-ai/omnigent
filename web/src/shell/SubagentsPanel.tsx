@@ -36,6 +36,7 @@ import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
+import { KiroIcon } from "@/components/icons/KiroIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
 import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
@@ -312,7 +313,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "opencode") return OpenCodeIcon;
   if (nativeAgent?.iconKind === "pi") return PiIcon;
   if (nativeAgent?.iconKind === "cursor") return CursorIcon;
-  if (nativeAgent?.iconKind === "kiro") return CursorIcon;
+  if (nativeAgent?.iconKind === "kiro") return KiroIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
@@ -323,7 +324,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
 
 /**
  * Indicator + optional label shared by the main and child rows. The working
- * state reuses the sidebar's RunningDot in the same brand-pink tone, so
+ * state reuses the sidebar's RunningDot in the same grey tone, so
  * "active" reads identically across the app; other states are a single
  * tokenized dot.
  *
@@ -477,8 +478,8 @@ function iconForWrapperOrHarness(
   if (iconKind === "claude" || harness?.includes("claude")) return ClaudeIcon;
   if (iconKind === "codex" || harness?.includes("codex")) return CodexIcon;
   if (iconKind === "opencode" || harness?.includes("opencode")) return OpenCodeIcon;
-  if (iconKind === "cursor" || iconKind === "kiro" || harness?.includes("cursor"))
-    return CursorIcon;
+  if (iconKind === "cursor" || harness?.includes("cursor")) return CursorIcon;
+  if (iconKind === "kiro" || harness?.includes("kiro")) return KiroIcon;
   if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
   if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
   if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;

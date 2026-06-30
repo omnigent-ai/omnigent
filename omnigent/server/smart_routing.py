@@ -34,12 +34,19 @@ TIER_TEMPLATES: dict[str, dict[str, list[str]]] = {
         "medium": ["databricks-gpt-5-4"],
         "expensive": ["databricks-gpt-5-5"],
     },
+    # pi is multi-model: both Claude and GPT models are available.
+    "pi": {
+        "cheap": ["databricks-claude-haiku-4-5", "databricks-gpt-5-4-mini"],
+        "medium": ["databricks-claude-sonnet-4-6", "databricks-gpt-5-4"],
+        "expensive": ["databricks-claude-opus-4-8", "databricks-gpt-5-5"],
+    },
 }
 
 _HARNESS_FAMILY: dict[str, str] = {
     "claude-sdk": "claude",
     "claude_sdk": "claude",
     "claude-native": "claude",
+    "pi": "pi",
     "codex": "gpt",
     "codex-native": "gpt",
     "openai-agents": "gpt",
