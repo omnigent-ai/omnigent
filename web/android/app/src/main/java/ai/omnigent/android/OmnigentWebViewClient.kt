@@ -43,21 +43,33 @@ class OmnigentWebViewClient(
     }
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-        // Subframe loads (cross-origin iframes: web previews, OAuth, embeds) stay
-        // inline. Safe because the native bridge is no longer injected into
-        // subframes (origin-allowlisted web message listener).
-        if (!request.isForMainFrame) return false
+        val scheme = request.url.scheme?.lowercase()
 
-        // Same-origin top-level navigation stays in the WebView.
-        if (originOf(request.url.toString()) == pinnedOrigin()) return false
-
-        // Off-origin: hand to the system browser, but ALWAYS intercept (return
-        // true) — fail closed. If no browser can handle it, we drop the link
-        // rather than load a foreign origin into a WebView that exposes the
-        // native bridges.
-        runCatching {
-            view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url))
+        // Non-http(s) schemes (mailto:, tel:, intent:, custom app links) can't load
+        // in the WebView — hand a top-level one to the system, fail-closed if
+        // nothing handles it.
+        if (request.isForMainFrame && scheme != "http" && scheme != "https") {
+            runCatching {
+                view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url))
+            }
+            return true
         }
-        return true
+
+        // All http/https navigation loads in the WebView — same-origin app pages
+        // AND the off-origin OIDC redirect chain (the server bounces the main frame
+        // to the IdP for login, then back to its own callback that sets the session
+        // cookie). Handing that redirect to an external browser instead (the prior
+        // behavior) completed auth in Chrome, where the cookie landed — so the
+        // WebView never got the session and login silently failed.
+        //
+        // Mirrors the iOS shell, which likewise lets top-level http/https load in
+        // the WKWebView. Safe here because the native bridge is origin-allowlisted
+        // (addWebMessageListener) and the window.omnigentNative facade is injected
+        // only on the pinned origin, so a foreign auth page can't reach native.
+        //
+        // NOTE: an IdP that bounces to Google still hits Google's WebView block
+        // (disallowed_useragent) — that needs a Custom-Tabs hand-off with a session
+        // hand-back and is tracked as a follow-up.
+        return false
     }
 }
