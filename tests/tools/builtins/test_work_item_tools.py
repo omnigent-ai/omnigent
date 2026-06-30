@@ -75,9 +75,13 @@ def test_create_list_update_flow(wired_store: SqlAlchemyWorkItemStore) -> None:
     assert upd["work_item"]["status"] == "needs_review"
     assert upd["work_item"]["pr_url"].endswith("/pull/9")
 
-    only_review = json.loads(ListWorkItemsTool().invoke(json.dumps({"status": "needs_review"}), _CTX))
+    only_review = json.loads(
+        ListWorkItemsTool().invoke(json.dumps({"status": "needs_review"}), _CTX)
+    )
     assert only_review["count"] == 1
-    assert json.loads(ListWorkItemsTool().invoke(json.dumps({"status": "done"}), _CTX))["count"] == 0
+    assert (
+        json.loads(ListWorkItemsTool().invoke(json.dumps({"status": "done"}), _CTX))["count"] == 0
+    )
 
 
 def test_validation_errors(wired_store: SqlAlchemyWorkItemStore) -> None:

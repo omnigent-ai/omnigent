@@ -35,7 +35,13 @@ async def test_create_work_item_posts_body() -> None:
     await client.aclose()
     assert reqs[0].method == "POST"
     assert reqs[0].url.path == "/v1/work-items"
-    assert json.loads(reqs[0].content) == {"title": "T", "source": "manual", "body": "b"}
+    # The current session id is defaulted onto the item when not supplied.
+    assert json.loads(reqs[0].content) == {
+        "title": "T",
+        "source": "manual",
+        "body": "b",
+        "conversation_id": "conv_1",
+    }
     assert json.loads(out) == {"ok": True}
 
 
@@ -43,7 +49,10 @@ async def test_list_work_items_passes_filters_as_query() -> None:
     reqs: list[httpx.Request] = []
     client = _recording_client(reqs)
     await _execute_work_management_tool(
-        "list_work_items", json.dumps({"status": "new"}), conversation_id="conv_1", server_client=client
+        "list_work_items",
+        json.dumps({"status": "new"}),
+        conversation_id="conv_1",
+        server_client=client,
     )
     await client.aclose()
     assert reqs[0].method == "GET"
