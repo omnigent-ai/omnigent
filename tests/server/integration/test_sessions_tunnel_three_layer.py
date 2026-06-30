@@ -144,6 +144,14 @@ class FakeProcessManager:
     def has_active_turn(self, conversation_id: str) -> bool:
         return conversation_id in self._in_flight
 
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        # Mirror the real manager: the runner registers the live turn on
+        # response.created so the idle reaper spares it (issue #1414).
+        self._in_flight[conversation_id] = response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        self._in_flight.pop(conversation_id, None)
+
     async def release(self, conversation_id: str) -> None:
         client = self._clients.pop(conversation_id, None)
         if client is not None:

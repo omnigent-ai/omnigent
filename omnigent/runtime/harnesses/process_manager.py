@@ -499,14 +499,17 @@ class HarnessProcessManager:
         # across re-entrant ``start()`` calls (idempotent boot).
         self._instance_dir = self._tmp_parent / f"ap-{uuid.uuid4().hex}"
         self._entries: dict[str, _SubprocessEntry] = {}
-        # Per-conversation in-flight harness response_id, populated
-        # by callers when the harness emits ``response.created``
-        # and cleared on ``response.completed``/``response.failed``
-        # /``response.cancelled``. :meth:`forward_cancel` reads it to translate
-        # an AP-side cancel into the harness's own response_id —
-        # AP's ``task_id`` and the harness's ``resp_<uuid>`` are
-        # different identifiers; the harness scaffold's ``/cancel``
-        # route keys ``_in_flight`` by the harness id only.
+        # Per-conversation in-flight harness response_id. The runner's
+        # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
+        # the harness emits ``response.created`` and clears it via
+        # :meth:`clear_in_flight` at stream end (``_on_proxy_stream_end``,
+        # reached on every terminal path). Two readers depend on it:
+        # :meth:`forward_cancel` translates an AP-side cancel into the
+        # harness's own response_id (AP's ``task_id`` and the harness's
+        # ``resp_<uuid>`` are different identifiers; the harness scaffold's
+        # ``/cancel`` route keys ``_in_flight`` by the harness id only),
+        # and the idle reaper skips any conversation present here so an
+        # actively-streaming turn is never reaped mid-flight.
         self._in_flight_response_ids: dict[str, str] = {}
         # Per-conversation spawn lock — see §Process management:
         # Spawn lock. The lock guards the lazy-init window in
@@ -731,10 +734,11 @@ class HarnessProcessManager:
         REPL.
 
         The harness-side ``response_id`` is looked up from
-        ``_in_flight_response_ids``, which callers populate on
-        ``response.created`` (currently no writers wired up — the
-        mapping is always empty in production, so this method is a
-        no-op until in-flight tracking is restored).
+        ``_in_flight_response_ids``, which the runner's ``proxy_stream``
+        populates on ``response.created`` (via :meth:`mark_in_flight`)
+        and clears at stream end (via :meth:`clear_in_flight`). If no
+        turn is currently live the mapping has no entry and this method
+        is a silent no-op.
 
         Best-effort: a missing harness (no entry registered for
         this conversation) OR a missing in-flight mapping (no turn
@@ -810,6 +814,40 @@ class HarnessProcessManager:
             registered.
         """
         return conversation_id in self._in_flight_response_ids
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """
+        Record that *conversation_id* has a live harness turn.
+
+        Called by the runner's ``proxy_stream`` on ``response.created``.
+        Registering the response id keeps the idle reaper from killing
+        an actively-streaming turn (the reaper skips any conversation
+        present in ``_in_flight_response_ids``) and lets
+        :meth:`forward_cancel` translate an AP-side cancel into the
+        harness's own response id. Always paired with a later
+        :meth:`clear_in_flight`.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        :param response_id: The harness-side ``resp_<uuid>`` from the
+            ``response.created`` event.
+        """
+        self._in_flight_response_ids[conversation_id] = response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """
+        Clear the live-turn marker for *conversation_id*.
+
+        Called by the runner from ``_on_proxy_stream_end``, which is
+        reached on every terminal path (success, error, status-fail,
+        interrupt) — so a dropped or late terminal SSE event cannot
+        leave an entry permanently marked in-flight and therefore never
+        reaped. No-op if no marker is set.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        """
+        self._in_flight_response_ids.pop(conversation_id, None)
 
     async def release(self, conversation_id: str) -> None:
         """
