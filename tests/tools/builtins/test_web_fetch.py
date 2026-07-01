@@ -144,15 +144,42 @@ def test_researcher_inherits_parent_sandbox_egress() -> None:
 
 def test_researcher_os_env_without_parent_sandbox() -> None:
     """
-    When the parent declares no os_env, the researcher still gets a
-    valid os_env (so ``sys_os_shell`` registers) with no sandbox —
-    matching the parent's (absent) policy rather than inventing one.
+    When the parent declares no os_env, the researcher must NOT get an
+    unsandboxed shell on the shared host network. It gets a locked-down
+    default-deny egress sandbox instead: a network-isolating backend, a
+    non-empty egress allow-list (so the MITM proxy starts AND the
+    network namespace is unshared), and
+    ``egress_allow_private_destinations=False`` so loopback /
+    link-local / RFC1918 / cloud-metadata (169.254.169.254) destinations
+    are refused at connect time.
+
+    Regression (P0 SSRF + privilege escalation): ``build_researcher_spec``
+    previously set ``sandbox=None`` here, which resolved to the platform
+    default sharing the host network. The child ``sys_os_shell`` could
+    then curl cloud IMDS / localhost / RFC1918, and a shell-less parent
+    was escalated to having an unsandboxed shell.
     """
     parent = _make_parent_spec()
     assert parent.os_env is None
     researcher = build_researcher_spec(parent)
     assert researcher.os_env is not None
-    assert researcher.os_env.sandbox is None
+    sandbox = researcher.os_env.sandbox
+    assert sandbox is not None, (
+        "Researcher must get a locked-down sandbox (not None) when the "
+        "parent declares no os_env — sandbox=None shares the host network."
+    )
+    # Non-empty egress_rules is what both starts the MITM proxy and
+    # triggers network-namespace isolation (``--unshare-net`` on bwrap);
+    # an empty list leaves the helper on the shared host network.
+    assert sandbox.egress_rules, (
+        "Default researcher sandbox must declare egress_rules so the "
+        "egress proxy starts and the network namespace is isolated."
+    )
+    # Private / link-local / metadata destinations must stay blocked.
+    assert sandbox.egress_allow_private_destinations is False
+    # Pinned to a backend that can hard-enforce network isolation
+    # (otherwise the egress rules would be inert decoration).
+    assert sandbox.type in ("linux_bwrap", "darwin_seatbelt")
 
 
 def test_researcher_name_is_internal() -> None:

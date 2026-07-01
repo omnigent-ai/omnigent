@@ -8,9 +8,14 @@ Examples::
     "GET,POST api.github.com/repos/myorg/**"  # Multiple methods
     "* pypi.org/**"                           # Any method
     "GET *.github.com/**"                     # Wildcard subdomain
+    "GET,POST *"                              # Any host (public only)
 
 - **Methods**: comma-separated HTTP verbs, or ``*`` for any.
-- **Host**: exact match, or ``*.domain`` for wildcard subdomains.
+- **Host**: exact match, ``*`` for any host, or ``*.domain`` for
+  wildcard subdomains. A bare ``*`` only ever reaches *public* hosts —
+  the proxy's connect-time guard still refuses loopback / link-local /
+  RFC1918 / CGNAT / cloud-metadata addresses unless
+  ``egress_allow_private_destinations`` is explicitly set.
 - **Path**: glob — ``*`` matches one segment, ``**`` matches any depth.
 - Default deny: requests not matching any rule are blocked.
 """
@@ -110,6 +115,17 @@ class EgressRule:
             return False
         host = host.lower()
         pattern = self.host_pattern.lower()
+        # ``*`` matches ANY DNS-safe host. Paired with the proxy's
+        # default-deny on private destinations
+        # (``egress_allow_private_destinations=False``), this is "any
+        # *public* host": the connect-time guard
+        # (``_assert_destination_allowed``) still refuses loopback /
+        # link-local / RFC1918 / CGNAT / cloud-metadata IPs even when a
+        # ``*`` rule is in force, so ``*`` cannot reach internal hosts.
+        # The ``is_dns_safe_host`` gate above runs first, so smuggled
+        # hosts (NUL / CRLF / percent) are rejected here too.
+        if pattern == "*":
+            return True
         if pattern.startswith("*."):
             suffix = pattern[1:]  # e.g. ".github.com"
             return host.endswith(suffix) or host == pattern[2:]

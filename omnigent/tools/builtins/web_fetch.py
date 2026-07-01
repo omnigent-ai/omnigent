@@ -19,11 +19,14 @@ Usage in config.yaml::
 from __future__ import annotations
 
 import logging
+import sys
 
 # Any: tool schemas are heterogeneous dicts, AgentSpec.params
 # has heterogeneous values.
 from typing import Any
 
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -94,6 +97,85 @@ Try ONE alternative approach, then return whatever you have. Don't
 loop endlessly. If nothing works, say so.
 """
 
+# Default-deny egress allow-list applied to the researcher when the
+# parent agent declares no ``os_env`` of its own (see
+# ``build_researcher_spec``). Permits the read-oriented HTTP(S) verbs
+# to ANY host; the ``*`` host pattern is load-bearing together with
+# ``egress_allow_private_destinations=False`` below — the MITM proxy
+# still refuses loopback / link-local / RFC1918 / CGNAT and
+# cloud-metadata IPs (e.g. ``169.254.169.254``) at connect time, so the
+# net effect is "any *public* host". The write verbs (PUT/DELETE/PATCH/
+# TRACE) are intentionally omitted: a web researcher reads pages and
+# queries search/JSON APIs, it never needs to mutate remote state.
+_DEFAULT_RESEARCHER_EGRESS_RULES: tuple[str, ...] = ("GET,HEAD,POST,OPTIONS *",)
+
+
+def _platform_egress_backend() -> str | None:
+    """
+    Return this platform's network-isolating sandbox backend, or
+    ``None`` when none can hard-enforce egress here.
+
+    Mirrors the platform decision in
+    ``omnigent.inner.sandbox._default_sandbox_for_platform`` but is
+    narrowed to the backends that actually isolate the network so the
+    L7 egress proxy is the *only* path off the box: ``linux_bwrap`` on
+    Linux (unshared network namespace) and ``darwin_seatbelt`` on macOS
+    (SBPL ``(deny network*)`` with a narrow loopback allow). Any other
+    platform — notably Windows, whose ``windows_jobobject`` backend does
+    not unshare the network and where the Unix-socket egress proxy is
+    unavailable — returns ``None`` so the caller can fail closed instead
+    of falling back to an unsandboxed shell.
+
+    :returns: ``"linux_bwrap"``, ``"darwin_seatbelt"``, or ``None``.
+    """
+    if sys.platform.startswith("linux"):
+        return "linux_bwrap"
+    if sys.platform == "darwin":
+        return "darwin_seatbelt"
+    return None
+
+
+def _default_researcher_sandbox() -> OSEnvSandboxSpec:
+    """
+    Build the locked-down default sandbox for a researcher whose parent
+    declares no ``os_env``.
+
+    The previous default (``sandbox=None``) resolved to the platform's
+    default sandbox with the host network *shared* — handing the child a
+    ``sys_os_shell`` that could reach cloud metadata
+    (``169.254.169.254``), localhost services, and RFC1918 hosts, and
+    that escalated a shell-less parent to an unsandboxed shell. This
+    returns a default-deny egress sandbox instead: pinned to a
+    network-isolating backend, all traffic forced through the MITM proxy
+    (a non-empty ``egress_rules`` is what both starts the proxy and
+    triggers the network-namespace isolation), and private / link-local
+    / metadata destinations refused
+    (``egress_allow_private_destinations=False``).
+
+    :returns: A restrictive :class:`OSEnvSandboxSpec` for the child.
+    :raises OmnigentError: When the host platform has no backend that
+        can hard-enforce network isolation (e.g. Windows), so a secure
+        default cannot be constructed — fail closed rather than fall
+        back to an unsandboxed shell on the shared host network.
+    """
+    backend = _platform_egress_backend()
+    if backend is None:
+        raise OmnigentError(
+            "web_fetch cannot build a secure default sandbox for its "
+            "__web_researcher sub-agent on this platform: no sandbox "
+            "backend here can hard-enforce network isolation (egress "
+            "requires sandbox.type=linux_bwrap on Linux or "
+            "sandbox.type=darwin_seatbelt on macOS). Declare an os_env "
+            "with an egress policy on the parent agent, or run web_fetch "
+            "on a supported platform.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return OSEnvSandboxSpec(
+        type=backend,
+        egress_rules=list(_DEFAULT_RESEARCHER_EGRESS_RULES),
+        egress_allow_private_destinations=False,
+    )
+
 
 def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
     """
@@ -106,35 +188,48 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
       implementation used ``terminal_run``; that family was deleted
       per ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §3a in favor of
       ``sys_os_shell`` for one-shot cases.
-    - The parent's ``os_env.sandbox`` (filesystem grants, egress
-      rules, private-destination policy). The runner treats the
-      resolved child spec as authoritative for ``sys_os_*`` and only
-      wires the egress proxy from ``spec.sandbox`` (see
-      ``omnigent/inner/os_env.py::create_os_environment``). If the
-      child dropped the parent's sandbox, an egress-restricted parent
-      would silently gain an unrestricted network path through the
-      researcher — so the child must never be more privileged than
-      its parent.
+    - A sandbox that is **never more privileged than the parent**. The
+      runner treats the resolved child spec as authoritative for
+      ``sys_os_*`` and only wires the egress proxy from ``spec.sandbox``
+      (egress_rules / egress_allow_private_destinations — see
+      ``omnigent/inner/os_env.py::create_os_environment``). Two cases:
+
+      * **Parent declares an ``os_env``** → inherit its ``type`` and
+        ``sandbox`` verbatim. Dropping the sandbox here would silently
+        hand an egress-restricted parent an unrestricted network path
+        through the researcher.
+      * **Parent declares no ``os_env``** → it has neither a
+        ``sys_os_shell`` nor a network of its own, so fabricating a
+        bare ``OSEnvSpec(sandbox=None)`` resolved to the platform
+        default sharing the host network: a default-off SSRF +
+        privilege-escalation surface (the child could curl cloud IMDS /
+        localhost / RFC1918 and fold attacker-controlled page content
+        into the same context that runs shell commands). Build a
+        locked-down default-deny egress sandbox instead — see
+        :func:`_default_researcher_sandbox`.
     - Non-conversational mode (one-shot task)
     - Inline instructions for web research
 
     :param parent_spec: The parent agent's parsed spec.
     :returns: A complete AgentSpec for the web researcher sub-agent.
+    :raises OmnigentError: When the parent declares no ``os_env`` and
+        the host platform cannot hard-enforce network isolation, so no
+        secure default sandbox can be built (fail closed).
     """
-    from omnigent.inner.datamodel import OSEnvSpec
-
     parent_os_env = parent_spec.os_env
-    # Inherit the parent's sandbox so the child is bound by the same
-    # filesystem and egress policy. ``sandbox`` carries
-    # ``egress_rules`` / ``egress_allow_private_destinations``, which
-    # is the only state ``create_os_environment`` reads to start the
-    # MITM egress proxy. ``cwd`` is intentionally left at the default
-    # (inherit the parent process working dir) — the one-shot curl /
-    # python invocations don't need a specific workspace.
-    child_os_env = OSEnvSpec(
-        type=parent_os_env.type if parent_os_env is not None else "caller_process",
-        sandbox=parent_os_env.sandbox if parent_os_env is not None else None,
-    )
+    # ``cwd`` is intentionally left at the default (inherit the parent
+    # process working dir) — the one-shot curl / python invocations
+    # don't need a specific workspace.
+    if parent_os_env is not None:
+        child_os_env = OSEnvSpec(
+            type=parent_os_env.type,
+            sandbox=parent_os_env.sandbox,
+        )
+    else:
+        child_os_env = OSEnvSpec(
+            type="caller_process",
+            sandbox=_default_researcher_sandbox(),
+        )
 
     return AgentSpec(
         spec_version=1,

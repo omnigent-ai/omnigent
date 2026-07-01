@@ -142,6 +142,37 @@ def test_matches_wildcard_method() -> None:
     assert rule.matches("POST", "pypi.org", "/upload") is True
 
 
+def test_matches_any_host_wildcard() -> None:
+    """A bare ``*`` host pattern matches any DNS-safe host.
+
+    This is the host pattern web_fetch's default researcher egress uses
+    so a parent-less researcher can still reach arbitrary *public* web
+    hosts. The proxy's connect-time guard (not the rule layer) is what
+    keeps ``*`` from reaching private/metadata IPs — see
+    ``EgressProxy._assert_destination_allowed``.
+    """
+    rule = parse_rule("GET,HEAD,POST,OPTIONS *")
+    assert rule.host_pattern == "*"
+    assert rule.matches("GET", "example.com", "/") is True
+    assert rule.matches("GET", "api.github.com", "/repos/x") is True
+    assert rule.matches("POST", "duckduckgo.com", "/html/") is True
+    # Method still gated: a verb outside the allow-list is denied even
+    # though the host wildcard matches.
+    assert rule.matches("DELETE", "example.com", "/") is False
+    # A bare ``*`` host is still subject to the DNS-grammar canonicalization
+    # guard, so smuggled hosts never match even with the any-host wildcard.
+    assert rule.matches("GET", "attacker.com\x00.example.com", "/") is False
+
+
+def test_check_host_any_host_wildcard() -> None:
+    """``check_host`` (the CONNECT fast-path) honors the ``*`` wildcard."""
+    rules = parse_rules(["GET,HEAD,POST,OPTIONS *"])
+    assert check_host(rules, "example.com") is True
+    assert check_host(rules, "raw.githubusercontent.com") is True
+    # Smuggled host still rejected at the fast-path.
+    assert check_host(rules, "evil.com\r\n.example.com") is False
+
+
 def test_matches_case_insensitive_host() -> None:
     rule = parse_rule("GET API.GitHub.COM/repos/**")
     assert rule.matches("GET", "api.github.com", "/repos/x") is True
