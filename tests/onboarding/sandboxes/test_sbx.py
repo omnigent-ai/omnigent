@@ -312,3 +312,50 @@ def test_exec_foreground_reraises_keyboard_interrupt(fake_sbx: _FakeSbx) -> None
     fake_sbx.raise_on["exec"] = KeyboardInterrupt()
     with pytest.raises(KeyboardInterrupt):
         SbxSandboxLauncher().exec_foreground("box", "omnigent host --server u")
+
+
+# ── attach / keep_alive / terminate ─────────────────────────
+
+
+def _ls_json(*names: str) -> str:
+    import json
+
+    return json.dumps([{"name": n} for n in names])
+
+
+def test_attach_ok_when_present(fake_sbx: _FakeSbx) -> None:
+    """attach succeeds when the sandbox appears in `sbx ls --json`."""
+    fake_sbx.responses["ls"] = _FakeCompleted(args=[], stdout=_ls_json("box"))
+    SbxSandboxLauncher().attach("box")  # must not raise
+
+
+def test_attach_unknown_fails_with_hint(fake_sbx: _FakeSbx) -> None:
+    """attach to a missing sandbox names the id."""
+    fake_sbx.responses["ls"] = _FakeCompleted(args=[], stdout=_ls_json("other"))
+    with pytest.raises(click.ClickException, match="box"):
+        SbxSandboxLauncher().attach("box")
+
+
+def test_keep_alive_issues_no_sbx_call(fake_sbx: _FakeSbx) -> None:
+    """
+    sbx DOES idle-stop (~30s after the last session disconnects), but
+    there is no disable knob — the foreground `connect` session is what
+    holds the host up — so keep_alive is informational and calls no sbx.
+    """
+    SbxSandboxLauncher().keep_alive("box")
+    assert fake_sbx.calls == []
+
+
+def test_terminate_removes_when_present(fake_sbx: _FakeSbx) -> None:
+    """terminate removes an existing sandbox via `sbx rm -f`."""
+    fake_sbx.responses["ls"] = _FakeCompleted(args=[], stdout=_ls_json("box"))
+    SbxSandboxLauncher().terminate("box")
+    rm = fake_sbx.calls[-1]
+    assert rm.args[1:] == ["rm", "-f", "box"]
+
+
+def test_terminate_idempotent_when_absent(fake_sbx: _FakeSbx) -> None:
+    """terminate is a no-op success when the sandbox is already gone."""
+    fake_sbx.responses["ls"] = _FakeCompleted(args=[], stdout=_ls_json())
+    SbxSandboxLauncher().terminate("box")
+    assert [c.args[1] for c in fake_sbx.calls] == ["ls"]

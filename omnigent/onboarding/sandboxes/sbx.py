@@ -27,6 +27,7 @@ Platform notes that shape this launcher:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -286,6 +287,73 @@ class SbxSandboxLauncher(SandboxLauncher):
             click.echo("\n  → detaching; stopping the remote process")
             raise
         return result.returncode
+
+    def _sandbox_exists(self, sandbox_id: str) -> bool:
+        """Return whether a sandbox named *sandbox_id* is listed."""
+        result = self._run_sbx(["ls", "--json"])
+        if result.returncode != 0:
+            raise click.ClickException(
+                f"Could not list sbx sandboxes: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        try:
+            entries = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            entries = []
+        return any(entry.get("name") == sandbox_id for entry in entries)
+
+    def attach(self, sandbox_id: str) -> None:
+        """
+        Validate that an existing sandbox is present (``sbx exec``
+        auto-starts a stopped one, so no explicit start is needed).
+
+        :param sandbox_id: The sandbox to attach to.
+        :raises click.ClickException: When it does not exist.
+        """
+        click.echo(f"▸ Reusing existing sbx sandbox '{sandbox_id}'")
+        if not self._sandbox_exists(sandbox_id):
+            raise click.ClickException(
+                f"sbx sandbox '{sandbox_id}' not found — create one with "
+                "`omnigent sandbox create --provider sbx`."
+            )
+
+    def keep_alive(self, sandbox_id: str) -> None:
+        """
+        Informational: issues no sbx call. Discovery confirmed sbx DOES
+        idle-stop a sandbox ~30s after its last session disconnects, but
+        there is no "disable idle-stop" knob to set here. The host stays
+        up the way it must anyway — the bootstrap's ``connect`` step runs
+        ``omnigent host`` in the FOREGROUND via ``sbx exec``, which holds
+        a session attached for the host's whole lifetime. A sandbox that
+        is merely created but not yet connected may idle-stop; that is
+        harmless because ``sbx exec`` auto-starts a stopped sandbox on the
+        next call (``run`` during ship, ``exec_foreground`` on connect).
+
+        :param sandbox_id: Unused; present to satisfy the contract.
+        """
+        click.echo(
+            "  → sbx idle-stops a sandbox ~30s after its last session "
+            "disconnects; `connect` holds one open. A stopped sandbox is "
+            "auto-started on the next exec."
+        )
+
+    def terminate(self, sandbox_id: str) -> None:
+        """
+        Remove a sandbox via ``sbx rm -f``. Idempotent: an already-gone
+        sandbox is treated as success.
+
+        :param sandbox_id: The sandbox to remove.
+        :raises click.ClickException: When removal of a present sandbox
+            fails.
+        """
+        if not self._sandbox_exists(sandbox_id):
+            return
+        result = self._run_sbx(["rm", "-f", sandbox_id])
+        if result.returncode != 0:
+            raise click.ClickException(
+                f"Could not remove sbx sandbox '{sandbox_id}': "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
 
     def _resolve_template(self) -> str | None:
         """Resolve the create image: constructor wins, then env var."""
