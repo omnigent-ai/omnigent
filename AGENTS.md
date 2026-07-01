@@ -23,3 +23,15 @@ filename). Keep every section and checkbox row so reviewers can skim them.
 Generate the description from the actual diff and this session's context — lead
 with the motivation, then the change. Don't pass a `--body` that skips these
 sections.
+
+## Code comments
+
+Keep comments short and focused on the code, not on the change history.
+
+- **Keep them brief** — prefer one or two lines. Avoid comments longer than
+  three lines; if you need more, the code likely needs refactoring or a doc
+  string, not a wall of inline commentary.
+- **Describe the scenario, not the PR** — explain *what* the code handles or
+  *why* it exists, in terms a future reader needs. Don't reference PR numbers,
+  issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
+  should be clear without chasing external links.
