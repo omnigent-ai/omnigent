@@ -344,6 +344,10 @@ export function ConnectHostInstructions({
       ) : (
         <CliCommandBlock command={`omni host --server ${serverUrl}`} testIdPrefix="connect-host" />
       )}
+      <p className="text-xs text-muted-foreground" data-testid="connect-host-login-hint">
+        Set this server as your default for new terminal sessions:
+      </p>
+      <CliCommandBlock command={`omni login ${serverUrl}`} testIdPrefix="connect-host-login" />
     </div>
   );
 }

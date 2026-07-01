@@ -808,6 +808,15 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("connect-host-command")).toBeTruthy();
   });
 
+  it("offers the optional `omni login` set-as-default hint alongside the host command", () => {
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+    // The hint and its own copyable command sit below the `omni host` block.
+    expect(screen.getByTestId("connect-host-login-hint")).toBeTruthy();
+    expect(screen.getByTestId("connect-host-login-command").textContent).toContain("omni login");
+  });
+
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();
