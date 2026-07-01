@@ -117,15 +117,17 @@ def main(argv: list[str] | None = None) -> int:
             progress=_progress if live else None,
         )
     )
+    # Offline (not live) has nothing observed, so show the declared matrix.
+    declared = not live
     if args.json:
         output = render_json(matrix)
     elif args.markdown:
-        output = render_markdown(matrix)
+        output = render_markdown(matrix, declared=declared)
     else:
         # Default: terminal table. Color only when stdout is a real TTY and
         # not suppressed, so piping to a file / pager stays plain.
         color = sys.stdout.isatty() and not args.no_color
-        output = render_table(matrix, color=color)
+        output = render_table(matrix, color=color, declared=declared)
     print(output, end="")
     # A drift is a non-zero exit so CI / scripts notice without parsing output.
     return 1 if matrix.has_drift else 0

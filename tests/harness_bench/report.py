@@ -45,19 +45,34 @@ def _colorize(text: str, verdict: Verdict, color: bool) -> str:
     return f"\x1b[{_ANSI.get(verdict, '0')}m{text}\x1b[0m"
 
 
-def _cell_glyph_for_grid(cell: CellResult) -> str:
-    """Compact glyph for a grid cell; drift shows the transition."""
+def _display_verdict(cell: CellResult | None, declared: bool) -> Verdict:
+    if cell is None:
+        return Verdict.UNKNOWN
+    return cell.declared if declared else cell.verdict
+
+
+def _cell_glyph_for_grid(cell: CellResult, declared: bool = False) -> str:
+    """Compact glyph for a grid cell; drift shows the transition.
+
+    When *declared* is set (offline mode), render the declared glyph so the
+    dry matrix shows claimed capabilities instead of a grid of skips.
+    """
+    if declared:
+        return cell.declared.glyph
     if cell.verdict is Verdict.DRIFT:
         return f"!!{cell.declared.glyph}>{cell.observed.glyph}"
     return cell.verdict.glyph
 
 
-def render_table(matrix: BenchMatrix, *, color: bool = False) -> str:
+def render_table(matrix: BenchMatrix, *, color: bool = False, declared: bool = False) -> str:
     """Render *matrix* as an aligned column grid for terminal reading.
 
     :param color: When true, colorize each glyph with ANSI (green supported,
         red drift, dim skipped, ...). The CLI passes the TTY state so piped
         output stays plain.
+    :param declared: When true (offline mode), render each cell's *declared*
+        verdict glyph instead of the observed/reconciled one, so the dry
+        matrix shows the capabilities the profile claims rather than ``·``.
     """
     titles = [p.title for p in ALL_PROBES]
     names = [p.name for p in ALL_PROBES]
@@ -70,8 +85,8 @@ def render_table(matrix: BenchMatrix, *, color: bool = False) -> str:
         by_name = {c.probe_name: c for c in r.cells}
         for n in names:
             cell = by_name.get(n)
-            glyphs[(id(r), n)] = _cell_glyph_for_grid(cell) if cell else "?"
-            verdicts[(id(r), n)] = cell.verdict if cell else Verdict.UNKNOWN
+            glyphs[(id(r), n)] = _cell_glyph_for_grid(cell, declared) if cell else "?"
+            verdicts[(id(r), n)] = _display_verdict(cell, declared)
     col_w = [
         max(len(t), *(len(glyphs[(id(r), n)]) for r in matrix.reports))
         for t, n in zip(titles, names, strict=False)
@@ -99,7 +114,8 @@ def render_table(matrix: BenchMatrix, *, color: bool = False) -> str:
         ]
         lines.append("  ".join(row))
 
-    out = ["Harness capability matrix", "", *lines, "", _legend()]
+    heading = "Harness capability matrix" + (" (declared, not observed)" if declared else "")
+    out = [heading, "", *lines, "", _legend()]
 
     drift = _drift_lines(matrix)
     if drift:
@@ -131,8 +147,12 @@ def _note_lines(matrix: BenchMatrix) -> list[str]:
     return lines
 
 
-def render_markdown(matrix: BenchMatrix) -> str:
-    """Render *matrix* as a Markdown capability grid with a legend and drift list."""
+def render_markdown(matrix: BenchMatrix, *, declared: bool = False) -> str:
+    """Render *matrix* as a Markdown capability grid with a legend and drift list.
+
+    :param declared: When true (offline mode), render declared glyphs so the
+        table shows the claimed matrix rather than a grid of skips.
+    """
     columns = [p.title for p in ALL_PROBES]
     names = [p.name for p in ALL_PROBES]
 
@@ -142,10 +162,11 @@ def render_markdown(matrix: BenchMatrix) -> str:
 
     for report in matrix.reports:
         by_name = {c.probe_name: c for c in report.cells}
-        cells = [_cell_glyph(by_name[n]) if n in by_name else "?" for n in names]
+        cells = [_cell_glyph(by_name[n], declared) if n in by_name else "?" for n in names]
         lines.append(f"| `{report.profile.harness}` | " + " | ".join(cells) + " |")
 
-    out = ["# Harness capability matrix", "", *lines, "", _legend()]
+    heading = "# Harness capability matrix" + (" (declared, not observed)" if declared else "")
+    out = [heading, "", *lines, "", _legend()]
 
     drift = _drift_lines(matrix)
     if drift:
@@ -158,8 +179,10 @@ def render_markdown(matrix: BenchMatrix) -> str:
     return "\n".join(out) + "\n"
 
 
-def _cell_glyph(cell: Any) -> str:
+def _cell_glyph(cell: Any, declared: bool = False) -> str:
     """Glyph for a cell; a drift cell shows the alarm plus what changed."""
+    if declared:
+        return cell.declared.glyph
     if cell.verdict is Verdict.DRIFT:
         return f"!! ({cell.declared.glyph}->{cell.observed.glyph})"
     return cell.verdict.glyph
