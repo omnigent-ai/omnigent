@@ -162,6 +162,44 @@ def post_may_have_been_delivered(exc: httpx.HTTPError) -> bool:
     return True
 
 
+async def post_external_session_status(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    status: str,
+    output: str | None = None,
+    background_task_count: int | None = None,
+) -> None:
+    """Post one ``external_session_status`` event to the Sessions API.
+
+    The turn-end edge native forwarders use to drive session status and, for
+    sub-agents, the parent-inbox wake. Shared by the claude-native and
+    cursor-native forwarders so the event shape stays in one place.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param status: Session status value, e.g. ``"idle"`` or ``"failed"``.
+    :param output: Optional text attached to ``data``. On a ``"failed"`` edge
+        the server surfaces it as ``last_task_error`` so the UI shows a detail
+        instead of a bare "failed". Ignored when falsy.
+    :param background_task_count: Background tasks (shells) still running at the
+        edge, forwarded so the UI can show "N background tasks still running".
+        ``None`` omits the field (server leaves its sticky tally untouched) — the
+        default for edges that know nothing about background shells.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    data: dict[str, object] = {"status": status}
+    if output:
+        data["output"] = output
+    if background_task_count is not None:
+        data["background_task_count"] = background_task_count
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    resp.raise_for_status()
+
+
 async def post_session_event_with_retry(
     *,
     client: httpx.AsyncClient,

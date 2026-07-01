@@ -6504,6 +6504,15 @@ class _SessionSnapshot:
         ``None`` for top-level sessions. Projected from the server
         snapshot so the identity survives a runner reconnect / spec-cache
         eviction (the in-memory ``_session_sub_agent_names`` map does not).
+    :param parent_session_id: For sub-agent sessions, the parent
+        conversation's id, e.g. ``"conv_parent987"``. ``None`` for
+        top-level sessions. Lets ``_ensure_subagent_work_entry`` rebuild a lost
+        work entry when the in-memory map was wiped (reconnect / restart) or
+        never populated (a ``sys_session_create`` child).
+    :param agent_name: Human-readable bound agent name, e.g.
+        ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
+        work entry for a child the server did not record a ``sub_agent_name``
+        for. ``None`` when unbound / the fetch failed.
     """
 
     ok: bool
@@ -6512,6 +6521,8 @@ class _SessionSnapshot:
     workspace: str | None
     agent_id: str | None
     sub_agent_name: str | None = None
+    parent_session_id: str | None = None
+    agent_name: str | None = None
 
 
 # Language constant the omnigent YAML translator stamps on callable-backed
@@ -8458,6 +8469,8 @@ def create_runner_app(
             workspace: str | None = None
             agent_id: str | None = None
             sub_agent_name: str | None = None
+            parent_session_id: str | None = None
+            agent_name: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -8480,6 +8493,15 @@ def create_runner_app(
                     raw_sub_agent = body.get("sub_agent_name")
                     if isinstance(raw_sub_agent, str) and raw_sub_agent:
                         sub_agent_name = raw_sub_agent
+                    # Parent linkage + agent label, so a native sub-agent's
+                    # terminal status can rebuild a lost work entry and deliver
+                    # to the parent inbox.
+                    raw_parent = body.get("parent_session_id")
+                    if isinstance(raw_parent, str) and raw_parent:
+                        parent_session_id = raw_parent
+                    raw_agent_name = body.get("agent_name")
+                    if isinstance(raw_agent_name, str) and raw_agent_name:
+                        agent_name = raw_agent_name
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -8489,6 +8511,8 @@ def create_runner_app(
                 workspace=workspace,
                 agent_id=agent_id,
                 sub_agent_name=sub_agent_name,
+                parent_session_id=parent_session_id,
+                agent_name=agent_name,
             )
             # Cache only a complete snapshot. A 200 with agent_id still
             # null means the agent has not bound yet; caching it would
@@ -10332,6 +10356,47 @@ def create_runner_app(
         if name:
             _session_sub_agent_names[conv_id] = name
         return name
+
+    async def _ensure_subagent_work_entry(conv_id: str) -> _SubagentWorkEntry | None:
+        """Rebuild a sub-agent's work entry from the snapshot when it is missing.
+
+        The work entry that delivers a completion to the parent inbox lives only
+        in this runner's memory. It goes missing two ways — a reconnect / restart
+        wiped ``_subagent_work_by_child`` mid-turn, or a ``sys_session_create``
+        child never registered one (the server records a ``parent_session_id``
+        but no ``sub_agent_name``) — and the terminal status is then dropped
+        without waking the parent. Recover the parent linkage from the server
+        snapshot and re-register.
+
+        Best-effort: returns ``None`` for a top-level session or an unavailable
+        snapshot, preserving the prior no-op for non-sub-agent senders.
+
+        :param conv_id: Child session id whose terminal status just arrived,
+            e.g. ``"conv_child456"``.
+        :returns: The existing or reconstructed work entry, or ``None`` when the
+            session has no recoverable parent.
+        """
+        existing = get_subagent_work(conv_id)
+        if existing is not None:
+            return existing
+        if conv_id in _drained_delivered_subagent_children:
+            # Already delivered and drained; rebuilding would discard the
+            # tombstone and re-deliver a duplicate. Leave it as a no-op.
+            return None
+        try:
+            snapshot = await _session_snapshot(conv_id)
+        except Exception:  # noqa: BLE001 — best-effort recovery
+            return None
+        parent_id = snapshot.parent_session_id
+        if not parent_id or parent_id == conv_id:
+            return None
+        agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
+        return register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=conv_id,
+            agent=agent,
+            title=snapshot.sub_agent_name or "",
+        )
 
     def _session_harness_name(conv_id: str) -> str | None:
         """
@@ -15034,6 +15099,7 @@ def create_runner_app(
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
+            recovered_entry: _SubagentWorkEntry | None = None
             # Keep this allowlist in sync with Omnigent server's
             # ``_EXTERNAL_SESSION_STATUS_VALUES``. These events are produced by
             # native terminal forwarders, so AP-forwarded output is the only
@@ -15046,6 +15112,11 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+            if status in ("idle", "failed"):
+                # Rebuild a lost / never-registered work entry from the snapshot
+                # first, so a reconnect-wiped map or a sys_session_create child
+                # still wakes the parent instead of being dropped.
+                recovered_entry = await _ensure_subagent_work_entry(conversation_id)
             if status == "idle":
                 # Native transcripts are owned by AP. If Omnigent did not forward
                 # output for this idle edge, deliver an explicit empty result
@@ -15062,9 +15133,15 @@ def create_runner_app(
                     output=output or "Error: native sub-agent turn failed",
                 )
             if delivery_ack is not None:
+                # Known sub-agent when the in-memory map names it OR the snapshot
+                # recovered a parent link — so an undelivered terminal status
+                # returns 503 (forwarder retries) instead of a silent 204.
+                is_known = (
+                    conversation_id in _session_sub_agent_names or recovered_entry is not None
+                )
                 not_confirmed = _subagent_delivery_not_confirmed_response(
                     delivery_ack,
-                    is_runner_known_subagent=conversation_id in _session_sub_agent_names,
+                    is_runner_known_subagent=is_known,
                 )
                 if not_confirmed is not None:
                     return not_confirmed
