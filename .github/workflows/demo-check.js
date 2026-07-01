@@ -1,12 +1,12 @@
-// Scan contributor PRs opened in the last hour and comment when a Bug fix,
+// Scan contributor PRs opened in the last 24 hours and comment when a Bug fix,
 // Feature, or UI / frontend change is checked but no real demo (screenshot /
-// video) is provided. Runs hourly so each new PR is checked once shortly after
-// it opens. Drafts and maintainer PRs are skipped. Already-flagged PRs
-// (labeled `needs-demo`) are skipped to avoid duplicate comments if the cron
-// overlaps.
+// video) is provided. Runs hourly; the 24-hour window ensures every new PR is
+// checked even if it was opened just before a cron tick. Drafts and maintainer
+// PRs are skipped. Already-flagged PRs (labeled `needs-demo`) are skipped to
+// avoid duplicate comments on subsequent runs.
 
 const MS_PER_HOUR = 60 * 60 * 1000;
-const HOURS_TO_SCAN = 1;
+const HOURS_TO_SCAN = 24;
 const NEEDS_DEMO_LABEL = "needs-demo";
 
 const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
@@ -151,7 +151,7 @@ module.exports = async ({ context, github, core }) => {
       allPRs.push(...nodes);
     }
 
-    console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hour(s)`);
+    console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
 
     let flaggedCount = 0;
     let skippedCount = 0;
