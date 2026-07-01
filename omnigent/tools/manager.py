@@ -182,6 +182,11 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        # Canvas tool (#2) is auto-registered so an agent — and the Omnigent MCP
+        # surface — can render an artifact without the spec opting in. Registered
+        # directly (like the comment tools) rather than declared in
+        # ``tools.builtins``, sidestepping the function-tool callable-recovery path.
+        self._register_canvas_tools()
 
     def _register_policy_tools(self) -> None:
         """
@@ -521,6 +526,22 @@ class ToolManager:
         """
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
+
+    def _register_canvas_tools(self) -> None:
+        """
+        Auto-register the ``set_canvas`` builtin (#2, #12).
+
+        Framework-owned and always available so an agent — and the Omnigent MCP
+        surface — can render a canvas artifact without the spec opting in.
+        Instantiated straight from the builtin registry (like the comment tools)
+        rather than declared in ``tools.builtins``, which avoids the
+        declared-builtin function-tool callable-recovery path. The tool returns a
+        clear error at invoke time when its backing CanvasStore isn't configured,
+        so registering it unconditionally is safe.
+        """
+        tool = get_builtin_tool("set_canvas")
+        if tool is not None:
+            self._tools["set_canvas"] = tool
 
     def _register_os_env_tools(self) -> None:
         """
