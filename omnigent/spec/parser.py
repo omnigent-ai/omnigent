@@ -363,10 +363,16 @@ def _parse_tools_config(
         return ToolsConfig()
     timeout = int(raw["timeout"]) if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
-    builtins = _parse_builtin_tools(raw.get("builtins", []))
+    # A present-but-null key (``builtins:`` / ``agents:`` with no value) yields
+    # ``None``, not the ``.get`` default. ``_parse_builtin_tools(None)`` iterates
+    # ``None`` and crashes with an uncaught ``TypeError`` (not the clean
+    # ``OmnigentError`` used elsewhere), and ``agents=None`` violates the
+    # ``list[str]`` field type. Coerce null to the empty list for both so a
+    # blank key parses as "no tools" instead of erroring.
+    builtins = _parse_builtin_tools(raw.get("builtins") or [])
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
-        agents=raw.get("agents", []),
+        agents=raw.get("agents") or [],
         builtins=builtins,
         timeout=timeout,
         retry=retry,
