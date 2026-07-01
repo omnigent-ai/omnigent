@@ -25,6 +25,8 @@ HARNESS_ALIASES: dict[str, str] = {
     # Reversed spelling for the native Kimi Code TUI harness; canonical id is
     # "kimi-native" (the SDK/headless harness keeps the bare "kimi" id).
     "native-kimi": "kimi-native",
+    # Mistral-Vibe harness alias.
+    "mistral-vibe": "vibe",
     # Qwen Code harness alias.
     "qwen-code": "qwen",
     # User-facing reversed spelling for the qwen native-CLI harness; canonical

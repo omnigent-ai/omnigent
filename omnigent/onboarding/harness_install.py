@@ -56,6 +56,7 @@ QWEN_KEY = "qwen"
 # ``CURSOR_API_KEY``) with no provider/gateway credential, and ships via a curl
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
+VIBE_KEY = "vibe"
 
 # Kimi authenticates against Moonshot AI's backend (``kimi login`` OAuth or a
 # Moonshot API key), not via the ambient provider config; like Cursor it ships
@@ -230,6 +231,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
         auth_hint="run `agy` once and complete the browser sign-in",
     ),
+    VIBE_KEY: HarnessInstallSpec(
+        "Mistral Vibe",
+        "vibe",
+        package=None,
+        install_hint="pipx install mistral-vibe",
+    ),
     GOOSE_KEY: HarnessInstallSpec(
         "Goose",
         "goose",
@@ -271,6 +278,7 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # returns its install spec and ``missing_harness_cli`` fails loud
     # before a subagent spawn.
     KIMI_KEY: KIMI_KEY,
+    VIBE_KEY: VIBE_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,

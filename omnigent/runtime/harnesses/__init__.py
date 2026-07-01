@@ -143,6 +143,9 @@ _HARNESS_MODULES: dict[str, str] = {
     # name stays the headless subprocess harness. See
     # omnigent/inner/hermes_native_harness.py.
     "hermes-native": "omnigent.inner.hermes_native_harness",
+    # Mistral Vibe CLI harness wrap. Drives the ``vibe`` CLI.
+    # See omnigent/inner/vibe_harness.py.
+    "vibe": "omnigent.inner.vibe_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]
