@@ -23,17 +23,23 @@ directly — no ``run_coroutine_threadsafe`` hop.
 
 Native tools — Copilot's built-in ``create`` / ``view`` / ``edit`` / ``bash`` run
 *inside* the SDK rather than through Omnigent's bridged-tool dispatch. They are
-gated by evaluating Omnigent's ``PHASE_TOOL_CALL`` policy inside the SDK
-``on_permission_request`` handler (:meth:`CopilotExecutor._on_permission_request`,
-parity with the cursor harness): a policy DENY rejects the individual call (the
-model sees the denial and continues), otherwise the call is approved. When no
-policy evaluator is wired (single-process / pre-turn paths) native tools default
-to approved, preserving prior behavior. Native tool calls still leave no
-``function_call`` item in the persisted transcript — only the streamed narration
-is recorded — so an ``on:[tool_call]`` guardrail won't *see* them as items, but
-the policy IS evaluated for them at permission time. Bridged ``sys_*`` tools are
-gated + recorded server-side via ``_tool_executor`` (and registered
-``skip_permission=True``, so they never reach the permission handler).
+gated through a two-stage check inside the SDK ``on_permission_request`` handler
+(:meth:`CopilotExecutor._on_permission_request`, parity with the cursor harness):
+
+1. **Policy hard-deny**: if the policy evaluator returns ``POLICY_ACTION_DENY``
+   the call is rejected immediately (the model sees the denial and continues,
+   rather than aborting the whole turn).
+2. **User elicitation**: for any other outcome (ALLOW, ASK, or no evaluator
+   wired), ``_elicitation_handler`` is invoked so the user can approve or
+   reject from the web-UI approval card. If no handler is wired (single-process
+   / pre-turn paths) the call is approved, preserving prior behavior.
+
+Native tool calls still leave no ``function_call`` item in the persisted
+transcript — only the streamed narration is recorded — so an ``on:[tool_call]``
+guardrail won't *see* them as items, but the policy IS evaluated for them at
+permission time. Bridged ``sys_*`` tools are gated + recorded server-side via
+``_tool_executor`` (and registered ``skip_permission=True``, so they never reach
+the permission handler).
 
 Auth: a **GitHub token** that carries Copilot access — a fine-grained PAT with
 the "Copilot Requests" permission, or an OAuth token from the GitHub CLI (``gh``)
@@ -316,6 +322,10 @@ class CopilotExecutor(Executor):
         # PHASE_LLM_RESPONSE policies (the same round-trip pi / claude-sdk /
         # cursor use). ``None`` on single-process / pre-turn paths (no-op).
         self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+        # Installed by the runtime adapter; surfaces native-tool calls to the
+        # user via the web-UI elicitation approval card. ``None`` when no
+        # handler is wired (single-process / test paths → default approve).
+        self._elicitation_handler: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -414,33 +424,49 @@ class CopilotExecutor(Executor):
     # -- session lifecycle --------------------------------------------------
 
     async def _on_permission_request(self, request: Any, _invocation: dict[str, str]) -> Any:  # type: ignore[explicit-any]
-        """Gate a Copilot NATIVE-tool permission request through Omnigent policy.
+        """Gate a Copilot NATIVE-tool permission request through policy + elicitation.
 
         Installed as ``create_session(on_permission_request=...)``. The SDK awaits
-        this in its own event loop, so it ``await``\\s the main-loop
-        ``_policy_evaluator`` directly (no thread hop). Only Copilot's built-in
+        this in its own event loop, so it ``await``\\s ``_policy_evaluator`` and
+        ``_elicitation_handler`` directly (no thread hop). Only Copilot's built-in
         tools (``bash`` / ``edit`` / ``view`` / ``create`` / ``url``) reach here;
         bridged ``sys_*`` tools are registered ``skip_permission=True`` and are
         gated + recorded server-side via ``_tool_executor`` instead.
 
-        Evaluates ``PHASE_TOOL_CALL`` (parity with the cursor harness): a policy
-        DENY rejects the individual call (the model sees the denial and continues,
-        rather than aborting the whole turn); otherwise the call is approved. When
-        no policy evaluator is wired (single-process / pre-turn paths) the call is
-        approved, preserving the prior default-approve behavior.
+        Two-stage gate (parity with the cursor harness):
+
+        1. **Policy hard-deny**: if the policy evaluator returns
+           ``POLICY_ACTION_DENY``, reject immediately without prompting the user.
+           The model sees the denial and continues (individual call blocked, not
+           the whole turn).
+        2. **User elicitation**: for any other outcome (ALLOW, ASK, or no
+           evaluator wired), invoke ``_elicitation_handler`` so the user can
+           approve or reject from the web-UI card. When no handler is wired
+           (single-process / pre-turn paths) the call is approved by default,
+           preserving prior behavior.
         """
         from copilot.rpc import (  # lazy: optional dependency
             PermissionDecisionApproveOnce,
             PermissionDecisionReject,
         )
 
+        name, args = _permission_policy_input(request)
+
+        # Stage 1 — hard policy deny: block immediately, no elicitation.
         evaluator = self._policy_evaluator
         if evaluator is not None:
-            name, args = _permission_policy_input(request)
             verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
             if getattr(verdict, "action", "") == "POLICY_ACTION_DENY":
                 reason = getattr(verdict, "reason", "") or "blocked by policy"
                 return PermissionDecisionReject(feedback=f"Denied by Omnigent policy: {reason}")
+
+        # Stage 2 — user elicitation: surface an approval card.
+        handler = self._elicitation_handler
+        if handler is not None:
+            approved = await handler(name, args)
+            if not approved:
+                return PermissionDecisionReject(feedback="Denied via Omnigent approval UI")
+
         return PermissionDecisionApproveOnce()
 
     async def _ensure_session(
