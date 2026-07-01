@@ -99,23 +99,23 @@ There are **two enforcement surfaces**, both calling the same engine:
 
 ```mermaid
 flowchart TD
-  A[engine.evaluate ctx, read_only] --> S[open policy.evaluate span]
-  S --> P[populate ctx: trajectory, session_state, usage,<br/>subtree_usage, user_daily_cost, model, labels, llm_client]
-  P --> L{for policy in<br/>session + agent + admin + ask_on_add}
-  L --> F{_should_fire?<br/>PhaseSelector AND condition label-gate}
+  A["engine.evaluate ctx, read_only"] --> S["open policy.evaluate span"]
+  S --> P["populate ctx: trajectory, session_state, usage,<br/>subtree_usage, user_daily_cost, model, labels, llm_client"]
+  P --> L{"for policy in<br/>session + agent + admin + ask_on_add"}
+  L --> F{"_should_fire?<br/>PhaseSelector AND condition label-gate"}
   F -- no --> L
-  F -- yes --> D[_dispatch_policy<br/>safety net + action-whitelist check]
-  D --> M[filter set_labels thru whitelist<br/>merge monotonic; accumulate state_updates]
-  M --> V{action}
-  V -- DENY --> DENY[_compose_deny:<br/>apply accumulated writes unless read_only<br/>SHORT-CIRCUIT return]
-  V -- ALLOW --> CH[if data: feed forward as ctx.content]
-  V -- ASK --> AK[record ask_reason + deciding policy<br/>continue loop]
+  F -- yes --> D["_dispatch_policy<br/>safety net + action-whitelist check"]
+  D --> M["filter set_labels thru whitelist<br/>merge monotonic; accumulate state_updates"]
+  M --> V{"action"}
+  V -- DENY --> DENY["_compose_deny:<br/>apply accumulated writes unless read_only<br/>SHORT-CIRCUIT return"]
+  V -- ALLOW --> CH["if data: feed forward as ctx.content"]
+  V -- ASK --> AK["record ask_reason + deciding policy<br/>continue loop"]
   CH --> L
   AK --> L
-  L -- loop done --> R{any ASK?}
-  R -- yes --> RASK[return ASK<br/>WITHHELD set_labels + state_updates<br/>+ deciding_policies]
-  R -- no --> RAL[apply writes unless read_only<br/>return ALLOW]
-  DENY --> Z[set span policy.decision/reason/deciding]
+  L -- loop done --> R{"any ASK?"}
+  R -- yes --> RASK["return ASK<br/>WITHHELD set_labels + state_updates<br/>+ deciding_policies"]
+  R -- no --> RAL["apply writes unless read_only<br/>return ALLOW"]
+  DENY --> Z["set span policy.decision/reason/deciding"]
   RASK --> Z
   RAL --> Z
 ```
@@ -176,14 +176,14 @@ sequenceDiagram
     Web->>Eng: POST /elicitations/{eid}/resolve {action:accept}
     Eng->>Reg: _resolve_elicitation: Future.set_result (owner-checked)
     Eng->>Web: publish response.elicitation_resolved (badge -1, card flips)
-    Eng->>Run: _forward_approval_to_runner (canonical "approval" event)
+    Eng->>Run: _forward_approval_to_runner (canonical approval event)
     Eng->>Eng: on accept → apply withheld set_labels + state_updates
   else runner-parked (SDK relay TOOL_CALL): verdict=pending
     Eng->>Web: _register_policy_elicitation (publish request)
     Eng->>Eng: stash deferred writes in _pending_policy_ask_writes[eid]
     Run->>Run: park on _pending_approvals[eid] Future
     Web->>Eng: POST /elicitations/{eid}/resolve OR approval event
-    Eng->>Run: forward "approval" → Future resolves → tool proceeds/denied
+    Eng->>Run: forward approval → Future resolves → tool proceeds/denied
     Eng->>Eng: _apply_pending_policy_ask_writes (accept→apply, else→drop)
   end
 ```

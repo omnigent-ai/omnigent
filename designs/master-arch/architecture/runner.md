@@ -91,9 +91,9 @@ sequenceDiagram
     participant M as Custom MCP / sys_* tool
 
     C->>S: POST /v1/sessions/{id}/events (message)
-    Note over S: persist-before-forward; policy.evaluate (REQUEST)
+    Note over S: persist-before-forward — policy.evaluate (REQUEST)
     S->>R: POST /v1/sessions/{id}/events  (httpx over WS tunnel, stream=true)
-    Note over R: FIFO ingest gate (_ingest_now_serving); single-active-turn (I2)
+    Note over R: FIFO ingest gate (_ingest_now_serving) — single-active-turn (I2)
     R->>S: GET /v1/sessions/{id}/items     (load transcript)
     R->>S: GET /v1/sessions/{id}/agent/contents  (load agent spec bundle)
     R->>H: POST /v1/sessions/{id}/events   (executor, UDS) — SSE turn events
@@ -118,19 +118,19 @@ Every edge in this diagram is **observed in the live trace** (see §5).
 
 ```mermaid
 flowchart TD
-    A[runner _entry: serve_tunnel] -->|WS connect /v1/runners/{id}/tunnel<br/>Origin=omnigent://internal<br/>Bearer + X-Databricks-Org-Id + tunnel_token| B[server runner_tunnel.tunnel]
-    B -->|token gate + owner resolve<br/>fail-closed if unauth non-loopback| C{accept?}
-    C -->|no| X[ws.close 4004 / 4001 / 4002]
-    C -->|yes| D[recv hello frame: harnesses[], frame_proto_version]
-    D -->|strict-major check| E[registry.register newest-wins]
-    E --> F[runner online in TunnelRegistry]
-    G[server dispatch: RunnerRouter.client_for_conversation] --> H{conv.runner_id set?}
-    H -->|no| I[CONFLICT 'not bound']
-    H -->|yes| J{registry.get online?}
-    J -->|no| K[RUNNER_UNAVAILABLE]
-    J -->|yes| L{hello.harnesses ∋ harness?}
-    L -->|no| M[RUNNER_CAPABILITY_MISMATCH]
-    L -->|yes| N[RoutedRunner: cached WSTunnelTransport client]
+    A["runner _entry: serve_tunnel"] -->|"WS connect /v1/runners/{id}/tunnel<br/>Origin=omnigent://internal<br/>Bearer + X-Databricks-Org-Id + tunnel_token"| B["server runner_tunnel.tunnel"]
+    B -->|"token gate + owner resolve<br/>fail-closed if unauth non-loopback"| C{"accept?"}
+    C -->|no| X["ws.close 4004 / 4001 / 4002"]
+    C -->|yes| D["recv hello frame: harnesses[], frame_proto_version"]
+    D -->|"strict-major check"| E["registry.register newest-wins"]
+    E --> F["runner online in TunnelRegistry"]
+    G["server dispatch: RunnerRouter.client_for_conversation"] --> H{"conv.runner_id set?"}
+    H -->|no| I["CONFLICT 'not bound'"]
+    H -->|yes| J{"registry.get online?"}
+    J -->|no| K["RUNNER_UNAVAILABLE"]
+    J -->|yes| L{"hello.harnesses ∋ harness?"}
+    L -->|no| M["RUNNER_CAPABILITY_MISMATCH"]
+    L -->|yes| N["RoutedRunner: cached WSTunnelTransport client"]
 ```
 
 ---

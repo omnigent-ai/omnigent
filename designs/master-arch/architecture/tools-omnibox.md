@@ -316,15 +316,15 @@ Two models (default = swap-on-access, nothing credential-shaped in the sandbox):
 
 ```mermaid
 flowchart LR
-  subgraph parent[Parent process - unsandboxed]
-    sec[Real secret resolved] --> tbl[Proxy in-memory rewrite table]
+  subgraph parent["Parent process — unsandboxed"]
+    sec["Real secret resolved"] --> tbl["Proxy in-memory rewrite table"]
   end
-  subgraph box[Sandbox - bwrap/seatbelt]
-    tool[git / curl / gh] -->|no auth header OR oa_cred_*| relay[in-ns relay]
+  subgraph box["Sandbox — bwrap/seatbelt"]
+    tool["git / curl / gh"] -->|"no auth header OR oa_cred_*"| relay["in-ns relay"]
   end
-  relay -->|unix socket| proxy[Egress MITM proxy]
-  proxy -->|host bound? inject/swap real| up[(upstream 200)]
-  proxy -.->|wrong host / unknown oa_cred_*| f403[403]
+  relay -->|"unix socket"| proxy["Egress MITM proxy"]
+  proxy -->|"host bound? inject/swap real"| up[("upstream 200")]
+  proxy -.->|"wrong host / unknown oa_cred_*"| f403["403"]
   tbl --- proxy
 ```
 

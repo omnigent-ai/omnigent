@@ -141,7 +141,7 @@ sequenceDiagram
     E-->>H: TextChunk / ReasoningChunk
     H-->>R: SSE response.output_text.delta / reasoning deltas
     E-->>H: ToolCallRequest (MCP/spec tool)
-    H->>H: start_tool_span (TOOL); emit observed function_call (inline)
+    H->>H: start_tool_span (TOOL) — emit observed function_call (inline)
     H-->>R: SSE response.output_item.done {function_call, status:action_required}
     R->>S: POST /v1/sessions/{id}/mcp/execute (run sys_* / spec tool)
     S-->>R: tool result  (+ policy.evaluate span on server)
@@ -153,7 +153,7 @@ sequenceDiagram
     H->>H: end_agent_span (records usage)
   end
   H-->>R: SSE response.completed
-  R->>S: persist final assistant item; relay SSE
+  R->>S: persist final assistant item — relay SSE
   S-->>C: SSE deltas + final item (deduped by ctx.itemId)
 ```
 

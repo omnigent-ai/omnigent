@@ -112,7 +112,7 @@ sequenceDiagram
   participant GW as Databricks serving-endpoints
   Exec->>Auth: HTTP POST /serving-endpoints/... (httpx.Client auth=auth)
   Auth->>SDK: Config.authenticate()  (auth_flow, every request)
-  SDK-->>Auth: {Authorization: Bearer <fresh>}  (in-mem cache; CLI re-shell ~0.5s near expiry)
+  SDK-->>Auth: {Authorization: Bearer <fresh>}  (in-mem cache — CLI re-shell ~0.5s near expiry)
   Auth->>GW: request + Authorization
   GW-->>Auth: 200 (or 401/403 if refresh token dead → DatabricksAuthError)
 ```
@@ -129,14 +129,14 @@ the current live state of the codex Databricks gateway token — expired/403).
 ```mermaid
 flowchart TB
   subgraph Runner
-    F[_make_auth_token_factory] --> T1[OIDC token from auth_tokens.json]
-    F --> T2[Databricks SDK OAuth host-keyed]
+    F["_make_auth_token_factory"] --> T1["OIDC token from auth_tokens.json"]
+    F --> T2["Databricks SDK OAuth host-keyed"]
   end
-  F -->|once at boot| WS[serve_tunnel: WS handshake Bearer in additional_headers]
-  F -->|per HTTP callback| HX[_RunnerDatabricksAuth.auth_flow]
-  WS -->|connection stays open ~hrs| SRV[(omni-server)]
-  WS -.->|on reconnect: _refresh_auth_token| SRV
-  HX -->|401 or 302-/oidc/ retry-once| SRV
+  F -->|"once at boot"| WS["serve_tunnel: WS handshake Bearer in additional_headers"]
+  F -->|"per HTTP callback"| HX["_RunnerDatabricksAuth.auth_flow"]
+  WS -->|"connection stays open ~hrs"| SRV[("omni-server")]
+  WS -.->|"on reconnect: _refresh_auth_token"| SRV
+  HX -->|"401 or 302-/oidc/ retry-once"| SRV
 ```
 - **HTTP callbacks** (agent-bundle GET, response lookups, file APIs, idle notify): `_RunnerDatabricksAuth.auth_flow`
   mints fresh per request and retries once on 401 **or** Apps `302→/oidc/` (`_entry.py:226-238`). ✅ survives ~1h OAuth.
@@ -147,14 +147,14 @@ flowchart TB
 ### (3) Client ↔ Server — provider selection
 ```mermaid
 flowchart TB
-  R[resolve_auth_source server/auth.py:193] --> EXP{OMNIGENT_AUTH_PROVIDER set?}
-  EXP -->|yes| USE[use that: header/oidc/accounts]
-  EXP -->|no| EN{OMNIGENT_AUTH_ENABLED truthy?}
-  EN -->|no| HDR[header default]
-  EN -->|yes + OMNIGENT_OIDC_ISSUER| OIDC[oidc]
-  EN -->|yes, no issuer| ACC[accounts]
-  HDR --> CH[_check_header: X-Forwarded-Email]
-  OIDC --> CK[_check_cookie: __Host-ap_session JWT HS256]
+  R["resolve_auth_source server/auth.py:193"] --> EXP{"OMNIGENT_AUTH_PROVIDER set?"}
+  EXP -->|yes| USE["use that: header/oidc/accounts"]
+  EXP -->|no| EN{"OMNIGENT_AUTH_ENABLED truthy?"}
+  EN -->|no| HDR["header default"]
+  EN -->|"yes + OMNIGENT_OIDC_ISSUER"| OIDC["oidc"]
+  EN -->|"yes, no issuer"| ACC["accounts"]
+  HDR --> CH["_check_header: X-Forwarded-Email"]
+  OIDC --> CK["_check_cookie: __Host-ap_session JWT HS256"]
   ACC --> CK
 ```
 - **header** (default): reads `X-Forwarded-Email` (overridable `OMNIGENT_AUTH_HEADER`, e.g.

@@ -152,7 +152,7 @@ sequenceDiagram
     end
     SDK-->>Exec: result + usage
     Exec-->>Adp: TurnComplete(response, usage)
-    Adp-->>Run: final item persisted; agent span closed
+    Adp-->>Run: final item persisted — agent span closed
 ```
 
 The LLM work happens **inside** `omni-harness POST /events` (the long span). Tools the model
@@ -179,14 +179,14 @@ sequenceDiagram
     alt claude-native
         Exec->>CLI: tmux load-buffer + paste-buffer + Enter (inject_user_message)
     else codex-native
-        Exec->>CLI: turn/start (or turn/steer) JSON-RPC; thread/settings/update first if model/effort pinned
+        Exec->>CLI: turn/start (or turn/steer) JSON-RPC — thread/settings/update first if model/effort pinned
     end
-    Exec-->>Adp: TurnComplete(response=None)  %% returns immediately
+    Exec-->>Adp: TurnComplete(response=None)
     Note over CLI: vendor runs the real LLM turn here (own prompt/tools/transcript)
     loop forwarder poll (decoupled trace)
         CLI-->>Fwd: JSONL transcript lines / SSE app-server events
         Fwd->>Srv: external_assistant_message / external_conversation_item / external_subagent_start
-        Fwd->>Srv: model mirror (statusLine /model → model_override); cost
+        Fwd->>Srv: model mirror (statusLine /model → model_override) — cost
     end
 ```
 
@@ -199,15 +199,15 @@ policy gating is the **separate PreToolUse HTTP hook**, not an in-turn `policies
 
 ```mermaid
 flowchart LR
-    Stop[Web Stop] --> RA[runner _handle_claude_native_interrupt]
+    Stop["Web Stop"] --> RA["runner _handle_claude_native_interrupt"]
     RA --> II["inject_interrupt → tmux send-keys Escape"]
-    Model["/model in web"] --> RM[runner _handle_claude_native_model_change]
+    Model["/model in web"] --> RM["runner _handle_claude_native_model_change"]
     RM --> SC["inject_slash_command '/model X' auto_confirm"]
-    Effort["/effort in web"] --> RE[runner _handle_claude_native_effort_change]
-    RE -->|effort in CLAUDE_EFFORTS| SE["inject_slash_command '/effort L' auto_confirm"]
-    RE -->|none/minimal| Persist[persist only → next spawn --effort]
-    InPane["in-pane /model switch"] --> Fwd[forwarder _forward_model_from_status]
-    Fwd --> MO[model_override mirrored every poll]
+    Effort["/effort in web"] --> RE["runner _handle_claude_native_effort_change"]
+    RE -->|"effort in CLAUDE_EFFORTS"| SE["inject_slash_command '/effort L' auto_confirm"]
+    RE -->|"none/minimal"| Persist["persist only → next spawn --effort"]
+    InPane["in-pane /model switch"] --> Fwd["forwarder _forward_model_from_status"]
+    Fwd --> MO["model_override mirrored every poll"]
 ```
 
 claude-native control is **not** done through the executor (it returns immediately). The web

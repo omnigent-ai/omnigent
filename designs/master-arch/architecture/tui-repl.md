@@ -144,9 +144,9 @@ sequenceDiagram
     participant C as OmnigentClient (httpx)
 
     U->>CLI: omnigent run agent.yaml
-    CLI->>CLI: load+validate spec; materialize overrides; _find_free_port
-    CLI->>SRV: _start_local_server(spec, port)  [telemetry.init("omni-server") here]
-    CLI->>CLI: _wait_for_server(port); base_url=http://127.0.0.1:port
+    CLI->>CLI: load+validate spec — materialize overrides — _find_free_port
+    CLI->>SRV: _start_local_server(spec, port)  [telemetry.init(omni-server) here]
+    CLI->>CLI: _wait_for_server(port) — base_url=http://127.0.0.1:port
     CLI->>CLI: _resolve_resume_target (resume/continue/picker)
     CLI->>C: build OmnigentClient(base_url)
     CLI->>REPL: run_repl(client, agent_name, bundle, runner_id, …)

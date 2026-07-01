@@ -43,18 +43,18 @@ stood up — see `telemetry-tracing.md §9`.)
 ```mermaid
 flowchart LR
   subgraph Clients
-    W[Web UI omni-web]
-    T[TUI/REPL omni-tui]
+    W["Web UI omni-web"]
+    T["TUI/REPL omni-tui"]
   end
-  W -- REST + SSE + WS/updates --> S
-  T -- REST + SSE --> S
-  S[(Server omni-server\nDB system-of-record)]
-  S <-- WS control frames (JSON) --> H[Host daemon omni-host]
-  H -- spawn (env) --> R[Runner omni-runner]
-  S <-- WS reverse-tunnel (HTTP verbatim) --> R
-  R -- HTTP over UDS --> X[Harness/executor omni-harness]
-  R <-. JSONL forwarder re-POST /events .-> S
-  X -. native: tmux + bridge HTTP relay .-> R
+  W -->|"REST + SSE + WS/updates"| S
+  T -->|"REST + SSE"| S
+  S[("Server omni-server<br/>DB system-of-record")]
+  S <-->|"WS control frames (JSON)"| H["Host daemon omni-host"]
+  H -->|"spawn (env)"| R["Runner omni-runner"]
+  S <-->|"WS reverse-tunnel (HTTP verbatim)"| R
+  R -->|"HTTP over UDS"| X["Harness/executor omni-harness"]
+  R -.->|"JSONL forwarder re-POST /events"| S
+  X -.->|"native: tmux + bridge HTTP relay"| R
 ```
 
 ## 4. Inter-component channels (answers "what channel between components")

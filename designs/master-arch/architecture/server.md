@@ -128,8 +128,8 @@ sequenceDiagram
   participant H as harness
 
   Note over C: opens GET /sessions/{id}/stream FIRST (live-tail), reads snapshot
-  C->>S: POST /v1/sessions/{id}/events {type:"message", role:"user"}
-  S->>S: _require_access_and_level(LEVEL_EDIT); validate type ∈ _ALLOWED_EVENT_TYPES
+  C->>S: POST /v1/sessions/{id}/events {type=message, role=user}
+  S->>S: _require_access_and_level(LEVEL_EDIT) — validate type ∈ _ALLOWED_EVENT_TYPES
   S->>P: _evaluate_input_policy → engine.evaluate  (span: policy.evaluate)
   alt policy DENY/ASK
     P-->>S: deny(reason)
@@ -143,7 +143,7 @@ sequenceDiagram
     S-->>C: SSE session.input.consumed {item_id}     ⟵ only after forward OK
     S-->>C: 202 {queued:true, item_id}
     Note over S,R: meanwhile _relay_runner_stream is tailing R's GET /stream
-    R->>H: drive harness; emit SSE
+    R->>H: drive harness — emit SSE
     H-->>R: response.created / .output_text.delta* / .output_item.done / .completed
     R-->>S: same SSE frames (over tunnel)
     S->>S: re-publish each to session_stream (live clients)

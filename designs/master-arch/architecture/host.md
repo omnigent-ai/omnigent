@@ -160,12 +160,12 @@ sequenceDiagram
     Srv->>Reg: send host.stat (validate_workspace)
     Reg-->>Host: host.stat {path}
     Host-->>Reg: host.stat_result {exists,type,canonical_path}
-    Note over Srv: workspace = realpath; enforce agent os_env.cwd boundary (W6)
+    Note over Srv: workspace = realpath — enforce agent os_env.cwd boundary (W6)
     opt body.git (fork/branch)
         Srv->>Host: host.create_worktree {repo,branch,base}
         Host-->>Srv: host.create_worktree_result {worktree_path,branch}
     end
-    Note over Srv: binding_token=token_urlsafe(32); runner_id=token_bound_runner_id(token)
+    Note over Srv: binding_token=token_urlsafe(32) — runner_id=token_bound_runner_id(token)
     Note over Srv: atomic set_runner_id (UPDATE WHERE runner_id IS NULL) + set_host_id
     Srv->>Reg: pending_launches[req_id]=Future
     Reg-->>Host: host.launch_runner {req_id,binding_token,workspace,harness}
@@ -174,9 +174,9 @@ sequenceDiagram
     Host->>Run: subprocess.Popen([py,-m,omnigent.runner._entry], env, stdin=/dev/null, stdout/err→log)
     Host-->>Reg: host.launch_runner_result {status:launched, runner_id}
     Reg->>Srv: Future.set_result
-    Srv-->>Web: 200 {runner_id, status:"launching"}
+    Srv-->>Web: 200 {runner_id, status=launching}
     Run-->>Srv: (separate runner WS tunnel) connect with binding_token
-    Note over Host: _watch_runner polls; on unexpected death → host.runner_exited
+    Note over Host: _watch_runner polls — on unexpected death → host.runner_exited
 ```
 
 The server-side `launch_runner` route (`hosts.py:405-666`) ordering is load-bearing:
