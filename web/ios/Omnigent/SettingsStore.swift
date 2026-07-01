@@ -15,7 +15,13 @@ final class SettingsStore: ObservableObject {
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
-    serverURL = defaults.string(forKey: Keys.serverURL)
+    #if DEBUG
+      serverURL = ProcessInfo.processInfo.omnigentArgumentValue(after: "--omnigent-server-url")
+        ?? ProcessInfo.processInfo.environment["OMNIGENT_SCREENSHOT_APP_URL"]
+        ?? defaults.string(forKey: Keys.serverURL)
+    #else
+      serverURL = defaults.string(forKey: Keys.serverURL)
+    #endif
     recentServers = defaults.stringArray(forKey: Keys.recentServers) ?? []
   }
 
@@ -50,3 +56,16 @@ final class SettingsStore: ObservableObject {
     static let allowedProtocols = "omnigent.allowedProtocols"
   }
 }
+
+#if DEBUG
+  private extension ProcessInfo {
+    func omnigentArgumentValue(after argumentName: String) -> String? {
+      guard let index = arguments.firstIndex(of: argumentName) else { return nil }
+      let valueIndex = arguments.index(after: index)
+      guard arguments.indices.contains(valueIndex) else { return nil }
+
+      let value = arguments[valueIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+      return value.isEmpty ? nil : value
+    }
+  }
+#endif

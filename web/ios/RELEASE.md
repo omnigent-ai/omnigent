@@ -25,7 +25,9 @@ follow-up).
    cp fastlane/.env.example fastlane/.env
    # edit fastlane/.env: set ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH
    ```
-   `.env` is git-ignored and is loaded automatically by fastlane.
+   `.env` is git-ignored and is loaded automatically by fastlane. The lanes
+   also accept `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`, and `APPLE_API_KEY`
+   (`.p8` file path) for compatibility with local shell exports.
 
 ## Cutting a TestFlight build
 
@@ -50,18 +52,29 @@ Apple finishes processing.
   manually. Bump `MARKETING_VERSION` for both the Debug and Release
   configurations of the **Omnigent** target in Xcode (or via `fastlane
 increment_version_number`) when shipping a new user-facing version.
+- **App icon** is the shared Icon Composer source at
+  `platform-assets/AppIcon.icon`, which the iOS target includes directly for
+  Liquid Glass app icon rendering.
 
 ## App Store submission (later)
 
 ```sh
-bundle exec fastlane release
+bundle exec fastlane prod
 ```
 
-Uploads the binary without submitting for review. App Store metadata and
-screenshots are not yet wired up — add them under `fastlane/metadata` and enable
-submission in the `release` lane when ready.
+Prepares the App Store version without submitting for review. The lane reuses
+the latest uploaded TestFlight build and uploads `fastlane/metadata` plus
+`fastlane/screenshots`. Set
+`OMNIGENT_PROD_BUILD_NUMBER=4` to pin a specific processed build.
 
 ## Other commands
 
 - `bundle exec fastlane tests` — run the `OmnigentTests` unit suite.
+- `bundle exec fastlane screenshots` — build and capture App Store screenshots
+  into `fastlane/screenshots` using the `OmnigentUITests` snapshot target. The
+  lane rebuilds the web UI, starts an isolated local Omnigent server via `uv` on
+  a non-6767 port, and connects the simulator to that server automatically.
+- `bundle exec fastlane release` — upload a new binary to App Store Connect
+  without submitting it for review. Prefer `prod` after a TestFlight build is
+  already uploaded.
 - `bundle exec fastlane lanes` — list available lanes.
