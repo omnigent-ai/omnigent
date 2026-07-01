@@ -13,8 +13,9 @@ re-stages the synced file (mirroring ``end-of-file-fixer`` and
 ``normalize_uv_lock_registry``).
 
 Pass ``--check`` to validate without writing: it exits non-zero (and prints the
-mismatch) when the constant is stale, but leaves the file untouched — used by
-CI to catch a committed drift.
+mismatch) when the constant is stale, but leaves the file untouched. (CI-side
+drift is caught by ``scripts/update_versions.py check`` and the
+``test_version_matches_pyproject`` test; this flag is for ad-hoc local use.)
 
 Usage::
 
