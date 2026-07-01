@@ -1180,6 +1180,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "antigravity",
         "attach",
         "claude",
+        "cline",
         "codex",
         "config",
         "cursor",
@@ -4789,6 +4790,86 @@ def cursor(
     default=None,
     help=(
         "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Cline TUI, and attaches this TTY. "
+        'Pass --server "" to auto-spawn a persistent local server in the '
+        "background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to cline-native sessions."
+    ),
+)
+@click.option(
+    "--session",
+    "session_id",
+    metavar="SESSION_ID",
+    default=None,
+    hidden=True,
+    help="Deprecated alias for ``--resume <id>``; kept for one release.",
+)
+@click.argument("cline_args", nargs=-1, type=click.UNPROCESSED)
+def cline(
+    server: str | None,
+    resume: str | None,
+    session_id: str | None,
+    cline_args: tuple[str, ...],
+) -> None:
+    """Launch the Cline TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent cline
+      omnigent cline --resume conv_abc123
+      omnigent cline --resume                 # interactive picker
+    """
+    choice = _split_resume_value(resume)
+    if session_id is not None and (choice.picker or choice.conversation_id is not None):
+        raise click.UsageError(
+            "--session and --resume are mutually exclusive; "
+            "prefer --resume (--session is deprecated).",
+        )
+
+    from omnigent.cline_native import run_cline_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+    resolved_session_id = (
+        choice.conversation_id if choice.conversation_id is not None else session_id
+    )
+
+    run_cline_native(
+        server=server,
+        session_id=resolved_session_id,
+        resume_picker=choice.picker,
+        cline_args=cline_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
         "daemon-spawned runner to launch the Kiro TUI, and attaches this TTY. "
         'Pass --server "" to auto-spawn a persistent local server in the '
         "background and use that instead of a remote one."
@@ -5866,6 +5947,10 @@ def _dispatch_native_terminal_harness(
         from omnigent.kimi_native import run_kimi_native
 
         run_kimi_native(kimi_args=passthrough, **common)
+    elif native_agent.key == "cline":
+        from omnigent.cline_native import run_cline_native
+
+        run_cline_native(cline_args=passthrough, **common)
     else:  # pragma: no cover - new native agent added without a dispatch arm
         raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
     return True

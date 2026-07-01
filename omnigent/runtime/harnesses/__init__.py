@@ -143,6 +143,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # name stays the headless subprocess harness. See
     # omnigent/inner/hermes_native_harness.py.
     "hermes-native": "omnigent.inner.hermes_native_harness",
+    # cline-native harness wrap. Drives the resident ``cline`` TUI (the
+    # standalone Cline CLI's interactive mode) by injecting each web-UI turn
+    # into its tmux pane (tmux paste) — a native-CLI harness like
+    # cursor/kimi-native, so it IS in ``NATIVE_HARNESSES``. See
+    # omnigent/inner/cline_native_harness.py.
+    "cline-native": "omnigent.inner.cline_native_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

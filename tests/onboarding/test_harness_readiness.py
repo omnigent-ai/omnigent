@@ -187,6 +187,9 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # Native Cline (``omni cline``) — gates on the cline CLI.
+        "cline-native",
+        "native-cline",
     }
     assert set(result) == expected_keys
 
