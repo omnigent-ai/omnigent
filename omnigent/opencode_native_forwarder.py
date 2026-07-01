@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
-from omnigent.opencode_native_bridge import update_active_message_id, update_last_event_id
+from omnigent.opencode_native_bridge import update_active_message_id
 from omnigent.opencode_native_client import OpenCodeClient, OpenCodeEvent
 from omnigent.opencode_native_permissions import (
     PolicyDecision,
@@ -63,6 +63,15 @@ _EXTERNAL_OUTPUT_REASONING_DELTA = "external_output_reasoning_delta"
 
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+_STATUS_FAILED = "failed"
+
+# Appended to a failed edge's output when opencode reports a provider-auth
+# error so the web surface can prompt a re-auth (matches the codex-native
+# ``_CODEX_REAUTH_HINT`` phrasing; ``opencode auth login`` per
+# ``omnigent/onboarding/opencode_auth.py``).
+_OPENCODE_REAUTH_HINT = (
+    "OpenCode needs you to re-authenticate. Run `opencode auth login` and retry."
+)
 
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
@@ -173,13 +182,17 @@ class OpenCodeNativeForwarder:
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
 
-    async def seed_dedupe_from_history(self) -> None:
+    async def seed_dedupe_from_history(self, *, post_unseen_text: bool = False) -> None:
         """
         Pre-seed dedupe state from existing OpenCode messages.
 
         Prevents re-posting prior history on a resume/reconnect. Best
         effort: a failure leaves the dedupe set empty (at worst a few
         re-posts on resume).
+
+        When ``post_unseen_text`` is true, assistant text parts not already
+        marked as finalized are posted before being marked. This catches up
+        messages completed while the SSE stream was disconnected.
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
@@ -192,6 +205,8 @@ class OpenCodeNativeForwarder:
             role = info.get("role") if isinstance(info, Mapping) else None
             if isinstance(message_id, str) and isinstance(role, str):
                 self._msg_role[message_id] = role
+                if role == "assistant" and isinstance(info, Mapping):
+                    self._record_assistant_usage(message_id, info)
             parts = message.get("parts") if isinstance(message, Mapping) else None
             if isinstance(parts, list):
                 for part in parts:
@@ -203,9 +218,17 @@ class OpenCodeNativeForwarder:
                     # Pre-mark the keys the live handlers check so a resume
                     # never re-posts already-finalized text / tool parts.
                     if part.get("type") == "text" and isinstance(part_id, str):
-                        # Pre-mark both the assistant-finalize and user-message
-                        # keys so a resume re-posts neither.
-                        self.state.mark(self._key("text-final", part_id))
+                        text = part.get("text")
+                        if (
+                            post_unseen_text
+                            and role == "assistant"
+                            and isinstance(text, str)
+                            and text
+                            and self.state.mark(self._key("text-final", part_id))
+                        ):
+                            await self._post_assistant_text(text, message_id=message_id)
+                        else:
+                            self.state.mark(self._key("text-final", part_id))
                         self.state.mark(self._key("user-text", part_id))
                     if part.get("type") == "tool":
                         call_id = part.get("callID")
@@ -214,18 +237,39 @@ class OpenCodeNativeForwarder:
                             self.state.mark(self._key("tool-out", call_id))
             if isinstance(message_id, str):
                 self.state.mark(self._key("message", message_id))
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after seeding", exc_info=True
+            )
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
-        Run the SSE consume loop with reconnect/backoff.
+        Run the SSE consume loop with reconnect/backoff and gap-fill.
+
+        On the first connection, seeds the dedupe set from the existing
+        session history so a restart (e.g. runner process restart) never
+        re-posts content that was already delivered.
+
+        On *every reconnect* after a dropped stream, the same catch-up is
+        performed to close the gap that opened during the disconnect window.
+        The dedupe set ensures that items posted before the drop are never
+        duplicated.
 
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used
             by tests to bound the loop.
         """
-        await self.seed_dedupe_from_history()
         attempt = 0
         backoff = 0.5
         while True:
+            # Seed / catch-up on every attempt (initial start *and* reconnects).
+            # The first call pre-fills the dedupe set from history so no prior
+            # content is re-posted. Subsequent calls fill in the gap that
+            # accumulated while the SSE stream was down — the deduplication
+            # in OpenCodeForwarderState.mark() is idempotent so there is no
+            # double-posting risk.
+            await self.seed_dedupe_from_history(post_unseen_text=attempt > 0)
             try:
                 await self._consume_once()
                 # Clean stream end (server closed): reconnect.
@@ -256,8 +300,6 @@ class OpenCodeNativeForwarder:
         """
         if not self._event_targets_session(event):
             return
-        if event.id and self._bridge_dir is not None:
-            update_last_event_id(self._bridge_dir, event.id)
         handler = _HANDLERS.get(event.type)
         if handler is None:
             _logger.debug(
@@ -324,9 +366,12 @@ class OpenCodeNativeForwarder:
             )
             return None
 
-    async def _post_status(self, status: str) -> None:
+    async def _post_status(self, status: str, *, extra: Mapping[str, Any] | None = None) -> None:
         """Publish a coarse session status edge."""
-        await self._post_event(_EXTERNAL_STATUS, {"status": status})
+        data: dict[str, Any] = {"status": status}
+        if extra:
+            data.update(extra)
+        await self._post_event(_EXTERNAL_STATUS, data)
 
     def _response_id(self, message_id: str | None) -> str:
         """Map an opencode assistant messageID to a per-turn ``response_id``.
@@ -405,8 +450,10 @@ class OpenCodeNativeForwarder:
             self.state.turn_active = True
             await self._post_status(_STATUS_RUNNING)
 
-    async def _end_turn(self) -> None:
-        """Post ``idle`` and clear active state at turn end."""
+    async def _end_turn(
+        self, *, status: str = _STATUS_IDLE, extra: Mapping[str, Any] | None = None
+    ) -> None:
+        """Post the terminal status (idle by default) and clear active state."""
         self.state.turn_active = False
         # Reasoning deltas are per-turn; drop the per-part offsets so the map
         # can't grow across a long-lived session (the next turn's reasoning
@@ -414,7 +461,7 @@ class OpenCodeNativeForwarder:
         self._reasoning_posted.clear()
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
-        await self._post_status(_STATUS_IDLE)
+        await self._post_status(status, extra=extra)
 
     # --- per-event handlers ----------------------------------------------
 
@@ -727,14 +774,32 @@ class OpenCodeNativeForwarder:
         await self._post_event(_EXTERNAL_SESSION_USAGE, data)
 
     async def _on_session_error(self, event: OpenCodeEvent) -> None:
-        """Handle ``session.error`` — log, finalize, end turn."""
-        _logger.warning(
-            "OpenCode session error for session=%s: %s",
-            self._session_id,
-            event.properties.get("error"),
-        )
+        """Handle ``session.error`` — surface a failed (or re-auth) status edge.
+
+        opencode reports provider/auth failures as ``session.error`` with an
+        ``{name, data}`` error. Post ``external_session_status: failed`` with the
+        error message (and a re-auth hint for provider-auth errors) so the web UI
+        shows the failure instead of a silent idle. A ``MessageAbortedError`` is a
+        user interrupt, not a failure, so it takes the normal idle path.
+        """
+        error = event.properties.get("error")
+        _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
         await self._flush_pending_text()
-        await self._end_turn()
+        name = error.get("name") if isinstance(error, Mapping) else None
+        data = error.get("data") if isinstance(error, Mapping) else None
+        if name == "MessageAbortedError":
+            await self._end_turn()
+            return
+        message = data.get("message") if isinstance(data, Mapping) else None
+        if not isinstance(message, str) or not message.strip():
+            message = "OpenCode session ended with an error."
+        status_code = data.get("statusCode") if isinstance(data, Mapping) else None
+        is_auth = name == "ProviderAuthError" or (name == "APIError" and status_code in (401, 403))
+        extra: dict[str, Any] = {"output": message.strip()}
+        if is_auth:
+            extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
+            extra["reauth_required"] = True
+        await self._end_turn(status=_STATUS_FAILED, extra=extra)
 
     async def _on_compaction_started(self, event: OpenCodeEvent) -> None:
         """Handle ``session.next.compaction.started`` (auto or manual).
