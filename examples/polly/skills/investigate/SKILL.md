@@ -12,8 +12,8 @@ repository-specific technical question.
 ## Procedure
 1. Decompose the question into one or more bounded investigation tasks. Prefer
    two independent lenses for ambiguous or high-stakes questions.
-2. Dispatch each task to `claude_code`, `codex`, `opencode`, or `pi`:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"pi",
+2. Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, or `pi`:
+   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi",
    title="explore-<task_slug>", args={purpose: "explore", input: "<question +
    exact scope + evidence requested>"})`. Use a task-based title such as
    `explore-ci-flake`, never the raw vendor name. Use `purpose: "search"` only
