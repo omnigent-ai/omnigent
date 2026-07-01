@@ -81,6 +81,7 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0,<1",
     # The Claude Code and OpenAI Agents harnesses are part of the
     # baseline install — every CUJ command in the README depends on at
     # least one of them, so making them optional just forces every user

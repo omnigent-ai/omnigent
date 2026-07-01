@@ -308,6 +308,9 @@ def get_or_create_engine(db_uri: str) -> Engine:
             if db_uri not in _engine_cache:
                 engine = _create_engine(db_uri)
                 _initialize_or_verify_schema(engine, db_uri)
+                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+
+                instrument_sqlalchemy_engine(engine)
                 _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]
 

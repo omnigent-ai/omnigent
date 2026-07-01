@@ -110,12 +110,18 @@ class TracingContext:
     child spans.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: str | None = None) -> None:
         self._root_span: Span | None = None
         self._current_span: Span | None = None
         # parent span from parent context (for sub-agents)
         self._inherited_parent: Span | None = None
         self.enabled: bool = True
+        # Omnigent session (conversation) id, stamped as ``session.id`` on
+        # every span this context creates. An agent turn can root its own
+        # trace (the response-id-seeded root, decoupled from the request
+        # trace), so this attribute is what keeps those spans groupable by
+        # session in the backend even when they share no trace id.
+        self.session_id: str | None = session_id
 
     @property
     def active(self) -> bool:
@@ -141,6 +147,8 @@ class TracingContext:
             _SPAN_KIND_ATTR: _SPAN_KIND_AGENT,
             "agent.name": agent_name,
         }
+        if self.session_id:
+            attrs["session.id"] = self.session_id
         if model:
             attrs[_LLM_MODEL_NAME] = model
         if parent_ended and parent is not None:
@@ -221,6 +229,8 @@ class TracingContext:
         from opentelemetry import trace
 
         attrs: dict[str, str] = {_SPAN_KIND_ATTR: _SPAN_KIND_LLM}
+        if self.session_id:
+            attrs["session.id"] = self.session_id
         if model:
             attrs[_LLM_MODEL_NAME] = model
 
@@ -275,6 +285,8 @@ class TracingContext:
             context=ctx_carrier,
             attributes={_SPAN_KIND_ATTR: _SPAN_KIND_TOOL},
         )
+        if self.session_id:
+            span.set_attribute("session.id", self.session_id)
         span.set_attribute("tool.name", tool_name)
         span.set_attribute(_INPUT_VALUE, _safe_serialize_str(tool_args))
         self._current_span = span
@@ -327,6 +339,8 @@ class TracingContext:
                 "policy.phase": phase,
             },
         )
+        if self.session_id:
+            span.set_attribute("session.id", self.session_id)
         span.set_attribute(_INPUT_VALUE, _safe_serialize_str(content))
         return span
 
@@ -352,7 +366,7 @@ class TracingContext:
     def create_child_context(self) -> TracingContext:
         """Create a child TracingContext for a sub-agent, parented to the
         current span of this context."""
-        child = TracingContext()
+        child = TracingContext(session_id=self.session_id)
         child.enabled = self.enabled
         child._current_span = self._current_span
         child._inherited_parent = self._current_span

@@ -12,8 +12,14 @@ import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
+import { initBrowserTelemetry } from "./lib/telemetry";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
+
+// Start tracing before any request fires so fetch/XHR are patched in time
+// and a trace begins in the browser. No-op unless a collector endpoint is
+// configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
+initBrowserTelemetry();
 
 // Single client at module scope — shared across the whole app.
 //

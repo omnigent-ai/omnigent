@@ -3311,6 +3311,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
   if (modelPickerKind === "cursor") return "Cursor";
+  if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
@@ -4847,7 +4848,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "opencode";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4911,6 +4912,11 @@ export function modelPickerKindForConv(
       return "codex";
     case "cursor-native-ui":
       return "cursor";
+    case "kiro-native-ui":
+      // Launch-only model selection: kiro applies ``--model`` at launch. Unlike
+      // cursor/opencode there is no terminal->web model mirror, so the picker
+      // reflects the pre-launch ``model_override`` selection.
+      return "kiro";
     case "opencode-native-ui":
       // Like cursor: a vendor-owns-model wrapper that mirrors its live TUI
       // model into the session ``model_override`` (the forwarder's terminal→web
@@ -5031,7 +5037,8 @@ function AgentPicker({
   // Codex and cursor both populate the picker from the server-provided
   // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
   // claude uses the static local catalog.
-  const usesServerModelOptions = modelPickerKind === "codex" || modelPickerKind === "cursor";
+  const usesServerModelOptions =
+    modelPickerKind === "codex" || modelPickerKind === "cursor" || modelPickerKind === "kiro";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
@@ -5063,8 +5070,13 @@ function AgentPicker({
   // carried over from some other session) nor the meaningless `llmModel`
   // default. The other vendor-owns wrappers have no Omnigent-visible model and
   // stay null.
+  // kiro persists the pick as ``model_override`` (applied via ``--model`` at
+  // launch) and, mid-session, the runner types ``/model <id>`` into the live TUI.
+  // There is no terminal→web mirror, so the picker reflects the web-side
+  // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
+  // cursor/opencode surface theirs.
   const pickerSelectedModel =
-    modelPickerKind === "cursor" || modelPickerKind === "opencode"
+    modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
       ? sessionModelOverride
       : selectedModel;
   // SDK/bundle agents (no native picker) never have the cross-session sticky
@@ -5076,8 +5088,11 @@ function AgentPicker({
   const nonNativeModel =
     modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
-    ? modelPickerKind === "cursor"
-      ? sessionModelOverride
+    ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+      ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
+        // on a web pick (which also drives a live ``/model`` switch). Either way
+        // the Omnigent-visible model is ``model_override``.
+        sessionModelOverride
       : modelPickerKind === "opencode"
         ? // opencode mirrors its live TUI model into ``model_override`` (set at
           // launch and updated by the forwarder on a TUI switch); show that,
@@ -5091,6 +5106,15 @@ function AgentPicker({
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
       : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
+
+  // Until kiro mirrors its live model (its first session ``.json`` write), there
+  // is no resolved model to show; fall back to the catalog default (e.g. "Auto")
+  // so the trigger reads as a model rather than the harness name ("Kiro").
+  const kiroDefaultOption =
+    modelPickerKind === "kiro"
+      ? (codexModelOptions.find((m) => m.isDefault) ?? codexModelOptions[0])
+      : undefined;
+  const kiroLaunchFallbackLabel = kiroDefaultOption?.displayName ?? kiroDefaultOption?.id;
 
   // Model in foreground (black), effort in muted (grey). Static fallbacks
   // first; the final `else` returns null so a session with nothing to show
@@ -5121,8 +5145,10 @@ function AgentPicker({
     // spec may carry no executor model and no sticky/override is set), but the
     // dropdown still has model rows to switch. Keep the trigger rendered — and
     // the model dropdown + bare-`/model` open path reachable — with a stable
-    // identity fallback rather than hiding the picker entirely.
-    triggerContent = agentDisplayName ?? "Model";
+    // identity fallback rather than hiding the picker entirely. For kiro, prefer
+    // the catalog default (e.g. "Auto") over the agent name so the launch-window
+    // label reads as a model.
+    triggerContent = kiroLaunchFallbackLabel ?? agentDisplayName ?? "Model";
   } else {
     return null;
   }

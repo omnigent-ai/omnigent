@@ -3364,18 +3364,32 @@ async def _post_external_conversation_item(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item_type": item.item_type,
-                "item_data": item.data,
-                "response_id": item.response_id,
+    from omnigent.runtime import telemetry
+
+    # The forwarder is the decoupled response path (it tails Claude's
+    # transcript and re-POSTs items under its own trace, not the request's).
+    # session_scope binds the session generically (the processor stamps
+    # session.id on this span and any other span in the forward); response_id
+    # is per-item, so it's set explicitly.
+    with (
+        telemetry.session_scope(session_id),
+        telemetry.span(
+            "claude_native.forward",
+            attributes={"omnigent.response_id": item.response_id},
+        ),
+    ):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": item.item_type,
+                    "item_data": item.data,
+                    "response_id": item.response_id,
+                },
             },
-        },
-    )
-    resp.raise_for_status()
+        )
+        resp.raise_for_status()
 
 
 async def _post_external_output_text_delta(

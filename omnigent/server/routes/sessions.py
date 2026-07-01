@@ -93,6 +93,7 @@ from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
     NativeCodingAgent,
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -530,6 +531,7 @@ _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
+_KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -12145,6 +12147,14 @@ async def _create_session_from_existing_agent(
                 reason="create-rollback",
             )
         raise
+
+    # The create request has no conv id in its URL, so the path-based
+    # FastAPI hook can't tag it — stamp the minted id so the create span
+    # joins the session's session.id group.
+    from omnigent.runtime import telemetry
+
+    telemetry.set_session_id(conv.id)
+
     if (
         model_override is not None
         or reasoning_effort is not None
@@ -12391,6 +12401,12 @@ def _persist_stored_session_bundle(
             agent_bundle_location,
         )
         raise
+
+    # The create request has no conv id in its URL; stamp the minted id so
+    # the create span joins the session's session.id group.
+    from omnigent.runtime import telemetry
+
+    telemetry.set_session_id(created.conversation.id)
     return CreatedSessionResponse(
         session_id=created.conversation.id,
         agent_id=agent_id,
@@ -14576,6 +14592,15 @@ def create_sessions_router(
                 ``{"type": "changed", "items": [...]}``. Sent as JSON text.
             """
             nonlocal last_send_monotonic
+            # Stamp the active trace context into the frame so a client
+            # with browser-side propagation can correlate sidebar updates
+            # to the trace that produced them. No-op when no span is
+            # active (idle heartbeats/snapshots), keeping the frame
+            # wire-identical in the common case.
+            from omnigent.runtime import telemetry
+
+            telemetry.record_message_payload(frame)
+            telemetry.inject_trace_context(frame)
             await websocket.send_text(json.dumps(frame))
             last_send_monotonic = time.monotonic()
 
@@ -14651,13 +14676,20 @@ def create_sessions_router(
                 # The watched set after capping — used to prune baselines for ids
                 # the client no longer watches (including any just truncated).
                 watched_set = set(deduped)
-                async with emit_lock:
-                    watched = deduped
-                    # Drop baselines for ids no longer watched so they
-                    # can't surface as spurious "removed" later.
-                    for stale in [cid for cid in last_sent if cid not in watched_set]:
-                        del last_sent[stale]
-                    await _emit_snapshot()
+                # Handle the watch under a span parented on any trace
+                # context the browser stamped into the frame, so the
+                # snapshot read (and its DB spans) nest under the
+                # client-originated trace.
+                from omnigent.runtime import telemetry
+
+                with telemetry.consume_frame_span("session_updates.watch", msg):
+                    async with emit_lock:
+                        watched = deduped
+                        # Drop baselines for ids no longer watched so they
+                        # can't surface as spurious "removed" later.
+                        for stale in [cid for cid in last_sent if cid not in watched_set]:
+                            del last_sent[stale]
+                        await _emit_snapshot()
 
         async def _ticker() -> None:
             """Emit deltas / heartbeats on a fixed interval."""
@@ -20260,6 +20292,10 @@ async def _fetch_model_options(
         from omnigent.cursor_native import cursor_base_model_options
 
         return cursor_base_model_options()
+    if wrapper == _KIRO_NATIVE_WRAPPER_LABEL_VALUE:
+        from omnigent.kiro_native import kiro_base_model_options
+
+        return kiro_base_model_options()
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         return []

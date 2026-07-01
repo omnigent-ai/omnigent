@@ -12764,6 +12764,72 @@ async def test_events_model_change_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+async def test_events_model_change_on_kiro_session_types_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` ``{"type":"model_change","model":"claude-haiku-4.5"}`` on a
+    kiro-native session drives ``inject_model_command`` (which types
+    ``/model claude-haiku-4.5`` into the live kiro TUI).
+
+    Pins that the runner dispatch routes model_change to the kiro handler.
+    Mirrors ``test_events_model_change_on_native_session_types_slash_command``.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+
+    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+        """Record the call and return without touching tmux."""
+        captured.append((bridge_dir, model, timeout_s))
+
+    monkeypatch.setattr(kiro_native_bridge, "inject_model_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the kiro-native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_kiro_model", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        # Drain kiro auto-create events so nothing below trips on them.
+        _drain_session_event_queue(_session_event_queues_ref.get("conv_kiro_model"))
+
+        resp = await client.post(
+            "/v1/sessions/conv_kiro_model/events",
+            json={"type": "model_change", "model": "claude-haiku-4.5"},
+        )
+
+    assert resp.status_code == 204, (
+        f"Kiro model_change must return 204 from /events; got {resp.status_code}: {resp.text}"
+    )
+    assert len(captured) == 1, (
+        f"Expected one inject_model_command call from kiro model_change, got {len(captured)}."
+    )
+    _bridge_dir, model, timeout_s = captured[0]
+    assert model == "claude-haiku-4.5"
+    assert timeout_s == 1.0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model_value",
     # Claude Code has no slash form for "use spawn default", so

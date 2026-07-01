@@ -30,6 +30,7 @@ from omnigent.kiro_native import (
     _update_startup_progress,
     _wait_for_kiro_terminal_ready,
     build_kiro_launch,
+    kiro_base_model_options,
     kiro_terminal_resource_id,
     resolve_kiro_executable,
     run_kiro_native,
@@ -543,3 +544,18 @@ async def test_wait_for_kiro_terminal_ready_times_out() -> None:
 
     with pytest.raises(ClickException, match="did not create the Kiro terminal"):
         await _wait_for_kiro_terminal_ready(client, "conv", timeout_s=0.05)
+
+
+def test_kiro_base_model_options_shape_and_default() -> None:
+    """The curated kiro catalog exposes picker option dicts with one default."""
+    options = kiro_base_model_options()
+    ids = [o["id"] for o in options]
+
+    # Canonical ids confirmed against ``kiro-cli --list-models`` (2.10.0).
+    assert ids[0] == "auto"
+    assert "claude-haiku-4.5" in ids and "glm-5" in ids
+    # Exactly one default, and every option carries the picker fields.
+    assert [o["id"] for o in options if o["isDefault"]] == ["auto"]
+    for option in options:
+        assert set(option) == {"id", "displayName", "isDefault", "isCurrent"}
+        assert option["isCurrent"] is False
