@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_AP_WEB_DIR = _REPO_ROOT / "ap-web"
+_WEB_DIR = _REPO_ROOT / "web"
 
 
 def test_embed_build_ships_no_service_worker(built_spa: None, tmp_path: Path) -> None:
@@ -38,7 +38,7 @@ def test_embed_build_ships_no_service_worker(built_spa: None, tmp_path: Path) ->
     out = tmp_path / "embed"
     subprocess.run(
         ["npm", "run", "build:embed", "--", "--outDir", str(out)],
-        cwd=_AP_WEB_DIR,
+        cwd=_WEB_DIR,
         check=True,
     )
     # Guard against a vacuous pass: if the `--outDir` override is ever dropped
