@@ -382,7 +382,8 @@ class SbxSandboxLauncher(SandboxLauncher):
             if value is None:
                 raise click.ClickException(
                     f"sbx env passthrough names '{name}' but it is not set in the "
-                    f"local environment — set it (or remove it from {SANDBOX_ENV_PASSTHROUGH_ENV_VAR})."
+                    f"local environment — set it (or remove it from "
+                    f"{SANDBOX_ENV_PASSTHROUGH_ENV_VAR})."
                 )
             resolved[name] = value
         return resolved

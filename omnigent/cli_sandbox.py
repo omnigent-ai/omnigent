@@ -207,6 +207,12 @@ def sandbox() -> None:
     help="Label for the new sandbox.",
 )
 @click.option(
+    "--kit",
+    "kits",
+    multiple=True,
+    help="sbx kit reference to apply at provision (repeatable). Only used by --provider sbx.",
+)
+@click.option(
     "--server",
     "server_url",
     required=True,
@@ -241,6 +247,7 @@ def sandbox_create(
     provider: str,
     sandbox_id: str | None,
     sandbox_name: str | None,
+    kits: tuple[str, ...],
     server_url: str,
     repo_root: Path | None,
     skip_auth: bool,
@@ -270,7 +277,9 @@ def sandbox_create(
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
     launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+        provider,
+        workspace_host=workspace.host if workspace is not None else None,
+        kits=kits,
     )
     _require_cli_bootstrap(launcher)
     # The in-sandbox login only exists for providers that can forward

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,7 +15,6 @@ from omnigent.onboarding.sandboxes.sbx import (
     TEMPLATE_ENV_VAR,
     SbxSandboxLauncher,
 )
-
 
 # ── Fake sbx CLI ────────────────────────────────────────────
 #
@@ -90,7 +88,9 @@ def test_capability_class_vars() -> None:
     assert SbxSandboxLauncher.supports_local_port_forward is False
 
 
-def test_resolve_kits_constructor_wins(fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_kits_constructor_wins(
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Constructor kits win over the env-var fallback."""
     monkeypatch.setenv(KITS_ENV_VAR, "env-kit")
     launcher = SbxSandboxLauncher(kits=["a", "b"])
@@ -381,3 +381,55 @@ def test_login_primitives_are_capability_gated(fake_sbx: _FakeSbx) -> None:
         launcher.forward_local_port("box", 8022)
     with pytest.raises(SandboxCapabilityError):
         launcher.stream_exec("box", "echo hi")
+
+
+# ── CLI / get_launcher kit threading ────────────────────────
+
+
+def test_get_launcher_threads_kits() -> None:
+    """get_launcher passes kits into the sbx launcher constructor."""
+    from omnigent.onboarding.sandboxes import get_launcher
+
+    launcher = get_launcher("sbx", kits=("/tmp/sbxkit/claude",))
+    assert isinstance(launcher, SbxSandboxLauncher)
+    assert launcher._resolve_kits() == ["/tmp/sbxkit/claude"]
+
+
+def test_create_command_forwards_kit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`omnigent sandbox create --provider sbx --kit X` forwards X to get_launcher."""
+    from click.testing import CliRunner
+
+    import omnigent.cli_sandbox as cli_sandbox
+
+    recorded: dict[str, object] = {}
+
+    def fake_get_launcher(provider: str, *, workspace_host=None, kits=None):
+        recorded["provider"] = provider
+        recorded["kits"] = kits
+        return SbxSandboxLauncher(kits=kits)
+
+    monkeypatch.setattr(cli_sandbox, "get_launcher", fake_get_launcher)
+    monkeypatch.setattr(cli_sandbox, "_resolve_repo_root", lambda r: Path("/repo"))
+    # Keep the command offline: stub workspace derivation + the bootstrap.
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.derive_workspace", lambda url: None
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.sandboxes.bootstrap_sandbox_host",
+        lambda *a, **k: "omnigent-host",
+    )
+
+    result = CliRunner().invoke(
+        cli_sandbox.sandbox_create,
+        [
+            "--provider",
+            "sbx",
+            "--server",
+            "https://example.com",
+            "--kit",
+            "/tmp/sbxkit/claude",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert recorded["provider"] == "sbx"
+    assert recorded["kits"] == ("/tmp/sbxkit/claude",)
