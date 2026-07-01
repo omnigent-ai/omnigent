@@ -281,3 +281,34 @@ def test_wheel_install_is_full_install(fake_sbx: _FakeSbx) -> None:
     assert "--user" in cmd
     assert "--no-deps" not in cmd
     assert "--force-reinstall" not in cmd
+
+
+# ── exec_foreground ─────────────────────────────────────────
+
+
+def test_exec_foreground_argv_and_env(fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Foreground attach uses an interactive TTY, injects passthrough env via
+    `-e`, forces TERM, and `exec`s the command so its exit code is returned.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    fake_sbx.responses["exec"] = _FakeCompleted(args=[], returncode=7)
+    rc = SbxSandboxLauncher(env=["ANTHROPIC_API_KEY"]).exec_foreground(
+        "box", "omnigent host --server u"
+    )
+    assert rc == 7
+    [call] = fake_sbx.calls
+    assert call.args[1:4] == ["exec", "-it", "-e"]
+    assert call.args[4] == "ANTHROPIC_API_KEY=sk-test"
+    assert call.args[5] == "box"
+    assert call.args[6:8] == ["bash", "-lc"]
+    assert call.args[8] == "TERM=xterm-256color exec omnigent host --server u"
+    # Foreground inherits the terminal — output is NOT captured.
+    assert call.capture is False
+
+
+def test_exec_foreground_reraises_keyboard_interrupt(fake_sbx: _FakeSbx) -> None:
+    """Ctrl-C during the attach tears down and re-raises."""
+    fake_sbx.raise_on["exec"] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        SbxSandboxLauncher().exec_foreground("box", "omnigent host --server u")

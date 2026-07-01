@@ -260,6 +260,33 @@ class SbxSandboxLauncher(SandboxLauncher):
             "--no-warn-script-location oa-wheels/*.whl"
         )
 
+    def exec_foreground(self, sandbox_id: str, command: str) -> int:
+        """
+        Run *command* in the sandbox over an interactive TTY with stdio
+        inherited from the local terminal, returning its exit code.
+
+        Passthrough env (resolved from :meth:`_resolve_env`) is injected
+        with ``-e``; ``TERM`` is forced (native harnesses spawn tmux,
+        which refuses a dumb/unset TERM); ``exec`` replaces the shell so
+        the returned code is the command's own. The ``sbx`` process is a
+        local child, so Ctrl-C reaches it directly — no remote-kill dance.
+
+        :param sandbox_id: Target sandbox name.
+        :param command: Shell command, e.g. ``"omnigent host --server …"``.
+        :returns: The command's exit code.
+        :raises KeyboardInterrupt: Re-raised when the user detaches.
+        """
+        argv = [self._sbx_binary(), "exec", "-it"]
+        for name, value in self._resolve_env().items():
+            argv += ["-e", f"{name}={value}"]
+        argv += [sandbox_id, "bash", "-lc", f"TERM=xterm-256color exec {command}"]
+        try:
+            result = subprocess.run(argv, check=False)
+        except KeyboardInterrupt:
+            click.echo("\n  → detaching; stopping the remote process")
+            raise
+        return result.returncode
+
     def _resolve_template(self) -> str | None:
         """Resolve the create image: constructor wins, then env var."""
         return self._template or os.environ.get(TEMPLATE_ENV_VAR) or None
