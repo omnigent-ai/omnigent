@@ -9,29 +9,12 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 
 import omnigent.runtime as runtime
 from omnigent.entities.push_subscription import PushSubscription
 from omnigent.runtime.caps import RuntimeCaps
-from omnigent.server.webpush import b64url_encode
 from omnigent.server.webpush_sender import notify_user_push
-
-
-def _sub(sub_id: str, endpoint: str) -> PushSubscription:
-    ua = ec.generate_private_key(ec.SECP256R1())
-    pub = ua.public_key().public_bytes(
-        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
-    )
-    return PushSubscription(
-        id=sub_id,
-        user_id="u",
-        endpoint=endpoint,
-        p256dh=b64url_encode(pub),
-        auth=b64url_encode(b"0123456789abcdef"),
-        created_at=0,
-    )
+from tests.server.webpush_test_keys import make_push_subscription, new_signing_key
 
 
 class _FakeStore:
@@ -48,9 +31,14 @@ class _FakeStore:
 
 
 async def test_fan_out_counts_successes_and_prunes_gone(monkeypatch: pytest.MonkeyPatch) -> None:
-    store = _FakeStore([_sub("a", "http://push.test/A"), _sub("b", "http://push.test/B")])
+    store = _FakeStore(
+        [
+            make_push_subscription("a", "http://push.test/A"),
+            make_push_subscription("b", "http://push.test/B"),
+        ]
+    )
     caps = RuntimeCaps(
-        vapid_private_key=ec.generate_private_key(ec.SECP256R1()),
+        vapid_signing_key=new_signing_key(),
         vapid_subject="mailto:test@localhost",
     )
     monkeypatch.setattr(runtime, "get_push_subscription_store", lambda: store)
@@ -69,9 +57,9 @@ async def test_fan_out_counts_successes_and_prunes_gone(monkeypatch: pytest.Monk
 
 
 async def test_noop_without_vapid_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    store = _FakeStore([_sub("a", "http://push.test/A")])
+    store = _FakeStore([make_push_subscription("a", "http://push.test/A")])
     monkeypatch.setattr(runtime, "get_push_subscription_store", lambda: store)
-    monkeypatch.setattr(runtime, "get_caps", lambda: RuntimeCaps())  # vapid_private_key=None
+    monkeypatch.setattr(runtime, "get_caps", lambda: RuntimeCaps())  # vapid_signing_key=None
 
     sent = await notify_user_push("u", title="x", body="y")
     assert sent == 0
@@ -79,7 +67,7 @@ async def test_noop_without_vapid_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def test_noop_without_subscriptions(monkeypatch: pytest.MonkeyPatch) -> None:
     caps = RuntimeCaps(
-        vapid_private_key=ec.generate_private_key(ec.SECP256R1()),
+        vapid_signing_key=new_signing_key(),
         vapid_subject="mailto:test@localhost",
     )
     monkeypatch.setattr(runtime, "get_push_subscription_store", lambda: _FakeStore([]))

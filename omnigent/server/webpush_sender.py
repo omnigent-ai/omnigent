@@ -46,16 +46,16 @@ async def notify_user_push(
 
     store = get_push_subscription_store()
     caps = get_caps()
-    if store is None or caps.vapid_private_key is None:
+    if store is None or caps.vapid_signing_key is None:
         return 0
 
     subs = await asyncio.to_thread(store.list_for_user, user_id)
     if not subs:
         return 0
 
-    payload = json.dumps(
-        {"title": title, "body": body, "navigatePath": navigate_path}
-    ).encode("utf-8")
+    payload = json.dumps({"title": title, "body": body, "navigatePath": navigate_path}).encode(
+        "utf-8"
+    )
 
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=30.0)
@@ -65,7 +65,7 @@ async def notify_user_push(
             url, headers, data = build_push_request(
                 Subscription(endpoint=sub.endpoint, p256dh=sub.p256dh, auth=sub.auth),
                 payload,
-                caps.vapid_private_key,
+                caps.vapid_signing_key,
                 caps.vapid_subject,
             )
             try:

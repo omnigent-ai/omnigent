@@ -80,5 +80,5 @@ class RuntimeCaps:
     # Web Push (#8). The server's stable VAPID signing key (loaded/persisted at
     # startup) and the operator contact for the JWT ``sub`` claim. ``None`` key
     # disables push (the endpoints 503 and the sender no-ops).
-    vapid_private_key: EllipticCurvePrivateKey | None = None
+    vapid_signing_key: EllipticCurvePrivateKey | None = None
     vapid_subject: str = "mailto:admin@localhost"
