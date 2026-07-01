@@ -14,9 +14,9 @@ is the only production consumer; see designs/RUNNER_MCP.md.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
-import os
 import shlex
 import time
 from collections.abc import Awaitable, Callable
@@ -34,7 +34,7 @@ from anyio.streams.memory import (
 from cachetools import TTLCache
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.exceptions import McpError
 from mcp.shared.message import SessionMessage
@@ -51,7 +51,6 @@ from mcp.types import (
 )
 from mcp.types import Tool as McpToolDef
 
-from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 
 _T = TypeVar("_T")
@@ -121,6 +120,58 @@ def _resolve_databricks_token(profile: str) -> str:
         raise RuntimeError(
             f"Failed to resolve Databricks token from profile {profile!r}: {exc}"
         ) from exc
+
+
+# First-party Databricks host suffixes that may receive the runner's
+# workspace OAuth token. The token resolved from ``databricks_profile``
+# is the runner's own workspace credential, so it must only ever be
+# attached to Databricks-owned control-plane hosts. A spec author
+# controls both ``url`` and ``databricks_profile``; without this gate a
+# malicious spec could point ``url`` at an attacker host (or a
+# cloud-metadata / loopback endpoint) and exfiltrate the credential.
+_DATABRICKS_TOKEN_HOST_SUFFIXES: tuple[str, ...] = (
+    ".cloud.databricks.com",
+    ".gcp.databricks.com",
+    ".azuredatabricks.net",
+)
+
+
+def _is_databricks_token_host_allowed(url: str | None) -> bool:
+    """
+    Return whether the runner's Databricks token may be sent to *url*.
+
+    Only first-party Databricks hosts reached over HTTPS qualify.
+    Bearer tokens never travel over plaintext, and IP-literal hosts are
+    rejected outright: the Databricks control plane is always addressed
+    by hostname, so an IP here is the signature of an SSRF attempt at
+    loopback (``127.0.0.0/8`` / ``::1``), link-local / cloud-metadata
+    (``169.254.169.254``), or a private range.
+
+    :param url: The configured MCP endpoint URL, or ``None``.
+    :returns: ``True`` only for an ``https`` URL whose hostname ends in
+        a :data:`_DATABRICKS_TOKEN_HOST_SUFFIXES` entry and is not an IP
+        literal; ``False`` otherwise.
+    """
+    if not url:
+        return False
+    parsed = urlparse(url)
+    # A bearer token must travel over TLS only — never attach it to a
+    # plaintext scheme where the credential is exposed on the wire.
+    if parsed.scheme != "https":
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    host = host.lower()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass  # Not an IP literal — fall through to the host allowlist.
+    else:
+        # IP literals can never be on the first-party allowlist and are
+        # the primary SSRF / metadata-exfiltration vector; reject them.
+        return False
+    return any(host.endswith(suffix) for suffix in _DATABRICKS_TOKEN_HOST_SUFFIXES)
 
 
 # Seconds to wait after tripping before allowing a single
@@ -934,10 +985,24 @@ class McpServerConnection:
             are needed (empty config headers and no profile).
         """
         merged = dict(self.config.headers) if self.config.headers else {}
-        if self.config.databricks_profile is not None:
+        # Attach the runner's Databricks workspace token only when BOTH
+        # gates pass: (1) the author has not already supplied an explicit
+        # Authorization header (case-insensitive — HTTP header names are),
+        # and (2) the destination is a first-party Databricks host (see
+        # :func:`_is_databricks_token_host_allowed`). The token is the
+        # runner's own credential and a spec controls both ``url`` and
+        # ``databricks_profile``, so an unconditional attach lets a
+        # malicious spec exfiltrate it to an arbitrary host. Resolve the
+        # token only after both gates pass — never fetch a credential for
+        # a request that will not carry it.
+        has_authorization = any(name.lower() == "authorization" for name in merged)
+        if (
+            self.config.databricks_profile is not None
+            and not has_authorization
+            and _is_databricks_token_host_allowed(self.config.url)
+        ):
             token = _resolve_databricks_token(self.config.databricks_profile)
-            # Explicit Authorization header wins — don't overwrite.
-            merged.setdefault("Authorization", f"Bearer {token}")
+            merged["Authorization"] = f"Bearer {token}"
         return merged or None
 
     async def _open_streamable_http_transport(
@@ -1043,14 +1108,19 @@ class McpServerConnection:
             command=self.config.command,
             args=list(self.config.args),
             cwd=self.cwd,
-            # ``env=None`` inherits the SDK's ``get_default_environment``
-            # allowlist (no runner-auth secret). The ``config.env`` branch
-            # overlays author-declared vars (e.g. ``GITHUB_TOKEN``) on the
-            # full parent env, so strip the runner tunnel binding token
-            # first: an MCP server command is spec-author code.
-            env=(strip_runner_auth_secrets(os.environ) | self.config.env)
-            if self.config.env
-            else None,
+            # Base the subprocess env on the MCP SDK's minimal
+            # inherited-var allowlist (HOME, PATH, SHELL, ... — see
+            # ``get_default_environment``), NOT the runner's full
+            # ``os.environ``. An MCP server command is spec-author code we
+            # do not fully trust; inheriting the entire parent environment
+            # would hand it every host secret in the runner's scope
+            # (AWS_*, OPENAI_API_KEY, Databricks creds, other MCP tokens,
+            # ...). Author-declared ``config.env`` is overlaid on top.
+            # ``env=None`` resolves to this same allowlist inside the SDK,
+            # so the empty-env and non-empty-env paths are symmetric — a
+            # single benign ``env:`` entry no longer flips on full
+            # inheritance.
+            env=(get_default_environment() | self.config.env) if self.config.env else None,
         )
         read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
         return read_stream, write_stream

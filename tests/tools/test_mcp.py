@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1970,17 +1971,19 @@ def test_open_stdio_transport_spawns_unwrapped() -> None:
     assert params.args == ["--flag", "value"]
 
 
-def test_open_stdio_transport_overlays_env_on_parent() -> None:
+def test_open_stdio_transport_overlays_env_on_minimal_allowlist() -> None:
     """
-    ``config.env`` is overlaid on ``os.environ`` so the spawned
-    subprocess inherits ``PATH``, ``HOME``, etc., plus the
-    MCP-specific overrides.
+    ``config.env`` is overlaid on the MCP SDK's minimal inherited-var
+    allowlist (``get_default_environment`` — HOME, PATH, SHELL, ...),
+    NOT the runner's full ``os.environ``. The author-declared overlay
+    reaches the subprocess and PATH is still inherited (so the server
+    can resolve its own binaries), but unrelated host secrets in the
+    runner environment are withheld.
 
-    What breaks if this fails: an MCP subprocess that needs
-    ``GITHUB_TOKEN=ghp_xyz`` but also needs ``PATH`` to resolve
-    its own binaries would lose PATH (getting only the caller's
-    env overlay) and fail at spawn with "fake-mcp: command not
-    found".
+    What breaks if this fails (security, P0): a non-empty ``env:`` made
+    the stdio launch forward the runner's entire environment to
+    spec-author MCP code — AWS_*, OPENAI_API_KEY, Databricks creds,
+    other MCP tokens — silently flipped on by a single benign entry.
     """
 
     config = _make_stdio_config(
@@ -1998,20 +2001,32 @@ def test_open_stdio_transport_overlays_env_on_parent() -> None:
 
     conn = McpServerConnection(config=config)
 
-    with patch("omnigent.tools.mcp.stdio_client", side_effect=_capture_stdio_client):
-        with patch(
-            "omnigent.tools.mcp.ClientSession",
-            return_value=_mock_session(),
-        ):
-            asyncio.run(conn.connect())
+    # Seed a host secret into the runner env that must NOT leak into
+    # the spec-author subprocess, and keep a real PATH so the SDK
+    # allowlist has something to inherit.
+    with patch.dict(
+        os.environ,
+        {
+            "AWS_SECRET_ACCESS_KEY": "leaked-aws-secret",
+            "PATH": os.environ.get("PATH", "/usr/bin"),
+        },
+        clear=False,
+    ):
+        with patch("omnigent.tools.mcp.stdio_client", side_effect=_capture_stdio_client):
+            with patch(
+                "omnigent.tools.mcp.ClientSession",
+                return_value=_mock_session(),
+            ):
+                asyncio.run(conn.connect())
 
     env = captured["params"].env
-    # Config overlay reached the subprocess
+    # Config overlay reached the subprocess.
     assert env["GITHUB_TOKEN"] == "ghp_xyz"
-    # Parent env merged — PATH is always in os.environ on any
-    # realistic test runner, so its presence confirms the dict
-    # union didn't wipe the inherited environment.
+    # PATH is on the SDK allowlist, so the subprocess can still resolve
+    # its own binaries.
     assert "PATH" in env
+    # The unrelated host secret is NOT forwarded — the core P0 fix.
+    assert "AWS_SECRET_ACCESS_KEY" not in env
 
 
 def test_open_stdio_transport_empty_env_inherits_fully() -> None:
@@ -2050,6 +2065,130 @@ def test_open_stdio_transport_empty_env_inherits_fully() -> None:
     # None tells stdio_client to inherit the parent env as-is —
     # matches its documented behavior.
     assert captured["params"].env is None
+
+
+def _make_databricks_http_config(
+    *,
+    url: str,
+    headers: dict[str, str] | None = None,
+) -> MCPServerConfig:
+    """
+    Build an HTTP MCP config with ``databricks_profile`` set, for
+    Databricks token-attach tests.
+
+    :param url: The HTTP endpoint URL under test.
+    :param headers: Optional explicit headers (e.g. an author-supplied
+        ``Authorization``).
+    :returns: An ``MCPServerConfig`` with ``transport="http"`` and
+        ``databricks_profile="oss"``.
+    """
+    return MCPServerConfig(
+        name="dbx",
+        transport="http",
+        url=url,
+        headers=dict(headers) if headers is not None else {},
+        databricks_profile="oss",
+    )
+
+
+def test_resolve_http_headers_attaches_databricks_token_to_allowed_host() -> None:
+    """
+    A first-party Databricks HTTPS host receives the resolved
+    workspace token as a ``Bearer`` Authorization header.
+
+    What breaks if this fails: legitimate Databricks MCP gateways
+    (``*.cloud.databricks.com`` etc.) would no longer authenticate.
+    """
+    conn = McpServerConnection(
+        config=_make_databricks_http_config(
+            url="https://myworkspace.cloud.databricks.com/mcp",
+        )
+    )
+    with patch(
+        "omnigent.tools.mcp._resolve_databricks_token",
+        return_value="tok_abc",
+    ) as mock_resolve:
+        headers = conn._resolve_http_headers()
+
+    assert headers == {"Authorization": "Bearer tok_abc"}
+    mock_resolve.assert_called_once_with("oss")
+
+
+def test_resolve_http_headers_rejects_databricks_token_for_disallowed_host() -> None:
+    """
+    The runner's Databricks token is NOT attached when ``url`` points
+    at a non-Databricks host, and the token is never even resolved.
+
+    What breaks if this fails (security, P0): a spec controlling both
+    ``url`` and ``databricks_profile`` could exfiltrate the runner's
+    workspace credential to an attacker-controlled host.
+    """
+    conn = McpServerConnection(
+        config=_make_databricks_http_config(
+            url="https://attacker.example.com/mcp",
+        )
+    )
+    with patch(
+        "omnigent.tools.mcp._resolve_databricks_token",
+        return_value="tok_abc",
+    ) as mock_resolve:
+        headers = conn._resolve_http_headers()
+
+    assert headers is None
+    mock_resolve.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://169.254.169.254/mcp",  # cloud metadata / link-local
+        "https://127.0.0.1/mcp",  # loopback (IPv4)
+        "https://[::1]/mcp",  # loopback (IPv6)
+        "http://myworkspace.cloud.databricks.com/mcp",  # non-TLS
+        "https://databricks.com.attacker.example/mcp",  # suffix-spoof
+    ],
+)
+def test_resolve_http_headers_rejects_databricks_token_for_unsafe_url(url: str) -> None:
+    """
+    Loopback / link-local / cloud-metadata IP literals, plaintext
+    HTTP, and suffix-spoofing hosts never receive the Databricks
+    token, and the token is never resolved for them.
+    """
+    conn = McpServerConnection(config=_make_databricks_http_config(url=url))
+    with patch(
+        "omnigent.tools.mcp._resolve_databricks_token",
+        return_value="tok_abc",
+    ) as mock_resolve:
+        headers = conn._resolve_http_headers()
+
+    assert headers is None, f"token must not attach for {url!r}"
+    mock_resolve.assert_not_called()
+
+
+def test_resolve_http_headers_preserves_explicit_authorization() -> None:
+    """
+    An explicit ``Authorization`` header wins and the Databricks token
+    is not resolved — even for an allowed host (case-insensitive: a
+    lowercase ``authorization`` still suppresses the injected token).
+
+    What breaks if this fails: the runner would fetch (and could
+    attach) its own credential for a request the author already
+    authenticated, shadowing intent and leaking the token needlessly.
+    """
+    conn = McpServerConnection(
+        config=_make_databricks_http_config(
+            url="https://myworkspace.cloud.databricks.com/mcp",
+            headers={"authorization": "Bearer explicit-token"},
+        )
+    )
+    with patch(
+        "omnigent.tools.mcp._resolve_databricks_token",
+        return_value="tok_abc",
+    ) as mock_resolve:
+        headers = conn._resolve_http_headers()
+
+    assert headers == {"authorization": "Bearer explicit-token"}
+    mock_resolve.assert_not_called()
 
 
 def _mock_session() -> AsyncMock:
