@@ -41,7 +41,10 @@ from pathlib import Path
 
 import httpx
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_post_delivery import (
+    post_may_have_been_delivered,
+    post_session_event_with_retry,
+)
 from omnigent.cursor_native_bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
 
 _logger = logging.getLogger(__name__)
@@ -51,6 +54,9 @@ _logger = logging.getLogger(__name__)
 #: latency; ~0.7s keeps the chat view feeling live.
 _DEFAULT_POLL_INTERVAL_S = 0.7
 _POST_TIMEOUT_S = 30.0
+_POST_MAX_ATTEMPTS = 3
+_POST_RETRY_DELAY_SECONDS = 0.1
+_POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 #: Max length of a mirrored item's ``response_id``. The server stores it in
 #: ``conversation_items.response_id``, a ``VARCHAR(64)`` (see
@@ -597,19 +603,25 @@ async def _post_model_change_if_new(
         state.observed = model
     if state.observed is None or state.observed == state.posted:
         return
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": "external_model_change", "data": {"model": state.observed}},
-        )
-        resp.raise_for_status()
-        state.posted = state.observed
-    except httpx.HTTPError:
+    response = await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={"type": "external_model_change", "data": {"model": state.observed}},
+        event_type="external_model_change",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
+    )
+    if response is None or response.status_code >= 400:
         # Leave posted behind observed so the next poll retries.
         _logger.warning(
             "Failed to mirror cursor model change to session=%s; web picker may lag",
             session_id,
         )
+        return
+    state.posted = state.observed
 
 
 def _read_new_items(store_path: Path, last_rowid: int, agent_name: str) -> list[_MirrorItem]:
@@ -741,7 +753,7 @@ async def _post_conversation_item(
 
 async def _post_external_compaction_status(
     client: httpx.AsyncClient, *, session_id: str, status: str
-) -> None:
+) -> httpx.Response | None:
     """POST one ``external_compaction_status`` event to the Sessions API.
 
     The server republishes this as the ``response.compaction.completed`` SSE the
@@ -755,16 +767,21 @@ async def _post_external_compaction_status(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param status: Compaction status value, e.g. ``"completed"``.
-    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={
             "type": "external_compaction_status",
             "data": {"status": status},
         },
+        event_type="external_compaction_status",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def _persist_native_compaction_item(
@@ -827,11 +844,17 @@ async def _persist_native_compaction_item(
     if compacted_messages:
         compaction_data["compacted_messages"] = compacted_messages
 
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "compaction", "data": compaction_data},
+    await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={"type": "compaction", "data": compaction_data},
+        event_type="compaction",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def forward_cursor_store_to_session(
@@ -989,19 +1012,9 @@ async def forward_cursor_store_to_session(
                                 # which retries connection loss forever. Matches
                                 # the claude forwarder's best-effort posture and
                                 # never desyncs the mirror, so it is acceptable.
-                                try:
-                                    await _post_external_compaction_status(
-                                        client, session_id=session_id, status="completed"
-                                    )
-                                except httpx.HTTPError:
-                                    _logger.warning(
-                                        "cursor forwarder could not post "
-                                        "compaction-completed; the web UI spinner "
-                                        "may linger; session=%s rowid=%s",
-                                        session_id,
-                                        item.rowid,
-                                        exc_info=True,
-                                    )
+                                await _post_external_compaction_status(
+                                    client, session_id=session_id, status="completed"
+                                )
                                 try:
                                     await _persist_native_compaction_item(
                                         client,
@@ -1138,6 +1151,11 @@ async def forward_cursor_store_to_session(
 def _supervisor_monotonic() -> float:
     """Indirection so tests can stub the supervisor's clock."""
     return time.monotonic()
+
+
+async def _sleep(seconds: float) -> None:
+    """Stubbable indirection for the per-POST retry backoff."""
+    await asyncio.sleep(seconds)
 
 
 async def _supervisor_sleep(seconds: float) -> None:

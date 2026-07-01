@@ -660,6 +660,251 @@ async def test_post_clear_supersession_swallows_post_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_migrated_posts_use_session_event_retry_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Migrated Claude event posts route through the shared retry helper."""
+    calls: list[dict[str, object]] = []
+
+    async def sink(**kwargs: object) -> httpx.Response:
+        calls.append(kwargs)
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+
+    monkeypatch.setattr(forwarder, "post_session_event_with_retry", sink, raising=False)
+    client = AsyncMock()
+    client.get.return_value = httpx.Response(
+        200,
+        json={"data": [{"id": "item_123"}]},
+        request=httpx.Request("GET", "http://t/"),
+    )
+    with patch("omnigent.claude_native_forwarder.read_claude_session_id", return_value=None):
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_usage",
+            usage={"input_tokens": 1},
+            context_window=200000,
+        )
+        await forwarder._post_external_model_change(
+            client,
+            session_id="conv_model",
+            model="sonnet",
+        )
+        await forwarder._post_external_compaction_status(
+            client,
+            session_id="conv_compact_status",
+            status="completed",
+        )
+        await forwarder._persist_native_compaction_item(
+            client,
+            session_id="conv_compaction",
+            bridge_dir=tmp_path,
+        )
+        await forwarder._post_external_session_todos(
+            client,
+            session_id="conv_todos",
+            todos=[{"content": "Write tests", "status": "in_progress"}],
+        )
+        await forwarder._post_clear_supersession(
+            client,
+            old_session_id="conv old",
+            new_session_id="conv_new",
+            agent_name="claude-native-ui",
+        )
+
+    event_types = [call["event_type"] for call in calls]
+    assert event_types == [
+        "external_session_usage",
+        "external_model_change",
+        "external_compaction_status",
+        "compaction",
+        "external_session_todos",
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    for call in calls:
+        payload = call["payload"]
+        assert isinstance(payload, dict)
+        assert payload["type"] == call["event_type"]
+    assert calls[0]["url"] == "/v1/sessions/conv_usage/events"
+    assert calls[5]["url"] == "/v1/sessions/conv%20old/events"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "post_event"),
+    [
+        (
+            "external_session_usage",
+            lambda client: forwarder._post_external_session_usage(
+                client,
+                session_id="conv_usage",
+                usage={"input_tokens": 1},
+            ),
+        ),
+        (
+            "external_model_change",
+            lambda client: forwarder._post_external_model_change(
+                client,
+                session_id="conv_model",
+                model="sonnet",
+            ),
+        ),
+    ],
+)
+async def test_migrated_post_records_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    post_event: Callable[[object], object],
+) -> None:
+    """Exhausted migrated POST transport failures populate the watchdog signal."""
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(forwarder, "_sleep", no_sleep, raising=False)
+    health.clear()
+    try:
+        response = await post_event(_AlwaysConnectError())
+        assert response is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert event_type in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()
+
+
+@pytest.mark.asyncio
+async def test_compaction_post_records_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The migrated compaction POST records exhausted transport failures."""
+    from omnigent import _native_forwarder_health as health
+
+    class _CompactionClient:
+        async def get(self, url: str, *, params: dict[str, object]) -> httpx.Response:
+            del params
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "item_123"}]},
+                request=httpx.Request("GET", url),
+            )
+
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(forwarder, "_sleep", no_sleep, raising=False)
+    health.clear()
+    try:
+        response = await forwarder._persist_native_compaction_item(
+            _CompactionClient(),  # type: ignore[arg-type]
+            session_id="conv_compaction",
+            bridge_dir=tmp_path,
+        )
+        assert response is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "compaction" in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_response", [503, None])
+async def test_model_change_does_not_advance_dedupe_after_helper_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_response: int | None,
+) -> None:
+    """A failed Shape-B model mirror leaves posted_model behind for retry."""
+    dedupe = forwarder._ForwardDedupeState(observed_model="opus", posted_model="opus")
+
+    async def sink(**kwargs: object) -> httpx.Response | None:
+        assert kwargs["event_type"] == "external_model_change"
+        if failed_response is None:
+            return None
+        return httpx.Response(failed_response, request=httpx.Request("POST", "http://t/"))
+
+    monkeypatch.setattr(forwarder, "post_session_event_with_retry", sink, raising=False)
+
+    await forwarder._post_model_change_if_new(
+        object(),  # type: ignore[arg-type]
+        session_id="conv_model",
+        dedupe=dedupe,
+        alias="sonnet",
+    )
+
+    assert dedupe.observed_model == "sonnet"
+    assert dedupe.posted_model == "opus"
+
+
+@pytest.mark.asyncio
+async def test_model_change_advances_dedupe_after_helper_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful Shape-B model mirror advances posted_model."""
+    dedupe = forwarder._ForwardDedupeState(observed_model="opus", posted_model="opus")
+
+    async def sink(**kwargs: object) -> httpx.Response:
+        assert kwargs["event_type"] == "external_model_change"
+        return httpx.Response(202, request=httpx.Request("POST", "http://t/"))
+
+    monkeypatch.setattr(forwarder, "post_session_event_with_retry", sink, raising=False)
+
+    await forwarder._post_model_change_if_new(
+        object(),  # type: ignore[arg-type]
+        session_id="conv_model",
+        dedupe=dedupe,
+        alias="sonnet",
+    )
+
+    assert dedupe.observed_model == "sonnet"
+    assert dedupe.posted_model == "sonnet"
+
+
+@pytest.mark.asyncio
+async def test_tracker_coupled_shared_leaves_still_raise_on_http_error() -> None:
+    """Shared tracker-coupled leaves must keep raising httpx.HTTPError."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, request=_request, json={"error": "boom"})
+
+    item = ClaudeTranscriptItem(
+        source_id="source_1",
+        item_type="message",
+        data={"role": "assistant", "content": []},
+        response_id="response_1",
+    )
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        with pytest.raises(httpx.HTTPError):
+            await forwarder._post_external_conversation_item(
+                client,
+                session_id="conv_x",
+                item=item,
+            )
+        with pytest.raises(httpx.HTTPError):
+            await forwarder._post_external_session_status(
+                client,
+                session_id="conv_x",
+                status="idle",
+            )
+
+
+@pytest.mark.asyncio
 async def test_clear_hook_consumes_hook_rotated_session_without_duplicate_fork(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3534,11 +3779,11 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
     model_posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        """Fail the FIRST external_model_change POST (503); accept the rest."""
+        """Fail the first helper retry window for external_model_change; accept the rest."""
         body = json.loads(request.content.decode("utf-8"))
         if body["type"] == "external_model_change":
             model_posts.append(body["data"])
-            if len(model_posts) == 1:
+            if len(model_posts) <= forwarder._POST_MAX_ATTEMPTS:
                 return httpx.Response(503, json={"error": "transient"})
         return httpx.Response(202, json={})
 
@@ -3566,7 +3811,7 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_assistant("a2", "claude-sonnet-4-6") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet"}]  # attempted once
+        assert model_posts == [{"model": "sonnet"}] * forwarder._POST_MAX_ATTEMPTS
         assert dedupe.posted_model == "opus"  # NOT advanced — POST failed
         assert dedupe.observed_model == "sonnet"  # but remembered
 
@@ -3574,7 +3819,7 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_user("u1") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet"}, {"model": "sonnet"}]  # retried
+        assert model_posts == [{"model": "sonnet"}] * (forwarder._POST_MAX_ATTEMPTS + 1)
         assert dedupe.posted_model == "sonnet"  # now committed
 
 
@@ -5311,6 +5556,118 @@ def _transcript_state_for(transcript_path: Path) -> forwarder.TranscriptForwardS
 
 
 @pytest.mark.asyncio
+async def test_forward_available_items_leaves_usage_dedupe_after_failed_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rejected usage POST leaves dedupe behind so the next poll retries."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "already forwarded")
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        seen_source_ids=("u1:0:message",),
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {
+            "context_window_size": 200_000,
+            "current_usage": {"input_tokens": 7, "output_tokens": 3},
+        },
+    )
+    dedupe = forwarder._ForwardDedupeState(
+        usage={"context_tokens": 1, "input_tokens": 1, "output_tokens": 0},
+        context_window=100_000,
+    )
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body["type"] == "external_session_usage":
+            posts.append(body["data"])
+            return httpx.Response(404, json={"error": "missing"})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    assert posts == [
+        {
+            "context_tokens": 7,
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "context_window": 200_000,
+        }
+    ]
+    assert dedupe.usage == {"context_tokens": 1, "input_tokens": 1, "output_tokens": 0}
+    assert dedupe.context_window == 100_000
+
+
+@pytest.mark.asyncio
+async def test_forward_available_items_advances_usage_dedupe_after_successful_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A successful usage POST advances both usage and context-window dedupe."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    _write_assistant_transcript(transcript_path, "u1", "already forwarded")
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        seen_source_ids=("u1:0:message",),
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {
+            "context_window_size": 200_000,
+            "current_usage": {"input_tokens": 7, "output_tokens": 3},
+        },
+    )
+    dedupe = forwarder._ForwardDedupeState(
+        usage={"context_tokens": 1, "input_tokens": 1, "output_tokens": 0},
+        context_window=100_000,
+    )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body["type"] == "external_session_usage":
+            return httpx.Response(202, json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    assert dedupe.usage == {"context_tokens": 7, "input_tokens": 7, "output_tokens": 3}
+    assert dedupe.context_window == 200_000
+
+
+@pytest.mark.asyncio
 async def test_assistant_item_held_until_its_deltas_forward(tmp_path: Path) -> None:
     """
     An assistant item whose deltas haven't fully forwarded is deferred.
@@ -6012,6 +6369,55 @@ async def test_forward_session_cost_posts_status_when_no_subagents(
     assert dedupe.posted_policy_cost == pytest.approx(0.25)
 
 
+@pytest.mark.asyncio
+async def test_forward_session_cost_leaves_dedupe_after_failed_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rejected cost POST leaves both cost dedupe fields behind."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    monkeypatch.setattr(
+        forwarder, "read_claude_context_state", lambda _bridge: {"total_cost_usd": 0.25}
+    )
+
+    def _fail_estimate(**_kwargs: Any) -> float | None:
+        raise AssertionError("estimator must not run without sub-agents")
+
+    monkeypatch.setattr(forwarder, "_session_cost_estimate", _fail_estimate)
+    dedupe = forwarder._ForwardDedupeState()
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") == "external_session_usage":
+            posted.append(body["data"])
+            return httpx.Response(404, json={"error": "missing"})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._forward_session_cost(
+            client=client,
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            parent_transcript_path=parent,
+            subagent_state=forwarder.SubagentForwardState(subagents={}),
+            dedupe=dedupe,
+            cost_cache={},
+        )
+
+    assert posted == [
+        {
+            "cumulative_cost_usd": pytest.approx(0.25),
+            "policy_cost_usd": pytest.approx(0.25),
+        }
+    ]
+    assert dedupe.posted_cost is None
+    assert dedupe.posted_policy_cost is None
+
+
 def test_parse_json_response_returns_value_on_valid_json() -> None:
     """
     A normal JSON body parses through ``_parse_json_response`` unchanged.
@@ -6170,8 +6576,7 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
     get_response.raise_for_status = MagicMock()
     get_response.json.return_value = {"data": [{"id": "item_123"}]}
 
-    post_response = MagicMock()
-    post_response.raise_for_status = MagicMock()
+    post_response = httpx.Response(200, request=httpx.Request("POST", "http://t/"))
 
     client = AsyncMock()
     client.get.return_value = get_response
@@ -6231,8 +6636,7 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
     get_response.raise_for_status = MagicMock()
     get_response.json.return_value = {"data": []}
 
-    post_response = MagicMock()
-    post_response.raise_for_status = MagicMock()
+    post_response = httpx.Response(200, request=httpx.Request("POST", "http://t/"))
 
     client = AsyncMock()
     client.get.return_value = get_response

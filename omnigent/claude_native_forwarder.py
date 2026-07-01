@@ -17,7 +17,11 @@ from typing import Any
 
 import httpx
 
-from omnigent._native_post_delivery import append_dead_letter, post_may_have_been_delivered
+from omnigent._native_post_delivery import (
+    append_dead_letter,
+    post_may_have_been_delivered,
+    post_session_event_with_retry,
+)
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeHookRecord,
@@ -217,6 +221,9 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
 _POST_TIMEOUT_S = 10.0
+_POST_MAX_ATTEMPTS = 3
+_POST_RETRY_DELAY_SECONDS = 0.1
+_POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _MAX_SEEN_SOURCE_IDS = 2000
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
@@ -249,6 +256,11 @@ _HOOK_EVENT_TO_STATUS: dict[str, str] = {
 }
 
 _logger = logging.getLogger(__name__)
+
+
+async def _sleep(seconds: float) -> None:
+    """Stubbable indirection for the per-POST retry backoff."""
+    await asyncio.sleep(seconds)
 
 
 @dataclass
@@ -1793,19 +1805,19 @@ async def _forward_session_cost(
         model = status_state.get("model")
         if isinstance(model, str) and model:
             payload["model"] = model
-    try:
-        await _post_external_session_usage(
-            client,
-            session_id=session_id,
-            usage=payload,
-        )
-    except httpx.HTTPError as exc:
+    response = await _post_external_session_usage(
+        client,
+        session_id=session_id,
+        usage=payload,
+    )
+    if response is None or response.status_code >= 400:
+        # The post did not land (transport exhaustion or a non-2xx response);
+        # leave the cost dedupe behind so the next poll re-posts it.
         _logger.warning(
             "Failed to forward Claude session cost; session=%s bridge_dir=%s http_status=%s",
             session_id,
             bridge_dir,
-            _http_status_for_log(exc),
-            exc_info=True,
+            response.status_code if response is not None else None,
         )
         return
     if "cumulative_cost_usd" in payload:
@@ -2595,21 +2607,11 @@ async def _forward_available_status_events(
             # the rest of the hook stream.
             compaction_status = _compaction_status_for_record(record)
             if compaction_status is not None:
-                try:
-                    await _post_external_compaction_status(
-                        client,
-                        session_id=session_id,
-                        status=compaction_status,
-                    )
-                except httpx.HTTPError:
-                    _logger.warning(
-                        "Failed to forward Claude compaction status; "
-                        "session=%s event_cursor=%s status=%s",
-                        session_id,
-                        record.event_cursor,
-                        compaction_status,
-                        exc_info=True,
-                    )
+                await _post_external_compaction_status(
+                    client,
+                    session_id=session_id,
+                    status=compaction_status,
+                )
                 # Persist a compaction item so session resume knows
                 # the compaction boundary. Without this, rebuilding
                 # the transcript from the conversation DB loads the
@@ -2675,19 +2677,11 @@ async def _forward_available_status_events(
                     for tid in task_order
                 ]
             if todos_to_post is not None:
-                try:
-                    await _post_external_session_todos(
-                        client,
-                        session_id=session_id,
-                        todos=todos_to_post,
-                    )
-                except httpx.HTTPError:
-                    _logger.warning(
-                        "Failed to forward Claude todos from hook; session=%s event_cursor=%s",
-                        session_id,
-                        record.event_cursor,
-                        exc_info=True,
-                    )
+                await _post_external_session_todos(
+                    client,
+                    session_id=session_id,
+                    todos=todos_to_post,
+                )
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
             continue
@@ -3030,26 +3024,27 @@ async def _forward_available_items(
         resolved_context_window is not None and resolved_context_window != dedupe.context_window
     )
     if usage_changed or window_changed:
-        try:
-            await _post_external_session_usage(
-                client,
-                session_id=session_id,
-                usage=posted_usage,
-                context_window=resolved_context_window,
-            )
-            if usage_changed:
-                dedupe.usage = posted_usage
-            if window_changed:
-                dedupe.context_window = resolved_context_window
-        except httpx.HTTPError as exc:
+        response = await _post_external_session_usage(
+            client,
+            session_id=session_id,
+            usage=posted_usage,
+            context_window=resolved_context_window,
+        )
+        if response is None or response.status_code >= 400:
+            # The post did not land; leave the usage/context-window dedupe
+            # behind so the next poll re-posts the current snapshot.
             _logger.warning(
                 "Failed to forward Claude transcript usage; session=%s bridge_dir=%s "
                 "http_status=%s",
                 session_id,
                 bridge_dir,
-                _http_status_for_log(exc),
-                exc_info=True,
+                response.status_code if response is not None else None,
             )
+        else:
+            if usage_changed:
+                dedupe.usage = posted_usage
+            if window_changed:
+                dedupe.context_window = resolved_context_window
     # Mirror a TUI-side `/model` switch to the web picker. The transcript
     # records the resolved concrete id (e.g. "claude-opus-4-8"); collapse
     # it to the picker's tier alias. This transcript-derived observation
@@ -3287,66 +3282,60 @@ async def _post_clear_supersession(
         # state, but if that ever collapses to the new id, posting here
         # would dump the "you were cleared" banner onto the active chat.
         return
-    try:
-        status_resp = await client.post(
-            f"/v1/sessions/{url_component(old_session_id)}/events",
-            json={
-                "type": "external_session_status",
-                "data": {"status": "idle"},
-            },
-        )
-        status_resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-        )
+    await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{url_component(old_session_id)}/events",
+        payload={
+            "type": "external_session_status",
+            "data": {"status": "idle"},
+        },
+        event_type="external_session_status",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
+    )
     notice = (
         "This conversation was ended by `/clear`. "
         f"Continue in [the new chat](/c/{new_session_id}). "
         "You can also send a message here to resume this conversation."
     )
-    try:
-        item_resp = await client.post(
-            f"/v1/sessions/{url_component(old_session_id)}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "message",
-                    "item_data": {
-                        "role": "assistant",
-                        "agent": agent_name,
-                        "content": [{"type": "output_text", "text": notice}],
-                    },
+    await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{url_component(old_session_id)}/events",
+        payload={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": agent_name,
+                    "content": [{"type": "output_text", "text": notice}],
                 },
             },
-        )
-        item_resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to post /clear supersession notice; old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-        )
-    try:
-        event_resp = await client.post(
-            f"/v1/sessions/{url_component(old_session_id)}/events",
-            json={
-                "type": "external_session_superseded",
-                "data": {"target_conversation_id": new_session_id},
-            },
-        )
-        event_resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-        )
+        },
+        event_type="external_conversation_item",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
+    )
+    await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{url_component(old_session_id)}/events",
+        payload={
+            "type": "external_session_superseded",
+            "data": {"target_conversation_id": new_session_id},
+        },
+        event_type="external_session_superseded",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
+    )
 
 
 async def _post_external_conversation_item(
@@ -3516,7 +3505,7 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
-) -> None:
+) -> httpx.Response | None:
     """
     Post one ``external_session_usage`` event to the Sessions API.
 
@@ -3538,12 +3527,18 @@ async def _post_external_session_usage(
     if context_window is not None:
         payload["context_window"] = context_window
     if not payload:
-        return
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_usage", "data": payload},
+        return None
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={"type": "external_session_usage", "data": payload},
+        event_type="external_session_usage",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 def _model_alias_for(model: str | None) -> str | None:
@@ -3578,7 +3573,7 @@ async def _post_external_model_change(
     *,
     session_id: str,
     model: str,
-) -> None:
+) -> httpx.Response | None:
     """
     Post one ``external_model_change`` event to the Sessions API.
 
@@ -3591,11 +3586,17 @@ async def _post_external_model_change(
     :param model: Tier alias the session is now on, e.g. ``"opus"``.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_model_change", "data": {"model": model}},
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={"type": "external_model_change", "data": {"model": model}},
+        event_type="external_model_change",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def _post_model_change_if_new(
@@ -3637,21 +3638,20 @@ async def _post_model_change_if_new(
         # posting so it can't clobber a pending silent model handoff.
         dedupe.posted_model = dedupe.observed_model
         return
-    try:
-        await _post_external_model_change(
-            client,
-            session_id=session_id,
-            model=dedupe.observed_model,
-        )
-        dedupe.posted_model = dedupe.observed_model
-    except httpx.HTTPError:
+    response = await _post_external_model_change(
+        client,
+        session_id=session_id,
+        model=dedupe.observed_model,
+    )
+    if response is None or response.status_code >= 400:
         # Leave posted_model behind observed_model so the next poll retries.
         _logger.warning(
             "Failed to mirror model change to Omnigent session=%s; model pill / "
             "cost-budget gate may lag until the next poll",
             session_id,
-            exc_info=True,
         )
+        return
+    dedupe.posted_model = dedupe.observed_model
 
 
 async def _forward_model_from_status(
@@ -3747,7 +3747,7 @@ async def _post_external_compaction_status(
     *,
     session_id: str,
     status: str,
-) -> None:
+) -> httpx.Response | None:
     """
     Post one ``external_compaction_status`` event to the Sessions API.
 
@@ -3767,14 +3767,20 @@ async def _post_external_compaction_status(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={
             "type": "external_compaction_status",
             "data": {"status": status},
         },
+        event_type="external_compaction_status",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def _persist_native_compaction_item(
@@ -3782,7 +3788,7 @@ async def _persist_native_compaction_item(
     *,
     session_id: str,
     bridge_dir: Path,
-) -> None:
+) -> httpx.Response | None:
     """
     Persist a compaction boundary item to the conversation store.
 
@@ -3841,14 +3847,20 @@ async def _persist_native_compaction_item(
     if compacted_messages is not None:
         event_data["compacted_messages"] = compacted_messages
 
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={
             "type": "compaction",
             "data": event_data,
         },
+        event_type="compaction",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def _patch_external_session_id(
@@ -3962,7 +3974,7 @@ async def _post_external_session_todos(
     *,
     session_id: str,
     todos: list[dict[str, Any]],
-) -> None:
+) -> httpx.Response | None:
     """
     Post one ``external_session_todos`` event to the Sessions API.
 
@@ -3974,11 +3986,17 @@ async def _post_external_session_todos(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_todos", "data": {"todos": todos}},
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={"type": "external_session_todos", "data": {"todos": todos}},
+        event_type="external_session_todos",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
