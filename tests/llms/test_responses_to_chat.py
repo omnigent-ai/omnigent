@@ -674,6 +674,42 @@ async def test_kimi_reasoning_started_emitted_once_per_run() -> None:
     assert [e.delta for e in reasoning_deltas] == ["part 1", " part 2"]
 
 
+@pytest.mark.asyncio
+async def test_grok_top_level_reasoning_content_streams() -> None:
+    """
+    xAI Grok / DeepSeek emit chain-of-thought as a top-level
+    ``delta.reasoning_content`` string (with ``content`` null during the
+    thinking phase), not as typed blocks nested inside ``content``. It must
+    surface as ``ResponseReasoningStartedEvent`` + ``ResponseReasoningTextDeltaEvent``
+    and stay out of the final answer text.
+    """
+    chunks = [
+        {"choices": [{"delta": {"reasoning_content": "Let me think..."}, "finish_reason": None}]},
+        {"choices": [{"delta": {"reasoning_content": " still thinking"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    events = [
+        e async for e in chat_stream_to_response_events(_aiter(chunks), model="xai/grok-4.3")
+    ]
+
+    reasoning_started = [e for e in events if isinstance(e, ResponseReasoningStartedEvent)]
+    reasoning_deltas = [e for e in events if isinstance(e, ResponseReasoningTextDeltaEvent)]
+    text_deltas = [e for e in events if isinstance(e, ResponseTextDeltaEvent)]
+    completed = events[-1]
+
+    # One reasoning.started sentinel; both reasoning deltas surfaced in order.
+    assert len(reasoning_started) == 1
+    assert [e.delta for e in reasoning_deltas] == ["Let me think...", " still thinking"]
+
+    # Reasoning is hidden from the main answer text.
+    assert len(text_deltas) == 1
+    assert text_deltas[0].delta == "42"
+
+    assert isinstance(completed, ResponseCompletedEvent)
+    assert completed.response.output[0].content[0].text == "42"
+
+
 # ── _extract_delta_content unit tests ──────────────────────────────
 
 
