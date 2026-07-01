@@ -5718,7 +5718,14 @@ def _isolated_provider_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
     monkeypatch.setenv("HOME", str(tmp_path))
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "OMNIGENT_ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OMNIGENT_OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OMNIGENT_OPENROUTER_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     return tmp_path
@@ -6014,6 +6021,23 @@ def test_resolve_native_claude_config_ambient_key(
     assert cfg.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     # Resolved from the env ref, delivered via the helper (no secret in env).
     assert cfg.api_key_helper == "printf %s sk-ant-ambient"
+
+
+def test_resolve_native_claude_config_ambient_prefixed_key(
+    _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prefixed Anthropic key routes native Claude without raw env exposure."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
+
+    cfg = claude_native.resolve_native_claude_config(spec=None)
+
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+    assert cfg.api_key_helper == "printf %s sk-ant-prefixed"
 
 
 def test_bedrock_config_auth_command_failure_returns_none() -> None:

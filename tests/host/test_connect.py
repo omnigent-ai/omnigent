@@ -1185,6 +1185,30 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
+def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
+    """Prefixed harness credential aliases forward without creating raw names."""
+    from omnigent.host.connect import HARNESS_CREDENTIAL_ENV_VARS
+
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "OMNIGENT_ANTHROPIC_API_KEY": "sk-prefixed",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert "OMNIGENT_ANTHROPIC_API_KEY" in HARNESS_CREDENTIAL_ENV_VARS
+    assert env["OMNIGENT_ANTHROPIC_API_KEY"] == "sk-prefixed"
+    assert "ANTHROPIC_API_KEY" not in env
+
+
 def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     """
     OMNIGENT_RUNNER_ENV_PASSTHROUGH names EXTRA vars to forward (for

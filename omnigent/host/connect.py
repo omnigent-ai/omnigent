@@ -22,6 +22,7 @@ import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -350,7 +351,7 @@ _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "O
 # on a server-managed sandbox: the deployment's injected provider
 # secrets) — forwarding them is the intent, not a leak. Vars absent
 # from the host env are simply not set.
-HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
+_BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
     {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -365,6 +366,11 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GIT_TOKEN",
         "GIT_USERNAME",
     }
+)
+HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
+    name
+    for canonical in _BASE_HARNESS_CREDENTIAL_ENV_VARS
+    for name in env_names_with_omnigent_prefix(canonical)
 )
 
 # Comma-separated EXTRA env var names to forward host→runner, beyond
