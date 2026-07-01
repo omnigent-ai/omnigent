@@ -411,9 +411,7 @@ def test_create_command_forwards_kit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli_sandbox, "get_launcher", fake_get_launcher)
     monkeypatch.setattr(cli_sandbox, "_resolve_repo_root", lambda r: Path("/repo"))
     # Keep the command offline: stub workspace derivation + the bootstrap.
-    monkeypatch.setattr(
-        "omnigent.onboarding.sandboxes.derive_workspace", lambda url: None
-    )
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.derive_workspace", lambda url: None)
     monkeypatch.setattr(
         "omnigent.onboarding.sandboxes.bootstrap_sandbox_host",
         lambda *a, **k: "omnigent-host",

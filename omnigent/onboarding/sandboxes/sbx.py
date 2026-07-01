@@ -293,8 +293,7 @@ class SbxSandboxLauncher(SandboxLauncher):
         result = self._run_sbx(["ls", "--json"])
         if result.returncode != 0:
             raise click.ClickException(
-                f"Could not list sbx sandboxes: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
+                f"Could not list sbx sandboxes: {result.stderr.strip() or result.stdout.strip()}"
             )
         try:
             entries = json.loads(result.stdout or "[]")
