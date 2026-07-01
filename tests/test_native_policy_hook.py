@@ -487,12 +487,12 @@ def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    With no ``reauth`` callable, a login-redirect yields ``None`` (legacy).
+    With no ``reauth`` callable, a login-redirect yields ``None``.
 
-    Callers without a token source (e.g. codex/kimi today) see the same
-    behavior as before this change: ``raise_for_status`` rejects the 302 as a
-    non-retryable <500, the helper returns ``None``, and the caller fails
-    closed. Guards against the new branch altering that.
+    Callers without a token source still fail closed on an auth bounce: the
+    login-redirect branch has nothing to re-mint, so it returns ``None``
+    directly (with an actionable "run `databricks auth login`" hint on stderr)
+    rather than passing the 302 back as if it were a verdict.
     """
     seen_headers: list[dict[str, str]] = []
     redirect = httpx.Response(
@@ -516,10 +516,10 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
     """
     When re-mint yields no token, the helper returns ``None`` (caller fails closed).
 
-    Re-auth is best-effort: a ``reauth`` that returns ``None`` (no creds /
-    transient mint failure) must not loop — it falls through to
-    ``raise_for_status`` (302 → non-retryable) so the caller keeps the
-    fail-closed safety net.
+    Re-auth is best-effort: a ``reauth`` that returns ``None`` (no creds, or
+    the Databricks OAuth *refresh* token has itself lapsed so there is nothing
+    left to mint from) must not loop — the login-redirect branch fails closed
+    directly, preserving the caller's fail-closed safety net.
     """
     seen_headers: list[dict[str, str]] = []
     redirect = httpx.Response(

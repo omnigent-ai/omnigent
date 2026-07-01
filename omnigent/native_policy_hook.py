@@ -497,11 +497,7 @@ def post_evaluate_with_retry(
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=request_body)
-                if (
-                    reauth is not None
-                    and not reauthed
-                    and _is_login_redirect_or_unauthorized(resp)
-                ):
+                if not reauthed and _is_login_redirect_or_unauthorized(resp):
                     # The one-shot ``ap_auth_headers`` token lapsed (~1h
                     # Databricks OAuth lifetime): the Apps front door bounces
                     # an expired bearer with a 302→/oidc/ (or a 401). Re-mint
@@ -510,7 +506,7 @@ def post_evaluate_with_retry(
                     # runner's own callbacks. Without this, every tool call on a
                     # session older than the token lifetime fails CLOSED while
                     # chat (refresh-capable) keeps working.
-                    refreshed = reauth()
+                    refreshed = reauth() if reauth is not None else None
                     if refreshed:
                         headers = refreshed
                         reauthed = True
@@ -520,6 +516,22 @@ def post_evaluate_with_retry(
                             file=sys.stderr,
                         )
                         continue
+                    # No re-mint available, or the re-mint itself failed
+                    # because the Databricks OAuth *refresh* token has also
+                    # lapsed — there is nothing left to mint from. Fail closed
+                    # here with an actionable hint. (Falling through to
+                    # ``raise_for_status`` would also fail closed — a 302/401 is
+                    # caught below and returns ``None`` — but only after a terse
+                    # "Omnigent returned 302" with no next step; this names the
+                    # fix instead.)
+                    print(
+                        f"omnigent {hook_label}: Omnigent auth expired and could not "
+                        "re-mint a token (Databricks OAuth session likely lapsed) — "
+                        "run `databricks auth login` to re-authenticate. "
+                        "Failing closed for this call.",
+                        file=sys.stderr,
+                    )
+                    return None
                 resp.raise_for_status()
                 return resp
         except httpx.HTTPStatusError as exc:

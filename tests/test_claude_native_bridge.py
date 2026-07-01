@@ -43,6 +43,7 @@ from omnigent.claude_native_bridge import (
     read_transcript_items_since,
     read_transcript_path,
     record_hook_event,
+    refresh_permission_hook_auth,
     start_tool_relay,
     stop_hook_seen_since,
     write_tmux_target,
@@ -267,6 +268,70 @@ def test_prepare_bridge_dir_preserves_permission_hook_config(
     config = read_permission_hook_config(bridge_dir)
     assert config["ap_server_url"] == "http://127.0.0.1:8787"
     assert config["ap_auth_headers"] == {"Authorization": "Bearer xyz"}
+
+
+def test_refresh_permission_hook_auth_restamps_bearer_preserving_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-stamp only the ``Authorization`` header; keep routing + server URL.
+
+    The transcript forwarder periodically refreshes the one-shot hook token
+    (which dies at the ~1h Databricks OAuth TTL) from its own refresh-capable
+    auth. Only the bearer may change: ``ap_server_url`` and routing headers
+    like ``X-Databricks-Org-Id`` must survive, or the hook loses its workspace
+    routing and target on the next tool call.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o1"},
+    )
+    before = read_permission_hook_config(bridge_dir)["updated_at"]
+
+    changed = refresh_permission_hook_auth(bridge_dir, "Bearer fresh")
+
+    assert changed is True
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_server_url"] == "http://127.0.0.1:8787"
+    assert config["ap_auth_headers"] == {
+        "Authorization": "Bearer fresh",
+        "X-Databricks-Org-Id": "o1",
+    }
+    assert config["updated_at"] >= before
+
+
+def test_refresh_permission_hook_auth_noops_when_unchanged_or_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Return ``False`` (no write) for an absent config or an unchanged bearer.
+
+    A bridge with no ``permission_hook.json`` yet has nothing to refresh, and
+    an unchanged token (the SDK served the same cached bearer) must not churn
+    the file — and its ``updated_at`` — every cycle.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+
+    # No permission_hook.json written yet → nothing to refresh.
+    assert refresh_permission_hook_auth(bridge_dir, "Bearer x") is False
+
+    augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer same"},
+    )
+    # Same bearer → no rewrite.
+    assert refresh_permission_hook_auth(bridge_dir, "Bearer same") is False
 
 
 def test_prepare_bridge_dir_restricts_filesystem_permissions(
