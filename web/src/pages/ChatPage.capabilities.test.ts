@@ -110,7 +110,9 @@ describe("shouldShowEffortPicker", () => {
   it("hides effort controls for kiro-native (model selection only)", () => {
     // WHY: kiro exposes only launch-time --model selection; its --effort knob is
     // not surfaced in the Web UI (deferred), so no effort dial.
-    expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(false);
+    expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(
+      false,
+    );
   });
 });
 
