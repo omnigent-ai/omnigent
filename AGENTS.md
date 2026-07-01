@@ -3,6 +3,12 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Committing
+
+Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
+let it run on staged files via `git commit`). Fix any issues it reports so the
+commit lands clean — CI runs the same checks.
+
 ## Pull requests
 
 When you open a pull request, fill in the repo's PR template at
