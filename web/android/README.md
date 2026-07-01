@@ -2,7 +2,7 @@
 
 Thin Kotlin/`WebView` shell for Omnigent. Like the Electron app and the iOS
 shell (`web/ios`), this target loads the server-served web UI instead of
-shipping a duplicate copy of the SPA. It is a native *shell*, not a rewrite.
+shipping a duplicate copy of the SPA. It is a native _shell_, not a rewrite.
 
 ## Development
 
