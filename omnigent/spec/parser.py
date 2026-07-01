@@ -181,6 +181,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             model=executor.model or llm.model,
             extra=llm.extra,
             connection=executor.connection,
+            profile=llm.profile,
             request_timeout=llm.request_timeout,
             retry=llm.retry,
         )
