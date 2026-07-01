@@ -163,21 +163,26 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
     ``history-limit`` is generated per terminal because it comes from
     ``TerminalEnvSpec.scrollback``. ``mouse on`` makes the attached web
     terminal scrollable. ``focus-events on`` lets interactive programs
-    observe pane focus changes. ``extended-keys`` with CSI-u formatting
-    lets programs inside tmux receive Kitty Keyboard Protocol keys such
-    as Shift+Enter when the attached terminal supports them. Terminals
-    without that protocol ignore tmux's request, and the quiet tmux
-    options keep older tmux versions from failing launch. ``escape-time
-    0`` prevents pasted ANSI escape bytes from accumulating tmux's
-    default delay.
+    observe pane focus changes. ``escape-time 0`` prevents pasted ANSI
+    escape bytes from accumulating tmux's default delay.
+
+    ``extended-keys``/``extended-keys-format csi-u`` are deliberately
+    NOT set. Enabling them makes tmux negotiate the Kitty Keyboard
+    Protocol (CSI-u) with whatever terminal attaches to this server.
+    A native terminal attached via ``_attach_direct_tmux`` is the
+    user's real TTY, so tmux would enable progressive keyboard
+    enhancement on it and leak that mode back into the user's shell
+    when the attach ends (e.g. Ctrl+C printing ``^[[99;133u`` instead
+    of sending SIGINT). tmux defaults ``extended-keys`` to off, so
+    omitting these lines keeps the real terminal untouched. The
+    trade-off is that managed terminals no longer receive
+    disambiguated keys such as Shift+Enter.
 
     :param scrollback: Tmux history limit, e.g. ``10000``.
     :returns: Tmux commands configuring pane input and scrollback.
     """
     return [
         ["set-option", "-g", "history-limit", str(scrollback)],
-        ["set-option", "-sq", "extended-keys", "on"],
-        ["set-option", "-sq", "extended-keys-format", "csi-u"],
         ["set-option", "-g", "mouse", "on"],
         ["set-option", "-g", "focus-events", "on"],
         ["set-option", "-g", "escape-time", "0"],

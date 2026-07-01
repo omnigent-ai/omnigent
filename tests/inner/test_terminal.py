@@ -47,7 +47,7 @@ def contains_subsequence(values: list[str], expected: list[str]) -> bool:
 
     :param values: Full argv list, e.g. ``["tmux", "set-option"]``.
     :param expected: Expected contiguous argv slice, e.g.
-        ``["set-option", "-sq", "extended-keys", "on"]``.
+        ``["set-option", "-gq", "remain-on-exit", "on"]``.
     :returns: ``True`` when the expected slice appears in order.
     """
     if not expected:
@@ -430,18 +430,21 @@ async def test_launch_omits_keep_alive_options_by_default(
 
 
 @pytest.mark.asyncio
-async def test_launch_enables_csi_u_extended_keys_quietly(
+async def test_launch_does_not_enable_csi_u_extended_keys(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Managed tmux sessions request CSI-u extended-key forwarding on launch.
+    Managed tmux sessions must NOT enable CSI-u extended keys on launch.
 
-    This is the tmux-side half of Shift+Enter support for capable
-    native terminals: applications in the pane can receive
-    ``\\x1b[13;2u`` after they request Kitty Keyboard Protocol mode.
-    The ``-q`` flag is part of the assertion so older tmux versions
-    that do not know these options do not fail terminal launch.
+    Enabling ``extended-keys``/``extended-keys-format csi-u`` makes tmux
+    negotiate the Kitty Keyboard Protocol with the attached terminal.
+    A native terminal attaches its real TTY directly to this tmux
+    server, so the mode leaks back into the user's shell when the
+    attach ends — Ctrl+C then prints ``^[[99;133u`` instead of sending
+    SIGINT. tmux defaults ``extended-keys`` to off, so launch must not
+    turn it on. The trade-off is that managed terminals lose
+    disambiguated keys such as Shift+Enter.
 
     :param tmp_path: Temporary directory used for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -487,15 +490,14 @@ async def test_launch_enables_csi_u_extended_keys_quietly(
 
     # ``launch`` should issue one flattened tmux setup command. Zero calls
     # would mean the test never captured launch; more than one call would
-    # mean the extended-key assertions below may not cover the full setup argv.
+    # mean the assertions below may not cover the full setup argv.
     assert len(captured) == 1
     cmd = captured[0]
 
-    assert contains_subsequence(cmd, ["set-option", "-sq", "extended-keys", "on"])
-    assert contains_subsequence(
-        cmd,
-        ["set-option", "-sq", "extended-keys-format", "csi-u"],
-    )
+    # Neither the option nor the CSI-u format may appear anywhere in the argv.
+    assert "extended-keys" not in cmd
+    assert "extended-keys-format" not in cmd
+    assert "csi-u" not in cmd
 
 
 @pytest.mark.asyncio
