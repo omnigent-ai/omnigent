@@ -69,7 +69,7 @@ def create_push_router(
         from omnigent.runtime import get_caps
         from omnigent.server.vapid_keys import vapid_application_server_key
 
-        key = get_caps().vapid_private_key
+        key = get_caps().vapid_signing_key
         if key is None:
             raise OmnigentError(
                 "Web Push is not configured on this server", code=ErrorCode.NOT_FOUND
@@ -86,9 +86,7 @@ def create_push_router(
             raise OmnigentError(
                 "endpoint and keys.{p256dh,auth} are required", code=ErrorCode.INVALID_INPUT
             )
-        sub = store.upsert(
-            generate_push_subscription_id(), user_id, body.endpoint, p256dh, auth
-        )
+        sub = store.upsert(generate_push_subscription_id(), user_id, body.endpoint, p256dh, auth)
         return {"id": sub.id, "object": "push_subscription"}
 
     @router.delete("/push/subscriptions")

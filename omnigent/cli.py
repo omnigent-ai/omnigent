@@ -3072,7 +3072,7 @@ def server(
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
-        vapid_private_key=vapid_private_key,
+        vapid_signing_key=vapid_private_key,
         vapid_subject=vapid_subject,
     )
     init_runtime(
