@@ -15,6 +15,8 @@ import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 
 // Start tracing before any request fires so fetch/XHR are patched in time

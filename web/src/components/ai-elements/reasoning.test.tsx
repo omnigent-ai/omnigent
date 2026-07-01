@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { Reasoning, ReasoningContent, ReasoningTrigger } from "./reasoning";
 
@@ -24,6 +24,21 @@ describe("Reasoning — auto-expand", () => {
 
     expect(document.querySelector('img[src^="https://attacker.example"]')).toBeNull();
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
+  });
+
+  it("renders explicit inline TeX delimiters inside reasoning content", async () => {
+    const { container } = render(
+      <Reasoning isStreaming={true}>
+        <ReasoningTrigger />
+        <ReasoningContent>{String.raw`Check \(\sqrt{x + 1}\).`}</ReasoningContent>
+      </Reasoning>,
+    );
+
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    const katex = container.querySelector(".katex") as HTMLElement;
+    expect(katex.querySelector(".sqrt")).not.toBeNull();
+    expect(katex.textContent).toContain("x");
+    expect(katex.textContent).toContain("1");
   });
 
   it("renders the trigger button in the open state when isStreaming=true on mount", () => {

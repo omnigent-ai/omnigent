@@ -2,12 +2,15 @@
 // to break by removing a case — neither the walker nor the
 // individual card tests catch that. Drive it directly here.
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { BlockRenderer } from "./BlockRenderer";
 
 afterEach(cleanup);
@@ -19,6 +22,16 @@ const FILE_VIEWER_NOOP = {
   workspaceRoot: null,
   workspaceHome: null,
 };
+
+const renderMarkdownText = (text: string) =>
+  render(
+    <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+      <BlockRenderer
+        items={[{ kind: "text", itemId: "t1", text, final: true }]}
+        sessionStatus="idle"
+      />
+    </FileViewerContext.Provider>,
+  );
 
 describe("BlockRenderer dispatch", () => {
   it("renders a slash_command RenderItem via SlashCommandCard", () => {
@@ -261,6 +274,104 @@ describe("BlockRenderer dispatch", () => {
     // (the count would still read 5, but the live tail would vanish).
     expect(screen.getByText(/tool_5/)).toBeDefined();
     expect(screen.queryByText(/tool_1/)).toBeNull();
+  });
+
+  describe("math rendering", () => {
+    it("normalizes explicit TeX delimiters outside code", () => {
+      expect(normalizeExplicitMathDelimiters(String.raw`中文 \(\sqrt{x}\) 文本`)).toBe(
+        String.raw`中文 $\sqrt{x}$ 文本`,
+      );
+      expect(normalizeExplicitMathDelimiters(String.raw`\[\sqrt{x}\]`)).toBe(
+        String.raw`$$\sqrt{x}$$`,
+      );
+      expect(normalizeExplicitMathDelimiters(String.raw`\`\(\sqrt{x}\)\``)).toBe(
+        String.raw`\`\(\sqrt{x}\)\``,
+      );
+      expect(
+        normalizeExplicitMathDelimiters(["```", String.raw`\(\sqrt{x}\)`, "```"].join("\n")),
+      ).toBe(["```", String.raw`\(\sqrt{x}\)`, "```"].join("\n"));
+    });
+
+    it("loads required Streamdown and KaTeX styles at the app entrypoint", () => {
+      // KaTeX's DOM is mostly positioned spans. Without its stylesheet, radicals
+      // and fractions can leave only the root bar/outer shell visible while the
+      // radicand appears missing. Keep this as a source-level guard because
+      // jsdom cannot catch visual CSS layout failures.
+      const entrypoints = ["src/main.tsx", "src/embed.tsx"].map((file) =>
+        readFileSync(path.join(process.cwd(), file), "utf8"),
+      );
+      const indexCss = readFileSync(path.join(process.cwd(), "src/index.css"), "utf8");
+
+      for (const source of entrypoints) {
+        expect(source).toContain('import "katex/dist/katex.min.css"');
+        expect(source).toContain('import "streamdown/styles.css"');
+      }
+      expect(indexCss).toContain('@source "../node_modules/streamdown/dist/*.js"');
+    });
+
+    it("renders radicals, fractions, and superscripts without dropping the radicand", async () => {
+      const { container } = renderMarkdownText(
+        String.raw`$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$`,
+      );
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+
+      expect(katex.querySelector(".mfrac")).not.toBeNull();
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.querySelector(".vlist")).not.toBeNull();
+      expect(katex.textContent).toContain("b");
+      expect(katex.textContent).toContain("2");
+      expect(katex.textContent).toContain("4");
+      expect(katex.textContent).toContain("a");
+      expect(katex.textContent).toContain("c");
+    });
+
+    it("renders multi-term square roots used by distance formulas", async () => {
+      const { container } = renderMarkdownText(
+        String.raw`$$d = \sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$$`,
+      );
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.textContent).toContain("x");
+      expect(katex.textContent).toContain("y");
+      expect(katex.textContent).toContain("1");
+      expect(katex.textContent).toContain("2");
+    });
+
+    it("keeps invalid math visible instead of swallowing the message", async () => {
+      const { container } = renderMarkdownText(String.raw`$$\sqrt{$$`);
+
+      await waitFor(() => {
+        expect(container.textContent).toContain("\\sqrt");
+      });
+      expect(container.textContent).not.toBe("");
+    });
+
+    it("recovers from an incomplete streamed radical to the final KaTeX output", async () => {
+      const streamingItem = (text: string): RenderItem[] => [
+        { kind: "text", itemId: null, text, final: false },
+      ];
+      const renderStreamingMath = (text: string) => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={streamingItem(text)} sessionStatus="running" />
+        </FileViewerContext.Provider>
+      );
+
+      const { container, rerender } = render(renderStreamingMath(String.raw`$$\sqrt{`));
+      await waitFor(() => expect(container.textContent).toContain("\\sqrt"));
+
+      rerender(renderStreamingMath(String.raw`$$\sqrt{x + 1}$$`));
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.textContent).toContain("x");
+      expect(katex.textContent).toContain("1");
+    });
   });
 
   // Proves the markdown throttle is actually wired into the render path (not

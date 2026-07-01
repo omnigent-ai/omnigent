@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -98,6 +98,18 @@ describe("UserBubble markdown rendering", () => {
     // table would render as literal pipe text with no <table>/<td>.
     const cell = await screen.findByText("1", { selector: "td, td *" });
     expect(cell.closest("table")).not.toBeNull();
+  });
+
+  it("renders CJK text around explicit inline math", async () => {
+    const { container } = renderBubble(userBubble(String.raw`中文 \(\sqrt{x + 1}\) 文本`));
+
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    expect(container.textContent).toContain("中文");
+    expect(container.textContent).toContain("文本");
+    const katex = container.querySelector(".katex") as HTMLElement;
+    expect(katex.querySelector(".sqrt")).not.toBeNull();
+    expect(katex.textContent).toContain("x");
+    expect(katex.textContent).toContain("1");
   });
 });
 
