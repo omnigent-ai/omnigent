@@ -238,6 +238,28 @@ class SbxSandboxLauncher(SandboxLauncher):
                 f"{result.stderr.strip() or result.stdout.strip()}"
             )
 
+    def wheel_install_command(self, remote_tgz_path: str) -> str:
+        """
+        Full dependency install of the shipped wheels into the user site.
+
+        Unlike the prebaked-host-image launchers, sbx's default image has
+        no baked omnigent, so this installs WITH dependencies (no
+        ``--no-deps`` / ``--force-reinstall``). ``--user`` lands the
+        install where the bootstrap's PATH-persistence step adds to PATH
+        (``$HOME/.local/bin``). ``--break-system-packages`` tolerates a
+        PEP-668 externally-managed base python (drop it if the discovery
+        task showed PEP 668 is not in force).
+
+        :param remote_tgz_path: Sandbox path of the shipped tarball.
+        :returns: Shell command string for :meth:`run`.
+        """
+        return (
+            "cd /tmp && rm -rf oa-wheels && mkdir oa-wheels && "
+            f"tar xzf {remote_tgz_path} -C oa-wheels --warning=no-unknown-keyword && "
+            "pip install --user --break-system-packages "
+            "--no-warn-script-location oa-wheels/*.whl"
+        )
+
     def _resolve_template(self) -> str | None:
         """Resolve the create image: constructor wins, then env var."""
         return self._template or os.environ.get(TEMPLATE_ENV_VAR) or None

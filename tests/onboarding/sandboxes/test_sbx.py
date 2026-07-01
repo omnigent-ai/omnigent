@@ -264,3 +264,20 @@ def test_put_wraps_failure(fake_sbx: _FakeSbx) -> None:
     fake_sbx.responses["cp"] = _FakeCompleted(args=[], returncode=1, stderr="no such sandbox")
     with pytest.raises(click.ClickException, match="no such sandbox"):
         SbxSandboxLauncher().put("box", Path("/tmp/x"), "/tmp/x")
+
+
+# ── wheel_install_command ───────────────────────────────────
+
+
+def test_wheel_install_is_full_install(fake_sbx: _FakeSbx) -> None:
+    """
+    The default sbx image has no baked omnigent, so the install is a
+    FULL dependency install into the user site — NOT the host-image
+    overlay (no --no-deps / --force-reinstall).
+    """
+    cmd = SbxSandboxLauncher().wheel_install_command("/tmp/oa-wheels.tgz")
+    assert "tar xzf /tmp/oa-wheels.tgz" in cmd
+    assert "pip install" in cmd
+    assert "--user" in cmd
+    assert "--no-deps" not in cmd
+    assert "--force-reinstall" not in cmd
