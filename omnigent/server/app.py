@@ -182,6 +182,10 @@ def _register_web_mimetypes() -> None:
         (".map", "application/json"),
         (".wasm", "application/wasm"),
         (".svg", "image/svg+xml"),
+        # Python's mimetypes DB has no ``.webmanifest`` entry, so without this
+        # Starlette serves the PWA manifest as ``application/octet-stream`` and
+        # browsers silently refuse to install the app.
+        (".webmanifest", "application/manifest+json"),
     ):
         mimetypes.add_type(ctype, ext)
 
@@ -2428,6 +2432,11 @@ def _apply_web_ui_cache_headers(response: Response, path: str) -> Response:
     media_type = content_type.partition(";")[0].lower() if content_type is not None else None
     if path.startswith("assets/"):
         response.headers["Cache-Control"] = _WEB_UI_ASSET_CACHE_CONTROL
+    elif path in {"sw.js", "version.json"}:
+        # The service worker and the version sentinel it precaches must
+        # revalidate on every load, or the HTTP cache could mask a deploy for up
+        # to an hour and defeat prompt-to-reload.
+        response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     elif media_type == "text/html" or path in {"", ".", "index.html"}:
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     else:
