@@ -62,6 +62,8 @@ describe("shouldShowModelPicker", () => {
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "opencode-native-ui" } })).toBe(
       true,
     );
+    // kiro applies the picked model as --model at launch (no in-session mirror).
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(true);
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
@@ -101,6 +103,14 @@ describe("shouldShowEffortPicker", () => {
     // WHY: opencode surfaces its live model read-only (switching stays in the
     // opencode TUI); there is no Web UI effort dial for it.
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "opencode-native-ui" } })).toBe(
+      false,
+    );
+  });
+
+  it("hides effort controls for kiro-native (model selection only)", () => {
+    // WHY: kiro exposes only launch-time --model selection; its --effort knob is
+    // not surfaced in the Web UI (deferred), so no effort dial.
+    expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(
       false,
     );
   });

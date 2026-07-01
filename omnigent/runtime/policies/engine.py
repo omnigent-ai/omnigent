@@ -234,6 +234,60 @@ class PolicyEngine:
         read_only: bool = False,
     ) -> PolicyResult:
         """
+        Evaluate the composed policy decision, recording a span.
+
+        Thin tracing wrapper over :meth:`_evaluate_composed`. Opens a
+        ``policy.evaluate`` span tagged with the phase, resolved tool
+        name, and read-only flag, then records the resulting decision
+        (and reason / deciding policies on a non-ALLOW). This is the one
+        in-process policy choke point — every enforcement site routes
+        through it — so the span makes policy decisions visible inline
+        in the request trace.
+
+        :param ctx: The current evaluation context
+            (phase + content + resolved tool_name).
+        :param read_only: When ``True``, skip persistent side effects;
+            see :meth:`_evaluate_composed`.
+        :returns: The composed :class:`PolicyResult`.
+        """
+        from omnigent.runtime import telemetry
+
+        with telemetry.span(
+            "policy.evaluate",
+            attributes={
+                "policy.phase": getattr(ctx.phase, "name", str(ctx.phase)),
+                "policy.tool_name": ctx.tool_name or "",
+                "policy.read_only": read_only,
+            },
+        ) as evaluate_span:
+            if self._conversation_id:
+                evaluate_span.set_attribute("session.id", self._conversation_id)
+            # The content under evaluation (tool args / prompt) is recorded
+            # only when content capture is on (redacted + capped).
+            telemetry.record_message_payload(
+                {"content": ctx.content},
+                span=evaluate_span,
+                key="policy.content",
+            )
+            result = await self._evaluate_composed(ctx, read_only=read_only)
+            evaluate_span.set_attribute(
+                "policy.decision",
+                getattr(result.action, "name", str(result.action)),
+            )
+            if result.reason:
+                evaluate_span.set_attribute("policy.reason", result.reason)
+            deciding = getattr(result, "deciding_policies", None)
+            if deciding:
+                evaluate_span.set_attribute("policy.deciding_policies", list(deciding))
+            return result
+
+    async def _evaluate_composed(
+        self,
+        ctx: EvaluationContext,
+        *,
+        read_only: bool = False,
+    ) -> PolicyResult:
+        """
         Evaluate the composed policy decision for one phase.
 
         Runs the pipeline from POLICIES.md §4:
@@ -490,6 +544,7 @@ class PolicyEngine:
             return
         from omnigent.policies.schema import (
             SESSION_COST_ASK_APPROVED_STATE_KEY,
+            SESSION_COST_UNPRICED_APPROVED_KEY,
             USER_DAILY_ASK_APPROVED_STATE_KEY,
         )
 
@@ -505,7 +560,7 @@ class PolicyEngine:
             if op.key == USER_DAILY_ASK_APPROVED_STATE_KEY:
                 self._record_user_daily_ask_approved(op.value)
             elif (
-                op.key == SESSION_COST_ASK_APPROVED_STATE_KEY
+                op.key in (SESSION_COST_ASK_APPROVED_STATE_KEY, SESSION_COST_UNPRICED_APPROVED_KEY)
                 and self._root_conversation_id != self._conversation_id
             ):
                 self._record_root_cost_ask_approved(op)

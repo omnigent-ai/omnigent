@@ -45,7 +45,11 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    is_native_harness,
+    native_terminal_name,
+)
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -553,6 +557,7 @@ class _KiroNativeLaunchConfig:
     workspace: Path
     terminal_launch_args: list[str] | None
     external_session_id: str | None
+    model_override: str | None = None
 
 
 def _required_runner_env(name: str) -> str:
@@ -668,12 +673,23 @@ async def _kiro_native_launch_config(
         not isinstance(external_session_id, str) or not external_session_id.strip()
     ):
         raise RuntimeError(f"Invalid external_session_id for Kiro session {session_id!r}.")
+    model_override = snapshot.get("model_override")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override:
+            raise RuntimeError(f"Invalid model_override for Kiro session {session_id!r}.")
+        try:
+            model_override = validate_model_override(model_override)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for Kiro session {session_id!r}: {exc}"
+            ) from exc
     return _KiroNativeLaunchConfig(
         workspace=_kiro_session_workspace(session_workspace),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id.strip()
         if isinstance(external_session_id, str)
         else None,
+        model_override=model_override if isinstance(model_override, str) else None,
     )
 
 
@@ -2689,6 +2705,7 @@ async def _auto_create_kiro_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """Auto-create the Kiro TUI terminal for a kiro-native session."""
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -2697,6 +2714,7 @@ async def _auto_create_kiro_terminal(
         KIRO_NATIVE_ENV_UNSET,
         build_kiro_native_terminal_env,
         prepare_bridge_dir,
+        write_kiro_workspace_mcp_config,
     )
 
     launch_config = await _kiro_native_launch_config(
@@ -2708,9 +2726,16 @@ async def _auto_create_kiro_terminal(
         raise RuntimeError(f"Kiro workspace does not exist for session {session_id!r}.")
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
+    # Declare the Omnigent MCP server in the workspace-scoped kiro config so
+    # kiro-cli can call Omnigent tools. Only when the tool relay will actually
+    # start (server_client + ensure_comment_relay present), else serve-mcp would
+    # launch with no relay to route calls back to. Mirrors cursor-native.
+    if server_client is not None and ensure_comment_relay is not None:
+        write_kiro_workspace_mcp_config(workspace_path, bridge_dir)
     kiro_launch = build_kiro_launch(
         launch_config.terminal_launch_args or [],
         resume_id=launch_config.external_session_id,
+        model=launch_config.model_override,
     )
     launch_epoch_ms = int(time.time() * 1000)
     terminal_view = await resource_registry.launch_required_terminal(
@@ -2753,6 +2778,17 @@ async def _auto_create_kiro_terminal(
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    # Start the Omnigent builtin-tool relay (writes tool_relay.json into the kiro
+    # bridge dir) so the serve-mcp server declared in the workspace mcp.json can
+    # route Omnigent tool calls back through the session's policy/elicitation
+    # gate. Mirrors cursor-native.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
 
     from omnigent.kiro_native_permissions import supervise_kiro_permission_mirror
     from omnigent.kiro_native_session_forwarder import supervise_kiro_session_forwarder
@@ -3273,9 +3309,9 @@ async def _auto_create_kimi_terminal(
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
     # the workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
 
-    _runner_headers = databricks_auth_headers(server_url, _auth_token)
+    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -3636,9 +3672,11 @@ async def _auto_create_codex_terminal(
     # The codex policy hook subprocess replays these static headers from its
     # config (no refresh-capable auth of its own); the helper pairs the bearer
     # with the workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
 
-    policy_headers = databricks_auth_headers(launch_config.policy_server_url, _policy_auth_token)
+    policy_headers = databricks_request_headers(
+        launch_config.policy_server_url, bearer_token=_policy_auth_token
+    )
 
     app_server = build_codex_native_server(
         socket_path=socket_path,
@@ -4104,7 +4142,10 @@ async def _auto_create_antigravity_terminal(
     from omnigent.antigravity_native_bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
         AntigravityNativeBridgeState,
+        agy_gemini_dir,
+        agy_home_dir,
         clear_bridge_state,
+        ensure_agy_feedback_survey_disabled,
         ensure_agy_onboarding_complete,
         prepare_bridge_dir,
         seed_isolated_agy_home,
@@ -4198,19 +4239,33 @@ async def _auto_create_antigravity_terminal(
     # Wire the Omnigent MCP relay so the wrapped agy gets the sys_* tools
     # (spawn sub-agent sessions, drive Omnigent terminals, list agents/models,
     # sys_os_*) — the only native harness that otherwise lacks them (#1194).
-    # agy has no --mcp-config flag and ignores ANTIGRAVITY_* env knobs; it loads
-    # MCP servers ONLY from the HOME-global ~/.gemini/config/mcp_config.json. To
-    # avoid clobbering the user's interactive agy config (and the concurrency
-    # footgun of a single shared file), launch agy under a per-session ISOLATED
-    # HOME seeded with a copy of the user's OAuth token + onboarding state and a
-    # bridge-scoped mcp_config.json. The relay subprocess is the same shared
-    # ``serve-mcp`` claude/codex/cursor use. Offloaded to a thread (file I/O) and
-    # done BEFORE the terminal launch so agy sees the config on its first MCP scan.
+    # agy has no --mcp-config flag and ignores ANTIGRAVITY_* env knobs. It does
+    # accept the hidden --gemini_dir flag, so keep the process HOME real for auth
+    # providers such as macOS Keychain, but point agy's config/state root at a
+    # per-session isolated Gemini dir. This avoids clobbering the user's
+    # interactive ~/.gemini/config/mcp_config.json and avoids the concurrency
+    # footgun of one shared bridge-specific config file. The relay subprocess is
+    # the same shared ``serve-mcp`` claude/codex/cursor use. Offloaded to a thread
+    # (file I/O) and done BEFORE terminal launch so agy sees the config on its
+    # first MCP scan.
     await asyncio.to_thread(write_mcp_config, bridge_dir)
     env_overrides = {
         **env_overrides,
-        **await asyncio.to_thread(seed_isolated_agy_home, bridge_dir),
+        **await asyncio.to_thread(
+            seed_isolated_agy_home,
+            bridge_dir,
+            trusted_workspace=workspace,
+        ),
     }
+    # agy's periodic feedback survey shares its "esc to cancel" footer with the
+    # running-turn marker, so a web turn injected while it is up is misread as an
+    # active turn and lost (#1494). Disable it before launch. agy now runs under
+    # the real HOME with an isolated --gemini_dir, so the survey setting must be
+    # written into that isolated dir (ensure_agy_feedback_survey_disabled appends
+    # /.gemini/antigravity-cli/settings.json to its arg), NOT the user's real
+    # HOME — env_overrides no longer carries a HOME key.
+    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
     # Start the shared comment/sys_* relay against THIS session's bridge dir before
     # launch so its tool_relay.json is on disk when agy first scans the MCP server.
     # ``await_notify=False``: agy starts its MCP client lazily, so awaiting the
@@ -5360,9 +5415,9 @@ async def _auto_create_claude_terminal(
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable auth of its own); the helper pairs the bearer with the
     # workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
 
-    _runner_headers = databricks_auth_headers(server_url, _auth_token)
+    _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_launcher import resolve_claude_launch
@@ -7669,6 +7724,21 @@ def get_session_agent_id(session_id: str) -> str | None:
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 
 
+class _BodyRequest:
+    """Minimal stand-in for a Starlette ``Request`` exposing only ``json()``.
+
+    Lets internal callers reuse a route handler that consumes the request
+    solely for its JSON body (e.g. ``create_session_terminal``) without
+    constructing a real ASGI ``Request``. Not a general Request substitute.
+    """
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    async def json(self) -> dict[str, Any]:
+        return self._body
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -7716,6 +7786,13 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+
+    # Instrument the runner ASGI app so HTTP requests tunneled in from
+    # the server (whose headers are forwarded verbatim) continue the
+    # caller's trace instead of starting a new one.
+    from omnigent.runtime import telemetry
+
+    telemetry.instrument_fastapi_app(app)
 
     # Runner-side auth middleware.
     if auth_token is not None:
@@ -7829,6 +7906,14 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Turn sequencing (SESSION_REARCHITECTURE Step 5 / SESSION_STEERING_MIGRATION Step 1)
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
+    # Latest working status per session ("running"/"idle"/...), mirrored from
+    # every session.status edge at the _publish_event chokepoint (so it covers the
+    # PTY watcher's roles AND codex/antigravity/opencode, whose edges are published
+    # directly). The native-pane idle reaper (#1349) reads this as its "currently
+    # working" signal: native turns clear _active_turns right after the prompt is
+    # pasted, so for a long autonomous turn this status is the only reliable
+    # in-memory liveness signal.
+    _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     # Per-conversation message-ingest ordering (RUNNER_MESSAGE_INGEST.md
     # Part A). Each inbound ``message`` event takes a monotonic arrival
@@ -7920,6 +8005,18 @@ def create_runner_app(
             queue = asyncio.Queue()
             _session_event_queues[session_id] = queue
         queue.put_nowait(event)
+        # Mirror the latest session.status edge so the native-pane idle reaper
+        # (#1349) can tell a pane working autonomously ("running") from an idle
+        # one. This is the single chokepoint every session.status publish flows
+        # through, so it covers BOTH the PTY watcher's roles (via
+        # _publish_session_status) AND codex/antigravity/opencode, whose
+        # running/idle edges are published here directly rather than by the PTY
+        # watcher. Recorded for every session (SDK too); the reaper only consults
+        # it for native panes.
+        if event.get("type") == "session.status":
+            _status_value = event.get("status")
+            if isinstance(_status_value, str):
+                _native_pane_status[session_id] = _status_value
         # Mirror a child sub-agent's status / preview deltas onto the
         # PARENT's stream. No-op for non-child sessions. Single chokepoint
         # so every session.status publish is covered.
@@ -8156,6 +8253,8 @@ def create_runner_app(
             ``"conv_abc123"``.
         :param status: New working status, ``"running"`` or ``"idle"``.
         """
+        # (The native-pane reaper's status mirror is recorded centrally in
+        # _publish_event, which this routes through — see #1349.)
         _publish_event(
             session_id,
             {"type": "session.status", "status": status},
@@ -9129,6 +9228,7 @@ def create_runner_app(
                             resource_registry,
                             _publish_event,
                             server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -9661,6 +9761,7 @@ def create_runner_app(
                 await turn_task
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
+        _native_pane_status.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -11586,6 +11687,57 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_kiro_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        """
+        Switch a running kiro-native session's model via its TUI ``/model``.
+
+        kiro-cli's ``--model`` is baked in at spawn (see
+        ``_auto_create_kiro_terminal``), so a live web-UI / REPL ``/model`` switch
+        can't be applied by re-reading the persisted ``model_override`` —
+        ``inject_model_command`` types ``/model <id>`` into the tmux pane, which
+        kiro applies directly (confirmed by its ``Model changed to <id>`` line).
+        Mirrors ``_handle_cursor_native_model_change``.
+
+        Skipped silently when *model* is ``None`` or blank — kiro has no slash
+        form for "use the spawn default", so a clear only takes effect on the
+        next spawn.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param model: New persisted kiro model id, e.g. ``"claude-haiku-4.5"``;
+            ``None`` when the user cleared the override.
+        :returns: 204 on success or skip; 503 if the tmux pane isn't advertised
+            yet (best-effort — the persisted value applies on the next spawn).
+        """
+        from omnigent.kiro_native_bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            # Short pane-readiness timeout: a missing tmux.json means the pane
+            # isn't attached; the persisted model still applies on the next spawn.
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=model.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         """
         Type ``/compact`` into Claude's tmux pane.
@@ -12096,6 +12248,10 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        # Mint a fresh AP-routing snapshot rather than letting the popup read
+        # this bridge's permission_hook.json, whose launch token goes stale at
+        # ~1h and would 401 the verdict POST (silently losing the approval).
+        config_file = await _native_cost_popup_config_file(conv_id, "claude-native")
         try:
             # Short timeout: missing tmux.json means the pane isn't
             # attached, so there is no client to render the modal — the
@@ -12108,6 +12264,7 @@ def create_runner_app(
                 message=message,
                 policy_name=policy_name,
                 timeout_s=1.0,
+                config_file=config_file,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
@@ -12133,9 +12290,10 @@ def create_runner_app(
         a ``tmux.json`` (its terminal is launched through the resource
         registry), so the pane's socket/target come from the registry
         instance — the same source the web-terminal attach uses — and AP
-        routing comes from this bridge's ``policy_hook.json``. Resolution
-        differs; the actual popup launch is the shared, harness-agnostic
-        :func:`omnigent.native_cost_popup.launch_cost_popup`.
+        routing comes from a freshly-minted snapshot (see
+        :func:`_native_cost_popup_config_file`) rather than the stale launch
+        token. Resolution differs; the actual popup launch is the shared,
+        harness-agnostic :func:`omnigent.native_cost_popup.launch_cost_popup`.
 
         Best-effort: skips (204) when no live codex terminal is registered
         for the session, so the web ApprovalCard remains the surface.
@@ -12150,7 +12308,6 @@ def create_runner_app(
         :returns: 204 once the popup is dispatched (or skipped when no
             terminal is registered). 503 if launching raised.
         """
-        from omnigent.codex_native_bridge import _POLICY_HOOK_FILE, bridge_dir_for_bridge_id
         from omnigent.native_cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
@@ -12158,7 +12315,10 @@ def create_runner_app(
         if instance is None or not instance.running:
             # No live codex terminal to render on; web card is the surface.
             return Response(status_code=204)
-        config_file = bridge_dir_for_bridge_id(conv_id) / _POLICY_HOOK_FILE
+        # Mint a fresh AP-routing snapshot rather than reading this bridge's
+        # policy_hook.json, whose launch token goes stale at ~1h and would 401
+        # the verdict POST (silently losing the approval).
+        config_file = await _native_cost_popup_config_file(conv_id, "codex-native")
         try:
             await asyncio.to_thread(
                 launch_cost_popup,
@@ -12289,47 +12449,55 @@ def create_runner_app(
 
     async def _native_cost_popup_config_file(conv_id: str, harness: str) -> Path:
         """
-        Resolve the AP-routing config file the cost popup reads, per harness.
+        Mint the AP-routing config the cost popup reads, per harness.
 
-        The popup script reads ``ap_server_url`` + ``ap_auth_headers`` from
-        this file: ``permission_hook.json`` in the claude-native bridge dir,
-        ``policy_hook.json`` in the codex-native bridge dir. opencode-native
-        has no permission/policy hook of its own (it gates via the SSE
-        forwarder), so there is no such file at rest — write a fresh snapshot
-        here (the only consumer is this popup).
+        The popup subprocess reads ``ap_server_url`` + ``ap_auth_headers``
+        from this file and replays the static headers when POSTing its
+        verdict. claude/codex used to point it at their long-lived
+        ``permission_hook.json`` / ``policy_hook.json`` — but those carry the
+        one-shot launch token, which dies with the ~1h Databricks OAuth
+        lifetime, so a cost gate firing late in a session would 401 the
+        verdict and silently lose the approval. Mint a fresh bearer here (the
+        popup launches right after) and pair it with the workspace-routing
+        header — bearer alone misroutes the POST to the account — for every
+        harness uniformly.
 
         :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
         :param harness: ``"claude-native"``, ``"codex-native"``, or
             ``"opencode-native"``.
-        :returns: Path to the harness's AP-routing config file.
+        :returns: Path to the freshly-written popup config file.
         """
+        from omnigent.cli_auth import databricks_request_headers
+        from omnigent.opencode_native_bridge import write_cost_popup_config
+        from omnigent.runner._entry import _make_auth_token_factory
+
         if harness == "claude-native":
             from omnigent import claude_native_bridge as _cnb
 
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client, session_id=conv_id
             )
-            return _cnb.bridge_dir_for_bridge_id(bridge_id) / _cnb._PERMISSION_HOOK_FILE
-        if harness == "opencode-native":
+            bridge_dir = _cnb.bridge_dir_for_bridge_id(bridge_id)
+        elif harness == "opencode-native":
             from omnigent.opencode_native_bridge import (
                 bridge_dir_for_bridge_id as _oc_bridge_dir,
             )
-            from omnigent.opencode_native_bridge import (
-                write_cost_popup_config,
-            )
-            from omnigent.runner._entry import _make_auth_token_factory
 
-            _factory = _make_auth_token_factory()
-            _token = _factory() if _factory is not None else None
-            return await asyncio.to_thread(
-                write_cost_popup_config,
-                _oc_bridge_dir(conv_id),
-                ap_server_url=_required_runner_env("RUNNER_SERVER_URL"),
-                ap_auth_headers={"Authorization": f"Bearer {_token}"} if _token else {},
-            )
-        from omnigent import codex_native_bridge as _cxb
+            bridge_dir = _oc_bridge_dir(conv_id)
+        else:  # codex-native
+            from omnigent import codex_native_bridge as _cxb
 
-        return _cxb.bridge_dir_for_bridge_id(conv_id) / _cxb._POLICY_HOOK_FILE
+            bridge_dir = _cxb.bridge_dir_for_bridge_id(conv_id)
+
+        _server_url = _required_runner_env("RUNNER_SERVER_URL")
+        _factory = _make_auth_token_factory()
+        _token = _factory() if _factory is not None else None
+        return await asyncio.to_thread(
+            write_cost_popup_config,
+            bridge_dir,
+            ap_server_url=_server_url,
+            ap_auth_headers=databricks_request_headers(_server_url, bearer_token=_token),
+        )
 
     async def _repop_pending_cost_popup_on_attach(
         conv_id: str,
@@ -12446,6 +12614,13 @@ def create_runner_app(
         _active_turns.pop(conv_id, None)
         # Turn ended: clear the live marker so a concurrent forward is skipped.
         _live_response_id.pop(conv_id, None)
+        # Mirror the clear onto the process manager's in-flight map so the
+        # idle reaper can reap the (now genuinely idle) entry once its idle
+        # window elapses. Reached on every terminal path, so a dropped or
+        # late terminal SSE event can't strand a permanently-marked entry
+        # (which would never be reaped — the inverse of #1414, cf. #1349).
+        if process_manager is not None:
+            process_manager.clear_in_flight(conv_id)
         # Skip the idle transient when a buffered message will start a
         # continuation turn immediately — `_check_and_start_next_turn`
         # publishes "running" microseconds later, and the in-between idle
@@ -13593,6 +13768,14 @@ def create_runner_app(
             and name not in _spec_names
         )
 
+        # Self-heal (#1349): the native-pane idle reaper may have reclaimed this
+        # conversation's pane while it sat idle. The native forward below assumes
+        # a live pane, so re-create it first when missing — otherwise a turn that
+        # arrives without a client handshake (sub-agent / API forward) injects
+        # into a dead tmux target and the message is lost. No-op for SDK harnesses
+        # and when the pane is already live; resumes via the vendor ``--resume``.
+        await _ensure_native_terminal_for_turn(conv, harness_name)
+
         # Fallback for native sessions whose terminal was launched
         # outside the runner terminal route (e.g. tests, UI-launched
         # terminals): make sure the comment-tool relay is running before the
@@ -14103,6 +14286,13 @@ def create_runner_app(
                                         _resp_to_conv[_response_id] = conv_id
                                         # Mark the turn live for the forward gate.
                                         _live_response_id[conv_id] = _response_id
+                                        # Register the live turn with the process
+                                        # manager so its idle reaper skips this
+                                        # conversation while it is streaming (and
+                                        # forward_cancel can resolve the harness
+                                        # response id). Cleared in
+                                        # _on_proxy_stream_end. See issue #1414.
+                                        process_manager.mark_in_flight(conv_id, _response_id)
 
                                 # Defer publish for action_required
                                 # events that the runner dispatches
@@ -14284,6 +14474,39 @@ def create_runner_app(
                                         ) = await _resolve_turn_spec_lazy()
                                         if _lazy_err is not None:
                                             _err_type, _err_msg = _lazy_err
+                                            # Finalize the turn like the two
+                                            # sibling spec-error early-returns
+                                            # above (eager-error, non-200): a
+                                            # bare return here exits the
+                                            # generator cleanly, so without this
+                                            # no _on_proxy_stream_end runs and
+                                            # the turn's terminal bookkeeping
+                                            # (status publish + clearing the
+                                            # live/in-flight markers) is skipped,
+                                            # stranding the idle-reaper guard
+                                            # (#1414/#1349). Reachable on a
+                                            # transient resolver failure: the
+                                            # setup-phase resolution fails (so
+                                            # _session_spec_cache stays empty)
+                                            # but the harness resolution
+                                            # succeeds (so the turn streams),
+                                            # then this lazy dispatch resolution
+                                            # fails again.
+                                            _fail = {
+                                                "type": "response.failed",
+                                                "error": {
+                                                    "message": _err_msg,
+                                                    "type": _err_type,
+                                                },
+                                            }
+                                            _publish_event(conv_id, _fail)
+                                            _on_proxy_stream_end(
+                                                conv_id,
+                                                error={
+                                                    "message": _err_msg,
+                                                    "type": _err_type,
+                                                },
+                                            )
                                             yield _response_failed_event(
                                                 {"message": _err_msg, "type": _err_type}
                                             )
@@ -14931,7 +15154,13 @@ def create_runner_app(
             # update. Other harnesses pick up the persisted value on the
             # next turn and 204 here.
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native", "cursor-native", "opencode-native"):
+            if harness in (
+                "claude-native",
+                "codex-native",
+                "cursor-native",
+                "opencode-native",
+                "kiro-native",
+            ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -14955,6 +15184,11 @@ def create_runner_app(
                     )
                 if harness == "opencode-native":
                     return await _handle_opencode_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "kiro-native":
+                    return await _handle_kiro_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -15689,6 +15923,7 @@ def create_runner_app(
                         resource_registry,
                         _publish_event,
                         server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -16014,6 +16249,65 @@ def create_runner_app(
             status_code=200,
             content=session_resource_view_to_dict(resource_view),
         )
+
+    async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
+        """Re-create a reaped native pane before forwarding a turn (#1349 self-heal).
+
+        The native-pane idle reaper may reclaim an idle pane while a session sits
+        between turns. ``NativeServerHarness.run_turn`` forwards into the live
+        pane and assumes it exists, so a turn arriving WITHOUT a client handshake
+        (a sub-agent or API forward to a long-idle session) would otherwise inject
+        into a dead tmux target and lose the message. This re-ensures the pane
+        first. Idempotent: a no-op when the harness is not a native CLI harness or
+        the pane is already live. Reuses ``create_session_terminal``'s
+        ``ensure_native_terminal`` path, so the pane resumes via the vendor CLI's
+        own ``--resume`` (no fresh-start, no lost history).
+
+        Detection relies on the reaper POPPING the registry entry when it reaps
+        (``registry.close()`` -> ``get()`` returns ``None``) — exactly the
+        reaped-pane window this targets. The membership check stays cheap and
+        in-memory on purpose: no per-turn tmux probe, and it doesn't perturb the
+        normal native turn path (a registered pane short-circuits). A
+        crashed-but-registered pane (tmux killed externally without ``close()``)
+        is out of scope here. Every native short-name this can target has a
+        matching ``ensure_native_terminal`` branch in ``create_session_terminal``
+        (kept in lockstep with ``harness_aliases.NATIVE_HARNESSES``).
+        """
+        terminal_name = native_terminal_name(harness_name)
+        if terminal_name is None:
+            return
+        terminal_registry = resource_registry.terminal_registry if resource_registry else None
+        if terminal_registry is None:
+            return
+        if terminal_registry.get(conv_id, terminal_name, "main") is not None:
+            return  # a pane is still registered — nothing to heal
+        _logger.info(
+            "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
+            conv_id,
+            harness_name,
+        )
+        try:
+            resp = await create_session_terminal(
+                conv_id,
+                _BodyRequest(
+                    {
+                        "terminal": terminal_name,
+                        "session_key": "main",
+                        "ensure_native_terminal": True,
+                    }
+                ),
+            )
+        except Exception:
+            _logger.exception("native pane self-heal failed for conv=%s", conv_id)
+            return
+        status = getattr(resp, "status_code", 200)
+        if status >= 400:
+            _logger.warning(
+                "native pane self-heal returned status %s for conv=%s (%s)",
+                status,
+                conv_id,
+                terminal_name,
+            )
 
     @app.get("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
     async def get_session_terminal(
@@ -16507,17 +16801,29 @@ def create_runner_app(
             e.g. ``"default"``.
         :returns: JSON list of changed file entries with ``status`` field.
         """
+        from omnigent.runtime.filesystem_registry import GitStatusUnavailable
+
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
-        raw_changes = (
-            session_registry.list_changed_files(
-                session_id,
-                limit=10_000,
+        try:
+            raw_changes = (
+                session_registry.list_changed_files(
+                    session_id,
+                    limit=10_000,
+                )
+                if session_registry is not None
+                else []
             )
-            if session_registry is not None
-            else []
-        )
+        except GitStatusUnavailable as exc:
+            # The working-tree read itself failed (e.g. `git status` timed out
+            # on a huge repo, or exited non-zero). Surface it as an error so
+            # the UI shows a failure state instead of an empty list that is
+            # indistinguishable from a genuinely clean tree.
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": "git_status_failed", "message": exc.reason}},
+            )
         data = [
             {
                 "object": "session.environment.filesystem.entry",
@@ -16597,11 +16903,23 @@ def create_runner_app(
             )
 
         # Check the file is tracked in the changed-files registry.
-        record = (
-            session_registry.get_changed_file(session_id, relative_path)
-            if session_registry is not None
-            else None
-        )
+        from omnigent.runtime.filesystem_registry import GitStatusUnavailable
+
+        try:
+            record = (
+                session_registry.get_changed_file(session_id, relative_path)
+                if session_registry is not None
+                else None
+            )
+        except GitStatusUnavailable as exc:
+            # The working-tree read itself failed (timeout / spawn error /
+            # non-zero exit). Surface it like the /changes endpoint does,
+            # rather than letting a swallowed failure masquerade as a 404
+            # "not in the changed-files registry".
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"code": "git_status_failed", "message": exc.reason}},
+            )
         if record is None:
             return JSONResponse(
                 status_code=404,
@@ -18233,6 +18551,83 @@ def create_runner_app(
 
     # Expose catch-up scan so _entry.py can wire it as on_reconnect.
     app.state.catch_up_scan = _catch_up_scan
+
+    # Native-pane idle reaper (#1349): reclaim idle native CLI panes
+    # (claude/codex/... + their MCP fleets), which — unlike the SDK harness
+    # proxies the process manager reaps — would otherwise be held for the whole
+    # conversation lifetime and OOM a shared runner. Started/stopped by the runner
+    # lifespan (_entry.py). ``app.state.native_pane_reaper`` is ``None`` for the
+    # registry-less lightweight app factory and minimal test doubles
+    # (``getattr`` + ``native_panes`` capability check, not a bare access, so the
+    # ``_CapturingResourceRegistry`` / ``_TrackingTerminalRegistry`` doubles
+    # don't break app construction — they just get no reaper).
+    _pane_reaper_registry = getattr(resource_registry, "terminal_registry", None)
+    if (
+        resource_registry is not None
+        and _pane_reaper_registry is not None
+        and hasattr(_pane_reaper_registry, "native_panes")
+    ):
+        # NB: do NOT import terminal_resource_id locally here — it is a
+        # module-level import (top of file) used by handlers defined far above
+        # (e.g. create_session_terminal). A function-local ``from ... import``
+        # would rebind it as a create_runner_app local for the WHOLE function,
+        # leaving those earlier uses unbound on any path where this branch does
+        # not run (registry-less app factory / test doubles) → NameError.
+        from omnigent.native_cost_popup import _list_tmux_clients
+        from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+        from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
+
+        def _native_panes_for_reaper() -> list[PaneRef]:
+            panes: list[PaneRef] = []
+            for conv_id, name, socket_path in _pane_reaper_registry.native_panes():
+                terminal_id = terminal_resource_id(name, "main")
+                # Role gate (not just the name match native_panes does): only a
+                # terminal whose resource ROLE is a native harness is reapable, so
+                # a user terminal that merely shares a harness name is never
+                # reclaimed.
+                if is_native_harness(
+                    resource_registry.terminal_resource_role(conv_id, terminal_id)
+                ):
+                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
+            return panes
+
+        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+            conv_id = pane.conversation_id
+            if conv_id in _active_turns or (
+                process_manager is not None and process_manager.has_active_turn(conv_id)
+            ):
+                return True
+            # The vendor CLI working autonomously between runner turns (native
+            # turns clear _active_turns right after the prompt is pasted).
+            if _native_pane_status.get(conv_id) == "running":
+                return True
+            # A human attached to the pane. The tmux probe is a blocking
+            # subprocess, so run it off the event loop.
+            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
+            return bool(clients)
+
+        async def _reap_native_pane(pane: PaneRef) -> None:
+            # Pane-scoped teardown: close ONLY this native terminal (its MCP
+            # children die by parent-death), leaving the conversation's other
+            # terminals + primary OSEnv intact. The next message re-creates it and
+            # the vendor CLI resumes via --resume.
+            try:
+                await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
+            finally:
+                _publish_terminal_deleted_event(
+                    conversation_id=pane.conversation_id,
+                    terminal_name=pane.terminal_name,
+                    session_key="main",
+                    publish_event=_publish_event,
+                )
+
+        app.state.native_pane_reaper = NativePaneReaper(
+            list_native_panes=_native_panes_for_reaper,
+            is_busy=_native_pane_is_busy,
+            reap=_reap_native_pane,
+        )
+    else:
+        app.state.native_pane_reaper = None
 
     return app
 

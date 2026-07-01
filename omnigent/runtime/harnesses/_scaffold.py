@@ -50,6 +50,7 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -867,6 +868,12 @@ class HarnessApp:
             be served by ``omnigent.runtime.harnesses._runner``.
         """
         app = FastAPI(title="omnigent-harness", lifespan=self._lifespan)
+        # Instrument the harness ASGI app so HTTP calls from the runner
+        # (over the per-conversation Unix socket) continue the caller's
+        # trace rather than rooting a fresh one.
+        from omnigent.runtime import telemetry
+
+        telemetry.instrument_fastapi_app(app)
         # FastAPI / Starlette types add_exception_handler narrowly
         # (Callable[[Request, Exception], ...]) — the OmnigentError
         # subclass annotation is what we actually want at runtime, but
@@ -1483,10 +1490,26 @@ class HarnessApp:
                     ctx.response_id,
                     idle_timeout,
                 )
+                # A native forwarder that can't reach the server (e.g.
+                # ``No route to host``) starves the turn of progress events, so
+                # the idle watchdog — not the connectivity error — is what fails
+                # the turn. If such a POST failure was recorded recently, attach
+                # it so the user sees the real cause rather than a generic
+                # "wedged LLM" reason (issue #1119). The window is twice the
+                # idle timeout: the failure that began the stall is already
+                # ~idle_timeout old when the watchdog fires, so a window equal
+                # to the stall would race past it; 2x captures it while still
+                # ignoring a long-resolved earlier blip.
+                forwarder_failure = native_forwarder_health.recent_post_failure(idle_timeout * 2)
+                cause = (
+                    f"likely a wedged LLM or tool call; "
+                    f"recent forwarder POST failure ({forwarder_failure})"
+                    if forwarder_failure is not None
+                    else "likely a wedged LLM or tool call"
+                )
                 raise RuntimeError(
                     f"turn exceeded the {idle_timeout:.0f}s harness idle watchdog "
-                    f"(run_turn emitted no events for {idle_timeout:.0f}s; "
-                    f"likely a wedged LLM or tool call)"
+                    f"(run_turn emitted no events for {idle_timeout:.0f}s; {cause})"
                 ) from exc
             if absolute_wd.expired():
                 _logger.warning(

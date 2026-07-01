@@ -1,6 +1,6 @@
 """Tests for the server-side intelligent model routing module.
 
-Covers tier inference, the RoutingClient protocol, the default
+Covers model inference, the RoutingClient protocol, the default
 LLMRoutingClient, and the public ``route_turn`` entry point.
 """
 
@@ -14,11 +14,10 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.server.smart_routing import (
-    _VALID_TIERS,
     LLMRoutingClient,
     RoutingResult,
     _build_rubric,
-    infer_tiers,
+    infer_models,
     route_turn,
 )
 
@@ -63,67 +62,66 @@ class _FakeRoutingClient:
     def __init__(self, result: RoutingResult | None) -> None:
         self._result = result
 
-    async def route(
-        self,
-        message: str,
-        available_tiers: dict[str, list[str]],
-    ) -> RoutingResult | None:
+    async def route(self, message: str, available_models: list[str]) -> RoutingResult | None:
+        del message, available_models
         return self._result
 
 
-# ── infer_tiers ─────────────────────────────────────────────────────
+# ── infer_models ────────────────────────────────────────────────────
 
 
-def test_infer_tiers_claude_sdk() -> None:
-    """claude-sdk maps to the claude tier template."""
-    tiers = infer_tiers("claude-sdk")
-    assert tiers is not None
-    assert "cheap" in tiers
-    assert "medium" in tiers
-    assert "expensive" in tiers
-    assert any("haiku" in m for m in tiers["cheap"])
-    assert any("opus" in m for m in tiers["expensive"])
+def test_infer_models_claude_sdk() -> None:
+    """claude-sdk returns the claude model list."""
+    models = infer_models("claude-sdk")
+    assert models is not None
+    assert any("haiku" in m for m in models)
+    assert any("opus" in m for m in models)
+    # Ordered cheapest → most powerful
+    haiku_idx = next(i for i, m in enumerate(models) if "haiku" in m)
+    opus_idx = next(i for i, m in enumerate(models) if "opus" in m)
+    assert haiku_idx < opus_idx
 
 
-def test_infer_tiers_native_harnesses() -> None:
-    assert infer_tiers("claude-native") is not None
-    assert infer_tiers("codex-native") is not None
+def test_infer_models_native_harnesses() -> None:
+    assert infer_models("claude-native") is not None
+    assert infer_models("codex-native") is not None
 
 
-def test_infer_tiers_codex() -> None:
-    """codex maps to the gpt tier template."""
-    tiers = infer_tiers("codex")
-    assert tiers is not None
-    assert any("gpt" in m for m in tiers["cheap"])
-    assert any("gpt-5-5" in m for m in tiers["expensive"])
+def test_infer_models_codex() -> None:
+    models = infer_models("codex")
+    assert models is not None
+    assert any("gpt" in m for m in models)
 
 
-def test_infer_tiers_openai_agents() -> None:
-    tiers = infer_tiers("openai-agents")
-    assert tiers is not None
+def test_infer_models_openai_agents() -> None:
+    assert infer_models("openai-agents") is not None
 
 
-def test_infer_tiers_unknown_harness() -> None:
-    """Unknown harnesses return None (not routable)."""
-    assert infer_tiers("cursor") is None
-    assert infer_tiers("antigravity") is None
-    assert infer_tiers(None) is None
+def test_infer_models_pi() -> None:
+    """pi is multi-model — both Claude and GPT."""
+    models = infer_models("pi")
+    assert models is not None
+    assert any("haiku" in m for m in models)
+    assert any("gpt" in m for m in models)
+
+
+def test_infer_models_unknown_harness() -> None:
+    assert infer_models("cursor") is None
+    assert infer_models("antigravity") is None
+    assert infer_models(None) is None
 
 
 # ── _build_rubric ───────────────────────────────────────────────────
 
 
-def test_build_rubric_includes_all_tiers() -> None:
-    tiers = {
-        "cheap": ["m-cheap"],
-        "medium": ["m-mid"],
-        "expensive": ["m-exp"],
-    }
-    rubric = _build_rubric(tiers)
-    assert "m-cheap" in rubric
-    assert "m-mid" in rubric
-    assert "m-exp" in rubric
+def test_build_rubric_includes_all_models() -> None:
+    models = ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"]
+    rubric = _build_rubric(models)
+    assert "databricks-claude-haiku-4-5" in rubric
+    assert "databricks-claude-opus-4-8" in rubric
     assert "strict JSON" in rubric
+    # Naming conventions are explained
+    assert "haiku" in rubric and "opus" in rubric
 
 
 # ── LLMRoutingClient ───────────────────────────────────────────────
@@ -132,67 +130,50 @@ def test_build_rubric_includes_all_tiers() -> None:
 @pytest.mark.asyncio
 async def test_llm_routing_client_returns_result() -> None:
     verdict = {
-        "tier": "expensive",
         "model": "databricks-claude-opus-4-8",
         "rationale": "hard refactor",
     }
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    tiers = infer_tiers("claude-sdk")
-    assert tiers is not None
-    result = await client.route("refactor auth", tiers)
+    models = infer_models("claude-sdk")
+    assert models is not None
+    result = await client.route("refactor auth", models)
     assert result is not None
     assert result.model == "databricks-claude-opus-4-8"
-    assert result.tier == "expensive"
     assert result.rationale == "hard refactor"
+    assert not hasattr(result, "tier")
 
 
 @pytest.mark.asyncio
 async def test_llm_routing_client_clamps_hallucinated_model() -> None:
-    verdict = {
-        "tier": "expensive",
-        "model": "hallucinated-model",
-        "rationale": "hard",
-    }
+    verdict = {"model": "hallucinated-model", "rationale": "hard"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    tiers = infer_tiers("claude-sdk")
-    assert tiers is not None
-    result = await client.route("hard task", tiers)
+    models = infer_models("claude-sdk")
+    assert models is not None
+    result = await client.route("hard task", models)
     assert result is not None
-    assert result.model == "databricks-claude-opus-4-8"
-
-
-@pytest.mark.asyncio
-async def test_llm_routing_client_rejects_unknown_tier() -> None:
-    verdict = {"tier": "gigantic", "model": "m", "rationale": "x"}
-    client = LLMRoutingClient(_FakeLLMClient(verdict))
-    tiers = infer_tiers("claude-sdk")
-    assert tiers is not None
-    result = await client.route("hello", tiers)
-    assert result is None
+    assert result.model == models[0]  # clamped to cheapest
 
 
 @pytest.mark.asyncio
 async def test_llm_routing_client_rejects_empty_model() -> None:
-    verdict = {"tier": "cheap", "model": "", "rationale": "x"}
+    verdict = {"model": "", "rationale": "x"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    tiers = infer_tiers("claude-sdk")
-    assert tiers is not None
-    result = await client.route("hello", tiers)
+    models = infer_models("claude-sdk")
+    assert models is not None
+    result = await client.route("hello", models)
     assert result is None
 
 
 @pytest.mark.asyncio
 async def test_llm_routing_client_returns_none_on_error() -> None:
-    """LLM errors produce None (fail-open)."""
-
     class _BrokenLLM:
         async def create(self, **kwargs: Any) -> None:
             raise TypeError("boom")
 
     client = LLMRoutingClient(_BrokenLLM())
-    tiers = infer_tiers("claude-sdk")
-    assert tiers is not None
-    result = await client.route("hello", tiers)
+    models = infer_models("claude-sdk")
+    assert models is not None
+    result = await client.route("hello", models)
     assert result is None
 
 
@@ -208,7 +189,6 @@ class _FakeCaps:
 async def test_route_turn_uses_caps_routing_client() -> None:
     expected = RoutingResult(
         model="databricks-claude-haiku-4-5",
-        tier="cheap",
         rationale="trivial",
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
@@ -219,7 +199,7 @@ async def test_route_turn_uses_caps_routing_client() -> None:
         model, v = await route_turn("claude-sdk", "hello")
     assert model == "databricks-claude-haiku-4-5"
     assert v is not None
-    assert v["tier"] == "cheap"
+    assert "tier" not in v
 
 
 @pytest.mark.asyncio
@@ -238,7 +218,3 @@ async def test_route_turn_unknown_harness() -> None:
     model, _v = await route_turn("cursor", "hello")
     assert model is None
     assert _v is None
-
-
-def test_valid_tiers_constant() -> None:
-    assert frozenset({"cheap", "medium", "expensive"}) == _VALID_TIERS

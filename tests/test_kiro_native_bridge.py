@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -484,3 +486,94 @@ def test_kill_session_kills_target(
     bridge.kill_session(tmp_path)
 
     assert calls == [("kill-session", "-t", "t")]
+
+
+def test_write_mcp_bridge_config_writes_token_idempotently(tmp_path: Path) -> None:
+    """serve-mcp's bridge.json gets a token; a second call keeps the same one."""
+    bridge_dir = tmp_path / "bridge"
+    bridge.write_mcp_bridge_config(bridge_dir)
+    config_path = bridge_dir / "bridge.json"
+    first = json.loads(config_path.read_text())
+    assert isinstance(first.get("token"), str) and first["token"]
+
+    bridge.write_mcp_bridge_config(bridge_dir)
+
+    assert json.loads(config_path.read_text())["token"] == first["token"]
+
+
+def test_build_kiro_mcp_config_targets_serve_mcp(tmp_path: Path) -> None:
+    """The mcp.json entry runs the shared serve-mcp against the bridge dir."""
+    bridge_dir = tmp_path / "bridge"
+    server = bridge.build_kiro_mcp_config(bridge_dir, python_executable="/usr/bin/python3")[
+        "mcpServers"
+    ]["omnigent"]
+    assert server["command"] == "/usr/bin/python3"
+    assert server["args"] == [
+        "-I",
+        "-m",
+        "omnigent.claude_native_bridge",
+        "serve-mcp",
+        "--bridge-dir",
+        str(bridge_dir),
+    ]
+    # Defaults to the running interpreter when no executable is given.
+    default_cmd = bridge.build_kiro_mcp_config(bridge_dir)["mcpServers"]["omnigent"]["command"]
+    assert default_cmd == sys.executable
+
+
+def test_write_kiro_workspace_mcp_config_merges_preserving_user_servers(tmp_path: Path) -> None:
+    """The Omnigent server is merged into <workspace>/.kiro/settings/mcp.json
+    without clobbering a user's pre-existing workspace servers."""
+    workspace = tmp_path / "repo"
+    settings = workspace / ".kiro" / "settings"
+    settings.mkdir(parents=True)
+    (settings / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"user_server": {"command": "x", "args": []}}}),
+        encoding="utf-8",
+    )
+    bridge_dir = tmp_path / "bridge"
+
+    path = bridge.write_kiro_workspace_mcp_config(workspace, bridge_dir)
+
+    assert path == workspace / ".kiro" / "settings" / "mcp.json"
+    written = json.loads(path.read_text())
+    assert set(written["mcpServers"]) == {"user_server", "omnigent"}
+    assert "serve-mcp" in written["mcpServers"]["omnigent"]["args"]
+    # serve-mcp's token file is written alongside.
+    assert (bridge_dir / "bridge.json").exists()
+
+
+def test_inject_model_command_switches_and_confirms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/model <id>`` is typed literally and confirmed via kiro's success line."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_TYPE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    marker_pane = "Model changed to claude-haiku-4.5 (saved as default)\n" + _READY_PANE
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_READY_PANE, marker_pane])
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    bridge.inject_model_command(bridge_dir, model="claude-haiku-4.5", timeout_s=0.1)
+
+    sent = [call[-1] for call in calls if "send-keys" in call]
+    # Clear the draft (C-a/C-k), send the literal slash command, then Enter.
+    assert sent == ["C-a", "C-k", "/model claude-haiku-4.5", "Enter"]
+
+
+def test_inject_model_command_raises_when_switch_not_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing ``Model changed to <id>`` line fails loudly (bad/unavailable id)."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_TYPE_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_MODEL_CONFIRM_TIMEOUT_S", 0.05)
+    bridge_dir = tmp_path / "bridge"
+    # Pane stays at the input prompt and never shows the confirmation line.
+    _install_fake_tmux(monkeypatch, pane_outputs=[_READY_PANE])
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    with pytest.raises(RuntimeError, match="did not confirm the model switch"):
+        bridge.inject_model_command(bridge_dir, model="bogus-model", timeout_s=0.1)

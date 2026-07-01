@@ -133,13 +133,20 @@ class ClaudeNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
+        from omnigent.runtime import telemetry
+
+        # Span the tmux send-keys inject — the input half of the decoupled
+        # native path. session.id is applied generically by the span processor
+        # (the executor adapter binds session_scope for the turn), so there's
+        # no per-call-site stamping here.
         try:
-            async with self._inject_lock:
-                await asyncio.to_thread(
-                    inject_user_message,
-                    self._bridge_dir,
-                    content=text,
-                )
+            with telemetry.span("claude_native.inject"):
+                async with self._inject_lock:
+                    await asyncio.to_thread(
+                        inject_user_message,
+                        self._bridge_dir,
+                        content=text,
+                    )
         except RuntimeError as exc:
             yield ExecutorError(message=str(exc))
             return

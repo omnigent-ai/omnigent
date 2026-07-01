@@ -326,6 +326,44 @@ async def test_release_terminates_subprocess(
         await manager.shutdown()
 
 
+async def test_close_entry_kills_process_when_aclose_raises(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ``client.aclose()`` must not skip the subprocess kill.
+
+    ``_close_entry`` used to ``await client.aclose()`` first with no guard, so a
+    raise there (a broken transport, a wedged client) skipped the SIGTERM/SIGKILL
+    below and the subprocess leaked un-killed — and untracked, since ``release``
+    already popped the entry. Force ``aclose()`` to raise and assert the process
+    is still terminated (and ``release`` itself doesn't raise, since teardown is
+    now best-effort).
+    """
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        entry = manager._entries["conv_a"]
+
+        async def _boom() -> None:
+            raise RuntimeError("simulated aclose failure")
+
+        monkeypatch.setattr(entry.client, "aclose", _boom)
+
+        # release() -> _close_entry(): the aclose failure must not prevent the
+        # kill, and best-effort teardown means release itself completes.
+        await manager.release("conv_a")
+        assert "conv_a" not in manager._entries
+
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid), "subprocess survived a teardown where aclose() raised"
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_respawns_after_crash(
     manager: HarnessProcessManager,
 ) -> None:
@@ -515,6 +553,148 @@ async def test_idle_reaper_releases_stale_entries(
         # isn't acting on stale entries — both regressions in
         # the contract.
         assert not socket_path.exists()
+    finally:
+        await fast.shutdown()
+
+
+async def test_idle_reaper_survives_release_error(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``release`` failure during reaping must not kill the reaper loop.
+
+    ``_idle_reaper_loop`` awaits ``self.release(conv_id)`` for each stale
+    entry with no guard around it. ``release`` -> ``_close_entry`` awaits
+    ``client.aclose()`` and ``process.wait()``, any of which can raise
+    (broken transport, dead process, ``ProcessLookupError``). An unguarded
+    raise propagates out of the ``while True`` loop and the reaper task
+    exits permanently — and silently, since nothing awaits the dead task —
+    so the AP instance never reclaims another idle subprocess for the rest
+    of its lifetime (FD / memory / socket leak).
+
+    Inject a one-shot ``release`` failure on the first reaper-triggered
+    call and assert the loop keeps going: the still-stale entry is reaped
+    on a later pass. Before the fix the socket never disappears (the loop
+    died); after it, a subsequent pass reclaims it.
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=2.0,
+        reaper_interval_s=0.1,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+
+        # Make the first reaper-triggered release raise, then defer to the
+        # real release on later calls — a transient teardown failure.
+        real_release = fast.release
+        calls = {"n": 0}
+
+        async def flaky_release(conversation_id: str) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated close failure")
+            await real_release(conversation_id)
+
+        monkeypatch.setattr(fast, "release", flaky_release)
+
+        # Across many reaper passes: with the bug the first raise kills the
+        # loop and the socket lingers; with the guard a later pass reaps it.
+        for _ in range(60):
+            if not socket_path.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert calls["n"] >= 1, "reaper never attempted to release the stale entry"
+        assert not socket_path.exists(), (
+            "reaper died on the first release error and never reclaimed the "
+            "stale subprocess on a later pass"
+        )
+    finally:
+        await fast.shutdown()
+
+
+async def test_idle_reaper_skips_in_flight_turn(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+) -> None:
+    """A conversation with a live harness turn is never reaped mid-flight.
+
+    Regression test for #1414. ``last_used_at`` is stamped once per turn at
+    ``get_client``, so a turn that runs longer than ``idle_timeout_s`` looks
+    "idle" to the reaper. The only guard against killing it —
+    ``conv_id in _in_flight_response_ids`` — had no writers and was always
+    empty, so long turns were ``SIGTERM``'d mid-stream. ``mark_in_flight`` /
+    ``clear_in_flight`` populate that guard (the runner calls them from
+    ``proxy_stream`` on ``response.created`` and from ``_on_proxy_stream_end``).
+
+    Marks a turn in-flight, holds it well past the 2 s idle window across many
+    reaper passes, and asserts the subprocess survives; then clears the marker
+    and asserts the now-genuinely-idle entry is reaped (so the fix doesn't
+    leak entries that never get reclaimed — the inverse failure, cf. #1349).
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=2.0,
+        reaper_interval_s=0.1,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+        # Mark the turn live, as the runner does on ``response.created``.
+        fast.mark_in_flight("conv_a", "resp_x")
+        assert fast.has_active_turn("conv_a")
+        # Hold past the 2 s idle window across ~40 reaper passes (~4 s). An
+        # unguarded reaper would have reaped this stale-looking entry; the
+        # in-flight guard must keep the subprocess alive the whole time.
+        for _ in range(40):
+            await asyncio.sleep(0.1)
+            assert socket_path.exists(), "in-flight turn was reaped mid-flight"
+        # Turn ends: clear the marker (as ``_on_proxy_stream_end`` does). The
+        # entry is now genuinely idle and must become reapable.
+        fast.clear_in_flight("conv_a")
+        assert not fast.has_active_turn("conv_a")
+        for _ in range(60):
+            if not socket_path.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert not socket_path.exists()
+    finally:
+        await fast.shutdown()
+
+
+async def test_idle_reaper_disabled_when_timeout_zero(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+) -> None:
+    """A non-positive idle window disables reaping (``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``).
+
+    Regression: ``0`` must mean "never reap", not "reap everything". Without the
+    ``idle_timeout_s <= 0`` guard the reaper computes ``cutoff = now - 0 == now``,
+    and since every ``last_used_at`` is <= now it reaps every entry on the first
+    pass. The spawned entry must survive many fast reaper passes.
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=0.0,
+        reaper_interval_s=0.05,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+        # ~20 reaper passes at 0.05 s. With the bug the socket is gone almost
+        # immediately; with the guard it survives because reaping is disabled.
+        await asyncio.sleep(1.0)
+        assert socket_path.exists(), (
+            "idle_timeout_s=0 must DISABLE reaping, not reap every entry each pass"
+        )
     finally:
         await fast.shutdown()
 

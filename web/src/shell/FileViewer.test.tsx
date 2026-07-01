@@ -478,6 +478,31 @@ describe("FileViewer URL sync — diff param", () => {
       } as ReturnType<typeof useFileDiff>);
     }
   });
+
+  it("surfaces the server's reason instead of hanging on the loading state when the diff fetch fails", () => {
+    // On error, useFileDiff's `data` stays undefined — which would otherwise
+    // read as still-loading forever. The diff view must show the failure
+    // reason (e.g. a git_status_failed 500) so the read error is visible.
+    vi.mocked(useFileDiff).mockReturnValue({
+      data: undefined,
+      isError: true,
+      error: new Error("git status timed out after 5.0s"),
+    } as ReturnType<typeof useFileDiff>);
+    try {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      expect(screen.queryByText("Loading diff…")).toBeNull();
+      expect(
+        screen.getByText(/Failed to load:\s*git status timed out after 5\.0s/),
+      ).toBeInTheDocument();
+    } finally {
+      // Restore the default (payload present) so later tests render the diff.
+      vi.mocked(useFileDiff).mockReturnValue({
+        data: { before: "old", after: "new" },
+      } as ReturnType<typeof useFileDiff>);
+    }
+  });
 });
 
 describe("FileViewer URL sync — comment param", () => {

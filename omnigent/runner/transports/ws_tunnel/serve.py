@@ -534,10 +534,10 @@ async def _serve_tunnel_once(
     # Pair the bearer with the workspace-routing header: the handshake must
     # name the workspace or it routes to the account. Both empty for
     # single-workspace hosts / local unauthenticated runs.
-    from omnigent.cli_auth import databricks_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
-    headers.update(databricks_auth_headers(server_url, auth_token))
+    headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
     async with websockets.connect(

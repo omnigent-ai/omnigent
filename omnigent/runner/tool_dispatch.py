@@ -47,6 +47,7 @@ from omnigent.model_override import (
     normalize_model_for_provider,
     validate_model_override,
 )
+from omnigent.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -261,6 +262,10 @@ _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 # (RUNNER_TIMER_DISPATCH.md).
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 
+# Priority 5f.3: sys_advise_models — server-side via MCP intercept;
+# included in the tool surface only when smart routing is enabled.
+_ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
+
 # Priority 5h: Task lifecycle tools — runner-local sys_cancel_task.
 # The only cancellable task ids visible to the LLM are async dispatches
 # and sub-agent handles; observation happens through sys_read_inbox.
@@ -320,6 +325,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -450,6 +456,7 @@ _ALL_LOCAL_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
@@ -2933,7 +2940,12 @@ async def _session_get_info_via_rest(
             "status": snap.get("status"),
             "title": snap.get("title"),
             "agent_id": snap.get("agent_id"),
-            "agent_name": snap.get("agent_name"),
+            # Present the public agent name: a native-UI wrapper session
+            # (e.g. ``pi-native-ui``) reports its clean display name (``Pi``)
+            # so the internal ``-native-ui`` wrapper name never leaks to the
+            # model answering "what agent are you?". Non-wrapper names are
+            # unchanged.
+            "agent_name": public_agent_name(snap.get("agent_name")),
             "runner_id": snap.get("runner_id"),
             "runner_online": await _runner_online_or_none(snap.get("runner_id"), server_client),
             "host_id": snap.get("host_id"),
@@ -3617,7 +3629,11 @@ async def _collect_global_sessions(
     return [
         {
             "session_id": r.get("id"),
-            "agent_name": r.get("agent_name"),
+            # Hide the internal ``-native-ui`` wrapper name (e.g.
+            # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
+            # ``sys_session_get_info``. The server-side ``agent_name`` filter
+            # above still receives the caller's raw argument unchanged.
+            "agent_name": public_agent_name(r.get("agent_name")),
             "title": r.get("title"),
             "status": r.get("status"),
             "runner_id": r.get("runner_id"),

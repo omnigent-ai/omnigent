@@ -93,6 +93,7 @@ from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
     NativeCodingAgent,
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -213,6 +214,7 @@ from omnigent.server.schemas import (
     PaginatedList,
     PermissionObject,
     PolicySummary,
+    ReadStatePutRequest,
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
     ResponseObject,
@@ -529,6 +531,7 @@ _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
+_KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -834,6 +837,95 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 # Per-session status cache updated by the runner SSE relay.
 # Used by _get_session_snapshot.
 _session_status_cache: dict[str, str] = {}
+
+# Per-session background-shell tally (claude-native), kept in lockstep with
+# ``_session_status_cache`` so a snapshot/reload re-shows "N background tasks
+# still running" after the live SSE edge is gone. The authoritative source is
+# the ``Stop`` hook's ``background_tasks`` count: a positive count sets the
+# tally, an explicit ``0`` clears it (so a finished shell drops the indicator
+# at the next turn end), and a new turn (``running``) or a failure also clears
+# it. The trailing PTY-activity ``idle`` carries no count and must NOT clear it.
+#
+# KNOWN LIMITATION — the tally only refreshes at a turn boundary. Claude Code
+# emits no background-shell-completion hook, so a ``0`` is only ever posted by
+# the next ``Stop``. If a shell exits while the session is already idle and the
+# user never sends another message, no ``Stop`` fires and the indicator (chat,
+# sidebar, and reloads via ``_get_session_snapshot``) can read "N background
+# tasks still running" until the next turn. In practice the agent usually
+# narrates the shell's completion — which IS a turn, so its ``Stop`` clears the
+# tally — bounding the stale window to the next interaction. This mirrors the
+# TUI's own turn-boundary update of its "N shells still running" banner.
+# In-memory only — repopulates from live edges, exactly like the status cache.
+_session_background_task_count_cache: dict[str, int] = {}
+
+# Per-user read tracking, keyed by the user's discovery key (user id, or
+# the shared key in single-user mode) then by session id. Mirrors the two
+# values the web client used to keep in localStorage: a "last seen"
+# wall-clock baseline and an explicit "marked unread" override set.
+# In-memory only — like _session_status_cache it does NOT survive a server
+# restart. Unlike status (rederivable from the runner), read state has no
+# durable source, so a restart resets it; this is an accepted tradeoff for
+# keeping it server-side (shared across a user's devices while up) without
+# a DB. Entries are never pruned on session delete (bounded by churn,
+# wiped on restart).
+_read_last_seen: dict[str, dict[str, int]] = {}
+_read_explicit_unread: dict[str, set[str]] = {}
+
+
+def _read_state_entry(user_id: str | None, session_id: str) -> tuple[int | None, bool]:
+    """
+    Read the caller's read-state for one session, for embedding in the
+    per-user ``GET /v1/sessions`` list items.
+
+    :param user_id: Authenticated user id, or ``None`` in single-user mode.
+    :param session_id: Session/conversation identifier.
+    :returns: ``(last_seen, unread)`` — the wall-clock baseline (or ``None``
+        when the user has never seen the session) and the explicit-unread flag.
+    """
+    key = _discovery_key(user_id)
+    last_seen = _read_last_seen.get(key, {}).get(session_id)
+    unread = session_id in _read_explicit_unread.get(key, set())
+    return last_seen, unread
+
+
+def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread: bool) -> None:
+    """
+    Set the caller's read-state for one session.
+
+    :param user_id: Authenticated user id, or ``None`` in single-user mode.
+    :param session_id: Session/conversation identifier.
+    :param last_seen: Wall-clock baseline in seconds.
+    :param unread: Whether the session is explicitly flagged unread.
+    """
+    key = _discovery_key(user_id)
+    _read_last_seen.setdefault(key, {})[session_id] = last_seen
+    if unread:
+        _read_explicit_unread.setdefault(key, set()).add(session_id)
+    else:
+        unread_set = _read_explicit_unread.get(key)
+        if unread_set is not None:
+            unread_set.discard(session_id)
+
+
+def _prune_session_read_state(session_id: str) -> None:
+    """
+    Drop a session's read-state from every user's caches.
+
+    Called when a session leaves the default view for good — on delete, and
+    on archive (archived sessions are hidden and never show the unread dot).
+    This bounds the otherwise-monotonic ``_read_last_seen`` growth to live,
+    non-archived sessions. Read-state is a session-level removal (the session
+    is gone/archived for everyone), so it clears across all users. Unarchiving
+    does NOT restore the prior state — the session reads as seen, which is the
+    intended "done with it" semantics of archiving.
+
+    :param session_id: Session/conversation identifier.
+    """
+    for seen in _read_last_seen.values():
+        seen.pop(session_id, None)
+    for unread in _read_explicit_unread.values():
+        unread.discard(session_id)
+
 
 # Sessions whose current turn was Stopped: the relay drops the turn's trailing
 # response.* output (no forward, no persist). The fence lifts on the next
@@ -1862,6 +1954,12 @@ def _session_status_with_child_rollup(
     own_status = _session_status_from_cache(conversation_id)
     if own_status == "running":
         return "running"
+    # A claude-native session can settle to ``idle`` while background shells
+    # keep running; the sticky tally keeps the sidebar spinner lit, matching
+    # the in-chat "N background tasks still running" indicator. (``failed``
+    # clears the tally, so this never masks a failure.)
+    if own_status != "failed" and _session_background_task_count_cache.get(conversation_id, 0) > 0:
+        return "running"
     if any(
         _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
@@ -1972,6 +2070,10 @@ def _build_session_list_item(
     assert conv.agent_id is not None
     level = _permission_level_from_grants(user_id, grants, user_is_admin)
     owner = _owner_from_grants(grants) if permissions_enabled else None
+    # Per-viewer read tracking, embedded so the client hydrates the unread
+    # dots straight from the list (no separate fetch). Built per-user here —
+    # `user_id` is the requesting caller, never broadcast to other viewers.
+    viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -1995,6 +2097,8 @@ def _build_session_list_item(
         comments_updated_at=(
             comments_fingerprint.last_updated_at if comments_fingerprint else None
         ),
+        viewer_last_seen=viewer_last_seen,
+        viewer_unread=viewer_unread,
     )
 
 
@@ -2252,6 +2356,7 @@ def _build_session_response(
     items: list[ConversationItem],
     status: Literal["idle", "running", "waiting", "failed"],
     permission_level: int | None = None,
+    background_task_count: int | None = None,
     llm_model: str | None = None,
     context_window: int | None = None,
     last_total_tokens: int | None = None,
@@ -2277,6 +2382,10 @@ def _build_session_response(
         order, each a :class:`ConversationItem`.
     :param status: Derived session lifecycle status,
         e.g. ``"running"``.
+    :param background_task_count: Background shells still running as of the
+        last status edge (claude-native), so a reload re-shows "N shells
+        still running" even after the session settles to ``"idle"``. ``None``
+        when none are tracked.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -2353,6 +2462,7 @@ def _build_session_response(
         agent_id=conv.agent_id,
         agent_name=agent_name,
         status=status,
+        background_task_count=background_task_count,
         created_at=conv.created_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
@@ -2733,6 +2843,16 @@ def _record_daily_cost(
     from touching an absent ``user_daily_cost`` table is no longer needed
     now that the managed store backs it.)
 
+    Sub-agent conversations are created without a permission grant (the
+    internal runner POST carries no user context), so
+    ``get_session_owner(conv.id)`` returns ``None`` for them.  When
+    that happens, fall back to the spawn-tree root's owner: every
+    conversation carries ``root_conversation_id`` pointing to the
+    top-level session that *was* created with user context and therefore
+    always has an owner grant.  This ensures relay / SDK sub-agent spend
+    is attributed to the same user as the parent rather than silently
+    dropped from the daily rollup.
+
     :param conv: The conversation row for the session, or ``None``
         (a no-op — no owner to attribute to).
     :param delta_usd: The turn's cost in USD; ``<= 0`` is a no-op.
@@ -2742,6 +2862,10 @@ def _record_daily_cost(
     if conv is None or delta_usd <= 0:
         return
     owner = conversation_store.get_session_owner(conv.id)
+    if owner is None and conv.root_conversation_id != conv.id:
+        # Sub-agent: no direct owner grant — fall back to the root session's
+        # owner so sub-agent spend is attributed rather than silently dropped.
+        owner = conversation_store.get_session_owner(conv.root_conversation_id)
     if owner is None:
         return
     from omnigent.db.utils import now_epoch
@@ -2881,10 +3005,13 @@ def _accumulate_session_usage(
     Increment the session's cumulative token counters from a
     ``response.completed`` event's usage data.
 
-    Called synchronously from the relay loop. Reads the current
-    persisted ``session_usage``, adds the delta from the
-    response's ``usage`` field, and writes the updated totals
-    back. No-op when the response carries no usage data.
+    Called synchronously from the relay loop. Builds a usage delta from
+    the response's ``usage`` field and atomically applies it to the
+    persisted ``session_usage`` via a single database transaction
+    (``SELECT FOR UPDATE`` on PostgreSQL, SQLite's single-writer lock
+    otherwise). This prevents the read-modify-write race that caused
+    concurrent relay completions to silently drop each other's cost /
+    token deltas (#9). No-op when the response carries no usage data.
 
     Cost is computed when the model's per-token pricing is
     available from the MLflow catalog (looked up once per call
@@ -2920,20 +3047,10 @@ def _accumulate_session_usage(
     cache_read_input_tokens = usage_obj.get("cache_read_input_tokens", 0)
     cache_creation_input_tokens = usage_obj.get("cache_creation_input_tokens", 0)
 
-    # Load current cumulative usage from the store.
+    # Load conversation metadata for pricing only (NOT for reading session_usage —
+    # the atomic increment_session_usage call below handles that separately to
+    # avoid the read-modify-write race).
     conv = conversation_store.get_conversation(session_id)
-    current = dict(conv.session_usage) if conv else {}
-    current.setdefault("input_tokens", 0)
-    current.setdefault("output_tokens", 0)
-    current.setdefault("total_tokens", 0)
-    current.setdefault("cache_read_input_tokens", 0)
-    current.setdefault("cache_creation_input_tokens", 0)
-
-    current["input_tokens"] += input_tokens
-    current["output_tokens"] += output_tokens
-    current["total_tokens"] += total_tokens
-    current["cache_read_input_tokens"] += cache_read_input_tokens
-    current["cache_creation_input_tokens"] += cache_creation_input_tokens
 
     # Compute cost delta if pricing is available for the model. Resolve
     # the model to price with, most-specific first:
@@ -2948,6 +3065,7 @@ def _accumulate_session_usage(
     # created only on this priced branch, so an unpriced session never
     # gains a (misleading $0.00) cost key.
     cost_delta = 0.0
+    priced = False
     # Prefer an authoritative harness-reported cost over the catalog estimate.
     provider_cost = usage_obj.get("cost_usd")
     has_provider_cost = isinstance(provider_cost, (int, float))
@@ -2971,29 +3089,42 @@ def _accumulate_session_usage(
                 # token counts when the harness reports them; compute_llm_cost
                 # prices them at their own (cheaper read / pricier write) rates.
                 cost_delta = compute_llm_cost(usage_obj, pricing)
-        if priced:
-            current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + cost_delta
-        # Per-model attribution (ADD). Tokens are attributed whenever the
-        # model is known — including unpriced turns — so the per-model token
-        # view is complete; cost is attributed only when this model's turn
-        # was priced (passing ``None`` otherwise keeps the model's cost key
-        # absent, matching the flat "priced ⟺ key present" contract).
-        _add_model_usage_delta(
-            _model_usage_bucket(current, llm_model),
-            {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-            },
-            cost_delta if priced else None,
-        )
 
-    conversation_store.set_session_usage(session_id, current)
+    # Build the delta dict and atomically apply it to the persisted
+    # session_usage in a single DB transaction (SELECT FOR UPDATE on
+    # PostgreSQL; SQLite's exclusive write lock on SQLite). This is the fix
+    # for the read-modify-write race that caused concurrent completions to
+    # overwrite each other's deltas (#9).
+    delta: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+    }
+    if priced:
+        delta["total_cost_usd"] = cost_delta
+    if llm_model:
+        # Per-model attribution. Tokens are attributed whenever the model is
+        # known — including unpriced turns — so the per-model token view is
+        # complete; cost is attributed only when this model's turn was priced
+        # (keeping the model's cost key absent otherwise, matching the flat
+        # "priced ⟺ key present" contract).
+        model_delta: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+        }
+        if priced:
+            model_delta["total_cost_usd"] = cost_delta
+        delta["by_model"] = {llm_model: model_delta}
+
+    new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
-    return _priced_cost_for_display(current)
+    return _priced_cost_for_display(new_current)
 
 
 def _persist_native_cumulative_usage(
@@ -4558,6 +4689,42 @@ def _is_codex_native_subagent(conv: Conversation) -> bool:
     )
 
 
+def _subagent_delivery_status(
+    status: str,
+    background_task_count: int | None,
+    conv: Conversation,
+) -> str:
+    """Collapse a sub-agent's background-task ``waiting`` back to ``idle``.
+
+    A claude-native session running as an Omnigent sub-agent relabels its
+    ``Stop`` turn-end ``idle`` to ``waiting`` (in the forwarder) when
+    background shells linger, purely so its own UI shows a spinner. But the
+    sub-agent terminal-delivery branch in ``post_event`` keys off
+    ``idle``/``failed``: a ``waiting`` edge would never deliver the child's
+    result to the parent, hanging the orchestrator with no follow-up ``Stop``
+    to recover. The ``background_task_count`` alone already drives the child's
+    spinner at ``idle`` (the in-chat indicator and the sidebar rollup both
+    treat a positive tally as working), so for a sub-agent the turn genuinely
+    ended — deliver ``idle``. Top-level sessions are returned unchanged so the
+    web UI keeps its ``waiting`` shimmer.
+
+    :param status: The incoming external status, e.g. ``"waiting"``.
+    :param background_task_count: Parsed background-shell tally, or ``None``.
+    :param conv: The conversation the status is for.
+    :returns: ``"idle"`` for a non-codex sub-agent's background-task
+        ``waiting``; otherwise ``status`` unchanged.
+    """
+    if (
+        status == "waiting"
+        and background_task_count is not None
+        and background_task_count > 0
+        and conv.kind == "sub_agent"
+        and not _is_codex_native_subagent(conv)
+    ):
+        return "idle"
+    return status
+
+
 def _codex_subagent_labels_from_body(
     thread_id: str,
     body: SessionEventInput,
@@ -5180,6 +5347,7 @@ def _publish_status(
     status: str,
     error: ErrorDetail | None = None,
     response_id: str | None = None,
+    background_task_count: int | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5223,16 +5391,33 @@ def _publish_status(
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         return
     _session_status_cache[session_id] = status
+    # Keep the background-shell tally sticky alongside the status (see the
+    # cache's declaration). A ``Stop`` hook reports an authoritative count
+    # (``None`` is never sent by it): a positive count sets the tally, and
+    # an explicit ``0`` clears it so a finished background shell drops the
+    # indicator on the next turn end. ``None`` means "no information" (the
+    # trailing PTY-activity ``idle`` carries none) and must NOT wipe the
+    # count the Stop hook just published. A new turn or a failure clears it.
+    if background_task_count is not None:
+        if background_task_count > 0:
+            _session_background_task_count_cache[session_id] = background_task_count
+        else:
+            _session_background_task_count_cache.pop(session_id, None)
+    elif status in ("running", "failed"):
+        _session_background_task_count_cache.pop(session_id, None)
     event = SessionStatusEvent(
         type="session.status",
         conversation_id=session_id,
         status=status,  # type: ignore[arg-type]
         response_id=response_id,
         error=error,
+        background_task_count=background_task_count,
     )
     payload = event.model_dump()
     if response_id is None:
         payload.pop("response_id", None)
+    if background_task_count is None:
+        payload.pop("background_task_count", None)
     session_stream.publish(session_id, payload)
 
 
@@ -8295,38 +8480,6 @@ async def _emit_server_routing_decision(
         )
         persisted_id = None
 
-    # Persist the verdict as a session label so the AgentInfo popover's
-    # "Intelligent model router" section can read it (it uses
-    # parseCostRoutingVerdict which reads the cost_control.plan label).
-    try:
-        import datetime
-
-        from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL
-
-        label_value = json.dumps(
-            {
-                "version": 3,
-                "tier": item_data["tier"],
-                "model": model,
-                "applied": True,
-                "rationale": item_data["rationale"],
-                "turn_anchor": datetime.datetime.now(tz=datetime.UTC).isoformat(),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {COST_CONTROL_PLAN_LABEL: label_value},
-        )
-    except (OSError, ValueError):
-        _logger.warning(
-            "Server routing: failed to persist verdict label for session=%s",
-            session_id,
-            exc_info=True,
-        )
-
     # Publish live event so the web UI renders the chip immediately.
     session_stream.publish(
         session_id,
@@ -8486,11 +8639,20 @@ async def _forward_event_to_runner(
     # the entire session.  The verdict is persisted as model_override
     # on the conversation so subsequent turns reuse it without another
     # judge call.
-    if (
-        effective_runner_override is None
-        and conv.cost_control_mode_override == "on"
-        and body.type == "message"
-    ):
+    # Route if: toggle is on for this session (top-level), OR this is a
+    # sub-agent and its parent session has the toggle on.
+    _parent_routing_on = False
+    if conv.parent_conversation_id is not None:
+        _parent_conv = await asyncio.to_thread(
+            conversation_store.get_conversation, conv.parent_conversation_id
+        )
+        _parent_routing_on = (
+            _parent_conv is not None and _parent_conv.cost_control_mode_override == "on"
+        )
+    _routing_enabled = (
+        conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+    ) or _parent_routing_on
+    if effective_runner_override is None and _routing_enabled and body.type == "message":
         from omnigent.server.smart_routing import route_turn
 
         _harness = _resolve_harness(conv)
@@ -8698,7 +8860,19 @@ async def _dispatch_session_event_to_runner(
         # the toggle is on and no model_override is set, call the
         # judge and persist the chosen model on the conversation row.
         # The native CLI reads model_override from the session.
-        if conv.model_override is None and conv.cost_control_mode_override == "on":
+        _native_parent_routing_on = False
+        if conv.parent_conversation_id is not None:
+            _native_parent_conv = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+            _native_parent_routing_on = (
+                _native_parent_conv is not None
+                and _native_parent_conv.cost_control_mode_override == "on"
+            )
+        _native_routing_enabled = (
+            conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+        ) or _native_parent_routing_on
+        if conv.model_override is None and _native_routing_enabled:
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
@@ -11973,6 +12147,14 @@ async def _create_session_from_existing_agent(
                 reason="create-rollback",
             )
         raise
+
+    # The create request has no conv id in its URL, so the path-based
+    # FastAPI hook can't tag it — stamp the minted id so the create span
+    # joins the session's session.id group.
+    from omnigent.runtime import telemetry
+
+    telemetry.set_session_id(conv.id)
+
     if (
         model_override is not None
         or reasoning_effort is not None
@@ -12219,6 +12401,12 @@ def _persist_stored_session_bundle(
             agent_bundle_location,
         )
         raise
+
+    # The create request has no conv id in its URL; stamp the minted id so
+    # the create span joins the session's session.id group.
+    from omnigent.runtime import telemetry
+
+    telemetry.set_session_id(created.conversation.id)
     return CreatedSessionResponse(
         session_id=created.conversation.id,
         agent_id=agent_id,
@@ -12605,6 +12793,157 @@ async def _child_session_summaries_from_conversations(
 # These module-level functions implement the JSON-RPC 2.0 handlers for
 # ``POST /v1/sessions/{session_id}/mcp``.  They live outside the router
 # factory so the factory closure stays compact.
+
+
+def _mcp_tool_result(rpc_id: int | str | None, text: str) -> Response:
+    """
+    Wrap a plain-text tool result in a JSON-RPC 2.0 MCP ``tools/call`` response.
+
+    :param rpc_id: The JSON-RPC request id (may be int, str, or ``None``
+        for notifications), e.g. ``1``.
+    :param text: The tool output text to embed in the ``content`` block.
+    :returns: A :class:`Response` with ``Content-Type: application/json``
+        carrying the JSON-RPC 2.0 envelope with a single ``text`` content block.
+    """
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": rpc_id, "result": {"content": [{"type": "text", "text": text}]}}
+    )
+    return Response(content=body, media_type="application/json")
+
+
+async def _handle_advise_models_mcp(
+    rpc_id: int | str | None,
+    conv: Any,
+    arguments: dict[str, Any],
+    agent_store: Any,
+) -> Response:
+    """
+    Server-side handler for ``sys_advise_models`` MCP tool calls.
+
+    Intercepts the call before the runner forward because
+    ``RuntimeCaps.routing_client`` lives in the server process.
+
+    :param rpc_id: The JSON-RPC request id.
+    :param conv: The :class:`Conversation` for this session.
+    :param arguments: Parsed tool arguments from the LLM.
+    :param agent_store: Store for agent lookup (used to resolve sub-agent harnesses).
+    :returns: A JSON-RPC 2.0 ``tools/call`` result response.
+    """
+    tasks = arguments.get("tasks")
+    if not isinstance(tasks, list):
+        return _mcp_tool_result(
+            rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
+        )
+
+    caps = get_caps()
+    routing_client = caps.routing_client
+    if routing_client is None:
+        return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
+
+    from omnigent.model_catalog import spec_harness
+    from omnigent.server.smart_routing import infer_models
+
+    # Resolve the parent agent spec to look up sub-agent harnesses.
+    spec: Any | None = None
+    if conv.agent_id is not None:
+        agent_obj = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent_obj is not None:
+            try:
+                spec = (
+                    get_agent_cache()
+                    .load(
+                        agent_obj.id,
+                        agent_obj.bundle_location,
+                        expand_env=agent_obj.session_id is None,
+                    )
+                    .spec
+                )
+            except Exception:  # noqa: BLE001
+                _logger.debug(
+                    "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
+                )
+
+    _WORKER_HARNESS: dict[str, str] = {
+        "claude_code": "claude-sdk",
+        "codex": "codex",
+        "pi": "pi",
+    }
+
+    def _resolve_harness_for_worker(agent: str) -> str | None:
+        if spec is not None:
+            sub_agents = getattr(spec, "sub_agents", None) or []
+            for sub in sub_agents:
+                if getattr(sub, "name", None) == agent:
+                    h = spec_harness(sub)
+                    if h:
+                        return h
+                    break
+        return _WORKER_HARNESS.get(agent)
+
+    recommendations: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        title = task.get("title", "")
+        task_text = task.get("task", "")
+        agents_spec = task.get("agents")
+        if not isinstance(agents_spec, list) or not agents_spec:
+            continue
+
+        # Build a combined model list from all agent entries,
+        # preserving cheapest→powerful order. Map chosen model → agent.
+        model_to_agent: dict[str, str] = {}
+        combined_models: list[str] = []
+        for agent_entry in agents_spec:
+            if not isinstance(agent_entry, dict):
+                continue
+            agent = agent_entry.get("agent", "")
+            explicit_models: list[str] | None = agent_entry.get("models")
+            if explicit_models is not None and not isinstance(explicit_models, list):
+                explicit_models = None
+            if explicit_models:
+                candidates = explicit_models
+            else:
+                harness = _resolve_harness_for_worker(agent)
+                candidates = infer_models(harness) or []
+            for m in candidates:
+                if m not in model_to_agent:
+                    model_to_agent[m] = agent
+                    combined_models.append(m)
+
+        if not combined_models:
+            recommendations.append(
+                {"title": title, "agent": None, "model": None, "rationale": "no candidates"}
+            )
+            continue
+        try:
+            verdict = await routing_client.route(task_text, combined_models)
+        except Exception:  # routing failures must not crash the advisor
+            _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
+            verdict = None
+        if verdict is None:
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": None,
+                    "model": None,
+                    "rationale": "router returned no verdict",
+                }
+            )
+        else:
+            chosen_agent = model_to_agent.get(verdict.model)
+            recommendations.append(
+                {
+                    "title": title,
+                    "agent": chosen_agent,
+                    "model": verdict.model,
+                    "rationale": verdict.rationale,
+                }
+            )
+
+    return _mcp_tool_result(
+        rpc_id, json.dumps({"router_on": True, "recommendations": recommendations})
+    )
 
 
 def _mcp_ok_response(rpc_id: int | str | None, result: dict[str, Any]) -> Response:
@@ -13051,6 +13390,12 @@ async def _handle_mcp_tools_call(
         # PII-redacted args), use them instead of the originals.
         if call_result.data is not None:
             arguments = call_result.data
+
+    # ── Server-side sys_advise_models intercept ──────────────────────────
+    # After policy evaluation (DENY/ASK handled above); arguments may have
+    # been transformed. The advisor runs server-side where routing_client lives.
+    if namespaced_name in ("sys_advise_models", "mcp__omnigent__sys_advise_models"):
+        return await _handle_advise_models_mcp(rpc_id, conv, arguments, agent_store)
 
     # ── Execute on the runner via WS tunnel ──────────────────────────
     # The runner owns stdio subprocess spawning (correct machine, cwd,
@@ -13737,6 +14082,45 @@ def create_sessions_router(
             accessible_by=user_id,
         )
 
+    # ── PUT /sessions/{session_id}/read-state ─────────────────────
+    #
+    # The per-user read-state *write* path. The *read* path is the
+    # per-viewer ``viewer_last_seen`` / ``viewer_unread`` fields embedded in
+    # the ``GET /v1/sessions`` list items — no separate read endpoint.
+
+    @router.put(
+        "/sessions/{session_id}/read-state",
+        status_code=204,
+    )
+    async def put_read_state(
+        request: Request,
+        session_id: str,
+        body: ReadStatePutRequest,
+    ) -> Response:
+        """
+        Set the calling user's read-state for one session.
+
+        Requires ``LEVEL_READ`` on the session in multi-user mode — you can
+        only track read-state for sessions you can see. Stores the values
+        verbatim (the client enforces the baseline's monotonicity and the
+        unread semantics); the server does not interpret them against
+        session status. Returns ``204`` — the client already has the
+        optimistic state and re-reads the authoritative value on the next
+        ``GET /v1/sessions`` poll.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param body: The validated :class:`ReadStatePutRequest`.
+        :returns: An empty ``204 No Content`` response.
+        :raises OmnigentError: 403 if the caller lacks read access.
+        """
+        user_id = _require_user(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        _set_read_state(user_id, session_id, body.last_seen, body.unread)
+        return Response(status_code=204)
+
     # ── GET /sessions/{session_id} ───────────────────────────────
 
     @router.get(
@@ -14208,6 +14592,15 @@ def create_sessions_router(
                 ``{"type": "changed", "items": [...]}``. Sent as JSON text.
             """
             nonlocal last_send_monotonic
+            # Stamp the active trace context into the frame so a client
+            # with browser-side propagation can correlate sidebar updates
+            # to the trace that produced them. No-op when no span is
+            # active (idle heartbeats/snapshots), keeping the frame
+            # wire-identical in the common case.
+            from omnigent.runtime import telemetry
+
+            telemetry.record_message_payload(frame)
+            telemetry.inject_trace_context(frame)
             await websocket.send_text(json.dumps(frame))
             last_send_monotonic = time.monotonic()
 
@@ -14283,13 +14676,20 @@ def create_sessions_router(
                 # The watched set after capping — used to prune baselines for ids
                 # the client no longer watches (including any just truncated).
                 watched_set = set(deduped)
-                async with emit_lock:
-                    watched = deduped
-                    # Drop baselines for ids no longer watched so they
-                    # can't surface as spurious "removed" later.
-                    for stale in [cid for cid in last_sent if cid not in watched_set]:
-                        del last_sent[stale]
-                    await _emit_snapshot()
+                # Handle the watch under a span parented on any trace
+                # context the browser stamped into the frame, so the
+                # snapshot read (and its DB spans) nest under the
+                # client-originated trace.
+                from omnigent.runtime import telemetry
+
+                with telemetry.consume_frame_span("session_updates.watch", msg):
+                    async with emit_lock:
+                        watched = deduped
+                        # Drop baselines for ids no longer watched so they
+                        # can't surface as spurious "removed" later.
+                        for stale in [cid for cid in last_sent if cid not in watched_set]:
+                            del last_sent[stale]
+                        await _emit_snapshot()
 
         async def _ticker() -> None:
             """Emit deltas / heartbeats on a fixed interval."""
@@ -14671,6 +15071,11 @@ def create_sessions_router(
                 "Session not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        # Archiving hides the session from the default view (and its unread
+        # dot), so drop its per-user read-state to bound in-memory growth.
+        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
+        if body.archived is True:
+            _prune_session_read_state(session_id)
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries
         # (today: claude-native, whose ``claude`` binary has
@@ -18295,7 +18700,32 @@ def create_sessions_router(
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
-            _publish_status(session_id, status, status_error, response_id=response_id)
+            # ``None`` (field absent) = no information; leave the sticky
+            # tally untouched (the PTY-activity ``idle`` carries none). An
+            # explicit ``0`` from a ``Stop`` hook is authoritative and clears
+            # the tally, so a finished background shell drops the indicator.
+            raw_bg_count = body.data.get("background_task_count")
+            bg_count = (
+                raw_bg_count
+                if isinstance(raw_bg_count, int)
+                and not isinstance(raw_bg_count, bool)
+                and raw_bg_count >= 0
+                else None
+            )
+            # A sub-agent's background-task ``waiting`` must deliver as ``idle``
+            # so the parent's terminal-delivery branch below fires (otherwise
+            # the orchestrator hangs); the tally still drives the child spinner.
+            effective_status = _subagent_delivery_status(status, bg_count, conv)
+            if effective_status != status:
+                status = effective_status
+                body.data["status"] = status
+            _publish_status(
+                session_id,
+                status,
+                status_error,
+                response_id=response_id,
+                background_task_count=bg_count,
+            )
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
@@ -19049,6 +19479,10 @@ def create_sessions_router(
         # failed-launch session would leak one entry for the process
         # lifetime.
         _session_sandbox_status_cache.pop(session_id, None)
+        # Drop the deleted session's per-user read-state from every user's
+        # caches so they don't accumulate orphan entries for the process
+        # lifetime.
+        _prune_session_read_state(session_id)
         # Same for the tracker's entry — a deleted session's launch can
         # never be rendezvoused again (access checks 404 first), so a
         # retained failure is dead weight. ``finish`` also settles a
@@ -19858,6 +20292,10 @@ async def _fetch_model_options(
         from omnigent.cursor_native import cursor_base_model_options
 
         return cursor_base_model_options()
+    if wrapper == _KIRO_NATIVE_WRAPPER_LABEL_VALUE:
+        from omnigent.kiro_native import kiro_base_model_options
+
+        return kiro_base_model_options()
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         return []
@@ -20177,6 +20615,7 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
+        background_task_count=_session_background_task_count_cache.get(session_id),
         llm_model=llm_model,
         context_window=context_window,
         last_total_tokens=last_total_tokens,

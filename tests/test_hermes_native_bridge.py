@@ -284,13 +284,16 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     assert hermes_home == bridge_dir / "hermes_home"
     assert hermes_home.is_dir()
 
-    # Wrapper shell script exists and is executable.
+    # Wrapper shell script exists and is owner-only (it bakes a one-shot auth
+    # token, so the secret is never world-readable).
     wrapper = hermes_home / "omnigent-policy-hook.sh"
     assert wrapper.is_file()
-    assert wrapper.stat().st_mode & 0o111
+    assert wrapper.stat().st_mode & 0o777 == 0o700
     wrapper_text = wrapper.read_text()
-    assert "_OMNIGENT_SERVER_URL='http://localhost:6767'" in wrapper_text
-    assert "_OMNIGENT_SESSION_ID='session-123'" in wrapper_text
+    # Values are shlex-quoted (shell-safe URLs/ids need no quotes).
+    assert "_OMNIGENT_SERVER_URL=http://localhost:6767" in wrapper_text
+    assert "_OMNIGENT_SESSION_ID=session-123" in wrapper_text
+    assert "_OMNIGENT_AUTH_HEADERS=" in wrapper_text
     assert sys.executable in wrapper_text
     assert "hermes_policy_hook.py" in wrapper_text
 

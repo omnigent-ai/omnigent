@@ -137,6 +137,7 @@ import {
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { UserMessageNav } from "@/components/UserMessageNav";
+import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -195,7 +196,25 @@ function extractUserText(content: MessageContentBlock[]): string {
  * user message, so the bubble can show what was attached (the marker text
  * itself is stripped from the rendered text by {@link extractUserText}). A
  * trailing "/" marks a folder. Returns [] for ordinary messages.
+ *
+ * Explicitly *uploaded* files share this marker wording: the native executor
+ * materializes the upload to disk and injects `[Attached: <abs-path>]` so the
+ * vendor CLI can read it. Those uploads already ride in as an
+ * `input_image`/`input_file` block (rendered as the image / a file chip), so
+ * surfacing them again here would double-render — as the path of an internal
+ * bridge temp dir, no less. "@"-mention paths are always workspace-relative
+ * while upload markers are absolute, so skip absolute paths (see
+ * {@link isAbsolutePath}).
  */
+// An absolute filesystem path in any form a native executor might materialize
+// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
+// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
+// reliably tells a materialized upload apart from a tagged workspace file
+// regardless of the host OS the runner happens to be on.
+function isAbsolutePath(p: string): boolean {
+  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+}
+
 function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
   const text = content
     .filter(
@@ -207,6 +226,8 @@ function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
   for (const m of text.matchAll(ATTACHED_RE)) {
     const raw = m[1].trim();
     if (!raw) continue;
+    // Absolute path → a materialized upload, already shown via its file block.
+    if (isAbsolutePath(raw)) continue;
     // Split a trailing ":start-end" line span back out so the chip can show
     // it without truncation (it's the whole point of a partial-file attach).
     const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
@@ -635,6 +656,7 @@ export function ChatPage() {
   useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -823,7 +845,11 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  const showsWorking = computeShowsWorking(sessionStatus, { hasPendingElicitation, runnerOnline });
+  const showsWorking = computeShowsWorking(sessionStatus, {
+    hasPendingElicitation,
+    runnerOnline,
+    backgroundTaskCount,
+  });
 
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
@@ -1635,20 +1661,7 @@ function MainAgentSurface({
                     Suppressed when the last bubble is a compaction spinner —
                     that bubble already owns the "in-progress" slot. aria-hidden:
                     the pinned pill owns the single aria-live region (see WorkingStatusPin). */}
-                {showWorkingIndicator && (
-                  <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-                    <MessageContent>
-                      {/* py-0.5 = headroom for the bob: MessageContent is overflow-hidden
-                          and would clip otto's head at the top of the bounce. */}
-                      <div className="flex items-center gap-1.5 py-0.5">
-                        <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-                        <Shimmer className="text-xs font-mono" duration={1.5}>
-                          Working…
-                        </Shimmer>
-                      </div>
-                    </MessageContent>
-                  </Message>
-                )}
+                {showWorkingIndicator && <WorkingIndicator />}
                 {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
                     runner-online send gate), but `showWorkingIndicator` stays
@@ -2301,6 +2314,35 @@ function hasInProgressAssistantBubble(bubbles: Bubble[]): boolean {
  *   least one item, or a compaction-loading bubble already represents the
  *   busy state.
  */
+/**
+ * The label shown next to the working spinner. When background shells outlive
+ * the turn (`bgCount > 0`) it names how many are still running; otherwise it's
+ * the plain "Working…" string.
+ */
+export function workingIndicatorLabel(bgCount: number): string {
+  if (bgCount <= 0) return "Working…";
+  return bgCount === 1
+    ? "1 background task still running"
+    : `${bgCount} background tasks still running`;
+}
+
+function WorkingIndicator() {
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const label = workingIndicatorLabel(bgCount);
+  return (
+    <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
+      <MessageContent>
+        <div className="flex items-center gap-1.5 py-0.5">
+          <OttoIcon className="otto-working h-4 w-auto shrink-0" />
+          <Shimmer className="text-xs font-mono" duration={1.5}>
+            {label}
+          </Shimmer>
+        </div>
+      </MessageContent>
+    </Message>
+  );
+}
+
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
   if (hasInProgressAssistantBubble(bubbles)) return false;
@@ -3269,6 +3311,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
   if (modelPickerKind === "cursor") return "Cursor";
+  if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
@@ -3291,9 +3334,11 @@ export function composerHarnessLabel(
 function ComposerStatusLine({
   harnessLabel,
   codexGoal,
+  isSubAgentSession,
 }: {
   harnessLabel: string | null;
   codexGoal: CodexGoal | null;
+  isSubAgentSession: boolean;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
@@ -3305,6 +3350,12 @@ function ComposerStatusLine({
   const gitBranch = useChatStore((s) => s.gitBranch);
 
   const showBranch = !!conversationId && !!gitBranch;
+  // Host indicator (green/red dot + host name), left of the worktree branch.
+  // Hidden on sub-agent sessions — the header's child-session slot owns the
+  // back affordance there, mirroring where this badge used to live. HostBadge
+  // self-hides when the session isn't host-bound, so this is a visibility gate,
+  // not a host-presence claim.
+  const showHost = !!conversationId && !isSubAgentSession;
   // The harness/agent identity (e.g. "Claude", "Polly (Pi)") lives here now;
   // the picker trigger above owns the model/effort label since it's the
   // control that changes them.
@@ -3332,19 +3383,20 @@ function ComposerStatusLine({
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Left: worktree branch. Always holds the flex-1 slot so the
-          right cluster stays pinned right even with no branch, and
-          truncates to an ellipsis so the tray never wraps. */}
-      <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-muted-foreground">
+      {/* Left: host badge then worktree branch. Always holds the flex-1 slot
+          so the right cluster stays pinned right even when both are absent;
+          each item truncates to an ellipsis so the tray never wraps. */}
+      <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
+        {showHost && conversationId && <HostBadge sessionId={conversationId} />}
         {showBranch && (
-          <>
+          <span className="flex min-w-0 items-center gap-1.5">
             <GitBranchIcon className="size-3.5 shrink-0" />
             <span data-testid="composer-git-branch" className="min-w-0 truncate" title={gitBranch}>
               {gitBranch}
             </span>
-          </>
+          </span>
         )}
-      </span>
+      </div>
       {/* Right: model/effort and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
@@ -3953,6 +4005,9 @@ export function Composer({
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
       dirtyRef.current = true;
+      // Return focus to the composer so the user can keep typing right
+      // after attaching (the file picker / paperclip button steals it).
+      if (!isMobileRef.current) textareaRef.current?.focus();
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
@@ -4614,7 +4669,11 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine harnessLabel={harnessLabel} codexGoal={codexGoal} />
+      <ComposerStatusLine
+        harnessLabel={harnessLabel}
+        codexGoal={codexGoal}
+        isSubAgentSession={subAgentLabel != null}
+      />
     </form>
   );
 }
@@ -4637,15 +4696,24 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
  *   known offline, ``undefined`` before the health poll resolves. Only known
  *   offline suppresses the indicator.
+ * @param options.backgroundTaskCount - Background shells still running after
+ *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
+ *   watcher's edge) even while shells run, so the bare status alone would hide
+ *   the indicator; a positive count keeps it lit so "N background tasks still running"
+ *   stays visible.
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
   sessionStatus: SessionStatus,
-  options: { hasPendingElicitation: boolean; runnerOnline: boolean | undefined },
+  options: {
+    hasPendingElicitation: boolean;
+    runnerOnline: boolean | undefined;
+    backgroundTaskCount?: number;
+  },
 ): boolean {
   if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus);
+  return computeIsWorking(sessionStatus) || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**
@@ -4780,7 +4848,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "opencode";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4844,6 +4912,11 @@ export function modelPickerKindForConv(
       return "codex";
     case "cursor-native-ui":
       return "cursor";
+    case "kiro-native-ui":
+      // Launch-only model selection: kiro applies ``--model`` at launch. Unlike
+      // cursor/opencode there is no terminal->web model mirror, so the picker
+      // reflects the pre-launch ``model_override`` selection.
+      return "kiro";
     case "opencode-native-ui":
       // Like cursor: a vendor-owns-model wrapper that mirrors its live TUI
       // model into the session ``model_override`` (the forwarder's terminal→web
@@ -4964,7 +5037,8 @@ function AgentPicker({
   // Codex and cursor both populate the picker from the server-provided
   // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
   // claude uses the static local catalog.
-  const usesServerModelOptions = modelPickerKind === "codex" || modelPickerKind === "cursor";
+  const usesServerModelOptions =
+    modelPickerKind === "codex" || modelPickerKind === "cursor" || modelPickerKind === "kiro";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
@@ -4996,8 +5070,13 @@ function AgentPicker({
   // carried over from some other session) nor the meaningless `llmModel`
   // default. The other vendor-owns wrappers have no Omnigent-visible model and
   // stay null.
+  // kiro persists the pick as ``model_override`` (applied via ``--model`` at
+  // launch) and, mid-session, the runner types ``/model <id>`` into the live TUI.
+  // There is no terminal→web mirror, so the picker reflects the web-side
+  // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
+  // cursor/opencode surface theirs.
   const pickerSelectedModel =
-    modelPickerKind === "cursor" || modelPickerKind === "opencode"
+    modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
       ? sessionModelOverride
       : selectedModel;
   // SDK/bundle agents (no native picker) never have the cross-session sticky
@@ -5009,8 +5088,11 @@ function AgentPicker({
   const nonNativeModel =
     modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
-    ? modelPickerKind === "cursor"
-      ? sessionModelOverride
+    ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+      ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
+        // on a web pick (which also drives a live ``/model`` switch). Either way
+        // the Omnigent-visible model is ``model_override``.
+        sessionModelOverride
       : modelPickerKind === "opencode"
         ? // opencode mirrors its live TUI model into ``model_override`` (set at
           // launch and updated by the forwarder on a TUI switch); show that,
@@ -5024,6 +5106,15 @@ function AgentPicker({
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
       : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
+
+  // Until kiro mirrors its live model (its first session ``.json`` write), there
+  // is no resolved model to show; fall back to the catalog default (e.g. "Auto")
+  // so the trigger reads as a model rather than the harness name ("Kiro").
+  const kiroDefaultOption =
+    modelPickerKind === "kiro"
+      ? (codexModelOptions.find((m) => m.isDefault) ?? codexModelOptions[0])
+      : undefined;
+  const kiroLaunchFallbackLabel = kiroDefaultOption?.displayName ?? kiroDefaultOption?.id;
 
   // Model in foreground (black), effort in muted (grey). Static fallbacks
   // first; the final `else` returns null so a session with nothing to show
@@ -5054,8 +5145,10 @@ function AgentPicker({
     // spec may carry no executor model and no sticky/override is set), but the
     // dropdown still has model rows to switch. Keep the trigger rendered — and
     // the model dropdown + bare-`/model` open path reachable — with a stable
-    // identity fallback rather than hiding the picker entirely.
-    triggerContent = agentDisplayName ?? "Model";
+    // identity fallback rather than hiding the picker entirely. For kiro, prefer
+    // the catalog default (e.g. "Auto") over the agent name so the launch-window
+    // label reads as a model.
+    triggerContent = kiroLaunchFallbackLabel ?? agentDisplayName ?? "Model";
   } else {
     return null;
   }

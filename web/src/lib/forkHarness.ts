@@ -1,27 +1,25 @@
-// Pure helpers for the "fork with a different agent" flow: decide which
-// switch targets preserve the source's conversation history.
+// Pure helpers for the "fork / switch agent" flows: decide which target
+// harnesses preserve the source's conversation history (and so should appear
+// in each picker). Three carry mechanisms, all keyed off the TARGET harness —
+// a frontend mirror of the server (omnigent/server/routes/sessions.py):
 //
-// Two mechanisms carry a fork's history, both keyed off the TARGET harness:
 //   - SDK (non-native) harnesses replay the Omnigent transcript as LLM
-//     context, so they always carry history regardless of the source.
-//   - Native harnesses (Claude Code, Codex) do NOT replay the transcript;
-//     the runner rebuilds their on-disk transcript before launch — cloning
-//     the source's native transcript when the source is same-family native,
-//     else building one from the copied Omnigent items (a format-agnostic
-//     conversion, so the source harness doesn't matter).
-//   - Cursor is native but server-backed: a synthesized local store is NOT
-//     loaded by `cursor-agent --resume`, so the runner replays the prior turns
-//     as a text preamble on the fork's first message (text-prefix replay). The
-//     turns appear as one context block in the Cursor TUI rather than as
-//     reconstructed bubbles, but the agent gets the full prior context.
+//     context — carry on BOTH fork and switch, regardless of source/family.
+//   - Native-REBUILD harnesses (Claude Code, Codex, Pi, Hermes, Qwen Code)
+//     record a resumable on-disk session file the runner rebuilds from the
+//     copied Omnigent items (a same-family native source clones the source
+//     file instead; cross-family rebuilds, format-agnostic) — carry on BOTH
+//     fork and switch. Mirrors `_FORK_HISTORY_NATIVE_HARNESSES`.
+//   - PREAMBLE harnesses (Cursor, OpenCode) have no rebuildable local store,
+//     so prior turns replay as a text preamble on the fork's first message —
+//     FORK-ONLY. An in-place switch-agent has no first-message injection
+//     point, so switching into one starts fresh. Mirrors
+//     `_CURSOR_FORK_HISTORY_HARNESSES`.
 //
-// Native targets carry history from any source: the rollout synthesizer
-// writes the session_meta fields codex ≥ 0.133 requires (timestamp,
-// cli_version, model_provider) plus the event_msg mirrors codex rebuilds
-// visible turns from, so cross-family forks into codex-native rebuild the
-// rollout from the copied Omnigent items like claude-native always did
-// (see _codex_rollout_records_from_session_items in omnigent/codex_native.py
-// and tests/e2e/test_host_cross_family_fork_e2e.py).
+// Hence two predicates: forkTargetCarriesHistory (rebuild ∪ preamble ∪ SDK)
+// and switchTargetCarriesHistory (rebuild ∪ SDK — no preamble). Native
+// harnesses with no carry path (kiro/kimi/goose) are offered by neither; an
+// unclassifiable harness (catalog harness=null) is conservatively dropped.
 
 /** Provider family a harness consumes, or null when unknown. */
 export function harnessFamily(
@@ -84,33 +82,80 @@ export function isNativeHarness(harness: string | null | undefined): boolean {
 }
 
 /**
- * Whether forking/switching into `targetHarness` keeps the source's
- * conversation history (and so should be offered in the picker).
+ * Native harnesses whose runner REBUILDS a resumable on-disk transcript from
+ * the copied Omnigent items, so they carry history on BOTH fork and switch.
+ * Mirrors Python `_FORK_HISTORY_NATIVE_HARNESSES`
+ * (`omnigent/server/routes/sessions.py`); both canonical and reversed
+ * spellings are listed so a catalog `harness` in either form matches.
+ */
+const NATIVE_REBUILD_HARNESSES: ReadonlySet<string> = new Set([
+  "claude-native",
+  "native-claude",
+  "codex-native",
+  "native-codex",
+  "pi-native",
+  "native-pi",
+  "hermes-native",
+  "native-hermes",
+  "qwen-native",
+  "native-qwen",
+]);
+
+/**
+ * Native harnesses that carry FORK history only as a text preamble on the
+ * fork's first message (no rebuildable local store) — FORK-ONLY. An in-place
+ * switch-agent has no first-message injection point, so switching into one
+ * starts fresh. Mirrors Python `_CURSOR_FORK_HISTORY_HARNESSES`.
+ */
+const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
+  "cursor-native",
+  "native-cursor",
+  "opencode-native",
+  "native-opencode",
+]);
+
+/**
+ * Whether forking into `targetHarness` keeps the source's conversation
+ * history (and so should be offered in the fork picker): a native-rebuild
+ * target, a preamble (cursor/opencode) target, or an SDK-family target (which
+ * replays the transcript as context). Conservatively false for an
+ * unclassifiable harness (the catalog can report harness=null when the bundle
+ * failed to load) and for native harnesses with no carry path
+ * (kiro/kimi/goose).
  *
- * True for every classifiable target — the source harness doesn't matter:
- *   - an SDK target replays the transcript as context;
- *   - a native target clones the source's native transcript when the
- *     source is same-family native, else the runner rebuilds the target's
- *     on-disk transcript from the copied Omnigent items (a format-agnostic
- *     conversion; see the module comment).
+ * NOTE: the SDK branch is `harnessFamily(h) !== null`, which also matches the
+ * one native harness that has a single family today — antigravity-native
+ * (gemini). That preserves Antigravity's prior presence in the pickers, but a
+ * native Antigravity fork is in NEITHER server carry-set, so whether it truly
+ * carries is unverified. TODO(fork-switch): confirm, then move it to a carry
+ * set or drop it rather than leaning on this proxy.
  *
- * Returns false — conservatively — only for a target whose harness we
- * can't classify.
- *
- * TODO(fork-switch): the false-for-unknown default exists because the
- * catalog can report `harness: null` when the server couldn't load the
- * agent's bundle (see `_to_agent_object` in
- * `server/routes/builtin_agents.py`). We don't offer a switch we can't
- * verify preserves history. Revisit once the catalog reliably reports a
- * harness for every built-in, or to add an explicit "may start fresh"
- * affordance for unclassified harnesses.
- *
- * @param targetHarness - The harness the fork would switch to.
+ * @param targetHarness - The harness the fork would bind.
  */
 export function forkTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
-  // Gate on isNativeHarness too: Pi is native but multi-family, so its
-  // harnessFamily is null and it would otherwise be dropped from the pickers.
-  return isNativeHarness(targetHarness) || harnessFamily(targetHarness) !== null;
+  if (!targetHarness) return false;
+  return (
+    NATIVE_REBUILD_HARNESSES.has(targetHarness) ||
+    PREAMBLE_FORK_HARNESSES.has(targetHarness) ||
+    harnessFamily(targetHarness) !== null
+  );
+}
+
+/**
+ * Whether switching a session in place to `targetHarness` keeps history (and
+ * so should be offered in the switch-agent picker). Same as
+ * {@link forkTargetCarriesHistory} MINUS the preamble harnesses: the
+ * text-preamble path is fork-only (switch-agent has no first-message
+ * injection point), so a switch into cursor/opencode would silently start
+ * fresh and must not be offered. Mirrors the server, where switch-agent stamps
+ * carry-history only for `_FORK_HISTORY_NATIVE_HARNESSES`, never the cursor
+ * set.
+ *
+ * @param targetHarness - The harness the switch would bind.
+ */
+export function switchTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
+  if (!targetHarness) return false;
+  return NATIVE_REBUILD_HARNESSES.has(targetHarness) || harnessFamily(targetHarness) !== null;
 }
 
 /**
