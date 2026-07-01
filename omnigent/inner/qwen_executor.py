@@ -1279,6 +1279,16 @@ class QwenExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""
 
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
+        """Terminate the qwen ACP subprocess to cancel the active turn."""
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+            return True
+        return False
+
     async def close(self) -> None:
         """Terminate the qwen subprocess and clean up."""
         if self._reader_task:

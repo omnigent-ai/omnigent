@@ -972,6 +972,36 @@ async def test_close_session_is_noop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# interrupt_session terminates the live ACP subprocess
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_terminates_live_process() -> None:
+    """A live subprocess (returncode None) is terminated and True returned."""
+    executor = QwenExecutor()
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    executor._proc = mock_proc
+
+    assert await executor.interrupt_session("some-key") is True
+    mock_proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_session_returns_false_when_finished_or_absent() -> None:
+    """No process, or an already-exited one, yields False with no terminate."""
+    executor = QwenExecutor()
+    assert await executor.interrupt_session("some-key") is False
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    executor._proc = mock_proc
+    assert await executor.interrupt_session("some-key") is False
+    mock_proc.terminate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # system_prompt folded into the first turn (ACP has no system field)
 # ---------------------------------------------------------------------------
 
