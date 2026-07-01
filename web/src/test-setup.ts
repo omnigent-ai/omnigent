@@ -67,6 +67,17 @@ if (!("IntersectionObserver" in globalThis)) {
   });
 }
 
+// cmdk (the command-palette primitive) constructs a ResizeObserver on mount,
+// which jsdom doesn't implement. A no-op stub lets command-palette/selector
+// component tests render without throwing.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  };
+}
+
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({
