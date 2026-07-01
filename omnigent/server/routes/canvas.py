@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from omnigent.db.utils import generate_canvas_id
 from omnigent.entities.canvas import CANVAS_CONTENT_TYPES, Canvas
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime import get_caps
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.stores.canvas_store import CanvasStore
@@ -58,6 +59,8 @@ def create_canvas_router(
     @router.get("/canvas/{conversation_id}")
     async def get_canvas(request: Request, conversation_id: str) -> dict[str, Any]:
         """Return the conversation's canvas, or 404 if none is set."""
+        if not get_caps().canvas_enabled:
+            raise OmnigentError("Canvas is not enabled on this server", code=ErrorCode.NOT_FOUND)
         user_id = get_user_id(request, auth_provider)
         if permission_store is not None and user_id is None:
             raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
@@ -71,6 +74,8 @@ def create_canvas_router(
         request: Request, conversation_id: str, body: UpsertCanvasBody
     ) -> dict[str, Any]:
         """Create or overwrite the conversation's canvas (one per conversation)."""
+        if not get_caps().canvas_enabled:
+            raise OmnigentError("Canvas is not enabled on this server", code=ErrorCode.NOT_FOUND)
         user_id = get_user_id(request, auth_provider)
         if permission_store is not None and user_id is None:
             raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)

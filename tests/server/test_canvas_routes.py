@@ -49,3 +49,27 @@ def test_get_canvas_404_when_unset(
 ) -> None:
     client, _, conv = ctx
     assert client.get(f"/v1/canvas/{conv}").status_code == 404
+
+
+def test_canvas_routes_404_when_disabled(
+    ctx: tuple[TestClient, SqlAlchemyCanvasStore, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``canvas.enabled`` is off, both handlers 404 before touching the
+    store — the hard server-side gate (#2). GET 404s even though a canvas
+    exists; PUT 404s without writing."""
+    from omnigent.runtime.caps import RuntimeCaps
+
+    client, store, conv = ctx
+    store.upsert("cnv_1", conv, "Report", "<h1>Hi</h1>", "html")
+    monkeypatch.setattr(
+        "omnigent.server.routes.canvas.get_caps",
+        lambda: RuntimeCaps(canvas_enabled=False),
+    )
+
+    assert client.get(f"/v1/canvas/{conv}").status_code == 404
+    put = client.put(
+        f"/v1/canvas/{conv}",
+        json={"title": "T", "content": "<p>x</p>", "content_type": "html"},
+    )
+    assert put.status_code == 404
