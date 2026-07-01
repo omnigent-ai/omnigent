@@ -2975,6 +2975,8 @@ def server(
 
     from omnigent.runner.transports.ws_tunnel.limits import (
         RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+        TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     )
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider
@@ -3225,6 +3227,25 @@ def server(
             port=port,
             log_config=_server_uvicorn_log_config(),
             ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # Server side of the runner/host tunnels' protocol keepalive, aligned
+            # to the 90 s app-level budget instead of uvicorn's 20 s default that
+            # drops a busy-but-healthy tunnel with 1011 — issue #1116.
+            #
+            # uvicorn's ws_ping_* is server-global (no per-route override), so this
+            # 30 s/90 s budget also applies to the app's other WebSocket routes —
+            # /v1/sessions/updates (browser stream) and .../terminals/{id}/attach.
+            # Deliberate and acceptable: for an IDLE such socket the protocol
+            # PING/PONG is the only half-open detector (the sessions-updates
+            # heartbeat is a server->client send, and an idle terminal has no
+            # traffic), so widening it means a dead idle browser/terminal socket is
+            # reaped at worst ~120 s (30 s interval + 90 s timeout) instead of
+            # ~40 s — a slightly later half-open cleanup (e.g. the out-of-process
+            # terminal-attach proxy holds its runner socket + tmux child ~80 s
+            # longer), bounded and eventually reaped, not a leak or correctness
+            # change. The tunnels are the sockets that actually need the looser
+            # budget (issue #1116).
+            ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+            ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         )
     finally:

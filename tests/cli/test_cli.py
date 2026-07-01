@@ -63,7 +63,11 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
-from omnigent.runner.transports.ws_tunnel.limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+from omnigent.runner.transports.ws_tunnel.limits import (
+    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1212,6 +1216,10 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert result.exit_code == 0, result.output
     assert captured.get("uvicorn_called") is True
     assert captured["uvicorn_kwargs"]["ws_max_size"] == RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+    # Tunnel protocol keepalive aligned to the 90s app-level budget, not uvicorn's
+    # 20s default that drops a busy-but-healthy tunnel with 1011 (issue #1116).
+    assert captured["uvicorn_kwargs"]["ws_ping_interval"] == TUNNEL_KEEPALIVE_PING_INTERVAL_S
+    assert captured["uvicorn_kwargs"]["ws_ping_timeout"] == TUNNEL_KEEPALIVE_PING_TIMEOUT_S
     assert (
         captured["uvicorn_kwargs"]["log_config"]["formatters"]["access"]["()"]
         == "omnigent.server.performance_metrics.RequestDurationAccessFormatter"

@@ -69,6 +69,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.runner.transports.ws_tunnel.limits import (
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -1386,6 +1390,12 @@ class HostProcess:
                 url,
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
+                # Align the host->server tunnel's protocol keepalive to the same
+                # 90 s app-level budget as the runner tunnel (not the 20 s library
+                # default that drops a busy-but-healthy tunnel with 1011 — #1116).
+                # Symmetric with serve.py's runner-side connect().
+                ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+                ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             )
             ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:
