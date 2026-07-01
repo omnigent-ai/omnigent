@@ -117,6 +117,46 @@ _LOG_TAIL_MAX_LINES = 15
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
+# Cadence of the orphan-reaper sweep. The host installs itself as a child
+# subreaper (Linux — see :func:`_install_child_subreaper`), so a harness's
+# detached tool subprocess (node/npm/chromium/tmux/python) whose runner
+# parent died reparents to the host. With no reaper such an orphan lingers
+# as a ``<defunct>`` zombie; over an overnight blocked run they reached
+# ~900 zombies and OOM'd the box (#1782). A ``WNOHANG`` sweep is a cheap
+# syscall, so 2s keeps zombie lifetime short at negligible cost.
+_ORPHAN_REAP_INTERVAL_S = 2.0
+
+
+def _install_child_subreaper() -> bool:
+    """Make this process reap orphaned descendants (Linux only).
+
+    ``prctl(PR_SET_CHILD_SUBREAPER, 1)`` asks the kernel to reparent any
+    orphaned descendant — e.g. a harness's detached tool subprocess whose
+    runner parent exited — to THIS process instead of PID 1, so the host's
+    orphan reaper can ``wait()`` on it even when the host is not itself
+    PID 1 (e.g. ``omni host --server`` launched under a shell). When the
+    host already IS PID 1 (container entrypoint) orphans reparent here
+    regardless and this call is a harmless no-op.
+
+    Complements — does not replace — the per-runner ``_watch_runner``
+    reaping of the host's own direct children.
+
+    :returns: ``True`` if the subreaper bit was set; ``False`` on non-Linux
+        or if ``prctl`` is unavailable. Both are non-fatal: direct-child
+        reaping and the PID-1 case still work; only the non-PID-1 orphan
+        case degrades.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _PR_SET_CHILD_SUBREAPER = 36
+        return libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
+
 
 def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
     """Read the last portion of a runner log file for diagnostics.
@@ -575,6 +615,158 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
+        # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
+        self._reaper_task: asyncio.Task[None] | None = None
+
+    def _tracked_runner_pids(self) -> set[int]:
+        """PIDs of runners this host spawned and still tracks directly.
+
+        The orphan reaper must NOT ``wait()`` these: their exit status is
+        owned by their :class:`subprocess.Popen` (read via ``poll()`` /
+        ``.returncode`` for the ``host.runner_exited`` report). Reaping one
+        out from under ``Popen`` makes ``poll()`` either spin forever
+        (``while poll() is None`` in ``_watch_runner``) or report a bogus
+        exit 0 for a crash — so the reaper skips these and lets
+        ``_watch_runner`` / ``_handle_stop`` own them.
+
+        :returns: Set of live tracked runner OS pids.
+        """
+        return {h.proc.pid for h in self._runners.values()}
+
+    async def _orphan_reaper_loop(self) -> None:
+        """Reap orphaned descendant processes reparented to this host.
+
+        A harness spawns its tool subprocesses detached
+        (``start_new_session=True`` — ``omnigent.inner._proc.spawn_kwargs``),
+        so when the runner that owns them dies, those grandchildren
+        (``node`` / ``npm`` / ``chromium`` / ``tmux`` / ``python``) are
+        orphaned and reparented to this host (it is PID 1 in a container, or
+        a child subreaper otherwise — see :func:`_install_child_subreaper`).
+        Nothing ``wait()``s them, so each becomes a permanent ``<defunct>``
+        zombie; a blocked overnight run accumulated ~900 and OOM'd the box
+        (#1782).
+
+        This loop periodically reaps any ready-to-reap child that is NOT a
+        Popen-tracked runner (:meth:`_tracked_runner_pids`), draining zombies
+        without disturbing runner exit reporting. Non-Linux (no reparenting)
+        and the "no orphans yet" case both make this a cheap no-op sweep.
+
+        :returns: None. Runs until cancelled on shutdown.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_ORPHAN_REAP_INTERVAL_S)
+                self._reap_orphans_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a reaper must never die on a stray error
+                _logger.debug("orphan reaper sweep failed", exc_info=True)
+
+    def _reap_orphans_once(self) -> int:
+        """Reap ready orphaned children without corrupting runner exits.
+
+        The hazard: the host reads each runner's exit status through its
+        :class:`subprocess.Popen` (``poll()`` / ``.returncode``) for the
+        ``host.runner_exited`` report. A blind ``waitpid(-1)`` reaper that
+        consumes a just-crashed tracked runner makes ``Popen.poll()`` report
+        a bogus exit 0 (verified) — the crash cause is lost. So the reaper
+        must drain orphans while leaving tracked runners' status intact.
+
+        Two implementations, same guarantee:
+
+        * **Linux/POSIX with** ``os.waitid`` — *peek* at the next reapable
+          child with ``WNOWAIT`` (does not consume). Reap it only if it is
+          not a tracked runner; if it is, stop the sweep and let the runner's
+          own Popen reaper (``_watch_runner``) consume it. Cleanest: a tracked
+          runner's status is never touched.
+        * **Platforms without** ``os.waitid`` **(e.g. macOS)** — ``waitpid``
+          has no peek, so reap with ``WNOHANG`` and, if the reaped pid is a
+          tracked runner, re-inject its exit status onto the ``Popen`` so
+          ``_watch_runner`` still reports the true code. Safe because
+          ``_reap_orphans_once`` runs to completion on the event loop without
+          awaiting, so it cannot interleave with ``_watch_runner`` /
+          ``_handle_stop``.
+
+        This runs only when the host is PID 1 (container) or a child
+        subreaper (:func:`_install_child_subreaper`); otherwise no orphan
+        ever reparents here and every sweep is a no-op.
+
+        :returns: Count of orphan (non-runner) processes reaped this sweep.
+        """
+        if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
+            return self._reap_orphans_waitid()
+        return self._reap_orphans_waitpid()
+
+    def _reap_orphans_waitid(self) -> int:
+        """Peek-and-reap using ``os.waitid(WNOWAIT)`` (Linux/POSIX).
+
+        :returns: Count of orphan processes reaped.
+        """
+        reaped = 0
+        tracked = self._tracked_runner_pids()
+        while True:
+            try:
+                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except (ChildProcessError, OSError):
+                break
+            if info is None:
+                break  # children exist but none ready to reap
+            pid = info.si_pid
+            if pid in tracked:
+                # Leave it for _watch_runner's Popen to reap+report. Break, not
+                # continue: WNOWAIT keeps returning the same head pid, so
+                # continuing would spin. The runner is reaped within ~0.5s and
+                # the next sweep proceeds past it.
+                break
+            try:
+                os.waitpid(pid, 0)  # consume the orphan
+                reaped += 1
+            except ChildProcessError:
+                break
+        if reaped:
+            _logger.debug("orphan reaper reaped %d process(es)", reaped)
+        return reaped
+
+    def _reap_orphans_waitpid(self) -> int:
+        """Reap with ``waitpid(WNOHANG)``, re-injecting tracked-runner status.
+
+        Fallback for platforms without ``os.waitid`` (no peek). See
+        :meth:`_reap_orphans_once` for why re-injection is race-free.
+
+        :returns: Count of orphan (non-runner) processes reaped.
+        """
+        reaped = 0
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                break
+            if pid == 0:
+                break  # children exist but none ready
+            handle = self._runner_handle_for_pid(pid)
+            if handle is not None:
+                # A tracked runner — do NOT count it as an orphan. Re-inject
+                # the status so its Popen (and thus _watch_runner) reports the
+                # true exit code instead of ECHILD → bogus 0.
+                if handle.proc.returncode is None:
+                    handle.proc.returncode = os.waitstatus_to_exitcode(status)
+                continue
+            reaped += 1
+        if reaped:
+            _logger.debug("orphan reaper reaped %d process(es)", reaped)
+        return reaped
+
+    def _runner_handle_for_pid(self, pid: int) -> _RunnerHandle | None:
+        """Return the tracked runner handle owning *pid*, or ``None``.
+
+        :param pid: An OS process id observed by the reaper.
+        :returns: The matching :class:`_RunnerHandle`, or ``None`` if *pid*
+            is not a tracked runner (i.e. an orphan to reap).
+        """
+        for handle in self._runners.values():
+            if handle.proc.pid == pid:
+                return handle
+        return None
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -1276,6 +1468,15 @@ class HostProcess:
 
         :returns: None. Runs until the process is terminated.
         """
+        # Reap orphaned harness/tool grandchildren that reparent here when a
+        # runner dies (this host is PID 1 in a container, or a subreaper
+        # otherwise). Without this they pile up as <defunct> zombies and can
+        # OOM the box on a long-blocked run (#1782).
+        if _install_child_subreaper():
+            _logger.debug("installed PR_SET_CHILD_SUBREAPER; host will reap orphans")
+        self._reaper_task = asyncio.create_task(
+            self._orphan_reaper_loop(), name="host-orphan-reaper"
+        )
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -1347,7 +1548,14 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            if self._reaper_task is not None:
+                self._reaper_task.cancel()
+                self._reaper_task = None
             self._cleanup_runners()
+            # Final drain: _cleanup_runners has just reaped the tracked
+            # runners via Popen, so any of their still-orphaned tool
+            # grandchildren are now reapable and no tracked pid can be stolen.
+            self._reap_orphans_once()
 
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -807,6 +808,94 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
         assert proc.poll() is not None, f"Runner pid={proc.pid} should be dead after cleanup"
     # Tracking dict should be empty.
     assert host._runners == {}
+
+
+def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
+    """Regression for #1782: orphaned children are reaped, not leaked.
+
+    In production the leak is a harness tool subprocess (node/chromium/tmux)
+    whose runner parent died: it is orphaned and reparented to the host
+    (PID 1 in a container, or a subreaper). Once reparented it is a *direct*
+    child of the host that nothing ``wait()``s — so it lingers as a
+    ``<defunct>`` zombie forever. This test models that end state directly by
+    forking a child the host does not track and never waits: ``os.fork`` is
+    portable (no ``PR_SET_CHILD_SUBREAPER``, which macOS lacks), and a
+    reparented orphan is indistinguishable from a plain unwaited child to the
+    reaper. ``_reap_orphans_once`` must drain it.
+    """
+    import errno
+    import os
+
+    host = _make_host_process()
+
+    # Fork a bare child (NOT a tracked runner, NOT wrapped in Popen) that
+    # exits immediately — the faithful model of an orphan reparented to us.
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+
+    # Let it exit and become a zombie parented to this process.
+    deadline = time.monotonic() + 5.0
+    reaped_total = 0
+    while time.monotonic() < deadline:
+        reaped_total += host._reap_orphans_once()
+        if reaped_total >= 1:
+            break
+        time.sleep(0.05)
+
+    assert reaped_total >= 1, "orphaned child was not reaped (zombie leak — #1782)"
+    # It is truly reaped: a direct waitpid now raises ECHILD (no such child).
+    with pytest.raises(OSError) as exc_info:
+        os.waitpid(pid, 0)
+    assert exc_info.value.errno == errno.ECHILD
+    # A second sweep with no orphans left is a clean no-op.
+    assert host._reap_orphans_once() == 0
+
+
+def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> None:
+    """The reaper must not consume a tracked runner's exit status (#1782).
+
+    A naive ``waitpid(-1)`` reaper would reap a just-exited tracked runner
+    behind ``Popen``'s back, making ``_watch_runner``'s ``poll()`` report a
+    bogus exit 0 for a crash. ``_reap_orphans_once`` peeks with ``WNOWAIT``
+    and skips tracked pids, so the runner's real exit code survives for the
+    ``host.runner_exited`` report.
+    """
+    host = _make_host_process()
+
+    # A tracked runner that exits non-zero (a "crash").
+    runner = subprocess.Popen(["python3", "-c", "import sys; sys.exit(42)"])
+    host._runners["runner_crash"] = _RunnerHandle(
+        proc=runner, log_path=tmp_path / "runner-crash.log"
+    )
+    # Wait until the OS reports it as exited (zombie), WITHOUT Popen.wait().
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and runner.poll() is None:
+        # poll() would itself reap; instead peek via the reaper repeatedly.
+        host._reap_orphans_once()
+        time.sleep(0.05)
+
+    # The reaper ran while the crashed runner was reapable; it must NOT have
+    # stolen it. Popen must still see the true exit code.
+    assert runner.poll() == 42, "reaper corrupted the tracked runner's exit code"
+
+    runner.wait()
+
+
+def test_install_child_subreaper_is_safe_to_call() -> None:
+    """``_install_child_subreaper`` never raises and reports a bool.
+
+    ``True`` on Linux where ``prctl`` set the bit; ``False`` on non-Linux or
+    when ``prctl`` is unavailable — both are acceptable, non-fatal outcomes.
+    """
+    import sys
+
+    from omnigent.host.connect import _install_child_subreaper
+
+    result = _install_child_subreaper()
+    assert isinstance(result, bool)
+    if sys.platform != "linux":
+        assert result is False
 
 
 def test_host_spawned_runner_has_parent_pid_env(
