@@ -94,7 +94,7 @@ _logger = logging.getLogger(__name__)
 
 # ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
 # The runner emits ``session.status: "waiting"`` when a turn ends with sub-agents
-# still running (PR #930, for the headless ``-p`` fast-exit). Servers older than
+# still running (for the headless ``-p`` fast-exit). Servers older than
 # 0.3.0 don't model "waiting" — their ``SessionResponse.status`` is
 # ``Literal["idle","running","failed"]`` — and 500 on ``GET /v1/sessions`` when
 # they try to serialize the cached value. So we resolve the server version once
@@ -8254,7 +8254,7 @@ def create_runner_app(
         :param status: New working status, ``"running"`` or ``"idle"``.
         """
         # (The native-pane reaper's status mirror is recorded centrally in
-        # _publish_event, which this routes through — see #1349.)
+        # _publish_event, which this routes through.)
         _publish_event(
             session_id,
             {"type": "session.status", "status": status},
@@ -14291,7 +14291,7 @@ def create_runner_app(
                                         # conversation while it is streaming (and
                                         # forward_cancel can resolve the harness
                                         # response id). Cleared in
-                                        # _on_proxy_stream_end. See issue #1414.
+                                        # _on_proxy_stream_end.
                                         process_manager.mark_in_flight(conv_id, _response_id)
 
                                 # Defer publish for action_required

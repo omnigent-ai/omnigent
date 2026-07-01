@@ -231,7 +231,7 @@ async def post_session_event_with_retry(
                 # Surface this connectivity failure to the harness idle-turn
                 # watchdog so a stall caused by unreachable-server posts is
                 # reported with its real cause, not a generic "wedged LLM"
-                # reason (issue #1119).
+                # reason.
                 record_native_post_failure(event_type, exc)
                 return None
             await sleep(retry_delay(attempt))
@@ -239,7 +239,7 @@ async def post_session_event_with_retry(
         # Reaching here means the POST got an HTTP response (no transport
         # error), proving the server is reachable — clear any stale
         # connectivity-failure record so the watchdog can't later misattribute
-        # it to an unrelated stall (issue #1119).
+        # it to an unrelated stall.
         note_native_post_success()
         if response.status_code < 400:
             return response

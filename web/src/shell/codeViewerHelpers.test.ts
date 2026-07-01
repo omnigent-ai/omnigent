@@ -218,7 +218,7 @@ describe("indexToLine", () => {
 });
 
 // ---------------------------------------------------------------------------
-// prepareHtmlPreviewDoc — force links to open in a new tab (issue #777)
+// prepareHtmlPreviewDoc — force links to open in a new tab
 // ---------------------------------------------------------------------------
 
 describe("prepareHtmlPreviewDoc", () => {

@@ -1684,7 +1684,7 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # conflict (the bypass already implies ``danger-full-access``), so leaving
 # them in is harmless. We strip BOTH anyway when bypass is on — the approval
 # flag because it MUST go, the sandbox flag for hygiene so the launched arg
-# list reflects a single coherent stance. See issue #657.
+# list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 # Granular approval/sandbox flags to drop when bypass is on. The "Full
 # access" / "Read only" approval presets emit the long ``--flag value`` form

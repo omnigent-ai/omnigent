@@ -226,7 +226,7 @@ class _FakeProcessManager:
         self.cancelled: list[str] = []
         self.get_client_calls: list[tuple[str, str, dict[str, str] | None]] = []
         # In-flight tracking the runner wires up on response.created /
-        # stream end (issue #1414). Recorded so tests can assert the
+        # stream end. Recorded so tests can assert the
         # idle reaper's guard is actually populated for a live turn.
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []

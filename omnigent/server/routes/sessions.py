@@ -20618,8 +20618,8 @@ async def _get_session_snapshot(
                     # compaction trigger a single source of truth — computed by
                     # one function — so they can't drift even though they run in
                     # different processes at different times. (They previously
-                    # each inlined this rule and silently fell out of step; see
-                    # PR #769 review. Sharing the function removes the manual
+                    # each inlined this rule and silently fell out of step;
+                    # sharing the function removes the manual
                     # sync.) spec.executor.context_window describes only the spec
                     # model, so an active override bypasses it — the resolver
                     # makes that decision from the spec model + override.
