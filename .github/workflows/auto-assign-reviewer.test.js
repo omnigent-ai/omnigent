@@ -1,8 +1,19 @@
 // Local unit test for auto-assign-reviewer.js -- mocks the GitHub client and
-// runs the real decision logic against the real .github/reviewers and
-// .github/MAINTAINER (cwd must be the repo root). No network. Loads are made
-// distinct so picks are deterministic.
+// runs the real decision logic against a FROZEN owner fixture
+// (auto-assign-reviewer.fixture.json) + the real .github/MAINTAINER (cwd must be
+// the repo root). No network. Loads are made distinct so picks are
+// deterministic.
+//
+// The fixture -- not the live .github/areas.json -- backs these tests on
+// purpose: real ownership changes often, and pinning logic assertions to it
+// would make them churn/flake. areas.test.js validates the real file instead.
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
+// Point the script at the frozen fixture for every run in this file.
+process.env.REVIEWER_AREAS_FILE = path.resolve(
+  ".github/workflows/auto-assign-reviewer.fixture.json"
+);
 const script = require(path.resolve(".github/workflows/auto-assign-reviewer.js"));
 
 function mkOpenPRs(loadMap) {
@@ -20,7 +31,16 @@ function mkOpenPRs(loadMap) {
 async function run({
   files, load = {}, current = [], currentAssignees = [],
   author = "someexternaldev", fork = true, linkedIssues = [],
+  rank = null, // LLM area-fit ranking (array of logins) or null for none
 }) {
+  // Point the script at a per-run rank file so real /tmp state can't leak in.
+  // `rank: null` writes no file -> the script's fallback (pure load) is tested,
+  // which is what the load-only cases below assert.
+  const rankFile = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "rank-")), "reviewer_rank.json"
+  );
+  if (rank) fs.writeFileSync(rankFile, JSON.stringify(rank));
+  process.env.REVIEWER_RANK_FILE = rankFile;
   const listFiles = () => {}; listFiles._tag = "files";
   const list = () => {}; list._tag = "open";
   const PR_NUMBER = 1;
@@ -238,7 +258,7 @@ function assert(name, cond, detail) {
     Object.keys(r.issueAssigned).length === 0, JSON.stringify(r.issueAssigned));
 
   // 15. linked issue assigned to a maintainer who is NOT in the reviewers pool
-  //     (hzub is in .github/MAINTAINER but not .github/reviewers): NOT adopted
+  //     (hzub is in .github/MAINTAINER but not .github/areas.json): NOT adopted
   //     (adoption is restricted to the managed pool so the reviewer stays
   //     removable), so the normal area pick stands. The issue already has an
   //     assignee, so no push-down.
@@ -264,4 +284,52 @@ function assert(name, cond, detail) {
     Object.keys(r.issueAssigned).length === 5, JSON.stringify(Object.keys(r.issueAssigned)));
   assert("capped overflow is warned",
     r.warnings.some((w) => /capping push-down/.test(w)), JSON.stringify(r.warnings));
+
+  // 17. LLM ranking overrides load within the candidate pool: dhruv0811 has the
+  //     lowest load (would win on load alone), but the rank prefers dbczumar, an
+  //     inner owner -- so dbczumar is chosen.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    rank: ["dbczumar", "TomeHirata", "SabhyaC26", "dhruv0811"],
+  });
+  assert("LLM rank beats load within the area pool",
+    JSON.stringify(r.added) === JSON.stringify(["dbczumar"]), JSON.stringify(r));
+
+  // 18. Allowlist enforcement: a rank naming someone who does NOT own the touched
+  //     area (PattaraS is a maintainer + pool member, but not an inner owner) is
+  //     ignored for that entry; the ranking only reorders actual candidates, so
+  //     the next ranked inner owner (dbczumar) wins -- never PattaraS.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1, PattaraS: 0 },
+    rank: ["PattaraS", "dbczumar", "TomeHirata", "SabhyaC26", "dhruv0811"],
+  });
+  assert("LLM rank cannot route outside the area owners",
+    JSON.stringify(r.added) === JSON.stringify(["dbczumar"]) && !r.added.includes("PattaraS"),
+    JSON.stringify(r));
+
+  // 19. Unranked candidates (rank omits them) sort after ranked ones but still by
+  //     load: rank lists only SabhyaC26 (highest load); the rest are unranked, so
+  //     SabhyaC26 -- despite load 5 -- is preferred because a finite rank beats
+  //     Infinity. Confirms the rank-primary / load-secondary ordering.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    rank: ["SabhyaC26"],
+  });
+  assert("a ranked high-load owner beats unranked low-load owners",
+    JSON.stringify(r.added) === JSON.stringify(["SabhyaC26"]), JSON.stringify(r));
+
+  // 20. Adoption still overrides the LLM rank: a linked-issue maintainer assignee
+  //     (TomeHirata) is adopted as reviewer even when the rank prefers someone
+  //     else -- the issue owner reviews the fix.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    rank: ["dbczumar", "dhruv0811"],
+    linkedIssues: [{ number: 42, assignees: ["TomeHirata"] }],
+  });
+  assert("linked-issue adoption overrides the LLM rank",
+    JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]), JSON.stringify(r));
 })();
