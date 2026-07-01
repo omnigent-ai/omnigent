@@ -14131,6 +14131,55 @@ def create_runner_app(
         if agent_version is not None:
             _version_cache[conv_id] = agent_version
 
+        # Cold-boot readiness gate (opencode-native turns). ``opencode serve``
+        # takes up to ~30s to boot, and a turn can only run once the terminal +
+        # bridge state are in place. That boot is normally driven by the
+        # session-init / ensure-terminal path, but a sub-agent's FIRST turn can
+        # arrive while the boot is still in flight (or before it starts): the
+        # turn then found no ready server, produced no result, and silently hung
+        # the parent orchestrator (polly). Ensure the terminal here, idempotent
+        # and under the SAME per-session lock the session-init path uses, so this
+        # turn WAITS for the boot instead of racing it (the events POST budget is
+        # ~1 day, so a one-time cold-boot wait is safe). A boot failure surfaces
+        # as a 503 turn failure -> parent inbox, never a silent hang.
+        if harness_name == "opencode-native":
+            _oc_lock = _opencode_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+            async with _oc_lock:
+                _oc_tr = resource_registry.terminal_registry
+                _oc_ready = (
+                    _oc_tr is not None and _oc_tr.get(conv_id, "opencode", "main") is not None
+                )
+                if not _oc_ready:
+                    _publish_terminal_pending(_publish_event, conv_id, True)
+                    try:
+                        try:
+                            _oc_spec = await _resolve_session_agent_spec(conv_id)
+                        except OmnigentError:
+                            _oc_spec = None
+                        await _auto_create_opencode_terminal(
+                            conv_id,
+                            resource_registry,
+                            _publish_event,
+                            agent_spec=_oc_spec,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "opencode-native cold-boot ensure failed for %s", conv_id
+                        )
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "opencode_native_boot_failed",
+                                "detail": _client_safe_error_detail(
+                                    exc, context="opencode-native boot"
+                                ),
+                            },
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, conv_id, False)
+
         try:
             client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
