@@ -41,7 +41,6 @@ are covered by :mod:`tests.e2e.test_policies_e2e`
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -282,22 +281,6 @@ async def test_secure_research_both_taints_deny_shell(
 # ─── risk_score_agent: built-in session-risk-score policy ───
 
 
-def _tool_result_ctx(name: str, result: str) -> EvaluationContext:
-    """
-    Build a TOOL_RESULT :class:`EvaluationContext` carrying a stringified result.
-
-    :param name: Tool that produced the result, e.g. ``"docs_document_get"``.
-    :param result: Stringified tool output under ``content.result``, e.g.
-        ``'{"label_classification": "Highly Confidential"}'``.
-    :returns: A ready-to-enforce TOOL_RESULT context.
-    """
-    return EvaluationContext(
-        phase=Phase.TOOL_RESULT,
-        content={"result": result},
-        tool_name=name,
-    )
-
-
 @pytest.mark.asyncio
 async def test_risk_score_below_threshold_allows_guarded_tool(
     conversation_store: SqlAlchemyConversationStore,
@@ -340,28 +323,13 @@ async def test_risk_score_web_searches_accrue_and_gate_send(
     assert gated.deciding_policy == "session_risk"
 
 
-@pytest.mark.asyncio
-async def test_risk_score_confidential_reads_accrue_and_gate(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """
-    Loaded from YAML: two reads returning a "Highly Confidential" label
-    (2×30 = 60) cross the threshold, gating drive_permission_create.
-
-    Claim: the label-in-result scoring path works through the real load + engine
-    pipeline, not just the unit-level callable.
-    """
-    engine = _load_engine_from_yaml(_RISK_SCORE, conversation_store)
-    confidential = json.dumps({"label_classification": "Highly Confidential"})
-    for _ in range(2):
-        read = await _enforce_policy(engine, _tool_result_ctx("docs_document_get", confidential))
-        assert read.action == PolicyAction.ALLOW  # +30 each
-    gated = await _enforce_policy(
-        engine, _tool_ctx("drive_permission_create", {"file_id": "1AbC"})
-    )
-    # 60 >= 50 → sharing is gated after reading confidential material.
-    assert gated.action == PolicyAction.ASK
-    assert gated.deciding_policy == "session_risk"
+# NOTE: the label-in-result scoring path (``sensitive_labels``) is intentionally
+# NOT exercised from this example YAML. There is no portable, cross-MCP
+# classification field to depend on (the field the demo previously used,
+# ``label_classification``, is specific to the Databricks-internal Google MCP),
+# so the shipped example leaves ``sensitive_labels`` commented out and drives the
+# threshold via ``tool_points`` alone. The label-scoring mechanism itself is
+# fully covered at the unit level in tests/policies/builtins/test_risk_score.py.
 
 
 # Scenario 10 (secure_research_agent_os_env.yaml) is NOT tested
@@ -375,3 +343,108 @@ async def test_risk_score_confidential_reads_accrue_and_gate(
 # structurally identical to scenario 9 above, which IS covered,
 # so the policy-engine behavior is not uncovered — only the
 # direct-from-YAML load path is blocked.
+
+
+# ─── info_flow_agent: built-in gdrive Bell-LaPadula "no write-down" ───
+
+
+_INFO_FLOW = _EXAMPLES_DIR / "info_flow_agent.yaml"
+
+# Must match the confidential_files entry declared in info_flow_agent.yaml.
+_CONF_DOC_ID = "1ConfidentialStrategyDocDEMO0000000000000000"
+
+
+def _read_result_ctx(name: str, file_id: str) -> EvaluationContext:
+    """
+    Build a TOOL_RESULT context for a Drive *read*, carrying ``request_data``.
+
+    The policy correlates the read with the file it targeted (via
+    ``request_data``) to decide whether a confidential file was read, so a
+    scenario must supply the target file id.
+
+    :param name: Read tool name, e.g. ``"mcp__google__docs_document_get"``.
+    :param file_id: The file the read targeted, echoed under ``request_data``.
+    :returns: A ready-to-enforce TOOL_RESULT context.
+    """
+    return EvaluationContext(
+        phase=Phase.TOOL_RESULT,
+        content={"result": "{}"},
+        tool_name=name,
+        request_data={"name": name, "arguments": {"document_id": file_id}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_info_flow_write_allowed_before_reading_confidential(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Loaded from YAML: before reading a confidential doc, writing elsewhere is fine.
+
+    Claim: the compartment rule imposes no constraint until the session has read
+    a confidential file.
+    """
+    engine = _load_engine_from_yaml(_INFO_FLOW, conversation_store)
+    # A create is allowed (allow_create: true) since no confidential read yet.
+    created = await _enforce_policy(
+        engine, _tool_ctx("mcp__google__docs_document_create", {"title": "notes"})
+    )
+    assert created.action == PolicyAction.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_info_flow_blocks_write_out_after_reading_confidential(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Loaded from YAML: reading the confidential doc then creating an outside file denies.
+
+    Reading the confidential doc latches the session; the follow-up
+    ``docs_document_create`` targets a brand-new (outside-compartment) file, a
+    write-down, and DENYs — the demo's headline "same action, different outcome,
+    because the state changed".
+
+    Claim: the confidential-read latch persists in session_state across
+    enforcement calls and drives the write-down gate through the real load +
+    engine pipeline.
+    """
+    engine = _load_engine_from_yaml(_INFO_FLOW, conversation_store)
+    read = await _enforce_policy(
+        engine,
+        _read_result_ctx("mcp__google__docs_document_get", _CONF_DOC_ID),
+    )
+    assert read.action == PolicyAction.ALLOW
+    create = await _enforce_policy(
+        engine,
+        _tool_ctx("mcp__google__docs_document_create", {"title": "leak"}),
+    )
+    assert create.action == PolicyAction.DENY
+    assert create.deciding_policy == "confidential_containment"
+
+
+@pytest.mark.asyncio
+async def test_info_flow_confidential_files_does_not_grant_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Loaded from YAML: declaring a file confidential does not make it writable.
+
+    The example lists the doc in ``confidential_files`` but not ``write_files``,
+    and the agent never created it, so a write to it is denied by the base write
+    rule — ``confidential_files`` is a containment declaration, not a write
+    grant. (The no-write-down check itself abstains here, since the target is in
+    the confidential set; the denial comes from the base scope rule.)
+
+    Claim: through the real load + engine pipeline, ``confidential_files`` does
+    not widen the write boundary.
+    """
+    engine = _load_engine_from_yaml(_INFO_FLOW, conversation_store)
+    await _enforce_policy(
+        engine,
+        _read_result_ctx("mcp__google__docs_document_get", _CONF_DOC_ID),
+    )
+    write = await _enforce_policy(
+        engine,
+        _tool_ctx("mcp__google__docs_document_batch_update", {"document_id": _CONF_DOC_ID}),
+    )
+    assert write.action == PolicyAction.DENY

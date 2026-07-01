@@ -16,7 +16,6 @@ transport-dependent probes as ``SKIPPED``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import shutil
 import uuid
@@ -33,6 +32,13 @@ from tests.harness_bench.profile import BenchProfile
 # Proto-style policy verdict strings the wrap's policy_verdict event accepts.
 POLICY_ALLOW = "POLICY_ACTION_ALLOW"
 POLICY_DENY = "POLICY_ACTION_DENY"
+
+# Proto-style policy evaluation phases (see _scaffold.evaluate_policy and
+# omnigent/native_policy_hook.py). A tool call is gated at PHASE_TOOL_CALL;
+# the request/result phases fire at other points in the turn. The policy
+# probe must scope its DENY to PHASE_TOOL_CALL so a DENY on the request
+# phase cannot masquerade as a tool-call guardrail pass.
+PHASE_TOOL_CALL = "PHASE_TOOL_CALL"
 
 _CONV_ID = "conv_bench"
 
@@ -111,9 +117,12 @@ class TurnResult:
         harness forwards any.
     :param tool_calls: The ``response.tool_call`` events observed, each a
         raw event dict carrying ``call_id`` / ``name`` / ``arguments``.
-    :param policy_actions: The verdict strings this driver posted back
-        (one per ``policy_evaluation.requested``), so a probe can tell a
-        DENY was actually delivered.
+    :param policy_actions: ``(phase, action)`` pairs this driver posted back
+        (one per ``policy_evaluation.requested``), so a probe can tell which
+        verdict was delivered for which phase.
+    :param tool_call_denied: Whether a ``PHASE_TOOL_CALL`` evaluation was
+        answered DENY — the only signal that proves a tool-call guardrail
+        (not a request/result-phase DENY) was actually exercised.
     :param completed: Whether a terminal ``response.completed`` was seen.
     :param cancelled: Whether a terminal ``response.cancelled`` was seen
         (the harness honored an interrupt).
@@ -128,7 +137,8 @@ class TurnResult:
     text_delta_count: int = 0
     reasoning_delta_count: int = 0
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    policy_actions: list[str] = field(default_factory=list)
+    policy_actions: list[tuple[str, str]] = field(default_factory=list)
+    tool_call_denied: bool = False
     completed: bool = False
     cancelled: bool = False
     failed: bool = False
@@ -171,11 +181,18 @@ class SdkInprocDriver:
     def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
         """Return a skip reason if this driver cannot run *profile*, else ``None``.
 
-        Checks, in order: a supplied Databricks profile (no gateway route
-        without one), and a runnable harness CLI binary. Mirrors the e2e
-        suite's gating so the bench skips — rather than errors — in
-        environments missing creds or a vendor CLI.
+        Checks, in order: the profile's transport matches this driver, a
+        supplied Databricks profile (no gateway route without one), and a
+        runnable harness CLI binary. Mirrors the e2e suite's gating so the
+        bench skips — rather than errors — in environments missing creds or
+        a vendor CLI, or when a profile declares a transport this driver
+        does not implement (e.g. a native/community harness).
         """
+        if profile.transport != SdkInprocDriver.transport:
+            return (
+                f"transport {profile.transport!r} not supported by the "
+                f"{SdkInprocDriver.transport!r} driver"
+            )
         if not databricks_profile:
             return "no --profile / databricks profile provided; live probes need a gateway route"
         if profile.cli_binary is not None:
@@ -212,7 +229,7 @@ class SdkInprocDriver:
         prompt: str,
         *,
         tools: list[dict[str, Any]] | None = None,
-        policy_action: str = POLICY_ALLOW,
+        deny_phases: frozenset[str] = frozenset(),
         policy_reason: str | None = None,
         auto_tool_output: str | None = None,
         interrupt_on_first_delta: bool = False,
@@ -222,10 +239,14 @@ class SdkInprocDriver:
 
         Handles the three downward round-trips the wrap may need mid-turn:
 
-        - ``policy_evaluation.requested`` → posts a ``policy_verdict`` with
-          *policy_action* (set ``POLICY_DENY`` to exercise enforcement).
-        - ``response.tool_call`` → when *auto_tool_output* is set, posts a
-          ``tool_result`` so a tool-calling turn can complete.
+        - ``policy_evaluation.requested`` → posts a ``policy_verdict``,
+          answering DENY only for evaluations whose ``phase`` is in
+          *deny_phases* and ALLOW otherwise. Scoping the DENY by phase is
+          what lets the policy probe prove a *tool-call* guardrail rather
+          than accidentally denying the request phase.
+        - ``response.output_item.done`` (function_call, action_required) →
+          when *auto_tool_output* is set, posts a ``tool_result`` so a
+          tool-calling turn can complete.
         - *interrupt_on_first_delta* → posts an ``interrupt`` event the
           first time text streams, to exercise cancellation.
 
@@ -233,7 +254,9 @@ class SdkInprocDriver:
         :param tools: Optional tool specs forwarded verbatim as the wrap's
             passthrough ``tools`` field (Chat-Completions shape:
             ``[{"type": "function", "function": {...}}]``).
-        :param policy_action: Verdict posted for every policy evaluation.
+        :param deny_phases: Policy phases to answer DENY (e.g.
+            ``{PHASE_TOOL_CALL}``); all other phases are answered ALLOW.
+            Empty (default) answers ALLOW to every phase.
         :param policy_reason: Reason string sent with a DENY verdict.
         :param auto_tool_output: Stringified output auto-returned for each
             tool call; ``None`` leaves tool calls unanswered.
@@ -258,7 +281,7 @@ class SdkInprocDriver:
                 self._drive(
                     body,
                     result,
-                    policy_action,
+                    deny_phases,
                     policy_reason,
                     auto_tool_output,
                     interrupt_on_first_delta,
@@ -273,7 +296,7 @@ class SdkInprocDriver:
         self,
         body: dict[str, Any],
         result: TurnResult,
-        policy_action: str,
+        deny_phases: frozenset[str],
         policy_reason: str | None,
         auto_tool_output: str | None,
         interrupt_on_first_delta: bool,
@@ -325,15 +348,25 @@ class SdkInprocDriver:
                                     }
                                 )
                     elif etype == "policy_evaluation.requested":
+                        # Answer DENY only for phases the caller asked to deny
+                        # (e.g. PHASE_TOOL_CALL); ALLOW every other phase so a
+                        # request/result-phase evaluation cannot be mistaken
+                        # for a tool-call guardrail.
+                        phase = str(event.get("phase", ""))
+                        action = POLICY_DENY if phase in deny_phases else POLICY_ALLOW
                         verdict: dict[str, Any] = {
                             "type": "policy_verdict",
                             "evaluation_id": event["evaluation_id"],
-                            "action": policy_action,
+                            "action": action,
                         }
-                        if policy_reason is not None:
+                        if action == POLICY_DENY and policy_reason is not None:
                             verdict["reason"] = policy_reason
-                        result.policy_actions.append(policy_action)
-                        await self._post(verdict)
+                        # Record only after a successful post, so a raced /
+                        # rejected verdict is not counted as delivered.
+                        if await self._post(verdict):
+                            result.policy_actions.append((phase, action))
+                            if action == POLICY_DENY and phase == PHASE_TOOL_CALL:
+                                result.tool_call_denied = True
                     elif etype == "response.completed":
                         result.completed = True
                     elif etype == "response.cancelled":
@@ -342,16 +375,23 @@ class SdkInprocDriver:
                         result.failed = True
                         result.error = event.get("error") or event.get("response", {}).get("error")
 
-    async def _post(self, payload: dict[str, Any]) -> None:
+    async def _post(self, payload: dict[str, Any]) -> bool:
         """POST a downward event on the wrap's events endpoint (best-effort).
 
         Downward events race the turn's terminal state (e.g. an interrupt
         landing just as the turn ends). A failed post here is benign — the
         probe reads the outcome from the stream — so the error is suppressed.
+
+        :returns: ``True`` if the post got a non-error response, else
+            ``False``. Callers that record a verdict as "delivered" gate on
+            this so a raced/rejected post is not counted.
         """
         assert self._client is not None
-        with contextlib.suppress(httpx.HTTPError):
-            await self._client.post(f"/v1/sessions/{_CONV_ID}/events", json=payload)
+        try:
+            resp = await self._client.post(f"/v1/sessions/{_CONV_ID}/events", json=payload)
+        except httpx.HTTPError:
+            return False
+        return not resp.is_error
 
 
 # Reasoning-delta event names vary across harness wraps; match the common

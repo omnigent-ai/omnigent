@@ -3907,6 +3907,121 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     assert settings_data.get("showFeedbackSurvey") is False
 
 
+@pytest.mark.asyncio
+async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--gemini_dir`` is inserted right after the binary, ahead of every other flag.
+
+    The sibling relay-wiring test mocks ``build_agy_launch`` to emit no flags, so it
+    cannot prove the insertion does not corrupt the order of the REAL generated
+    flags (``--conversation``, ``--model``, ``--dangerously-skip-permissions``, and
+    pass-through ``extra_args``). agy global flags must precede any positional /
+    subcommand token, so ``--gemini_dir`` is prepended at index 0 and the rest of
+    argv is preserved verbatim. This guards that invariant against a future change
+    to the argv-composition line in ``_auto_create_antigravity_terminal``.
+    """
+    import omnigent.antigravity_native_bridge as bridge_mod
+    import omnigent.antigravity_native_launch as launch_mod
+    import omnigent.antigravity_native_reader as reader_mod
+    import omnigent.antigravity_native_rpc as rpc_mod
+    import omnigent.runner.app as runner_app_mod
+
+    session_id = "conv_agy_argv"
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
+    monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
+    monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
+
+    # A realistic build_agy_launch output: binary + a full set of generated flags.
+    # The argv-composition line must preserve these verbatim after the prepend.
+    generated_tail = [
+        "--conversation",
+        "abc-123",
+        "--model",
+        "gemini-2.5-pro",
+        "--dangerously-skip-permissions",
+        "--print-timeout",
+        "30",
+    ]
+    monkeypatch.setattr(
+        launch_mod,
+        "build_agy_launch",
+        lambda **_kwargs: (("agy", *generated_tail), {}),
+    )
+
+    def _noop_reader(*_args: Any, **_kwargs: Any) -> Any:
+        async def _runner() -> None:
+            await asyncio.Event().wait()
+
+        return _runner()
+
+    monkeypatch.setattr(reader_mod, "supervise_reader", _noop_reader)
+
+    async def _recording_relay(_session_id_arg: str, **_kwargs: Any) -> None:
+        return None
+
+    captured_spec: dict[str, Any] = {}
+    snapshot = {"workspace": str(tmp_path / "workspace")}
+
+    class _SnapshotServerClient:
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+        async def patch(self, url: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
+            del json
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            captured_spec["command"] = spec.command
+            captured_spec["args"] = list(spec.args)
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=session_id,
+                name="Antigravity",
+            )
+
+    try:
+        await _auto_create_antigravity_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+            ensure_comment_relay=_recording_relay,
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+    iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
+
+    # The terminal command stays the agy binary; --gemini_dir leads the arg list and
+    # every generated flag follows in its original order (none dropped or reordered).
+    assert captured_spec["command"] == "agy"
+    assert captured_spec["args"] == [f"--gemini_dir={iso_gemini}", *generated_tail]
+
+
 @pytest.mark.parametrize("parent_host_id", ["host_parent", None])
 @pytest.mark.asyncio
 async def test_codex_subagent_always_needs_runner_terminal(

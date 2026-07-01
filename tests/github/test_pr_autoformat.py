@@ -34,3 +34,11 @@ def test_preserves_existing_sections_and_adds_missing_optional_context() -> None
     assert "## Diagram" in formatted
     assert "## Test Plan" in formatted
     assert "## Coverage notes" in formatted
+    assert "## Changelog" in formatted
+
+
+def test_scaffolds_changelog_section_with_skip_default() -> None:
+    formatted = pr_autoformat.format_body("Fix the important thing.")
+    assert "## Changelog" in formatted
+    # The scaffolded section defaults to the `skip` sentinel.
+    assert formatted.rstrip().endswith("skip")

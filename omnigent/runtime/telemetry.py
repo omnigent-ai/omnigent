@@ -399,10 +399,17 @@ def _instrument_httpx() -> None:
     runner reverse-tunnel (whose transport forwards request headers
     verbatim), and the native-harness policy HTTP hook.
 
+    Disabled when ``OMNIGENT_OTEL_HTTP_CLIENT_INSTRUMENTATION=false``.
+    Set this to suppress internal API call spans (server↔runner↔harness
+    requests) from appearing in the trace backend alongside agent spans.
+
     Idempotent: ``HTTPXClientInstrumentor`` no-ops if already
     instrumented. Failures degrade quietly — tracing is best-effort and
     must never break request handling.
     """
+    explicit = os.environ.get("OMNIGENT_OTEL_HTTP_CLIENT_INSTRUMENTATION")
+    if explicit is not None and explicit.strip().lower() not in ("true", "1", "yes"):
+        return
     try:
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 

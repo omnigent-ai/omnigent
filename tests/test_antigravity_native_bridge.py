@@ -1367,6 +1367,58 @@ def test_agy_gemini_dir_is_under_agy_home_dir(tmp_path: Path) -> None:
     assert agy_gemini_dir(bridge_dir) == agy_home_dir(bridge_dir) / ".gemini"
 
 
+def test_seeding_and_mcp_config_never_mutate_real_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Linux non-regression: the user's real ``~/.gemini`` is read-only to setup.
+
+    This is the central promise of the ``--gemini_dir`` design: keeping the real
+    ``HOME`` must NOT reintroduce the clobber/concurrency footgun the prior
+    isolated-HOME design avoided. Both setup steps that touch the real
+    ``~/.gemini`` — ``seed_isolated_agy_home`` (COPIES the OAuth markers out) and
+    ``write_mcp_config`` (writes the relay config) — must leave a fully populated
+    real ``~/.gemini`` (interactive-agy user with their own MCP config) byte-for-byte
+    untouched, writing only under the per-session isolated Gemini dir.
+    """
+    fake_home = tmp_path / "real-home"
+    real_gemini = fake_home / ".gemini"
+    (real_gemini / "antigravity-cli").mkdir(parents=True)
+    (real_gemini / "config").mkdir(parents=True)
+    # Populate the real tree as a logged-in interactive-agy user would have it,
+    # including their OWN mcp_config.json the design must never clobber.
+    seeded_files = {
+        real_gemini / "oauth_creds.json": '{"access_token":"mac-token"}',
+        real_gemini / "installation_id": "root-install-id",
+        real_gemini / "antigravity-cli" / "antigravity-oauth-token": "linux-token",
+        real_gemini / "antigravity-cli" / "installation_id": "cli-install-id",
+        real_gemini / "config" / "mcp_config.json": '{"mcpServers":{"user_own":{}}}',
+    }
+    for path, body in seeded_files.items():
+        path.write_text(body, encoding="utf-8")
+    before = {path: path.read_text(encoding="utf-8") for path in seeded_files}
+    real_listing_before = sorted(
+        p.relative_to(real_gemini).as_posix() for p in real_gemini.rglob("*")
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    write_mcp_config(bridge_dir, python_executable="python-test")
+
+    # Every real file is byte-for-byte unchanged: nothing copied OUT was mutated,
+    # and the user's own mcp_config.json was NOT overwritten by the relay config.
+    for path, original in before.items():
+        assert path.read_text(encoding="utf-8") == original
+    # No new files leaked into the real tree (e.g. a relay config under real config/).
+    real_listing_after = sorted(
+        p.relative_to(real_gemini).as_posix() for p in real_gemini.rglob("*")
+    )
+    assert real_listing_after == real_listing_before
+    # The relay config DID land in the isolated tree (positive control).
+    assert (agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json").is_file()
+
+
 # ---------------------------------------------------------------------------
 # Interaction-prompt TUI delivery (send_interaction_keys_via_tui) — #1200
 # ---------------------------------------------------------------------------
