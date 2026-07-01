@@ -13,25 +13,27 @@
  *   home of the theme control that used to sit in the sidebar header.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
- *   the old sidebar AccountMenu: signed-in identity, admin-only Members /
- *   Policies links, change password, and sign out.
+ *   the old sidebar AccountMenu: signed-in identity, change password, and
+ *   sign out.
+ * - **Members** / **Policies** — admin-only, accounts deploys. Server-wide
+ *   management surfaces rendered as settings sub-categories (previously
+ *   standalone `/members` and `/policies` pages linked from Account) so
+ *   entering them stays inside settings — the sidebar keeps the section nav
+ *   instead of snapping back to the conversation list.
  * - **Archived sessions** — archived sessions, moved out of the sidebar
  *   list. Not clickable; each row reveals Delete / Unarchive on hover.
  */
 
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArchiveRestoreIcon,
   KeyRoundIcon,
   LogOutIcon,
-  ShieldCheckIcon,
   Trash2Icon,
   UserCogIcon,
-  UsersIcon,
 } from "lucide-react";
 import { LaptopMinimalIcon, MoonIcon, SunIcon } from "lucide-react";
 import { useTheme } from "next-themes";
-import { Link } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -60,6 +62,17 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
+// Admin-only management surfaces, rendered as the Members / Policies settings
+// sub-categories. Lazy-loaded so non-accounts deploys (where these sections
+// never appear) don't pull them into the settings chunk — mirrors the
+// route-level lazy loading these had when they were standalone pages.
+const MembersPage = lazy(() =>
+  import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
+);
+const PoliciesPage = lazy(() =>
+  import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
+);
+
 /**
  * Settings content panel. The section nav lives in the sidebar card
  * (SettingsSidebarBody); this renders only the selected section into the
@@ -71,6 +84,18 @@ export function SettingsPage() {
   const info = useServerInfo();
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
   const { section } = useSettingsRoute();
+
+  // Members / Policies are admin-only management surfaces that own their full
+  // layout (their own PageScroll + admin gating), so they render directly —
+  // NOT inside the shared section PageScroll below, which would nest two
+  // scroll containers. Both self-gate to admins server-side and client-side.
+  if (accountsEnabled && (section === "members" || section === "policies")) {
+    return (
+      <Suspense fallback={null}>
+        {section === "members" ? <MembersPage /> : <PoliciesPage />}
+      </Suspense>
+    );
+  }
 
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
@@ -324,20 +349,10 @@ function AccountSection() {
           </div>
         </div>
 
-        {me.is_admin && (
-          <div className="flex flex-col gap-1">
-            <Button asChild variant="ghost" className="w-full justify-start gap-2">
-              <Link to="/members">
-                <UsersIcon className="size-4" /> Members
-              </Link>
-            </Button>
-            <Button asChild variant="ghost" className="w-full justify-start gap-2">
-              <Link to="/policies">
-                <ShieldCheckIcon className="size-4" /> Policies
-              </Link>
-            </Button>
-          </div>
-        )}
+        {/* Members / Policies used to live here as links to standalone pages.
+            They're now first-class settings sub-categories in the sidebar nav
+            (Admin group), so entering them keeps the settings surface put
+            instead of navigating away from /settings. */}
 
         <div className="flex flex-col gap-1">
           <Button

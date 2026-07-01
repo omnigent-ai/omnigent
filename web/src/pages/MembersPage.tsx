@@ -1,5 +1,6 @@
 /**
- * Admin members management page (``/members``).
+ * Admin members management page (``/settings/members``; the legacy
+ * ``/members`` path redirects here). Rendered as a Settings sub-category.
  *
  * Lists every account on the server and lets admins:
  *

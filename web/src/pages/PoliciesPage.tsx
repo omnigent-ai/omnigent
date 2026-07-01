@@ -1,5 +1,6 @@
 /**
- * Admin default-policies management page (``/policies``).
+ * Admin default-policies management page (``/settings/policies``; the legacy
+ * ``/policies`` path redirects here). Rendered as a Settings sub-category.
  *
  * Lists every global default policy and lets admins add, toggle,
  * and remove them. The add-policy dialog reuses the same registry-
