@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -43,6 +43,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server._api_only_landing import API_ONLY_LANDING_HTML
 from omnigent.server.auth import AuthProvider
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -2269,7 +2270,8 @@ def create_app(
             app.include_router(router, prefix=prefix, tags=tags)
 
     web_ui_dist = _WEB_UI_DIST
-    if web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file():
+    web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
+    if web_ui_present:
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
@@ -2279,26 +2281,16 @@ def create_app(
             name="web-ui",
         )
     else:
+        # No SPA bundle (API-only build, or an install that skipped the web
+        # UI). The "/" route isn't used for anything else, so just always serve
+        # a short HTML explainer there with a 200 — no content negotiation. A
+        # normal install bundles the UI and the static mount above owns "/", so
+        # this only applies to API-only servers.
 
         @app.get("/", include_in_schema=False)
-        async def root() -> dict[str, str]:
-            """
-            Return API server metadata when no web UI build is bundled.
-
-            Databricks Apps opens the app URL at ``/`` in a browser.
-            API-only wheels intentionally omit the SPA assets, so serve
-            a small JSON landing response instead of FastAPI's generic
-            404. When a web UI build is present, the static mount above
-            owns ``/`` and this fallback is not registered.
-
-            :returns: Service metadata with health and docs paths.
-            """
-            return {
-                "service": "omnigent",
-                "status": "ok",
-                "health": "/health",
-                "docs": "/docs",
-            }
+        async def root() -> HTMLResponse:
+            """Serve the API-only landing page (no web UI bundle present)."""
+            return HTMLResponse(API_ONLY_LANDING_HTML)
 
     return app
 
