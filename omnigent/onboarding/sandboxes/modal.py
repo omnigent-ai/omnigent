@@ -28,6 +28,7 @@ Platform constraints that shape this launcher:
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -87,11 +88,14 @@ the WORKLOAD's environment. The server's managed-host config
 _SANDBOX_CPU: float = 2.0
 _SANDBOX_MEMORY_MIB: int = 4096
 
-# Where exec_foreground records the remote process's pid so Ctrl-C on
-# the local side can kill it (the SDK has no kill API for exec'd
-# processes). One foreground process per sandbox at a time, by design —
-# it holds the local terminal.
-_FOREGROUND_PIDFILE: str = "/tmp/oa-foreground.pid"
+# Prefix for the private dir exec_foreground creates to record the remote
+# process's pid so Ctrl-C on the local side can kill it (the SDK has no kill
+# API for exec'd processes). One foreground process per sandbox at a time, by
+# design — it holds the local terminal. The dir carries an unpredictable random
+# suffix and is created mode 700 with a bare `mkdir` that fails closed if the
+# path already exists, so a co-tenant on the sandbox can't pre-create, symlink,
+# or read the pidfile in the world-writable /tmp it lives under.
+_FOREGROUND_RUNDIR_PREFIX: str = "/tmp/oa-foreground-"
 
 
 def _ensure_sdk() -> None:
@@ -521,7 +525,15 @@ class ModalSandboxLauncher(SandboxLauncher):
             process when the user detaches with Ctrl-C.
         """
         handle = self._resolve(sandbox_id)
-        remote = f"echo $$ > {_FOREGROUND_PIDFILE} && TERM=xterm-256color exec {command}"
+        # Record the pid in a private, unpredictably-named dir under /tmp.
+        # `mkdir -m 700` (no -p) fails closed if the path already exists, so a
+        # co-tenant on the sandbox can't pre-seed a symlink we'd write through,
+        # nor read our pid back, in world-writable /tmp.
+        run_dir = f"{_FOREGROUND_RUNDIR_PREFIX}{secrets.token_hex(16)}"
+        pidfile = f"{run_dir}/pid"
+        remote = (
+            f"mkdir -m 700 {run_dir} && echo $$ > {pidfile} && TERM=xterm-256color exec {command}"
+        )
         process = handle.exec("bash", "-lc", remote, pty=True)
         try:
             for line in process.stdout:
@@ -529,7 +541,14 @@ class ModalSandboxLauncher(SandboxLauncher):
             return process.wait()
         except KeyboardInterrupt:
             click.echo("\n  → detaching; stopping the remote process")
-            handle.exec("bash", "-c", f"kill $(cat {_FOREGROUND_PIDFILE}) 2>/dev/null").wait()
+            # Signal only a numeric pid read back from our own private pidfile,
+            # then drop the dir; never feed unvalidated file contents to kill.
+            kill = (
+                f"pid=$(cat {pidfile} 2>/dev/null); "
+                f'case "$pid" in ""|*[!0-9]*) ;; *) kill "$pid" 2>/dev/null ;; esac; '
+                f"rm -rf {run_dir}"
+            )
+            handle.exec("bash", "-c", kill).wait()
             raise
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
