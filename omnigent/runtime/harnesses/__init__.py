@@ -143,6 +143,13 @@ _HARNESS_MODULES: dict[str, str] = {
     # name stays the headless subprocess harness. See
     # omnigent/inner/hermes_native_harness.py.
     "hermes-native": "omnigent.inner.hermes_native_harness",
+    # Rovo Dev harness wrap. See omnigent/inner/rovo_harness.py. Drives
+    # Atlassian Rovo Dev's ACP server (``acli rovodev acp``) over stdio.
+    # Like the SDK harnesses (and unlike ``*-native``), it owns its own ACP
+    # session rather than an on-disk TUI transcript.
+    "rovo-cli": "omnigent.inner.rovo_harness",
+    # User-facing alias accepted in specs / Omnigent harness dispatch.
+    "rovo": "omnigent.inner.rovo_harness",
 }
 
 __all__ = ["_HARNESS_MODULES"]

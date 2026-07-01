@@ -220,6 +220,15 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    ``rovo-cli`` is excluded for the same reason as ``cursor`` / ``copilot`` /
+    ``qwen`` / ``goose``: it requires the ``acli`` CLI binary and authenticates
+    through ``acli rovodev auth login`` against Atlassian's backend, not the
+    shared ``HARNESS_<HARNESS>_GATEWAY`` / ``DATABRICKS_PROFILE`` probe wiring
+    this matrix drives (its ``_build_spawn_env_from_spec`` branch emits only
+    ``HARNESS_ROVO_MODEL``, no gateway vars), so it cannot be pointed at the mock
+    LLM server. Its live round-trip is covered by the gated
+    ``tests/inner/test_rovo_live_e2e.py`` (runs with ``OMNIGENT_RUN_ROVO_LIVE=1``).
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -240,5 +249,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        "rovo-cli",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

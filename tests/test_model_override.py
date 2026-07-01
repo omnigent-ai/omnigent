@@ -94,6 +94,10 @@ def test_validate_model_override_rejects_unsafe_values(value: str) -> None:
         "antigravity",
         "kiro-native",
         "native-kiro",
+        # rovo-cli plumbs the override via HARNESS_ROVO_MODEL + ACP set_model.
+        "rovo-cli",
+        # The "rovo" shorthand canonicalizes to rovo-cli, so it must report too.
+        "rovo",
     ],
 )
 def test_harness_supports_model_override_for_plumbed_harnesses(harness: str) -> None:
@@ -164,10 +168,16 @@ class TestModelFamilyMismatch:
             ("antigravity", "gemini-2.5-pro"),
             ("kiro-native", "claude-sonnet-4.5"),
             ("native-kiro", "gpt-5.4-mini"),
+            # rovo-cli is multi-model (its ACP session advertised Claude, GPT,
+            # and Gemini families), so it accepts any validated id like pi.
+            ("rovo-cli", "databricks-claude-sonnet-4-6"),
+            ("rovo-cli", "gpt-5.4-mini"),
+            ("rovo-cli", "databricks-meta-llama-3.3-70b-instruct"),
+            ("rovo", "databricks-claude-opus-4-8"),
         ],
     )
     def test_compatible_pairs_pass(self, harness: str, model: str) -> None:
-        """A matching family (or a multi-model harness: pi, openai-agents) returns None."""
+        """A matching family (or a multi-model harness: pi, openai-agents, rovo) returns None."""
         assert model_family_mismatch(harness, model) is None
 
     @pytest.mark.parametrize(
