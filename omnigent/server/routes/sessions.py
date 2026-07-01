@@ -8881,6 +8881,8 @@ async def _dispatch_session_event_to_runner(
         _native_routing_enabled = (
             conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
         ) or _native_parent_routing_on
+        _native_routed_model: str | None = None
+        _native_verdict: dict[str, Any] | None = None
         if conv.model_override is None and _native_routing_enabled:
             from omnigent.server.smart_routing import route_turn
 
@@ -8888,18 +8890,18 @@ async def _dispatch_session_event_to_runner(
             _user_text = _extract_user_text_for_routing(body)
             if _user_text:
                 _native_runner_client = await _get_runner_client(session_id, runner_router)
-                _routed_model, _verdict = await route_turn(
+                _native_routed_model, _native_verdict = await route_turn(
                     _harness,
                     _user_text,
                     session_id=session_id,
                     runner_client=_native_runner_client,
                 )
-                if _routed_model is not None:
+                if _native_routed_model is not None:
                     try:
                         await asyncio.to_thread(
                             conversation_store.update_conversation,
                             session_id,
-                            model_override=_routed_model,
+                            model_override=_native_routed_model,
                         )
                     except (OSError, ValueError):
                         _logger.warning(
@@ -8907,19 +8909,13 @@ async def _dispatch_session_event_to_runner(
                             session_id,
                             exc_info=True,
                         )
-                    await _emit_server_routing_decision(
-                        session_id,
-                        conversation_store,
-                        _routed_model,
-                        _verdict or {},
-                    )
                     # For claude-native: inject /model into the running
                     # terminal so the change takes effect immediately
                     # (model_override alone is only applied at spawn).
                     try:
                         await runner_client.post(
                             f"/v1/sessions/{session_id}/events",
-                            json={"type": "model_change", "model": _routed_model},
+                            json={"type": "model_change", "model": _native_routed_model},
                             timeout=5.0,
                         )
                     except httpx.HTTPError:
@@ -8943,6 +8939,16 @@ async def _dispatch_session_event_to_runner(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+        # Emit the routing chip AFTER forwarding the message to the
+        # terminal so the live SSE stream delivers the user bubble
+        # (echoed back by the CLI) before the chip.
+        if _native_routed_model is not None and _native_verdict is not None:
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                _native_routed_model,
+                _native_verdict,
+            )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,
