@@ -127,10 +127,14 @@ _CLAUDE_PROMPT_GLYPH = "❯"
 # How many trailing non-empty lines to scan for the prompt glyph. The
 # input box sits near the bottom of the pane; scanning only the tail
 # avoids false positives from the glyph appearing in scrollback output.
-# The window has to clear the footer rendered below the box — some
-# people's statuslines run ~3 lines — so the ``❯`` row isn't the last
-# non-empty line.
-_PROMPT_SCAN_TAIL_LINES = 5
+# The window has to clear the footer rendered below the box, which on
+# real user configs is more than a few lines: a multi-line custom
+# statusline, Claude Code's own mode indicator (e.g. ``⏵⏵ auto mode
+# on``), and the box's bottom border all sit below the ``❯`` row. A
+# 4-line statusline already pushes the glyph to the 6th-from-last line,
+# so a tight window (was 5) misses it and readiness never fires. Keep
+# generous headroom.
+_PROMPT_SCAN_TAIL_LINES = 10
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
