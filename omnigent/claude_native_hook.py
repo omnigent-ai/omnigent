@@ -617,9 +617,26 @@ def _post_hook_with_reattach(
       not by elapsed wall-clock, is what makes "a slow human is never capped"
       hold even when the proxy severs every 30-60s.
 
-    A hard 4xx is final (bad request won't succeed on retry). An absolute
-    :data:`_PERMISSION_TIMEOUT_S` ceiling still bounds the total wait as a
-    backstop, matching the day-long human-answer window.
+    A hard 4xx is final (bad request won't succeed on retry).
+
+    Residual limitation (by design): a *sick* backend behind a proxy/LB that
+    accepts the connection and then silently severs it after its upstream
+    timeout (>= the floor) is indistinguishable at the transport layer from a
+    proxy severing a genuinely-parked human poll — both surface as an
+    established-then-severed error after N seconds, and the server holds the
+    POST silently with no client-visible "parked" ack. So this case resets the
+    counter and is NOT caught by the consecutive-hard-failure cap; it is bounded
+    only by the absolute :data:`_PERMISSION_TIMEOUT_S` ceiling below (the same
+    day-long human-answer window). That is the tightest safe client-side bound:
+    capping it sooner would necessarily cap a real slow human on the same
+    topology. The blast radius is limited — this loop only re-POSTs over HTTP
+    from one hook process (it does not itself respawn harness/tool
+    subprocesses), and the host-side orphan reaper (#1782 Bug A) reclaims any
+    subprocesses a re-driven turn does spawn — so the worst case is one hook
+    slow-retrying for up to a day, not the original zombie pileup.
+
+    The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
+    every path, matching the day-long human-answer window.
 
     :param url: Absolute hook endpoint URL, e.g.
         ``"http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request"``.

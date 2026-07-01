@@ -2286,6 +2286,50 @@ def test_reattach_fast_flapping_connection_is_hard_failure(
     )
 
 
+def test_reattach_never_resolving_severs_are_bounded_by_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sick backend behind a holding proxy still terminates (#1782 review).
+
+    The known residual: a dead backend behind a proxy that accepts then
+    silently severs a held connection (>= the floor) is transport-
+    indistinguishable from a proxy severing a genuinely-parked human poll, so
+    every sever RESETS the consecutive-hard-failure counter and the cap is
+    never reached. This must NOT be an infinite loop — the absolute
+    ``_PERMISSION_TIMEOUT_S`` deadline has to bound it. Here every attempt is a
+    ~15s held sever that never resolves; the loop must eventually return
+    ``None`` (fail-ask) once the day-long budget elapses, not spin forever.
+    """
+    # Each attempt: an established connection held ~15s (> floor) then severed,
+    # never a success. The counter resets every time, so only the deadline can
+    # stop it. Fake clock advances 15s per attempt + 30s backoff.
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 5.0  # 15s: a held sever
+    client = _scripted_client(script=[("severed", held)], monkeypatch=monkeypatch)
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is None, "a never-resolving held-sever spin must fail-ask, not loop forever"
+    # It resets the counter every time (never hits the cap of 8), so it ran far
+    # more than the cap and stopped only when the ~1-day deadline elapsed.
+    assert len(client.calls) > claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES, (
+        "held severs must reset the cap; the deadline (not the cap) bounds this path"
+    )
+    # And it is genuinely bounded by the deadline. In this harness only post()
+    # advances the fake clock (by ``held``); the backoff sleep is a no-op, so
+    # the loop runs ~deadline/held times. (In production the real backoff sleep
+    # also elapses, so the real-world count is strictly lower.) Assert the
+    # count matches that ceiling — proving the deadline, not an accident, stops
+    # it — and stays comfortably below a runaway.
+    max_expected = claude_native_hook._PERMISSION_TIMEOUT_S / held + 2
+    assert len(client.calls) <= max_expected, "deadline did not bound the reset-forever path"
+
+
 def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """A 2xx on the first try returns immediately (no regression).
 
