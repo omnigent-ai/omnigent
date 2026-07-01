@@ -59,7 +59,18 @@ const ELICITATION_BODY = "Agent is asking for your input.";
  */
 function useLazyPermissionRequest(): void {
   useEffect(() => {
-    if (getNotificationPermission() !== "default") return;
+    const current = getNotificationPermission();
+    // Already granted from a prior session, another device, or because the
+    // user enabled notifications in site settings: (re)subscribe to Web Push
+    // now. We otherwise only subscribe on the default→granted transition
+    // below, so a browser that is granted-but-unsubscribed (cleared push
+    // registration, or permission flipped on outside the app) would never
+    // register with the server (#8). Best-effort + feature-detected.
+    if (current === "granted") {
+      void enablePushNotifications().catch(() => {});
+      return;
+    }
+    if (current !== "default") return;
     const handler = () => {
       // Promise.resolve wraps the call so a non-Promise return is handled
       // gracefully (and keeps the unit test's simple mock happy).
