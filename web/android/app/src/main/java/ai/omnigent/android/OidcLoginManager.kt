@@ -97,6 +97,11 @@ class OidcLoginManager {
             val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
             val id = json.optString("ticket").ifEmpty { return null }
             val loginUrl = json.optString("login_url").ifEmpty { return null }
+            // The browser hand-off must stay on the pinned origin: [start]
+            // concatenates this onto it, so only a relative path may pass — an
+            // absolute URL or a scheme-relative `//host` would send the one-time
+            // ticket flow to a server-chosen destination instead.
+            if (!loginUrl.startsWith("/") || loginUrl.startsWith("//")) return null
             Ticket(id, loginUrl)
         } finally {
             conn.disconnect()

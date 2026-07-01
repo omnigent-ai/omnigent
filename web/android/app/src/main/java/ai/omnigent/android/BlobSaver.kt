@@ -83,7 +83,11 @@ class BlobSaver(private val context: Context) {
         }.getOrDefault(false)
 
     private fun safeFileName(suggested: String): String {
-        val cleaned = suggested.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._-]"), "_")
+        // Basename past either separator style — a Windows-flavored "foo\bar.txt"
+        // suggestion should save as "bar.txt", not "foo_bar.txt".
+        val cleaned =
+            suggested.substringAfterLast('/').substringAfterLast('\\')
+                .replace(Regex("[^A-Za-z0-9._-]"), "_")
         // "" / "." / ".." aren't usable names — on the API 28 File path "." and
         // ".." resolve to a directory, so the write would fail. Fall back instead.
         return if (cleaned.isBlank() || cleaned == "." || cleaned == "..") {

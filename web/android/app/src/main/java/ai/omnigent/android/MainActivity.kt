@@ -310,6 +310,10 @@ class MainActivity : ComponentActivity() {
             // setCookie's callback is async — re-check the WebView is still alive.
             if (isDestroyed || !::webView.isInitialized) return@setCookie
             authLog("setCookie accepted=$accepted present=${cookies.getCookie(origin)?.contains(name) == true}")
+            // A rejected cookie means the reload would land unauthenticated,
+            // bounce to login, and re-launch the browser — burning the retry
+            // budget on a failure that retrying can't fix. Stay put instead.
+            if (!accepted) return@setCookie
             cookies.flush()
             webView.loadUrl(origin)
         }
@@ -384,6 +388,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun flushPendingActivation() {
+        // A tap can arrive (onNewIntent) while the WebView is parked off-origin —
+        // e.g. mid re-login — where the bridge facade doesn't exist, so emitting
+        // would silently drop the path. Keep it pending; the next pinned-origin
+        // onPageReady flushes it.
+        if (originOf(webView.url) != pinnedOrigin) return
         emitNotificationActivation(pendingNavigatePath)
         pendingNavigatePath = null
     }
@@ -503,7 +512,10 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        if (!url.startsWith("http")) return
+        // Same normalization as the navigation gate: accepts odd casing
+        // ("HTTPS://") and rejects non-http lookalikes ("httpfoo:"), which
+        // DownloadManager.Request would otherwise throw on.
+        if (!isHttpScheme(Uri.parse(url).scheme)) return
         val request =
             DownloadManager.Request(Uri.parse(url)).apply {
                 setMimeType(mimeType)
