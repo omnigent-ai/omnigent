@@ -304,6 +304,11 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
+# Schedule/loop & monitor builtins (#6, #12). Like the comment tools, the
+# runner has no in-process ScheduleStore, so these proxy to the server's REST
+# API over server_client (see _execute_schedule_tool).
+_SCHEDULE_TOOLS = frozenset({"create_loop", "create_monitor", "list_schedules", "delete_schedule"})
+
 # Builtin tools the claude-native / codex-native relay advertises to the
 # real CLI, beyond the always-relayed ``sys_os_*`` family. Native harnesses
 # ignore the harness ``tools`` list, so the relay is their ONLY tool
@@ -331,6 +336,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    | _SCHEDULE_TOOLS
 )
 
 
@@ -467,6 +473,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _SCHEDULE_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -2559,6 +2566,92 @@ async def _execute_comment_tool(
         return json.dumps({"error": f"update_comment failed: {exc}"})
 
 
+async def _execute_schedule_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Runner-local handler for the schedule (loop & monitor) builtins (#6, #12).
+
+    The runner has no in-process ScheduleStore, so — like the comment tools —
+    these proxy to the Omnigent server's REST API over ``server_client``:
+    ``/v1/schedules`` (POST create, GET list, DELETE). The conversation-scoped
+    tools (create_loop, create_monitor, list_schedules) default to the current
+    ``conversation_id`` when the arg is omitted.
+
+    :param tool_name: One of :data:`_SCHEDULE_TOOLS`.
+    :param arguments: JSON-encoded args from the LLM.
+    :param conversation_id: Current session id, used as the default scope.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: A JSON result/error string for the agent.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    def _result(resp: httpx.Response) -> str:
+        if resp.status_code >= 400:
+            return json.dumps(
+                {"error": f"{tool_name} returned HTTP {resp.status_code}: {resp.text[:300]}"}
+            )
+        return json.dumps(resp.json())
+
+    # The conversation id for the tools scoped to one.
+    scoped_conv = args.get("conversation_id") or conversation_id
+
+    try:
+        if tool_name == "create_loop":
+            if not scoped_conv:
+                return json.dumps({"error": "create_loop requires a session id"})
+            body = {
+                "conversation_id": scoped_conv,
+                "name": args.get("name"),
+                "kind": "loop",
+                "prompt": args.get("prompt"),
+                "cron": args.get("cron"),
+            }
+            return _result(await server_client.post("/v1/schedules", json=body, timeout=30.0))
+
+        if tool_name == "create_monitor":
+            if not scoped_conv:
+                return json.dumps({"error": "create_monitor requires a session id"})
+            body = {
+                "conversation_id": scoped_conv,
+                "name": args.get("name"),
+                "kind": "monitor",
+                "prompt": args.get("prompt"),
+                "command": args.get("command"),
+            }
+            return _result(await server_client.post("/v1/schedules", json=body, timeout=30.0))
+
+        if tool_name == "list_schedules":
+            if not scoped_conv:
+                return json.dumps({"error": "list_schedules requires a session id"})
+            return _result(
+                await server_client.get(
+                    "/v1/schedules", params={"conversation_id": scoped_conv}, timeout=30.0
+                )
+            )
+
+        if tool_name == "delete_schedule":
+            schedule_id = args.get("schedule_id")
+            if not schedule_id:
+                return json.dumps({"error": "missing required argument: schedule_id"})
+            return _result(
+                await server_client.delete(f"/v1/schedules/{schedule_id}", timeout=30.0)
+            )
+
+        return json.dumps({"error": f"unknown schedule tool: {tool_name}"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -4173,6 +4266,13 @@ async def execute_tool(
             )
         elif tool_name in _POLICY_TOOLS:
             output = await _execute_policy_tool(
+                tool_name,
+                arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+            )
+        elif tool_name in _SCHEDULE_TOOLS:
+            output = await _execute_schedule_tool(
                 tool_name,
                 arguments,
                 conversation_id=conversation_id,
