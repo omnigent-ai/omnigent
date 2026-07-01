@@ -125,7 +125,7 @@ def upgrade() -> None:
         sa.Column("agent_name", sa.String(length=256), nullable=False),
         sa.Column("background", sa.Boolean(), nullable=False),
         sa.Column("root_task_id", sa.String(length=64), nullable=True),
-        # Immediate parent task_id (distinct from
+        # Audit fix #1: immediate parent task_id (distinct from
         # root_task_id when a sub-agent creates children). The
         # PATCH async_tool_results handler signals this, so the
         # immediate calling agent's drain wakes — not the root.
