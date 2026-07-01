@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from omnigent.harnesses.capabilities import HarnessCapabilities
 from omnigent.native_coding_agents import NativeCodingAgent
 
 
@@ -50,6 +51,8 @@ class HarnessDescriptor:
     :param supports_model_override: Whether a per-session ``/model`` override
         reaches the harness process (native CLIs via ``--model`` at launch, SDK
         harnesses via ``HARNESS_<H>_MODEL`` in the spawn env).
+    :param capabilities: The declarative feature set this harness supports —
+        the single source of truth for "what can this harness do?".
     """
 
     name: str
@@ -59,6 +62,7 @@ class HarnessDescriptor:
     native: NativeCodingAgent | None
     install_family_key: str | None
     supports_model_override: bool
+    capabilities: HarnessCapabilities
 
     @property
     def is_native(self) -> bool:

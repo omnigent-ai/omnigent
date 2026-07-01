@@ -17,6 +17,16 @@ phases invert ownership so those constants derive from the registry instead.
 
 from __future__ import annotations
 
+from omnigent.harnesses.capabilities import (
+    AuthModel,
+    EffortFamily,
+    Elicitation,
+    HarnessCapabilities,
+    IntegrationMode,
+    ModelFamily,
+    Resume,
+)
+from omnigent.harnesses.matrix import render_matrix
 from omnigent.harnesses.registry import (
     REGISTRY,
     all_descriptors,
@@ -26,7 +36,15 @@ from omnigent.harnesses.types import HarnessDescriptor
 
 __all__ = [
     "REGISTRY",
+    "AuthModel",
+    "EffortFamily",
+    "Elicitation",
+    "HarnessCapabilities",
     "HarnessDescriptor",
+    "IntegrationMode",
+    "ModelFamily",
+    "Resume",
     "all_descriptors",
     "get",
+    "render_matrix",
 ]

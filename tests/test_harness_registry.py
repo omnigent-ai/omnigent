@@ -11,12 +11,20 @@ loudly — which is the drift the registry exists to prevent.
 from __future__ import annotations
 
 from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, is_native_harness
-from omnigent.harnesses import REGISTRY, all_descriptors, get
-from omnigent.model_override import harness_supports_model_override
+from omnigent.harnesses import REGISTRY, all_descriptors, get, render_matrix
+from omnigent.harnesses.capabilities import IntegrationMode, ModelFamily, Resume
+from omnigent.model_override import (
+    _ANTIGRAVITY_FAMILY_HARNESSES,
+    _CLAUDE_FAMILY_HARNESSES,
+    _CODEX_FAMILY_HARNESSES,
+    harness_supports_model_override,
+)
 from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
 from omnigent.onboarding.harness_install import _HARNESS_NAME_TO_KEY
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESS_ALIASES, OMNIGENT_HARNESSES
+
+_NATIVE_MODES = frozenset({IntegrationMode.NATIVE_TUI, IntegrationMode.NATIVE_SERVER})
 
 # The one canonical harness that is intentionally resolved through an alternate
 # path and has no ``_HARNESS_MODULES`` entry. Documented here so that a NEW
@@ -106,3 +114,60 @@ def test_get_is_alias_insensitive() -> None:
     assert get("native-antigravity") is get("antigravity-native")
     assert get(None) is None
     assert get("definitely-not-a-harness") is None
+
+
+# ── Capability declarations (PR 2) ────────────────────────────────────────
+
+
+def test_every_descriptor_declares_capabilities() -> None:
+    for descriptor in all_descriptors():
+        assert descriptor.capabilities is not None
+
+
+def test_integration_mode_agrees_with_native_flag() -> None:
+    # A native integration mode iff the descriptor carries native UI metadata.
+    for descriptor in all_descriptors():
+        is_native_mode = descriptor.capabilities.integration_mode in _NATIVE_MODES
+        assert is_native_mode == descriptor.is_native, descriptor.name
+
+
+def test_model_family_matches_model_override_sets() -> None:
+    # model_family is derivable from model_override's family frozensets, so the
+    # declaration must not contradict the code that actually enforces routing.
+    for descriptor in all_descriptors():
+        name = descriptor.name
+        family = descriptor.capabilities.model_family
+        if name in _CLAUDE_FAMILY_HARNESSES:
+            assert family is ModelFamily.CLAUDE, name
+        elif name in _CODEX_FAMILY_HARNESSES:
+            assert family is ModelFamily.GPT, name
+        elif name in _ANTIGRAVITY_FAMILY_HARNESSES:
+            assert family is ModelFamily.GEMINI, name
+        else:
+            assert family is ModelFamily.MULTI, name
+
+
+def test_subagents_matches_native_wrapper_label() -> None:
+    # subagents is derivable: only native agents with a subagent_wrapper_label
+    # can spawn Omnigent native sub-agents.
+    subagent_capable = {
+        agent.harness for agent in NATIVE_CODING_AGENTS if agent.subagent_wrapper_label
+    }
+    for descriptor in all_descriptors():
+        expected = descriptor.name in subagent_capable
+        assert descriptor.capabilities.subagents == expected, descriptor.name
+
+
+def test_native_harnesses_resume_warm() -> None:
+    # Every native harness reattaches to a live vendor session/terminal.
+    for descriptor in all_descriptors():
+        if descriptor.is_native:
+            assert descriptor.capabilities.resume is Resume.WARM_REATTACH, descriptor.name
+
+
+def test_matrix_renders_every_harness() -> None:
+    table = render_matrix()
+    for descriptor in all_descriptors():
+        assert descriptor.name in table
+    # Header + separator + one row per harness.
+    assert len(table.splitlines()) == len(REGISTRY) + 2

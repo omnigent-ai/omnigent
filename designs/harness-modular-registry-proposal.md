@@ -1,7 +1,10 @@
 # Modular, self-describing harnesses — design + migration plan
 
-**Status:** proposal for review (no code yet)
-**Author:** drafted with Claude Code
+**Status:** Phase 0 implemented in `omnigent/harnesses/` (registry + capability model,
+landing as stacked PRs); Phases 1-7 pending. Structural claims below re-verified against
+`main` — the frontend has since moved `ap-web/` -> `web/` (reflected here); the per-harness
+if-chains in `runner/app.py` (36), `resume_dispatch.py` (10), `cli.py` `_manage_*` (9) and
+`server/app.py` `_ensure_default_*` (11) all still stand.
 **Goal:** Adding or editing one coding-agent harness should touch ONLY that harness's
 own files, and each harness should explicitly declare which features it supports.
 
@@ -29,11 +32,11 @@ rounds; #1204 re-collided with kimi). The touch points, classified by **shape**:
 | `omnigent/server/app.py` | `_ensure_default_X_agent()` fn + call in `_ensure_default_agents()` | **imperative fn + call** |
 | `omnigent/cli.py` | setup-menu sentinel + row block + dispatch branch + `_manage_X_harness()` fn + `omnigent X` launch | **imperative** |
 | `omnigent/server/routes/sessions.py` | `if harness == X` launch-arg / subagent-label branch | **imperative if-chain** |
-| `ap-web/src/lib/nativeCodingAgents.ts` | spec-array entry + alias-map row | declarative array (mirror of BE) |
-| `ap-web/src/lib/agentGrouping.ts` | `BUILTIN_AGENTS` member + `AGENT_DISPLAY_ORDER` row | declarative (two lists must align) |
-| `ap-web/src/shell/SubagentsPanel.tsx` | icon `if`-branch ×2 | imperative switch |
-| `ap-web/src/shell/sidebarNav.ts` | `ConversationIconKind` union member | declarative type |
-| tests: `test_resume_dispatch.py`, `test_sessions_native_messages.py`, `test_run_harness_without_agent_e2e.py` (exclusion set), ap-web `.test.ts` | per-harness cases / exclusions | mixed |
+| `web/src/lib/nativeCodingAgents.ts` | spec-array entry + alias-map row | declarative array (mirror of BE) |
+| `web/src/lib/agentGrouping.ts` | `BUILTIN_AGENTS` member + `AGENT_DISPLAY_ORDER` row | declarative (two lists must align) |
+| `web/src/shell/SubagentsPanel.tsx` | icon `if`-branch ×2 | imperative switch |
+| `web/src/shell/sidebarNav.ts` | `ConversationIconKind` union member | declarative type |
+| tests: `test_resume_dispatch.py`, `test_sessions_native_messages.py`, `test_run_harness_without_agent_e2e.py` (exclusion set), web `.test.ts` | per-harness cases / exclusions | mixed |
 | `docs/AGENT_YAML_SPEC.md` | harness in the example list | declarative comment |
 
 Two distinct sub-problems fall out:
@@ -49,9 +52,13 @@ Two distinct sub-problems fall out:
 Whether a harness supports a feature is implicit — encoded in (a) membership of ad-hoc
 frozensets (`NATIVE_HARNESSES`, `_SDK_MODEL_OVERRIDE_HARNESSES`, the two status-suppression
 sets in `runner/app.py`), and (b) **presence/absence of a module** (e.g.
-`codex_native_elicitation.py` exists; kiro has no elicitation code at all;
-`*_native_hook.py` exists for claude/codex/kimi/goose/hermes but not pi/cursor/kiro/qwen).
-There is no single place that answers "what can kiro-native do?".
+`codex_native_elicitation.py` exists; `*_native_hook.py` exists for
+claude/codex/kimi/goose/hermes; `*_native_permissions.py` exists for
+cursor/goose/hermes/kiro/opencode/qwen). There is no single place that answers "what can
+this harness do?" — and the scatter actively misleads: an early read of this code assumed
+"kiro-native has no elicitation", but the evidence (`kiro_native_permissions.py`: "TUI ACP
+recorder -> web elicitation") shows it surfaces approval cards via APPROVAL_MIRROR. A
+declared, code-backed capability set removes exactly this guesswork.
 
 ---
 
@@ -179,46 +186,35 @@ The spawn_env builders already share a uniform signature
   axes agree (e.g. a descriptor claiming `WARM_REATTACH` must back a harness whose executor
   implements the reattach path).
 
-Then `kiro-native` literally declares `elicitation=NONE`, and code that needs elicitation
-queries `d.capabilities.elicitation` instead of probing for a module's existence.
+Then a harness literally declares its elicitation mechanism (e.g. `pi-native` →
+`elicitation=NONE`, `kiro-native` → `APPROVAL_MIRROR`, `codex-native` → `JSONRPC`), and code
+that needs elicitation queries `d.capabilities.elicitation` instead of probing for a
+module's existence.
 
 ---
 
 ## 4. Capability inventory (the real axes, from code)
 
-Modeled from the conditionals/sets/modules found in the audit. `?` = present in code but
-value not yet pinned down (resolve during migration).
+The exhaustive, evidence-backed harness × capability values now live **in code** as the
+single source of truth: `omnigent/harnesses/capabilities.py` (declarations) rendered by
+`omnigent/harnesses/matrix.py` (run `python -m omnigent.harnesses.matrix`). This supersedes
+the hand-maintained draft table that used to live here — every value there had been verified
+against the implementing module and several early assumptions were corrected (notably
+`kiro-native`, which is `APPROVAL_MIRROR`, not "no elicitation").
 
-| harness | mode | elicitation | resume | model_ovr | family | effort | permission | web_bridge | subagents | auth |
-|---|---|---|---|---|---|---|---|---|---|---|
-| claude-native | NATIVE_TUI | HOOK | WARM | ✓ | CLAUDE | ANTHROPIC | flag+hook | terminal | ✓ | omni-cred |
-| codex-native | NATIVE_SERVER | JSONRPC | WARM+cold | ✓ | GPT | OPENAI | flag+hook | app_server | ✓ | omni-cred |
-| pi-native | NATIVE_TUI | NONE | WARM | ✓ | MULTI | ? | ? | terminal | ✗ | session-cfg |
-| cursor-native | NATIVE_TUI | APPROVAL_MIRROR | WARM | ✓ | ? | ? | approval-card | terminal | ✗ | ? |
-| kiro-native | NATIVE_TUI | **NONE** | WARM | ✓ | ? | ? | ? | terminal | ✗ | own-auth |
-| opencode-native | NATIVE_SERVER | SSE_PERMISSION | WARM | ✓ | ? | ? | approval-card | app_server_sse | ✓ | omni-cred |
-| antigravity-native | NATIVE_TUI(RPC) | RPC | WARM | ✓ | GEMINI | GEMINI | ? | rpc | ✗ | own-auth |
-| goose-native | NATIVE_TUI | NONE | WARM | ✓ | ? | ? | hook | terminal | ✗ | own-auth |
-| qwen-native | NATIVE_TUI | NONE | WARM | ✓ | ? | ? | ? | terminal | ✗ | ? |
-| kimi-native | NATIVE_TUI | NONE | WARM | ✓ | ? | ? | hook | terminal | ✗ | session-cfg |
-| hermes-native | NATIVE_TUI | NONE | WARM | ✓ | ? | ? | hook | terminal | ✗ | own-auth |
-| claude-sdk | SDK | NONE | COLD | ✓ | CLAUDE | ANTHROPIC | server-policy | none | n/a | omni-cred |
-| codex | SDK | NONE | COLD | ✓ | GPT | OPENAI | server-policy | none | n/a | omni-cred |
-| openai-agents | SDK | NONE | COLD | ✓ | GPT/MULTI | OPENAI | server-policy | none | n/a | omni-cred |
-| pi | SDK | NONE | COLD | ✓ | MULTI | ? | server-policy | none | n/a | omni-cred |
-| cursor | SDK(ACP) | NONE | COLD | ✓ | ? | ? | server-policy | none | n/a | omni-cred |
-| antigravity | SDK | NONE | COLD | ✓ | GEMINI | GEMINI | server-policy | none | n/a | own-auth |
-| goose | ACP_HEADLESS | (card) | COLD | ✓ | ? | ? | approval-card | none | n/a | own-auth |
-| qwen | ACP_HEADLESS | NONE | COLD | ✓ | ? | ? | server-policy | none | n/a | ? |
-| kimi | SDK | NONE | COLD | ✓ | ? | ? | server-policy | none | n/a | session-cfg |
-| hermes | SUBPROC | NONE | COLD | **✗** | ? | ? | server-policy | none | n/a | own-auth |
-| copilot | SDK | NONE | COLD | ✓ | ? | ? | server-policy | none | n/a | own-auth(GH) |
+The modeled axes are: `integration_mode` (SDK_IN_PROCESS / CLI_SUBPROCESS / ACP_SUBPROCESS /
+NATIVE_TUI / NATIVE_SERVER), `elicitation` (NONE / HOOK / JSONRPC / APPROVAL_MIRROR /
+SSE_PERMISSION), `resume` (WARM_REATTACH / COLD_ONLY), `effort` (NONE / ANTHROPIC / OPENAI /
+GEMINI / COPILOT), `model_family` (CLAUDE / GPT / GEMINI / MULTI), `auth`
+(OMNIGENT_CREDENTIAL / OWN_AUTH / SESSION_SCOPED_CONFIG), and `subagents`. Two axes are
+*derivable* and asserted against their source in tests (`model_family` from
+`model_override`'s family sets; `subagents` from `NativeCodingAgent.subagent_wrapper_label`);
+the rest are declared with an inline evidence comment.
 
-Additional axes the code also branches on (fold into capabilities or a sub-struct):
-status-suppression policy (full vs idle-only), terminal auto-create, history-synthesis at
-cold resume, app-server lifecycle ownership, session-scoped credential synthesis. Most are
-*derivable* from `integration_mode` + `web_bridge` rather than independent flags — worth
-collapsing so the descriptor stays small.
+Additional axes the code also branches on but that are *derivable* from the above (so they
+stay out of the descriptor to keep it small): status-suppression policy (full vs idle-only),
+terminal auto-create, history-synthesis at cold resume, app-server lifecycle ownership,
+session-scoped credential synthesis.
 
 ---
 

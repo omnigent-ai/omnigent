@@ -9,6 +9,7 @@ those constants; the accompanying test
 from __future__ import annotations
 
 from omnigent.harness_aliases import HARNESS_ALIASES
+from omnigent.harnesses.capabilities import capabilities_for
 from omnigent.harnesses.types import HarnessDescriptor
 from omnigent.model_override import harness_supports_model_override
 from omnigent.native_coding_agents import NativeCodingAgent, native_coding_agent_for_harness
@@ -81,6 +82,13 @@ def _build_registry() -> dict[str, HarnessDescriptor]:
     for name in sorted(OMNIGENT_HARNESSES):
         native = native_coding_agent_for_harness(name)
         install_family_key = _HARNESS_NAME_TO_KEY.get(name)
+        capabilities = capabilities_for(name)
+        if capabilities is None:
+            raise ValueError(
+                f"harness {name!r} is in OMNIGENT_HARNESSES but has no entry in "
+                f"omnigent.harnesses.capabilities._CAPABILITIES — declare its "
+                f"capabilities there"
+            )
         registry[name] = HarnessDescriptor(
             name=name,
             aliases=_aliases_for(name),
@@ -89,6 +97,7 @@ def _build_registry() -> dict[str, HarnessDescriptor]:
             native=native,
             install_family_key=install_family_key,
             supports_model_override=harness_supports_model_override(name),
+            capabilities=capabilities,
         )
     return registry
 
