@@ -58,6 +58,7 @@ import {
 } from "./codeViewerHelpers";
 import { renderLineTokens } from "./codeViewerRendering";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
@@ -101,6 +102,7 @@ const CHECKERBOARD_STYLE: React.CSSProperties = {
 function ImageViewer({ data, path }: { data: FileContentResponse; path: string }) {
   const [url, setUrl] = useState<string | null>(null);
   const [errored, setErrored] = useState(false);
+  const { open } = useLightbox();
 
   // Create the object URL in an effect and revoke it on cleanup so the blob is
   // released when the file changes or the viewer unmounts (avoids a leak).
@@ -134,8 +136,10 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
           src={url}
           alt={filename}
           onError={() => setErrored(true)}
-          className="max-h-full max-w-full object-contain"
+          onClick={() => open({ src: url, alt: filename })}
+          className="max-h-full max-w-full cursor-zoom-in object-contain"
           style={CHECKERBOARD_STYLE}
+          title="Click to zoom"
         />
       )}
     </div>

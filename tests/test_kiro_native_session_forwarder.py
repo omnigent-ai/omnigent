@@ -459,7 +459,11 @@ async def test_forward_kiro_session_posts_cumulative_cost_once(
         if calls["n"] >= 2:
             raise asyncio.CancelledError
 
+    async def _noop_model(client: httpx.AsyncClient, *, session_id: str, model: str) -> None:
+        del client
+
     monkeypatch.setattr(forwarder, "_post_session_cost", _fake_post_cost)
+    monkeypatch.setattr(forwarder, "_post_external_model_change", _noop_model)
     monkeypatch.setattr(forwarder, "_post_conversation_message", _noop_message)
     monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
     monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_after_two_polls)
@@ -744,3 +748,86 @@ async def test_forward_kiro_session_does_not_post_session_status(
     assert "external_conversation_item" in posted_event_types
     # …but the forwarder posts no session status (the PTY watcher owns it).
     assert "external_session_status" not in posted_event_types
+
+
+def test_read_kiro_current_model_reads_without_metering(tmp_path: Path) -> None:
+    """The model id is read from rts_model_state even before any turn/metering."""
+    sessions_dir = tmp_path / "cli"
+    _write_kiro_session(sessions_dir, session_id="k", cwd=tmp_path, model_id="claude-haiku-4.5")
+    assert forwarder._read_kiro_current_model(sessions_dir / "k.json") == "claude-haiku-4.5"
+
+    # Missing file and a session with no model state both yield None.
+    assert forwarder._read_kiro_current_model(sessions_dir / "missing.json") is None
+    _write_kiro_session(sessions_dir, session_id="bare", cwd=tmp_path)
+    assert forwarder._read_kiro_current_model(sessions_dir / "bare.json") is None
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_mirrors_current_model_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forwarder mirrors kiro's current model via external_model_change, deduped."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {"message_id": "a1", "content": [{"kind": "text", "data": "hi"}]},
+            },
+        ],
+        # No metering: proves the model mirror fires at launch, before a turn's cost.
+        model_id="claude-haiku-4.5",
+    )
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    models: list[tuple[str, str]] = []
+
+    async def _fake_post_model(client: httpx.AsyncClient, *, session_id: str, model: str) -> None:
+        del client
+        models.append((session_id, model))
+
+    async def _noop_message(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        agent_name: str,
+        message: forwarder._KiroConversationMessage,
+    ) -> None:
+        del client
+
+    async def _noop_patch(
+        client: httpx.AsyncClient, *, session_id: str, external_session_id: str
+    ) -> None:
+        del client
+
+    calls = {"n": 0}
+
+    async def _cancel_after_two_polls(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder, "_post_external_model_change", _fake_post_model)
+    monkeypatch.setattr(forwarder, "_post_conversation_message", _noop_message)
+    monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_after_two_polls)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    # Mirrored once; the unchanged second poll does not re-post.
+    assert models == [("conv_kiro", "claude-haiku-4.5")]

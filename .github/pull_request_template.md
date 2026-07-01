@@ -65,3 +65,23 @@ Optional — but required if you checked "Manual verification completed" or
 "Not applicable" above. Describe what you verified manually, or why automated
 test coverage is not needed for this change.
 -->
+
+## Changelog
+
+<!--
+If this PR has a user-facing change worth announcing, write one or more lines
+below in the user's voice, each prefixed with a category. Otherwise leave it
+as `skip`.
+
+Lower the bar than docs: DO include small features and UX changes (moved/renamed
+buttons, new flags, copy tweaks). DO skip pure-internal churn (CI, refactors,
+test-only changes, dependency bumps with no user impact).
+
+Categories: Added | Changed | Fixed | Deprecated | Removed | Security
+Format:     <Category>: <one-line description>   (the PR link is added for you)
+Example:    Added: `omnigent run --watch` reruns an agent when files change
+
+A `skip` here is fine for chores — but a Breaking change must always be announced.
+-->
+
+skip

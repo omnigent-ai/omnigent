@@ -12,22 +12,34 @@ import {
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
+  ShieldCheckIcon,
   TerminalIcon,
   UserCogIcon,
+  UsersIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useMe } from "@/hooks/useMe";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
-export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived" | "cli";
+export type SettingsSectionId =
+  | "appearance"
+  | "shortcuts"
+  | "account"
+  | "members"
+  | "policies"
+  | "archived"
+  | "cli";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "shortcuts",
   "account",
+  "members",
+  "policies",
   "archived",
   "cli",
 ];
@@ -47,11 +59,13 @@ interface SettingsNavGroup {
 
 /**
  * Nav groups for the current deploy. The Account section is auth-gated; the
- * Desktop group (Local CLI) appears only in the Electron shell.
+ * Admin group (Members / Policies) appears only for admins on accounts
+ * deploys; the Desktop group (Local CLI) appears only in the Electron shell.
  */
 export function settingsNavGroups(
   accountsEnabled: boolean,
   isDesktop: boolean,
+  isAdmin = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
@@ -71,13 +85,24 @@ export function settingsNavGroups(
       items: [{ id: "cli", label: "Local CLI", icon: TerminalIcon }],
     });
   }
-  groups.push(
-    { title: "General", items: general },
-    {
-      title: "Archived",
-      items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
-    },
-  );
+  groups.push({ title: "General", items: general });
+  // Admin: server-wide management, admin-only. Nested here as sub-categories
+  // (rather than links out of the Account section) so entering them stays
+  // inside /settings — the sidebar keeps the settings nav instead of snapping
+  // back to the conversation list.
+  if (accountsEnabled && isAdmin) {
+    groups.push({
+      title: "Admin",
+      items: [
+        { id: "members", label: "Members", icon: UsersIcon },
+        { id: "policies", label: "Policies", icon: ShieldCheckIcon },
+      ],
+    });
+  }
+  groups.push({
+    title: "Archived",
+    items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
+  });
   return groups;
 }
 
@@ -98,9 +123,15 @@ export function useSettingsRoute(): { inSettings: boolean; section: SettingsSect
   const idx = segments.lastIndexOf("settings");
   if (idx === -1) return { inSettings: false, section: defaultSection };
   const next = segments[idx + 1];
-  const section = (SECTION_IDS as readonly string[]).includes(next)
-    ? (next as SettingsSectionId)
-    : defaultSection;
+  // Members / Policies are accounts-only sections. Off an accounts deploy
+  // they aren't real destinations — fall back to the default section rather
+  // than resolving to an admin section the page would render as an empty
+  // panel (only reachable by manually typing the URL, but keep it clean).
+  const accountsOnlySections = new Set<string>(["members", "policies"]);
+  const isValidSection =
+    (SECTION_IDS as readonly string[]).includes(next) &&
+    (accountsEnabled || !accountsOnlySections.has(next));
+  const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   return { inSettings: true, section };
 }
 
@@ -118,8 +149,11 @@ export function SettingsSidebarBody({
 }) {
   const info = useServerInfo();
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  // Admin gating for the Members / Policies sub-categories. Only probed on
+  // accounts deploys; non-admins (and non-accounts deploys) never see them.
+  const { data: me } = useMe(accountsEnabled);
   const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(accountsEnabled, isElectronShell());
+  const groups = settingsNavGroups(accountsEnabled, isElectronShell(), me?.is_admin ?? false);
 
   return (
     <>

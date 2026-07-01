@@ -16,6 +16,12 @@ ROOT = Path(__file__).resolve().parents[2]
 SIDECAR_MANIFEST = ROOT / "tests" / "codex_parity" / "sidecar" / "Cargo.toml"
 SIDECAR_TARGET_DIR = ROOT / ".tmp-codex-parity-target"
 
+# When set to an existing executable, use that prebuilt sidecar binary and skip
+# the (multi-minute, ~1100-crate) ``cargo build`` entirely. CI builds the
+# sidecar once in a dedicated job and points every consumer at the downloaded
+# artifact via this env var; see .github/workflows/e2e-ui.yml.
+PREBUILT_SIDECAR_ENV = "CODEX_PARITY_SIDECAR_BIN"
+
 
 class CodexResponsesSidecar:
     """Running mock Responses server backed by Codex's Rust test helpers."""
@@ -84,7 +90,24 @@ class CodexResponsesSidecar:
 
 
 def build_sidecar_bin() -> Path:
-    """Build the Rust sidecar binary and return its path."""
+    """Return the sidecar binary path, building it from source if needed.
+
+    If ``CODEX_PARITY_SIDECAR_BIN`` names an existing file, that prebuilt
+    binary is used and ``cargo build`` is skipped -- this is how CI avoids
+    compiling the ~1100-crate tree on the test's critical path. A set-but-
+    missing path raises ``FileNotFoundError`` (a misconfigured CI artifact
+    must fail loudly, not silently skip the test). With the env unset we fall
+    back to building from source, so local runs work unchanged; callers that
+    treat a missing ``cargo`` as a skip catch the ``RuntimeError`` below.
+    """
+    prebuilt = os.environ.get(PREBUILT_SIDECAR_ENV)
+    if prebuilt:
+        binary = Path(prebuilt)
+        if not binary.is_file():
+            raise FileNotFoundError(
+                f"{PREBUILT_SIDECAR_ENV}={prebuilt!r} is set but no file exists there"
+            )
+        return binary
     if shutil.which("cargo") is None:
         raise RuntimeError("cargo is required for Codex parity sidecar")
     subprocess.run(

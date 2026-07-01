@@ -264,6 +264,9 @@ jobs:
         shell: bash
         env:
           PYTHONFAULTHANDLER: "1"
+          # Reuse the binary from the "Build parity sidecar" step above so the
+          # fixture doesn't re-invoke cargo build during collection.
+          CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
         run: |
           mkdir -p artifacts
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \

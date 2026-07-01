@@ -407,6 +407,60 @@ def _read_kiro_cumulative_credits(metadata_path: Path) -> tuple[float | None, st
     return total, model_id
 
 
+def _read_kiro_current_model(metadata_path: Path) -> str | None:
+    """Return kiro's current model id from the session ``.json`` snapshot.
+
+    Reads ``session_state.rts_model_state.model_info.model_id`` (e.g. ``"auto"``
+    or ``"claude-haiku-4.5"``), independent of the metering read above so it is
+    available at launch before any turn. kiro updates it in place on a ``/model``
+    switch, so polling it mirrors both the launched model and live TUI switches.
+
+    :returns: The model id, or ``None`` when the file is missing/unparseable or
+        carries no model state yet.
+    """
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    session_state = data.get("session_state")
+    if not isinstance(session_state, dict):
+        return None
+    rts_model_state = session_state.get("rts_model_state")
+    if not isinstance(rts_model_state, dict):
+        return None
+    model_info = rts_model_state.get("model_info")
+    if not isinstance(model_info, dict):
+        return None
+    model_id = model_info.get("model_id")
+    return model_id if isinstance(model_id, str) and model_id else None
+
+
+async def _post_external_model_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    model: str,
+) -> None:
+    """Mirror kiro's current model to the web as ``external_model_change``.
+
+    The server persists this as ``model_override`` (so the picker shows the real
+    model instead of falling back to the harness name) and deliberately does NOT
+    forward a ``/model`` back to the runner, so mirroring the model the TUI is
+    already on cannot loop. Mirrors cursor-native's terminal->web model mirror.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_model_change", "data": {"model": model}},
+    )
+    resp.raise_for_status()
+
+
 async def _post_session_cost(
     client: httpx.AsyncClient,
     *,
@@ -452,6 +506,7 @@ async def forward_kiro_session_to_omnigent(
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     mirrored_external_session_id: str | None = None
     last_posted_cost: float | None = None
+    last_posted_model: str | None = None
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -528,6 +583,18 @@ async def forward_kiro_session_to_omnigent(
                             model=cost_model,
                         )
                         last_posted_cost = cumulative_cost
+                    # Mirror kiro's current model so the web picker shows the real
+                    # model (not the harness name) at launch and after a live
+                    # ``/model`` switch. Read independently of metering so it is
+                    # available before the first turn; posted only when it changes.
+                    current_model = await asyncio.to_thread(
+                        _read_kiro_current_model, jsonl_path.with_suffix(".json")
+                    )
+                    if current_model is not None and current_model != last_posted_model:
+                        await _post_external_model_change(
+                            client, session_id=session_id, model=current_model
+                        )
+                        last_posted_model = current_model
             except asyncio.CancelledError:
                 raise
             except Exception:

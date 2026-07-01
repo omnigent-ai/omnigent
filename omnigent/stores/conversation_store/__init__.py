@@ -71,7 +71,7 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # so it survives reload without a schema migration. The web UI gates turning
 # this on behind a typed confirmation + a persistent red warning banner; any
 # value other than ``"1"`` (incl. absent) leaves the session in Codex's
-# normal approval/sandbox stance. See issue #657.
+# normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
 # Reserved label key that stores a session's sidebar "project" membership

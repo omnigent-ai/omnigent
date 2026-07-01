@@ -120,6 +120,26 @@ class TestUtils:
         idx = args.index("--resume")
         assert args[idx + 1] == "20260620_abc123"
 
+    def test_build_hermes_args_skills_filter_list(self) -> None:
+        args = _build_hermes_args("hermes", "Hi", skills_filter=["a", "b"])
+        assert "-s" in args
+        idx = args.index("-s")
+        assert args[idx + 1] == "a,b"
+
+    def test_build_hermes_args_skills_filter_none(self) -> None:
+        args = _build_hermes_args("hermes", "Hi", skills_filter="none")
+        assert "--ignore-rules" in args
+
+    def test_build_hermes_args_skills_filter_all(self) -> None:
+        args = _build_hermes_args("hermes", "Hi", skills_filter="all")
+        assert "-s" not in args
+        assert "--ignore-rules" not in args
+
+    def test_build_hermes_args_skills_filter_default(self) -> None:
+        args = _build_hermes_args("hermes", "Hi")
+        assert "-s" not in args
+        assert "--ignore-rules" not in args
+
 
 # ---------------------------------------------------------------------------
 # HERMES_HOME population tests

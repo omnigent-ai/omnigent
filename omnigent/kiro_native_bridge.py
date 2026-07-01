@@ -694,3 +694,65 @@ def send_kiro_permission_verdict(
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     time.sleep(_PERMISSION_KEY_INTERVAL_S)
+
+
+# kiro prints "Model changed to <id> (saved as default)" after a successful
+# ``/model`` switch; the injector polls for this to confirm the switch landed.
+_MODEL_CHANGED_MARKER = "Model changed to"
+# The switch itself takes a couple of seconds (kiro round-trips the change), so
+# the confirmation poll uses its own timeout rather than the short pane-readiness
+# ``timeout_s`` the runner passes to fail fast when the pane isn't attached.
+_MODEL_CONFIRM_TIMEOUT_S = 10.0
+
+
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """Switch the live kiro model by typing ``/model <id>`` into the TUI.
+
+    kiro-cli's ``--model`` is baked in at spawn, so a mid-session web pick can't
+    be applied by re-reading the persisted ``model_override`` — it has to be
+    typed into the running pane. kiro's ``/model <id>`` switches directly (no
+    picker) and prints ``Model changed to <id>``; poll for that so a typo'd or
+    unavailable id fails loudly rather than silently leaving the model unchanged.
+    The cursor-native analog is
+    :func:`omnigent.cursor_native_bridge.inject_model_command`.
+
+    Note: kiro persists the switch as its own global default ("saved as
+    default"), so a live switch also affects the next fresh kiro launch.
+
+    :param bridge_dir: The kiro-native bridge dir holding ``tmux.json``.
+    :param model: kiro model id, e.g. ``"claude-haiku-4.5"`` (a ``--list-models`` id).
+    :param timeout_s: Per-readiness-gate / confirmation timeout.
+    :raises RuntimeError: If the tmux target is never advertised, the TUI has
+        exited, a tmux command fails, or kiro never confirms the switch.
+    """
+    model = model.strip()
+    if not model:
+        raise RuntimeError("kiro-native model switch requires a non-empty model id")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    socket_path = info["socket_path"]
+    tmux_target = info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        raise RuntimeError(
+            "kiro terminal is no longer running (the TUI exited); restart the session"
+        )
+    _wait_for_kiro_input_ready(socket_path, tmux_target, timeout_s=timeout_s)
+    # Clear any leftover draft so the slash command isn't appended to it.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # ``-l`` sends literal characters so ``/`` opens the slash command and the id
+    # is not parsed as tmux key names.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "-l", f"/model {model}")
+    time.sleep(_TYPE_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Confirm via kiro's "Model changed to <id>" line so a bad id fails loudly.
+    deadline = time.monotonic() + _MODEL_CONFIRM_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if f"{_MODEL_CHANGED_MARKER} {model}" in _capture_pane(socket_path, tmux_target):
+            return
+        time.sleep(_POLL_INTERVAL_S)
+    raise RuntimeError(f"kiro-native did not confirm the model switch to {model!r}")

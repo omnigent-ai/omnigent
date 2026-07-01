@@ -70,6 +70,13 @@ def format_body(body: str) -> str:
         "<!-- Optional; required if you checked 'Manual verification completed' "
         "or 'Not applicable' above. -->",
     )
+    body = _append_section(
+        body,
+        "Changelog",
+        "<!-- One or more '<Category>: description' lines (Added | Changed | "
+        "Fixed | Deprecated | Removed | Security) for user-facing changes, or "
+        "'skip'. A Breaking change must always be announced. -->\n\nskip",
+    )
     return body.rstrip() + "\n"
 
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import httpx
@@ -34,15 +33,20 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_returns_installed_package_version(
+async def test_version_returns_source_of_truth_version(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /api/version returns the installed omnigent package version.
+    """GET /api/version returns ``omnigent.version.VERSION``.
 
-    Compares the endpoint response against ``importlib.metadata.version``
-    directly — confirms the handler forwards the real installed version
-    rather than a hard-coded string.
+    The endpoint surfaces the shared source-of-truth constant, authoritative
+    regardless of how the package was installed. We deliberately do NOT assert
+    against ``importlib.metadata.version`` here: that is a frozen build-time
+    snapshot which can legitimately differ from ``VERSION`` (stale editable
+    install, or ``"source"`` placeholder metadata) — asserting equality would
+    re-couple to exactly the metadata this change moved off of.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/api/version")
     assert resp.status_code == 200
     body = resp.json()
@@ -50,49 +54,16 @@ async def test_version_returns_installed_package_version(
     # "version" key must be present — a missing key means the UI's
     # fetchVersion() falls back to "unknown" in every bug report.
     assert "version" in body
-
-    expected = _pkg_version("omnigent")
-    # Exact match against the installed version — confirms the endpoint
-    # calls importlib.metadata.version("omnigent"), not a constant.
-    assert body["version"] == expected, (
-        f"Expected version {expected!r} from importlib.metadata, "
-        f"got {body['version']!r}. If the handler hard-codes a version, "
-        "bug reports will always show the wrong version string."
+    assert body["version"] == VERSION, (
+        f"Expected version {VERSION!r} from omnigent.version.VERSION, got {body['version']!r}."
     )
 
 
-def test_server_version_uses_metadata_when_pep440(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A valid installed package version is the server version source of truth."""
-    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "0.3.1")
-    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
+def test_server_version_reads_version_constant() -> None:
+    """The server version is the shared ``omnigent.version.VERSION`` constant."""
+    from omnigent.version import VERSION
 
-    assert server_app._server_version() == "0.3.1"
-
-
-def test_server_version_falls_back_to_pyproject_for_source_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Source/editable installs can report ``source``; use pyproject's version."""
-    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "source")
-    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
-
-    assert server_app._server_version() == "0.3.0.dev0"
-
-
-def test_source_pyproject_version_reads_project_version(tmp_path: Path) -> None:
-    """The pyproject fallback reads the source checkout's ``[project].version``."""
-    repo = tmp_path / "repo"
-    package_file = repo / "omnigent" / "server" / "app.py"
-    package_file.parent.mkdir(parents=True)
-    package_file.write_text("", encoding="utf-8")
-    (repo / "pyproject.toml").write_text(
-        '[project]\nname = "omnigent"\nversion = "0.3.0.dev0"\n',
-        encoding="utf-8",
-    )
-
-    assert server_app._source_pyproject_version(package_file) == "0.3.0.dev0"
+    assert server_app._server_version() == VERSION
 
 
 class _StubWebSocket:
@@ -403,17 +374,19 @@ async def test_info_includes_server_version(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``GET /v1/info`` includes ``server_version`` — the installed package
-    version (same source as ``/api/version``) — so the web UI can show it
+    ``GET /v1/info`` includes ``server_version`` — the shared ``VERSION``
+    constant (same source as ``/api/version``) — so the web UI can show it
     in the session info popover's version footer without a second fetch.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     body = resp.json()
-    # Exact match against the installed version confirms the handler reads
-    # importlib.metadata, not a constant — a stale constant would mislead
-    # anyone reading the version off the popover.
-    assert body["server_version"] == _pkg_version("omnigent")
+    # Matches the source-of-truth constant, not importlib.metadata: the latter
+    # is a frozen build-time snapshot that can drift from VERSION in a stale
+    # editable or "source"-placeholder install.
+    assert body["server_version"] == VERSION
 
 
 @pytest.mark.asyncio

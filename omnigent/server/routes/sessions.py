@@ -93,6 +93,7 @@ from omnigent.native_coding_agents import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
     NativeCodingAgent,
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -530,6 +531,7 @@ _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
+_KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -7011,27 +7013,69 @@ async def _reset_runner_resources_after_switch(session_id: str) -> None:
     _publish_changed_files_invalidated(session_id)
 
 
-def _is_native_terminal_session(conv: Conversation) -> bool:
+def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | None:
     """
-    Return whether a session is owned by a terminal-native wrapper.
+    Resolve native terminal metadata for a session, by wrapper label OR harness.
+
+    Two independent signals identify a native session, because native message
+    handling must NOT be coupled to the terminal-first presentation labels:
+
+    * the ``omnigent.wrapper`` presentation label — set for the built-in
+      terminal-first wrapper sessions (``omnigent claude`` / ``omnigent
+      codex``); resolved directly and cheaply here (short-circuits the harness
+      load below); and
+    * the bound agent's RESOLVED harness — for a CUSTOM agent that declares a
+      native harness (e.g. a user ``polly`` orchestrator with
+      ``executor.harness: codex-native``) but is intentionally CHAT-first, so
+      it carries no wrapper label. Its runner still runs a native transcript
+      forwarder (the single writer for the conversation), so its web messages
+      must take the same native single-writer path — else the inbound user
+      message is persisted AP-side AND mirrored by the forwarder, landing
+      twice. Resolved via :func:`_resolve_harness` (honors a per-session
+      ``harness_override``), independent of the presentation labels; SDK
+      harnesses resolve to ``None``.
 
     :param conv: Conversation row for the target session.
-    :returns: ``True`` for wrappers backed by a native terminal harness.
+    :returns: The :class:`NativeCodingAgent` for the session's harness, or
+        ``None`` when it is not a native terminal harness.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    return native_coding_agent_for_wrapper_label(wrapper) is not None
+    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    if native_agent is not None:
+        return native_agent
+    return native_coding_agent_for_harness(_resolve_harness(conv))
+
+
+def _is_native_terminal_session(conv: Conversation) -> bool:
+    """
+    Return whether a session's turns are driven by a native terminal harness.
+
+    True for both a built-in terminal-first wrapper (``omnigent.wrapper``
+    label) and a custom chat-first agent bound to a native harness — see
+    :func:`_native_coding_agent_for_session` for why routing keys on the
+    resolved harness, not the presentation labels.
+
+    :param conv: Conversation row for the target session.
+    :returns: ``True`` when the session's harness is a native terminal harness.
+    """
+    return _native_coding_agent_for_session(conv) is not None
 
 
 def _native_terminal_runtime(conv: Conversation) -> tuple[str, str, str]:
     """
-    Return native terminal runtime strings for a wrapper session.
+    Return native terminal runtime strings for a native-harness session.
+
+    Resolves by wrapper label OR resolved harness (see
+    :func:`_native_coding_agent_for_session`), so a custom chat-first agent on
+    a native harness (no wrapper label) resolves too — otherwise it would raise
+    ``Unsupported native terminal session`` the moment its first web message
+    reached the native dispatch branch.
 
     :param conv: Conversation row for the target session.
     :returns: ``(display_name, model, harness)``.
-    :raises OmnigentError: If the wrapper label is unsupported.
+    :raises OmnigentError: If the session is not a native terminal harness.
     """
-    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    native_agent = _native_coding_agent_for_session(conv)
     if native_agent is not None:
         return native_agent.display_name, native_agent.agent_name, native_agent.harness
     raise OmnigentError(
@@ -8650,13 +8694,20 @@ async def _forward_event_to_runner(
     _routing_enabled = (
         conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
     ) or _parent_routing_on
+    _routed_model: str | None = None
+    _verdict: dict[str, Any] | None = None
     if effective_runner_override is None and _routing_enabled and body.type == "message":
         from omnigent.server.smart_routing import route_turn
 
         _harness = _resolve_harness(conv)
         _user_text = _extract_user_text_for_routing(body)
         if _user_text:
-            _routed_model, _verdict = await route_turn(_harness, _user_text)
+            _routed_model, _verdict = await route_turn(
+                _harness,
+                _user_text,
+                session_id=session_id,
+                runner_client=runner_client,
+            )
             if _routed_model is not None:
                 effective_runner_override = _routed_model
                 # Persist as the session's model_override so all
@@ -8674,14 +8725,6 @@ async def _forward_event_to_runner(
                         session_id,
                         exc_info=True,
                     )
-                # Emit the routing_decision transcript chip so the UI
-                # shows which model was picked, before the turn output.
-                await _emit_server_routing_decision(
-                    session_id,
-                    conversation_store,
-                    _routed_model,
-                    _verdict or {},
-                )
     # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
@@ -8702,6 +8745,16 @@ async def _forward_event_to_runner(
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
+        # Emit the routing_decision chip AFTER input.consumed so the
+        # live SSE stream delivers the user bubble before the chip —
+        # matching the store order (user message was persisted first).
+        if _routed_model is not None and _verdict is not None:
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                _routed_model,
+                _verdict,
+            )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Forward to runner failed for session=%s; "
@@ -8870,19 +8923,27 @@ async def _dispatch_session_event_to_runner(
         _native_routing_enabled = (
             conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
         ) or _native_parent_routing_on
+        _native_routed_model: str | None = None
+        _native_verdict: dict[str, Any] | None = None
         if conv.model_override is None and _native_routing_enabled:
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
             _user_text = _extract_user_text_for_routing(body)
             if _user_text:
-                _routed_model, _verdict = await route_turn(_harness, _user_text)
-                if _routed_model is not None:
+                _native_runner_client = await _get_runner_client(session_id, runner_router)
+                _native_routed_model, _native_verdict = await route_turn(
+                    _harness,
+                    _user_text,
+                    session_id=session_id,
+                    runner_client=_native_runner_client,
+                )
+                if _native_routed_model is not None:
                     try:
                         await asyncio.to_thread(
                             conversation_store.update_conversation,
                             session_id,
-                            model_override=_routed_model,
+                            model_override=_native_routed_model,
                         )
                     except (OSError, ValueError):
                         _logger.warning(
@@ -8890,12 +8951,21 @@ async def _dispatch_session_event_to_runner(
                             session_id,
                             exc_info=True,
                         )
-                    await _emit_server_routing_decision(
-                        session_id,
-                        conversation_store,
-                        _routed_model,
-                        _verdict or {},
-                    )
+                    # For claude-native: inject /model into the running
+                    # terminal so the change takes effect immediately
+                    # (model_override alone is only applied at spawn).
+                    try:
+                        await runner_client.post(
+                            f"/v1/sessions/{session_id}/events",
+                            json={"type": "model_change", "model": _native_routed_model},
+                            timeout=5.0,
+                        )
+                    except httpx.HTTPError:
+                        _logger.debug(
+                            "smart_routing: model_change forward failed for session=%s "
+                            "(runner may not support it yet)",
+                            session_id,
+                        )
         # ────────────────────────────────────────────────────────────
         forwarded = False
         try:
@@ -8911,6 +8981,16 @@ async def _dispatch_session_event_to_runner(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+        # Emit the routing chip AFTER forwarding the message to the
+        # terminal so the live SSE stream delivers the user bubble
+        # (echoed back by the CLI) before the chip.
+        if _native_routed_model is not None and _native_verdict is not None:
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                _native_routed_model,
+                _native_verdict,
+            )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,
@@ -12814,6 +12894,9 @@ async def _handle_advise_models_mcp(
     conv: Any,
     arguments: dict[str, Any],
     agent_store: Any,
+    *,
+    session_id: str | None = None,
+    runner_router: Any = None,
 ) -> Response:
     """
     Server-side handler for ``sys_advise_models`` MCP tool calls.
@@ -12839,7 +12922,18 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import infer_models
+    from omnigent.server.smart_routing import fetch_runner_models, infer_models
+
+    # Fetch live model catalog from the runner once; used below to populate
+    # per-agent model lists when the caller omits explicit models.
+    # Keys are worker names ("self", "claude_code", etc.) as returned by
+    # catalog_for_spec.  None when runner is unreachable — falls back to
+    # infer_models static table.
+    _runner_catalog: dict[str, list[str]] | None = None
+    if session_id is not None and runner_router is not None:
+        _runner_client = await _get_runner_client(session_id, runner_router)
+        if _runner_client is not None:
+            _runner_catalog = await fetch_runner_models(session_id, _runner_client)
 
     # Resolve the parent agent spec to look up sub-agent harnesses.
     spec: Any | None = None
@@ -12888,10 +12982,15 @@ async def _handle_advise_models_mcp(
         if not isinstance(agents_spec, list) or not agents_spec:
             continue
 
-        # Build a combined model list from all agent entries,
-        # preserving cheapest→powerful order. Map chosen model → agent.
+        # Build harness→models map for the routing client, plus two reverse
+        # maps for resolving the chosen agent after the verdict:
+        # - harness_to_agent: preferred path when the judge picks a harness
+        # - model_to_agent: fallback when harness is absent or unrecognised
+        # Insertion order is preserved; first-agent-wins dedup applies when
+        # the same model appears in multiple harness lists.
         model_to_agent: dict[str, str] = {}
-        combined_models: list[str] = []
+        harness_to_agent: dict[str, str] = {}
+        harness_models: dict[str, list[str]] = {}
         for agent_entry in agents_spec:
             if not isinstance(agent_entry, dict):
                 continue
@@ -12900,22 +12999,33 @@ async def _handle_advise_models_mcp(
             if explicit_models is not None and not isinstance(explicit_models, list):
                 explicit_models = None
             if explicit_models:
+                harness_key = agent  # use agent name as key when models are explicit
                 candidates = explicit_models
             else:
-                harness = _resolve_harness_for_worker(agent)
-                candidates = infer_models(harness) or []
-            for m in candidates:
-                if m not in model_to_agent:
-                    model_to_agent[m] = agent
-                    combined_models.append(m)
+                harness_key = _resolve_harness_for_worker(agent) or agent
+                # Prefer live runner catalog (worker name or harness key);
+                # fall back to static infer_models table.
+                candidates = (
+                    (_runner_catalog or {}).get(agent)
+                    or (_runner_catalog or {}).get(harness_key)
+                    or infer_models(harness_key)
+                    or []
+                )
+            if candidates:
+                harness_models.setdefault(harness_key, [])
+                harness_to_agent.setdefault(harness_key, agent)
+                for m in candidates:
+                    if m not in model_to_agent:
+                        model_to_agent[m] = agent
+                        harness_models[harness_key].append(m)
 
-        if not combined_models:
+        if not harness_models:
             recommendations.append(
                 {"title": title, "agent": None, "model": None, "rationale": "no candidates"}
             )
             continue
         try:
-            verdict = await routing_client.route(task_text, combined_models)
+            verdict = await routing_client.route(task_text, harness_models)
         except Exception:  # routing failures must not crash the advisor
             _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
             verdict = None
@@ -12929,7 +13039,10 @@ async def _handle_advise_models_mcp(
                 }
             )
         else:
-            chosen_agent = model_to_agent.get(verdict.model)
+            # Prefer the judge's harness pick; fall back to model ownership.
+            chosen_agent = (
+                harness_to_agent.get(verdict.harness) if verdict.harness else None
+            ) or model_to_agent.get(verdict.model)
             recommendations.append(
                 {
                     "title": title,
@@ -13393,7 +13506,14 @@ async def _handle_mcp_tools_call(
     # After policy evaluation (DENY/ASK handled above); arguments may have
     # been transformed. The advisor runs server-side where routing_client lives.
     if namespaced_name in ("sys_advise_models", "mcp__omnigent__sys_advise_models"):
-        return await _handle_advise_models_mcp(rpc_id, conv, arguments, agent_store)
+        return await _handle_advise_models_mcp(
+            rpc_id,
+            conv,
+            arguments,
+            agent_store,
+            session_id=session_id,
+            runner_router=runner_router,
+        )
 
     # ── Execute on the runner via WS tunnel ──────────────────────────
     # The runner owns stdio subprocess spawning (correct machine, cwd,
@@ -20290,6 +20410,10 @@ async def _fetch_model_options(
         from omnigent.cursor_native import cursor_base_model_options
 
         return cursor_base_model_options()
+    if wrapper == _KIRO_NATIVE_WRAPPER_LABEL_VALUE:
+        from omnigent.kiro_native import kiro_base_model_options
+
+        return kiro_base_model_options()
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         return []
@@ -20536,8 +20660,8 @@ async def _get_session_snapshot(
                     # compaction trigger a single source of truth — computed by
                     # one function — so they can't drift even though they run in
                     # different processes at different times. (They previously
-                    # each inlined this rule and silently fell out of step; see
-                    # PR #769 review. Sharing the function removes the manual
+                    # each inlined this rule and silently fell out of step;
+                    # sharing the function removes the manual
                     # sync.) spec.executor.context_window describes only the spec
                     # model, so an active override bypasses it — the resolver
                     # makes that decision from the spec model + override.

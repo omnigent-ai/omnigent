@@ -1,0 +1,167 @@
+name: Publish Changelog
+
+# When a final GitHub Release is PUBLISHED, mirror its (by-now human-curated)
+# notes to the docs site: open a PR to omnigent-site adding
+# app/releases/<version>/page.mdx, a per-version post.
+#
+# The granular CHANGELOG.md is NOT touched here — that PR is opened earlier, at
+# release-cut, by draft-release-notes.yml (so its "Full Changelog" link resolves
+# before the release goes public). This workflow is the publish-time, site-only
+# half of the pipeline.
+#
+# We trigger on `release: published` (not the tag push) because that's the moment
+# the maintainer-curated notes exist AND the version is installable — we never
+# advertise a release that PyPI can't serve yet. The release body we mirror is the
+# one draft-release-notes.yml seeded and the coordinator then edited.
+#
+# Cross-repo writes can't use the workflow's own GITHUB_TOKEN (scoped to this
+# repo), so we mint a short-lived token from the omnigent-ci GitHub App scoped to
+# omnigent-site — the same App used by sync-openapi-to-site.yml.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Final release tag to (re)publish, e.g. v0.3.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-changelog-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      is_final: ${{ steps.r.outputs.is_final }}
+    steps:
+      - name: Resolve tag and finality
+        id: r
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$EVENT_TAG}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          is_final=true
+          # Only final vX.Y.Z tags; exclude rc/dev/alpha/beta and the
+          # event's prerelease flag.
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) is_final=false ;;
+          esac
+          case "$tag" in
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_final=false ;;
+          esac
+          if [ "${PRERELEASE}" = "true" ]; then
+            is_final=false
+          fi
+          echo "is_final=${is_final}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} is_final=${is_final}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Open release-post PR (omnigent-site)
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Canonical repo only; skip cleanly where the App isn't configured.
+    if: >-
+      needs.resolve.outputs.is_final == 'true' &&
+      github.repository == 'omnigent-ai/omnigent' &&
+      vars.OMNIGENT_BOT_APP_ID != ''
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SOURCE_REPO: ${{ github.repository }}
+      SITE_REPO: ${{ github.repository_owner }}/omnigent-site
+      RELEASES_BRANCH: auto/releases/${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Checkout omnigent (for the render script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: omnigent
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Render the curated release body to MDX
+        working-directory: omnigent
+        # The release read uses the workflow's own token (scoped to this repo);
+        # only the cross-repo site write needs the App token, minted below.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+          gh release view "$TAG" --repo "$SOURCE_REPO" \
+            --json body,publishedAt > /tmp/release.json
+          jq -r '.body' /tmp/release.json > /tmp/release_body.md
+          date="$(jq -r '.publishedAt' /tmp/release.json | cut -c1-10)"
+          mkdir -p /tmp/site_page
+          python3 .github/scripts/changelog/release_to_mdx.py \
+            --tag "$TAG" --repo "$SOURCE_REPO" --date "$date" \
+            --body-file /tmp/release_body.md \
+            --out "/tmp/site_page/page.mdx"
+
+      - name: Mint App token (omnigent-site)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent-site
+
+      - name: Checkout omnigent-site (sync target)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.SITE_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: site
+
+      - name: Open or update the release-post PR (omnigent-site)
+        working-directory: site
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          dest="app/releases/${VERSION}"
+          mkdir -p "$dest"
+          cp /tmp/site_page/page.mdx "$dest/page.mdx"
+
+          if [ -z "$(git status --porcelain -- "$dest")" ]; then
+            echo "Release post for ${TAG} already in sync — nothing to do." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+          git switch -C "$RELEASES_BRANCH"
+          git add "$dest/page.mdx"
+          git commit -m "docs(releases): publish ${TAG} release post"
+          git push --force origin "$RELEASES_BRANCH"
+
+          if [ -n "$(gh pr list --repo "$SITE_REPO" --head "$RELEASES_BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "Release-post PR already open for ${RELEASES_BRANCH} — force-push updated it."
+            exit 0
+          fi
+          body="$(printf 'Publishes the **%s** release post at `/releases/%s`, mirroring the curated GitHub Release notes.\n\nGenerated by omnigent `.github/workflows/publish-changelog.yml`. Edit the GitHub Release, not this file.' "$TAG" "$VERSION")"
+          gh pr create \
+            --repo "$SITE_REPO" \
+            --base main \
+            --head "$RELEASES_BRANCH" \
+            --title "docs(releases): publish ${TAG} release post" \
+            --body "$body"

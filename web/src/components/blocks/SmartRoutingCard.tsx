@@ -72,6 +72,20 @@ export function parseRecommendations(output: string): Map<string, Recommendation
   } catch {
     return null;
   }
+  // The claude-sdk harness stores tool results as MCP content arrays
+  // ([{type:"text", text:"<json>"}]) rather than raw text strings.
+  // Unwrap the first text block before parsing the recommendations object.
+  if (Array.isArray(payload)) {
+    const textBlock = payload.find(
+      (b): b is { type: string; text: string } =>
+        typeof b === "object" &&
+        b !== null &&
+        (b as Record<string, unknown>).type === "text" &&
+        typeof (b as Record<string, unknown>).text === "string",
+    );
+    if (!textBlock) return null;
+    return parseRecommendations(textBlock.text);
+  }
   if (typeof payload !== "object" || payload === null) return null;
   const raw = (payload as Record<string, unknown>).recommendations;
   if (!Array.isArray(raw)) return null;

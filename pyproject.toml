@@ -4,6 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent"
+# Keep in sync with omnigent/version.py's VERSION constant.
 version = "0.3.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"

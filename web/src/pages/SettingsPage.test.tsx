@@ -39,6 +39,15 @@ vi.mock("@/hooks/useConversations", () => ({
   useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
   useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
 }));
+// The admin management surfaces are lazy-loaded and own heavy data layers of
+// their own; stub them so these tests only assert SettingsPage's section
+// routing (that /settings/members and /settings/policies render the right one).
+vi.mock("@/pages/MembersPage", () => ({
+  MembersPage: () => <div>members-page-stub</div>,
+}));
+vi.mock("@/pages/PoliciesPage", () => ({
+  PoliciesPage: () => <div>policies-page-stub</div>,
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -107,6 +116,37 @@ describe("SettingsPage", () => {
     mocks.accountsEnabled = false;
     renderPage("/settings/account");
     expect(screen.queryByText("alice")).toBeNull();
+  });
+
+  it("renders the Members section at /settings/members when accounts is on", async () => {
+    renderPage("/settings/members");
+    expect(await screen.findByText("members-page-stub")).toBeInTheDocument();
+    expect(screen.queryByText("policies-page-stub")).toBeNull();
+  });
+
+  it("renders the Policies section at /settings/policies when accounts is on", async () => {
+    renderPage("/settings/policies");
+    expect(await screen.findByText("policies-page-stub")).toBeInTheDocument();
+    expect(screen.queryByText("members-page-stub")).toBeNull();
+  });
+
+  it("does not render the admin sections when accounts is off", () => {
+    mocks.accountsEnabled = false;
+    renderPage("/settings/members");
+    // Falls through to the section switch, which renders nothing for an
+    // unknown-when-accounts-off section.
+    expect(screen.queryByText("members-page-stub")).toBeNull();
+  });
+
+  it("no longer links to Members / Policies from the Account section", async () => {
+    // They moved to the sidebar nav (Admin group); the Account section — even
+    // for an admin — must not re-link to them, or we'd be back to navigating
+    // away from /settings.
+    mocks.me = { id: "alice", is_admin: true };
+    renderPage("/settings/account");
+    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+    expect(screen.queryByRole("link", { name: /Members/ })).toBeNull();
+    expect(screen.queryByRole("link", { name: /Policies/ })).toBeNull();
   });
 
   it("lists archived sessions and unarchives on click", () => {

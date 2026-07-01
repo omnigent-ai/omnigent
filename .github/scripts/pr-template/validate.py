@@ -11,12 +11,27 @@ from __future__ import annotations
 import os
 import re
 import sys
+from pathlib import Path
+
+# Share the Markdown-section + changelog parsing with the release-time harvester
+# (.github/scripts/changelog/generate.py) so the gate and the harvester can
+# never disagree on what the "## Changelog" section means.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _md import (
+    CHANGELOG_CATEGORIES,
+    is_changelog_skip,
+    parse_changelog_entries,
+)
+from _md import heading_spans as _heading_spans
+from _md import section as _section
+from _md import strip_html_comments as _strip_html_comments
 
 REQUIRED_HEADINGS = (
     "Summary",
     "Test Plan",
     "Type of change",
     "Test coverage",
+    "Changelog",
 )
 
 TYPE_LABELS = (
@@ -52,30 +67,7 @@ class ValidationResult:
         self.errors = errors
 
 
-_HEADING_RE = re.compile(r"(?im)^\s*##\s+(.+?)\s*$")
 _CHECKBOX_RE = re.compile(r"(?im)^\s*-\s*\[(?P<mark>[ xX])\]\s*(?P<label>.+?)\s*$")
-
-
-def _strip_html_comments(text: str) -> str:
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-
-
-def _heading_spans(body: str) -> dict[str, tuple[int, int]]:
-    matches = list(_HEADING_RE.finditer(body))
-    spans: dict[str, tuple[int, int]] = {}
-    for idx, match in enumerate(matches):
-        title = match.group(1).strip().lower()
-        start = match.end()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
-        spans[title] = (start, end)
-    return spans
-
-
-def _section(body: str, spans: dict[str, tuple[int, int]], heading: str) -> str:
-    span = spans.get(heading.lower())
-    if span is None:
-        return ""
-    return body[span[0] : span[1]]
 
 
 def _checked_labels(section: str, expected_labels: tuple[str, ...]) -> set[str]:
@@ -172,6 +164,27 @@ def validate_pr_body(body: str) -> ValidationResult:
             )
         elif _contains_placeholder(coverage_notes):
             errors.append("Coverage notes still contains template placeholder text.")
+
+    # Changelog feeds the release-time CHANGELOG.md harvester, so it must be the
+    # `skip` sentinel or one or more `<Category>: description` lines it can parse
+    # deterministically. A breaking change must always carry an entry — those are
+    # exactly what users need announced.
+    if "changelog" in spans:
+        changelog_section = _section(body, spans, "Changelog")
+        if is_changelog_skip(changelog_section):
+            if "Breaking change" in checked_types:
+                errors.append(
+                    "Changelog must not be 'skip' when 'Breaking change' is checked "
+                    "— add a '<Category>: description' line announcing it."
+                )
+        else:
+            _entries, malformed = parse_changelog_entries(changelog_section)
+            if malformed:
+                errors.append(
+                    "Changelog lines must be 'skip' or '<Category>: description' "
+                    f"(Category one of: {', '.join(CHANGELOG_CATEGORIES)}). "
+                    "Offending line(s): " + "; ".join(malformed)
+                )
 
     return ValidationResult(ok=not errors, errors=errors)
 

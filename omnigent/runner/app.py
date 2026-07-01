@@ -94,7 +94,7 @@ _logger = logging.getLogger(__name__)
 
 # ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
 # The runner emits ``session.status: "waiting"`` when a turn ends with sub-agents
-# still running (PR #930, for the headless ``-p`` fast-exit). Servers older than
+# still running (for the headless ``-p`` fast-exit). Servers older than
 # 0.3.0 don't model "waiting" — their ``SessionResponse.status`` is
 # ``Literal["idle","running","failed"]`` — and 500 on ``GET /v1/sessions`` when
 # they try to serialize the cached value. So we resolve the server version once
@@ -557,6 +557,7 @@ class _KiroNativeLaunchConfig:
     workspace: Path
     terminal_launch_args: list[str] | None
     external_session_id: str | None
+    model_override: str | None = None
 
 
 def _required_runner_env(name: str) -> str:
@@ -672,12 +673,23 @@ async def _kiro_native_launch_config(
         not isinstance(external_session_id, str) or not external_session_id.strip()
     ):
         raise RuntimeError(f"Invalid external_session_id for Kiro session {session_id!r}.")
+    model_override = snapshot.get("model_override")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override:
+            raise RuntimeError(f"Invalid model_override for Kiro session {session_id!r}.")
+        try:
+            model_override = validate_model_override(model_override)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for Kiro session {session_id!r}: {exc}"
+            ) from exc
     return _KiroNativeLaunchConfig(
         workspace=_kiro_session_workspace(session_workspace),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id.strip()
         if isinstance(external_session_id, str)
         else None,
+        model_override=model_override if isinstance(model_override, str) else None,
     )
 
 
@@ -2723,6 +2735,7 @@ async def _auto_create_kiro_terminal(
     kiro_launch = build_kiro_launch(
         launch_config.terminal_launch_args or [],
         resume_id=launch_config.external_session_id,
+        model=launch_config.model_override,
     )
     launch_epoch_ms = int(time.time() * 1000)
     terminal_view = await resource_registry.launch_required_terminal(
@@ -6491,6 +6504,15 @@ class _SessionSnapshot:
         ``None`` for top-level sessions. Projected from the server
         snapshot so the identity survives a runner reconnect / spec-cache
         eviction (the in-memory ``_session_sub_agent_names`` map does not).
+    :param parent_session_id: For sub-agent sessions, the parent
+        conversation's id, e.g. ``"conv_parent987"``. ``None`` for
+        top-level sessions. Lets ``_ensure_subagent_work_entry`` rebuild a lost
+        work entry when the in-memory map was wiped (reconnect / restart) or
+        never populated (a ``sys_session_create`` child).
+    :param agent_name: Human-readable bound agent name, e.g.
+        ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
+        work entry for a child the server did not record a ``sub_agent_name``
+        for. ``None`` when unbound / the fetch failed.
     """
 
     ok: bool
@@ -6499,6 +6521,8 @@ class _SessionSnapshot:
     workspace: str | None
     agent_id: str | None
     sub_agent_name: str | None = None
+    parent_session_id: str | None = None
+    agent_name: str | None = None
 
 
 # Language constant the omnigent YAML translator stamps on callable-backed
@@ -8241,7 +8265,7 @@ def create_runner_app(
         :param status: New working status, ``"running"`` or ``"idle"``.
         """
         # (The native-pane reaper's status mirror is recorded centrally in
-        # _publish_event, which this routes through — see #1349.)
+        # _publish_event, which this routes through.)
         _publish_event(
             session_id,
             {"type": "session.status", "status": status},
@@ -8445,6 +8469,8 @@ def create_runner_app(
             workspace: str | None = None
             agent_id: str | None = None
             sub_agent_name: str | None = None
+            parent_session_id: str | None = None
+            agent_name: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -8467,6 +8493,15 @@ def create_runner_app(
                     raw_sub_agent = body.get("sub_agent_name")
                     if isinstance(raw_sub_agent, str) and raw_sub_agent:
                         sub_agent_name = raw_sub_agent
+                    # Parent linkage + agent label, so a native sub-agent's
+                    # terminal status can rebuild a lost work entry and deliver
+                    # to the parent inbox.
+                    raw_parent = body.get("parent_session_id")
+                    if isinstance(raw_parent, str) and raw_parent:
+                        parent_session_id = raw_parent
+                    raw_agent_name = body.get("agent_name")
+                    if isinstance(raw_agent_name, str) and raw_agent_name:
+                        agent_name = raw_agent_name
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -8476,6 +8511,8 @@ def create_runner_app(
                 workspace=workspace,
                 agent_id=agent_id,
                 sub_agent_name=sub_agent_name,
+                parent_session_id=parent_session_id,
+                agent_name=agent_name,
             )
             # Cache only a complete snapshot. A 200 with agent_id still
             # null means the agent has not bound yet; caching it would
@@ -10320,6 +10357,47 @@ def create_runner_app(
             _session_sub_agent_names[conv_id] = name
         return name
 
+    async def _ensure_subagent_work_entry(conv_id: str) -> _SubagentWorkEntry | None:
+        """Rebuild a sub-agent's work entry from the snapshot when it is missing.
+
+        The work entry that delivers a completion to the parent inbox lives only
+        in this runner's memory. It goes missing two ways — a reconnect / restart
+        wiped ``_subagent_work_by_child`` mid-turn, or a ``sys_session_create``
+        child never registered one (the server records a ``parent_session_id``
+        but no ``sub_agent_name``) — and the terminal status is then dropped
+        without waking the parent. Recover the parent linkage from the server
+        snapshot and re-register.
+
+        Best-effort: returns ``None`` for a top-level session or an unavailable
+        snapshot, preserving the prior no-op for non-sub-agent senders.
+
+        :param conv_id: Child session id whose terminal status just arrived,
+            e.g. ``"conv_child456"``.
+        :returns: The existing or reconstructed work entry, or ``None`` when the
+            session has no recoverable parent.
+        """
+        existing = get_subagent_work(conv_id)
+        if existing is not None:
+            return existing
+        if conv_id in _drained_delivered_subagent_children:
+            # Already delivered and drained; rebuilding would discard the
+            # tombstone and re-deliver a duplicate. Leave it as a no-op.
+            return None
+        try:
+            snapshot = await _session_snapshot(conv_id)
+        except Exception:  # noqa: BLE001 — best-effort recovery
+            return None
+        parent_id = snapshot.parent_session_id
+        if not parent_id or parent_id == conv_id:
+            return None
+        agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
+        return register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=conv_id,
+            agent=agent,
+            title=snapshot.sub_agent_name or "",
+        )
+
     def _session_harness_name(conv_id: str) -> str | None:
         """
         Resolve the canonical harness name for a session, if known.
@@ -11670,6 +11748,57 @@ def create_runner_app(
                 content={
                     "error": "cursor_native_model_failed",
                     "detail": _client_safe_error_detail(exc, context="cursor-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
+    async def _handle_kiro_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        """
+        Switch a running kiro-native session's model via its TUI ``/model``.
+
+        kiro-cli's ``--model`` is baked in at spawn (see
+        ``_auto_create_kiro_terminal``), so a live web-UI / REPL ``/model`` switch
+        can't be applied by re-reading the persisted ``model_override`` —
+        ``inject_model_command`` types ``/model <id>`` into the tmux pane, which
+        kiro applies directly (confirmed by its ``Model changed to <id>`` line).
+        Mirrors ``_handle_cursor_native_model_change``.
+
+        Skipped silently when *model* is ``None`` or blank — kiro has no slash
+        form for "use the spawn default", so a clear only takes effect on the
+        next spawn.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param model: New persisted kiro model id, e.g. ``"claude-haiku-4.5"``;
+            ``None`` when the user cleared the override.
+        :returns: 204 on success or skip; 503 if the tmux pane isn't advertised
+            yet (best-effort — the persisted value applies on the next spawn).
+        """
+        from omnigent.kiro_native_bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            # Short pane-readiness timeout: a missing tmux.json means the pane
+            # isn't attached; the persisted model still applies on the next spawn.
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=model.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native model change"),
                 },
             )
         return Response(status_code=204)
@@ -13767,9 +13896,10 @@ def create_runner_app(
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
             write_mcp_bridge_config(antigravity_bdir)
             # Fallback for sessions not started via _auto_create_antigravity_terminal
-            # (which already started the relay + wrote agy's isolated-HOME mcp_config).
-            # await_notify=False: agy starts its MCP client lazily, so awaiting would
-            # stall the turn (see the _ensure_comment_relay_started docstring).
+            # (which already started the relay + wrote agy's mcp_config into the
+            # per-session isolated --gemini_dir). await_notify=False: agy starts its
+            # MCP client lazily, so awaiting would stall the turn (see the
+            # _ensure_comment_relay_started docstring).
             await _ensure_comment_relay_started(
                 conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
             )
@@ -14001,6 +14131,55 @@ def create_runner_app(
         if agent_version is not None:
             _version_cache[conv_id] = agent_version
 
+        # Cold-boot readiness gate (opencode-native turns). ``opencode serve``
+        # takes up to ~30s to boot, and a turn can only run once the terminal +
+        # bridge state are in place. That boot is normally driven by the
+        # session-init / ensure-terminal path, but a sub-agent's FIRST turn can
+        # arrive while the boot is still in flight (or before it starts): the
+        # turn then found no ready server, produced no result, and silently hung
+        # the parent orchestrator (polly). Ensure the terminal here, idempotent
+        # and under the SAME per-session lock the session-init path uses, so this
+        # turn WAITS for the boot instead of racing it (the events POST budget is
+        # ~1 day, so a one-time cold-boot wait is safe). A boot failure surfaces
+        # as a 503 turn failure -> parent inbox, never a silent hang.
+        if harness_name == "opencode-native":
+            _oc_lock = _opencode_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+            async with _oc_lock:
+                _oc_tr = resource_registry.terminal_registry
+                _oc_ready = (
+                    _oc_tr is not None and _oc_tr.get(conv_id, "opencode", "main") is not None
+                )
+                if not _oc_ready:
+                    _publish_terminal_pending(_publish_event, conv_id, True)
+                    try:
+                        try:
+                            _oc_spec = await _resolve_session_agent_spec(conv_id)
+                        except OmnigentError:
+                            _oc_spec = None
+                        await _auto_create_opencode_terminal(
+                            conv_id,
+                            resource_registry,
+                            _publish_event,
+                            agent_spec=_oc_spec,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "opencode-native cold-boot ensure failed for %s", conv_id
+                        )
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "opencode_native_boot_failed",
+                                "detail": _client_safe_error_detail(
+                                    exc, context="opencode-native boot"
+                                ),
+                            },
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, conv_id, False)
+
         try:
             client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -14227,7 +14406,7 @@ def create_runner_app(
                                         # conversation while it is streaming (and
                                         # forward_cancel can resolve the harness
                                         # response id). Cleared in
-                                        # _on_proxy_stream_end. See issue #1414.
+                                        # _on_proxy_stream_end.
                                         process_manager.mark_in_flight(conv_id, _response_id)
 
                                 # Defer publish for action_required
@@ -14970,6 +15149,7 @@ def create_runner_app(
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
+            recovered_entry: _SubagentWorkEntry | None = None
             # Keep this allowlist in sync with Omnigent server's
             # ``_EXTERNAL_SESSION_STATUS_VALUES``. These events are produced by
             # native terminal forwarders, so AP-forwarded output is the only
@@ -14982,6 +15162,11 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+            if status in ("idle", "failed"):
+                # Rebuild a lost / never-registered work entry from the snapshot
+                # first, so a reconnect-wiped map or a sys_session_create child
+                # still wakes the parent instead of being dropped.
+                recovered_entry = await _ensure_subagent_work_entry(conversation_id)
             if status == "idle":
                 # Native transcripts are owned by AP. If Omnigent did not forward
                 # output for this idle edge, deliver an explicit empty result
@@ -14998,9 +15183,15 @@ def create_runner_app(
                     output=output or "Error: native sub-agent turn failed",
                 )
             if delivery_ack is not None:
+                # Known sub-agent when the in-memory map names it OR the snapshot
+                # recovered a parent link — so an undelivered terminal status
+                # returns 503 (forwarder retries) instead of a silent 204.
+                is_known = (
+                    conversation_id in _session_sub_agent_names or recovered_entry is not None
+                )
                 not_confirmed = _subagent_delivery_not_confirmed_response(
                     delivery_ack,
-                    is_runner_known_subagent=conversation_id in _session_sub_agent_names,
+                    is_runner_known_subagent=is_known,
                 )
                 if not_confirmed is not None:
                     return not_confirmed
@@ -15090,7 +15281,13 @@ def create_runner_app(
             # update. Other harnesses pick up the persisted value on the
             # next turn and 204 here.
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native", "cursor-native", "opencode-native"):
+            if harness in (
+                "claude-native",
+                "codex-native",
+                "cursor-native",
+                "opencode-native",
+                "kiro-native",
+            ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -15114,6 +15311,11 @@ def create_runner_app(
                     )
                 if harness == "opencode-native":
                     return await _handle_opencode_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "kiro-native":
+                    return await _handle_kiro_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -17365,6 +17567,36 @@ def create_runner_app(
             status_code=200,
             content={"skills": [{"name": s.name, "description": s.description} for s in skills]},
         )
+
+    @app.get("/v1/sessions/{session_id}/models")
+    async def get_session_models(session_id: str) -> JSONResponse:
+        """
+        Return the per-worker model catalog for a session.
+
+        The Omnigent server calls this before routing a turn so the
+        intelligent model router can use live, provider-resolved model
+        lists instead of the static fallback table.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: JSON ``{"workers": {<name>: {source, verified, models,
+            note}, ...}}`` shaped like the ``sys_list_models`` payload.
+            ``"self"`` is the calling session's own harness.  Returns an
+            empty workers dict when no spec resolver is configured.
+        """
+        spec = await _resolve_session_agent_spec(session_id)
+        if spec is None:
+            return JSONResponse(status_code=200, content={"workers": {}})
+        from omnigent.model_catalog import catalog_for_spec
+
+        try:
+            catalog = await asyncio.to_thread(catalog_for_spec, spec)
+        except Exception:
+            _logger.exception(
+                "get_session_models: catalog_for_spec failed for session=%s", session_id
+            )
+            return JSONResponse(status_code=200, content={"workers": {}})
+        return JSONResponse(status_code=200, content={"workers": catalog})
 
     @app.get("/v1/sessions/{session_id}/codex-model-options")
     async def get_session_codex_model_options(session_id: str) -> JSONResponse:
