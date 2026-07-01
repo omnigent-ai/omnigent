@@ -5,9 +5,10 @@ Backend selection is fully determined by the agent spec:
 - **OpenAI model** → passthrough to OpenAI's native
   ``web_search_preview`` (server-side, uses the LLM API key).
 - **Other models** → requires ``search_provider`` in config
-  (``"google"``, ``"perplexity"``, ``"nimble"``, or ``"tavily"``)
-  with the appropriate credentials. No env var fallbacks — the spec
-  is self-contained.
+  (``"google"``, ``"perplexity"``, ``"nimble"``, ``"tavily"``, or
+  ``"keenable"``) with the appropriate credentials. No env var
+  fallbacks — the spec is self-contained. ``keenable`` is keyless by
+  default and needs no credentials.
 
 Usage in config.yaml::
 
@@ -177,8 +178,9 @@ def _search(query: str, config: dict[str, str]) -> str:
     :param query: The search query string.
     :param config: Spec-level config. Required keys:
 
-        - ``search_provider``: ``"google"``, ``"perplexity"``, ``"nimble"``, or ``"tavily"``
-        - ``api_key``: API key for the chosen backend
+        - ``search_provider``: ``"google"``, ``"perplexity"``, ``"nimble"``,
+          ``"tavily"``, or ``"keenable"``
+        - ``api_key``: API key for the chosen backend (optional for ``keenable``)
         - ``engine_id``: Required for Google only
 
     :returns: Search results, or an error message.
@@ -197,6 +199,9 @@ def _search(query: str, config: dict[str, str]) -> str:
     if backend == "tavily":
         return _run_tavily(query, config)
 
+    if backend == "keenable":
+        return _run_keenable(query, config)
+
     return (
         "web_search requires configuration for non-OpenAI models. "
         "(For OpenAI models, web_search works automatically with no "
@@ -205,13 +210,14 @@ def _search(query: str, config: dict[str, str]) -> str:
         "  tools:\n"
         "    builtins:\n"
         "      - name: web_search\n"
-        "        search_provider: perplexity  # or google, nimble, tavily\n"
+        "        search_provider: perplexity  # or google, nimble, tavily, keenable\n"
         "        api_key: ${PERPLEXITY_API_KEY}\n\n"
         "Supported backends:\n"
         "  - google (requires api_key + engine_id)\n"
         "  - perplexity (requires api_key)\n"
         "  - nimble (requires api_key)\n"
-        "  - tavily (requires api_key)"
+        "  - tavily (requires api_key)\n"
+        "  - keenable (keyless by default; api_key optional)"
     )
 
 
@@ -290,3 +296,22 @@ def _run_tavily(query: str, config: dict[str, str]) -> str:
         return "Tavily web search requires api_key in the web_search config."
 
     return _search_tavily(query, config)
+
+
+def _run_keenable(query: str, config: dict[str, str]) -> str:
+    """
+    Run a Keenable web search query.
+
+    Keyless by default: unlike the other backends, ``api_key`` is optional.
+    Without it the keyless public endpoint is used; with it the
+    authenticated endpoint is used and rate limits are lifted.
+
+    :param query: The search query.
+    :param config: May contain ``api_key`` and ``max_results`` (both optional).
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_keenable import (
+        _search_keenable,
+    )
+
+    return _search_keenable(query, config)
