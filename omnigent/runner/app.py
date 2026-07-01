@@ -13896,9 +13896,10 @@ def create_runner_app(
             antigravity_bdir = antigravity_bridge_dir_for_id(antigravity_bid or conv)
             write_mcp_bridge_config(antigravity_bdir)
             # Fallback for sessions not started via _auto_create_antigravity_terminal
-            # (which already started the relay + wrote agy's isolated-HOME mcp_config).
-            # await_notify=False: agy starts its MCP client lazily, so awaiting would
-            # stall the turn (see the _ensure_comment_relay_started docstring).
+            # (which already started the relay + wrote agy's mcp_config into the
+            # per-session isolated --gemini_dir). await_notify=False: agy starts its
+            # MCP client lazily, so awaiting would stall the turn (see the
+            # _ensure_comment_relay_started docstring).
             await _ensure_comment_relay_started(
                 conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
             )
