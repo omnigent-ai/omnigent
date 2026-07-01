@@ -18,10 +18,12 @@ request-level function tools are NOT used here: the SDK harnesses handle
 tools internally, so they never round-trip as a server-dispatched, policy-
 gated call — a builtin does.
 
+Interrupt/cancel is also verified: a long turn is interrupted mid-flight
+and the server's cancellation marker confirms it stopped.
+
 Follow-ups (stacked PRs): delta-level streaming via the
-``/v1/sessions/{id}/stream`` SSE subscribe, interrupt/cancel, and a
-``--transport`` selector + driver registry so the bench's probes run
-through this driver.
+``/v1/sessions/{id}/stream`` SSE subscribe, and a ``--transport`` selector
++ driver registry so the bench's probes run through this driver.
 """
 
 from __future__ import annotations
@@ -60,6 +62,13 @@ _POLL_INTERVAL_S = 0.2
 _TOOL_NAME = "list_files"
 _DENY_REASON = "bench-policy-deny"
 _TOOL_PROMPT = f"List the files using the {_TOOL_NAME} tool, then tell me how many there are."
+
+# The server persists an interrupted turn as a synthetic user message whose
+# text contains this marker (see tests/e2e/test_cancel_history.py).
+_CANCELLATION_MARKER = "interrupted"
+_LONG_PROMPT = (
+    "Write a very detailed 600-word essay about the history of computing, in full paragraphs."
+)
 
 
 def _find_free_port() -> int:
@@ -380,6 +389,50 @@ class FullServerDriver:
             result.timed_out = True
         return result
 
+    # ── interrupt probe ──────────────────────────────────────
+
+    def interrupt_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
+        """Start a long turn, interrupt it mid-flight, and report the outcome.
+
+        Posts an ``interrupt`` event once the turn is running (after a short
+        hold so some text streams first), then waits for the server's
+        cancellation marker. Sets :attr:`TurnResult.cancelled` when the
+        marker appears — the honored-interrupt signal.
+        """
+        assert self._client is not None and self._session_id is not None
+        sid = self._session_id
+        result = TurnResult()
+        body = {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": _LONG_PROMPT}]},
+        }
+        self._client.post(f"/v1/sessions/{sid}/events", json=body).raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        interrupted = False
+        while time.monotonic() < deadline:
+            snap = self._client.get(f"/v1/sessions/{sid}").json()
+            status = snap.get("status")
+            items = snap.get("items", [])
+            if status in ("running", "waiting") and not interrupted:
+                # Let a little text stream so the interrupt lands mid-turn.
+                time.sleep(1.5)
+                self._client.post(f"/v1/sessions/{sid}/events", json={"type": "interrupt"})
+                interrupted = True
+            if _has_cancellation_marker(items):
+                result.cancelled = True
+                result.text = _assistant_text(items)
+                break
+            if status == "idle" and interrupted:
+                # Settled after the interrupt; the marker lands just after.
+                result.cancelled = _has_cancellation_marker(items)
+                result.text = _assistant_text(items)
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        else:
+            result.timed_out = True
+        return result
+
     # ── turn ─────────────────────────────────────────────────
 
     def run_turn(self, prompt: str, *, timeout: float = 180.0) -> TurnResult:
@@ -448,6 +501,19 @@ def _scan_tool_items(items: list[dict], result: TurnResult) -> None:
             out = str(data.get("output", ""))
             if data.get("status") == "blocked" or _DENY_REASON in out:
                 result.tool_call_denied = True
+
+
+def _has_cancellation_marker(items: list[dict]) -> bool:
+    """Whether items include the synthetic 'interrupted' user message."""
+    for raw in items:
+        data = raw.get("data", raw)
+        if (raw.get("type") == "message") and (data.get("role") == "user"):
+            if any(
+                _CANCELLATION_MARKER in (b.get("text", "") or "")
+                for b in data.get("content", []) or []
+            ):
+                return True
+    return False
 
 
 def _assistant_text(items: list[dict]) -> str:
