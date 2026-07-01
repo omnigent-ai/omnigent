@@ -37,6 +37,7 @@ struct AppRootView: View {
       }
     }
     .task {
+      guard shouldAutoOpenSavedServer else { return }
       if case .setup(nil, nil) = mode,
         let saved = settings.serverURL,
         let url = URL(string: saved)
@@ -49,5 +50,15 @@ struct AppRootView: View {
   private enum Mode: Equatable {
     case setup(prefill: String?, error: String?)
     case web(URL)
+  }
+
+  private var shouldAutoOpenSavedServer: Bool {
+    #if DEBUG
+      let processInfo = ProcessInfo.processInfo
+      return processInfo.environment["OMNIGENT_SCREENSHOT_APP_URL"] == nil
+        && !processInfo.arguments.contains("-FASTLANE_SNAPSHOT")
+    #else
+      true
+    #endif
   }
 }
