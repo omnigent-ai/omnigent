@@ -32,9 +32,7 @@ Env vars read at startup:
   ``str | list[str]`` carrying ``spec.skills_filter``. When
   unset, falls back to ``"all"``.
 - ``HARNESS_HERMES_BUNDLE_DIR``: Absolute path to the agent
-  bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<name>/``. Unset for
-  agents without a bundled-skill directory.
+  bundle's extracted root. Reserved for future skill wiring.
 - ``HARNESS_HERMES_AGENT_NAME``: Agent display name. Reserved for
   future use; currently unused by Hermes.
 """
