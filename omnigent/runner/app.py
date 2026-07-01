@@ -557,6 +557,7 @@ class _KiroNativeLaunchConfig:
     workspace: Path
     terminal_launch_args: list[str] | None
     external_session_id: str | None
+    model_override: str | None = None
 
 
 def _required_runner_env(name: str) -> str:
@@ -672,12 +673,23 @@ async def _kiro_native_launch_config(
         not isinstance(external_session_id, str) or not external_session_id.strip()
     ):
         raise RuntimeError(f"Invalid external_session_id for Kiro session {session_id!r}.")
+    model_override = snapshot.get("model_override")
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override:
+            raise RuntimeError(f"Invalid model_override for Kiro session {session_id!r}.")
+        try:
+            model_override = validate_model_override(model_override)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid model_override for Kiro session {session_id!r}: {exc}"
+            ) from exc
     return _KiroNativeLaunchConfig(
         workspace=_kiro_session_workspace(session_workspace),
         terminal_launch_args=terminal_launch_args,
         external_session_id=external_session_id.strip()
         if isinstance(external_session_id, str)
         else None,
+        model_override=model_override if isinstance(model_override, str) else None,
     )
 
 
@@ -2723,6 +2735,7 @@ async def _auto_create_kiro_terminal(
     kiro_launch = build_kiro_launch(
         launch_config.terminal_launch_args or [],
         resume_id=launch_config.external_session_id,
+        model=launch_config.model_override,
     )
     launch_epoch_ms = int(time.time() * 1000)
     terminal_view = await resource_registry.launch_required_terminal(
@@ -11674,6 +11687,57 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_kiro_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        """
+        Switch a running kiro-native session's model via its TUI ``/model``.
+
+        kiro-cli's ``--model`` is baked in at spawn (see
+        ``_auto_create_kiro_terminal``), so a live web-UI / REPL ``/model`` switch
+        can't be applied by re-reading the persisted ``model_override`` —
+        ``inject_model_command`` types ``/model <id>`` into the tmux pane, which
+        kiro applies directly (confirmed by its ``Model changed to <id>`` line).
+        Mirrors ``_handle_cursor_native_model_change``.
+
+        Skipped silently when *model* is ``None`` or blank — kiro has no slash
+        form for "use the spawn default", so a clear only takes effect on the
+        next spawn.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param model: New persisted kiro model id, e.g. ``"claude-haiku-4.5"``;
+            ``None`` when the user cleared the override.
+        :returns: 204 on success or skip; 503 if the tmux pane isn't advertised
+            yet (best-effort — the persisted value applies on the next spawn).
+        """
+        from omnigent.kiro_native_bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            # Short pane-readiness timeout: a missing tmux.json means the pane
+            # isn't attached; the persisted model still applies on the next spawn.
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=model.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         """
         Type ``/compact`` into Claude's tmux pane.
@@ -15090,7 +15154,13 @@ def create_runner_app(
             # update. Other harnesses pick up the persisted value on the
             # next turn and 204 here.
             harness = _session_harness_name(conversation_id)
-            if harness in ("claude-native", "codex-native", "cursor-native", "opencode-native"):
+            if harness in (
+                "claude-native",
+                "codex-native",
+                "cursor-native",
+                "opencode-native",
+                "kiro-native",
+            ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -15114,6 +15184,11 @@ def create_runner_app(
                     )
                 if harness == "opencode-native":
                     return await _handle_opencode_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "kiro-native":
+                    return await _handle_kiro_native_model_change(
                         conversation_id,
                         model,
                     )

@@ -541,3 +541,39 @@ def test_write_kiro_workspace_mcp_config_merges_preserving_user_servers(tmp_path
     assert "serve-mcp" in written["mcpServers"]["omnigent"]["args"]
     # serve-mcp's token file is written alongside.
     assert (bridge_dir / "bridge.json").exists()
+
+
+def test_inject_model_command_switches_and_confirms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/model <id>`` is typed literally and confirmed via kiro's success line."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_TYPE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    marker_pane = "Model changed to claude-haiku-4.5 (saved as default)\n" + _READY_PANE
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_READY_PANE, marker_pane])
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    bridge.inject_model_command(bridge_dir, model="claude-haiku-4.5", timeout_s=0.1)
+
+    sent = [call[-1] for call in calls if "send-keys" in call]
+    # Clear the draft (C-a/C-k), send the literal slash command, then Enter.
+    assert sent == ["C-a", "C-k", "/model claude-haiku-4.5", "Enter"]
+
+
+def test_inject_model_command_raises_when_switch_not_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing ``Model changed to <id>`` line fails loudly (bad/unavailable id)."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_TYPE_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_MODEL_CONFIRM_TIMEOUT_S", 0.05)
+    bridge_dir = tmp_path / "bridge"
+    # Pane stays at the input prompt and never shows the confirmation line.
+    _install_fake_tmux(monkeypatch, pane_outputs=[_READY_PANE])
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    with pytest.raises(RuntimeError, match="did not confirm the model switch"):
+        bridge.inject_model_command(bridge_dir, model="bogus-model", timeout_s=0.1)
