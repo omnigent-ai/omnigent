@@ -26,6 +26,7 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from omnigent.runner.app import ResolvedSpec
@@ -33,7 +34,9 @@ if TYPE_CHECKING:
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
 _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
-_RUNNER_VERSION = "0.1.0"
+# The runner advertises the omnigent version it is actually running (shared
+# with the CLI/server/host) instead of a hard-coded placeholder.
+_RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0

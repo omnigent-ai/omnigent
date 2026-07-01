@@ -1087,11 +1087,11 @@ def _format_version() -> str:
         ``"omnigent 0.1.0 (010cf77c, built 2026-05-21T14:34:45Z)"``.
     """
     import datetime
-    import importlib.metadata
 
     from omnigent.update_check import _read_build_info
+    from omnigent.version import VERSION
 
-    version_str = importlib.metadata.version("omnigent")
+    version_str = VERSION
     info = _read_build_info()
     if info is None:
         return f"omnigent {version_str}"
@@ -1145,15 +1145,11 @@ class _OmnigentCLI(click.Group):
         from omnigent.inner import ui
 
         if ui.show_banner():
-            import importlib.metadata
+            from omnigent.version import VERSION
 
-            try:
-                version = importlib.metadata.version("omnigent")
-            except importlib.metadata.PackageNotFoundError:  # pragma: no cover
-                version = ""
             epilogue = [("Get started", "omnigent setup")]
-            if version:
-                epilogue.insert(0, ("Version", version))
+            if VERSION:
+                epilogue.insert(0, ("Version", VERSION))
             ui.print_landing(tagline="all your agents, one cli", epilogue=epilogue)
         super().format_help(ctx, formatter)
 

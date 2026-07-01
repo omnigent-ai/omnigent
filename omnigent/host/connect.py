@@ -68,6 +68,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -1473,7 +1474,7 @@ class HostProcess:
             to the reconnect loop in :meth:`run`.
         """
         hello = HostHelloFrame(
-            version="0.1.0",
+            version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),

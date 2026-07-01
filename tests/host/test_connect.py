@@ -671,6 +671,28 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert host._unreported_exits == {}
 
 
+async def test_hello_advertises_installed_version() -> None:
+    """The ``host.hello`` frame reports the omnigent version, not a placeholder.
+
+    A hard-coded placeholder would make every host look like the same
+    stale build in the server's version popover. The hello must carry the
+    shared resolved version this host is actually running.
+    """
+    from omnigent.version import VERSION
+
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.version == VERSION
+    # Guard against the old hard-coded literal creeping back.
+    assert hello.version != "0.1.0"
+
+
 def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
