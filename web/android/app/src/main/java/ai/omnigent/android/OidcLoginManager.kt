@@ -42,11 +42,14 @@ class OidcLoginManager {
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
      * polls in the background; [onSession] is invoked on the main thread with the
-     * session JWT once the browser flow completes. A second call while one is in
-     * flight is ignored.
+     * session JWT once the browser flow completes.
+     *
+     * Returns true if this call started a flow, or false if one was already in
+     * flight (a second concurrent call is ignored). The caller uses the result so
+     * a no-op call isn't counted against a retry budget.
      */
-    fun start(activity: Activity, origin: String, onSession: (String) -> Unit) {
-        if (!inFlight.compareAndSet(false, true)) return
+    fun start(activity: Activity, origin: String, onSession: (String) -> Unit): Boolean {
+        if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
         io.execute {
             var token: String? = null
@@ -70,6 +73,7 @@ class OidcLoginManager {
             // destroyed host.
             if (result != null) main.post { sessionCallback?.invoke(result) }
         }
+        return true
     }
 
     /** Cancel an in-flight login and release the host. Call from onDestroy. */

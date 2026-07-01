@@ -234,6 +234,12 @@ class MainActivity : ComponentActivity() {
             authLog("login attempts exhausted ($loginAttempts) — not retrying")
             return
         }
+        // start() no-ops when a login is already in flight — a multi-hop OIDC
+        // redirect can re-enter this before the first browser hand-off settles.
+        // Count (and re-arm the history clear for) only a call that actually
+        // launches a flow, so re-entrant redirects can't burn the retry budget
+        // without ever relaunching and suppress a legitimate later retry.
+        if (!loginManager.start(this, origin, ::onSessionToken)) return
         loginAttempts++
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
@@ -241,7 +247,6 @@ class MainActivity : ComponentActivity() {
         // page-ready purges them — otherwise Back walks into the stopped IdP entry
         // and re-pops the login browser.
         historyCleared = false
-        loginManager.start(this, origin, ::onSessionToken)
     }
 
     /**
