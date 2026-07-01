@@ -196,10 +196,10 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.getByTestId("pin-conversation")).toHaveClass("md:hidden");
   });
 
-  it("reveals the quick-pin button without breaking icon centering (regression for #1226)", () => {
+  it("reveals the quick-pin button without breaking icon centering", () => {
     // The Button base centers its icon with `inline-flex` + `items-center
-    // justify-center`. The desktop reveal MUST keep a flex display: PR #1226
-    // revealed it with `md:block`, which overrode `inline-flex`, made the
+    // justify-center`. The desktop reveal MUST keep a flex display: revealing
+    // it with `md:block` overrode `inline-flex`, made the
     // centering classes inert, and shoved the pin glyph to the button's
     // top-left corner (~6px off-center). Guard the display so the reveal
     // stays flex and the glyph stays centered.

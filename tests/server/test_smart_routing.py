@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,6 +17,7 @@ from omnigent.server.smart_routing import (
     LLMRoutingClient,
     RoutingResult,
     _build_rubric,
+    fetch_runner_models,
     infer_models,
     route_turn,
 )
@@ -62,7 +63,9 @@ class _FakeRoutingClient:
     def __init__(self, result: RoutingResult | None) -> None:
         self._result = result
 
-    async def route(self, message: str, available_models: list[str]) -> RoutingResult | None:
+    async def route(
+        self, message: str, available_models: dict[str, list[str]]
+    ) -> RoutingResult | None:
         del message, available_models
         return self._result
 
@@ -115,13 +118,26 @@ def test_infer_models_unknown_harness() -> None:
 
 
 def test_build_rubric_includes_all_models() -> None:
-    models = ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"]
-    rubric = _build_rubric(models)
+    available = {
+        "claude-sdk": ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"],
+    }
+    rubric = _build_rubric(available)
     assert "databricks-claude-haiku-4-5" in rubric
     assert "databricks-claude-opus-4-8" in rubric
     assert "strict JSON" in rubric
-    # Naming conventions are explained
     assert "haiku" in rubric and "opus" in rubric
+
+
+def test_build_rubric_shows_harness_names() -> None:
+    available = {
+        "claude-sdk": ["databricks-claude-haiku-4-5"],
+        "codex": ["databricks-gpt-5-4-nano"],
+    }
+    rubric = _build_rubric(available)
+    assert "claude-sdk" in rubric
+    assert "codex" in rubric
+    assert "databricks-claude-haiku-4-5" in rubric
+    assert "databricks-gpt-5-4-nano" in rubric
 
 
 # ── LLMRoutingClient ───────────────────────────────────────────────
@@ -130,37 +146,75 @@ def test_build_rubric_includes_all_models() -> None:
 @pytest.mark.asyncio
 async def test_llm_routing_client_returns_result() -> None:
     verdict = {
+        "harness": "claude-sdk",
         "model": "databricks-claude-opus-4-8",
         "rationale": "hard refactor",
     }
     client = LLMRoutingClient(_FakeLLMClient(verdict))
     models = infer_models("claude-sdk")
     assert models is not None
-    result = await client.route("refactor auth", models)
+    result = await client.route("refactor auth", {"claude-sdk": models})
     assert result is not None
     assert result.model == "databricks-claude-opus-4-8"
     assert result.rationale == "hard refactor"
-    assert not hasattr(result, "tier")
+    assert result.harness == "claude-sdk"
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_harness_mismatch_re_resolves() -> None:
+    """If the judge picks a harness that doesn't own the model, fall back."""
+    claude_models = infer_models("claude-sdk")
+    assert claude_models is not None
+    verdict = {
+        "harness": "codex",  # codex doesn't have claude models
+        "model": "databricks-claude-opus-4-8",
+        "rationale": "deep reasoning",
+    }
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    result = await client.route(
+        "hard task", {"claude-sdk": claude_models, "codex": ["databricks-gpt-5-4"]}
+    )
+    assert result is not None
+    assert result.model == "databricks-claude-opus-4-8"
+    # harness re-resolved to the one that owns the model
+    assert result.harness == "claude-sdk"
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_unknown_harness_re_resolves() -> None:
+    """If the judge returns an unrecognised harness, fall back to model ownership."""
+    models = infer_models("claude-sdk")
+    assert models is not None
+    verdict = {
+        "harness": "hallucinated-harness",
+        "model": "databricks-claude-haiku-4-5",
+        "rationale": "simple task",
+    }
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    result = await client.route("hello", {"claude-sdk": models})
+    assert result is not None
+    assert result.model == "databricks-claude-haiku-4-5"
+    assert result.harness == "claude-sdk"
 
 
 @pytest.mark.asyncio
 async def test_llm_routing_client_clamps_hallucinated_model() -> None:
-    verdict = {"model": "hallucinated-model", "rationale": "hard"}
+    verdict = {"harness": "claude-sdk", "model": "hallucinated-model", "rationale": "hard"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
     models = infer_models("claude-sdk")
     assert models is not None
-    result = await client.route("hard task", models)
+    result = await client.route("hard task", {"claude-sdk": models})
     assert result is not None
     assert result.model == models[0]  # clamped to cheapest
 
 
 @pytest.mark.asyncio
 async def test_llm_routing_client_rejects_empty_model() -> None:
-    verdict = {"model": "", "rationale": "x"}
+    verdict = {"harness": "claude-sdk", "model": "", "rationale": "x"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
     models = infer_models("claude-sdk")
     assert models is not None
-    result = await client.route("hello", models)
+    result = await client.route("hello", {"claude-sdk": models})
     assert result is None
 
 
@@ -173,7 +227,72 @@ async def test_llm_routing_client_returns_none_on_error() -> None:
     client = LLMRoutingClient(_BrokenLLM())
     models = infer_models("claude-sdk")
     assert models is not None
-    result = await client.route("hello", models)
+    result = await client.route("hello", {"claude-sdk": models})
+    assert result is None
+
+
+# ── fetch_runner_models ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fetch_runner_models_parses_catalog() -> None:
+    catalog_payload = {
+        "workers": {
+            "self": {
+                "source": "catalog",
+                "verified": True,
+                "models": [
+                    {"id": "databricks-claude-haiku-4-5", "family": "claude"},
+                    {"id": "databricks-claude-opus-4-8", "family": "claude"},
+                ],
+                "note": "",
+            },
+            "claude_code": {
+                "source": "catalog",
+                "verified": True,
+                "models": [
+                    {"id": "databricks-claude-haiku-4-5", "family": "claude"},
+                    {"id": "databricks-claude-sonnet-4-6", "family": "claude"},
+                ],
+                "note": "",
+            },
+        }
+    }
+    mock_response = MagicMock()
+    mock_response.json.return_value = catalog_payload
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    result = await fetch_runner_models("conv_123", mock_client)
+    assert result is not None
+    assert "databricks-claude-haiku-4-5" in result["self"]
+    assert "databricks-claude-opus-4-8" in result["self"]
+    assert "databricks-claude-sonnet-4-6" in result["claude_code"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_runner_models_returns_none_on_http_error() -> None:
+    import httpx
+
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(side_effect=httpx.HTTPError("connection refused"))
+
+    result = await fetch_runner_models("conv_123", mock_client)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_runner_models_returns_none_on_empty_workers() -> None:
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"workers": {}}
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    result = await fetch_runner_models("conv_123", mock_client)
     assert result is None
 
 
@@ -190,6 +309,7 @@ async def test_route_turn_uses_caps_routing_client() -> None:
     expected = RoutingResult(
         model="databricks-claude-haiku-4-5",
         rationale="trivial",
+        harness="claude-sdk",
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch(
@@ -218,3 +338,70 @@ async def test_route_turn_unknown_harness() -> None:
     model, _v = await route_turn("cursor", "hello")
     assert model is None
     assert _v is None
+
+
+@pytest.mark.asyncio
+async def test_route_turn_uses_runner_catalog_when_available() -> None:
+    """route_turn uses live runner catalog instead of static table when provided."""
+    expected = RoutingResult(
+        model="databricks-claude-opus-4-8",
+        rationale="complex task",
+        harness="self",
+    )
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "self": {
+                "source": "catalog",
+                "verified": True,
+                "models": [
+                    {"id": "databricks-claude-haiku-4-5"},
+                    {"id": "databricks-claude-opus-4-8"},
+                ],
+                "note": "",
+            }
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, _v = await route_turn(
+            "claude-sdk",
+            "complex task",
+            session_id="conv_123",
+            runner_client=mock_client,
+        )
+    assert model == "databricks-claude-opus-4-8"
+    # Runner endpoint was called
+    mock_client.get.assert_called_once()
+    call_url = mock_client.get.call_args[0][0]
+    assert "conv_123" in call_url and "models" in call_url
+
+
+@pytest.mark.asyncio
+async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None:
+    """Falls back to infer_models when runner catalog fetch fails."""
+    import httpx
+
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(side_effect=httpx.HTTPError("runner down"))
+
+    expected = RoutingResult(
+        model="databricks-claude-haiku-4-5",
+        rationale="simple",
+        harness="claude-sdk",
+    )
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, _v = await route_turn(
+            "claude-sdk",
+            "hello",
+            session_id="conv_123",
+            runner_client=mock_client,
+        )
+    # Still routes — fell back to static infer_models
+    assert model == "databricks-claude-haiku-4-5"

@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import { CodeViewer } from "./CodeViewer";
+import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -318,5 +319,36 @@ describe("CodeViewer image rendering", () => {
   it("routes by content_type over extension (image MIME on a .txt name)", async () => {
     renderImage("image/png", "data.txt");
     expect(await screen.findByAltText("data.txt")).toBeDefined();
+  });
+
+  it("opens the shared zoom lightbox when the image is clicked", async () => {
+    render(
+      <ImageLightboxProvider>
+        <CodeViewer
+          conversationId="conv_1"
+          path="assets/logo.png"
+          fileQuery={makeImageQuery("image/png")}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen={true}
+          searchOpen={false}
+          setSearchOpen={() => {}}
+          searchInputRef={noopRef}
+          viewMode="source"
+        />
+      </ImageLightboxProvider>,
+    );
+
+    const img = (await screen.findByAltText("logo.png")) as HTMLImageElement;
+    // No lightbox until the user clicks the inline image.
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    fireEvent.click(img);
+
+    // The Radix Dialog is now open with the zoom controls from the lightbox.
+    expect(await screen.findByRole("dialog")).toBeDefined();
+    expect(screen.getByLabelText("Zoom in")).toBeDefined();
+    expect(screen.getByLabelText("Zoom out")).toBeDefined();
   });
 });

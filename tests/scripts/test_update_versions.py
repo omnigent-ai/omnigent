@@ -23,7 +23,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # a full-suite collection (pytest's default "prepend" import mode), failing with
 # ``ImportError: cannot import name 'update_versions' from 'scripts'``. Load the
 # module by its repo-root file path instead, which is immune to the collision.
-# See https://github.com/omnigent-ai/omnigent/issues/1311.
 _UPDATE_VERSIONS_SPEC = importlib.util.spec_from_file_location(
     "_update_versions_under_test", _REPO_ROOT / "scripts" / "update_versions.py"
 )
