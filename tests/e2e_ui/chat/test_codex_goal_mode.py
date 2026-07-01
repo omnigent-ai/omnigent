@@ -36,6 +36,10 @@ def _goal_response(session_id: str, method: str, suffix: str = ""):
     return _matches
 
 
+# Boots a real native Codex CLI (like the native render-parity tests it shares
+# fixtures with), so it costs ~7.5min -- the bulk of one e2e-ui CI shard. Gated
+# to nightly to match those siblings and keep the per-PR shards balanced.
+@pytest.mark.nightly
 @pytest.mark.timeout(900)
 def test_codex_goal_mode_with_mocked_responses(
     page: Page,
