@@ -58,8 +58,9 @@ QWEN_KEY = "qwen"
 CURSOR_KEY = "cursor"
 
 # Kimi authenticates against Moonshot AI's backend (``kimi login`` OAuth or a
-# Moonshot API key), not via the ambient provider config; like Cursor it ships
-# via a curl installer rather than npm, so it carries an ``install_hint``.
+# Moonshot API key), not via the ambient provider config. It ships as the
+# ``@moonshot-ai/kimi-code`` npm package, so ``omnigent setup`` can install it
+# the same way it installs Claude / Codex / Pi.
 KIMI_KEY = "kimi"
 
 # Kiro authenticates against its own backend and ships as a standalone native
@@ -188,20 +189,19 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
-    # Kimi Code CLI ships a single-binary ``kimi`` via a curl installer (no
-    # npm). ``kimi login`` is the interactive provider login (OAuth or a
-    # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
-    # no first-class "am I logged in?" exit-code probe — login state is
-    # only inspected interactively. With ``None`` the login path runs every
-    # time the operator asks for it (interactive, so they can cancel if
-    # already authenticated).
+    # Kimi Code CLI ships as the ``@moonshot-ai/kimi-code`` npm package and
+    # exposes the ``kimi`` binary. ``kimi login`` is the interactive provider
+    # login (OAuth or a Moonshot API key). ``status_args`` is intentionally
+    # ``None``: kimi has no first-class "am I logged in?" exit-code probe —
+    # login state is only inspected interactively. With ``None`` the login path
+    # runs every time the operator asks for it (interactive, so they can cancel
+    # if already authenticated).
     KIMI_KEY: HarnessInstallSpec(
         "Kimi",
         "kimi",
-        package=None,
+        package="@moonshot-ai/kimi-code",
         login_args=("login",),
         logout_args=("logout",),
-        install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
     ),
     KIRO_KEY: HarnessInstallSpec(
         "Kiro",

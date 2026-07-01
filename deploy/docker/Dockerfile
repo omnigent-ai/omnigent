@@ -18,7 +18,7 @@
 # and server-launched managed hosts. It bakes the full omnigent
 # install plus the tools a host needs at runtime — git (workspaces /
 # worktrees), tmux (terminal sessions spawned by native harnesses),
-# and the coding-harness CLIs (claude / codex / pi, via Node; kiro-cli via
+# and the coding-harness CLIs (claude / codex / pi / kimi, via Node; kiro-cli via
 # Kiro's installer) — and
 # skips everything server-only: no SPA bundle, no psycopg, no
 # uvicorn entrypoint. Modal's `Image.from_registry` requirements shape
@@ -55,7 +55,8 @@
 
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
-ARG NODE_VERSION=20
+# Node 22+ is required for @moonshot-ai/kimi-code (Kimi Code CLI).
+ARG NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the web SPA so `docker build` works from a clean checkout —
@@ -169,8 +170,8 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 # port" and breaks web-turn injection), bubblewrap to OS-sandbox the
 # native harness terminals (mandatory and fail-loud on Linux), curl + CA
 # certificates for outbound HTTPS and in-sandbox downloads, plus the
-# coding-harness CLIs (claude / codex / pi / kiro-cli) so claude-sdk,
-# claude-native, codex, pi, and kiro-native agents can run in managed
+# coding-harness CLIs (claude / codex / pi / kimi / kiro-cli) so claude-sdk,
+# claude-native, codex, pi, kimi-native, and kiro-native agents can run in managed
 # sandboxes without an in-sandbox install. No SPA, no psycopg, no server
 # entrypoint.
 #
@@ -244,6 +245,7 @@ RUN npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
       @earendil-works/pi-coding-agent \
+      @moonshot-ai/kimi-code \
  && npm cache clean --force
 
 # Kiro CLI is not published as an npm package, and its installer has NO version
