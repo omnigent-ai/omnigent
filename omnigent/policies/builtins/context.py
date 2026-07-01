@@ -146,7 +146,7 @@ def detect_task_switch(
         history: list[str] = state.get(_TASK_SWITCH_HISTORY_KEY) or []
 
         # Slide the window: append new message, keep last history_window entries.
-        updated_history = (history + [new_message[:500]])[-history_window:]
+        updated_history = [*history, new_message[:500]][-history_window:]
 
         # Not enough prior turns yet — record and pass through.
         if len(history) < min_turns:
