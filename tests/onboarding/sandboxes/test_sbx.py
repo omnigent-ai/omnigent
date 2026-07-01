@@ -359,3 +359,25 @@ def test_terminate_idempotent_when_absent(fake_sbx: _FakeSbx) -> None:
     fake_sbx.responses["ls"] = _FakeCompleted(args=[], stdout=_ls_json())
     SbxSandboxLauncher().terminate("box")
     assert [c.args[1] for c in fake_sbx.calls] == ["ls"]
+
+
+# ── registration / capability surface ───────────────────────
+
+
+def test_provider_is_registered() -> None:
+    """The sbx provider is listed and resolvable."""
+    from omnigent.onboarding.sandboxes import available_providers, get_launcher
+
+    assert "sbx" in available_providers()
+    assert isinstance(get_launcher("sbx"), SbxSandboxLauncher)
+
+
+def test_login_primitives_are_capability_gated(fake_sbx: _FakeSbx) -> None:
+    """No local->sandbox forward path, so the OAuth primitives stay gated."""
+    from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
+
+    launcher = SbxSandboxLauncher()
+    with pytest.raises(SandboxCapabilityError):
+        launcher.forward_local_port("box", 8022)
+    with pytest.raises(SandboxCapabilityError):
+        launcher.stream_exec("box", "echo hi")

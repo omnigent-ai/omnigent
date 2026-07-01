@@ -70,6 +70,7 @@ _LAUNCHERS: dict[str, str] = {
     # On-demand Kubernetes runner Pod via the official kubernetes client (the
     # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
     "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
+    "sbx": "omnigent.onboarding.sandboxes.sbx:SbxSandboxLauncher",
 }
 
 
