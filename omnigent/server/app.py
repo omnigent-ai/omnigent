@@ -124,7 +124,13 @@ def _register_web_mimetypes() -> None:
 
 _register_web_mimetypes()
 
-_WEB_UI_DIST = Path(__file__).parent / "static" / "web-ui"
+# Default: the SPA bundled into the installed wheel's package data. A deploy
+# that ships the SPA outside the wheel (e.g. as loose files in the app source
+# tree, to keep the wheel under a per-file size cap) can point here instead via
+# OMNIGENT_WEB_UI_DIST, without rebuilding or repackaging.
+_WEB_UI_DIST = Path(
+    os.environ.get("OMNIGENT_WEB_UI_DIST") or (Path(__file__).parent / "static" / "web-ui")
+)
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
