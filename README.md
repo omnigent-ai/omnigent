@@ -46,7 +46,12 @@ Omnigent lets you:
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
   [Boxlite](https://github.com/boxlite-ai/boxlite), or
   [Databricks](https://www.databricks.com) sandboxes, launched from the
-  CLI or provisioned by the server per session (*managed hosts*).
+  CLI or provisioned by the server per session (*managed hosts*). Prefer
+  local isolation? Run a session inside a
+  [Docker Sandbox](https://docs.docker.com/ai/sandboxes/) microVM with
+  `omnigent sandbox create --provider sbx` — it bind-mounts your project,
+  applies personal config via `--kit`, and gives the agent its own Docker
+  daemon for nested dev containers.
 
 - **🛡️ Govern your agents.** Create
   [policies](#6-govern-your-agents-with-policies) to pause for your approval
