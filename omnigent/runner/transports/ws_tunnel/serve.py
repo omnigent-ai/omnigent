@@ -46,6 +46,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+from omnigent.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
@@ -540,11 +541,16 @@ async def _serve_tunnel_once(
     headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
+    # Verifying SSL context from a real CA bundle for wss:// — a bare default
+    # context loads zero roots on uv / python-build-standalone Pythons (no
+    # OpenSSL default cert path). Local runners use ws:// and pass ssl=None.
+    ssl_ctx = client_ssl_context() if tunnel_url.startswith("wss://") else None
     async with websockets.connect(
         tunnel_url,
         additional_headers=headers,
         close_timeout=_RUNNER_TUNNEL_CLOSE_TIMEOUT_S,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        ssl=ssl_ctx,
     ) as ws:
         await _send_hello(ws.send, runner_version)
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)

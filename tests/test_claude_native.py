@@ -8,6 +8,7 @@ import importlib.metadata
 import io
 import json
 import os
+import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -3546,6 +3547,9 @@ def test_websocket_connect_sets_short_close_timeout(monkeypatch: pytest.MonkeyPa
     )
 
     assert result is sentinel
+    # A wss:// attach URL carries a verifying SSL context (asserted separately
+    # since an SSLContext isn't equality-comparable to a literal).
+    assert isinstance(captured.pop("ssl"), ssl.SSLContext)
     # The wrapper adds the first-party Origin sentinel alongside the
     # caller's auth header so the server's CSWSH origin guard admits this
     # non-browser attach client; the caller's bearer is preserved.
@@ -6159,3 +6163,39 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
         str(r.get("message", {}).get("content", "")) for r in records if r.get("type") == "user"
     ]
     assert any("after compaction" in t for t in user_texts)
+
+
+def test_websocket_connect_passes_ssl_context_for_wss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wss:// attach URL (remote https workspace) gets a verifying SSL context.
+
+    Without it, claude-native attach fails with CERTIFICATE_VERIFY_FAILED on
+    interpreters whose OpenSSL default trust store is empty (see issue #1730).
+    """
+    captured: dict[str, Any] = {}
+
+    def _stub_connect(url: str, **kwargs: Any) -> str:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return "cm"
+
+    monkeypatch.setattr(websockets, "connect", _stub_connect)
+    claude_native._websocket_connect("wss://example.databricksapps.com/attach", headers={})
+    assert isinstance(captured["kwargs"]["ssl"], ssl.SSLContext)
+
+
+def test_websocket_connect_no_ssl_context_for_ws(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain ws:// attach URL (local runner) passes ssl=None — the library default."""
+    captured: dict[str, Any] = {}
+
+    def _stub_connect(url: str, **kwargs: Any) -> str:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return "cm"
+
+    monkeypatch.setattr(websockets, "connect", _stub_connect)
+    claude_native._websocket_connect("ws://127.0.0.1:6767/attach", headers={})
+    assert captured["kwargs"]["ssl"] is None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, TypedDict
@@ -557,10 +558,14 @@ async def test_serve_tunnel_once_sends_bearer_header(
     )
 
     assert captured["url"] == "wss://example.databricksapps.com/v1/runners/runner_auth/tunnel"
+    # A wss:// tunnel carries a verifying SSL context (asserted separately since
+    # an SSLContext isn't equality-comparable to a literal).
+    kwargs = dict(captured["kwargs"])
+    assert isinstance(kwargs.pop("ssl"), ssl.SSLContext)
     # The runner also sends the first-party Origin sentinel so the server's
     # CSWSH origin guard admits the tunnel (a non-browser client), in
     # addition to the bearer and tunnel-binding token.
-    assert captured["kwargs"] == {
+    assert kwargs == {
         "additional_headers": {
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
             "Authorization": "Bearer tok-auth",
@@ -1204,3 +1209,75 @@ async def test_serve_tunnel_reconnect_uses_fresh_token_not_stale(
         f"If both are the same, the factory was cached. If either is "
         f"'tok-initial', the factory was not called before reconnect."
     )
+
+
+class _StubWS:
+    """Minimal websocket: accepts the hello frame, then closes immediately."""
+
+    async def send(self, _text: str) -> None:
+        return None
+
+    def __aiter__(self) -> _StubWS:
+        return self
+
+    async def __anext__(self) -> str:
+        raise StopAsyncIteration
+
+
+class _StubConnect:
+    """Captures the kwargs passed to ``websockets.connect`` for assertions."""
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self._captured = captured
+
+    def __call__(self, url: str, **kwargs: Any) -> _StubConnect:
+        self._captured["url"] = url
+        self._captured["kwargs"] = kwargs
+        return self
+
+    async def __aenter__(self) -> _StubWS:
+        return _StubWS()
+
+    async def __aexit__(self, *_exc: object) -> bool:
+        return False
+
+
+async def _capture_connect_kwargs(
+    monkeypatch: pytest.MonkeyPatch, tunnel_url: str
+) -> dict[str, Any]:
+    """Drive one ``_serve_tunnel_once`` and return the captured connect kwargs."""
+    import websockets
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(websockets, "connect", _StubConnect(captured))
+    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *_a, **_k: {})
+    await _serve_tunnel_once(
+        None,  # type: ignore[arg-type]  # app unused: the stub ws closes immediately
+        tunnel_url=tunnel_url,
+        server_url="https://example.databricks.com",
+        runner_id="runner_test",
+        runner_version="0.1.0",
+    )
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_passes_ssl_context_for_wss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wss:// tunnel gets a verifying SSL context (fixes empty-trust-store)."""
+    captured = await _capture_connect_kwargs(
+        monkeypatch, "wss://example.databricks.com/v1/runners/runner_test/tunnel"
+    )
+    assert isinstance(captured["kwargs"]["ssl"], ssl.SSLContext)
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_no_ssl_context_for_ws(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain ws:// tunnel (local runner) passes ssl=None — the library default."""
+    captured = await _capture_connect_kwargs(
+        monkeypatch, "ws://127.0.0.1:6767/v1/runners/runner_test/tunnel"
+    )
+    assert captured["kwargs"]["ssl"] is None

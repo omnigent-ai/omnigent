@@ -96,6 +96,11 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    # CA root bundle for client TLS verification (omnigent/tls.py,
+    # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
+    # python-build-standalone interpreters whose OpenSSL has no default cert
+    # path; previously only transitive, pinned here now that we import it.
+    "certifi>=2023.7",
 ]
 
 [project.optional-dependencies]

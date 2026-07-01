@@ -68,6 +68,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
@@ -1375,11 +1376,17 @@ class HostProcess:
         headers = self._build_connect_headers()
 
         _logger.info("Connecting to %s", url)
+        # Build a verifying SSL context from a real CA bundle for wss:// — a bare
+        # default context loads zero roots on uv / python-build-standalone Pythons
+        # (no OpenSSL default cert path), which fails handshake verification.
+        # ``ssl=None`` for ws:// is the library default (no TLS).
+        ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
+                ssl=ssl_ctx,
             )
             ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:
