@@ -2002,6 +2002,37 @@ def test_parse_builtins_string_entries(tmp_path: Path) -> None:
     assert spec.tools.builtins[1].config == {}
 
 
+def test_parse_tools_null_builtins_is_empty_not_crash(tmp_path: Path) -> None:
+    """A present-but-null ``builtins:`` key parses as empty, not a crash.
+
+    ``raw.get("builtins", [])`` returns ``None`` (not the default) when the key
+    is present with no value, and ``_parse_builtin_tools(None)`` iterates
+    ``None`` and raises an uncaught ``TypeError``. A blank ``builtins:`` key
+    should parse as "no builtins", matching the sibling ``agents:`` field.
+
+    Regression guard: pre-fix this raises ``TypeError``.
+    """
+    (tmp_path / "config.yaml").write_text(
+        "spec_version: 1\nname: a\nllm:\n  model: x\ntools:\n  builtins:\n"
+    )
+    spec = parse(tmp_path)
+    assert spec.tools.builtins == []
+
+
+def test_parse_tools_null_agents_is_empty_not_none(tmp_path: Path) -> None:
+    """A present-but-null ``agents:`` key parses as ``[]``, not ``None``.
+
+    ``ToolsConfig.agents`` is typed ``list[str]``; a blank ``agents:`` key used
+    to store ``None``, violating that contract and risking downstream
+    ``None``-iteration.
+    """
+    (tmp_path / "config.yaml").write_text(
+        "spec_version: 1\nname: a\nllm:\n  model: x\ntools:\n  agents:\n"
+    )
+    spec = parse(tmp_path)
+    assert spec.tools.agents == []
+
+
 def test_parse_builtins_dict_entries(tmp_path: Path) -> None:
     """Dict entries in tools.builtins carry tool-specific config."""
     config = {
