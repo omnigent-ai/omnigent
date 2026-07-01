@@ -177,7 +177,7 @@ export function ChatHeader({
       className={cn(
         // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
         // the 32px controls. No own background — the app canvas shows
-        // through (a scrim can't track the canvas gradient; see #3010).
+        // through (a scrim can't track the canvas gradient).
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).

@@ -1510,7 +1510,7 @@ async def test_default_window_compacts_same_fill(monkeypatch: pytest.MonkeyPatch
 
 
 # ---------------------------------------------------------------------------
-# Layer-2 auth-failure detection (issue #1121: don't bury a 401)
+# Layer-2 auth-failure detection (don't bury a 401)
 # ---------------------------------------------------------------------------
 
 
