@@ -1005,6 +1005,48 @@ def read_permission_hook_config(bridge_dir: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def refresh_permission_hook_auth(bridge_dir: Path, authorization: str) -> bool:
+    """
+    Re-stamp the stored ``ap_auth_headers`` bearer for the native hooks.
+
+    The permission / policy command hooks read a one-shot ``ap_auth_headers``
+    snapshot from ``permission_hook.json`` (written once by
+    :func:`build_hook_settings` at launch/reattach), which dies with the ~1h
+    Databricks OAuth token lifetime. Once it lapses the hook subprocess must
+    re-mint on its own — a fragile path that fails outright when the on-disk
+    Databricks *refresh* token has itself expired, leaving every tool call to
+    fail closed. The long-lived transcript forwarder holds refresh-capable
+    auth, so it calls this on a cadence well under the 1h TTL to hand the hook
+    a live bearer, making the hook's own re-mint a rare last resort rather
+    than the primary refresh path.
+
+    Only the ``Authorization`` header is replaced; routing headers (e.g.
+    ``X-Databricks-Org-Id``) and ``ap_server_url`` are preserved. The write is
+    atomic (:func:`_write_json_file`), so a concurrent hook read never tears.
+
+    :param bridge_dir: Bridge directory path.
+    :param authorization: Full ``Authorization`` header value, e.g.
+        ``"Bearer eyJ..."``.
+    :returns: ``True`` when the snapshot was rewritten; ``False`` when there
+        is no permission-hook config to refresh or the bearer is unchanged
+        (no write performed).
+    """
+    config = _read_json_file(bridge_dir / _PERMISSION_HOOK_FILE)
+    if not isinstance(config, dict) or not config.get("ap_server_url"):
+        return False
+    raw_headers = config.get("ap_auth_headers")
+    headers = dict(raw_headers) if isinstance(raw_headers, dict) else {}
+    if headers.get("Authorization") == authorization:
+        # Token unchanged (SDK served the same cached bearer): skip the write
+        # so we don't churn the file — and its mtime — every cycle.
+        return False
+    headers["Authorization"] = authorization
+    config["ap_auth_headers"] = headers
+    config["updated_at"] = time.time()
+    _write_json_file(bridge_dir / _PERMISSION_HOOK_FILE, config)
+    return True
+
+
 def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> dict[str, Any]:
     """
     Build the Claude Code MCP config for the Omnigent bridge server.

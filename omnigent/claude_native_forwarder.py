@@ -10,7 +10,7 @@ import logging
 import os
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ from omnigent.claude_native_bridge import (
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
+    refresh_permission_hook_auth,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -217,6 +218,12 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
 _POST_TIMEOUT_S = 10.0
+# Cadence for re-stamping the native hooks' ``ap_auth_headers`` bearer in
+# ``permission_hook.json``. The hooks read a one-shot snapshot that dies at the
+# ~1h Databricks OAuth TTL; well under that, the forwarder (which holds
+# refresh-capable auth) rewrites it so the hook subprocess always reads a live
+# token instead of re-minting from a possibly-lapsed on-disk refresh token.
+_HOOK_AUTH_REFRESH_INTERVAL_S = 600.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
@@ -674,6 +681,78 @@ class _PostRetryTracker:
         )
 
 
+class _HookAuthRefresher:
+    """Periodically re-stamp the native hooks' ``ap_auth_headers`` bearer.
+
+    The permission / policy command hooks authenticate with a one-shot
+    ``ap_auth_headers`` snapshot in ``permission_hook.json`` that dies at the
+    ~1h Databricks OAuth TTL. When it lapses the hook must re-mint on its own,
+    which fails outright once the on-disk Databricks *refresh* token has itself
+    expired — so every tool call fails closed while the (refresh-capable)
+    forwarder keeps working. This closes that gap: the forwarder mints a fresh
+    bearer from the same :func:`_make_auth_token_factory` its own client uses
+    and rewrites the snapshot, so the hook reads a token minted less than
+    :data:`_HOOK_AUTH_REFRESH_INTERVAL_S` ago and its own re-mint becomes a
+    rare last resort.
+
+    Best-effort throughout: a missing factory, a mint failure, or an absent
+    permission-hook config never disrupts transcript forwarding.
+    """
+
+    def __init__(self, *, bridge_dir: Path, server_url: str) -> None:
+        """
+        :param bridge_dir: Bridge directory holding ``permission_hook.json``.
+        :param server_url: Omnigent server URL — the token-factory key (the
+            same ``base_url`` the forwarder's client authenticates against).
+        """
+        self._bridge_dir = bridge_dir
+        self._server_url = server_url
+        self._factory: Callable[[], str | None] | None = None
+        self._factory_resolved = False
+        # The launch snapshot is already fresh; first refresh one interval in.
+        self._next_refresh_at = time.monotonic() + _HOOK_AUTH_REFRESH_INTERVAL_S
+
+    async def maybe_refresh(self) -> None:
+        """Re-stamp the hook bearer when the interval has elapsed.
+
+        Cheap to call every poll: returns immediately until the interval is
+        due. The token mint (which can shell out to the Databricks CLI near
+        expiry) runs off-thread so the forwarder's event loop never blocks.
+        """
+        now = time.monotonic()
+        if now < self._next_refresh_at:
+            return
+        self._next_refresh_at = now + _HOOK_AUTH_REFRESH_INTERVAL_S
+        try:
+            token = await asyncio.to_thread(self._mint_token)
+            if token:
+                refresh_permission_hook_auth(self._bridge_dir, f"Bearer {token}")
+        except Exception:  # noqa: BLE001 — never let auth refresh break forwarding
+            return
+
+    def _mint_token(self) -> str | None:
+        """Mint a fresh bearer via the shared Databricks token factory.
+
+        Resolves :func:`_make_auth_token_factory` once (lazily, off the hot
+        path) and reuses it, mirroring the runner's own auth. Returns ``None``
+        when no refresh mechanism is available or a mint transiently fails.
+        """
+        if not self._factory_resolved:
+            try:
+                from omnigent.runner._entry import _make_auth_token_factory
+
+                self._factory = _make_auth_token_factory(self._server_url)
+            except Exception:  # noqa: BLE001 — best-effort; fall back to no refresh
+                self._factory = None
+            self._factory_resolved = True
+        if self._factory is None:
+            return None
+        try:
+            return self._factory()
+        except Exception:  # noqa: BLE001 — transient SDK/refresh failure
+            return None
+
+
 async def forward_claude_transcript_to_session(
     *,
     base_url: str,
@@ -757,11 +836,17 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    # Keep the native hooks' ap_auth_headers bearer live from this
+    # refresh-capable loop, so the hook subprocess never has to re-mint from a
+    # possibly-lapsed on-disk Databricks refresh token. Best-effort; a no-op
+    # when no token factory resolves (e.g. local unauthenticated servers).
+    hook_auth_refresher = _HookAuthRefresher(bridge_dir=bridge_dir, server_url=base_url)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
         while True:
             try:
+                await hook_auth_refresher.maybe_refresh()
                 current_session_id = read_active_session_id(bridge_dir) or session_id
                 if hook_state is None:
                     hook_state = await _ensure_hook_state(

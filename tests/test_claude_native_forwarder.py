@@ -23,8 +23,10 @@ from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
+    augment_claude_args,
     prepare_bridge_dir,
     read_active_session_id,
+    read_permission_hook_config,
     record_hook_event,
     write_active_session_id,
 )
@@ -6699,3 +6701,75 @@ async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
         "type": "external_session_status",
         "data": {"status": "waiting", "background_task_count": 1},
     }
+
+
+async def test_hook_auth_refresher_restamps_bearer_after_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The forwarder re-stamps the hook's ap_auth_headers bearer on its cadence.
+
+    Once the interval elapses, ``_HookAuthRefresher`` mints a fresh token via
+    the shared Databricks factory and rewrites ``permission_hook.json`` so the
+    hook subprocess reads a live bearer instead of re-minting from a possibly
+    lapsed on-disk refresh token (the failure mode that made every tool call
+    fail closed while the refresh-capable forwarder kept working).
+    """
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        ap_server_url="http://ap",
+        ap_auth_headers={"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o1"},
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url: lambda: "fresh-token",
+    )
+    refresher = forwarder._HookAuthRefresher(bridge_dir=bridge_dir, server_url="http://ap")
+
+    # Not yet due → snapshot untouched.
+    await refresher.maybe_refresh()
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer stale"
+
+    # Interval elapsed → re-stamp only the bearer, preserving routing headers.
+    refresher._next_refresh_at = 0.0
+    await refresher.maybe_refresh()
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_auth_headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "X-Databricks-Org-Id": "o1",
+    }
+
+
+async def test_hook_auth_refresher_noop_when_no_token_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No token factory (e.g. local unauthenticated server) → snapshot untouched.
+
+    The refresh is purely additive resilience: when no credential source
+    resolves, the hook keeps its launch snapshot and the forwarder never
+    rewrites the file.
+    """
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        ap_server_url="http://ap",
+        ap_auth_headers={"Authorization": "Bearer stale"},
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url: None,
+    )
+    refresher = forwarder._HookAuthRefresher(bridge_dir=bridge_dir, server_url="http://ap")
+    refresher._next_refresh_at = 0.0
+
+    await refresher.maybe_refresh()
+
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer stale"
