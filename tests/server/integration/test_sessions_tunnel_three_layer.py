@@ -146,7 +146,7 @@ class FakeProcessManager:
 
     def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
         # Mirror the real manager: the runner registers the live turn on
-        # response.created so the idle reaper spares it (issue #1414).
+        # response.created so the idle reaper spares it.
         self._in_flight[conversation_id] = response_id
 
     def clear_in_flight(self, conversation_id: str) -> None:

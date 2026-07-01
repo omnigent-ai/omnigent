@@ -70,23 +70,29 @@ def test_invoke_copies_directory(
     assert (target / "prompt.md").exists()
 
 
-def test_invoke_overwrites_existing_target(
+def test_invoke_refuses_existing_target(
     tool_ctx: ToolContext,
     tmp_path: Path,
 ) -> None:
-    """invoke() replaces an existing target directory."""
-    target = tmp_path / "export-overwrite"
+    """An existing target is refused and never deleted (no rmtree).
+
+    Regression test for arbitrary directory deletion: the old code
+    called ``shutil.rmtree`` on the LLM-controlled absolute target,
+    which could wipe any directory on the user's filesystem.
+    """
+    target = tmp_path / "precious"
     target.mkdir()
-    (target / "old-file.txt").write_text("stale")
+    (target / "important.txt").write_text("do not delete")
 
     tool = ExportAgentTool()
     result = tool.invoke(
         json.dumps({"source": "my-agent", "target": str(target)}),
         tool_ctx,
     )
-    assert "Exported agent to" in result
-    assert (target / "config.yaml").exists()
-    assert not (target / "old-file.txt").exists()
+    assert "Error" in result and "already exists" in result.lower()
+    # The pre-existing directory and its contents are untouched.
+    assert (target / "important.txt").read_text() == "do not delete"
+    assert not (target / "config.yaml").exists()
 
 
 # ── Invoke: error cases ──────────────────────────────────
@@ -143,3 +149,54 @@ def test_invoke_no_workspace() -> None:
         ctx,
     )
     assert "Error" in result and "workspace" in result.lower()
+
+
+# ── Invoke: containment / exfiltration ───────────────────
+
+
+def test_invoke_rejects_source_escaping_workspace(
+    tool_ctx: ToolContext,
+    tmp_path: Path,
+) -> None:
+    """A traversal source path is rejected and nothing is copied."""
+    target = tmp_path / "escape-out"
+    tool = ExportAgentTool()
+    result = tool.invoke(
+        json.dumps({"source": "../../etc", "target": str(target)}),
+        tool_ctx,
+    )
+    assert "Error" in result and "escapes the workspace" in result.lower()
+    assert not target.exists()
+
+
+def test_invoke_does_not_dereference_source_symlink(
+    tool_ctx: ToolContext,
+    tmp_path: Path,
+) -> None:
+    """A symlink inside source is copied as a link, not dereferenced.
+
+    Regression test for host-file exfiltration: copytree's default
+    symlink dereference would copy the *contents* of the symlink's
+    target (a host secret) into the exported directory.
+    """
+    assert tool_ctx.workspace is not None
+    secret = tmp_path / "host-secret.txt"
+    secret.write_text("TOP SECRET")
+    (tool_ctx.workspace / "my-agent" / "leak").symlink_to(secret)
+
+    target = tmp_path / "export-symlink" / "my-agent"
+    tool = ExportAgentTool()
+    result = tool.invoke(
+        json.dumps({"source": "my-agent", "target": str(target)}),
+        tool_ctx,
+    )
+    assert "Exported agent to" in result
+
+    exported_link = target / "leak"
+    # The entry is preserved as a symlink rather than dereferenced
+    # into a regular file holding the secret bytes.
+    assert exported_link.is_symlink()
+    # Removing the host file leaves the export dangling, proving the
+    # secret's contents were never copied out of the workspace.
+    secret.unlink()
+    assert not exported_link.exists()

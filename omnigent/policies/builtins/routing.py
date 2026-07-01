@@ -8,6 +8,12 @@ Classification results are cached in ``session_state`` by message
 hash so repeated ``llm_request`` round-trips within a turn pay
 for only one classifier call. See
 ``examples/server_config_deny_trivial_opus.yaml`` for usage.
+
+:func:`intent_gate` implements intent-based permissioning: it records
+the user's first message as the authoritative intent for the session,
+then gates every subsequent ``tool_call`` against that intent using the
+server-level LLM client.  Tool calls that cannot plausibly serve the
+original intent are denied before they run.
 """
 
 from __future__ import annotations
@@ -230,6 +236,229 @@ def deny_trivial_to_expensive_model(
     return evaluate  # type: ignore[return-value]
 
 
+# ── intent_gate ───────────────────────────────────────────────────────────────
+
+# Session-state key that stores the user's original intent (first message).
+_INTENT_KEY = "_intent_gate_intent"
+
+# Session-state key prefix for per-tool-call verdict cache.
+# Full key: ``_intent_gate_check:<hex16-of-intent+tool+args>``.
+_INTENT_CHECK_PREFIX = "_intent_gate_check:"
+
+_DEFAULT_INTENT_CHECK_PROMPT = """\
+You are a security policy enforcer for an AI agent.
+
+The agent was given a specific task (the "original intent") at the start of the
+session. Your job is to decide whether a proposed tool call is consistent with
+completing that task, or whether it goes beyond / outside the task scope.
+
+Be permissive for sub-tasks and helper steps that clearly serve the original
+intent. Only flag tool calls that have no plausible connection to the stated
+goal (e.g. the user asked to "fix a login bug" and the agent is about to send
+an email to an external address).
+
+Return strict JSON only:
+{"verdict": "ON_TASK" | "OFF_TASK"}
+"""
+
+_INTENT_CHECK_SCHEMA: dict[str, Any] = {
+    "format": {
+        "type": "json_schema",
+        "name": "intent_check_verdict",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["ON_TASK", "OFF_TASK"],
+                },
+            },
+            "required": ["verdict"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def intent_gate() -> PolicyCallable:
+    """Factory: enforce intent-based permissioning across the session.
+
+    Implements a two-phase policy:
+
+    1. **``request`` phase (intent capture)** — the very first user message
+       is recorded in ``session_state`` as the authoritative intent for the
+       session.  Subsequent ``request`` events are ignored (the intent is
+       immutable once set).
+
+    2. **``tool_call`` phase (intent check)** — every tool call is evaluated
+       against the stored intent using the server-level LLM client.  If the
+       tool call has no plausible connection to the original task, it is
+       denied before the tool runs.
+
+    Classification results are cached in ``session_state`` keyed by a hash
+    of the intent + tool name + serialised arguments.  Identical tool calls
+    within a session pay for only one classifier round-trip.
+
+    No arguments are required.  All behaviour is configurable via the
+    optional *classification_prompt* parameter.
+
+    Requires the server to have an ``llm:`` config block; abstains
+    (fail-open) when no LLM client is available.
+
+    .. note::
+        This is a best-effort control, not a cryptographic guarantee.
+        A sophisticated adversary can craft inputs that convince the
+        classifier the call is ``ON_TASK``.  Use in combination with other
+        policies (e.g. Bell-LaPadula) for defence-in-depth.
+
+    :param classification_prompt: System instructions for the intent-check
+        LLM call.  Describes the ``ON_TASK`` / ``OFF_TASK`` classification
+        criteria; the output schema is enforced via structured output.
+    :returns: An async policy callable that fires on ``request`` (intent
+        capture) and ``tool_call`` (intent check) events.
+
+    YAML usage::
+
+        policies:
+          intent_gate:
+            type: function
+            function:
+              path: omnigent.policies.builtins.routing.intent_gate
+    """
+    # intent_gate takes no required arguments — it is a zero-config factory.
+    # The inner evaluate() closes over nothing from the outer scope except
+    # the classification prompt; we define it as a nested async function.
+
+    async def evaluate(event: PolicyEvent) -> PolicyResponse | None:
+        """Capture intent on first request; gate tool calls against it.
+
+        :param event: Policy event dict.
+        :returns: DENY when a tool call is classified as OFF_TASK; ``None``
+            (abstain) on all other phases and on fail-open conditions.
+        """
+        phase = event.get("type")
+
+        # ── Phase 1: capture intent from the first user message ───────────
+        if phase == "request":
+            state = event.get("session_state") or {}
+            if state.get(_INTENT_KEY):
+                return None  # intent already recorded — nothing to do
+
+            message = event.get("data", "")
+            if not isinstance(message, str) or not message.strip():
+                return None
+
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {
+                        "key": _INTENT_KEY,
+                        "action": "set",
+                        "value": message.strip()[:1000],
+                    }
+                ],
+            }
+
+        # ── Phase 2: check tool calls against the stored intent ───────────
+        if phase != "tool_call":
+            return None
+
+        state = event.get("session_state") or {}
+        intent: str = state.get(_INTENT_KEY, "")
+        if not intent:
+            return None  # no intent captured yet — fail open
+
+        tool_name: str = event.get("target") or ""
+        data = event.get("data") or {}
+        tool_args = data.get("arguments", {}) if isinstance(data, dict) else {}
+
+        # ── Cache lookup ─────────────────────────────────────────────────
+        args_repr = json.dumps(tool_args, sort_keys=True, default=str)
+        check_hash = hashlib.sha256(
+            f"{intent}\x00{tool_name}\x00{args_repr}".encode()
+        ).hexdigest()[:16]
+        cache_key = f"{_INTENT_CHECK_PREFIX}{check_hash}"
+        cached = state.get(cache_key)
+
+        if cached == "OFF_TASK":
+            return {
+                "result": "DENY",
+                "reason": (
+                    f"Tool call '{tool_name}' is not consistent with the "
+                    f"session's original task. The agent was asked to: "
+                    f"{intent[:200]}"
+                ),
+            }
+        if cached == "ON_TASK":
+            return None
+
+        # ── Classification ────────────────────────────────────────────────
+        llm_client = event.get("llm_client")
+        if llm_client is None:
+            _log.warning(
+                "intent_gate: event['llm_client'] is None — server has no llm: config. Abstaining."
+            )
+            return None
+
+        user_prompt = (
+            f"Original intent: {intent[:500]}\n\n"
+            f"Proposed tool call: {tool_name}\n"
+            f"Arguments: {args_repr[:500]}"
+        )
+
+        try:
+            response = await llm_client.create(
+                input=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_prompt}],
+                    }
+                ],
+                instructions=_DEFAULT_INTENT_CHECK_PROMPT,
+                text=_INTENT_CHECK_SCHEMA,
+            )
+            raw_text = _extract_response_text(response)
+            if not raw_text:
+                return None
+            verdict_obj = json.loads(raw_text)
+        except Exception:  # noqa: BLE001 — fail-open on LLM/JSON errors
+            _log.exception("intent_gate: classification call failed")
+            return None
+
+        verdict = verdict_obj.get("verdict", "") if isinstance(verdict_obj, dict) else ""
+
+        if verdict == "OFF_TASK":
+            _log.info(
+                "intent_gate: OFF_TASK — denying tool_call %s (intent: %.80s…)",
+                tool_name,
+                intent,
+            )
+            return {
+                "result": "DENY",
+                "reason": (
+                    f"Tool call '{tool_name}' is not consistent with the "
+                    f"session's original task. The agent was asked to: "
+                    f"{intent[:200]}"
+                ),
+                "state_updates": [
+                    {"key": cache_key, "action": "set", "value": "OFF_TASK"},
+                ],
+            }
+
+        if verdict == "ON_TASK":
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": cache_key, "action": "set", "value": "ON_TASK"},
+                ],
+            }
+
+        return None  # unrecognised verdict — fail open
+
+    return evaluate  # type: ignore[return-value]
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -263,6 +492,26 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                 },
             },
             "required": ["expensive_models"],
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.routing.intent_gate",
+        "kind": "factory",
+        "name": "Intent Gate",
+        "description": (
+            "Enforces intent-based permissioning: records the user's first message "
+            "as the authoritative session intent, then gates every tool call against "
+            "that intent using the server-level LLM client. Tool calls that cannot "
+            "plausibly serve the original task are denied before they run. "
+            "Classification results are cached in session_state to avoid redundant "
+            "LLM calls for identical tool invocations. "
+            "Requires an llm: config block on the server; abstains (fail-open) when "
+            "no LLM client is available. Zero required parameters."
+        ),
+        "params_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
 ]

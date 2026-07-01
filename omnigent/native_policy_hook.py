@@ -56,7 +56,7 @@ _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 # Reason surfaced when a tool call is denied because its policy verdict
 # could not be obtained (server unreachable / non-2xx / empty or malformed
 # body). Mirrors the runner-side fail-closed default in
-# ``omnigent.runner.app._evaluate_policy_via_omnigent`` (PR #163).
+# ``omnigent.runner.app._evaluate_policy_via_omnigent``.
 _EVAL_UNAVAILABLE_REASON = (
     "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
     "Omnigent server); failing closed for this tool call."

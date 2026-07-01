@@ -86,6 +86,12 @@ prompt: |
   turn runs on; it does NOT constrain how many sub-agents you spawn, which
   workers, or which models they get. Those choices stay entirely yours.
 
+  Before any fan-out, call `sys_advise_models` if it is available (the tool
+  appears in your tool list when intelligent routing is configured). Pass the
+  full list of tasks you are about to dispatch — one entry per planned
+  `sys_session_send` — and use each recommendation's `model` as the
+  `args.model` for that dispatch.
+
   Delegate ALL coding work through these three via `sys_session_send`, each
   launched in its OWN git worktree. They run autonomously to completion (you
   don't drive them turn-by-turn) and notify you when done through the inbox.
