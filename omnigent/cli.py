@@ -1145,15 +1145,11 @@ class _OmnigentCLI(click.Group):
         from omnigent.inner import ui
 
         if ui.show_banner():
-            import importlib.metadata
+            from omnigent.version import VERSION
 
-            try:
-                version = importlib.metadata.version("omnigent")
-            except importlib.metadata.PackageNotFoundError:  # pragma: no cover
-                version = ""
             epilogue = [("Get started", "omnigent setup")]
-            if version:
-                epilogue.insert(0, ("Version", version))
+            if VERSION:
+                epilogue.insert(0, ("Version", VERSION))
             ui.print_landing(tagline="all your agents, one cli", epilogue=epilogue)
         super().format_help(ctx, formatter)
 

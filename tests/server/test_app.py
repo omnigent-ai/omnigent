@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import httpx
@@ -39,10 +38,12 @@ async def test_version_returns_source_of_truth_version(
 ) -> None:
     """GET /api/version returns ``omnigent.version.VERSION``.
 
-    The endpoint surfaces the shared source-of-truth constant. In a correct
-    install the package metadata is *derived* from that same constant, so the
-    two agree — but the constant is authoritative regardless of how the
-    package was installed.
+    The endpoint surfaces the shared source-of-truth constant, authoritative
+    regardless of how the package was installed. We deliberately do NOT assert
+    against ``importlib.metadata.version`` here: that is a frozen build-time
+    snapshot which can legitimately differ from ``VERSION`` (stale editable
+    install, or ``"source"`` placeholder metadata) — asserting equality would
+    re-couple to exactly the metadata this change moved off of.
     """
     from omnigent.version import VERSION
 
@@ -56,9 +57,6 @@ async def test_version_returns_source_of_truth_version(
     assert body["version"] == VERSION, (
         f"Expected version {VERSION!r} from omnigent.version.VERSION, got {body['version']!r}."
     )
-    # In an editable/source install the built metadata derives from VERSION,
-    # so the two must agree — guards the pyproject dynamic-version wiring.
-    assert body["version"] == _pkg_version("omnigent")
 
 
 def test_server_version_reads_version_constant() -> None:
@@ -376,17 +374,19 @@ async def test_info_includes_server_version(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``GET /v1/info`` includes ``server_version`` — the installed package
-    version (same source as ``/api/version``) — so the web UI can show it
+    ``GET /v1/info`` includes ``server_version`` — the shared ``VERSION``
+    constant (same source as ``/api/version``) — so the web UI can show it
     in the session info popover's version footer without a second fetch.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     body = resp.json()
-    # Exact match against the installed version confirms the handler reads
-    # importlib.metadata, not a constant — a stale constant would mislead
-    # anyone reading the version off the popover.
-    assert body["server_version"] == _pkg_version("omnigent")
+    # Matches the source-of-truth constant, not importlib.metadata: the latter
+    # is a frozen build-time snapshot that can drift from VERSION in a stale
+    # editable or "source"-placeholder install.
+    assert body["server_version"] == VERSION
 
 
 @pytest.mark.asyncio
