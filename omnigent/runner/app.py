@@ -16269,7 +16269,22 @@ def create_runner_app(
             declared_terminal = terminals_map.get(terminal_name)
 
         if declared_terminal is not None:
-            env_spec = declared_terminal
+            # Resolve a placeholder cwd (``.``/``./``/unset) to the session
+            # workspace before launch — same as the synthesised branch and
+            # the sys_terminal_launch tool. Otherwise the placeholder reaches
+            # the inner builder and lands the shell in the runner's process
+            # cwd. Baked into the spec, not cwd_override (which is gated by
+            # allow_cwd_override).
+            from omnigent.tools.builtins.sys_terminal import (
+                _materialize_terminal_spec_for_launch,
+                _synthesize_parent_os_env,
+            )
+
+            default_root = resource_registry.compute_default_env_root(session_id, agent_spec)
+            env_spec = _materialize_terminal_spec_for_launch(declared_terminal, default_root)
+            # Covers terminals whose os_env inherits: the inner builder
+            # falls back to this parent, whose cwd would else be the placeholder.
+            agent_os_env = _synthesize_parent_os_env(agent_os_env, default_root)
             # Body's ``spec.cwd`` becomes a cwd_override (still
             # subject to the spec's allow_cwd_override gate and
             # the launch-time containment check).
