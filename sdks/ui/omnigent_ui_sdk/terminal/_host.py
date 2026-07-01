@@ -1700,16 +1700,17 @@ class TerminalHost:
 
         ticker = asyncio.create_task(_toolbar_ticker())
         try:
-            # Push Kitty Keyboard Protocol mode (flag 1 =
-            # disambiguate escape codes). Without this the terminal
-            # never knows to send CSI-u encoded sequences — e.g.
-            # Shift+Enter arrives as plain \r instead of
-            # \x1b[13;2u, so the F20 binding never fires. The
-            # push/pop model (\x1b[>Xu / \x1b[<u) restores the
-            # previous mode on exit. Terminals that don't support
-            # the protocol ignore the sequence per ECMA-48.
-            self._output.write_raw("\x1b[>1u")
-            self._output.flush()
+            # Kitty Keyboard Protocol (CSI-u progressive enhancement)
+            # is deliberately NOT enabled here. The prior code pushed
+            # ``\x1b[>1u`` so Shift+Enter arrived as ``\x1b[13;2u``,
+            # but the matching pop (``\x1b[<u``) only ran on the
+            # happy-path ``finally`` — a hard exit, SIGINT/SIGTERM/
+            # SIGHUP, or crash left the mode enabled and leaked it into
+            # the user's real terminal, so Ctrl+C at the shell prompt
+            # printed ``^[[99;133u`` instead of sending SIGINT.
+            # Never enabling it removes the leak entirely; the
+            # trade-off is losing disambiguated keys such as
+            # Shift+Enter in this TUI.
             with patch_stdout(raw=True):
                 while True:
                     try:
@@ -1817,9 +1818,9 @@ class TerminalHost:
                     self._tasks.append(task)
                     task.add_done_callback(self._on_handler_task_done)
         finally:
-            # Pop Kitty Keyboard Protocol — restore previous mode.
-            self._output.write_raw("\x1b[<u")
-            self._output.flush()
+            # Nothing to pop: the Kitty Keyboard Protocol push above
+            # was removed, so the mode is never enabled and there is
+            # no state to restore here.
             ticker.cancel()
 
     def _on_handler_task_done(self, task: asyncio.Task[None]) -> None:
