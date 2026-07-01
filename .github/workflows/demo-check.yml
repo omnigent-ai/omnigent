@@ -1,0 +1,46 @@
+name: Demo Check
+
+# Scan open contributor PRs every hour and comment on any that check the
+# "UI / frontend change" box but have no demo (screenshot / video) in the Demo
+# section. Maintainer PRs and drafts are skipped. PRs already labeled
+# `needs-demo` are skipped on subsequent runs to avoid duplicate comments.
+# Never checks out or runs PR code -- it reads PR metadata via the API using
+# only the default-branch script. See demo-check.js.
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+jobs:
+  demo-check:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    permissions:
+      # Job-level permissions REPLACE the workflow-level block (they don't
+      # merge), so contents:read must be restated here for actions/checkout.
+      contents: read
+      issues: write
+      pull-requests: write
+    timeout-minutes: 10
+    steps:
+      # Trusted default branch only (.github sparse). Pin the ref explicitly so
+      # manual workflow_dispatch runs can't execute a script from another branch.
+      # Never the PR head, so no PR-authored code runs.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          retries: 3
+          script: |
+            const script = require(".github/workflows/demo-check.js");
+            await script({ context, github, core });
