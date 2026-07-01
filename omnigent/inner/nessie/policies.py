@@ -631,7 +631,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
     {
         "handler": "omnigent.inner.nessie.policies.blast_radius",
         "kind": "factory",
-        "name": "Block Dangerous Shell Commands (force-push, rm -rf)",
+        "name": "Block Dangerous Shell Commands force-push, rm -rf",
         "description": "Classifies shell commands (sys_os_shell, Claude/Codex native Bash, "
         "and Pi native bash) as safe, risky (ASK), or catastrophic (DENY) to prevent "
         "destructive operations like force-push or rm -rf /",
