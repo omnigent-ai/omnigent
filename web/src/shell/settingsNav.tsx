@@ -123,9 +123,15 @@ export function useSettingsRoute(): { inSettings: boolean; section: SettingsSect
   const idx = segments.lastIndexOf("settings");
   if (idx === -1) return { inSettings: false, section: defaultSection };
   const next = segments[idx + 1];
-  const section = (SECTION_IDS as readonly string[]).includes(next)
-    ? (next as SettingsSectionId)
-    : defaultSection;
+  // Members / Policies are accounts-only sections. Off an accounts deploy
+  // they aren't real destinations — fall back to the default section rather
+  // than resolving to an admin section the page would render as an empty
+  // panel (only reachable by manually typing the URL, but keep it clean).
+  const accountsOnlySections = new Set<string>(["members", "policies"]);
+  const isValidSection =
+    (SECTION_IDS as readonly string[]).includes(next) &&
+    (accountsEnabled || !accountsOnlySections.has(next));
+  const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   return { inSettings: true, section };
 }
 

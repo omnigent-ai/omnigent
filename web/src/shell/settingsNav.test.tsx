@@ -143,14 +143,25 @@ describe("useSettingsRoute", () => {
     return renderHook(() => useSettingsRoute(), { wrapper: w }).result.current;
   }
 
-  it("treats /settings/members and /settings/policies as in-settings sections", () => {
+  it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the
     // sidebar's `inSettings` gate stays true and the settings nav stays put —
     // the old standalone /members and /policies fell through to inSettings:false
     // (see the bare-path case below), which snapped the sidebar back to the
     // conversation list.
+    mocks.accountsEnabled = true;
     expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "members" });
     expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
+  });
+
+  it("falls back from the accounts-only admin sections when accounts is off", () => {
+    // Members / Policies aren't real destinations off an accounts deploy — the
+    // sidebar never shows them and the page would render an empty panel. Only
+    // reachable by typing the URL, but resolve to the default section (still
+    // in-settings) instead of a dead admin section.
+    mocks.accountsEnabled = false;
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "appearance" });
+    expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "appearance" });
   });
 
   it("reports NOT in settings for the legacy standalone /members and /policies paths", () => {
@@ -179,6 +190,7 @@ describe("useSettingsRoute", () => {
   it("matches the settings segment under an embed basename", () => {
     // Basename-agnostic: the sidebar rebases links behind the app's back in the
     // embed, so detection keys off the `settings` segment wherever it lands.
+    mocks.accountsEnabled = true;
     expect(routeHook("/ml/omnigent-embed/settings/members")).toEqual({
       inSettings: true,
       section: "members",
