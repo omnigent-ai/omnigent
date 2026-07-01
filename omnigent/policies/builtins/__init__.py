@@ -45,5 +45,6 @@ BUILTIN_POLICY_MODULES = [
     "omnigent.policies.builtins.cel",
     "omnigent.policies.builtins.prompt",
     "omnigent.policies.builtins.context",
+    "omnigent.policies.builtins.access_control",
     "omnigent.inner.nessie.policies",
 ]
