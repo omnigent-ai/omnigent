@@ -18,12 +18,12 @@ request-level function tools are NOT used here: the SDK harnesses handle
 tools internally, so they never round-trip as a server-dispatched, policy-
 gated call — a builtin does.
 
-Interrupt/cancel is also verified: a long turn is interrupted mid-flight
-and the server's cancellation marker confirms it stopped.
+Interrupt/cancel is verified (a long turn is interrupted mid-flight and the
+server's cancellation marker confirms it stopped), and delta-level
+streaming is measured via the ``/v1/sessions/{id}/stream`` SSE subscribe.
 
-Follow-ups (stacked PRs): delta-level streaming via the
-``/v1/sessions/{id}/stream`` SSE subscribe, and a ``--transport`` selector
-+ driver registry so the bench's probes run through this driver.
+Follow-up (stacked PR): a ``--transport`` selector + driver registry so the
+bench's probes run through this driver, not just its gated tests.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -69,6 +70,12 @@ _CANCELLATION_MARKER = "interrupted"
 _LONG_PROMPT = (
     "Write a very detailed 600-word essay about the history of computing, in full paragraphs."
 )
+
+# Prompt long enough that a streaming harness emits clearly many deltas.
+_STREAM_PROMPT = (
+    "Count from 1 to 30 in words, one number per line, and add a short note after each."
+)
+_TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response.cancelled"})
 
 
 def _find_free_port() -> int:
@@ -386,6 +393,59 @@ class FullServerDriver:
                 break
             time.sleep(_POLL_INTERVAL_S)
         else:
+            result.timed_out = True
+        return result
+
+    # ── streaming probe ──────────────────────────────────────
+
+    def streaming_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
+        """Measure token-level streaming via the session SSE subscribe stream.
+
+        The full-server stream (``GET /v1/sessions/{id}/stream``) is separate
+        from the message POST, so a background thread subscribes and counts
+        ``response.output_text.delta`` events while the main thread posts the
+        turn. More than one delta means the harness streams incrementally.
+        """
+        assert self._client is not None and self._session_id is not None
+        sid = self._session_id
+        result = TurnResult()
+        done = threading.Event()
+
+        def _read_stream() -> None:
+            try:
+                with self._client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{sid}/stream", timeout=timeout
+                ) as resp:
+                    for line in resp.iter_lines():
+                        if not line.startswith("event:"):
+                            continue
+                        etype = line[len("event:") :].strip()
+                        if etype == "response.output_text.delta":
+                            result.text_delta_count += 1
+                        elif etype in _TERMINAL_EVENTS:
+                            result.completed = etype == "response.completed"
+                            result.cancelled = etype == "response.cancelled"
+                            result.failed = etype == "response.failed"
+                            return
+            except httpx.HTTPError as exc:
+                result.error = repr(exc)
+            finally:
+                done.set()
+
+        reader = threading.Thread(target=_read_stream, daemon=True)
+        reader.start()
+        time.sleep(1.0)  # let the subscription register before the turn starts
+        self._client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": _STREAM_PROMPT}],
+                },
+            },
+        ).raise_for_status()
+        if not done.wait(timeout):
             result.timed_out = True
         return result
 
