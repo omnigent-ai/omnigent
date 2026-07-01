@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 
-from omnigent.opencode_native_bridge import update_active_message_id, update_last_event_id
+from omnigent.opencode_native_bridge import update_active_message_id
 from omnigent.opencode_native_client import OpenCodeClient, OpenCodeEvent
 from omnigent.opencode_native_permissions import (
     PolicyDecision,
@@ -182,13 +182,17 @@ class OpenCodeNativeForwarder:
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
 
-    async def seed_dedupe_from_history(self) -> None:
+    async def seed_dedupe_from_history(self, *, post_unseen_text: bool = False) -> None:
         """
         Pre-seed dedupe state from existing OpenCode messages.
 
         Prevents re-posting prior history on a resume/reconnect. Best
         effort: a failure leaves the dedupe set empty (at worst a few
         re-posts on resume).
+
+        When ``post_unseen_text`` is true, assistant text parts not already
+        marked as finalized are posted before being marked. This catches up
+        messages completed while the SSE stream was disconnected.
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
@@ -214,9 +218,17 @@ class OpenCodeNativeForwarder:
                     # Pre-mark the keys the live handlers check so a resume
                     # never re-posts already-finalized text / tool parts.
                     if part.get("type") == "text" and isinstance(part_id, str):
-                        # Pre-mark both the assistant-finalize and user-message
-                        # keys so a resume re-posts neither.
-                        self.state.mark(self._key("text-final", part_id))
+                        text = part.get("text")
+                        if (
+                            post_unseen_text
+                            and role == "assistant"
+                            and isinstance(text, str)
+                            and text
+                            and self.state.mark(self._key("text-final", part_id))
+                        ):
+                            await self._post_assistant_text(text, message_id=message_id)
+                        else:
+                            self.state.mark(self._key("text-final", part_id))
                         self.state.mark(self._key("user-text", part_id))
                     if part.get("type") == "tool":
                         call_id = part.get("callID")
@@ -234,15 +246,30 @@ class OpenCodeNativeForwarder:
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
-        Run the SSE consume loop with reconnect/backoff.
+        Run the SSE consume loop with reconnect/backoff and gap-fill.
+
+        On the first connection, seeds the dedupe set from the existing
+        session history so a restart (e.g. runner process restart) never
+        re-posts content that was already delivered.
+
+        On *every reconnect* after a dropped stream, the same catch-up is
+        performed to close the gap that opened during the disconnect window.
+        The dedupe set ensures that items posted before the drop are never
+        duplicated.
 
         :param max_reconnects: Reconnect cap (``None`` = unbounded); used
             by tests to bound the loop.
         """
-        await self.seed_dedupe_from_history()
         attempt = 0
         backoff = 0.5
         while True:
+            # Seed / catch-up on every attempt (initial start *and* reconnects).
+            # The first call pre-fills the dedupe set from history so no prior
+            # content is re-posted. Subsequent calls fill in the gap that
+            # accumulated while the SSE stream was down — the deduplication
+            # in OpenCodeForwarderState.mark() is idempotent so there is no
+            # double-posting risk.
+            await self.seed_dedupe_from_history(post_unseen_text=attempt > 0)
             try:
                 await self._consume_once()
                 # Clean stream end (server closed): reconnect.
@@ -273,8 +300,6 @@ class OpenCodeNativeForwarder:
         """
         if not self._event_targets_session(event):
             return
-        if event.id and self._bridge_dir is not None:
-            update_last_event_id(self._bridge_dir, event.id)
         handler = _HANDLERS.get(event.type)
         if handler is None:
             _logger.debug(
