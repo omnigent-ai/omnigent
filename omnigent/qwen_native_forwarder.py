@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Container, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +72,20 @@ _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 
 _STATE_FILE = "qwen_forwarder.json"
+
+# Dedup window: the number of most-recently-posted event uuids persisted so a
+# truncation/relaunch re-read (offset rewinds to 0) doesn't re-post them. The
+# window must keep the *most recent* uuids, so ``seen`` is an insertion-ordered
+# mapping (a ``dict`` used as an ordered set), not a ``set`` — ``list(set)`` is
+# hash-ordered, which would make the ``[-_DEDUP_WINDOW:]`` cap keep an arbitrary
+# subset and re-post recent history on a long-session relaunch.
+_DEDUP_WINDOW = 512
+
+
+def _new_seen(uuids: Iterable[str] | None = None) -> dict[str, None]:
+    """Build the insertion-ordered dedup set (``dict`` used as an ordered set)."""
+    return dict.fromkeys(uuids or [])
+
 
 # The executor injects ``[Attached: <path>]`` markers for web-UI attachments
 # before submitting; strip them from the mirrored bubble (the path is an internal
@@ -114,8 +129,10 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
     try:
         bridge_dir.mkdir(parents=True, exist_ok=True)
         tmp = bridge_dir / (_STATE_FILE + ".tmp")
-        # Cap the dedup window so the state file can't grow unbounded.
-        seen = (state.seen_uuids or [])[-512:]
+        # Cap the dedup window so the state file can't grow unbounded. The list
+        # is insertion-ordered (see _new_seen), so this keeps the most recent
+        # _DEDUP_WINDOW uuids — the ones a relaunch re-read is most likely to hit.
+        seen = (state.seen_uuids or [])[-_DEDUP_WINDOW:]
         tmp.write_text(
             json.dumps({"offset": state.offset, "seen_uuids": seen}),
             encoding="utf-8",
@@ -204,7 +221,7 @@ def _event_to_item(event: dict[str, object], agent_name: str) -> _MirrorItem | N
 
 
 def _read_new_events(
-    events_file: Path, offset: int, seen: set[str], agent_name: str
+    events_file: Path, offset: int, seen: Container[str], agent_name: str
 ) -> tuple[list[_MirrorItem], int]:
     """Read NDJSON lines past *offset*, returning new mirror items + the new offset.
 
@@ -298,7 +315,7 @@ async def forward_qwen_events_to_session(
     target = events_file or events_file_path(bridge_dir)
     persisted = _read_state(bridge_dir)
     offset = persisted.offset
-    seen: set[str] = set(persisted.seen_uuids or [])
+    seen = _new_seen(persisted.seen_uuids)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -310,7 +327,7 @@ async def forward_qwen_events_to_session(
                 )
                 for item in items:
                     await _post_conversation_item(client, session_id=session_id, item=item)
-                    seen.add(item.uuid)
+                    seen[item.uuid] = None
                 if new_offset != offset or items:
                     offset = new_offset
                     _write_state(
