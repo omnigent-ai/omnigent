@@ -326,6 +326,44 @@ async def test_release_terminates_subprocess(
         await manager.shutdown()
 
 
+async def test_close_entry_kills_process_when_aclose_raises(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ``client.aclose()`` must not skip the subprocess kill.
+
+    ``_close_entry`` used to ``await client.aclose()`` first with no guard, so a
+    raise there (a broken transport, a wedged client) skipped the SIGTERM/SIGKILL
+    below and the subprocess leaked un-killed — and untracked, since ``release``
+    already popped the entry. Force ``aclose()`` to raise and assert the process
+    is still terminated (and ``release`` itself doesn't raise, since teardown is
+    now best-effort).
+    """
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        entry = manager._entries["conv_a"]
+
+        async def _boom() -> None:
+            raise RuntimeError("simulated aclose failure")
+
+        monkeypatch.setattr(entry.client, "aclose", _boom)
+
+        # release() -> _close_entry(): the aclose failure must not prevent the
+        # kill, and best-effort teardown means release itself completes.
+        await manager.release("conv_a")
+        assert "conv_a" not in manager._entries
+
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid), "subprocess survived a teardown where aclose() raised"
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_respawns_after_crash(
     manager: HarnessProcessManager,
 ) -> None:
