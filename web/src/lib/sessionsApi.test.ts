@@ -101,6 +101,7 @@ describe("createSession", () => {
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
+      activeResponseId: null,
       workspace: null,
       gitBranch: null,
     });
@@ -223,6 +224,39 @@ describe("createSession", () => {
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
     ]);
+  });
+
+  it("maps active_response_id (snake) to activeResponseId (camel)", async () => {
+    // The in-flight turn id lets a mid-turn reconnect reopen a streaming
+    // activeResponse so native Claude's tool cards keep rendering live.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "running",
+        created_at: 1704067200,
+        items: [],
+        active_response_id: "resp_turn_1",
+      }),
+    );
+
+    const session = await createSession("agent_xyz");
+    expect(session.activeResponseId).toBe("resp_turn_1");
+  });
+
+  it("defaults activeResponseId to null when the snapshot omits it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+      }),
+    );
+
+    const session = await createSession("agent_xyz");
+    expect(session.activeResponseId).toBeNull();
   });
 });
 

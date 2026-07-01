@@ -2175,6 +2175,14 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  * token/context/cost counters, and — when the turn ended during the gap —
  * the terminal `activeResponse` transition the missed `session.status`
  * event would have applied, so "Working…" clears.
+ *
+ * The inverse also matters: when the snapshot shows a turn STILL running and
+ * carries its in-flight `activeResponseId`, reopen the streaming
+ * `activeResponse`. The SSE stream is snapshot + live tail with no replay, so
+ * the turn-start `running` edge that originally opened it is never re-sent —
+ * without this, a client connecting mid-turn (reconnect, or first open of an
+ * already-running native session) would leave the turn's bubble non-streaming
+ * and its tool cards static for the rest of the turn.
  */
 function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState> {
   const patch: Partial<ChatState> = { sessionStatus: session.status };
@@ -2195,6 +2203,20 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
       error: null,
     };
     patch.status = "idle";
+  } else if (
+    (session.status === "running" || session.status === "waiting") &&
+    session.activeResponseId != null &&
+    s.activeResponse?.responseId !== session.activeResponseId
+  ) {
+    // Mid-turn (re)connect: reopen the streaming lifecycle from the snapshot.
+    // Guarded on a differing responseId so we never downgrade a live
+    // activeResponse that already matches (e.g. one cancelled in this tab).
+    patch.activeResponse = {
+      responseId: session.activeResponseId,
+      state: "streaming",
+      error: null,
+    };
+    patch.status = "streaming";
   }
   return patch;
 }
