@@ -73,6 +73,12 @@ _HARNESS_MODULES: dict[str, str] = {
     "kimi": "omnigent.inner.kimi_harness",
     # User-facing alias matching the upstream product name ("Kimi Code").
     "kimi-code": "omnigent.inner.kimi_harness",
+    # Kimi Code ACP harness wrap. Drives ``kimi acp`` (JSON-RPC over stdio) as a
+    # long-lived ACP session — the protocol-driven counterpart to the per-turn
+    # ``kimi`` (kimi -p) harness and the ``kimi-native`` TUI. Unlocks MCP,
+    # images, resume, and turn cancellation (session/cancel). See
+    # omnigent/inner/kimi_acp_harness.py.
+    "kimi-acp": "omnigent.inner.kimi_acp_harness",
     # cursor-native harness wrap. Drives the resident ``cursor-agent`` TUI by
     # injecting each web-UI turn into its tmux pane and mirroring the transcript
     # back — a native-CLI harness like claude/codex/pi-native, so it IS in

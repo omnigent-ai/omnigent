@@ -204,6 +204,11 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     authenticates through ``kimi login`` (OAuth or a Moonshot API key), not the
     shared Databricks gateway/profile probe wiring this matrix drives.
 
+    ``kimi-acp`` (headless ACP, ``kimi acp``) is excluded for the same reason as
+    ``kimi`` / ``goose``: it wraps the same ``kimi`` CLI and authenticates
+    through ``kimi login``, not the shared gateway/profile probe wiring. Its live
+    round-trip is covered by the dedicated ``test_per_harness_kimi_acp.py`` suite.
+
     ``kimi-native`` is excluded for the same reason as ``goose-native`` /
     ``qwen-native`` / ``kiro-native``: it is a terminal-first TUI launched via
     ``omni kimi`` (tmux pane + bridge dir), not ``omnigent run --harness
@@ -237,6 +242,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "goose-native",
         "kiro-native",
         "kimi",
+        "kimi-acp",
         "kimi-native",
         "hermes",
         "hermes-native",

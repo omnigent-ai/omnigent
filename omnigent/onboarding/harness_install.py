@@ -289,6 +289,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # Native Kimi TUI harness — same binary gate as the bare ``kimi`` surface.
     "kimi-native": KIMI_KEY,
     "native-kimi": KIMI_KEY,
+    # Headless Kimi ACP harness (``harness: kimi-acp``, drives ``kimi acp``)
+    # wraps the same ``kimi`` CLI, so it gates on the same binary.
+    "kimi-acp": KIMI_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
     # Native qwen TUI (``qwen-native``) wraps the same ``qwen`` CLI as the ACP

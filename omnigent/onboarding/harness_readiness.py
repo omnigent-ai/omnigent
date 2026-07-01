@@ -116,6 +116,12 @@ _GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goo
 # (:data:`KIMI_SURFACE`), which gates on the same binary but renders headlessly.
 _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"})
 
+# Headless Kimi ACP harness (``harness: kimi-acp``, drives ``kimi acp`` over
+# JSON-RPC). Like the bare ``kimi`` SDK surface and the native TUI, it wraps the
+# resident ``kimi`` binary and can't launch without it on ``PATH`` — gate on it
+# or it fails open like an unknown harness.
+_KIMI_ACP_HARNESSES: frozenset[str] = frozenset({"kimi-acp"})
+
 # Native Hermes harnesses. Boot the ``hermes`` TUI (``omni hermes``) and can't
 # launch without the ``hermes`` binary on ``PATH`` — gate on it, like the other
 # native CLI harnesses. Hermes owns its own auth (``hermes setup`` /
@@ -160,7 +166,11 @@ def _install_key(canonical: str) -> str:
         :data:`~omnigent.onboarding.harness_install.QWEN_KEY` for qwen, or
         :data:`~omnigent.onboarding.harness_install.PI_KEY` for pi.
     """
-    if canonical == KIMI_SURFACE or canonical in _KIMI_NATIVE_HARNESSES:
+    if (
+        canonical == KIMI_SURFACE
+        or canonical in _KIMI_NATIVE_HARNESSES
+        or canonical in _KIMI_ACP_HARNESSES
+    ):
         return KIMI_KEY
     if canonical in _OPENCODE_HARNESSES:
         return OPENCODE_KEY
@@ -250,6 +260,7 @@ def harness_is_configured(harness: str) -> bool:
         and canonical not in _PI_HARNESSES
         and canonical != KIMI_SURFACE
         and canonical not in _KIMI_NATIVE_HARNESSES
+        and canonical not in _KIMI_ACP_HARNESSES
         and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
@@ -305,6 +316,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_KIRO_NATIVE_HARNESSES)
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
+    spellings.update(_KIMI_ACP_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
