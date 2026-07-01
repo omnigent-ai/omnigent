@@ -4852,6 +4852,36 @@ def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_above_multiline_statusline() -> None:
+    """
+    The scan reaches the glyph above a *multi-line* custom statusline.
+
+    A ``statusLine`` command that emits several rows (a common setup: cwd
+    on one line, model+context on another, a cost/budget line, …) renders
+    every row below the input box, in addition to the box's closing rule
+    and Claude Code's own mode-hint line. With a 3-line statusline the
+    live ``❯`` row is the 6th non-empty line from the bottom, so the old
+    5-line window fell one short and the readiness gate timed out with
+    "input prompt never rendered" even though the box was mounted — the
+    message was silently dropped. A failure here means the window
+    regressed below the footer a real user config produces.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live prompt row (6th non-empty line from bottom)
+            "────────────────────────────────────────",  # box closing rule
+            "  ~/code/proj:main",  # custom statusline row 1 (cwd/branch)
+            "  Opus 4.8 | ctx 32k/200k (16%)",  # custom statusline row 2
+            "  $0.20/$500.00 (0% used)",  # custom statusline row 3 (budget)
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",  # Claude's mode hint
+        ]
+    )
+    # ``❯`` sits 6 non-empty lines above the bottom (rule + 3 statusline
+    # rows + hint), so only a scan window of >= 6 reaches it.
+    assert _claude_prompt_rendered(pane) is True
+
+
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
     """
     Append raw JSONL lines to the bridge deltas file.
