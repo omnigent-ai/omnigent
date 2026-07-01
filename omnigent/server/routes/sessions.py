@@ -8898,21 +8898,6 @@ async def _dispatch_session_event_to_runner(
                         _routed_model,
                         _verdict or {},
                     )
-                    # For claude-native: inject /model into the running
-                    # terminal so the change takes effect immediately
-                    # (model_override alone is only applied at spawn).
-                    try:
-                        await runner_client.post(
-                            f"/v1/sessions/{session_id}/events",
-                            json={"type": "model_change", "model": _routed_model},
-                            timeout=5.0,
-                        )
-                    except httpx.HTTPError:
-                        _logger.debug(
-                            "smart_routing: model_change forward failed for session=%s "
-                            "(runner may not support it yet)",
-                            session_id,
-                        )
         # ────────────────────────────────────────────────────────────
         forwarded = False
         try:
