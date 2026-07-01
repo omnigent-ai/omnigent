@@ -1386,7 +1386,9 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
     The profile remains the explicit workspace selector. If no
     profile is selected, or the profile has no matching ucode state,
     the native wrapper leaves Claude Code's normal provider
-    configuration alone.
+    configuration alone. A ``models:`` map on the profile's ``kind:
+    databricks`` provider entry overrides the ucode-cached models
+    per tier (config > ucode > hardcoded default).
 
     :param profile: Databricks CLI profile name, e.g.
         ``"<your-profile>"``.
@@ -1402,6 +1404,7 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
         DATABRICKS_CLAUDE_DEFAULT_MODEL,
         get_workspace_url_for_profile,
     )
+    from omnigent.onboarding.provider_config import databricks_provider_models
     from omnigent.onboarding.ucode_state import read_ucode_state
 
     workspace_url = get_workspace_url_for_profile(profile)
@@ -1444,9 +1447,12 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
     # canonical Anthropic name (e.g. "claude-opus-4-7[1m]") that the
-    # Databricks gateway rejects.
+    # Databricks gateway rejects.  Per-tier ``models:`` overrides from the
+    # provider config outrank the ucode-cached models; ucode fills the tiers
+    # the config leaves unset.
+    model_overrides = databricks_provider_models(profile)
     for tier, env_var in _UCODE_CLAUDE_TIER_TO_ENV.items():
-        model_id = workspace_state.claude_models.get(tier)
+        model_id = model_overrides.get(tier) or workspace_state.claude_models.get(tier)
         if model_id:
             env[env_var] = model_id
     # When ucode caches no model, default it so Claude Code doesn't fall back
@@ -1454,7 +1460,9 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
     return ClaudeNativeUcodeConfig(
         env=env,
         api_key_helper=agent_state.auth_command,
-        model=agent_state.model or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        model=(
+            model_overrides.get("default") or agent_state.model or DATABRICKS_CLAUDE_DEFAULT_MODEL
+        ),
     )
 
 

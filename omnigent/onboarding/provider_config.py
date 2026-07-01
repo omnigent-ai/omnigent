@@ -308,6 +308,15 @@ class ProviderEntry:
         ``None`` otherwise.
     :param profile: For ``kind="databricks"`` only: the Databricks profile
         name from ``~/.databrickscfg``, e.g. ``"oss"``. ``None`` otherwise.
+    :param models: For ``kind="databricks"`` only: optional tier→model map
+        with the same shape as :attr:`FamilyConfig.models`, e.g.
+        ``{"opus": "main.agents.my-opus-endpoint", "default":
+        "databricks-claude-opus-4-8"}``. Tier keys mirror ucode's
+        ``claude_models`` tiers (``fable`` / ``opus`` / ``sonnet`` /
+        ``haiku``) plus ``default``. Entries override the ucode-cached
+        models at every Databricks model-resolution point (see
+        :func:`databricks_provider_models`); absent tiers keep the ucode
+        → hardcoded-default behavior. Empty otherwise.
     :param model_provider: For ``kind="cli-config"`` only: the custom
         provider id in the CLI's config file that the launch pins, i.e. the
         ``X`` in ``[model_providers.X]``, e.g. ``"Databricks"``. ``None``
@@ -336,6 +345,7 @@ class ProviderEntry:
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
+    models: dict[str, str] = field(default_factory=dict)
 
     @property
     def default(self) -> bool:
@@ -863,10 +873,16 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
         # gemini: the antigravity harness drives Gemini via the dedicated google
         # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
         # profile cannot serve (or default) the Gemini surface.
+        models_raw = raw.get("models")
         return ProviderEntry(
             name=name,
             kind=kind,
             profile=profile_raw,
+            models=(
+                {str(k): str(v) for k, v in models_raw.items()}
+                if isinstance(models_raw, dict)
+                else {}
+            ),
             default_families=_parse_default_families(
                 name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
             ),
@@ -953,6 +969,35 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
             )
         result[str(name)] = _parse_provider(str(name), raw)
     return result
+
+
+def databricks_provider_models(profile: str | None) -> dict[str, str]:
+    """Return the ``models:`` overrides of the databricks provider for *profile*.
+
+    The shared lookup behind the Databricks model-resolution points (the
+    native-claude tier pinning and the claude-sdk / pi spawn env): given
+    the profile that identifies the gateway workspace, find the ``kind:
+    databricks`` provider entry carrying it and return its tier→model map.
+    Callers apply the precedence provider ``models:`` → ucode state →
+    hardcoded default, so an absent map (no matching entry, or one without
+    ``models:``) leaves their behavior unchanged.
+
+    :param profile: Databricks profile name from ``~/.databrickscfg``,
+        e.g. ``"oss"``; ``None`` / empty returns ``{}``.
+    :returns: The entry's tier→model map, e.g. ``{"opus":
+        "main.agents.my-opus-endpoint", "default":
+        "databricks-claude-opus-4-8"}``; ``{}`` when no databricks entry
+        matches *profile* or it declares no ``models:``. When several
+        entries share a profile, the first in config order wins.
+    :raises OmnigentError: If the ``providers:`` block is malformed (same
+        as :func:`load_providers`).
+    """
+    if not profile:
+        return {}
+    for entry in load_providers(load_config()).values():
+        if entry.kind == DATABRICKS_KIND and entry.profile == profile:
+            return entry.models
+    return {}
 
 
 def harness_family(harness: str) -> str | None:

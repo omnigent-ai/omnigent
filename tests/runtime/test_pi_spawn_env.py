@@ -198,3 +198,70 @@ def test_no_ucode_pi_entry_leaves_model_to_executor_default(
     assert env["HARNESS_PI_DATABRICKS_PROFILE"] == "oss"
     # No producer model — the executor's profile-path default applies.
     assert "HARNESS_PI_MODEL" not in env
+
+
+def test_provider_models_default_beats_ucode_model_for_pi(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Pi parity: the databricks provider's ``models.default`` outranks ucode.
+
+    The claude-sdk and pi producers share
+    ``configure_agent_harness_with_ucode``, so the ``models:`` override on
+    the ``kind: databricks`` entry must reach ``HARNESS_PI_MODEL`` the same
+    way (config > ucode > hardcoded default).
+    """
+    import yaml as _yaml
+
+    _ucode_state_for_pi(monkeypatch, model="databricks-claude-sonnet-4-6", with_pi_entry=True)
+    (tmp_path / "config.yaml").write_text(
+        _yaml.safe_dump(
+            {
+                "providers": {
+                    "databricks": {
+                        "kind": "databricks",
+                        "profile": "oss",
+                        "models": {"default": "main.agents.my-opus-endpoint"},
+                    }
+                }
+            }
+        )
+    )
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_MODEL"] == "main.agents.my-opus-endpoint"
+
+
+def test_provider_models_1m_suffix_stripped_for_pi(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Claude Code's ``[1m]`` suffix never reaches ``HARNESS_PI_MODEL``.
+
+    The suffix is a claude-CLI-side convention (stripped before the API
+    call); pi passes model ids through verbatim and the gateway rejects
+    suffixed names outright — so the producer must strip it for pi while
+    the claude-sdk path keeps it.
+    """
+    import yaml as _yaml
+
+    _ucode_state_for_pi(monkeypatch, model=None, with_pi_entry=True)
+    (tmp_path / "config.yaml").write_text(
+        _yaml.safe_dump(
+            {
+                "providers": {
+                    "databricks": {
+                        "kind": "databricks",
+                        "profile": "oss",
+                        "models": {"default": "main.agents.my-opus-endpoint[1m]"},
+                    }
+                }
+            }
+        )
+    )
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_MODEL"] == "main.agents.my-opus-endpoint"
