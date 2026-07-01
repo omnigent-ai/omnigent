@@ -6331,10 +6331,12 @@ async def test_sys_session_share_maps_error_statuses(
     expected_error: str,
 ) -> None:
     """
-    A 404 maps to ``session_not_found``; 401/403 map to ``access_denied``
-    — a typed reason instead of a raw status, matching the sibling
-    session tools so the LLM can distinguish "no such session" from
-    "you can't manage it".
+    For an IN-TREE target, a 404 on the PUT maps to ``session_not_found``
+    and 401/403 map to ``access_denied`` — a typed reason instead of a raw
+    status, matching the sibling session tools so the LLM can distinguish
+    "no such session" from "you can't manage it". (The snapshot GETs that
+    resolve the spawn-tree scope gate return 200 with a shared root, so the
+    parametrized status is the PUT's.)
 
     :param status_code: HTTP status the mocked Omnigent server returns.
     :param expected_error: The typed error string the tool should emit.
@@ -6342,6 +6344,11 @@ async def test_sys_session_share_maps_error_statuses(
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        # The caller + target snapshot GETs resolve the tree-scope gate;
+        # a shared root puts conv_x in-tree so the parametrized status
+        # below exercises the PUT-status mapping (not the scope gate).
+        if request.method == "GET":
+            return httpx.Response(200, json={"root_conversation_id": "conv_root"})
         return httpx.Response(status_code, json={"detail": "x"})
 
     async with httpx.AsyncClient(
@@ -6412,6 +6419,10 @@ async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
     server_message = "Public access is limited to read-only (level 1)"
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        # In-tree snapshot GETs pass the scope gate; the PUT returns the
+        # server's public-above-read 400 envelope to be surfaced.
+        if request.method == "GET":
+            return httpx.Response(200, json={"root_conversation_id": "conv_root"})
         return httpx.Response(
             400, json={"error": {"code": "INVALID_INPUT", "message": server_message}}
         )
@@ -6423,7 +6434,15 @@ async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
         output = await execute_tool(
             tool_name="sys_session_share",
             arguments=json.dumps(
-                {"user_id": "__public__", "level": "edit", "session_id": "conv_x"}
+                {
+                    "user_id": "__public__",
+                    "level": "edit",
+                    "session_id": "conv_x",
+                    # __public__ is a sensitive grant; the explicit opt-in
+                    # lets it past the runner's confirmation gate so the
+                    # server's own level>read rejection is what surfaces.
+                    "confirm_sensitive_grant": True,
+                }
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -6552,7 +6571,9 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_share",
-            arguments=json.dumps({"user_id": "__public__"}),
+            # __public__ is a sensitive grant — the explicit opt-in is
+            # required for it to pass the runner's confirmation gate.
+            arguments=json.dumps({"user_id": "__public__", "confirm_sensitive_grant": True}),
             server_client=server_client,
             conversation_id="conv_caller",
             agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
@@ -6568,6 +6589,248 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
         "session_id": "conv_caller",
         "user_id": "__public__",
         "level": "read",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_refuses_out_of_tree_target() -> None:
+    """
+    Sharing a session in a DIFFERENT spawn tree is refused before any
+    grant: the runner resolves the caller's and target's
+    ``root_conversation_id`` and, when they differ, returns
+    ``session_out_of_tree`` without PUTting. This is the core fix — the
+    always-on ``sys_session_list`` lets a prompt-injected agent enumerate
+    the owner's other session ids, and without this gate the ambient-
+    identity PUT would happily expose them. A permissions PUT reaching the
+    handler would mean the tree-scope gate regressed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"root_conversation_id": "conv_tree_a"})
+        if request.url.path == "/v1/sessions/conv_other":
+            return httpx.Response(200, json={"root_conversation_id": "conv_tree_b"})
+        # A PUT here = the scope gate let an out-of-tree grant through.
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_other"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    result = json.loads(output)
+    assert result["error"] == "session_out_of_tree"
+    assert result["session_id"] == "conv_other"
+    # Only the two snapshot GETs ran — the permissions PUT was never sent.
+    assert all(method == "GET" for method, _ in requests)
+    assert ("PUT", "/v1/sessions/conv_other/permissions") not in requests
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_in_tree_target_succeeds() -> None:
+    """
+    A non-self target that shares the caller's spawn-tree root passes the
+    scope gate and PUTs the grant — the positive case the out-of-tree
+    refusal excludes. If the gate wrongly blocked it, an orchestrator
+    couldn't share a child it legitimately spawned.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    puts: list[tuple[str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            # Caller and target share a root ⇒ in-tree.
+            return httpx.Response(200, json={"root_conversation_id": "conv_tree"})
+        puts.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "alice@example.com", "conversation_id": "conv_child", "level": 1},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_child"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    assert puts == [
+        ("/v1/sessions/conv_child/permissions", {"user_id": "alice@example.com", "level": 1})
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_child",
+        "user_id": "alice@example.com",
+        "level": "read",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_null_level_defaults_to_read() -> None:
+    """
+    An explicit ``"level": null`` (key present, value null) defaults to
+    ``read`` rather than failing the enum check. The old
+    ``args.get("level", "read")`` returned None for a present-but-null key
+    and fell through to "level must be one of ..."; ``args.get("level") or
+    "read"`` coerces it to the documented default.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "alice@example.com", "conversation_id": "conv_caller", "level": 1},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": None}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    # level null → read (numeric 1), not an enum rejection.
+    assert requests == [
+        (
+            "PUT",
+            "/v1/sessions/conv_caller/permissions",
+            {"user_id": "alice@example.com", "level": 1},
+        )
+    ]
+    result = json.loads(output)
+    assert result["level"] == "read"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "share_args,policy",
+    [
+        pytest.param({"user_id": "__public__"}, SharePolicy.PUBLIC, id="public-no-confirm"),
+        pytest.param(
+            {"user_id": "alice@example.com", "level": "manage"},
+            SharePolicy.NON_PUBLIC,
+            id="manage-no-confirm",
+        ),
+    ],
+)
+async def test_sys_session_share_sensitive_grant_refused_without_confirm(
+    share_args: dict[str, Any],
+    policy: SharePolicy,
+) -> None:
+    """
+    Granting ``__public__`` (anonymous read of the whole transcript) or
+    ``manage`` (the grantee can re-share) is refused — fail-closed —
+    unless the call carries ``confirm_sensitive_grant: true``. The refusal
+    is client-side: no snapshot GET and no PUT, so a prompt-injected call
+    can't silently expose or escalate. Any server I/O here would mean the
+    confirmation gate regressed.
+
+    :param share_args: The share arguments under test (sans confirmation).
+    :param policy: The spec's ``agent_session_sharing`` policy enabling the
+        grant tier (so the call reaches the confirmation gate, not the
+        policy gate).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps(share_args),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=policy),
+        )
+
+    assert called is False  # the gate must short-circuit before any I/O
+    assert "confirm_sensitive_grant" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_manage_with_confirm_succeeds() -> None:
+    """
+    With ``confirm_sensitive_grant: true`` a ``manage`` grant passes the
+    confirmation gate and PUTs the numeric level 3 — proving the gate
+    blocks the unconfirmed grant (sibling test) without breaking the
+    confirmed one.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "alice@example.com", "conversation_id": "conv_caller", "level": 3},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps(
+                {
+                    "user_id": "alice@example.com",
+                    "level": "manage",
+                    "confirm_sensitive_grant": True,
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    assert requests == [
+        (
+            "PUT",
+            "/v1/sessions/conv_caller/permissions",
+            {"user_id": "alice@example.com", "level": 3},
+        )
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_caller",
+        "user_id": "alice@example.com",
+        "level": "manage",
     }
 
 

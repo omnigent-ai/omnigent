@@ -659,18 +659,27 @@ class SysSessionShareTool(Tool):
 
     ``session_id`` is optional — when omitted, the caller's own session
     is shared, which is the common case ("share this session with X").
-    ``user_id`` is the grantee's email, or (when ``allow_public``) the
-    sentinel ``"__public__"`` for anonymous read-only access. ``level``
-    is ``"read"`` (default), ``"edit"``, or ``"manage"``; the server
-    caps public grants at read.
+    A non-default ``session_id`` must name another session in the
+    caller's OWN spawn tree; sharing an unrelated session (e.g. one
+    enumerated from ``sys_session_list``) is refused
+    (``session_out_of_tree``). ``user_id`` is the grantee's email, or
+    (when ``allow_public``) the sentinel ``"__public__"`` for anonymous
+    read-only access. ``level`` is ``"read"`` (default), ``"edit"``, or
+    ``"manage"``; the server caps public grants at read. Granting
+    ``__public__`` or ``manage`` is high-impact and requires an explicit
+    ``confirm_sensitive_grant=true`` opt-in — without it the runner
+    refuses the grant (fail-closed); ``read``/``edit`` to a named user
+    need no confirmation.
 
     Runner-dispatched: the runner proxies ``PUT
     /v1/sessions/{id}/permissions`` using its authenticated server
     client, so the grant runs with the session user's own identity and
     is subject to the server's permission checks (the caller needs
-    manage-level access — which the session owner has). Returns
-    ``access_denied`` when the server refuses and ``session_not_found``
-    for an unknown id.
+    manage-level access — which the session owner has). The spawn-tree
+    scope and sensitive-grant confirmation are ALSO enforced in the
+    runner (the server can't see them), so a prompt-injected call naming
+    the tool can't bypass them. Returns ``access_denied`` when the server
+    refuses and ``session_not_found`` for an unknown id.
 
     :param allow_public: Whether ``__public__`` grants are permitted —
         ``True`` only when the spec's ``agent_session_sharing:`` flag is
@@ -698,8 +707,11 @@ class SysSessionShareTool(Tool):
             "Share a session with another user by granting them access "
             "(level 'read' default, 'edit', or 'manage'). Omit "
             "session_id to share the calling session itself, or pass it "
-            "to share another session you manage. Requires manage-level "
-            "access (the session owner has it)."
+            "to share another session in your own spawn tree (sharing an "
+            "unrelated session is refused). Requires manage-level access "
+            "(the session owner has it). Granting '__public__' or "
+            "'manage' is high-impact and requires confirm_sensitive_grant"
+            "=true."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -744,7 +756,9 @@ class SysSessionShareTool(Tool):
                             "description": (
                                 "Permission level to grant. Defaults to "
                                 "'read'. Public grants are capped at "
-                                "'read' regardless of this value."
+                                "'read' regardless of this value. 'manage' "
+                                "is high-impact (the grantee can re-share) "
+                                "and requires confirm_sensitive_grant=true."
                             ),
                         },
                         "session_id": {
@@ -752,7 +766,20 @@ class SysSessionShareTool(Tool):
                             "description": (
                                 "The session (conversation_id) to share, "
                                 "e.g. 'conv_abc123'. Omit to share the "
-                                "calling session itself."
+                                "calling session itself. Must be your own "
+                                "session or another in your spawn tree — "
+                                "sharing an unrelated session is refused."
+                            ),
+                        },
+                        "confirm_sensitive_grant": {
+                            "type": "boolean",
+                            "description": (
+                                "Explicit confirmation for a high-impact "
+                                "grant. Must be true to grant '__public__' "
+                                "(anonymous read of the whole transcript) "
+                                "or 'manage'; such grants are refused "
+                                "without it. Not needed for 'read'/'edit' "
+                                "to a named user."
                             ),
                         },
                     },

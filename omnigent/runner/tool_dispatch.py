@@ -2998,6 +2998,75 @@ def _omnigent_error_message(resp: httpx.Response) -> str | None:
     return None
 
 
+async def _share_tree_scope_error(
+    target_id: str,
+    caller_conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """
+    Enforce ``sys_session_share``'s spawn-tree gate over REST.
+
+    Share MUTATES access control, so a target other than the caller's own
+    session MUST live in the caller's spawn tree — i.e. share the caller's
+    ``root_conversation_id``. Mirrors :func:`_close_tree_scope_error`:
+    without it a prompt-injected agent could enumerate ids via the
+    always-on ``sys_session_list`` and expose the owner's OTHER, unrelated
+    sessions (the always-on list + an ambient-identity PUT was the whole
+    attack). Both roots are resolved from session snapshots — a session
+    can always read itself, so the caller fetch is a 200 on the happy
+    path; a non-200 is surfaced as an error rather than failing open, and
+    a ``None`` root on either side is treated as out-of-tree (never a
+    match).
+
+    Unlike close this does NOT also require the target to be a sub-agent:
+    sharing the caller's own (possibly top-level) session is the common
+    case, handled by the ``target == caller`` short-circuit in the caller
+    before this is even reached, and any other in-tree session — root
+    included — is a legitimate share target.
+
+    :param target_id: The session to share, e.g. ``"conv_abc123"``.
+    :param caller_conversation_id: The calling session's own id, e.g.
+        ``"conv_caller"``, whose ``root_conversation_id`` anchors the tree.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``None`` when the target is in the caller's tree; otherwise
+        a JSON error string (``session_not_found`` or
+        ``session_out_of_tree``) suitable for returning verbatim.
+    """
+    try:
+        target_snap = await server_client.get(f"/v1/sessions/{target_id}", timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_share failed: {exc}"})
+    if target_snap.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target_id})
+    if target_snap.status_code in (401, 403):
+        # Can't even read it ⇒ it is not in the caller's tree (or access
+        # was revoked) — refuse before attempting the grant.
+        return json.dumps({"error": "session_out_of_tree", "session_id": target_id})
+    if target_snap.status_code != 200:
+        return json.dumps({"error": f"sys_session_share returned {target_snap.status_code}"})
+    try:
+        caller_snap = await server_client.get(
+            f"/v1/sessions/{caller_conversation_id}", timeout=30.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_share failed: {exc}"})
+    if caller_snap.status_code != 200:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share could not resolve caller session "
+                    f"{caller_conversation_id!r}"
+                ),
+                "session_id": target_id,
+            }
+        )
+    caller_root = caller_snap.json().get("root_conversation_id")
+    target_root = target_snap.json().get("root_conversation_id")
+    if caller_root is None or target_root != caller_root:
+        return json.dumps({"error": "session_out_of_tree", "session_id": target_id})
+    return None
+
+
 async def _session_share_via_rest(
     args: dict[str, Any],
     conversation_id: str,
@@ -3023,6 +3092,20 @@ async def _session_share_via_rest(
     ToolManager, but an unadvertised-yet-named call must still be denied
     so a prompt-injected agent can't escalate by emitting the tool name.
 
+    Two further runner-side gates harden share against prompt injection:
+
+    * **Spawn-tree scope** — a target other than the caller's own session
+      must live in the caller's spawn tree (same ``root_conversation_id``;
+      see :func:`_share_tree_scope_error`). Mirrors
+      :func:`_session_close_via_rest`'s gate, since the always-on
+      ``sys_session_list`` would otherwise let an injected agent enumerate
+      and share the owner's UNRELATED sessions.
+    * **Sensitive-grant confirmation** — granting ``__public__`` (anonymous
+      read of the whole transcript) or ``manage`` (which lets the grantee
+      re-share) is refused unless the call carries
+      ``confirm_sensitive_grant: true``. Fails closed; ``read``/``edit`` to
+      a named user need no confirmation.
+
     Maps 404 to ``session_not_found`` and 401/403 to ``access_denied``;
     other 4xx/5xx surface the server's own error message when present
     (e.g. the "public is read-only" rejection of a ``__public__`` grant
@@ -3030,7 +3113,10 @@ async def _session_share_via_rest(
 
     :param args: Parsed tool arguments. Requires ``user_id`` (grantee
         email or ``"__public__"``); optional ``level`` (``"read"``
-        default / ``"edit"`` / ``"manage"``) and ``session_id``.
+        default / ``"edit"`` / ``"manage"`` — a null/empty value also
+        defaults to ``"read"``), ``session_id`` (defaults to the caller's
+        own session), and ``confirm_sensitive_grant`` (``bool``; must be
+        ``true`` to grant ``__public__`` or ``manage``).
     :param conversation_id: The caller's own session id, used as the
         default target when ``session_id`` is omitted.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -3038,8 +3124,11 @@ async def _session_share_via_rest(
         ``agent_session_sharing`` policy gates this call. ``None`` (or
         ``agent_session_sharing: none``) fails closed — no grant is
         attempted.
-    :returns: JSON ``{"shared": true, ...}`` on success, or a JSON
-        error object.
+    :returns: JSON ``{"shared": true, ...}`` on success, or a JSON error
+        object: ``session_not_found`` (404), ``access_denied`` (PUT
+        401/403), ``session_out_of_tree`` (target outside the caller's
+        spawn tree), or a confirmation/level/policy refusal emitted before
+        any PUT.
     """
     target = args.get("session_id") or conversation_id
     if not isinstance(target, str) or not target:
@@ -3075,12 +3164,54 @@ async def _session_share_via_rest(
         )
     # Friendly level name -> the server's numeric permission level
     # (GrantPermissionRequest accepts 1=read, 2=edit, 3=manage).
+    # ``args.get("level", "read")`` would return None for an explicit
+    # ``"level": null`` (key present, value null) and then fail the enum
+    # check below instead of defaulting; ``or "read"`` coerces a
+    # null/empty/missing level to the documented "read" default.
     level_by_name = {"read": 1, "edit": 2, "manage": 3}
-    level_name = args.get("level", "read")
+    level_name = args.get("level") or "read"
     if level_name not in level_by_name:
         return json.dumps(
             {"error": f"sys_session_share: level must be one of {sorted(level_by_name)}"}
         )
+    # Defense-in-depth confirmation gate for the two irreversible /
+    # high-privilege grants a prompt-injected agent could otherwise issue
+    # silently:
+    #   * ``__public__`` — anonymous read of the FULL transcript (anyone
+    #     with the link), effectively un-revocable once the link leaks; and
+    #   * ``manage`` — lets the grantee re-share (including to
+    #     ``__public__``) and otherwise control the session — i.e.
+    #     privilege escalation.
+    # Both are refused unless the call carries an explicit
+    # ``confirm_sensitive_grant: true`` opt-in; we fail closed (deny) when
+    # it is absent. A full human-in-the-loop elicitation would be stronger,
+    # but the runner share path has no elicitation plumbing reaching here
+    # (no minted elicitation id / publish_event), so this is the documented
+    # fail-closed fallback. ``read``/``edit`` grants to a NAMED user stay
+    # frictionless.
+    is_sensitive_grant = user_id == _PUBLIC_USER_SENTINEL or level_name == "manage"
+    if is_sensitive_grant and args.get("confirm_sensitive_grant") is not True:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_share: granting public ('__public__') access or "
+                    "'manage' level is high-impact and requires explicit "
+                    "confirmation — re-issue with confirm_sensitive_grant: true only "
+                    "if the session owner truly intends this; otherwise grant a "
+                    "named user 'read'/'edit' instead"
+                ),
+                "session_id": target,
+            }
+        )
+    # Tree-scope gate: share MUTATES access control, so a target other than
+    # the caller's own session must live in the caller's spawn tree. The
+    # common "share this session" case (target == caller) is always allowed
+    # and skips the lookup; any other id is refused unless it shares the
+    # caller's root_conversation_id (see _share_tree_scope_error).
+    if target != conversation_id:
+        scope_error = await _share_tree_scope_error(target, conversation_id, server_client)
+        if scope_error is not None:
+            return scope_error
     try:
         resp = await server_client.put(
             f"/v1/sessions/{target}/permissions",
