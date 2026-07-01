@@ -280,24 +280,28 @@ spike. Each item updates the corresponding design assumption.
    `sbx policy set-default balanced` (recommended: allows AI services + package
    registries; use `allow-all` if a custom `--server` host gets blocked). This
    is host-global one-time setup, not per-sandbox.
-6. **Host blocker — eCryptfs home (environment, not design).** On the dev
-   machine, `sbx create` fails to extract the image with
-   `failed to create prepare snapshot dir: … no space left on device` from the
-   containerd **erofs** snapshotter — and the daemon also fails to write tiny
-   `.lock` files with the same ENOSPC — despite ~116 GB and 27M inodes free.
-   Root cause: `/home/jason` is an **eCryptfs** encrypted home
-   (`/home/.ecryptfs/jason/.Private … type ecryptfs`), and sbx stores its
-   containerd/microVM data under `~/.local/{state,share}/sandboxes`.
-   containerd's overlay/erofs snapshotters do not work on eCryptfs; the failure
-   surfaces as spurious ENOSPC. **Remediation (host side):** relocate sbx's
-   data off the encrypted home onto the non-encrypted root fs — sbx honors the
-   XDG base dirs, so `export XDG_STATE_HOME=/var/tmp/sbx-$USER/state
-   XDG_DATA_HOME=/var/tmp/sbx-$USER/share` (a path on the ext4 `/`, not under
-   `/home/$USER`) before `sbx login` / first `sbx` call is the likely fix; `/tmp`
-   is unsuitable (tmpfs, 16 GB, volatile). This blocks the live image-contents
-   probe (item 1) and the Task 11 end-to-end verification until resolved on the
-   host. It does **not** affect the launcher code, which is fully unit-tested
-   against a mocked `sbx`.
+6. **Host blocker — eCryptfs home: RESOLVED (2026-07-01).** The dev machine's
+   home was previously an eCryptfs encrypted mount, which broke containerd's
+   erofs snapshotter with spurious ENOSPC during image extraction. The home
+   has since been migrated to plain ext4 (no ecryptfs mounts remain), and
+   `sbx create` now pulls and extracts `docker/sandbox-templates:shell-docker`
+   cleanly. A default network policy (item 5) is also configured on the host.
+7. **Host blocker — KVM vcpu entry failure (environment, not design;
+   recorded 2026-07-01).** With the filesystem blocker gone, `sbx create …
+   shell <dir>` now fails at microVM boot:
+   `failed to create shim task: VM exited before connecting`. The daemon log
+   shows the hypervisor ("sailor") starting all vcpus, then
+   `kvm fail entry, exit_reason=0` on one vcpu ~270ms in, after which the VM
+   shuts down. Reproducible across runs (not a flake); `/dev/kvm` exists and
+   the user is in the `kvm` group. Suspected sbx v0.32.0 hypervisor
+   incompatibility with this host's kernel (7.0.0-27-generic). sbx cleans up
+   the failed sandbox itself, so no stale state is left. This blocks the live
+   image-contents probe (item 1) and the Task 11 end-to-end verification on
+   this machine until an sbx/kernel update fixes VM boot — or the E2E runs on
+   another host. It does **not** affect the launcher code, which is fully
+   unit-tested against a mocked `sbx` (28 tests) and whose `create` argv,
+   policy preflight, and login probe were exercised for real up to the VM
+   boot failure.
 
 ### Confirmed CLI surface (matches the plan's argv assumptions)
 
