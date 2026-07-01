@@ -75,3 +75,18 @@ async def test_full_server_interrupt(databricks_profile: str) -> None:
 
     assert not result.timed_out, "interrupt turn never settled"
     assert result.cancelled, "interrupt did not produce a cancellation marker"
+
+
+async def test_full_server_streaming(databricks_profile: str) -> None:
+    profile = resolve_profile("openai-agents")
+    reason = FullServerDriver.unavailable(profile, databricks_profile=databricks_profile)
+    if reason is not None:
+        pytest.skip(f"full-server unavailable: {reason}")
+
+    with FullServerDriver(profile, databricks_profile=databricks_profile) as driver:
+        result = driver.streaming_probe_turn(timeout=120)
+
+    assert not result.timed_out, f"streaming turn never reached a terminal event ({result.error})"
+    assert result.text_delta_count > 1, (
+        f"expected token-level streaming (>1 delta), saw {result.text_delta_count}"
+    )
