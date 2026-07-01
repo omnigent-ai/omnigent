@@ -10,16 +10,18 @@ It reuses the exact spawn recipe of the e2e ``live_server`` fixture
 (``tests/e2e/conftest.py``) via the shared compat helpers, but packaged as
 a plain async context manager so the bench CLI can drive it without pytest.
 
-Status: foundation — server+runner lifecycle and a basic turn (send
-message, poll the session snapshot to terminal, extract assistant text),
-live-verified. Follow-ups (stacked PRs) layer on the dimensions the wrap
-path cannot prove and the bench wiring to select this transport:
+Status (live-verified): server+runner lifecycle, a basic turn, and the
+payoff this transport exists for — a real **server-dispatched tool call**
+(a read-only builtin) and **tool-call policy enforcement** (a spec-baked
+``tool_call`` deny policy blocks the call the way production does). Ad-hoc
+request-level function tools are NOT used here: the SDK harnesses handle
+tools internally, so they never round-trip as a server-dispatched, policy-
+gated call — a builtin does.
 
-- server-dispatched tools (request-level function-tool round-trip);
-- tool-call policy enforcement via a pre-attached ``tool_call`` deny policy;
-- delta-level streaming via the ``/v1/sessions/{id}/stream`` SSE subscribe;
-- interrupt/cancel;
-- a ``--transport`` selector + driver registry so the probes run through it.
+Follow-ups (stacked PRs): delta-level streaming via the
+``/v1/sessions/{id}/stream`` SSE subscribe, interrupt/cancel, and a
+``--transport`` selector + driver registry so the bench's probes run
+through this driver.
 """
 
 from __future__ import annotations
@@ -51,6 +53,13 @@ from tests.harness_bench.profile import BenchProfile
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 _HEALTH_TIMEOUT_S = 90.0
 _POLL_INTERVAL_S = 0.2
+
+# The builtin the tool/policy probes drive: read-only, zero setup, server-
+# dispatched, and gated at the tool_call phase. Its denial output carries
+# _DENY_REASON so a blocked call is unambiguous.
+_TOOL_NAME = "list_files"
+_DENY_REASON = "bench-policy-deny"
+_TOOL_PROMPT = f"List the files using the {_TOOL_NAME} tool, then tell me how many there are."
 
 
 def _find_free_port() -> int:
@@ -101,6 +110,12 @@ class FullServerDriver:
         self._logs: list[Path] = []
         self._client: httpx.Client | None = None
         self._session_id: str | None = None
+        # A second agent+session whose spec bakes a tool_call deny policy,
+        # created lazily for the policy probe (the REST policy endpoint's
+        # handler allowlist excludes make_fixed_action_callable, so the deny
+        # must ride in the agent spec instead).
+        self._deny_session_id: str | None = None
+        self._runner_id = ""
         self._base_url = ""
         self._tmp = Path("/tmp") / f"omni-bench-fs-{uuid.uuid4().hex[:8]}"
 
@@ -146,7 +161,8 @@ class FullServerDriver:
             timeout=300.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         )
-        agent_name = self._register_agent()
+        self._runner_id = runner_id
+        agent_name = self._register_agent(deny=False)
         self._session_id = self._create_session(agent_name, runner_id)
         return self
 
@@ -240,27 +256,54 @@ class FullServerDriver:
 
     # ── agent + session ──────────────────────────────────────
 
-    def _register_agent(self) -> str:
+    def _register_agent(self, *, deny: bool) -> str:
         import io
         import tarfile
 
         import yaml
 
         assert self._client is not None
-        name = f"bench-{self._profile.harness}"
-        config = {
+        name = f"bench-{self._profile.harness}" + ("-deny" if deny else "")
+        config: dict[str, Any] = {
+            "spec_version": 1,
             "name": name,
             "prompt": "You are a helpful assistant used for capability testing.",
             "executor": {
-                "harness": self._profile.harness,
+                "type": "omnigent",
                 "model": self._profile.model,
                 "profile": self._db_profile,
+                "config": {"harness": self._profile.harness},
             },
+            # A read-only builtin the server dispatches (and gates at the
+            # tool_call phase). The tool/policy probes drive a call to it;
+            # it is harmless for basic turns (the model just won't call it).
+            "tools": {"builtins": [_TOOL_NAME]},
         }
+        if deny:
+            # Bake a tool_call-phase deny on the builtin so the server blocks
+            # the call the way production policy enforcement does.
+            config["guardrails"] = {
+                "policies": {
+                    "deny_tool": {
+                        "type": "function",
+                        "function": {
+                            "path": "omnigent.policies.function.make_fixed_action_callable",
+                            "arguments": {
+                                "action": "deny",
+                                "reason": _DENY_REASON,
+                                "on_phases": ["tool_call"],
+                                "on_tools": [_TOOL_NAME],
+                            },
+                        },
+                    }
+                }
+            }
+        # spec_version bundles load via the directory spec loader, which
+        # recognizes tools.builtins and expects the member named config.yaml.
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             payload = yaml.safe_dump(config).encode()
-            info = tarfile.TarInfo(f"{name}.yaml")
+            info = tarfile.TarInfo("config.yaml")
             info.size = len(payload)
             tar.addfile(info, io.BytesIO(payload))
         resp = self._client.post(
@@ -283,6 +326,59 @@ class FullServerDriver:
         bound = self._client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
         bound.raise_for_status()
         return session_id
+
+    def _ensure_deny_session(self) -> str:
+        """Lazily register the deny agent and its session; return the session id."""
+        if self._deny_session_id is None:
+            name = self._register_agent(deny=True)
+            self._deny_session_id = self._create_session(name, self._runner_id)
+        return self._deny_session_id
+
+    # ── tool / policy probe ──────────────────────────────────
+
+    def tool_probe_turn(self, *, deny: bool, timeout: float = 180.0) -> TurnResult:
+        """Drive a turn that calls the builtin tool; return a :class:`TurnResult`.
+
+        On the full-server transport a tool call is real and server-
+        dispatched. With *deny* the turn runs against a session whose agent
+        bakes a ``tool_call`` deny policy, so the server blocks the call and
+        the tool output carries the deny reason.
+
+        Fills :attr:`TurnResult.tool_calls` (the builtin call) and
+        :attr:`TurnResult.tool_call_denied` (whether the server blocked it),
+        plus ``completed`` / ``failed`` / ``text``.
+        """
+        assert self._client is not None
+        sid = self._ensure_deny_session() if deny else self._session_id
+        assert sid is not None
+        result = TurnResult()
+        body = {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": _TOOL_PROMPT}]},
+        }
+        self._client.post(f"/v1/sessions/{sid}/events", json=body).raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        seen_running = False
+        while time.monotonic() < deadline:
+            snap = self._client.get(f"/v1/sessions/{sid}").json()
+            status = snap.get("status")
+            items = snap.get("items", [])
+            if status in ("running", "waiting"):
+                seen_running = True
+            if status == "failed":
+                result.failed = True
+                result.error = snap.get("last_task_error") or snap.get("error")
+                break
+            if status == "idle" and seen_running:
+                result.completed = True
+                _scan_tool_items(items, result)
+                result.text = _assistant_text(items)
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        else:
+            result.timed_out = True
+        return result
 
     # ── turn ─────────────────────────────────────────────────
 
@@ -333,6 +429,25 @@ class FullServerDriver:
         else:
             result.timed_out = True
         return result
+
+
+def _scan_tool_items(items: list[dict], result: TurnResult) -> None:
+    """Populate tool_calls and tool_call_denied from session items."""
+    for raw in items:
+        data = raw.get("data", raw)
+        itype = raw.get("type") or data.get("type")
+        if itype == "function_call":
+            result.tool_calls.append(
+                {
+                    "call_id": data.get("call_id"),
+                    "name": data.get("name"),
+                    "arguments": data.get("arguments"),
+                }
+            )
+        elif itype == "function_call_output":
+            out = str(data.get("output", ""))
+            if data.get("status") == "blocked" or _DENY_REASON in out:
+                result.tool_call_denied = True
 
 
 def _assistant_text(items: list[dict]) -> str:
