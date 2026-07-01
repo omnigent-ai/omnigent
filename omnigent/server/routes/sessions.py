@@ -7013,27 +7013,69 @@ async def _reset_runner_resources_after_switch(session_id: str) -> None:
     _publish_changed_files_invalidated(session_id)
 
 
-def _is_native_terminal_session(conv: Conversation) -> bool:
+def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | None:
     """
-    Return whether a session is owned by a terminal-native wrapper.
+    Resolve native terminal metadata for a session, by wrapper label OR harness.
+
+    Two independent signals identify a native session, because native message
+    handling must NOT be coupled to the terminal-first presentation labels:
+
+    * the ``omnigent.wrapper`` presentation label — set for the built-in
+      terminal-first wrapper sessions (``omnigent claude`` / ``omnigent
+      codex``); resolved directly and cheaply here (short-circuits the harness
+      load below); and
+    * the bound agent's RESOLVED harness — for a CUSTOM agent that declares a
+      native harness (e.g. a user ``polly`` orchestrator with
+      ``executor.harness: codex-native``) but is intentionally CHAT-first, so
+      it carries no wrapper label. Its runner still runs a native transcript
+      forwarder (the single writer for the conversation), so its web messages
+      must take the same native single-writer path — else the inbound user
+      message is persisted AP-side AND mirrored by the forwarder, landing
+      twice. Resolved via :func:`_resolve_harness` (honors a per-session
+      ``harness_override``), independent of the presentation labels; SDK
+      harnesses resolve to ``None``.
 
     :param conv: Conversation row for the target session.
-    :returns: ``True`` for wrappers backed by a native terminal harness.
+    :returns: The :class:`NativeCodingAgent` for the session's harness, or
+        ``None`` when it is not a native terminal harness.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    return native_coding_agent_for_wrapper_label(wrapper) is not None
+    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    if native_agent is not None:
+        return native_agent
+    return native_coding_agent_for_harness(_resolve_harness(conv))
+
+
+def _is_native_terminal_session(conv: Conversation) -> bool:
+    """
+    Return whether a session's turns are driven by a native terminal harness.
+
+    True for both a built-in terminal-first wrapper (``omnigent.wrapper``
+    label) and a custom chat-first agent bound to a native harness — see
+    :func:`_native_coding_agent_for_session` for why routing keys on the
+    resolved harness, not the presentation labels.
+
+    :param conv: Conversation row for the target session.
+    :returns: ``True`` when the session's harness is a native terminal harness.
+    """
+    return _native_coding_agent_for_session(conv) is not None
 
 
 def _native_terminal_runtime(conv: Conversation) -> tuple[str, str, str]:
     """
-    Return native terminal runtime strings for a wrapper session.
+    Return native terminal runtime strings for a native-harness session.
+
+    Resolves by wrapper label OR resolved harness (see
+    :func:`_native_coding_agent_for_session`), so a custom chat-first agent on
+    a native harness (no wrapper label) resolves too — otherwise it would raise
+    ``Unsupported native terminal session`` the moment its first web message
+    reached the native dispatch branch.
 
     :param conv: Conversation row for the target session.
     :returns: ``(display_name, model, harness)``.
-    :raises OmnigentError: If the wrapper label is unsupported.
+    :raises OmnigentError: If the session is not a native terminal harness.
     """
-    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    native_agent = _native_coding_agent_for_session(conv)
     if native_agent is not None:
         return native_agent.display_name, native_agent.agent_name, native_agent.harness
     raise OmnigentError(
