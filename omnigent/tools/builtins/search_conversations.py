@@ -10,12 +10,14 @@ from omnigent.tools.base import Tool, ToolContext
 
 class SearchConversationsTool(Tool):
     """
-    Full-text search across all conversations.
+    Full-text search within the caller's own conversation.
 
     Uses the FTS index to find past messages, tool calls, and
     results that match a query. Returns matching items with
     surrounding context so the agent can recall information
-    from prior interactions.
+    from prior interactions. Results are scoped to the current
+    session's ``conversation_id`` so the search never reads
+    other users'/sessions' data.
     """
 
     @classmethod
@@ -83,7 +85,8 @@ class SearchConversationsTool(Tool):
         :param arguments: JSON with ``"query"`` and optional
             ``"limit"`` keys, e.g.
             ``'{"query": "database config", "limit": 5}'``.
-        :param ctx: Server-side execution context (unused).
+        :param ctx: Server-side execution context; ``ctx.conversation_id``
+            scopes the search to the caller's own session.
         :returns: JSON string with search results.
         """
         args: dict[str, Any] = json.loads(arguments)
@@ -92,10 +95,22 @@ class SearchConversationsTool(Tool):
             return json.dumps({"error": "missing required 'query' argument"})
         limit = args.get("limit", 10)
 
+        # Scope the search to the caller's own session using the
+        # server-trusted conversation id (never an LLM-supplied
+        # argument). The store treats ``conversation_id=None`` as
+        # "search the entire shared DB", so an unscoped call would
+        # leak other sessions'/users' messages, tool-call arguments,
+        # and outputs. Fail closed when there is no session context
+        # rather than falling back to an unscoped search.
+        if ctx.conversation_id is None:
+            return json.dumps(
+                {"error": "no conversation context — cannot scope conversation search"}
+            )
+
         from omnigent.runtime import get_conversation_store
 
         conv_store = get_conversation_store()
-        items = conv_store.search(query, limit=limit)
+        items = conv_store.search(query, conversation_id=ctx.conversation_id, limit=limit)
 
         if not items:
             return json.dumps({"results": [], "message": "No matching conversations found."})
