@@ -108,7 +108,11 @@
    *
    * Three inputs combine:
    *   1. OS safe area  — `env(safe-area-inset-*)`, nonzero only on notched /
-   *      home-indicator devices (and only when `viewport-fit=cover`).
+   *      home-indicator devices (and only when `viewport-fit=cover`). The
+   *      Android shell can't rely on `env()` alone (unreliable across WebView
+   *      versions / nav modes), so it also injects measured insets as
+   *      `--omnigent-android-safe-area-*`; we fold those in with `max()` so the
+   *      var stays universal and contributes nothing off the Android shell.
    *   2. Native bar footprint — the pixel height of the iOS shell's floating
    *      server switcher (top) and chat/terminal bar (bottom). The native
    *      layer owns these dimensions and pushes them over the bridge (see
@@ -124,8 +128,14 @@
    * tracked here for symmetry/introspection but is intentionally NOT added to
    * the content top inset to avoid double-counting the header band. */
   --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
-  --omnigent-safe-top: env(safe-area-inset-top, 0px);
-  --omnigent-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --omnigent-safe-top: max(
+    env(safe-area-inset-top, 0px),
+    var(--omnigent-android-safe-area-top, 0px)
+  );
+  --omnigent-safe-bottom: max(
+    env(safe-area-inset-bottom, 0px),
+    var(--omnigent-android-safe-area-bottom, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
@@ -470,7 +480,7 @@
      drawer instantly with no animation. Transition both so the toggle slides
      too. Suppressed inline (`transition: none`) while a drag is live so the
      overlay tracks the finger 1:1. */
-  [data-ios-native] .conversations-sidebar {
+  :is([data-ios-native], [data-android-native]) .conversations-sidebar {
     transition-property: transform, translate;
     transition-duration: 360ms;
     transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
@@ -484,11 +494,11 @@
      screen's left edge while parked off-screen. It's visible only mid-slide and
      mid-drag — fully open the drawer covers the viewport, so its right edge (and
      the shadow) sit past the screen. iOS-only: the web overlay is unchanged. */
-  [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+  :is([data-ios-native], [data-android-native]) .conversations-sidebar:not([data-collapsed]) {
     box-shadow: 8px 0 28px -6px rgb(0 0 0 / 0.22);
   }
 
-  .dark [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+  .dark :is([data-ios-native], [data-android-native]) .conversations-sidebar:not([data-collapsed]) {
     box-shadow: 8px 0 30px -4px rgb(0 0 0 / 0.55);
   }
 
@@ -496,17 +506,24 @@
     font-size: 16px;
   }
 
-  [data-ios-native] .chat-header {
-    top: max(0px, calc(env(safe-area-inset-top, 0px) - 0.5rem));
+  /* `--omnigent-safe-top` (not raw env()) so this works on Android too, where
+     env(safe-area-inset-top) is 0 in the WebView and the OS inset arrives via
+     the native-injected `--omnigent-android-safe-area-top`. On iOS the var folds
+     down to env(), so the iOS result is unchanged. */
+  [data-ios-native] .chat-header,
+  [data-android-native] .chat-header {
+    top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
   }
 
-  [data-ios-native] .chat-conversation-content {
+  [data-ios-native] .chat-conversation-content,
+  [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
        shared inset vars (was a hardcoded 5rem). */
     padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
   }
 
-  [data-ios-native] .main-terminal-view {
+  [data-ios-native] .main-terminal-view,
+  [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
   }
 
@@ -523,7 +540,8 @@
     );
   }
 
-  [data-ios-native] .chat-composer-form {
+  [data-ios-native] .chat-composer-form,
+  [data-android-native] .chat-composer-form {
     padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
   }
 
@@ -614,7 +632,7 @@
       0 1px 0 rgb(255 255 255 / 0.12) inset;
   }
 
-  [data-ios-native]
+  :is([data-ios-native], [data-android-native])
     :is(
       .conversations-sidebar,
       [data-testid="file-viewer"],
