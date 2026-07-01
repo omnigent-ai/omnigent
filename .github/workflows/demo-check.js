@@ -60,7 +60,10 @@ function extractDemoContent(body) {
   const section = nextHeading
     ? afterHeading.slice(0, nextHeading.index)
     : afterHeading;
-  return section.replace(/<!--[\s\S]*?-->/g, "").trim();
+  return section
+    .replace(/<!--[\s\S]*?-->/g, "")   // complete HTML comments
+    .replace(/<!--[\s\S]*/g, "")        // unclosed comment remnants
+    .trim();
 }
 
 // Returns true when the demo section has real content (not empty / placeholder).
