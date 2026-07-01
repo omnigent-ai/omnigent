@@ -70,6 +70,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Canvas builtin (#2, #12) is always auto-registered so an agent +
+        # the Omnigent MCP can render an artifact without the spec opting in.
+        "set_canvas",
     }
 )
 

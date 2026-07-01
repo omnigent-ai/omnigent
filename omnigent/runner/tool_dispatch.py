@@ -304,6 +304,11 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
+# Canvas builtin (#2, #12): set_canvas. Like the comment tools, the runner has
+# no in-process CanvasStore, so it proxies to the server's REST API over
+# server_client (see _execute_canvas_tool): PUT /v1/canvas/{conversation_id}.
+_CANVAS_TOOLS = frozenset({"set_canvas"})
+
 # Builtin tools the claude-native / codex-native relay advertises to the
 # real CLI, beyond the always-relayed ``sys_os_*`` family. Native harnesses
 # ignore the harness ``tools`` list, so the relay is their ONLY tool
@@ -331,6 +336,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    | _CANVAS_TOOLS
 )
 
 
@@ -467,6 +473,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _CANVAS_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -2559,6 +2566,60 @@ async def _execute_comment_tool(
         return json.dumps({"error": f"update_comment failed: {exc}"})
 
 
+async def _execute_canvas_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Runner-local handler for the ``set_canvas`` builtin (#2, #12).
+
+    The runner has no in-process CanvasStore, so — like the comment tools —
+    ``set_canvas`` proxies to the Omnigent server's ``PUT /v1/canvas/{id}`` over
+    ``server_client``. The canvas is scoped to the current ``conversation_id``.
+
+    :param tool_name: One of :data:`_CANVAS_TOOLS`.
+    :param arguments: JSON-encoded args from the LLM.
+    :param conversation_id: Current session id, used as the default scope.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: A JSON result/error string for the agent.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    def _result(resp: httpx.Response) -> str:
+        if resp.status_code >= 400:
+            return json.dumps(
+                {"error": f"{tool_name} returned HTTP {resp.status_code}: {resp.text[:300]}"}
+            )
+        return json.dumps(resp.json())
+
+    scoped_conv = args.get("conversation_id") or conversation_id
+
+    try:
+        if tool_name == "set_canvas":
+            if not scoped_conv:
+                return json.dumps({"error": "set_canvas requires a session id"})
+            body = {
+                "title": args.get("title"),
+                "content": args.get("content"),
+                "content_type": args.get("content_type", "html"),
+            }
+            return _result(
+                await server_client.put(f"/v1/canvas/{scoped_conv}", json=body, timeout=30.0)
+            )
+
+        return json.dumps({"error": f"unknown canvas tool: {tool_name}"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -4173,6 +4234,13 @@ async def execute_tool(
             )
         elif tool_name in _POLICY_TOOLS:
             output = await _execute_policy_tool(
+                tool_name,
+                arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+            )
+        elif tool_name in _CANVAS_TOOLS:
+            output = await _execute_canvas_tool(
                 tool_name,
                 arguments,
                 conversation_id=conversation_id,
