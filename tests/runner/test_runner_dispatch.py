@@ -6142,6 +6142,65 @@ async def test_sys_session_create_config_path_escape_rejected(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_config_path_dir_symlink_not_dereferenced(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``config_path`` DIRECTORY containing an in-tree symlink to a host
+    file outside the working directory must not bundle that file's
+    contents.
+
+    The top-level guard only resolves ``config_path`` itself, but a
+    directory bundle is copied recursively. Without symlink-aware
+    containment an agent could author ``helper/config.yaml`` plus
+    ``helper/leak -> <secret>`` and exfiltrate the secret's contents
+    through the uploaded, session-scoped bundle (readable back via
+    ``sys_agent_download`` — polly runs unsandboxed). The upload must be
+    refused before any server call, and the secret must never be read.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    # A host secret living OUTSIDE the working directory.
+    secret = tmp_path / "id_rsa"
+    secret.write_text("TOP-SECRET-HOST-FILE\n")
+
+    # An agent-authored config directory under the working dir holding a
+    # valid config plus an in-tree symlink that points at the host
+    # secret. The default copytree(symlinks=False) would dereference it.
+    config_dir = workdir / "helper"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("name: helper\n")
+    (config_dir / "leak").symlink_to(secret)
+
+    server_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        server_calls.append(str(request.url))
+        raise AssertionError(f"server must not be reached when a bundle escapes: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=workdir,
+        )
+
+    info = json.loads(output)
+    assert "escapes the working directory" in info["error"]
+    # The escape is caught before bundling/upload — the secret's
+    # contents never leave the host.
+    assert server_calls == []
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_config_not_found(tmp_path: Path) -> None:
     """
     A missing ``config_path`` returns the typed ``config_not_found``

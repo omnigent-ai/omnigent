@@ -2020,6 +2020,36 @@ async def _post_child_first_message(
     return None
 
 
+def _directory_bundle_escapes_cwd(source: Path, resolved_cwd: Path) -> bool:
+    """
+    Report whether a directory bundle reaches outside the working dir.
+
+    The top-level ``config_path`` guard only resolves the directory
+    itself, but a directory bundle is copied recursively. Without a
+    symlink-aware check an agent could author ``helper/config.yaml``
+    alongside an in-tree symlink (e.g.
+    ``helper/leak -> /home/<user>/.ssh/id_rsa``) and exfiltrate that
+    host file's contents through the uploaded, session-scoped bundle
+    (readable back via ``sys_agent_download``). Resolving every nested
+    entry's realpath and rejecting any that escapes ``resolved_cwd``
+    keeps containment robust against symlinks anywhere in the tree, not
+    just the top-level path. ``rglob`` does not descend into symlinked
+    directories, so a symlinked subdirectory is itself checked (and
+    rejected) without following it.
+
+    :param source: A directory already confirmed to live under
+        ``resolved_cwd``.
+    :param resolved_cwd: The os_env working directory — the containment
+        boundary.
+    :returns: ``True`` if any nested entry resolves outside
+        ``resolved_cwd``; ``False`` when the whole tree is contained.
+    """
+    return any(
+        not Path(os.path.realpath(entry)).is_relative_to(resolved_cwd)
+        for entry in source.rglob("*")
+    )
+
+
 async def _upload_config_bundle(
     config_path: str,
     args: dict[str, Any],
@@ -2058,6 +2088,20 @@ async def _upload_config_bundle(
         )
     if not source.exists():
         return json.dumps({"error": "config_not_found", "config_path": config_path})
+    # The top-level guard above only resolves config_path itself. A
+    # directory bundle is copied recursively, so an in-tree symlink
+    # pointing at a host file outside the working dir would otherwise be
+    # bundled (its target's contents) and exfiltrated. Reject any nested
+    # entry whose realpath escapes the working directory.
+    if source.is_dir() and _directory_bundle_escapes_cwd(source, resolved_cwd):
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_create config_path contains a link that "
+                    "escapes the working directory"
+                )
+            }
+        )
     try:
         bundle_bytes = await asyncio.to_thread(_bundle_local_agent_source, source)
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.

@@ -113,17 +113,26 @@ def materialize_bundle(source: Path, dest: Path) -> Path:
     :param dest: Destination directory to populate. Created if it
         does not exist; may be empty or already contain the copied
         contents from a prior call (``shutil.copytree`` is invoked
-        with ``dirs_exist_ok=True``).
+        with ``dirs_exist_ok=True`` and ``symlinks=True``).
     :returns: *dest*, always as a populated directory. For the
         directory case the contents are a recursive copy of
-        *source*. For the file case the YAML is placed at the root
+        *source* with symlinks preserved (copied as links, never
+        dereferenced, so a link's external target contents stay out
+        of the bundle). For the file case the YAML is placed at the root
         of *dest* so
         :func:`omnigent.spec._find_omnigent_yaml_in_dir` picks
         it up on a subsequent :func:`load` call.
     :raises FileNotFoundError: If *source* does not exist.
     """
     if source.is_dir():
-        shutil.copytree(source, dest, dirs_exist_ok=True)
+        # symlinks=True copies links verbatim instead of dereferencing
+        # them. With the default (symlinks=False) an in-tree symlink to a
+        # file outside the source (e.g. an agent-authored
+        # ``helper/leak -> ~/.ssh/id_rsa``) would have its *target's*
+        # contents copied into the bundle, escaping the caller's
+        # containment guard. Preserving the link keeps external file
+        # contents out of the materialized bundle.
+        shutil.copytree(source, dest, dirs_exist_ok=True, symlinks=True)
         return dest
     if source.is_file():
         dest.mkdir(parents=True, exist_ok=True)
