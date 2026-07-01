@@ -1,24 +1,26 @@
-// Scan open contributor PRs and comment when a UI / frontend change is checked
-// but no demo (screenshot / video) is provided. Runs on a schedule so it
-// catches PRs that were opened without a demo and never updated. Drafts and
-// maintainer PRs are skipped. Already-flagged PRs (labeled `needs-demo`) are
-// skipped on subsequent runs to avoid duplicate comments.
+// Scan contributor PRs opened in the last 24 hours and comment when a Bug fix,
+// Feature, or UI / frontend change is checked but no real demo (screenshot /
+// video) is provided. Runs hourly; the 24-hour window ensures every new PR is
+// checked even if it was opened just before a cron tick. Drafts and maintainer
+// PRs are skipped. Already-flagged PRs (labeled `needs-demo`) are skipped to
+// avoid duplicate comments on subsequent runs.
 
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const DAYS_TO_SCAN = 14;
+const MS_PER_HOUR = 60 * 60 * 1000;
+const HOURS_TO_SCAN = 24;
 const NEEDS_DEMO_LABEL = "needs-demo";
 
 const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
 
-// Sentinel text that the PR template seeds into the Demo section. A Demo
-// section whose only non-whitespace content is one of these (possibly with the
-// surrounding HTML comment stripped) is treated as "not provided".
-const PLACEHOLDER_PATTERNS = [
-  /^n\/a$/i,
-  /^none$/i,
-  /^-$/,
-  /^tbd$/i,
-  /^todo$/i,
+// Patterns that match real demo media in the Demo section.
+// A demo is considered present only when one of these is found.
+const DEMO_MEDIA_PATTERNS = [
+  /!\[.*?\]\(https?:\/\//,           // Markdown image with URL: ![alt](https://...)
+  /<img\b[^>]+src=/i,                // HTML <img src="...">
+  /https?:\/\/\S+\.(?:gif|mp4|mov|webm|mkv)/i,  // direct video/gif URL
+  /https?:\/\/(?:www\.)?loom\.com\//i,           // Loom recording
+  /https?:\/\/(?:www\.)?youtube\.com\/|https?:\/\/youtu\.be\//i,  // YouTube
+  /https?:\/\/github\.com\/.*\/assets\//i,       // GitHub-hosted attachment
+  /https?:\/\/user-images\.githubusercontent\.com\//i,            // GitHub user images
 ];
 
 const QUERY = `
@@ -40,9 +42,15 @@ const QUERY = `
   }
 `;
 
-// Returns true when the "UI / frontend change" checkbox is checked.
-function hasUIChangeChecked(body) {
-  return /- \[[xX]\] UI \/ frontend change/.test(body ?? "");
+// Returns true when any change type that requires a demo is checked:
+// Bug fix, Feature, or UI / frontend change.
+function requiresDemo(body) {
+  const text = body ?? "";
+  return (
+    /- \[[xX]\] Bug fix/.test(text) ||
+    /- \[[xX]\] Feature/.test(text) ||
+    /- \[[xX]\] UI \/ frontend change/.test(text)
+  );
 }
 
 // Extracts the text content of the Demo section (between ## Demo and the next
@@ -64,22 +72,22 @@ function extractDemoContent(body) {
     .trim();
 }
 
-// Returns true when the demo section has real content (not empty / placeholder).
+// Returns true when the demo section contains real media (image/video/gif).
 function hasDemoContent(body) {
   const content = extractDemoContent(body);
   if (!content) return false;
-  return !PLACEHOLDER_PATTERNS.some((re) => re.test(content));
+  return DEMO_MEDIA_PATTERNS.some((re) => re.test(content));
 }
 
 const demoRequiredMessage = (author) =>
-  `@${author} This PR checks **UI / frontend change** but the **Demo** section is missing or only contains a placeholder.
+  `@${author} This PR is a **Bug fix**, **Feature**, or **UI / frontend change** but the **Demo** section is missing or only contains a placeholder.
 
-UI changes require a screenshot or screen recording so reviewers can see the new behaviour without checking out the branch. Please update the **Demo** section with:
+These change types require a screenshot or screen recording so reviewers can see the new behaviour without checking out the branch. Please update the **Demo** section with:
 
 - A screenshot or screen recording of the change, or
 - A link to a hosted video or GIF showing the new behaviour.
 
-_Use \`N/A\` only for non-visual changes. If this PR does not actually modify the UI, uncheck the **UI / frontend change** box instead._`;
+_Use \`N/A\` only when the change has no user-visible effect whatsoever (e.g. a pure refactor or test-only change). If that's the case, uncheck the relevant type box and check **Refactor / chore** or **Test / CI** instead._`;
 
 module.exports = async ({ context, github, core }) => {
   const { owner, repo } = context.repo;
@@ -121,9 +129,10 @@ module.exports = async ({ context, github, core }) => {
       }
     }
 
-    const cutoff = new Date(Date.now() - DAYS_TO_SCAN * MS_PER_DAY);
-    const dateString = cutoff.toISOString().slice(0, 10);
-    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${dateString}`;
+    const cutoff = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+    // GitHub search supports ISO 8601 timestamps for sub-day precision.
+    const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
 
     console.log(`Scanning PRs: ${searchQuery}`);
 
@@ -142,7 +151,7 @@ module.exports = async ({ context, github, core }) => {
       allPRs.push(...nodes);
     }
 
-    console.log(`Found ${allPRs.length} open PRs from the last ${DAYS_TO_SCAN} days`);
+    console.log(`Found ${allPRs.length} open PRs from the last ${HOURS_TO_SCAN} hours`);
 
     let flaggedCount = 0;
     let skippedCount = 0;
@@ -171,8 +180,8 @@ module.exports = async ({ context, github, core }) => {
         continue;
       }
 
-      // Only care about PRs that checked the UI / frontend change box.
-      if (!hasUIChangeChecked(pr.body)) {
+      // Only care about PRs that checked Bug fix, Feature, or UI / frontend change.
+      if (!requiresDemo(pr.body)) {
         continue;
       }
 
@@ -181,7 +190,7 @@ module.exports = async ({ context, github, core }) => {
         continue;
       }
 
-      console.log(`PR #${pr.number} (@${author}): UI change checked but no demo provided`);
+      console.log(`PR #${pr.number} (@${author}): demo required but not provided`);
 
       // Comment before labeling: if the comment fails the PR stays unlabeled
       // and will be retried on the next run. Labeling first would permanently
