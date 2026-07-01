@@ -75,3 +75,7 @@ class RuntimeCaps:
     # Managed deployments can supply a different implementation (e.g.
     # a rules engine or remote service).  ``None`` disables routing.
     routing_client: RoutingClient | None = None
+    # Global on/off for the Canvas feature (#2), from ``canvas.enabled`` in the
+    # server --config YAML (default on). When off, the ``/v1/canvas`` routes
+    # 404, ``set_canvas`` isn't registered, and the client hides the Canvas tab.
+    canvas_enabled: bool = True

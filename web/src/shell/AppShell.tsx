@@ -44,6 +44,7 @@ import {
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
@@ -125,6 +126,10 @@ export function AppShell() {
   const { conversationId } = useParams<{ conversationId: string }>();
   // Canvas (#2): drives the right-rail Canvas tab; null until the agent sets one.
   const canvasQuery = useCanvas(conversationId);
+  // Canvas is also gated by the server's ``canvas.enabled`` flag (#2): when the
+  // operator disables Canvas, hide the tab even if a stale canvas row exists.
+  const serverInfo = useServerInfo();
+  const canvasEnabled = serverInfo !== "loading" && serverInfo.canvas_enabled;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
@@ -449,8 +454,9 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
-        // Canvas tab appears once the agent has set a canvas for this session.
-        canvas: !!canvasQuery.data,
+        // Canvas tab appears once the agent has set a canvas for this session,
+        // and only when the server has Canvas enabled (``canvas.enabled``).
+        canvas: canvasEnabled && !!canvasQuery.data,
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
@@ -469,6 +475,7 @@ export function AppShell() {
     [
       showFilesPanel,
       canvasQuery.data,
+      canvasEnabled,
       hideTerminalsTab,
       railTerminals.length,
       agentSupportsShells,

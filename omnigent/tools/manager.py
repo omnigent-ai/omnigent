@@ -535,10 +535,20 @@ class ToolManager:
         surface — can render a canvas artifact without the spec opting in.
         Instantiated straight from the builtin registry (like the comment tools)
         rather than declared in ``tools.builtins``, which avoids the
-        declared-builtin function-tool callable-recovery path. The tool returns a
-        clear error at invoke time when its backing CanvasStore isn't configured,
-        so registering it unconditionally is safe.
+        declared-builtin function-tool callable-recovery path.
+
+        Gated on the ``canvas.enabled`` server flag (#2): when the operator has
+        disabled Canvas we don't advertise the tool. Best-effort — if the caps
+        aren't resolvable here (e.g. a runner without server config), we register
+        anyway; the ``/v1/canvas`` route is the hard gate and 404s regardless.
         """
+        try:
+            from omnigent.runtime import get_caps
+
+            if not get_caps().canvas_enabled:
+                return
+        except Exception:
+            pass
         tool = get_builtin_tool("set_canvas")
         if tool is not None:
             self._tools["set_canvas"] = tool

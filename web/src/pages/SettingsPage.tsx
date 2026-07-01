@@ -37,6 +37,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -100,6 +101,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "appearance" && <CanvasStatusCard />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && accountsEnabled && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
@@ -171,6 +173,45 @@ function AppearanceSection() {
         </div>
       )}
     </Section>
+  );
+}
+
+/**
+ * Read-only "Canvas" status card (#2). Canvas is gated by the server's
+ * ``canvas.enabled`` config, not a per-user preference (omnigent has no
+ * server-synced user prefs), so this reflects the server flag with a disabled
+ * switch rather than offering a live toggle. Rendered under Appearance as a
+ * light labeled card (no ``h1``) so the section keeps a single top-level
+ * heading. Hidden entirely while the capability probe is loading.
+ */
+function CanvasStatusCard() {
+  const info = useServerInfo();
+  if (info === "loading") return null;
+  const enabled = info.canvas_enabled;
+  return (
+    <div className="mt-10" data-testid="canvas-status">
+      <h2 className="text-sm font-semibold text-muted-foreground">Canvas</h2>
+      <div className="mt-3 flex items-center justify-between gap-4 rounded-lg border border-border p-4">
+        <div className="flex flex-col gap-1">
+          <span className="text-sm font-medium">
+            {enabled ? "Canvas is enabled" : "Canvas is disabled"}
+          </span>
+          <span className="text-xs text-muted-foreground">
+            {enabled
+              ? "Agents can create a canvas artifact per conversation, shown in the workspace rail."
+              : "The Canvas tool and panel are turned off on this server."}
+          </span>
+        </div>
+        <Switch
+          checked={enabled}
+          disabled
+          aria-label="Canvas enabled (controlled by the server operator)"
+        />
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Controlled by the server operator via <code>canvas.enabled</code>.
+      </p>
+    </div>
   );
 }
 

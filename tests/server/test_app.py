@@ -390,6 +390,20 @@ async def test_info_includes_server_version(
 
 
 @pytest.mark.asyncio
+async def test_info_includes_canvas_enabled(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/info`` exposes ``canvas_enabled`` (#2) so the SPA can hide the
+    Canvas rail tab (and Settings can show its status) when the operator
+    disables Canvas. Default on — no caps configured in this app → ``True``.
+    """
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["canvas_enabled"] is True
+
+
+@pytest.mark.asyncio
 async def test_health_bare_returns_status_ok(db_uri: str, tmp_path: Path) -> None:
     """
     ``GET /health`` with no session params still returns the bare

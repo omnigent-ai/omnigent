@@ -68,6 +68,14 @@ export interface ServerInfo {
    * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
    */
   smart_routing_enabled: boolean;
+  /**
+   * True when the Canvas feature (#2) is enabled on this server
+   * (``canvas.enabled`` in the server config, default on). When false the
+   * ``/v1/canvas`` routes 404, ``set_canvas`` isn't registered, and the SPA
+   * hides the Canvas rail tab. Fails closed — a failed probe (the ``_OFF``
+   * sentinel) hides the tab.
+   */
+  canvas_enabled: boolean;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
@@ -80,6 +88,7 @@ const _OFF: ServerInfo = {
   sandbox_provider: null,
   server_version: null,
   smart_routing_enabled: false,
+  canvas_enabled: false,
 };
 
 let _cached: ServerInfo | null = null;
@@ -114,6 +123,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: data.smart_routing_enabled === true,
+          canvas_enabled: data.canvas_enabled === true,
         };
         return _cached;
       }
