@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import io
 import json
 import logging
 import os
+import tarfile
 import tempfile
 import uuid
 from collections.abc import Callable
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 import httpx
+import yaml
 
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
@@ -55,6 +58,7 @@ from omnigent.session_lifecycle import (
     is_session_closed,
     title_without_closed_marker,
 )
+from omnigent.spec.tar_utils import extract_safe
 from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.async_inbox import (
@@ -3247,6 +3251,154 @@ def _agent_bundle_filename(
     return f"{safe_name}-v{agent_version}.tar.gz"
 
 
+# ``sys_agent_download`` writes the agent bundle to the caller's local disk for
+# ``sys_os_read``, gated only at LEVEL_READ — the same gate as the secret-free
+# ``sys_agent_get``. The server's :class:`MCPServerSummary` deliberately strips
+# the secret-bearing ``headers`` / ``env`` fields out of ``get``; the runner
+# applies the symmetric redaction to the downloaded bundle so a READ-level
+# session SHARER (intended only to view a conversation) cannot exfiltrate the
+# agent's credential VALUES via the download path. Key NAMES are kept so the
+# bundle stays useful for inspection / forking — the sharer still learns which
+# credentials the agent needs, just not their values.
+_BUNDLE_REDACTION_PLACEHOLDER = "[REDACTED]"
+_BUNDLE_SECRET_MAPPING_KEYS = frozenset({"headers", "env"})
+
+
+def _redact_secret_mappings(node: object) -> bool:
+    """
+    Redact secret VALUES under ``headers`` / ``env`` mappings, in place.
+
+    Walks a parsed-YAML structure (the shape :func:`yaml.safe_load`
+    returns) and, for every mapping keyed ``headers`` or ``env`` whose
+    value is itself a mapping, replaces each value with
+    :data:`_BUNDLE_REDACTION_PLACEHOLDER` while preserving the key names.
+    Matches the exact fields the server's
+    :class:`~omnigent.server.schemas.MCPServerSummary` excludes from
+    ``sys_agent_get``, covering both inline ``tools:`` MCP entries in
+    ``config.yaml`` and standalone ``tools/mcp/*.yaml`` files, recursing
+    into sub-agent configs.
+
+    :param node: A parsed-YAML node (mapping, sequence, or scalar).
+    :returns: ``True`` if any value was redacted, else ``False``.
+    """
+    changed = False
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _BUNDLE_SECRET_MAPPING_KEYS and isinstance(value, dict):
+                # Reassigning existing keys' values (not adding/removing
+                # keys) is safe during iteration; list() guards regardless.
+                for secret_key in list(value):
+                    if value[secret_key] != _BUNDLE_REDACTION_PLACEHOLDER:
+                        value[secret_key] = _BUNDLE_REDACTION_PLACEHOLDER
+                        changed = True
+            elif _redact_secret_mappings(value):
+                changed = True
+    elif isinstance(node, list):
+        for item in node:
+            if _redact_secret_mappings(item):
+                changed = True
+    return changed
+
+
+def _redact_bundle_yaml_file(path: Path) -> None:
+    """
+    Redact secret values in a single bundle YAML file, in place.
+
+    Parses *path* and, if it carries any ``headers`` / ``env`` secret
+    mapping, rewrites the file with those values replaced. A file that
+    fails to parse or does not parse to a mapping/sequence is left
+    untouched — it carries no recognized secret structure. Best effort by
+    design: the server validated the bundle at upload, so well-formed
+    ``config.yaml`` / ``tools/mcp/*.yaml`` parse cleanly here.
+
+    :param path: A ``.yaml`` / ``.yml`` file inside the extracted bundle.
+    """
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return
+    if not isinstance(loaded, (dict, list)):
+        return
+    if _redact_secret_mappings(loaded):
+        path.write_text(
+            yaml.safe_dump(loaded, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+
+
+def _redact_bundle_dotenv_file(path: Path) -> None:
+    """
+    Redact values in a single ``.env``-style file, in place.
+
+    Replaces the value of each ``KEY=VALUE`` assignment with
+    :data:`_BUNDLE_REDACTION_PLACEHOLDER`, preserving blank lines,
+    comments, and key names. Defensive coverage for an agent that ships a
+    dotenv file alongside the spec; the structured YAML ``headers`` /
+    ``env`` fields are the primary secret vector.
+
+    :param path: A ``.env`` (or ``*.env``) file inside the extracted
+        bundle.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    new_lines: list[str] = []
+    changed = False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            new_lines.append(line)
+            continue
+        key, _, _value = line.partition("=")
+        new_lines.append(f"{key}={_BUNDLE_REDACTION_PLACEHOLDER}")
+        changed = True
+    if changed:
+        path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def _redact_agent_bundle_sync(bundle_bytes: bytes) -> bytes:
+    """
+    Unpack, redact secret values, and repack an agent bundle.
+
+    Extracts *bundle_bytes* (a ``.tar.gz``) into a temp directory with the
+    project's hardened :func:`~omnigent.spec.tar_utils.extract_safe`,
+    redacts secret values in every ``*.yaml`` / ``*.yml`` (the
+    ``headers`` / ``env`` mappings) and ``.env`` file, then repacks into a
+    fresh gzip tarball. The bundle the agent later reads from disk
+    therefore never contains credential VALUES — only their key names —
+    mirroring the secret-free projection ``sys_agent_get`` already returns.
+
+    Synchronous (filesystem + CPU bound); call via
+    :func:`asyncio.to_thread` off the event loop.
+
+    :param bundle_bytes: Raw bytes of the server's ``.tar.gz`` bundle.
+    :returns: Raw bytes of the redacted ``.tar.gz`` bundle.
+    :raises Exception: If *bundle_bytes* cannot be safely unpacked /
+        repacked — an unsafe tarball
+        (:class:`~omnigent.spec.tar_utils.ExtractionError`), corrupt gzip
+        (e.g. ``EOFError``), or decode error. The caller fails closed and
+        writes nothing rather than persisting an unredacted bundle.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "bundle"
+        extract_safe(bundle_bytes, root)
+        for file_path in root.rglob("*"):
+            if not file_path.is_file():
+                continue
+            name = file_path.name
+            if name.endswith((".yaml", ".yml")):
+                _redact_bundle_yaml_file(file_path)
+            elif name == ".env" or name.endswith(".env"):
+                _redact_bundle_dotenv_file(file_path)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for file_path in sorted(root.rglob("*")):
+                if file_path.is_file():
+                    tf.add(str(file_path), arcname=str(file_path.relative_to(root)))
+        return buf.getvalue()
+
+
 async def _agent_download_via_rest(
     session_id: str,
     args: dict[str, Any],
@@ -3259,12 +3411,17 @@ async def _agent_download_via_rest(
     """
     Download a session's agent bundle and write it to the agent's disk.
 
-    Fetches the ``.tar.gz`` from ``GET /v1/sessions/{id}/agent/contents``
-    and writes the bytes into the agent's os_env working directory — the
-    same cwd the agent's ``sys_os_*`` tools operate on (resolved via
+    Fetches the ``.tar.gz`` from ``GET /v1/sessions/{id}/agent/contents``,
+    redacts secret VALUES (MCP ``headers`` / ``env``, plus any ``.env``
+    file) out of the archive via :func:`_redact_agent_bundle_sync`, then
+    writes the redacted bytes into the agent's os_env working directory —
+    the same cwd the agent's ``sys_os_*`` tools operate on (resolved via
     :func:`_effective_runner_os_env_spec`, so a ``caller_process``
     os_env's cwd is the ``runner_workspace`` or the per-conversation
-    tmpdir). The default filename is ``"<agent_name>-v<version>.tar.gz"``
+    tmpdir). Redaction keeps the secret-disclosure posture of this
+    LEVEL_READ-gated path in line with the secret-free ``sys_agent_get``;
+    an unpackable bundle fails closed (nothing is written). The default
+    filename is ``"<agent_name>-v<version>.tar.gz"``
     (from the ``X-Agent-*`` response headers); a caller-supplied
     ``dest_filename`` overrides it. Returns the written path so the
     orchestrator can extract (``sys_os_shell``) and read
@@ -3298,6 +3455,19 @@ async def _agent_download_via_rest(
         return json.dumps({"error": f"sys_agent_download returned {resp.status_code}"})
     agent_name = resp.headers.get("X-Agent-Name", "agent")
     agent_version = resp.headers.get("X-Agent-Version", "0")
+    # Strip secret VALUES (MCP ``headers`` / ``env``) before the bundle ever
+    # touches disk: the server's contents route is gated only at LEVEL_READ,
+    # the same gate as the secret-free ``sys_agent_get``, so a read-only
+    # session sharer must not be able to read raw credentials off the
+    # downloaded bundle. Fail closed — if the bundle can't be unpacked, write
+    # nothing rather than persist an unredacted archive.
+    try:
+        bundle_bytes = await asyncio.to_thread(_redact_agent_bundle_sync, resp.content)
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed on ANY unpack/redact failure (unsafe tarball,
+        # corrupt gzip, decode error, ...): never persist bytes we could
+        # not scrub.
+        return json.dumps({"error": f"sys_agent_download could not redact agent bundle: {exc}"})
     filename = _agent_bundle_filename(args.get("dest_filename"), agent_name, agent_version)
     if filename is None:
         return json.dumps(
@@ -3317,13 +3487,13 @@ async def _agent_download_via_rest(
         return json.dumps(
             {"error": "sys_agent_download resolved destination escapes the working directory"}
         )
-    await asyncio.to_thread(dest.write_bytes, resp.content)
+    await asyncio.to_thread(dest.write_bytes, bundle_bytes)
     return json.dumps(
         {
             "path": str(dest),
             "agent_name": agent_name,
             "agent_version": agent_version,
-            "bytes_written": len(resp.content),
+            "bytes_written": len(bundle_bytes),
         }
     )
 
@@ -3373,8 +3543,6 @@ def _scan_local_agent_configs(configs_dir: Path) -> list[dict[str, str | None]]:
         ``<cwd>/.omnigent/agent-configs``.
     :returns: ``[{"name", "path", "description"}, ...]``, sorted by path.
     """
-    import yaml
-
     if not configs_dir.is_dir():
         return []
     entries: list[dict[str, str | None]] = []

@@ -109,6 +109,11 @@ class SysAgentDownloadTool(Tool):
     ``sys_os_shell`` operate on) and the tool returns the path —
     path-only by design. To inspect the config, extract the archive
     (``sys_os_shell``) then read ``config.yaml`` (``sys_os_read``).
+    Secret VALUES (MCP server ``headers`` / ``env`` and any ``.env``
+    file) are **redacted** from the written bundle — key names are kept
+    but each value becomes ``[REDACTED]`` — so the download discloses no
+    more than the secret-free ``sys_agent_get``. A fork therefore needs
+    its credentials re-supplied.
     The download exists for inspecting or forking a config — launching
     an already-registered agent needs no download: pass its
     ``agent_id`` (from ``sys_agent_list`` / ``sys_agent_get``) to
@@ -137,10 +142,12 @@ class SysAgentDownloadTool(Tool):
             "and return the path. Global read — any session you can "
             "access. Requires session_id. Path-only: extract the "
             "archive with sys_os_shell, then read config.yaml with "
-            "sys_os_read. Optionally pass dest_filename to control the "
-            "output filename. Only needed to inspect or fork an "
-            "agent's config — launching an existing agent needs no "
-            "download: pass its agent_id to sys_session_create."
+            "sys_os_read. Secret values (MCP headers/env, .env) are "
+            "redacted to [REDACTED] in the bundle; key names are kept. "
+            "Optionally pass dest_filename to control the output "
+            "filename. Only needed to inspect or fork an agent's config "
+            "— launching an existing agent needs no download: pass its "
+            "agent_id to sys_session_create."
         )
 
     def get_schema(self) -> dict[str, Any]:

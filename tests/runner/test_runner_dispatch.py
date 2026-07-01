@@ -32,9 +32,11 @@ The unkeyed test asserts on plumbing only (handler is reached,
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
+import tarfile
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -45,6 +47,7 @@ from typing import Any, cast
 
 import httpx
 import pytest
+import yaml
 from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
@@ -5665,22 +5668,59 @@ async def test_sys_agent_download_rejects_symlink_escape_from_cwd(tmp_path: Path
     assert not outside_target.exists()
 
 
+def _build_agent_bundle(
+    config: dict[str, Any],
+    extra_files: dict[str, str] | None = None,
+) -> bytes:
+    """
+    Pack a minimal agent bundle (``.tar.gz``) for download tests.
+
+    :param config: ``config.yaml`` contents, dumped to YAML.
+    :param extra_files: Optional ``{arcname: text}`` extra members, e.g.
+        ``tools/mcp/github.yaml`` or ``.env``.
+    :returns: Raw ``.tar.gz`` bytes shaped like a real server bundle.
+    """
+    files = {"config.yaml": yaml.safe_dump(config, sort_keys=False)}
+    if extra_files:
+        files.update(extra_files)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for arcname, text in files.items():
+            data = text.encode("utf-8")
+            info = tarfile.TarInfo(name=arcname)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _extract_bundle_files(bundle_bytes: bytes) -> dict[str, str]:
+    """Extract a ``.tar.gz`` into ``{arcname: text}`` for assertions."""
+    out: dict[str, str] = {}
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            if member.isfile():
+                fh = tf.extractfile(member)
+                assert fh is not None
+                out[member.name] = fh.read().decode("utf-8")
+    return out
+
+
 @pytest.mark.asyncio
 async def test_sys_agent_download_writes_bundle_to_workspace(tmp_path: Path) -> None:
     """
-    ``sys_agent_download`` writes the fetched ``.tar.gz`` bytes into the
+    ``sys_agent_download`` writes the (redacted) ``.tar.gz`` into the
     agent's os_env cwd (here ``runner_workspace`` = tmp_path) and returns
     the path. Proves the full path: fetch bytes, derive the default
-    filename from the X-Agent-* headers, and persist to the agent-visible
-    disk. If the write regressed, the file wouldn't exist or the bytes
-    wouldn't match.
+    filename from the X-Agent-* headers, and persist a valid archive to
+    the agent-visible disk. If the write regressed, the file wouldn't
+    exist or wouldn't round-trip as a tarball.
 
     :param tmp_path: Pytest temp dir used as the runner workspace, so the
         resolved os_env cwd is a real local directory.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
-    bundle_bytes = b"\x1f\x8b\x08fake-tar-gz-bytes"
+    bundle_bytes = _build_agent_bundle({"spec_version": 1, "name": "my agent"})
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_x/agent/contents":
@@ -5707,10 +5747,154 @@ async def test_sys_agent_download_writes_bundle_to_workspace(tmp_path: Path) -> 
     # Default filename: agent name sanitized (space → "_") + version.
     expected = tmp_path / "my_agent-v5.tar.gz"
     assert info["path"] == str(expected)
-    assert info["bytes_written"] == len(bundle_bytes)
-    # The bundle actually landed on disk with the exact bytes — a
-    # mismatch means the write path or byte handling broke.
-    assert expected.read_bytes() == bundle_bytes
+    # bytes_written reflects the redacted/repacked archive actually on disk.
+    written = expected.read_bytes()
+    assert info["bytes_written"] == len(written)
+    # The written bytes are a valid tarball that round-trips to the spec.
+    files = _extract_bundle_files(written)
+    assert yaml.safe_load(files["config.yaml"])["name"] == "my agent"
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_download_redacts_secret_values(tmp_path: Path) -> None:
+    """
+    ``sys_agent_download`` strips secret VALUES out of the bundle it
+    writes to disk — MCP ``headers`` / ``env`` (inline in ``config.yaml``
+    and standalone ``tools/mcp/*.yaml``) plus ``.env`` values — while
+    keeping key names. The ``.../agent/contents`` route is gated only at
+    LEVEL_READ, the same gate as the secret-free ``sys_agent_get``, so a
+    read-only session SHARER must not be able to read raw credentials off
+    the downloaded archive. If redaction regressed, the literal secret
+    tokens below would survive into the on-disk bundle.
+
+    :param tmp_path: Pytest temp dir used as the runner workspace.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    http_header_secret = "Bearer sk-HTTP-HEADER-SECRET"
+    stdio_env_secret = "ghp_STDIO-ENV-SECRET"
+    mcp_file_secret = "Bearer tok-MCP-FILE-SECRET"
+    dotenv_secret = "DOTENV-SECRET-VALUE"
+    secrets = [http_header_secret, stdio_env_secret, mcp_file_secret, dotenv_secret]
+
+    config = {
+        "spec_version": 1,
+        "name": "researcher",
+        "tools": {
+            "search": {
+                "type": "mcp",
+                "url": "https://mcp.example.com/sse",
+                "headers": {"Authorization": http_header_secret},
+            },
+            "github": {
+                "type": "mcp",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {"GITHUB_TOKEN": stdio_env_secret},
+            },
+        },
+    }
+    mcp_file = yaml.safe_dump(
+        {
+            "name": "deployed",
+            "transport": "http",
+            "url": "https://deployed.example.com/sse",
+            "headers": {"Authorization": mcp_file_secret},
+        },
+        sort_keys=False,
+    )
+    bundle_bytes = _build_agent_bundle(
+        config,
+        extra_files={
+            "tools/mcp/deployed.yaml": mcp_file,
+            ".env": f"GITHUB_TOKEN={dotenv_secret}\n# keep this comment\n",
+        },
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_x/agent/contents":
+            return httpx.Response(
+                200,
+                content=bundle_bytes,
+                headers={"X-Agent-Name": "researcher", "X-Agent-Version": "3"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_agent_download",
+            arguments=json.dumps({"session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert "error" not in info, info
+    written = Path(info["path"])
+    assert written.exists()
+
+    # No literal secret value survives anywhere in the written archive.
+    raw = written.read_bytes()
+    for secret in secrets:
+        assert secret.encode("utf-8") not in raw, f"secret leaked: {secret!r}"
+
+    files = _extract_bundle_files(raw)
+    # Inline config.yaml MCP servers: key names kept, values redacted.
+    config_out = yaml.safe_load(files["config.yaml"])
+    assert config_out["tools"]["search"]["headers"] == {"Authorization": "[REDACTED]"}
+    assert config_out["tools"]["github"]["env"] == {"GITHUB_TOKEN": "[REDACTED]"}
+    # Non-secret structure is preserved (so the bundle stays inspectable).
+    assert config_out["tools"]["github"]["args"] == ["-y", "@modelcontextprotocol/server-github"]
+    assert config_out["name"] == "researcher"
+    # Standalone tools/mcp/*.yaml file redacted too.
+    mcp_out = yaml.safe_load(files["tools/mcp/deployed.yaml"])
+    assert mcp_out["headers"] == {"Authorization": "[REDACTED]"}
+    assert mcp_out["url"] == "https://deployed.example.com/sse"
+    # .env values redacted, comments/keys preserved.
+    assert "GITHUB_TOKEN=[REDACTED]" in files[".env"]
+    assert "# keep this comment" in files[".env"]
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_download_fails_closed_on_unpackable_bundle(tmp_path: Path) -> None:
+    """
+    ``sys_agent_download`` fails closed when the fetched bundle is not a
+    valid tarball: it returns an error and writes NOTHING, rather than
+    persisting raw (potentially secret-bearing) bytes it could not
+    redact. Real server bundles are always ``.tar.gz``; a non-tarball is
+    anomalous and must never reach disk unredacted.
+
+    :param tmp_path: Pytest temp dir used as the runner workspace.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"\x1f\x8b\x08not-actually-a-tarball",
+            headers={"X-Agent-Name": "a", "X-Agent-Version": "1"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_agent_download",
+            arguments=json.dumps({"session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert "error" in info
+    # Nothing was written under the workspace.
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio
