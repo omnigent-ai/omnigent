@@ -511,36 +511,61 @@ async def test_window_title_none_skips_title_calls(
     )
 
 
-def test_run_never_enables_kitty_keyboard_protocol() -> None:
+def test_host_never_enables_kitty_keyboard_protocol() -> None:
     """
-    The host input loop must never enable the Kitty Keyboard Protocol.
+    No code in ``_host.py`` may enable the Kitty Keyboard Protocol.
 
-    The loop used to push CSI-u progressive enhancement with
+    The input loop used to push CSI-u progressive enhancement with
     ``\\x1b[>1u`` (to get disambiguated keys like Shift+Enter) and
     pop it with ``\\x1b[<u`` in a happy-path ``finally``. Because the
     pop only ran on a clean return, any hard exit — SIGINT/SIGTERM/
     SIGHUP or a crash — left the mode enabled and leaked it into the
     user's real terminal, so Ctrl+C at the shell prompt printed
     ``^[[99;133u`` instead of sending SIGINT. The fix removes the
-    push entirely (never enabled → nothing to leak). Guard the
-    source so the enable escape cannot creep back in.
+    push entirely (never enabled → nothing to leak).
+
+    Guard against reintroduction anywhere in the module — not just
+    ``run`` — because a helper could push it too. The enable push is a
+    *string written to the terminal* that starts with ``ESC [ >`` (the
+    ``>`` private-parameter prefix, e.g. ``ESC[>1u``). We therefore
+    inspect the decoded VALUE of every string literal in the module,
+    which:
+
+    - matches the escape in any spelling (``\\x1b``, ``\\033``, or a
+      raw ESC byte), since all decode to the same bytes;
+    - ignores comments and docstrings-about-the-bug (this test and the
+      explanatory comment in ``_host.py`` mention ``\\x1b[>1u`` in prose,
+      which is not a string literal so must not trip the guard);
+    - does NOT flag the legitimate INCOMING CSI-u decoders in
+      ``_install_csi_u_sequences`` (``ESC[13u``, ``ESC[9u``,
+      ``ESC[127u`` …). Those parse sequences the terminal sends *to*
+      us and never carry the ``>`` prefix, so ``ESC [ >`` cleanly
+      separates an enable-push from decoder/parse code.
     """
+    import ast
     import inspect
 
-    source = inspect.getsource(TerminalHost.run)
+    from omnigent_ui_sdk.terminal import _host as host_module
 
-    assert "\x1b[>1u" not in source, (
-        "TerminalHost.run() writes the Kitty Keyboard Protocol push "
-        "(\\x1b[>1u). Enabling CSI-u leaks into the user's real "
-        "terminal on any non-happy-path exit — Ctrl+C then prints "
-        "^[[99;133u instead of sending SIGINT. Do not re-enable it."
-    )
-    # The literal ``\x1b[>`` prefix begins every progressive-enhancement
-    # push (``>1u``, ``>3u``, ...); block the whole family, not just >1u.
-    assert "\x1b[>" not in source, (
-        "TerminalHost.run() writes a CSI-u progressive-enhancement push "
-        "(\\x1b[>...u). Enabling any Kitty Keyboard Protocol flag leaks "
-        "into the user's real terminal on non-happy-path exits."
+    module_source = inspect.getsource(host_module)
+
+    # Real bytes (not the escaped source spelling): ESC, '[', '>'.
+    enable_push_prefix = "\x1b[>"
+
+    offenders = [
+        node.value
+        for node in ast.walk(ast.parse(module_source))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and enable_push_prefix in node.value
+    ]
+
+    assert not offenders, (
+        "_host.py contains a string literal that enables the Kitty "
+        "Keyboard Protocol (CSI-u progressive enhancement) — it starts "
+        "with ESC[> (e.g. '\\x1b[>1u'). Writing this to the terminal "
+        "leaks the mode into the user's real shell on any non-happy-path "
+        f"exit (Ctrl+C then prints ^[[99;133u). Offending values: {offenders!r}"
     )
 
 
