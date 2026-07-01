@@ -515,8 +515,7 @@ def test_cwd_resolution_uses_workspace_when_spec_cwd_is_dot(
     # warrants direct testing rather than only being covered
     # transitively through a launched tmux. Public-API coverage
     # comes from the round-trip integration test above.
-    resolved = tool._resolve_cwd(
-        cwd_override=None,
+    resolved = tool._resolve_anchor_cwd(
         terminal_spec=spec.terminals["bash"],
         ctx=ctx,
     )
@@ -543,8 +542,7 @@ def test_cwd_resolution_uses_workspace_when_terminal_cwd_is_dot(
     )
     tool = SysTerminalLaunchTool(spec=spec, registry=registry)
 
-    resolved = tool._resolve_cwd(
-        cwd_override=None,
+    resolved = tool._resolve_anchor_cwd(
         terminal_spec=spec.terminals["bash"],
         ctx=ctx,
     )
@@ -566,34 +564,150 @@ def test_cwd_resolution_explicit_spec_cwd_wins_over_workspace(
         os_env=OSEnvSpec(type="caller_process", cwd=explicit_cwd),
     )
     tool = SysTerminalLaunchTool(spec=spec, registry=registry)
-    resolved = tool._resolve_cwd(
-        cwd_override=None,
+    resolved = tool._resolve_anchor_cwd(
         terminal_spec=spec.terminals["bash"],
         ctx=ctx,
     )
     assert resolved == explicit_cwd
 
 
-def test_cwd_resolution_per_call_override_wins(
+def test_anchor_cwd_ignores_per_call_override(
     registry: TerminalRegistry, ctx: ToolContext, tmp_path: Path
 ) -> None:
     """
-    The per-call ``cwd`` argument (already vetted against
-    ``allow_cwd_override``) wins over every spec-level setting.
+    The trusted containment anchor is resolved WITHOUT the LLM's
+    per-call ``cwd`` override. The override must never become its own
+    anchor — it flows separately through the inner guard's
+    ``cwd_override``, which contains it within this anchor.
+
+    Regression guard for the P0 where the launch tool folded the
+    override into the effective cwd for a placeholder-cwd terminal
+    (``os_env.cwd: "."`` + ``allow_cwd_override: true``), so the
+    inner containment check compared the override against itself and
+    accepted any path (``/``, ``~/.ssh``, ``/etc``). The anchor must
+    stay pinned to the explicit spec cwd (or the workspace), no
+    matter what override the LLM later supplies.
     """
     spec_cwd = str(tmp_path / "spec_cwd")
-    override_cwd = str(tmp_path / "override")
     spec = _make_spec(
         terminals={"bash": TerminalEnvSpec(command="bash", allow_cwd_override=True)},
         os_env=OSEnvSpec(type="caller_process", cwd=spec_cwd),
     )
     tool = SysTerminalLaunchTool(spec=spec, registry=registry)
-    resolved = tool._resolve_cwd(
-        cwd_override=override_cwd,
+    # ``_resolve_anchor_cwd`` takes no override by construction — the
+    # anchor is the trusted spec cwd, never the (out-of-band) override.
+    anchor = tool._resolve_anchor_cwd(
         terminal_spec=spec.terminals["bash"],
         ctx=ctx,
     )
-    assert resolved == override_cwd
+    assert anchor == spec_cwd
+
+
+# ── cwd-override containment guard (sandbox escape) ───────────
+
+
+async def test_launch_rejects_out_of_root_cwd_override_for_placeholder_spec(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    tmp_path: Path,
+) -> None:
+    """
+    A ``cwd`` override pointing OUTSIDE the terminal's root is
+    rejected even when the terminal spec uses the placeholder cwd
+    ``"."`` together with ``allow_cwd_override: true`` — exactly
+    polly's ``shell`` terminal.
+
+    This is the P0 regression target. The launch tool used to fold
+    the override into the effective cwd whenever the spec cwd was a
+    placeholder (``None`` / ``""`` / ``"."`` / ``"./"``) AND also
+    pass it as ``cwd_override``, so the inner containment guard
+    compared the override against itself (``relative_to`` of a path
+    against itself always passes) and accepted ANY path — ``/``,
+    ``~/.ssh``, ``/etc``. With the anchor resolved without the
+    override, the guard anchors at ``ctx.workspace`` and rejects an
+    override that escapes it.
+
+    What breaks if this fails: a sandboxed adopter's agent can
+    repoint its terminal anchor anywhere on the host, escaping the
+    project sandbox's filesystem / dotfile-masking anchors.
+    """
+    del cleanup_registry  # registered for its teardown side-effect
+    # A sibling of the workspace is guaranteed to be outside it.
+    outside_root = tmp_path.parent / "p0_outside_root_escape"
+    outside_root.mkdir(exist_ok=True)
+    spec = _make_spec(
+        terminals={
+            "bash": TerminalEnvSpec(
+                command="bash",
+                allow_cwd_override=True,
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=".",  # placeholder — the vulnerable idiom
+                    sandbox=OSEnvSandboxSpec(type="none"),
+                ),
+            )
+        },
+    )
+    tool = SysTerminalLaunchTool(spec=spec, registry=registry)
+
+    result = await _invoke(
+        tool,
+        {"terminal": "bash", "session": "s1", "cwd": str(outside_root)},
+        ctx,
+    )
+
+    assert "error" in result, (
+        "out-of-root cwd override was accepted for a placeholder-cwd "
+        f"terminal — the containment guard is a no-op (sandbox escape). Got {result!r}"
+    )
+    assert "outside the allowed root" in result["error"], (
+        f"expected a containment-guard rejection, got {result['error']!r}"
+    )
+    # The rejected launch must not register a tmux session.
+    assert registry.get(ctx.conversation_id, "bash", "s1") is None
+
+
+async def test_launch_accepts_in_root_cwd_override_for_placeholder_spec(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    tmp_path: Path,
+) -> None:
+    """
+    A ``cwd`` override that stays INSIDE the terminal's root still
+    launches for a placeholder-cwd terminal. The containment fix must
+    reject escapes without breaking the legitimate in-root override
+    (the whole point of ``allow_cwd_override: true``).
+    """
+    del cleanup_registry
+    in_root = tmp_path / "workdir"
+    in_root.mkdir()
+    spec = _make_spec(
+        terminals={
+            "bash": TerminalEnvSpec(
+                command="bash",
+                allow_cwd_override=True,
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=".",
+                    sandbox=OSEnvSandboxSpec(type="none"),
+                ),
+            )
+        },
+    )
+    tool = SysTerminalLaunchTool(spec=spec, registry=registry)
+
+    result = await _invoke(
+        tool,
+        {"terminal": "bash", "session": "s1", "cwd": str(in_root)},
+        ctx,
+    )
+
+    assert result.get("status") == "launched", (
+        "in-root cwd override was rejected — the containment fix over-blocked a "
+        f"legitimate override under the workspace root. Got {result!r}"
+    )
 
 
 # ── §9.1 concurrent-send race ─────────────────────

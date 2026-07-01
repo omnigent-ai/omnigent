@@ -23,7 +23,10 @@ singleton; both are passed in at registration time by
 :meth:`ToolManager._register_terminal_tools`.
 
 Cwd resolution at launch follows the §4.6 precedence list — see
-:meth:`SysTerminalLaunchTool._resolve_cwd` for the implementation.
+:meth:`SysTerminalLaunchTool._resolve_anchor_cwd` for the trusted
+containment anchor. The LLM ``cwd`` override is applied and
+containment-checked separately by the inner guard, never folded into
+the anchor.
 """
 
 from __future__ import annotations
@@ -574,8 +577,8 @@ class SysTerminalLaunchTool(Tool):
             # Validation hit an error envelope — already JSON-encoded.
             return validated
 
-        # §4.6 cwd resolution. Two synthesis points feed the result
-        # into the inner builder, because the inner code's
+        # §4.6 cwd resolution. Two synthesis points feed the trusted
+        # ANCHOR cwd into the inner builder, because the inner code's
         # ``effective_os_env_spec`` selection prefers
         # ``terminal_spec.os_env`` over ``parent_os_env`` whenever
         # the terminal declares its own — so we can't just patch
@@ -590,13 +593,21 @@ class SysTerminalLaunchTool(Tool):
         #   ``os.getcwd()`` — AP's process cwd — instead of the
         #   §4.6-resolved workspace.
         #
-        # Neither path uses the inner builder's ``cwd_override``
-        # parameter — that one enforces ``allow_cwd_override``,
-        # an LLM-untrusted gate.
-        resolved_cwd = self._resolve_cwd(validated.cwd_override, validated.terminal_spec, ctx)
-        parent_os_env = _synthesize_parent_os_env(self._spec.os_env, resolved_cwd)
+        # SECURITY: the anchor is resolved WITHOUT the LLM ``cwd``
+        # override. The override must never become its own
+        # containment anchor — it flows ONLY through the inner
+        # builder's ``cwd_override`` parameter (see
+        # :meth:`_perform_launch`), where the guard validates it
+        # against this anchor. Feeding the override in here as the
+        # effective cwd (as a prior version did for placeholder-cwd
+        # specs) makes the inner guard compare the override against
+        # itself, so it accepts ANY path — a sandbox escape for the
+        # idiomatic ``os_env.cwd: "."`` + ``allow_cwd_override:
+        # true`` terminal.
+        anchor_cwd = self._resolve_anchor_cwd(validated.terminal_spec, ctx)
+        parent_os_env = _synthesize_parent_os_env(self._spec.os_env, anchor_cwd)
         materialized_terminal_spec = _materialize_terminal_spec_for_launch(
-            validated.terminal_spec, resolved_cwd
+            validated.terminal_spec, anchor_cwd
         )
 
         # Snapshot whether the registry already has a live instance
@@ -629,7 +640,7 @@ class SysTerminalLaunchTool(Tool):
         Orchestrates :meth:`_perform_launch` and
         :func:`_format_launch_envelope`. All arguments are
         pre-validated by :meth:`_validate_launch_args` /
-        :meth:`_resolve_cwd` / :func:`_synthesize_parent_os_env`.
+        :meth:`_resolve_anchor_cwd` / :func:`_synthesize_parent_os_env`.
 
         :param ctx: Tool execution context — supplies
             ``conversation_id`` for the resource-publish event.
@@ -688,10 +699,12 @@ class SysTerminalLaunchTool(Tool):
                     validated.session_key,
                     terminal_spec,
                     parent_os_env=parent_os_env,
-                    # cwd_override is reserved for LLM-supplied
-                    # per-call overrides (already validated against
-                    # allow_cwd_override above). The §4.6
-                    # precedence flows through parent_os_env.
+                    # cwd_override is reserved for the LLM-supplied
+                    # per-call override (already validated against
+                    # allow_cwd_override above). The trusted anchor
+                    # flows separately through parent_os_env / the
+                    # materialized terminal spec; the inner guard
+                    # contains this override within that anchor.
                     cwd_override=validated.cwd_override,
                     sandbox_override=validated.sandbox_override,
                 )
@@ -749,35 +762,43 @@ class SysTerminalLaunchTool(Tool):
             sandbox_override=sandbox_override,
         )
 
-    def _resolve_cwd(
+    def _resolve_anchor_cwd(
         self,
-        cwd_override: str | None,
         terminal_spec: TerminalEnvSpec,
         ctx: ToolContext,
     ) -> str | None:
         """
-        Apply the §4.6 cwd-resolution precedence.
+        Resolve the trusted containment *anchor* cwd for a launch.
 
-        Order (first match wins):
-        1. ``cwd_override`` from the LLM (already vetted against
-           ``allow_cwd_override`` by the caller).
-        2. The terminal's own ``os_env.cwd`` if the terminal spec
+        This is the directory the terminal is anchored to and the
+        root that an LLM-supplied ``cwd`` override is contained
+        within. It is resolved **without** the override on purpose:
+        the override must never become its own anchor, or the inner
+        containment guard
+        (:func:`omnigent.inner.terminal.build_terminal_os_env_spec`)
+        would compare it against itself — ``relative_to`` always
+        passes — and accept ANY path (``/``, ``~/.ssh``, ``/etc``).
+        That is a sandbox escape for placeholder-cwd terminals
+        (``os_env.cwd: "."`` + ``allow_cwd_override: true``). The
+        override instead flows separately as the registry's
+        ``cwd_override``, where the guard validates it against this
+        anchor.
+
+        Precedence (first match wins):
+        1. The terminal's own ``os_env.cwd`` if the terminal spec
            declares a meaningful cwd (not ``None``, ``""``,
            ``"."``, or ``"./"``).
-        3. ``spec.os_env.cwd`` if it's set to a meaningful path
+        2. ``spec.os_env.cwd`` if it's set to a meaningful path
            (not ``None``, ``""``, ``"."``, or ``"./"``).
-        4. ``ctx.workspace`` — the per-task workspace Omnigent creates
-           in ``runtime/workflow.py``.
+        3. ``ctx.workspace`` — the per-task workspace Omnigent creates
+           in ``runtime/workflow.py`` (the trusted root).
 
-        :param cwd_override: Per-call override (or ``None``).
         :param terminal_spec: The :class:`TerminalEnvSpec`.
         :param ctx: Tool context with the per-task workspace.
-        :returns: The resolved cwd as a string, or ``None`` if no
-            tier matched (caller falls back to host cwd, mirroring
+        :returns: The resolved anchor cwd as a string, or ``None`` if
+            no tier matched (caller falls back to host cwd, mirroring
             legacy behavior).
         """
-        if cwd_override is not None:
-            return cwd_override
         terminal_os_env = getattr(terminal_spec, "os_env", None)
         # ``os_env`` on a TerminalEnvSpec may be the literal string
         # ``"inherit"`` (legacy sentinel for "use parent's"). That

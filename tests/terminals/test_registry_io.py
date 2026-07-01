@@ -157,7 +157,7 @@ async def test_launched_shell_starts_in_spec_cwd(
 ) -> None:
     """``pwd`` in a freshly launched shell reports the spec's cwd.
 
-    The behavioral half of ``_resolve_cwd``'s precedence logic, which is
+    The behavioral half of ``_resolve_anchor_cwd``'s precedence logic, which is
     unit-tested in isolation but never proven against a live shell.
     """
     instance = await reg.launch("conv_a", "bash", "s1", _bash_spec(tmp_path))
