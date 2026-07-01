@@ -1,4 +1,4 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useQuery, useQueries, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 
 /**
@@ -183,6 +183,17 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   }));
 }
 
+function childSessionsQueryOptions(sessionId: string, pollMs?: number | null) {
+  return {
+    queryKey: childSessionsQueryKey(sessionId),
+    queryFn: () => fetchChildSessions(sessionId),
+    staleTime: 60_000,
+    retry: false as const,
+    refetchOnMount: false as const,
+    refetchInterval: pollMs ?? (false as const),
+  };
+}
+
 /**
  * Live child-session list for a conversation, served by
  * ``GET /v1/sessions/{id}/child_sessions``.
@@ -198,11 +209,14 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
  *     tab is backgrounded). The execution-logs panel passes a value
  *     here so the dropdown updates when new sub-agents spawn;
  *     callers that just need a snapshot (the rail card) can omit it.
+ * :param includeDescendants: Walk the bounded tree for badge totals.
  */
 export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
+  includeDescendants = false,
 ): UseChildSessionsResult {
+  const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({
     queryKey:
       conversationId === null
@@ -215,8 +229,46 @@ export function useChildSessions(
     refetchOnMount: false,
     refetchInterval: pollMs ?? false,
   });
+  const children = data ?? [];
+  const seenParents = new Set<string>();
+  const queryParentIds: string[] = [];
+  let frontier = children;
+  if (includeDescendants) {
+    for (let depth = 1; depth < MAX_TREE_DEPTH; depth++) {
+      const next: ChildSessionInfo[] = [];
+      for (const child of frontier) {
+        if (seenParents.has(child.id)) continue;
+        seenParents.add(child.id);
+        queryParentIds.push(child.id);
+        next.push(
+          ...(queryClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(child.id)) ?? []),
+        );
+      }
+      frontier = next;
+    }
+  }
+  const descendantQueries = useQueries({
+    queries: queryParentIds.map((id) => childSessionsQueryOptions(id, pollMs)),
+  });
+
+  if (!includeDescendants) {
+    return {
+      children,
+      isLoading,
+      error: (error as Error | null) ?? null,
+    };
+  }
+  const seen = new Set<string | null>([conversationId]);
+  const descendants = [children, descendantQueries.flatMap((query) => query.data ?? [])]
+    .flat()
+    .filter((child) => {
+      if (seen.has(child.id)) return false;
+      seen.add(child.id);
+      return true;
+    });
+
   return {
-    children: data ?? [],
+    children: descendants,
     isLoading,
     error: (error as Error | null) ?? null,
   };
