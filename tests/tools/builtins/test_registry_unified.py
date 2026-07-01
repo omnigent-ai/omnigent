@@ -121,7 +121,6 @@ def test_builtin_names_size_matches_registry() -> None:
                 "search_conversations",
                 "export_agent",
                 "create_loop",
-                "create_monitor",
                 "list_schedules",
                 "delete_schedule",
                 # Framework-owned (need runtime context, not
