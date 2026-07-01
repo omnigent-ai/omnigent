@@ -14,6 +14,7 @@ from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
 from omnigent.runtime.policies.builder import (
+    _load_default_policy_specs,
     _load_session_policy_specs,
     _stored_policy_to_spec,
     build_policy_engine,
@@ -160,6 +161,55 @@ def test_load_session_policy_specs_rejects_enabled_url(db_uri: str) -> None:
     assert excinfo.value.code == ErrorCode.INVALID_INPUT
 
 
+# ── _load_default_policy_specs ──────────────────────────────────────────────
+
+
+def test_load_default_policy_specs_filters_disabled(db_uri: str) -> None:
+    """Disabled default policies are excluded from the loaded specs.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="pol_enabled",
+        name="enabled_default",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    store.create_default(
+        policy_id="pol_disabled",
+        name="disabled_default",
+        type="python",
+        handler="myorg.policies.deny_all",
+        enabled=False,
+    )
+
+    specs = _load_default_policy_specs(store)
+
+    assert len(specs) == 1
+    assert specs[0].name == "enabled_default"
+
+
+def test_load_default_policy_specs_rejects_enabled_url(db_uri: str) -> None:
+    """An enabled url-type default policy raises at load time.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="pol_url",
+        name="external_default",
+        type="url",
+        handler="https://example.com/eval",
+        enabled=True,
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        _load_default_policy_specs(store)
+    assert excinfo.value.code == ErrorCode.INVALID_INPUT
+
+
 # ── build_policy_engine integration ─────────────────────────────────────────
 
 
@@ -280,6 +330,43 @@ def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
         "session_policy",
         "agent_policy",
         "admin_policy",
+        "__ask_on_add_policy",
+    ]
+
+
+def test_build_engine_includes_persisted_default_policies(db_uri: str) -> None:
+    """Default policies created through the store join the admin layer.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create_default(
+        policy_id="pol_default",
+        name="persisted_admin_policy",
+        type="python",
+        handler=handler,
+    )
+    policy_store.create_default(
+        policy_id="pol_disabled_default",
+        name="disabled_admin_policy",
+        type="python",
+        handler=handler,
+        enabled=False,
+    )
+
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+
+    names = [p.spec.name for p in engine.policies]
+    assert names == [
+        "persisted_admin_policy",
         "__ask_on_add_policy",
     ]
 

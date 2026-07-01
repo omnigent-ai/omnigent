@@ -39,6 +39,32 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Runtime policies
+
+The Docker stack uses the same policy store as the rest of the server.
+On startup the entrypoint reads `DATABASE_URL`, runs Alembic
+`upgrade head`, and wires `SqlAlchemyPolicyStore` into the runtime and
+API app. There is no separate policy-store environment variable; policy
+rows follow the same database backup and volume lifecycle as sessions,
+agents, and files.
+
+Policy configuration is API-backed. `config.yaml` (`/data/config.yaml`
+by default, or `OMNIGENT_CONFIG`) can register `policy_modules` so
+custom handlers appear in the registry, but global and session policy
+assignments live in Postgres:
+
+- `POST /v1/policies` creates server-wide defaults that apply to every
+  session.
+- `POST /v1/sessions/{session_id}/policies` creates policies scoped to
+  one session.
+
+Enabled session policies run before agent policies. Server-wide admin
+defaults from `/v1/policies` run after agent policies. If migrations
+fail, the container exits before serving traffic.
+
+For the local Docker policy-store smoke test, use
+[`SKILL.md`](SKILL.md#runtime-policies).
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.

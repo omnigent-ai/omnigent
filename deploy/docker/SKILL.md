@@ -43,7 +43,7 @@ Server is on http://localhost:8000.
 |---|---|
 | `Dockerfile` | Multi-stage build with two final targets. `web-builder` (node:20) runs `npm install && npm run build` on `web/`. `builder` (python:3.12) installs omnigent into `/opt/venv`; `server-builder` overlays the SPA bundle from `web-builder` and adds psycopg. The default target (`runtime`) copies the venv + `/build/` from `server-builder` and runs `entrypoint.py`. `--target host` builds the host image instead (from `builder`: omnigent + git/tmux, no SPA/psycopg/entrypoint). |
 | `Dockerfile.dockerignore` | BuildKit-aware exclude. Trims `deploy/databricks/`, `deploy/aws/`, tests, dev tooling — keeps the build context small. |
-| `entrypoint.py` | Server process entrypoint. Reads `DATABASE_URL`, runs Alembic migrations, builds the SQLAlchemy stores, calls `create_app()`, runs uvicorn. Single source of truth for what env vars the container respects. |
+| `entrypoint.py` | Server process entrypoint. Reads `DATABASE_URL`, runs Alembic migrations, builds the SQLAlchemy stores including the policy store, calls `create_app()`, runs uvicorn. Single source of truth for what env vars the container respects. |
 | `docker-compose.yaml` | Two services: `postgres` (16-alpine, persistent volume) and `omnigent` (built from the Dockerfile, depends on postgres healthcheck). Build context is `../..` (repo root). |
 | `.env.example` | Documents every env var the compose file passes through: `POSTGRES_PASSWORD`, `OMNIGENT_PORT`, all the `OMNIGENT_AUTH_*` and `OMNIGENT_OIDC_*` vars. |
 | `README.md` | Customer-facing quickstart + the OIDC walkthrough (GitHub OAuth, Google Workspace, generic OIDC). |
@@ -64,6 +64,86 @@ If you change it in `.env`, you need `docker compose down -v` before
 `up -d` or the server will fail to authenticate against the existing
 cluster.
 
+## Runtime policies
+
+This is the canonical Docker policy-store verification section; keep
+the README operator-facing and `config.yaml.example` focused on config
+keys.
+
+Behavior to preserve:
+
+- `DATABASE_URL` selects the policy store database. There is no
+  policy-store-specific environment variable.
+- `main()` runs Alembic `upgrade head` before `build_app()` constructs
+  `SqlAlchemyPolicyStore`.
+- `build_app()` passes the same policy store to runtime initialization
+  and `create_app()`.
+- `config.yaml` can register `policy_modules` so API-created Python
+  policies can reference custom handlers through the registry allowlist.
+- Persisted defaults created through `/v1/policies` join the admin
+  policy layer for every session; session-scoped policies from
+  `/v1/sessions/{session_id}/policies` run before agent and admin
+  policies.
+
+Completion criteria for a Docker policy-store change:
+
+- `/health` returns success after `docker compose up -d --build`.
+- `/openapi.json` includes default and session policy routes.
+- A default policy created through `/v1/policies` can be listed,
+  enforced through `/v1/sessions/{session_id}/policies/evaluate`, and
+  still exists after `docker compose restart omnigent`.
+- A session-scoped policy created through
+  `/v1/sessions/{session_id}/policies` can be listed for that session.
+- The `policies` table exists in the compose Postgres database.
+
+Local smoke test:
+
+```bash
+cd deploy/docker
+./bootstrap.sh
+OMNIGENT_AUTH_ENABLED=0 docker compose down -v
+OMNIGENT_AUTH_ENABLED=0 docker compose up -d --build
+curl -fsS http://localhost:8000/health
+curl -fsS http://localhost:8000/openapi.json \
+  | jq -r '.paths | keys[] | select(test("polic"))'
+
+docker compose exec -T postgres sh -lc \
+'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+INSERT INTO users (id, is_admin) VALUES ('\''local'\'', true)
+ON CONFLICT (id) DO UPDATE SET is_admin = true;
+"'
+
+BASE=http://localhost:8000
+DEFAULT_HANDLER=omnigent.policies.builtins.safety.max_tool_calls_per_session
+SESSION_HANDLER=omnigent.policies.builtins.safety.ask_on_os_tools
+
+curl -fsS -X POST "$BASE/v1/policies" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"local_default_limit\",\"type\":\"python\",\"handler\":\"$DEFAULT_HANDLER\",\"factory_params\":{\"limit\":0}}"
+curl -fsS "$BASE/v1/policies" | jq '.data'
+
+AGENT_ID=$(curl -fsS "$BASE/v1/agents" | jq -r '.data[0].id // empty')
+test -n "$AGENT_ID"
+SESSION_ID=$(curl -fsS -X POST "$BASE/v1/sessions" \
+  -H 'content-type: application/json' \
+  -d "{\"agent_id\":\"$AGENT_ID\",\"title\":\"policy crud smoke\"}" \
+  | jq -r '.id')
+curl -fsS -X POST "$BASE/v1/sessions/$SESSION_ID/policies" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"local_session_policy\",\"type\":\"python\",\"handler\":\"$SESSION_HANDLER\"}"
+curl -fsS "$BASE/v1/sessions/$SESSION_ID/policies" | jq '.data'
+
+curl -fsS -X POST "$BASE/v1/sessions/$SESSION_ID/policies/evaluate" \
+  -H 'content-type: application/json' \
+  -d '{"event":{"type":"PHASE_TOOL_CALL","target":"","data":{"name":"Bash","arguments":{}},"context":{}}}' \
+  | jq -e '.result == "POLICY_ACTION_DENY"'
+
+docker compose restart omnigent
+curl -fsS "$BASE/v1/policies" | jq '.data'
+docker compose exec -T postgres sh -lc \
+'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\d+ policies"'
+```
+
 ## Common debugging
 
 | Symptom | Likely cause | First check |
@@ -71,6 +151,7 @@ cluster.
 | Root URL returns `{"service":"omnigent",…}` instead of the SPA | npm build didn't produce the bundle inside the container | `docker compose exec omnigent ls /build/omnigent/server/static/web-ui/` — empty = the `web-builder` stage didn't run cleanly. Rebuild with `--no-cache`. |
 | `ModuleNotFoundError: No module named 'uvicorn'` at startup | venv copy didn't pick up the install | Sanity-check the Dockerfile's `VIRTUAL_ENV=/opt/venv` is set before the `uv pip install` calls. |
 | `psycopg.OperationalError: password authentication failed` | `POSTGRES_PASSWORD` changed in `.env` after the data volume was initialized | `docker compose down -v` then `up -d` (wipes the DB). |
+| `/v1/policies` is missing from OpenAPI | App was built without a policy store | Check that `entrypoint.py` passes `policy_store` to both `init_runtime()` and `create_app()`. |
 | Web UI loads but new chats hang forever | Expected — runners are external. The UI's landing page prints the CLI command to launch a runner. |
 
 ## Extending to a new platform

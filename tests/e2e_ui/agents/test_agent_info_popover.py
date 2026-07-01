@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import sys
+import uuid
 from pathlib import Path
 
 import httpx
@@ -33,6 +34,8 @@ _COMPOSER = "Ask the agent anything…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ECHO_MCP_SERVER = _REPO_ROOT / "tests" / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
+_GLOBAL_POLICY_HANDLER = "omnigent.policies.builtins.safety.max_tool_calls_per_session"
+_SESSION_POLICY_HANDLER = "omnigent.policies.builtins.safety.ask_on_os_tools"
 
 
 def _callable_registry_policy(base_url: str) -> dict:
@@ -79,6 +82,11 @@ def _session_policies(base_url: str, session_id: str) -> list[dict]:
 def _user_policy_names(base_url: str, session_id: str) -> set[str]:
     """Names of user-attached (``source == "session"``) policies on the session."""
     return {p["name"] for p in _session_policies(base_url, session_id) if p["source"] == "session"}
+
+
+def _policy_names_by_source(base_url: str, session_id: str, source: str) -> set[str]:
+    """Names of policy rows with the requested source."""
+    return {p["name"] for p in _session_policies(base_url, session_id) if p["source"] == source}
 
 
 def _user_policy_by_name(base_url: str, session_id: str, name: str) -> dict | None:
@@ -182,6 +190,70 @@ def test_agent_info_policy_add_and_remove(
     # Re-open the popover: the section is empty again.
     _open_popover(page)
     expect(page.get_by_text("No policies added")).to_be_visible(timeout=15_000)
+
+
+def test_agent_info_global_default_policy_is_read_only(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """AgentInfo shows global defaults as read-only and keeps session Remove."""
+    base_url, session_id = seeded_session
+    suffix = uuid.uuid4().hex[:8]
+    global_name = f"e2e_global_default_{suffix}"
+    session_name = f"e2e_session_policy_{suffix}"
+    default_policy_id: str | None = None
+    session_policy_id: str | None = None
+
+    try:
+        default_resp = httpx.post(
+            f"{base_url}/v1/policies",
+            json={
+                "name": global_name,
+                "type": "python",
+                "handler": _GLOBAL_POLICY_HANDLER,
+                "factory_params": {"limit": 100},
+            },
+            timeout=10.0,
+        )
+        default_resp.raise_for_status()
+        default_policy_id = default_resp.json()["id"]
+
+        session_resp = httpx.post(
+            f"{base_url}/v1/sessions/{session_id}/policies",
+            json={
+                "name": session_name,
+                "type": "python",
+                "handler": _SESSION_POLICY_HANDLER,
+            },
+            timeout=10.0,
+        )
+        session_resp.raise_for_status()
+        session_policy_id = session_resp.json()["id"]
+
+        _wait_for(lambda: global_name in _policy_names_by_source(base_url, session_id, "admin"))
+        _wait_for(lambda: session_name in _user_policy_names(base_url, session_id))
+
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+        _open_popover(page)
+
+        global_pill = page.get_by_role("button").filter(has_text=global_name).first
+        session_pill = page.get_by_role("button").filter(has_text=session_name).first
+        expect(global_pill).to_be_visible(timeout=15_000)
+        expect(global_pill).to_contain_text("global")
+        expect(session_pill).to_be_visible(timeout=15_000)
+
+        global_pill.click()
+        expect(page.get_by_text("Global default policy.")).to_be_visible(timeout=15_000)
+        expect(page.get_by_role("button", name="Remove")).to_have_count(0)
+    finally:
+        if session_policy_id is not None:
+            httpx.delete(
+                f"{base_url}/v1/sessions/{session_id}/policies/{session_policy_id}",
+                timeout=10.0,
+            )
+        if default_policy_id is not None:
+            httpx.delete(f"{base_url}/v1/policies/{default_policy_id}", timeout=10.0)
 
 
 def test_agent_info_policy_integer_params_validate_and_submit(

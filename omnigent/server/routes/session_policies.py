@@ -3,9 +3,11 @@
 Session policies are managed via
 ``POST/GET/PATCH/DELETE /v1/sessions/{session_id}/policies[/{policy_id}]``.
 
-The List endpoint merges store-persisted (``source="session"``) and
-spec-declared (``source="spec"``) policies so the UI shows a unified
-view. Spec policies have ``id=None`` and cannot be patched or deleted.
+The List endpoint merges store-persisted session policies
+(``source="session"``) with server-wide defaults (``source="admin"``)
+so the UI shows a unified view of policies that can affect the
+session. Admin policies cannot be patched or deleted through the
+session-scoped endpoints.
 """
 
 from __future__ import annotations
@@ -61,6 +63,35 @@ def _entity_to_response(policy: Policy) -> dict[str, Any]:
         "handler": policy.handler,
         "enabled": policy.enabled,
         "source": "session",
+        "created_at": policy.created_at,
+        "updated_at": policy.updated_at,
+    }
+    if policy.factory_params is not None:
+        result["factory_params"] = policy.factory_params
+    return result
+
+
+def _default_entity_to_response(policy: Policy) -> dict[str, Any]:
+    """Convert a default-policy entity to a session policy response dict.
+
+    :param policy: Default policy entity (``session_id is None``).
+    :returns: Dict matching :class:`SessionPolicyObject` shape with
+        ``source="admin"`` so clients can render it read-only.
+    """
+    description = None
+    if policy.handler:
+        entry = get_entry(policy.handler)
+        description = entry.description if entry else policy.handler
+
+    result: dict[str, Any] = {
+        "id": policy.id,
+        "object": "session.policy",
+        "name": policy.name,
+        "type": policy.type,
+        "handler": policy.handler,
+        "enabled": policy.enabled,
+        "source": "admin",
+        "description": description,
         "created_at": policy.created_at,
         "updated_at": policy.updated_at,
     }
@@ -237,10 +268,11 @@ def create_session_policies_router(
         # Admin (server-wide) policies from the --config YAML.
         admin_specs = get_caps().default_policies
         admin_data = [_spec_to_response(s, "admin") for s in admin_specs]
+        default_data = [_default_entity_to_response(p) for p in store.list_defaults() if p.enabled]
         # Session policies from the store.
         session_policies = store.list_for_session(session_id)
         session_data = [_entity_to_response(p) for p in session_policies]
-        return {"object": "list", "data": admin_data + session_data}
+        return {"object": "list", "data": admin_data + default_data + session_data}
 
     @router.get("/sessions/{session_id}/policies/{policy_id}")
     async def get_policy(

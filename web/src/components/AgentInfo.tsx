@@ -984,7 +984,7 @@ function McpServersSection({
 }
 
 // ---------------------------------------------------------------------------
-// Session policies section (user-editable only)
+// Session policies section (session-editable + global read-only)
 // ---------------------------------------------------------------------------
 
 function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
@@ -993,7 +993,9 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
   const deletePolicy = useDeletePolicy(sessionId);
   const [addOpen, setAddOpen] = useState(false);
 
-  const userPolicies = sessionPolicies.filter((p) => p.source === "session");
+  const visiblePolicies = sessionPolicies.filter(
+    (p) => p.source === "session" || p.source === "admin",
+  );
   const registryByHandler = new Map(registry.map((r) => [r.handler, r]));
   const appliedHandlers = new Set(
     sessionPolicies.map((p) => p.handler).filter((h): h is string => h != null),
@@ -1012,12 +1014,13 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
           <PlusIcon className="size-3 text-muted-foreground" />
         </button>
       </div>
-      {userPolicies.length > 0 ? (
+      {visiblePolicies.length > 0 ? (
         <div className="flex flex-wrap gap-1">
-          {userPolicies.map((p) => {
+          {visiblePolicies.map((p) => {
             const description =
               p.description ??
               (p.handler ? registryByHandler.get(p.handler)?.description : undefined);
+            const isGlobal = p.source === "admin";
             return (
               <Popover key={p.id ?? p.name}>
                 <PopoverTrigger asChild>
@@ -1028,6 +1031,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                   >
                     <ShieldCheckIcon className="size-2.5 shrink-0" />
                     {p.name}
+                    {isGlobal && <span className="ml-0.5 font-sans text-[9px]">global</span>}
                   </button>
                 </PopoverTrigger>
                 <PopoverContent
@@ -1044,14 +1048,18 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                     {description && (
                       <p className="break-words text-xs text-muted-foreground">{description}</p>
                     )}
-                    <button
-                      type="button"
-                      onClick={() => p.id && deletePolicy.mutate(p.id)}
-                      className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
-                    >
-                      <TrashIcon className="size-3" />
-                      Remove
-                    </button>
+                    {isGlobal ? (
+                      <p className="text-[11px] text-muted-foreground">Global default policy.</p>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => p.id && deletePolicy.mutate(p.id)}
+                        className="flex items-center gap-1 self-end rounded px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                      >
+                        <TrashIcon className="size-3" />
+                        Remove
+                      </button>
+                    )}
                   </div>
                 </PopoverContent>
               </Popover>

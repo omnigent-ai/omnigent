@@ -476,12 +476,33 @@ describe("SessionPoliciesSection", () => {
     registryData.current = [];
   });
 
-  it("shows the empty state when no user policies are applied", () => {
-    // WHY: only `source === "session"` policies are user-managed; a spec
-    // policy must not count, so the section reads "No policies added".
+  it("shows the empty state when no session or global policies are applied", () => {
+    // WHY: spec policies are already shown with the agent definition; this
+    // section is for session-editable policies and global defaults.
     policiesData.current = [{ id: "p_spec", name: "spec_one", handler: "h.spec", source: "spec" }];
     renderContent("conv_pol");
     expect(screen.getByText("No policies added")).toBeInTheDocument();
+  });
+
+  it("lists global default policies as read-only pills", () => {
+    // WHY: DB-backed defaults from /v1/policies are enforced for every
+    // session, so the session policy surface must show them even though they
+    // cannot be removed through the session-scoped endpoint.
+    policiesData.current = [
+      {
+        id: "p_admin",
+        name: "global_default",
+        handler: "guard.global",
+        source: "admin",
+        description: "Applies to all sessions.",
+      },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByRole("button", { name: /global_default/ }));
+    expect(screen.getByText("Global default policy.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Remove/ })).toBeNull();
+    expect(deleteMutate).not.toHaveBeenCalled();
   });
 
   it("lists user policies and deletes one via the popover Remove button", () => {

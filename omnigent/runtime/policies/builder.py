@@ -239,11 +239,13 @@ def build_policy_engine(
     snapshot.
 
     Policy run order: session policies (from the CRUD API)
-    first, then agent spec policies, then *default_policies*
-    (server-wide admin policies). This lets user-configured
-    session policies short-circuit on DENY before agent or
-    admin policies run, and gives admin policies the last
-    word on ALLOW/ASK decisions.
+    first, then agent spec policies, then server-wide admin
+    policies. Admin policies include *default_policies* (parsed
+    from server YAML) plus persisted default policies from
+    ``policy_store.list_defaults()``. This lets user-configured
+    session policies short-circuit on DENY before agent or admin
+    policies run, and gives admin policies the last word on
+    ALLOW/ASK decisions.
 
     For sub-agent conversations, session policies from the
     root (top-level) conversation are inherited and prepended
@@ -266,7 +268,9 @@ def build_policy_engine(
     :param default_policies: Server-wide policies appended after
         per-agent policies. Sourced from ``RuntimeCaps.default_policies``
         (parsed from the server ``--config`` YAML at startup).
-        ``None`` and ``[]`` both mean no server-wide policies.
+        Persisted default policies from ``policy_store`` are
+        appended after these YAML policies. ``None`` and ``[]`` both
+        mean no YAML-defined server-wide policies.
     :param policy_store: Session-scoped policy store. When
         provided, enabled policies for ``conversation_id`` are
         loaded and inserted between agent and admin policies in
@@ -306,6 +310,7 @@ def build_policy_engine(
         root_policy_specs = [p for p in root_policy_specs if p.name not in child_names]
         session_policy_specs = root_policy_specs + session_policy_specs
     admin_policy_specs: list[PolicySpec] = list(default_policies or [])
+    admin_policy_specs.extend(_load_default_policy_specs(policy_store))
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
     # Always require user approval before sys_add_policy executes.
@@ -951,6 +956,34 @@ def _load_session_policy_specs(
     return specs
 
 
+def _load_default_policy_specs(
+    policy_store: PolicyStore | None,
+) -> list[PolicySpec]:
+    """
+    Load enabled server-wide default policies from the store.
+
+    These are the mutable admin policies managed by
+    ``POST /v1/policies``. They share the admin layer with YAML
+    ``RuntimeCaps.default_policies`` and are evaluated for every
+    session.
+
+    :param policy_store: The policy store. ``None`` returns an
+        empty list.
+    :returns: List of :class:`FunctionPolicySpec` for enabled
+        default policies, in ``created_at ASC`` order.
+    :raises OmnigentError: If an enabled policy has an unsupported
+        ``type`` (e.g. ``type="url"``).
+    """
+    if policy_store is None:
+        return []
+    specs: list[PolicySpec] = []
+    for policy in policy_store.list_defaults():
+        if not policy.enabled:
+            continue
+        specs.append(_stored_policy_to_spec(policy))
+    return specs
+
+
 def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
     """
     Convert a stored :class:`Policy` entity to a
@@ -987,7 +1020,7 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
     # Reject loudly and fail closed: a stored policy that silently never
     # enforces is worse than a visible failure the operator can act on.
     raise OmnigentError(
-        f"Session policy {policy.name!r} (id {policy.id!r}) has unsupported "
+        f"Stored policy {policy.name!r} (id {policy.id!r}) has unsupported "
         f"type {policy.type!r}; only type='python' policies can be evaluated "
         f"today. URL policy evaluation is a future extension. Remove or "
         f"disable this policy, since storing it does not enforce anything.",

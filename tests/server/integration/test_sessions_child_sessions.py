@@ -1362,7 +1362,6 @@ async def test_subagent_create_ignores_caller_supplied_launch_args(
 )
 async def test_native_subagent_message_uses_native_terminal_forward(
     client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
     harness: str,
     expected_wrapper: str,
     expected_model: str,
@@ -1379,7 +1378,6 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     writer for conversation items.
 
     :param client: Test HTTP client.
-    :param monkeypatch: Pytest monkeypatch fixture.
     :param harness: Native harness declared by the sub-agent spec,
         e.g. ``"claude-native"``.
     :param expected_wrapper: Wrapper label expected on the child row,
@@ -1443,7 +1441,8 @@ async def test_native_subagent_message_uses_native_terminal_forward(
         del session_id, runner_router
         return fake_runner
 
-    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    original_get_runner_client = sessions_module._get_runner_client
+    sessions_module._get_runner_client = _fake_get_runner_client
     try:
         message_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
@@ -1456,6 +1455,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
             },
         )
     finally:
+        sessions_module._get_runner_client = original_get_runner_client
         await fake_runner.aclose()
 
     assert message_resp.status_code == 202, message_resp.text

@@ -289,9 +289,10 @@ class SessionPolicyObject(BaseModel):
         callables and ``type="url"`` handlers.
     :param enabled: Whether the engine consults this policy.
     :param source: Origin of the policy: ``"session"`` for
-        CRUD-created policies, ``"spec"`` for policies
-        declared in the agent YAML. Spec policies cannot be
-        patched or deleted.
+        CRUD-created session policies, ``"admin"`` for server-wide
+        defaults, ``"spec"`` for policies declared in the agent YAML.
+        Non-session policies cannot be patched or deleted through the
+        session-scoped endpoints.
     :param created_at: Unix epoch timestamp of creation.
     :param updated_at: Unix epoch timestamp of the last
         update, or ``None`` if never updated.
