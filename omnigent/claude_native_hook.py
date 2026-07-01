@@ -86,6 +86,29 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env override, ignoring a malformed value.
+
+    Float sibling of :func:`_env_int`; a bad value logs and falls back to
+    *default* rather than crashing the hook at import time.
+
+    :param name: Environment variable name.
+    :param default: Value used when unset or unparseable.
+    :returns: The parsed float, or *default*.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(
+            f"omnigent hook: ignoring non-numeric {name}={raw!r}; using {default}",
+            file=sys.stderr,
+        )
+        return default
+
+
 # Cap on CONSECUTIVE HARD failures before the reattach loop gives up and lets
 # the caller fail-ask. A "hard failure" is the server being sick or unreachable
 # (5xx, or a connection that never established) — i.e. the #1782 spin. It is
@@ -111,8 +134,13 @@ _NEVER_CONNECTED_ERRORS = (
 # a flapping/crash-looping server (a hard failure), NOT a genuinely-parked poll
 # a proxy severed. Comfortably below any real idle-proxy timeout (typically
 # 30-60s+) but above an instant accept-then-reset crash drop, so it tells a
-# legitimate long-poll sever from a tight establish-drop spin.
-_PERMISSION_HELD_POLL_FLOOR_S = 10.0
+# legitimate long-poll sever from a tight establish-drop spin. Operators behind
+# an unusually aggressive proxy/LB whose idle timeout is under 10s can lower
+# this via OMNIGENT_HOOK_HELD_POLL_FLOOR_S so their legitimate slow-human severs
+# stay classified as held polls (not flaps) and are never capped; the default
+# suits typical proxies. Floored at 0 (a negative would make every sever a
+# held poll, disabling flap detection).
+_PERMISSION_HELD_POLL_FLOOR_S = max(0.0, _env_float("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", 10.0))
 # Fail-fast budget for the synchronous ``/clear`` and ``/fork`` session
 # rotations that run inside the SessionStart hook to gate Claude's
 # welcome banner. Unlike the permission long-poll these are quick

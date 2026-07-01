@@ -2286,6 +2286,34 @@ def test_reattach_fast_flapping_connection_is_hard_failure(
     )
 
 
+def test_held_poll_floor_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_HOOK_HELD_POLL_FLOOR_S`` tunes the flap-vs-held boundary.
+
+    Operators behind an aggressive proxy whose idle timeout is under the 10s
+    default can lower the floor so their legitimate slow-human severs stay
+    classified as held polls (reset), not flaps (counted) — closing the one
+    narrow human-capping edge. A malformed value falls back to the default.
+    """
+    import importlib
+
+    monkeypatch.setenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", "3.5")
+    reloaded = importlib.reload(claude_native_hook)
+    try:
+        assert reloaded._PERMISSION_HELD_POLL_FLOOR_S == 3.5
+    finally:
+        monkeypatch.delenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", raising=False)
+        importlib.reload(claude_native_hook)
+
+    # A malformed override must not crash the hook — falls back to the default.
+    monkeypatch.setenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", "not-a-number")
+    reloaded = importlib.reload(claude_native_hook)
+    try:
+        assert reloaded._PERMISSION_HELD_POLL_FLOOR_S == 10.0
+    finally:
+        monkeypatch.delenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", raising=False)
+        importlib.reload(claude_native_hook)
+
+
 def test_reattach_never_resolving_severs_are_bounded_by_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
