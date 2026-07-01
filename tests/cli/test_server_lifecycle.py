@@ -11,7 +11,7 @@ from click import ClickException
 from click.testing import CliRunner
 
 from omnigent.cli import _HostDaemonRecord, _SessionPagesResult, cli
-from omnigent.host.local_server import LocalServerInfo, LocalServerStartup
+from omnigent.host.local_server import _DEFAULT_LOCAL_PORT, LocalServerInfo, LocalServerStartup
 
 
 def _record(
@@ -379,3 +379,125 @@ def test_server_stop_finds_untracked_orphan_when_pidfile_lost(
 
     assert result.exit_code == 0, result.output
     assert "Stopped the background server." in result.output
+
+
+# ── foreground `server`: non-loopback + no-auth warning ─────────────
+
+
+class _StopBeforeServe(Exception):
+    """Sentinel raised by a patched ``_load_config`` to stop the foreground
+    server boot right after the bind/auth warning decision, before any real
+    server setup (no stores, no uvicorn bind)."""
+
+
+def _stop_after_auth_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Short-circuit the foreground ``omnigent server`` boot.
+
+    ``_load_config`` is the first heavy step after the bind/auth warning
+    block, so raising there lets the warning (if any) be emitted while
+    stopping before stores are built or a socket is bound.
+    """
+
+    def _raise(_path: str | None) -> dict[str, object]:
+        raise _StopBeforeServe
+
+    monkeypatch.setattr("omnigent.cli._load_config", _raise)
+
+
+def _clear_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset every auth-related env var to a known-unset baseline.
+
+    ``monkeypatch.delenv`` records the prior value so teardown also undoes
+    the ``OMNIGENT_LOCAL_SINGLE_USER`` that the loopback path sets via
+    ``os.environ.setdefault`` — keeping the warning tests isolated.
+    """
+    for name in (
+        "OMNIGENT_AUTH_PROVIDER",
+        "OMNIGENT_AUTH_ENABLED",
+        "OMNIGENT_ACCOUNTS_ENABLED",
+        "OMNIGENT_OIDC_ISSUER",
+        "OMNIGENT_LOCAL_SINGLE_USER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+_WARNING_MARKER = "Every request without an 'X-Forwarded-Email' header will be rejected with 401"
+
+
+def test_foreground_non_loopback_header_no_auth_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-loopback bind in header mode with no single-user fallback warns.
+
+    Header mode + no ``OMNIGENT_LOCAL_SINGLE_USER`` + a non-loopback bind
+    means every request 401s; the foreground server must say so at startup.
+    """
+    _clear_auth_env(monkeypatch)
+    _stop_after_auth_decision(monkeypatch)
+
+    result = CliRunner().invoke(cli, ["server", "--host", "0.0.0.0"])
+
+    # The boot stopped at the patched seam — i.e. we ran past the warning.
+    assert isinstance(result.exception, _StopBeforeServe), result.output
+    assert f"WARNING: binding 0.0.0.0:{_DEFAULT_LOCAL_PORT} (non-loopback)" in result.output
+    assert _WARNING_MARKER in result.output
+    # Both audiences are addressed: proxy operators and naive LAN binders.
+    assert "X-Forwarded-Email" in result.output
+    assert "OMNIGENT_AUTH_ENABLED=1" in result.output
+    # OIDC guidance requires the enable switch (issuer alone resolves to header
+    # mode and still 401s), so it must name AUTH_ENABLED alongside the issuer.
+    assert "OMNIGENT_AUTH_ENABLED=1 together with OMNIGENT_OIDC_ISSUER" in result.output
+
+
+def test_foreground_loopback_does_not_warn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A loopback bind never triggers the non-loopback auth warning.
+
+    Loopback is the single-user local posture (the fallback is auto-enabled),
+    so there is no 401 foot-gun and no warning. Stubbing a healthy server
+    makes the canonical-local path reuse it and exit cleanly.
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.host.local_server.local_server_url_if_healthy",
+        lambda: f"http://127.0.0.1:{_DEFAULT_LOCAL_PORT}",
+    )
+
+    result = CliRunner().invoke(cli, ["server", "--host", "127.0.0.1"])
+
+    assert result.exit_code == 0, result.output
+    assert "reusing it" in result.output  # took the canonical-local reuse path
+    assert "WARNING" not in result.output
+    assert "401" not in result.output
+
+
+def test_foreground_non_loopback_accounts_does_not_warn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-loopback with accounts auth (OMNIGENT_AUTH_ENABLED=1) does not warn.
+
+    Accounts mode authenticates every request, so there is no silent-401
+    foot-gun — the warning is header-mode-only.
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "1")
+    _stop_after_auth_decision(monkeypatch)
+
+    result = CliRunner().invoke(cli, ["server", "--host", "0.0.0.0"])
+
+    assert isinstance(result.exception, _StopBeforeServe), result.output
+    assert "WARNING" not in result.output
+    assert "401" not in result.output
+
+
+def test_foreground_non_loopback_oidc_does_not_warn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-loopback with OIDC configured does not warn.
+
+    An operator-supplied OIDC issuer resolves to ``oidc`` mode (not header),
+    so the warning is suppressed without ever constructing OIDC config.
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://issuer.example")
+    _stop_after_auth_decision(monkeypatch)
+
+    result = CliRunner().invoke(cli, ["server", "--host", "0.0.0.0"])
+
+    assert isinstance(result.exception, _StopBeforeServe), result.output
+    assert "WARNING" not in result.output
+    assert "401" not in result.output
