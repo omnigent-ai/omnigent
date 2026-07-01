@@ -100,7 +100,7 @@ def _extract_text(response: Any) -> str:
 def detect_task_switch(
     *,
     min_turns: int = 1,
-    history_window: int = 4,
+    history_window: int = 10,
     action: str = "ASK",
     classification_prompt: str = _DEFAULT_TASK_SWITCH_PROMPT,
 ) -> PolicyCallable:
@@ -138,7 +138,7 @@ def detect_task_switch(
         classify from the very first message.
     :param history_window: Maximum number of recent user messages kept
         in state as prior context for the classifier.  Defaults to
-        ``4``.  Older messages are dropped as the window slides.
+        ``10``.  Older messages are dropped as the window slides.
     :param action: Response when a task switch is detected.
         ``"ASK"`` (default) escalates to the user; ``"DENY"`` blocks
         the request outright.  Defaults to ``"ASK"`` because
@@ -310,7 +310,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                     "description": (
                         "Maximum number of recent user messages kept as prior "
                         "context for the classifier. Older messages are dropped "
-                        "as the window slides. Defaults to 4."
+                        "as the window slides. Defaults to 10."
                     ),
                 },
                 "action": {
