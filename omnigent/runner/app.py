@@ -17441,6 +17441,36 @@ def create_runner_app(
             content={"skills": [{"name": s.name, "description": s.description} for s in skills]},
         )
 
+    @app.get("/v1/sessions/{session_id}/models")
+    async def get_session_models(session_id: str) -> JSONResponse:
+        """
+        Return the per-worker model catalog for a session.
+
+        The Omnigent server calls this before routing a turn so the
+        intelligent model router can use live, provider-resolved model
+        lists instead of the static fallback table.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: JSON ``{"workers": {<name>: {source, verified, models,
+            note}, ...}}`` shaped like the ``sys_list_models`` payload.
+            ``"self"`` is the calling session's own harness.  Returns an
+            empty workers dict when no spec resolver is configured.
+        """
+        spec = await _resolve_session_agent_spec(session_id)
+        if spec is None:
+            return JSONResponse(status_code=200, content={"workers": {}})
+        from omnigent.model_catalog import catalog_for_spec
+
+        try:
+            catalog = await asyncio.to_thread(catalog_for_spec, spec)
+        except Exception:
+            _logger.exception(
+                "get_session_models: catalog_for_spec failed for session=%s", session_id
+            )
+            return JSONResponse(status_code=200, content={"workers": {}})
+        return JSONResponse(status_code=200, content={"workers": catalog})
+
     @app.get("/v1/sessions/{session_id}/codex-model-options")
     async def get_session_codex_model_options(session_id: str) -> JSONResponse:
         """
