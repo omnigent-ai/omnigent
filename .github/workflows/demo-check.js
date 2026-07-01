@@ -1,13 +1,12 @@
 // Scan open contributor PRs and comment when a UI / frontend change is checked
 // but no demo (screenshot / video) is provided. Runs on a schedule so it
-// catches PRs that were opened without a demo and never updated. Maintainer
-// PRs are skipped. Already-flagged PRs (labeled `needs-demo`) are skipped on
-// subsequent runs to avoid duplicate comments.
+// catches PRs that were opened without a demo and never updated. Drafts and
+// maintainer PRs are skipped. Already-flagged PRs (labeled `needs-demo`) are
+// skipped on subsequent runs to avoid duplicate comments.
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const DAYS_TO_SCAN = 14;
 const NEEDS_DEMO_LABEL = "needs-demo";
-const COMMENT_MARKER = "<!-- demo-check -->";
 
 const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
 
@@ -61,8 +60,7 @@ function extractDemoContent(body) {
     ? afterHeading.slice(0, nextHeading.index)
     : afterHeading;
   return section
-    .replace(/<!--[\s\S]*?-->/g, "")   // complete HTML comments
-    .replace(/<!--[\s\S]*/g, "")        // unclosed comment remnants
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, "")  // complete and unclosed HTML comments
     .trim();
 }
 
@@ -74,8 +72,7 @@ function hasDemoContent(body) {
 }
 
 const demoRequiredMessage = (author) =>
-  `${COMMENT_MARKER}
-@${author} This PR checks **UI / frontend change** but the **Demo** section is missing or only contains a placeholder.
+  `@${author} This PR checks **UI / frontend change** but the **Demo** section is missing or only contains a placeholder.
 
 UI changes require a screenshot or screen recording so reviewers can see the new behaviour without checking out the branch. Please update the **Demo** section with:
 
@@ -151,7 +148,7 @@ module.exports = async ({ context, github, core }) => {
     let skippedCount = 0;
 
     for (const pr of allPRs) {
-      // Skip bots, drafts, and maintainer-association PRs.
+      // Skip drafts and maintainer PRs (by association and MAINTAINER file).
       if (pr.isDraft) {
         skippedCount++;
         continue;
@@ -186,20 +183,21 @@ module.exports = async ({ context, github, core }) => {
 
       console.log(`PR #${pr.number} (@${author}): UI change checked but no demo provided`);
 
-      // Label before commenting so a comment failure leaves the PR labeled and
-      // won't be re-commented on the next run.
-      await github.rest.issues.addLabels({
-        owner,
-        repo,
-        issue_number: pr.number,
-        labels: [NEEDS_DEMO_LABEL],
-      });
-
+      // Comment before labeling: if the comment fails the PR stays unlabeled
+      // and will be retried on the next run. Labeling first would permanently
+      // suppress the reminder on a transient comment failure.
       await github.rest.issues.createComment({
         owner,
         repo,
         issue_number: pr.number,
         body: demoRequiredMessage(author),
+      });
+
+      await github.rest.issues.addLabels({
+        owner,
+        repo,
+        issue_number: pr.number,
+        labels: [NEEDS_DEMO_LABEL],
       });
 
       flaggedCount++;
