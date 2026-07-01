@@ -122,16 +122,24 @@ async: true
 cancellable: true
 
 # `os_env` registers the `sys_os_read` / `sys_os_write` / `sys_os_edit` /
-# `sys_os_shell` tools (filesystem access bundled with a shell). `sandbox:
-# type: none` runs unsandboxed so it can read the repo, and keeps the bundle
-# loadable on macOS. The `sys_os_write` / `sys_os_edit` tools come bundled and
-# cannot be unregistered, so the `read_only_os` policy below is what actually
-# holds Sentinel to report-only; it never writes fixes.
+# `sys_os_shell` tools (filesystem access bundled with a shell).
+#
+# Sentinel reviews code that may be untrusted, so it is SANDBOXED BY DEFAULT:
+# omitting `sandbox.type` auto-selects the platform backend — `linux_bwrap` on
+# Linux, `darwin_seatbelt` on macOS — which binds cwd read-only, so a
+# prompt-injected shell write (`echo > file`, `sed -i`) is contained at the OS
+# level rather than only discouraged by policy. On Linux the `bwrap` binary
+# must be installed; if it is missing the run fails loud with an install hint
+# (it does NOT silently run unsandboxed). macOS uses the built-in sandbox-exec,
+# so no install is needed.
+#
+# `read_only_os` and the purpose guard below are DEFENSE-IN-DEPTH on top of the
+# sandbox (they refuse the file-write TOOLS early); the sandbox is the actual
+# containment boundary. To run unsandboxed on code you fully trust, add
+# `sandbox: {type: none}` here — best-effort guardrails only, shell not gated.
 os_env:
   type: caller_process
   cwd: .
-  sandbox:
-    type: none
 
 # Three guardrails enforce Sentinel's contract at the policy layer, not just in
 # the prompt:

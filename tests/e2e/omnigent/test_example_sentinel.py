@@ -59,8 +59,12 @@ def test_sentinel_skills_present(sentinel_spec: AgentSpec) -> None:  # DoC-4
 def test_sentinel_has_os_env(sentinel_spec: AgentSpec) -> None:  # DoC-9
     assert sentinel_spec.os_env is not None
     assert sentinel_spec.os_env.type == "caller_process"
-    assert sentinel_spec.os_env.sandbox is not None
-    assert sentinel_spec.os_env.sandbox.type == "none"
+    # Sandboxed by default: the config omits ``sandbox`` so the runtime resolves
+    # the platform backend (linux_bwrap / darwin_seatbelt, binding cwd
+    # read-only). An unset spec-level sandbox means "use the platform default",
+    # NOT unsandboxed -- ``type: none`` is the explicit opt-out, which Sentinel
+    # deliberately does not use because it reviews untrusted code.
+    assert sentinel_spec.os_env.sandbox is None
 
 
 def test_sentinel_orchestrator_guardrails(sentinel_spec: AgentSpec) -> None:  # DoC-5
