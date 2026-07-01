@@ -440,10 +440,23 @@ def _parse_tools_config(
         return ToolsConfig()
     timeout = _parse_int_field(raw["timeout"], "tools.timeout") if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
-    builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
+    # A present-but-null key (``builtins:`` / ``agents:`` with no value) is
+    # ``None`` (not the ``.get`` default) and means "no tools": coerce it to an
+    # empty list so a blank key doesn't crash (``_parse_builtin_tools(None)``
+    # iterates ``None``) or store ``None`` into the ``list``-typed field. A
+    # present-but-non-list value is a spec error, so reject it cleanly here
+    # rather than masking it as empty or letting a raw ``TypeError`` surface
+    # deeper in.
+    raw_builtins = raw.get("builtins")
+    if raw_builtins is not None and not isinstance(raw_builtins, list):
+        raise OmnigentError("tools.builtins must be a list", code=ErrorCode.INVALID_INPUT)
+    raw_agents = raw.get("agents")
+    if raw_agents is not None and not isinstance(raw_agents, list):
+        raise OmnigentError("tools.agents must be a list", code=ErrorCode.INVALID_INPUT)
+    builtins = _parse_builtin_tools(raw_builtins or [], expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
-        agents=raw.get("agents", []),
+        agents=raw_agents or [],
         builtins=builtins,
         timeout=timeout,
         retry=retry,
