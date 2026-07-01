@@ -112,11 +112,89 @@ def test_blast_radius_gates_pi_native_bash_tool() -> None:
     assert _result(evaluate(_tool_call("bash", command="git status"), {})) == "ALLOW"
 
 
+def test_blast_radius_gates_terminal_send_channel() -> None:
+    """
+    blast_radius must gate a command typed into a terminal via
+    ``sys_terminal_send`` the same way it gates ``sys_os_shell``.
+
+    polly (and any agent with a ``terminals:`` block) registers a ``bash``
+    terminal; ``sys_terminal_send`` types its ``text`` into that shell and the
+    default ``keys: "Enter"`` runs it. Before this gate the ``text`` channel
+    was unclassified, so a destructive command routed through the terminal
+    bypassed the entire DENY/ASK guard. ``text`` must now classify identically
+    to a ``sys_os_shell`` ``command``.
+    """
+    evaluate = blast_radius()
+    # Catastrophic via the terminal channel — should DENY.
+    assert (
+        _result(evaluate(_tool_call("sys_terminal_send", text="git push --force origin main"), {}))
+        == "DENY"
+    )
+    assert _result(evaluate(_tool_call("sys_terminal_send", text="rm -rf /"), {})) == "DENY"
+    # Recoverable-but-outward via the terminal channel — should ASK.
+    push = _tool_call("sys_terminal_send", text="git push origin main")
+    assert _result(evaluate(push, {})) == "ASK"
+    # Safe via the terminal channel — should ALLOW.
+    assert _result(evaluate(_tool_call("sys_terminal_send", text="git status"), {})) == "ALLOW"
+
+
+def test_blast_radius_terminal_send_catastrophic_denies_when_pushes_ungated() -> None:
+    """
+    The catastrophic DENY tier covers the terminal channel even with
+    ``gate_pushes=False`` — the setting polly ships for its unattended ``bash``
+    terminal. Without this, polly's terminal could run ``rm -rf /`` or
+    force-push entirely ungated.
+    """
+    evaluate = blast_radius(gate_pushes=False)
+    assert _result(evaluate(_tool_call("sys_terminal_send", text="rm -rf /"), {})) == "DENY"
+    assert (
+        _result(evaluate(_tool_call("sys_terminal_send", text="git push --force origin main"), {}))
+        == "DENY"
+    )
+    # Recoverable-but-outward is dropped to ALLOW once pushes aren't gated.
+    assert (
+        _result(evaluate(_tool_call("sys_terminal_send", text="git push origin main"), {}))
+        == "ALLOW"
+    )
+
+
+def test_blast_radius_terminal_send_non_command_payloads_allow() -> None:
+    """
+    A key-only ``sys_terminal_send`` (no ``text``) carries no command to
+    classify and must ALLOW — gating kicks in only on a real command string,
+    so ordinary control keystrokes (``C-c``, ``Enter``) pass through.
+    """
+    evaluate = blast_radius()
+    assert _result(evaluate(_tool_call("sys_terminal_send", keys="C-c"), {})) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_terminal_send", keys="Enter"), {})) == "ALLOW"
+
+
+def test_blast_radius_gates_terminal_launch_command() -> None:
+    """
+    ``sys_terminal_launch`` is covered too: an ordinary launch names no
+    command (the terminal's program comes from the spec) and ALLOWs, but a
+    launch shape that bakes a destructive ``command`` is classified like any
+    other shell command rather than slipping past the gate.
+    """
+    evaluate = blast_radius()
+    # Ordinary launch — no command arg to classify → ALLOW.
+    assert (
+        _result(evaluate(_tool_call("sys_terminal_launch", terminal="bash", session="s1"), {}))
+        == "ALLOW"
+    )
+    # A baked destructive command — DENY.
+    launch_rm = _tool_call(
+        "sys_terminal_launch", terminal="bash", session="s1", command="rm -rf /"
+    )
+    assert _result(evaluate(launch_rm, {})) == "DENY"
+
+
 def test_blast_radius_ignores_non_shell_tools() -> None:
     """
-    Non-shell tool calls pass through ALLOW — blast_radius only inspects
-    ``sys_os_shell`` and ``Bash``. A failure here means the guard is matching
-    on the wrong tool and would corrupt unrelated tool dispatch.
+    Non-command tool calls pass through ALLOW — blast_radius only inspects the
+    shell / terminal command channels (:data:`_BLAST_RADIUS_COMMAND_KEY`). A
+    failure here means the guard is matching on the wrong tool and would
+    corrupt unrelated tool dispatch.
     """
     evaluate = blast_radius()
     assert _result(evaluate(_tool_call("sys_session_send", agent="impl_claude"), {})) == "ALLOW"

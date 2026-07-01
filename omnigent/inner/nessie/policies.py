@@ -343,6 +343,55 @@ def _push_severity(argv: list[str]) -> str | None:
     return "ASK"
 
 
+# Command channels blast_radius classifies, mapped to the arg key the command
+# string lives in. Two kinds of channel reach the same shell:
+#   * One-shot shell — ``sys_os_shell`` (Omnigent built-in), plus the
+#     Claude/Codex native ``Bash`` and Pi native lowercase ``bash`` tools
+#     (surfaced via the PreToolUse / tool_call hooks). All carry a ``command``.
+#   * Terminal bridge — ``sys_terminal_send`` types its ``text`` into a
+#     registered terminal (e.g. polly's ``bash`` terminal) and the default
+#     ``keys: "Enter"`` runs it, so ``text`` IS a shell command and must be
+#     gated identically. (``keys`` holds tmux key chords like ``"C-c"`` /
+#     ``"Enter"``, never a command, so it is not classified.)
+#     ``sys_terminal_launch`` carries no command in Omnigent's schema (the
+#     terminal's program comes from the spec), but a launch shape that bakes a
+#     ``command`` is classified too — ordinary launches extract nothing → ALLOW.
+# Without the terminal entries, a destructive command routed through a
+# registered terminal bypasses the DENY/ASK guard entirely.
+_BLAST_RADIUS_COMMAND_KEY: dict[str, str] = {
+    "sys_os_shell": "command",
+    "Bash": "command",
+    "bash": "command",
+    "sys_terminal_send": "text",
+    "sys_terminal_launch": "command",
+}
+_BLAST_RADIUS_TOOLS: frozenset[str] = frozenset(_BLAST_RADIUS_COMMAND_KEY)
+
+
+def _blast_radius_command(tool_name: str, args: _Json) -> str | None:
+    """
+    Return the shell command a matched tool call would run, else ``None``.
+
+    Routes each blast-radius tool to the argument key its command lives in
+    (:data:`_BLAST_RADIUS_COMMAND_KEY`) — ``command`` for the one-shot shell
+    tools and ``sys_terminal_launch``, ``text`` for ``sys_terminal_send`` (the
+    literal text typed into the terminal, run by the default ``Enter``). A
+    missing or non-string value yields ``None`` so the caller ALLOWs: there is
+    nothing for the patterns to classify (e.g. a bare ``sys_terminal_launch``
+    or a key-only ``sys_terminal_send``).
+
+    :param tool_name: The matched ``tool_call`` name, e.g.
+        ``"sys_terminal_send"``.
+    :param args: The tool's argument dict.
+    :returns: The command string to classify, or ``None``.
+    """
+    key = _BLAST_RADIUS_COMMAND_KEY.get(tool_name)
+    if key is None:
+        return None
+    value = args.get(key)
+    return value if isinstance(value, str) else None
+
+
 def blast_radius(
     *,
     gate_pushes: bool = True,
@@ -358,6 +407,13 @@ def blast_radius(
     they run. Everything else — reads, tests, edits, and local git
     (commit / merge / worktree) — is ALLOWED.
 
+    The same classification covers every command channel
+    (:data:`_BLAST_RADIUS_COMMAND_KEY`): the one-shot shell tools
+    (``sys_os_shell`` / native ``Bash`` / ``bash``) and the terminal bridge
+    (``sys_terminal_send`` ``text`` and ``sys_terminal_launch`` ``command``),
+    so a destructive command routed through a registered ``bash`` terminal is
+    gated the same as ``sys_os_shell`` rather than slipping past the guard.
+
     :param gate_pushes: When ``True`` (default), recoverable-but-outward
         commands return ASK. When ``False`` only the catastrophic DENY
         set is enforced — use only for trusted unattended batch runs.
@@ -367,27 +423,30 @@ def blast_radius(
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
-        Classify a ``sys_os_shell`` command by blast radius.
+        Classify a shell command by blast radius across all command channels.
 
-        :param event: V0 ``tool_call`` event for ``sys_os_shell``.
+        Covers the one-shot shell tools (``sys_os_shell`` / native ``Bash`` /
+        ``bash``) and the terminal bridge (``sys_terminal_send`` ``text`` /
+        ``sys_terminal_launch`` ``command``), routing each to its command via
+        :func:`_blast_radius_command` so a destructive command typed into a
+        registered terminal is gated the same as ``sys_os_shell``.
+
+        :param event: V0 ``tool_call`` event for a blast-radius tool.
         :param config: Runtime config dict (unused; bounds come from the
             factory params).
         :returns: ALLOW / ASK / DENY decision dict.
         """
-        # Match the Omnigent built-in OS shell, the Claude/Codex native
-        # Bash tool, and Pi's native lowercase ``bash``. The PreToolUse hook
-        # reports BOTH CLI harnesses' shell tool as ``Bash`` with a string
-        # ``command`` (codex normalizes to this shape); Pi's ``tool_call``
-        # hook reports ``bash`` with the same ``command`` key — so one match
-        # set covers all three.
-        args = _tool_call(event, {"sys_os_shell", "Bash", "bash"})
+        args = _tool_call(event, _BLAST_RADIUS_TOOLS)
         if args is None:
             return _ALLOW
-        command = args.get("command")
-        # A Bash / sys_os_shell call always carries a string ``command`` by
-        # contract; a non-str is a malformed payload no pattern can classify, so
-        # there is nothing to gate.
-        if not isinstance(command, str):
+        # ``_tool_call`` confirmed a tool_call event whose name is in the set,
+        # so ``data.name`` is present and selects the command-carrying arg.
+        command = _blast_radius_command(event["data"]["name"], args)
+        # A shell / terminal call normally carries a string command; a missing
+        # or non-str value (a bare ``sys_terminal_launch``, a key-only
+        # ``sys_terminal_send``, or a malformed payload) is nothing a pattern
+        # can classify, so there is nothing to gate.
+        if command is None:
             return _ALLOW
         # rm + git push are classified by flag/refspec-robust helpers (a regex
         # missed split/long rm flags, root children, and force/delete refspecs);
@@ -633,8 +692,9 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "kind": "factory",
         "name": "Block Dangerous Shell Commands (force-push, rm -rf)",
         "description": "Classifies shell commands (sys_os_shell, Claude/Codex native Bash, "
-        "and Pi native bash) as safe, risky (ASK), or catastrophic (DENY) to prevent "
-        "destructive operations like force-push or rm -rf /",
+        "Pi native bash, and the sys_terminal_send/sys_terminal_launch terminal channel) as "
+        "safe, risky (ASK), or catastrophic (DENY) to prevent destructive operations like "
+        "force-push or rm -rf /",
     },
     {
         "handler": "omnigent.inner.nessie.policies.spawn_bounds",
