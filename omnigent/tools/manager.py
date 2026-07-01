@@ -108,6 +108,7 @@ class ToolManager:
         client_tool_specs: list[ClientSideToolSpec] | None = None,
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
+        sandbox_required: bool = False,
         os_env: OSEnvironment | None = None,
     ) -> None:
         """
@@ -130,6 +131,11 @@ class ToolManager:
             ``True`` enables sandboxing when ``srt`` is on PATH.
             This is a deployment decision from ``RuntimeCaps``, not
             an agent config setting.
+        :param sandbox_required: Deployment gate to *demand* sandboxing.
+            When ``True``, local Python tools refuse to run (fail
+            closed) if sandboxing is enabled but ``srt`` is unavailable,
+            instead of silently downgrading to an unsandboxed
+            subprocess. Defaults to ``False`` (dev fail-open fallback).
         :param os_env: Pre-resolved primary OSEnvironment from the
             ``SessionResourceRegistry``. When provided, ``sys_os_*``
             tools use this shared instance instead of creating their
@@ -139,6 +145,7 @@ class ToolManager:
         self._spec = spec
         self._workdir = workdir
         self._sandbox_enabled = sandbox_enabled
+        self._sandbox_required = sandbox_required
         self._pre_resolved_os_env = os_env
         self._started = False
         self._tools: dict[str, Tool] = {}
@@ -722,6 +729,7 @@ class ToolManager:
                 srt_available=self._srt_available,
                 uv_available=self._uv_available,
                 sandbox_enabled=self._sandbox_enabled,
+                sandbox_required=self._sandbox_required,
                 agent_name=self._spec.name,
                 # Pass the names of already-registered tools (builtins
                 # at this point) so the loader can detect collisions

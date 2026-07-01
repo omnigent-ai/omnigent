@@ -52,7 +52,7 @@ from omnigent_client.tools import ToolMetadata, get_tool_metadata
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.spec.types import LocalToolInfo, SandboxConfig
 from omnigent.tools._pep723 import parse_inline_metadata
-from omnigent.tools._srt import wrap_with_srt
+from omnigent.tools._srt import SandboxUnavailableError, wrap_with_srt
 from omnigent.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
@@ -97,6 +97,9 @@ class LocalPythonTool(Tool):
     :param srt_available: Whether ``srt`` is on PATH.
     :param uv_available: Whether ``uv`` is on PATH.
     :param sandbox_enabled: Runtime policy for srt sandboxing.
+    :param sandbox_required: When ``True``, refuse to run (fail
+        closed) if sandboxing is enabled but ``srt`` is unavailable,
+        instead of silently downgrading to a plain subprocess.
     """
 
     def __init__(
@@ -108,6 +111,7 @@ class LocalPythonTool(Tool):
         srt_available: bool,
         uv_available: bool,
         sandbox_enabled: bool = True,
+        sandbox_required: bool = False,
     ) -> None:
         """
         Initialize from a discovered ``@tool`` function.
@@ -122,12 +126,18 @@ class LocalPythonTool(Tool):
         :param srt_available: Whether ``srt`` is on PATH.
         :param uv_available: Whether ``uv`` is on PATH.
         :param sandbox_enabled: Runtime policy for srt sandboxing.
+        :param sandbox_required: When ``True``, a missing ``srt`` while
+            sandboxing is enabled is fatal: :meth:`invoke` refuses to
+            run the tool with a clear error rather than spawning an
+            unsandboxed subprocess. Defaults to ``False`` (dev
+            fail-open fallback).
         """
         self._info = info
         self._metadata = metadata
         self._module_path = module_path
         self._sandbox_config = sandbox_config
         self._sandbox_enabled = sandbox_enabled
+        self._sandbox_required = sandbox_required
         self._srt_available = srt_available
         self._uv_available = uv_available
         # Live subprocesses from any in-flight ``invoke()`` — tracked
@@ -245,7 +255,14 @@ class LocalPythonTool(Tool):
         # Python process. Use the stdout protocol instead.
         srt_active = self._srt_available and self._sandbox_enabled
         use_stdout = self._sandbox_config.container_image is not None or srt_active
-        cmd = self._build_command(state_root=state_root)
+        # Fail closed: when sandboxing is required but srt is missing,
+        # _build_command raises rather than yielding an unsandboxed
+        # command. Surface it as a clear tool error instead of letting
+        # untrusted spec-author code run with full host privileges.
+        try:
+            cmd = self._build_command(state_root=state_root)
+        except SandboxUnavailableError as exc:
+            return f"Error: {exc}"
         if use_stdout:
             return self._invoke_stdout(cmd, request, workspace=ctx.workspace)
         return self._invoke_subprocess(cmd, request, workspace=ctx.workspace)
@@ -386,6 +403,19 @@ class LocalPythonTool(Tool):
             # srt -c receives the python command as a quoted string.
             inner = shlex.join(["python", _RUNNER_PATH])
             uv_args.extend(["--", "srt", "-c", inner])
+        elif self._sandbox_enabled and self._sandbox_required:
+            # Sandboxing demanded but srt missing on this (uv/PEP 723)
+            # tier. The plain-srt tier fails closed via wrap_with_srt;
+            # this branch can't use that helper (uv must wrap srt, not
+            # the reverse), so enforce the same fail-closed posture
+            # here. Scope: refuse-when-srt-missing only — the separate
+            # "uv-installed deps run outside srt" gap is out of scope.
+            raise SandboxUnavailableError(
+                "Sandboxing is required (sandbox_enabled=True, "
+                "sandbox_required=True) for a tool with PEP 723 inline "
+                "dependencies, but the 'srt' sandbox runtime is not available "
+                "on PATH. Refusing to run the tool unsandboxed."
+            )
         else:
             uv_args.extend(["--", "python", _RUNNER_PATH])
         return uv_args
@@ -419,11 +449,17 @@ class LocalPythonTool(Tool):
         semantics; this method only builds the per-call
         ``settings_file`` for stateful tools and hands it in.
 
+        When ``sandbox_required`` is set and ``srt`` is unavailable,
+        the helper raises :class:`SandboxUnavailableError` (fail
+        closed) rather than returning the command unwrapped.
+
         :param cmd: The base command to wrap.
         :param state_root: Per-call ToolState directory, or ``None``
             for stateless invocations. A stateless call skips the
             ``-s`` settings file entirely.
         :returns: The wrapped command.
+        :raises SandboxUnavailableError: If sandboxing is required but
+            ``srt`` is unavailable.
         """
         settings_file = _write_srt_settings_file(state_root) if state_root is not None else None
         return wrap_with_srt(
@@ -431,6 +467,7 @@ class LocalPythonTool(Tool):
             sandbox_enabled=self._sandbox_enabled,
             srt_available=self._srt_available,
             settings_file=settings_file,
+            sandbox_required=self._sandbox_required,
         )
 
     def _build_container_command(self) -> list[str]:
@@ -617,6 +654,7 @@ def load_local_python_tools(
     srt_available: bool | None = None,
     uv_available: bool | None = None,
     sandbox_enabled: bool = True,
+    sandbox_required: bool = False,
     *,
     agent_name: str | None = None,
     builtin_tool_names: frozenset[str] | None = None,
@@ -641,6 +679,13 @@ def load_local_python_tools(
     :param uv_available: Whether ``uv`` is on PATH. ``None``
         auto-detects.
     :param sandbox_enabled: Runtime policy for srt sandboxing.
+    :param sandbox_required: When ``True``, demand sandboxing — tools
+        refuse to run (fail closed) if ``srt`` is unavailable while
+        sandboxing is enabled, rather than silently downgrading to a
+        plain subprocess. Defaults to ``False`` (dev fail-open). When
+        sandboxing is enabled but ``srt`` is missing, a WARNING is
+        logged at load time regardless of this flag so operators can
+        detect a missing or renamed ``srt``.
     :param agent_name: The agent's name, used in error messages.
         ``None`` falls back to the workdir basename.
     :param builtin_tool_names: Names of framework-provided built-in
@@ -656,6 +701,35 @@ def load_local_python_tools(
     effective_srt = srt_available if srt_available is not None else shutil.which("srt") is not None
     effective_uv = uv_available if uv_available is not None else shutil.which("uv") is not None
     effective_agent_name = agent_name or workdir.name
+
+    # Observability for the silent-downgrade hazard: sandboxing is
+    # enabled but srt is missing, so subprocess-tier tools would run
+    # unsandboxed. Container-image tools sandbox via the container
+    # runtime (not srt), so they don't trip this. Warn once at load
+    # time so operators can spot a missing/renamed srt; the message
+    # reflects whether the policy fails closed (refuse at invoke) or
+    # open (dev fallback).
+    if (
+        sandbox_enabled
+        and not effective_srt
+        and effective_sandbox.container_image is None
+        and any(info.language == "python" for info in local_tools)
+    ):
+        if sandbox_required:
+            _logger.warning(
+                "Agent %r: sandboxing is REQUIRED but 'srt' is not on PATH — "
+                "local @tool subprocesses will be REFUSED at invocation "
+                "(fail closed). Install 'srt' or restore it to PATH.",
+                effective_agent_name,
+            )
+        else:
+            _logger.warning(
+                "Agent %r: sandboxing is enabled but 'srt' is not on PATH — "
+                "local @tool subprocesses will run UNSANDBOXED with full host "
+                "privileges (dev fail-open fallback). Install 'srt', or set "
+                "sandbox_required=True to fail closed instead.",
+                effective_agent_name,
+            )
 
     # Discover decorated functions per file. Track tool name -> source so
     # we can detect cross-file collisions and surface them with both paths.
@@ -720,6 +794,7 @@ def load_local_python_tools(
             srt_available=effective_srt,
             uv_available=effective_uv,
             sandbox_enabled=sandbox_enabled,
+            sandbox_required=sandbox_required,
         )
         for disc in discovered.values()
     ]

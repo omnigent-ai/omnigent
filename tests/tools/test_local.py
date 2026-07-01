@@ -119,6 +119,74 @@ def test_invoke_subprocess_success(tmp_path: Path, tool_ctx: ToolContext) -> Non
     assert "result:" in result
 
 
+def test_invoke_refuses_when_sandbox_required_but_srt_unavailable(
+    tmp_path: Path,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    With ``sandbox_required=True`` and ``srt`` unavailable, ``invoke``
+    REFUSES to run the tool: it returns a clear ``Error:`` string and
+    never spawns the (unsandboxed) subprocess.
+
+    This is the end-to-end view of the P0 fix. The fail-open default
+    (no ``sandbox_required``) is exercised throughout the rest of this
+    module; here we pin the fail-closed posture so a deployment that
+    demands sandboxing can never silently run spec-author code with
+    full host privileges when ``srt`` is missing.
+
+    What breaks if this fails: a ``sandbox_required`` deployment runs
+    untrusted tool code unsandboxed (the original vulnerability) — and
+    the tool body would actually execute (``result:`` would appear).
+    """
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "echo_tool.py", func_name="echo_tool")
+    info = LocalToolInfo(name="echo_tool", path="tools/python/echo_tool.py", language="python")
+    tools = load_local_python_tools(
+        [info],
+        tmp_path,
+        srt_available=False,
+        sandbox_enabled=True,
+        sandbox_required=True,
+    )
+    result = tools[0].invoke(json.dumps({"value": "hello"}), tool_ctx)
+    assert result.startswith("Error:")
+    assert "srt" in result
+    # The refusal must short-circuit BEFORE the subprocess runs — the
+    # tool body's "result:" sentinel must be absent.
+    assert "result:" not in result
+
+
+def test_load_warns_when_sandbox_enabled_but_srt_unavailable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Loading local Python tools with sandboxing enabled but ``srt``
+    missing logs a WARNING so operators can detect a missing/renamed
+    ``srt`` — observability the silent fail-open never provided.
+
+    Default (``sandbox_required=False``) loads fine (dev fail-open) but
+    must still warn.
+
+    What breaks if this fails: a misconfigured deployment (srt removed
+    or renamed) gives no signal that its tools are running unsandboxed.
+    """
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "echo_tool.py", func_name="echo_tool")
+    info = LocalToolInfo(name="echo_tool", path="tools/python/echo_tool.py", language="python")
+    with caplog.at_level("WARNING"):
+        tools = load_local_python_tools(
+            [info],
+            tmp_path,
+            srt_available=False,
+            sandbox_enabled=True,
+            agent_name="testagent",
+        )
+    assert len(tools) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("srt" in m and "testagent" in m for m in warnings), warnings
+
+
 def test_invoke_subprocess_strips_runner_binding_token(
     tmp_path: Path,
     tool_ctx: ToolContext,

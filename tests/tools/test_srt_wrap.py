@@ -20,7 +20,11 @@ import shlex
 
 import pytest
 
-from omnigent.tools._srt import is_srt_available, wrap_with_srt
+from omnigent.tools._srt import (
+    SandboxUnavailableError,
+    is_srt_available,
+    wrap_with_srt,
+)
 
 
 def test_wrap_with_srt_passthrough_when_disabled() -> None:
@@ -43,11 +47,16 @@ def test_wrap_with_srt_passthrough_when_disabled() -> None:
 
 def test_wrap_with_srt_passthrough_when_unavailable() -> None:
     """
-    ``srt_available=False`` passes the command through regardless
-    of the caller's sandbox preference. On machines without srt
-    installed, the subprocess runs unsandboxed — silently, by
-    design, so dev boxes that haven't installed the sandbox
+    ``srt_available=False`` with the default ``sandbox_required=False``
+    passes the command through. On machines without srt installed, the
+    subprocess runs unsandboxed — the documented dev fail-open
+    fallback, so dev boxes / CI that haven't installed the sandbox
     runtime still function.
+
+    NOTE: this is the *opt-in* dev posture. Deployments that demand
+    sandboxing pass ``sandbox_required=True`` and get the fail-closed
+    raise instead (see
+    :func:`test_wrap_with_srt_fails_closed_when_required_and_unavailable`).
 
     What breaks if this fails: CI environments and fresh dev
     machines without srt installed would crash at subprocess
@@ -55,6 +64,78 @@ def test_wrap_with_srt_passthrough_when_unavailable() -> None:
     """
     cmd = ["python", "/tmp/foo.py"]
     assert wrap_with_srt(cmd, sandbox_enabled=True, srt_available=False) is cmd
+
+
+def test_wrap_with_srt_fails_closed_when_required_and_unavailable() -> None:
+    """
+    ``sandbox_enabled=True`` + ``srt_available=False`` +
+    ``sandbox_required=True`` raises :class:`SandboxUnavailableError`
+    instead of returning the command unwrapped.
+
+    This is the P0 fix: previously this exact combination failed *open*
+    — ``wrap_with_srt`` returned the bare command and the caller ran
+    untrusted spec-author code as a full-privilege subprocess with no
+    error, warning, or log. A deployment that demanded sandboxing was
+    silently unsandboxed. The fail-closed gate refuses instead.
+
+    What breaks if this fails: the silent-downgrade vulnerability is
+    back — a deployment with ``sandbox_required`` set runs untrusted
+    code unsandboxed whenever ``srt`` is missing or renamed on PATH.
+    """
+    cmd = ["python", "/tmp/foo.py"]
+    with pytest.raises(SandboxUnavailableError):
+        wrap_with_srt(
+            cmd,
+            sandbox_enabled=True,
+            srt_available=False,
+            sandbox_required=True,
+        )
+
+
+def test_wrap_with_srt_required_and_available_wraps() -> None:
+    """
+    ``sandbox_required=True`` does not change the happy path: when srt
+    IS available, the command is wrapped normally. ``sandbox_required``
+    only governs the missing-srt case.
+
+    What breaks if this fails: requiring the sandbox would somehow
+    break wrapping when srt is present — i.e. the gate is conflated
+    with the wrap logic.
+    """
+    cmd = ["python", "/tmp/foo.py"]
+    wrapped = wrap_with_srt(
+        cmd,
+        sandbox_enabled=True,
+        srt_available=True,
+        sandbox_required=True,
+    )
+    assert wrapped[:2] == ["srt", "-c"]
+    assert shlex.split(wrapped[2]) == cmd
+
+
+def test_wrap_with_srt_required_but_disabled_passes_through() -> None:
+    """
+    An explicit ``sandbox_enabled=False`` opt-out wins over
+    ``sandbox_required=True``: the command passes through unchanged and
+    no error is raised. ``sandbox_required`` hardens the
+    *enabled-but-unavailable* case; it does not override a caller that
+    has deliberately turned sandboxing off.
+
+    What breaks if this fails: a caller that sets
+    ``SandboxConfig(enabled=False)`` would crash with
+    :class:`SandboxUnavailableError` instead of running its plain
+    subprocess.
+    """
+    cmd = ["python", "/tmp/foo.py"]
+    assert (
+        wrap_with_srt(
+            cmd,
+            sandbox_enabled=False,
+            srt_available=False,
+            sandbox_required=True,
+        )
+        is cmd
+    )
 
 
 def test_wrap_with_srt_wraps_when_enabled_and_available() -> None:
