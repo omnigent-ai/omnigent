@@ -611,9 +611,18 @@ class HarnessProcessManager:
         # Write the AP_PID sentinel so other instances' sweeps can
         # tell our dir is live. Strict ``"x"`` because the dir is
         # exclusively ours; a pre-existing sentinel would mean the
-        # uuid collided with a still-running instance — fail loud.
+        # uuid collided with a still-running instance — fail loud
+        # rather than silently clobber its AP_PID (which would break
+        # that instance's orphan sweep).
         sentinel = self._instance_dir / _AP_PID_FILE
-        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        try:
+            with open(sentinel, "x", encoding="utf-8") as fh:
+                fh.write(str(os.getpid()))
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"AP_PID sentinel already exists at {sentinel}: instance-dir "
+                "uuid collided with a still-running Omnigent instance"
+            ) from exc
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
