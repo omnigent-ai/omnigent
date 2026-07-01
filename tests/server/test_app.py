@@ -34,15 +34,18 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_returns_installed_package_version(
+async def test_version_returns_source_of_truth_version(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /api/version returns the installed omnigent package version.
+    """GET /api/version returns ``omnigent.version.VERSION``.
 
-    Compares the endpoint response against ``importlib.metadata.version``
-    directly — confirms the handler forwards the real installed version
-    rather than a hard-coded string.
+    The endpoint surfaces the shared source-of-truth constant. In a correct
+    install the package metadata is *derived* from that same constant, so the
+    two agree — but the constant is authoritative regardless of how the
+    package was installed.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/api/version")
     assert resp.status_code == 200
     body = resp.json()
@@ -50,49 +53,19 @@ async def test_version_returns_installed_package_version(
     # "version" key must be present — a missing key means the UI's
     # fetchVersion() falls back to "unknown" in every bug report.
     assert "version" in body
-
-    expected = _pkg_version("omnigent")
-    # Exact match against the installed version — confirms the endpoint
-    # calls importlib.metadata.version("omnigent"), not a constant.
-    assert body["version"] == expected, (
-        f"Expected version {expected!r} from importlib.metadata, "
-        f"got {body['version']!r}. If the handler hard-codes a version, "
-        "bug reports will always show the wrong version string."
+    assert body["version"] == VERSION, (
+        f"Expected version {VERSION!r} from omnigent.version.VERSION, got {body['version']!r}."
     )
+    # In an editable/source install the built metadata derives from VERSION,
+    # so the two must agree — guards the pyproject dynamic-version wiring.
+    assert body["version"] == _pkg_version("omnigent")
 
 
-def test_server_version_uses_metadata_when_pep440(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A valid installed package version is the server version source of truth."""
-    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "0.3.1")
-    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
+def test_server_version_reads_version_constant() -> None:
+    """The server version is the shared ``omnigent.version.VERSION`` constant."""
+    from omnigent.version import VERSION
 
-    assert server_app._server_version() == "0.3.1"
-
-
-def test_server_version_falls_back_to_pyproject_for_source_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Source/editable installs can report ``source``; use pyproject's version."""
-    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "source")
-    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
-
-    assert server_app._server_version() == "0.3.0.dev0"
-
-
-def test_source_pyproject_version_reads_project_version(tmp_path: Path) -> None:
-    """The pyproject fallback reads the source checkout's ``[project].version``."""
-    repo = tmp_path / "repo"
-    package_file = repo / "omnigent" / "server" / "app.py"
-    package_file.parent.mkdir(parents=True)
-    package_file.write_text("", encoding="utf-8")
-    (repo / "pyproject.toml").write_text(
-        '[project]\nname = "omnigent"\nversion = "0.3.0.dev0"\n',
-        encoding="utf-8",
-    )
-
-    assert server_app._source_pyproject_version(package_file) == "0.3.0.dev0"
+    assert server_app._server_version() == VERSION
 
 
 class _StubWebSocket:
