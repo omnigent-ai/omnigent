@@ -45,27 +45,6 @@ async def test_create_loop_posts_body_with_default_conversation() -> None:
     assert json.loads(out) == {"ok": True}
 
 
-async def test_create_monitor_posts_monitor_kind() -> None:
-    reqs: list[httpx.Request] = []
-    client = _recording_client(reqs)
-    await _execute_schedule_tool(
-        "create_monitor",
-        json.dumps({"name": "M", "prompt": "p", "command": "tail -f log"}),
-        conversation_id="conv_X",
-        server_client=client,
-    )
-    await client.aclose()
-    assert reqs[0].method == "POST"
-    assert reqs[0].url.path == "/v1/schedules"
-    assert json.loads(reqs[0].content) == {
-        "conversation_id": "conv_X",
-        "name": "M",
-        "kind": "monitor",
-        "prompt": "p",
-        "command": "tail -f log",
-    }
-
-
 async def test_explicit_conversation_id_overrides_default() -> None:
     reqs: list[httpx.Request] = []
     client = _recording_client(reqs)

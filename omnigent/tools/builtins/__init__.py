@@ -49,7 +49,6 @@ from omnigent.tools.builtins.read_skill_file import (
 )
 from omnigent.tools.builtins.schedules import (
     CreateLoopTool,
-    CreateMonitorTool,
     DeleteScheduleTool,
     ListSchedulesTool,
 )
@@ -73,7 +72,6 @@ __all__ = [
     "BUILTIN_NAMES",
     "INSTANTIABLE_BUILTINS",
     "CreateLoopTool",
-    "CreateMonitorTool",
     "DeleteScheduleTool",
     "ListCommentsTool",
     "ListSchedulesTool",
@@ -189,17 +187,6 @@ def _create_loop(config: dict[str, str]) -> Tool:
     return CreateLoopTool()
 
 
-def _create_monitor(config: dict[str, str]) -> Tool:
-    """
-    Lazy factory for CreateMonitorTool.
-
-    :param config: Tool config (unused).
-    :returns: A CreateMonitorTool instance.
-    """
-    del config
-    return CreateMonitorTool()
-
-
 def _create_list_schedules(config: dict[str, str]) -> Tool:
     """
     Lazy factory for ListSchedulesTool.
@@ -244,9 +231,8 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
-    # Schedules (#6, #12) — loops & monitors, backed by the ScheduleStore.
+    # Schedules (#6, #12) — loops, backed by the ScheduleStore.
     "create_loop": _create_loop,
-    "create_monitor": _create_monitor,
     "list_schedules": _create_list_schedules,
     "delete_schedule": _create_delete_schedule,
     # Framework-owned: need runtime context. ``web_fetch`` is

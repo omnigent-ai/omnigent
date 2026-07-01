@@ -1,4 +1,4 @@
-"""Tests for the scheduler builtin tools (loops & monitors)."""
+"""Tests for the scheduler builtin tools (loops)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleSt
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.schedules import (
     CreateLoopTool,
-    CreateMonitorTool,
     DeleteScheduleTool,
     ListSchedulesTool,
 )
@@ -50,17 +49,8 @@ def test_create_list_delete_flow(conv_id: str) -> None:
     )
     assert "error" in dup and "already exists" in dup["error"]
 
-    mon = json.loads(
-        CreateMonitorTool().invoke(
-            json.dumps({"name": "tail", "prompt": "look at {line}", "command": "tail -f app.log"}),
-            ctx,
-        )
-    )
-    assert mon["schedule"]["kind"] == "monitor"
-    assert mon["schedule"]["command"].startswith("tail -f")
-
     listed = json.loads(ListSchedulesTool().invoke(json.dumps({}), ctx))
-    assert listed["count"] == 2
+    assert listed["count"] == 1
 
     gone = json.loads(DeleteScheduleTool().invoke(json.dumps({"schedule_id": sid}), ctx))
     assert gone["deleted"] is True

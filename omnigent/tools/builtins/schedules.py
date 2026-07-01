@@ -1,19 +1,21 @@
-"""Built-in tools for scheduled work (loops & monitors).
+"""Built-in tools for scheduled work (loops).
 
-Four LLM-callable tools backed by the :class:`ScheduleStore`:
+Three LLM-callable tools backed by the :class:`ScheduleStore`:
 
 - :class:`CreateLoopTool` (``create_loop``) — a cron-driven recurring prompt
   (e.g. a Friday-night weekly report).
-- :class:`CreateMonitorTool` (``create_monitor``) — stream a shell command and
-  fire a prompt per output line.
-- :class:`ListSchedulesTool` (``list_schedules``) — list a conversation's
-  loops & monitors.
+- :class:`ListSchedulesTool` (``list_schedules``) — list a conversation's loops.
 - :class:`DeleteScheduleTool` (``delete_schedule``) — remove one by id.
 
 These run AP-side (synchronous ``invoke``) and resolve the store lazily via
-:func:`omnigent.runtime.get_schedule_store`. Creating a schedule persists the
+:func:`omnigent.runtime.get_schedule_store`. Creating a loop persists the
 definition and arms it on the next scheduler pass; firing is handled by the
 scheduler service (not these tools).
+
+Monitors (streaming a command and firing a prompt per output line) are a
+planned follow-up: they need host-side subprocess supervision, so the
+``create_monitor`` tool is intentionally not shipped here. The ``schedules``
+table keeps its ``kind``/``command`` columns as the foundation for that work.
 """
 
 from __future__ import annotations
@@ -91,10 +93,15 @@ class CreateLoopTool(Tool):
     def description(cls) -> str:
         """:returns: Description visible to the LLM."""
         return (
-            "Schedule a recurring prompt on a cron cadence — e.g. a weekly "
-            "report every Friday at 22:00 ('0 22 * * FRI'). The loop fires in "
-            "this conversation unless conversation_id is given. Names are unique "
-            "per conversation."
+            "Schedule a recurring PROMPT on a cron cadence (5-field cron, e.g. "
+            "'*/10 * * * *' = every 10 min, '0 9 * * 1-5' = 9am weekdays, "
+            "'0 22 * * FRI' = Fridays at 22:00). Use for periodic work, checks, "
+            "or reports — each time it fires, the prompt runs as a fresh turn in "
+            "the conversation and the agent sees the full output. Prefer this "
+            "over ad-hoc shell loops (e.g. 'while true; do …; sleep'), which "
+            "block the session and leave no tracked run. Fires in this "
+            "conversation unless conversation_id is given; names are unique per "
+            "conversation."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -158,96 +165,6 @@ class CreateLoopTool(Tool):
                 "loop",
                 prompt,
                 cron=cron,
-            )
-        except IntegrityError:
-            return json.dumps(
-                {"error": f"a schedule named {name!r} already exists in this conversation"}
-            )
-        return json.dumps({"schedule": _schedule_dict(sched)})
-
-
-class CreateMonitorTool(Tool):
-    """Create a monitor: stream a command and fire a prompt per line."""
-
-    @classmethod
-    def name(cls) -> str:
-        """:returns: ``"create_monitor"``."""
-        return "create_monitor"
-
-    @classmethod
-    def description(cls) -> str:
-        """:returns: Description visible to the LLM."""
-        return (
-            "Stream a shell command and fire a prompt for each new output line "
-            "(e.g. tail a log and react to errors). The prompt may reference the "
-            "triggering line as {line}. Runs in this conversation unless "
-            "conversation_id is given. Names are unique per conversation."
-        )
-
-    def get_schema(self) -> dict[str, Any]:
-        """:returns: OpenAI tool schema for ``create_monitor``."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name(),
-                "description": self.description(),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Monitor name (unique per conversation).",
-                        },
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to stream, e.g. 'tail -f app.log'.",
-                        },
-                        "prompt": {
-                            "type": "string",
-                            "description": "Prompt template fired per line (may use {line}).",
-                        },
-                        "conversation_id": {
-                            "type": "string",
-                            "description": "Target conversation (defaults to the current one).",
-                        },
-                    },
-                    "required": ["name", "command", "prompt"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-
-    def invoke(self, arguments: str, ctx: ToolContext) -> str:
-        """Create a monitor schedule; return it as JSON."""
-        try:
-            args = json.loads(arguments) if arguments else {}
-        except json.JSONDecodeError as exc:
-            return json.dumps({"error": f"invalid arguments: {exc}"})
-
-        name = args.get("name")
-        prompt = args.get("prompt")
-        command = args.get("command")
-        if not all(isinstance(v, str) and v.strip() for v in (name, prompt, command)):
-            return json.dumps({"error": "name, command, and prompt are required"})
-
-        conversation_id = _resolve_conversation_id(args, ctx)
-        if not conversation_id:
-            return json.dumps({"error": "create_monitor requires a conversation context"})
-
-        store, err = _store_or_error()
-        if err is not None:
-            return err
-
-        from omnigent.db.utils import generate_schedule_id
-
-        try:
-            sched = store.create(
-                generate_schedule_id(),
-                conversation_id,
-                name.strip(),
-                "monitor",
-                prompt,
-                command=command,
             )
         except IntegrityError:
             return json.dumps(

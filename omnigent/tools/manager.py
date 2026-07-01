@@ -203,19 +203,19 @@ class ToolManager:
 
     def _register_schedule_tools(self) -> None:
         """
-        Auto-register the schedule (loop & monitor) builtins (#6, #12).
+        Auto-register the schedule (loop) builtins (#6, #12).
 
-        ``create_loop`` / ``create_monitor`` / ``list_schedules`` /
-        ``delete_schedule`` are framework-owned and always available so an
-        agent — and the Omnigent MCP surface — can manage cron loops and stream
-        monitors without the spec opting in. Instantiated straight from the
-        builtin registry (like the comment tools) rather than declared in
-        ``tools.builtins``, which sidesteps the declared-builtin function-tool
-        callable-recovery path. Each returns a clear error at invoke time when
-        its backing ScheduleStore isn't configured, so registering them
-        unconditionally is safe.
+        ``create_loop`` / ``list_schedules`` / ``delete_schedule`` are
+        framework-owned and always available so an agent — and the Omnigent MCP
+        surface — can manage cron loops without the spec opting in. Instantiated
+        straight from the builtin registry (like the comment tools) rather than
+        declared in ``tools.builtins``, which sidesteps the declared-builtin
+        function-tool callable-recovery path. Each returns a clear error at
+        invoke time when its backing ScheduleStore isn't configured, so
+        registering them unconditionally is safe. (Monitors are a planned
+        follow-up needing host-side streaming; ``create_monitor`` isn't shipped.)
         """
-        for name in ("create_loop", "create_monitor", "list_schedules", "delete_schedule"):
+        for name in ("create_loop", "list_schedules", "delete_schedule"):
             tool = get_builtin_tool(name)
             if tool is not None:
                 self._tools[name] = tool

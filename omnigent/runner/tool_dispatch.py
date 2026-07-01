@@ -304,10 +304,11 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
-# Schedule/loop & monitor builtins (#6, #12). Like the comment tools, the
-# runner has no in-process ScheduleStore, so these proxy to the server's REST
-# API over server_client (see _execute_schedule_tool).
-_SCHEDULE_TOOLS = frozenset({"create_loop", "create_monitor", "list_schedules", "delete_schedule"})
+# Schedule/loop builtins (#6, #12). Like the comment tools, the runner has no
+# in-process ScheduleStore, so these proxy to the server's REST API over
+# server_client (see _execute_schedule_tool). Monitors are a planned follow-up
+# (host-side streaming), so create_monitor is intentionally not advertised here.
+_SCHEDULE_TOOLS = frozenset({"create_loop", "list_schedules", "delete_schedule"})
 
 # Builtin tools the claude-native / codex-native relay advertises to the
 # real CLI, beyond the always-relayed ``sys_os_*`` family. Native harnesses
@@ -2574,12 +2575,12 @@ async def _execute_schedule_tool(
     server_client: httpx.AsyncClient | None,
 ) -> str:
     """
-    Runner-local handler for the schedule (loop & monitor) builtins (#6, #12).
+    Runner-local handler for the schedule (loop) builtins (#6, #12).
 
     The runner has no in-process ScheduleStore, so — like the comment tools —
     these proxy to the Omnigent server's REST API over ``server_client``:
     ``/v1/schedules`` (POST create, GET list, DELETE). The conversation-scoped
-    tools (create_loop, create_monitor, list_schedules) default to the current
+    tools (create_loop, list_schedules) default to the current
     ``conversation_id`` when the arg is omitted.
 
     :param tool_name: One of :data:`_SCHEDULE_TOOLS`.
@@ -2615,18 +2616,6 @@ async def _execute_schedule_tool(
                 "kind": "loop",
                 "prompt": args.get("prompt"),
                 "cron": args.get("cron"),
-            }
-            return _result(await server_client.post("/v1/schedules", json=body, timeout=30.0))
-
-        if tool_name == "create_monitor":
-            if not scoped_conv:
-                return json.dumps({"error": "create_monitor requires a session id"})
-            body = {
-                "conversation_id": scoped_conv,
-                "name": args.get("name"),
-                "kind": "monitor",
-                "prompt": args.get("prompt"),
-                "command": args.get("command"),
             }
             return _result(await server_client.post("/v1/schedules", json=body, timeout=30.0))
 
