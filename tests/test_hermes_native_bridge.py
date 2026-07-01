@@ -384,6 +384,40 @@ def test_build_spawn_env_no_hermes_home_without_policy(tmp_path, monkeypatch) ->
     assert "HERMES_HOME" not in env
 
 
+def test_normalize_hermes_native_state_mode() -> None:
+    assert b.normalize_hermes_native_state_mode(None) == "managed"
+    assert b.normalize_hermes_native_state_mode("") == "managed"
+    assert b.normalize_hermes_native_state_mode("managed") == "managed"
+    assert b.normalize_hermes_native_state_mode("isolated") == "managed"
+    assert b.normalize_hermes_native_state_mode("ambient") == "ambient"
+    assert b.normalize_hermes_native_state_mode("real") == "ambient"
+    with pytest.raises(ValueError, match="unsupported"):
+        b.normalize_hermes_native_state_mode("blank-slate")
+
+
+def test_resolve_hermes_native_state_mode_precedence() -> None:
+    assert b.resolve_hermes_native_state_mode(snapshot={}, env={}) == "managed"
+    assert (
+        b.resolve_hermes_native_state_mode(
+            snapshot={b.STATE_MODE_METADATA_KEY: "ambient"}, env={}
+        )
+        == "ambient"
+    )
+    assert (
+        b.resolve_hermes_native_state_mode(
+            snapshot={"labels": {b.STATE_MODE_LABEL_KEY: "ambient"}}, env={}
+        )
+        == "ambient"
+    )
+    assert (
+        b.resolve_hermes_native_state_mode(
+            snapshot={b.STATE_MODE_METADATA_KEY: "managed"},
+            env={b.STATE_MODE_ENV_VAR: "ambient"},
+        )
+        == "ambient"
+    )
+
+
 # -- Session cloning tests --
 
 

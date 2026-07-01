@@ -5044,11 +5044,22 @@ def goose(
     hidden=True,
     help="Deprecated alias for ``--resume <id>``; kept for one release.",
 )
+@click.option(
+    "--state-mode",
+    type=click.Choice(["managed", "ambient"], case_sensitive=False),
+    default="managed",
+    show_default=True,
+    help=(
+        "Hermes state/config mode for new sessions. 'managed' uses Omnigent's "
+        "per-session HERMES_HOME; 'ambient' inherits the user's normal ~/.hermes."
+    ),
+)
 @click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
 def hermes(
     server: str | None,
     resume: str | None,
     session_id: str | None,
+    state_mode: str,
     hermes_args: tuple[str, ...],
 ) -> None:
     """Launch the Hermes TUI in an Omnigent terminal.
@@ -5084,6 +5095,7 @@ def hermes(
         resume_picker=choice.picker,
         hermes_args=hermes_args,
         auto_open_conversation=auto_open_conversation,
+        state_mode=state_mode,
     )
 
 

@@ -548,6 +548,7 @@ class _PiNativeLaunchConfig:
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
     model_override: str | None = None
+    hermes_native_state_mode: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -779,6 +780,13 @@ async def _pi_native_launch_config(
             raise RuntimeError(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
+    from omnigent.hermes_native_bridge import STATE_MODE_LABEL_KEY, STATE_MODE_METADATA_KEY
+
+    hermes_native_state_mode = snapshot.get(STATE_MODE_METADATA_KEY)
+    if hermes_native_state_mode is None and isinstance(labels, dict):
+        hermes_native_state_mode = labels.get(STATE_MODE_LABEL_KEY)
+    if hermes_native_state_mode is not None and not isinstance(hermes_native_state_mode, str):
+        raise RuntimeError(f"Invalid hermes_native_state_mode for session {session_id!r}.")
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
@@ -788,6 +796,7 @@ async def _pi_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         model_override=model_override,
+        hermes_native_state_mode=hermes_native_state_mode,
     )
 
 
@@ -2496,8 +2505,10 @@ async def _auto_create_hermes_terminal(
     # drop the prior terminal's stale forward cursor.
     await _cancel_auto_forwarder_task(session_id)
     from omnigent.hermes_native_bridge import (
+        STATE_MODE_AMBIENT,
         bridge_dir_for_session_id,
         read_hermes_home,
+        resolve_hermes_native_state_mode,
         write_policy_hook_config,
         write_tmux_target,
     )
@@ -2506,17 +2517,26 @@ async def _auto_create_hermes_terminal(
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_hermes_bridge_state(bridge_dir)
 
-    # Write a per-session HERMES_HOME with the Omnigent policy hook so the
-    # native TUI evaluates tool calls against Omnigent policies.
-    _hermes_server_url = _required_runner_env("RUNNER_SERVER_URL")
-    write_policy_hook_config(bridge_dir, _hermes_server_url, session_id)
-
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
         server_client=server_client,
     )
+    hermes_state_mode = resolve_hermes_native_state_mode(
+        snapshot={"hermes_native_state_mode": launch_config.hermes_native_state_mode}
+    )
+    if hermes_state_mode != STATE_MODE_AMBIENT:
+        # Write a per-session HERMES_HOME with the Omnigent policy hook so the
+        # native TUI evaluates tool calls against Omnigent policies.
+        _hermes_server_url = _required_runner_env("RUNNER_SERVER_URL")
+        write_policy_hook_config(bridge_dir, _hermes_server_url, session_id)
+    else:
+        _logger.info(
+            "Launching hermes-native in ambient state mode; "
+            "session=%s uses the user's normal ~/.hermes",
+            session_id,
+        )
     workspace = os.path.realpath(str(launch_config.workspace))
     hermes_command = resolve_hermes_executable()
     # Stamp the discovery floor BEFORE launch: the forwarder binds the newest
@@ -8872,17 +8892,29 @@ def create_runner_app(
                 spawn_env = build_goose_native_spawn_env(session_id)
             if harness_name == "hermes-native" and spawn_env is None:
                 from omnigent.hermes_native_bridge import (
-                    bridge_dir_for_session_id as _hermes_bridge_dir,
-                )
-                from omnigent.hermes_native_bridge import (
+                    STATE_MODE_AMBIENT,
                     build_hermes_native_spawn_env,
+                    resolve_hermes_native_state_mode,
                     write_policy_hook_config,
                 )
+                from omnigent.hermes_native_bridge import (
+                    bridge_dir_for_session_id as _hermes_bridge_dir,
+                )
 
-                _h_server_url = os.environ.get(
-                    "RUNNER_SERVER_URL", "http://localhost:6767"
-                ).rstrip("/")
-                write_policy_hook_config(_hermes_bridge_dir(session_id), _h_server_url, session_id)
+                labels = await _session_labels_for_runner_spawn(
+                    server_client=server_client,
+                    session_id=session_id,
+                )
+                _hermes_state_mode = resolve_hermes_native_state_mode(
+                    snapshot={"labels": labels}
+                )
+                if _hermes_state_mode != STATE_MODE_AMBIENT:
+                    _h_server_url = os.environ.get(
+                        "RUNNER_SERVER_URL", "http://localhost:6767"
+                    ).rstrip("/")
+                    write_policy_hook_config(
+                        _hermes_bridge_dir(session_id), _h_server_url, session_id
+                    )
                 spawn_env = build_hermes_native_spawn_env(session_id)
             if harness_name == "qwen-native" and spawn_env is None:
                 from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
@@ -14103,17 +14135,25 @@ def create_runner_app(
             spawn_env = build_goose_native_spawn_env(conv_id)
         if harness_name == "hermes-native" and spawn_env is None:
             from omnigent.hermes_native_bridge import (
-                bridge_dir_for_session_id as _hermes_bridge_dir2,
-            )
-            from omnigent.hermes_native_bridge import (
+                STATE_MODE_AMBIENT,
                 build_hermes_native_spawn_env,
+                resolve_hermes_native_state_mode,
                 write_policy_hook_config,
             )
-
-            _h_server_url2 = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip(
-                "/"
+            from omnigent.hermes_native_bridge import (
+                bridge_dir_for_session_id as _hermes_bridge_dir2,
             )
-            write_policy_hook_config(_hermes_bridge_dir2(conv_id), _h_server_url2, conv_id)
+
+            labels = await _session_labels_for_runner_spawn(
+                server_client=server_client,
+                session_id=conv_id,
+            )
+            _hermes_state_mode = resolve_hermes_native_state_mode(snapshot={"labels": labels})
+            if _hermes_state_mode != STATE_MODE_AMBIENT:
+                _h_server_url2 = os.environ.get(
+                    "RUNNER_SERVER_URL", "http://localhost:6767"
+                ).rstrip("/")
+                write_policy_hook_config(_hermes_bridge_dir2(conv_id), _h_server_url2, conv_id)
             spawn_env = build_hermes_native_spawn_env(conv_id)
         if harness_name == "qwen-native" and spawn_env is None:
             from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
