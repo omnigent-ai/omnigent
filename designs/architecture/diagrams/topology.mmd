@@ -1,0 +1,21 @@
+flowchart TB
+    subgraph clients["Clients"]
+        web["Browser · omni-web<br/>React SPA"]
+        tui["TUI / REPL · omni-tui<br/>pure HTTP client"]
+    end
+
+    server["omni-server · FastAPI control plane<br/>ConversationStore + DB · SOURCE OF TRUTH<br/>persist-before-forward · SSE live-tail<br/>in-process policy.evaluate · single-replica live state"]
+    host["omni-host · control-plane daemon<br/>launches / manages runners · never sees a turn"]
+    runner["omni-runner · 1 per conversation<br/>ASGI app: MCP pool + tool exec + shells / sandbox (OmniBox)<br/>spawns + owns the harness subprocess"]
+    harness["omni-harness · child subprocess of the runner<br/>1 per (conversation, harness, model)<br/>python -m harnesses._runner → uvicorn + FastAPI create_app()<br/>hosts ExecutorAdapter + Executor"]
+    vendor["vendor agent<br/>SDK: vendor SDK runs IN-PROCESS inside omni-harness<br/>native: separate resident CLI (Claude Code / Codex) in tmux / UDS"]
+
+    web -->|"REST + SSE /stream + WS /sessions/updates + poll /health"| server
+    tui -->|"REST + SSE /stream ONLY"| server
+    server <-->|"WS reverse-tunnel /v1/runners/:id/tunnel<br/>runner dials out · framed HTTP · headers verbatim · 30s ping"| runner
+    server <-->|"WS control frames /v1/hosts/:id/tunnel<br/>16 HostFrameKinds · per-request_id Futures"| host
+    host -.->|"env-based one-way spawn (allowlist)"| runner
+    runner -->|"real HTTP over UDS · httpx → uvicorn<br/>POST /v1/sessions/:conv/events · drives the turn"| harness
+    harness -->|"SDK: vendor SDK runs in-process here<br/>native: tmux send-keys — 1 inject into a separate CLI process"| vendor
+    vendor -.->|"native only: writes JSONL transcript —<br/>a forwarder asyncio-task INSIDE the runner tails it"| runner
+    runner -.->|"native only: forwarder POSTs external_* to the server<br/>over the WS tunnel · separate async trace · by session.id"| server

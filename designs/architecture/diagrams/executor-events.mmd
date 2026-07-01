@@ -1,0 +1,41 @@
+flowchart LR
+    server["omni-server"]
+
+    subgraph runner["omni-runner (spawns the harness subprocess, owns tool execution)"]
+        direction TB
+        driver["turn driver / proxy_stream<br/>reads harness SSE body · relays to server"]
+        fwd["transcript forwarder<br/>asyncio task IN the runner<br/>(native only) tails vendor JSONL"]
+    end
+
+    subgraph harness["omni-harness subprocess (uvicorn + FastAPI create_app)"]
+        direction TB
+        subgraph sdk["SDK harness — claude-sdk / codex"]
+            direction TB
+            adapter["ExecutorAdapter<br/>async for event in executor.run_turn()"]
+            executor["Executor.run_turn()<br/>async generator · vendor SDK runs IN-PROCESS here"]
+            adapter -->|"drives loop"| executor
+            executor -.->|"yields ExecutorEvent"| adapter
+        end
+        subgraph nat["native harness — claude-native / codex-native"]
+            direction TB
+            inject["Executor.run_turn()<br/>injects 1 message via tmux, returns empty stream"]
+        end
+    end
+
+    vendor["resident vendor CLI (Claude Code / Codex)<br/>SEPARATE process · tmux pane / UDS<br/>owns its own prompt + tools + transcript"]
+    jsonl[("vendor JSONL transcript<br/>file on disk / tmux pane<br/>OUTSIDE the runner")]
+
+    %% server ↔ runner (over the WS reverse-tunnel) — server on the far left
+    server -->|"POST /events — drive turn (WS tunnel)"| driver
+    driver -.->|"relay response.* events"| server
+
+    %% SDK path: runner drives the loop, SSE streams back on the same response body
+    driver -->|"real HTTP over UDS · POST /events ×N — drives loop"| adapter
+    adapter -.->|"SSE frames on the POST response body → relayed as response.*"| driver
+
+    %% native path: one inject, transcript mirrored back out-of-band
+    driver -->|"real HTTP over UDS · POST /events ×1 — one inject (empty SSE body)"| inject
+    inject -->|"tmux send-keys"| vendor
+    jsonl -.-|"vendor writes · forwarder tails"| vendor
+    fwd -.->|"tails vendor JSONL"| jsonl
+    fwd -->|"POST /events {external_*} over WS tunnel ×N"| server

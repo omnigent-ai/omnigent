@@ -534,3 +534,175 @@ markdown preview (#970), Windows (#19/#1236/#1325/#1375), install aarch64/Intel/
 command-palette/shortcuts. **Dropped as minor:** model-less SDK `/compact` raw error (#1192 — web shielded by #1139, maintainer leans wont-fix).
 **Fast wins (PRs written, just unreviewed):** #1146, #1029, #891, #1198, #1189, #567.
 **No-PR gaps needing fresh code:** #1349, #1116, #517 (part-1), #1542.
+
+---
+
+## 7. Verification addendum — trace-backed re-pass (2026-06-30)
+
+> Re-verified §2–§6 against current `main` (+ telemetry PR #1617) via 10 component subagents that
+> read the code **and** a live trace corpus (real turns → Jaeger). Full mechanism write-up:
+> `designs/ARCHITECTURE.md`. This addendum lists only where the analysis above is **wrong, stale,
+> or drifted**. Each item: correction → verified `path:line`. (`S` = `server/routes/sessions.py`.)
+
+### Anchors that drifted (line numbers moved)
+- Elicitation resolve route: `S:18014` (was :17611).
+- `_evaluate_tool_call_policy`: `S:10556` (was :10384). Policy evaluate endpoint: `S:15964`.
+- claude-native `inject_interrupt`: `claude_native_bridge.py:2530`, called `runner/app.py:10518` (was :2484).
+- `OmnigentClient`: `sdks/python-client/omnigent_client/_client.py:21` (AsyncClient :89) — **NOT under `omnigent/`**.
+- `resume_dispatch.py`: `omnigent/resume_dispatch.py` (**NOT** `runtime/`).
+- CLI token file: `~/.omnigent/auth_tokens.json` (the "~/.omnigent/n" in §2.G was a doc-redaction artifact).
+
+### §2.A Session lifecycle & continuity
+- **The tasks table is GONE** (migration `b9c1d2e3f4a5`). The "create-or-steer task" lifecycle is stale: turn start is `POST runner /events` → 202 → background task; the steer-vs-create branch is entirely runner-side. ⇒ `sys_cancel_task` is a permanent no-op (§6 already flags this).
+- **Fork is a top-level deep copy**, not a parent/root chain — fresh item ids; lineage only via the `omnigent.fork.source_id` label; server-only (no runner spawned) until the fork runs a turn (verified: fork trace `conv_151ad…` had zero inter-component edges).
+- **Resume loads NO transcript server-side** — the re-bound runner pulls the **full** transcript via paginated `GET /items` + `/agent/contents` (answers "how much transcript loads into the runner on resume"). Resume-bind is **last-writer-wins** `PATCH …/{id} {runner_id}`, NOT a CAS; only the *initial* new-conversation bind is a CAS (`set_runner_id … WHERE runner_id IS NULL`).
+- **Durability is type-encoded:** only `OutputItemDoneEvent` is durable (`schemas.py:3724`); `response.*` deltas (incl. reasoning), `session.*`, and turn-lifecycle events are SSE-only. **Reasoning is streamed but never persisted.**
+- **NO server-side dedup** (only `(conversation_id, position)` is unique). Dedup is client-side (`itemId` web / counters TUI) + runner cold-cache (`persisted_item_id`). `session.input.consumed` is a *client* anchor, not a server dedup set.
+- **Live status/presence/read/fence state is in-memory, single-replica** (`_session_status_cache`) — a restart or second replica desyncs it.
+
+### §2.D Policies & elicitations
+- **REQUEST fails CLOSED, not open.** `FAIL_CLOSED_PHASES = (TOOL_CALL, REQUEST)` (`policies/types.py:61`); native `fail_closed_hook_output` blocks the prompt on an unreachable server. (TOOL_RESULT/LLM_* fail-open.) A *raising* policy fails by its declared `action:` list, not by phase.
+- **codex-native hook row mislabeled** — claude + codex native share ONE policy hook (`PreToolUse`/`PostToolUse`/`UserPromptSubmit` → `/policies/evaluate`); `UserPromptSubmit` is the **sole** native REQUEST gate (server `_evaluate_input_policy` is bypassed for native, `S:8817`). The `codex-elicitation-request` endpoint (`codex_native_forwarder.py:3146`) is codex's OWN permission prompt — separate from policy ASK.
+- **No keystroke emulation** for any in-scope harness: native ASK verdicts return via **long-poll-held HTTP** (the `/policies/evaluate` body blocks then returns hard ALLOW/DENY — the hook never sees ASK); SDK via an `approval` event → runner Future.
+
+### §2.B / §4 Harnesses & matrix
+- claude-native does NOT override `interrupt_session` (inherits base False) — web Stop works via bridge `inject_interrupt` (Escape), not the executor method (the §4 caveat was right; anchor corrected above).
+- **Only claude-sdk overrides `supports_tool_boundary_interrupt`** (`:1617`); codex-sdk / claude-native / codex-native are base False ⇒ "queue ✅" means queued input applies at *turn* boundaries, not mid-tool.
+- Mid-session model differs by harness: claude-sdk mutates the **live** client (`set_model`, `:1422`); codex-sdk does a full **thread teardown+rebuild** (`:2303`, loses thread state); **claude-native is vendor-only, next-turn** (config `del`'d at `:123`) ⇒ should read ⚠️, not ✅.
+
+### §2.E Web UI & TUI/REPL
+- **"Working/idle state" names the wrong source.** `useSessionState.ts` is the SIDEBAR-row badge only. The chat "Working…" comes from the store's `sessionStatus` (`session.status` SSE) via `computeIsWorking`/`computeShowsWorking` in `ChatPage.tsx` — a different field and code path.
+- **Streaming↔durable reconciliation lives in `chatStore.ts`, not `blockStream.ts`** (a pure block reducer with no `blocks` array). Dedup-by-`ctx.itemId` at 3 sites; the streamed↔persisted merge point is `pumpStreamEvents:3027`.
+- **Close-page-return** calls `getSessionSlim` (`?include_items=false&refresh_state=true`), opens the SSE stream **first**, then loads a *windowed* history page via `GET …/items` — not the full snapshot.
+- WebUI live sidebar = `WS /sessions/updates`; the table's "/health/subscribe" is actually an **HTTP poll** `GET /health?session_ids=`; user search is host-IoC, not a `/v1/users/search` call.
+- **The TUI is SSE-only — NO `WS /sessions/updates`** (so no live sidebar; the sub-agent rail is polled). The real TUI↔WebUI gap is *inbound*. The REPL uses a bespoke single-SSE-pump adapter (`_repl.py:1234`), not the SDK's `SessionsChat`; its streaming↔durable dedup is crude counters, not `itemId`. `_server_headers(runner_id)` is a no-op (affinity carried by `PATCH …/{id}`, not a header).
+
+### §2.F Agents / subagents / routing
+- **Spawn is the generic `sys_session_send`**, not a per-`AgentTool` tool; `AgentTool`/`SelfAgentTool` are spec types → nested `AgentSpec.sub_agents`. The child Conversation is minted on the **runner** (`tool_dispatch.py:1146`) via `POST /v1/sessions` under the **parent's** `agent_id` (verified: subagent trace `conv_fc47…`, which also shows `POST /mcp`+`/mcp/execute` for the AgentTool dispatch and `GET /child_sessions`).
+- **`TIER_TEMPLATES` does not exist** — `smart_routing` uses flat per-family `MODEL_LISTS` + an LLM judge; a hallucinated model clamps to `available_models[0]`, not `tier[0]`.
+- **Native harnesses ARE routable** — `_HARNESS_FAMILY` maps `claude-native`/`codex-native` to families (`smart_routing.py:51-58`); `route_turn` runs for them. Nuance: native bakes `--model` at launch, so routing only bites on a message event with the cost-control toggle on.
+- **No spawn-time depth cap** — `_MAX_SUBAGENT_TREE_DEPTH=3` (`_repl.py:201`) is display-only; `SelfAgentTool` pruning is **parse-time only**; runtime clone-spawns-clone is explicitly possible (`spec/omnigent.py:1284`) — the runaway-recursion risk.
+- Child's own subagents init by the runner swapping `spec` via `_find_spec_by_name` at child-turn start (`app.py:8721`); inline subagents share the one parent `agent_id`.
+
+### §2.F Runner / dispatch
+- **`runner/routing.py` + `WSTunnelTransport` execute in the SERVER process** (they import the server's `ConversationStore`/`TunnelRegistry`), despite living under `omnigent/runner/`. Runner-side tunnel code is `transports/ws_tunnel/serve.py`. Read "RunnerRouter" as the *server's* view of runners.
+- **`HelloFrame.harnesses` is hardcoded** (`serve.py:581`) and omits `codex-native` (+ several native kinds the runner actually serves) → latent `RUNNER_CAPABILITY_MISMATCH` since `_runner_supports_harness` gates dispatch on it.
+
+### §2.G Credentials & auth
+- **The native-hook fail-closed-after-~1h bug is FIXED on `main`** for in-scope harnesses: `post_evaluate_with_retry(reauth=policy_hook_reauth(...))` re-mints the hook token on 401 **or** Apps 302→`/oidc/` (`native_policy_hook.py:500-522`; claude `:657,729,881`, codex `:170`). Only `pi_native` (Node, out of scope) still fails closed. ⇒ mark §2.G/§6 resolved-except-pi.
+- **Databricks bearer is per-request**, not a cached snapshot — `_DatabricksBearerAuth`/`_RunnerDatabricksAuth` re-authenticate every HTTP request (cheapness = SDK in-memory cache). The only true one-shot tokens are the (now re-mintable) native-hook launch token and the per-reconnect WS-tunnel header.
+- Runner↔server auth has **two cadences**: WS-tunnel Bearer minted once per connection (re-minted per reconnect); HTTP callbacks per-request with a 401-or-302→`/oidc/` re-mint. (Not "Bearer injected once at open, no per-message refresh" — the WS frames ride one authenticated tunnel; reconnect re-mints.)
+- Live LLM-cred example: `codex-databricks` bakes `databricks auth token --profile oss` as codex's `auth.command` (`codex_executor.py:730`); a dead `oss` refresh token → empty bearer → gateway 401 → turn fails (observed live, then fixed by `databricks auth login --profile oss`).
+
+### §2.C Tools / MCP / sandbox (OmniBox)
+- **OSEnvironment is ONE concrete class** (`CallerProcessOSEnvironment`); `create_os_environment` raises `NotImplementedError` for any other type (`os_env.py:887`). `fork`/`sandbox` are orthogonal **attributes** of that one env, not separate classes.
+- **The server never executes MCP tools** — it is the policy gate (TOOL_CALL/TOOL_RESULT); execution is delegated to the runner's `/mcp/execute` (`app.py:17829`). `ServerMcpPool` is dead on the proxy path.
+- **`sys_timer_set/cancel` are non-functional** on the live runner stack (`timer.py:220` `NotImplementedError`; cancel always `not_found`) — advertised in-schema but unimplemented.
+- **Native out-of-turn `serve-mcp` runs `sys_os_*` UNGATED** — the workspace-tool path bypasses the policy gate the in-turn relay enforces.
+- Tool routing is uniform: model → harness `tool_executor` → runner dispatch → (live AP) server `POST /mcp` (policy gate) → runner `POST /mcp/execute`; the `__` namespace split routes `server__tool`→custom-MCP vs bare `sys_*`→builtin.
+
+### Host daemon (thinly covered in §2 — now a first-class component in ARCHITECTURE.md §7)
+- Host↔server is a **WS JSON control-frame** channel (NOT HTTP): 16 `HostFrameKind`s, per-`request_id` `asyncio.Future` multiplexing, `traceparent` injected per frame. Host→runner spawn is **env-based, one-way** (strict allowlist). Host traces carry `session.id=None` (decoupled from any conv).
+- **#1022 corporate-proxy gap is TWO layers** — neither the host-daemon env (`cli.py:2267`) nor the runner-spawn allowlist (`connect.py:203`) carries `HTTP(S)_PROXY`/`NO_PROXY`.
+
+---
+
+## 8. Round-2 live-driving verification (2026-06-30)
+
+The CUJs that round-1 covered **code-only** (no live trace) were then DRIVEN live against the local
+telemetry server (`:7777` → Jaeger) by 5 parallel driver+analyzer subagents, each capturing traces
+by conv id and diffing the observed behavior against `ARCHITECTURE.md` / `CUJ-ANALYSIS.md`. Result:
+**2 doc-overturning corrections (both re-verified in code), 8 smaller corrections/additions, and a
+broad CONFIRM set** that validates the round-1 analysis. 20-conv corpus in `scratchpad/corpus2/`
+(per-conv `summary_<conv>.txt`/`tree_<conv>.txt`; query via `jaeger_query.py summary <conv>`).
+
+### ⭐ Flagship corrections — the documented claim was WRONG
+
+**R1. Timers WORK — `sys_timer_*` is functional.** (conv_777fc4b2)
+- *Doc said:* ARCHITECTURE §6 + §7-Tools + CUJ-ANALYSIS §2.C/§7 — `sys_timer_*` is
+  `NotImplementedError`/non-functional (citing `tools/builtins/timer.py:220`).
+- *Live + code:* the runner intercepts `sys_timer_set`/`sys_timer_cancel` at
+  `runner/tool_dispatch.py:4133` → `_execute_timer_set` (`:2345`) → a real asyncio `_timer_loop`
+  (`:2404`); it returns `{"status":"scheduled"}` and the timer **fired mid-turn**
+  (`[System: timer … fired]`). `_TIMER_TOOLS` is a frozenset at `:263`. The `timer.py:208-220` stub
+  (`_spawn_timer_workflow`→`NotImplementedError`) is **dead code on the runner path** — round-1
+  cited the stub and never executed the tool. ⇒ flip every "timers non-functional" claim.
+
+**R2. Hard affinity has runner FAILOVER — "no failover" is WRONG.** (conv_33219e7c)
+- *Doc said:* ARCHITECTURE §6 invariant + §7-Runner — an offline bound runner → `RUNNER_UNAVAILABLE`,
+  no failover/recovery.
+- *Live + code:* two distinct paths. The **message path** (`POST /events`) treats a dead runner on
+  a *live host* as recoverable — "host-relaunch optimism" (`server/app.py:1590-1601`): persist the
+  input, send `host.launch_runner` (`_launch_runner_on_host` `sessions.py:6035`), **LWW-rebind**
+  (`replace_runner_id`), return `{queued:true}`, and the turn runs. `RUNNER_UNAVAILABLE` (503,
+  `runner/routing.py:175` `client_for_existing_conversation`) is raised ONLY on the **resource
+  path** (`GET /resources/*`, which doesn't relaunch) and when the **host itself** is dead. Affinity
+  (one conv ↔ one `runner_id`, no rebalancing) holds; "no recovery" does not. Round-1 read the
+  routing path and over-generalized.
+
+### Corrections (DIFFERENT)
+
+**R3. `sys_add_policy` is gated by a hidden ASK.** (conv_5b5ba2e4) `policies/builtins/safety.py:189
+ask_on_add_policy` ASKs before every `sys_add_policy` (builder-injected, NOT shown in
+`GET /policies`). Headless → auto-decline → **no policy created**, never reaches `POST /policies`.
+CUJ-ANALYSIS §2.D "activates immediately" is wrong — creation is itself an approval-gated action.
+
+**R4. switch-agent changes harness via the agent clone, not `harness_override`.** (conv_ecd393→52e6,
+conv_622a68) The route deletes+re-clones the target as a session-scoped agent (new `agent_id`, name
+"X (switch …)"), leaves `harness_override` NULL; the effective harness is derived from the cloned
+agent's spec by `_resolve_harness` (`sessions.py:2718`). Target must be a **built-in/template**
+(`agent.session_id is None`) — a bundle-run (session-scoped) agent 404s "not bindable". 409 if
+running. Switch-back is **conditional**: `omnigent.switch.previous_builtin_id` is recorded only when
+leaving a built-in (or its clone), so leaving a bundled agent has no switch-back target.
+
+**R5. `sys_os_shell` ignores `os_env.cwd`.** (conv_85f506c5) It resolves cwd via
+`create_os_environment` (`spec.cwd or os.getcwd()`), NOT the `_resolve_cwd` precedence chain the docs
+cite — that chain is `sys_terminal_*`-only. Scope the cwd-precedence claim to terminals.
+
+**R6. Param fixes.** Archived sessions are listed with `?include_archived=true` (not
+`?archived=true`); archive requires `LEVEL_OWNER`. (conv_e7ca5eb1)
+
+### Additions (NEW — not in the docs)
+
+**R7. Policy-enforcement location follows the tool's dispatch route.** (conv_398cb8d7, conv_c8fa7569)
+`RunnerToolPolicyGate` (`runner/policy.py`) enforces **function**-type tool_call/tool_result policies
+locally for **locally-dispatched builtins** (fast ALLOW, escalate ASK to the server). But tools
+routed through the server `/mcp` gate (custom MCP, `sys_os_*`) are policy-gated **server-side at
+`/mcp`** — so the live `read_only_os` DENY on `sys_os_write` arrived on the `POST /mcp` edge, not
+locally. `label`/`prompt` policies are always server-side (`runner/policy.py:13`). ⇒ the §6 "runner
+fast-path" is route-dependent, not universal.
+
+**R8. Tool dispatch is three-way.** (conv_c8fa7569, conv_777fc4b2) custom-MCP (`server__tool`) +
+`sys_os_*` → server `POST /mcp` (gate) + runner `POST /mcp/execute`;
+`sys_call_async`/`sys_read_inbox`/`sys_timer_*` → **local runner builtins, NO `/mcp/execute` edge**.
+Refines §4's `__`-namespace model.
+
+**R9. Headless ASK always auto-declines (SDK).** (conv_3f58b08a) An SDK ASK is a runner-parked Future
+that **never populates `pending_elicitations`**; a headless client emits an explicit decline in <7s
+(not a timeout), and an external `accept` POST can't win the race. The resolve route itself works
+(202, push blocked) — but **resolve-to-ACCEPT is a web/native interactive capability, not
+headless-reproducible**.
+
+**R10. `omni run --resume` cannot drive a turn headlessly** (confirmed by 2 agents). It drops to the
+interactive agent-picker → `Abort` (bundled/codex/native) or detaches ("not a terminal", native).
+The working multi-turn driver is `POST /events` on the re-bound runner — which drives **SDK** turns
+but **NOT native** (the message persists, the native runner stays idle without a vendor loop;
+persist-before-forward still holds). A clean runtime SDK↔native separator. (Caveat: this means the
+round-2 "mid-session effort" self-test's 2nd turn via `--resume` was a no-op picker-abort; the real
+multi-turn evidence is the `POST /events` model run, conv_4cd033be.)
+
+**R11. Local runners never self-expire.** All pooled local runners stay `online:true` (the host holds
+the WS tunnel; no reaper) — forcing the offline/failover path requires SIGKILL of the bound
+`runner._entry` PID. **R12.** Compaction is idle-only (409 mid-turn) and needs a configured
+summarizer model (400 otherwise).
+
+### CONFIRMED as documented (validates round-1)
+custom stdio MCP (namespaced `mcpsrv__magic_word`, gate+execute) · async inbox · OSEnvironment one
+ABC · mid-session **model** propagation (`claude-sonnet-4-6`, live `set_model`) · mid-session
+**effort** (None→high PATCH) · DENY 5-phase + short-circuit (`read_only_os` blocks the write) · ASK
+held-Future + **no keystrokes** · interrupt fencing (turn truncated mid-word + synthetic
+`[System: interrupted]` item; `session.interrupted` SSE-only) · SSE reconnect = heartbeat-first
+snapshot, no replay buffer, `[DONE]` on exit · native resume = history-rebuild + forwarder pattern
+(inject ×1 vs forwarder `POST /events` ×9-16, `/labels` ×7-10) · plain resume **preserves**
+`external_session_id` (switch **clears** it — asymmetry) · codex mid-session model persists (thread
+rebuild is code-only, no distinct span).
