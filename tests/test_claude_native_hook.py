@@ -2042,3 +2042,181 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
         result["hookSpecificOutput"]["permissionDecisionReason"]
         == native_policy_hook._EVAL_UNAVAILABLE_REASON
     )
+
+
+# ── #1782: bound the reattach spin-loop ────────────────────────────────────
+#
+# Before the fix, ``_post_hook_with_reattach`` re-POSTed on every 5xx/transport
+# failure until a one-day wall-clock deadline. Against a persistently down
+# server that meant re-driving the turn (and respawning harness/tool
+# subprocesses) every <=30s for 24h — the spin half of the zombie pileup. The
+# fix bounds CONSECUTIVE FAST failures while leaving a legitimately-held
+# long-poll (a slow human) untouched.
+
+
+def _counting_client(*, durations: list[float], monkeypatch: pytest.MonkeyPatch) -> type:
+    """Build an httpx.Client stub that fails N times with given durations.
+
+    Each POST raises ``ConnectError`` (a fast failure unless its scripted
+    duration says otherwise) and records the call. ``durations[i]`` is how long
+    attempt ``i`` "took" — simulated by advancing a fake clock, so tests run
+    instantly. A duration past the end of the list repeats the last value.
+
+    :param durations: Per-attempt simulated wall-clock seconds.
+    :param monkeypatch: Fixture used to install the fake clock + no-op sleep.
+    :returns: A drop-in ``httpx.Client`` class; its ``calls`` list counts POSTs.
+    """
+    clock = {"t": 0.0}
+    calls: list[str] = []
+
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _CountingClient:
+        calls: list[str] = []
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _CountingClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            i = len(calls)
+            calls.append(url)
+            dur = durations[i] if i < len(durations) else durations[-1]
+            clock["t"] += dur  # advance the fake clock by this attempt's cost
+            raise httpx.ConnectError("AP unreachable", request=httpx.Request("POST", url))
+
+    _CountingClient.calls = calls
+    return _CountingClient
+
+
+def test_reattach_bounds_consecutive_fast_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A down server no longer re-POSTs for a day (#1782 spin-loop).
+
+    Every attempt fails fast (near-zero duration), so the loop must give up
+    after ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` attempts and return ``None``
+    (caller fails-ask) — not spin until the day-long budget.
+    """
+    client = _counting_client(durations=[0.0], monkeypatch=monkeypatch)
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is None
+    assert len(client.calls) == claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES, (
+        "reattach must stop after the consecutive-fast-failure cap, not spin"
+    )
+
+
+def test_reattach_cap_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_HOOK_MAX_RETRIES`` tunes the fast-failure cap.
+
+    Operators fronting a flaky proxy can widen the budget. Re-import the
+    module under the env override so the module-level constant is recomputed.
+    """
+    import importlib
+
+    monkeypatch.setenv("OMNIGENT_HOOK_MAX_RETRIES", "3")
+    reloaded = importlib.reload(claude_native_hook)
+    try:
+        client = _counting_client(durations=[0.0], monkeypatch=monkeypatch)
+        monkeypatch.setattr(reloaded.httpx, "Client", client)
+
+        resp = reloaded._post_hook_with_reattach(
+            url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+            headers={},
+            payload={"hook_event_name": "PreToolUse"},
+            hook_label="permission",
+        )
+        assert resp is None
+        assert reloaded._PERMISSION_MAX_CONSECUTIVE_FAILURES == 3
+        assert len(client.calls) == 3
+    finally:
+        # Restore the module for other tests (monkeypatch unsets the env var,
+        # but the reloaded constant would persist without this).
+        monkeypatch.delenv("OMNIGENT_HOOK_MAX_RETRIES", raising=False)
+        importlib.reload(claude_native_hook)
+
+
+def test_reattach_held_poll_does_not_count_as_spin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A long-held poll (slow human) resets the fast-failure counter (#1782).
+
+    If the server holds the poll open for most of the read budget and only
+    then drops it, that is not a spin — the counter must reset so a genuine
+    approval wait is never capped. Script: ``cap + 2`` *slow* attempts (each
+    held ~the full budget → each resets the counter), then fast failures that
+    finally trip the cap and end the loop. If slow attempts were wrongly
+    counted, the loop would stop at ``cap`` calls; we assert it runs further,
+    proving held polls don't spin.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    slow = claude_native_hook._PERMISSION_TIMEOUT_S  # held ~full budget → "not a spin"
+    durations = [slow] * (cap + 2) + [0.0] * cap  # slow polls, then fast failures
+    client = _counting_client(durations=durations, monkeypatch=monkeypatch)
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is None
+    # It retried through all the slow (held) attempts without capping, only
+    # stopping once fast failures accumulated — proving slow polls don't spin.
+    assert len(client.calls) >= cap + 2, (
+        "a legitimately-held long-poll must not count toward the spin cap"
+    )
+    # And it did eventually stop (didn't run away): cap+2 resets + cap fast fails.
+    assert len(client.calls) <= (cap + 2) + cap
+
+
+def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 2xx on the first try returns immediately (no regression).
+
+    The spin-loop bound must not perturb the happy path: one successful POST
+    returns its response without retry.
+    """
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _OkClient:
+        calls = 0
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _OkClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            type(self).calls += 1
+            return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _OkClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None
+    assert resp.status_code == 200
+    assert _OkClient.calls == 1

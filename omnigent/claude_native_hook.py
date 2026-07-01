@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import sys
 import time
@@ -43,6 +44,14 @@ from omnigent.native_policy_hook import (
 # answers in the terminal). Kept in lockstep with the server-side
 # ``_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S`` and Claude Code's own
 # command-hook ``timeout`` so no single layer caps the wait early.
+#
+# NOTE: this bounds a SINGLE long-poll (a slow human), NOT the retry loop.
+# Re-POST attempts after a *failure* are bounded separately by
+# ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` — see :func:`_post_hook_with_reattach`.
+# Before #1782 the retry deadline was also one day, so a persistently
+# sick/unreachable server made the hook re-POST (each re-driving the turn and
+# respawning harness/tool subprocesses) every ≤30s for 24h — the spin-loop half
+# of the zombie pileup.
 _PERMISSION_TIMEOUT_S = 86400.0
 # First retry must land inside the server's re-park grace (proxies
 # sever idle long-polls); later retries back off.
@@ -51,6 +60,22 @@ _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 # Fail unreachable-server connects fast into the backoff loop instead
 # of inheriting the day-long read budget.
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
+# Cap on CONSECUTIVE fast failures (5xx / transport error) before the reattach
+# loop gives up and lets the caller fail-ask. A "fast failure" is one that
+# returns well before the long read budget — i.e. the server is sick or
+# unreachable, not holding the poll for a human. This is what bounds the
+# #1782 spin: without it, a down server re-POSTs for a full day. A genuinely
+# held long-poll (slow human) is NOT a failure and never counts toward this,
+# so raising a legitimate approval prompt is unaffected. Overridable for
+# operators who front a flaky proxy and want more slack.
+_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(
+    1, int(os.environ.get("OMNIGENT_HOOK_MAX_RETRIES", "8"))
+)
+# A failure that returns in less than this fraction of the read budget is
+# "fast" (server sick), so it counts toward the consecutive-failure cap. A
+# failure that took longer means the poll was actually held open — reset the
+# counter, since that is the server working as intended, not a spin.
+_PERMISSION_FAST_FAILURE_FRACTION = 0.5
 # Fail-fast budget for the synchronous ``/clear`` and ``/fork`` session
 # rotations that run inside the SessionStart hook to gate Claude's
 # welcome banner. Unlike the permission long-poll these are quick
@@ -532,8 +557,18 @@ def _post_hook_with_reattach(
     watches on a headless sub-agent. Re-POSTs with one stable
     ``_omnigent_elicitation_id`` so the server re-parks the SAME
     elicitation and can hand back a gap verdict via its pre-resolved
-    tombstone. Retries transport errors and 5xx within the
-    ``_PERMISSION_TIMEOUT_S`` budget; a 4xx is final.
+    tombstone. Retries transport errors and 5xx; a 4xx is final.
+
+    Retries are bounded by ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` *fast*
+    failures, NOT by wall-clock. A fast failure (one that returns well before
+    the read budget — server sick / unreachable) counts toward the cap; a
+    failure that only surfaced after the poll was held open for a while resets
+    the counter, because that is the server working as intended. This is the
+    #1782 fix: before it, the retry deadline was ``_PERMISSION_TIMEOUT_S`` (a
+    day), so a persistently down server re-POSTed — re-driving the turn and
+    respawning harness/tool subprocesses — every ≤30s for 24h. Bounding fast
+    failures stops the spin while leaving a slow human's single long-poll
+    (which is not a failure) completely untouched.
 
     :param url: Absolute hook endpoint URL, e.g.
         ``"http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request"``.
@@ -554,11 +589,15 @@ def _post_hook_with_reattach(
         **payload,
         "_omnigent_elicitation_id": f"elicit_claude_{secrets.token_hex(16)}",
     }
-    deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
+    # A failure faster than this means the server did not hold the poll — it is
+    # sick/unreachable, so the attempt counts toward the consecutive-failure cap.
+    fast_failure_threshold_s = _PERMISSION_TIMEOUT_S * _PERMISSION_FAST_FAILURE_FRACTION
     reauthed = False
+    consecutive_fast_failures = 0
     while True:
+        attempt_started = time.monotonic()
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=body)
@@ -599,9 +638,18 @@ def _post_hook_with_reattach(
                 f"omnigent {hook_label} hook: Omnigent request failed; retrying: {exc}",
                 file=sys.stderr,
             )
-        if time.monotonic() + backoff_s >= deadline:
+        # A poll that was held open for a while (server working, just slow) is
+        # not a spin — reset the counter. Only fast failures (server down)
+        # accumulate toward the cap that stops the #1782 re-POST storm.
+        if time.monotonic() - attempt_started >= fast_failure_threshold_s:
+            consecutive_fast_failures = 0
+        else:
+            consecutive_fast_failures += 1
+        if consecutive_fast_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
             print(
-                f"omnigent {hook_label} hook: retry budget exhausted",
+                f"omnigent {hook_label} hook: giving up after "
+                f"{consecutive_fast_failures} consecutive failures "
+                "(server unreachable) — failing ask",
                 file=sys.stderr,
             )
             return None
