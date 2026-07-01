@@ -9,12 +9,13 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -617,6 +618,14 @@ class HostProcess:
         self._watcher_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
+        # Number of host-owned ``subprocess`` operations (e.g. the git worktree
+        # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
+        # The orphan reaper skips its sweep while this is >0 so it never
+        # ``wait()``s a child that ``subprocess.run`` is about to reap itself —
+        # stealing it would corrupt that command's returncode to 0 (#1782).
+        # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
+        # because both the mutation and the reaper run on the event loop.
+        self._owned_subprocess_ops = 0
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -693,9 +702,45 @@ class HostProcess:
 
         :returns: Count of orphan (non-runner) processes reaped this sweep.
         """
+        if self._owned_subprocess_ops > 0:
+            # A host-owned subprocess (e.g. a git worktree command) is running
+            # in a worker thread. Its child is a DIRECT child of this process
+            # but NOT a tracked runner, so it is indistinguishable from an
+            # orphan to the reaper — reaping it would steal it from
+            # ``subprocess.run``'s own ``wait()`` and corrupt that command's
+            # returncode to 0 (CPython swallows the ECHILD and reports 0).
+            # Skip this sweep; a later one drains any real orphans once the op
+            # finishes. A worktree op can hold this off for up to
+            # ``_GIT_TIMEOUT_S`` (120s) per git command, so real orphans can
+            # linger that long in the rare case a runner dies mid-worktree-op —
+            # acceptable, since the leak this guards against accrues over hours,
+            # not a two-minute worst case.
+            return 0
         if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
             return self._reap_orphans_waitid()
         return self._reap_orphans_waitpid()
+
+    @contextlib.contextmanager
+    def _host_subprocess_op(self) -> Iterator[None]:
+        """Mark a host-owned ``subprocess`` operation as in flight.
+
+        Wrap any host-owned :mod:`subprocess` call (or the ``to_thread`` that
+        runs it) in this so the orphan reaper pauses and cannot ``wait()`` the
+        child out from under ``subprocess``'s own reaping — see
+        :meth:`_reap_orphans_once` for why that would corrupt the command's
+        exit code (#1782).
+
+        Increment/decrement run on the event loop (the reaper does too), so a
+        plain counter needs no lock. Re-entrant and exception-safe: the
+        decrement is in a ``finally``.
+
+        :returns: A context manager; the body runs with the reaper paused.
+        """
+        self._owned_subprocess_ops += 1
+        try:
+            yield
+        finally:
+            self._owned_subprocess_ops -= 1
 
     def _reap_orphans_waitid(self) -> int:
         """Peek-and-reap using ``os.waitid(WNOWAIT)`` (Linux/POSIX).
@@ -1398,12 +1443,17 @@ class HostProcess:
             success, or ``status: "failed"`` with an error message.
         """
         try:
-            created = await asyncio.to_thread(
-                create_worktree,
-                repo_path=frame.repo_path,
-                branch_name=frame.branch_name,
-                base_branch=frame.base_branch,
-            )
+            # Pause the orphan reaper: create_worktree runs git via
+            # subprocess.run, whose children are direct children of this host
+            # but not tracked runners — the reaper must not wait() them out
+            # from under subprocess (#1782).
+            with self._host_subprocess_op():
+                created = await asyncio.to_thread(
+                    create_worktree,
+                    repo_path=frame.repo_path,
+                    branch_name=frame.branch_name,
+                    base_branch=frame.base_branch,
+                )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
                 request_id=frame.request_id,
@@ -1436,12 +1486,15 @@ class HostProcess:
             ``status: "failed"`` with an error message.
         """
         try:
-            await asyncio.to_thread(
-                remove_worktree,
-                worktree_path=frame.worktree_path,
-                branch=frame.branch,
-                delete_branch=frame.delete_branch,
-            )
+            # Pause the orphan reaper while remove_worktree runs git — see
+            # _handle_create_worktree above and _reap_orphans_once (#1782).
+            with self._host_subprocess_op():
+                await asyncio.to_thread(
+                    remove_worktree,
+                    worktree_path=frame.worktree_path,
+                    branch=frame.branch,
+                    delete_branch=frame.delete_branch,
+                )
         except WorktreeError as exc:
             return HostRemoveWorktreeResultFrame(
                 request_id=frame.request_id,

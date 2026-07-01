@@ -882,6 +882,69 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     runner.wait()
 
 
+def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:
+    """The reaper must not reap a host-owned subprocess's child (#1782).
+
+    Regression for the Polly-flagged race: the host also spawns *direct*
+    children that are not tracked runners — the ``git`` commands in
+    :mod:`omnigent.host.git_worktree`, run via ``subprocess.run`` under
+    ``asyncio.to_thread`` from the worktree handlers. If the 2s reaper sweep
+    fires after such a git child has exited but before ``subprocess``'s own
+    ``wait()`` collects it, a blind reaper would ``waitpid`` it — and CPython
+    then swallows the resulting ``ECHILD`` and reports ``returncode == 0``,
+    silently turning a *failed* ``git worktree`` op into a success.
+
+    ``_host_subprocess_op`` pauses the reaper for exactly that window. Here a
+    ``sh -c 'exit 42'`` stands in for a failing git command: while the op is
+    marked in flight, ``_reap_orphans_once`` must be a no-op and must NOT
+    consume the child, so the owner still reads the true exit code 42.
+    """
+    host = _make_host_process()
+
+    # A host-owned subprocess (git stand-in) that FAILS with a distinctive
+    # code. NOT a tracked runner — indistinguishable from an orphan to a naive
+    # reaper.
+    proc = subprocess.Popen(["sh", "-c", "exit 42"])
+    # Let it exit so it is reapable (the dangerous window subprocess.run has
+    # between the child exiting and its internal wait()).
+    time.sleep(0.3)
+
+    with host._host_subprocess_op():
+        # Every sweep during the op must be a no-op — the reaper is paused.
+        for _ in range(5):
+            assert host._reap_orphans_once() == 0, "reaper ran during a host-owned op"
+            time.sleep(0.02)
+
+    # The owner still collects its child's TRUE exit code — not corrupted to 0.
+    assert proc.poll() == 42, "reaper stole the host-owned subprocess's exit code (#1782)"
+    proc.wait()
+
+
+def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> None:
+    """``_host_subprocess_op`` nests correctly and always rebalances (#1782).
+
+    The reaper resumes only when the counter returns to 0, and the decrement
+    must survive an exception in the guarded body (``finally``), or a raising
+    worktree op would wedge the reaper off permanently.
+    """
+    host = _make_host_process()
+    assert host._owned_subprocess_ops == 0
+
+    with host._host_subprocess_op():
+        assert host._owned_subprocess_ops == 1
+        with host._host_subprocess_op():  # re-entrant
+            assert host._owned_subprocess_ops == 2
+        assert host._owned_subprocess_ops == 1
+    assert host._owned_subprocess_ops == 0
+
+    # An exception inside the guarded body must still rebalance the counter.
+    with pytest.raises(RuntimeError):
+        with host._host_subprocess_op():
+            assert host._owned_subprocess_ops == 1
+            raise RuntimeError("worktree op blew up")
+    assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
+
+
 def test_install_child_subreaper_is_safe_to_call() -> None:
     """``_install_child_subreaper`` never raises and reports a bool.
 
