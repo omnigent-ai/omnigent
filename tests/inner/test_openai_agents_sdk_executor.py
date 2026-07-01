@@ -1795,8 +1795,8 @@ def test_get_openai_client_missing_databricks_sdk_with_env_falls_through(monkeyp
     the function should log a warning and return a client configured from the
     env vars — not crash.
 
-    Regression test: a missing/invalid config must degrade to env-var
-    defaults with a warning, not crash.
+    Regression test: a missing ``databricks-sdk`` must degrade to the
+    env-var client with a warning, not crash.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log capture fixture.

@@ -4878,7 +4878,7 @@ def _codex_tool_call_from_item(item: dict[str, Any]) -> _CodexToolCall | None:
 # that sandbox cannot start and every command hard-fails with this raw bwrap
 # error, with no hint at how to recover. Detect the marker and append actionable
 # guidance so a top-level session degrades with direction instead of an opaque
-# failure (degrade with direction instead of crashing). The codex
+# failure. The codex
 # ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
 # access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
 _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
