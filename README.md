@@ -281,8 +281,12 @@ the OpenAI-compatible `…/api/v1`.
 <summary>Databricks model endpoints (pin serving endpoints or UC model services)</summary>
 
 A **Databricks** credential resolves its models from the workspace (via
-ucode state) by default. To pin specific endpoints, give the provider entry
-an optional `models:` map in `~/.omnigent/config.yaml`:
+ucode state) by default. `omnigent setup` can pin specific endpoints for
+you: open the Databricks credential under **Claude** or **Pi** and choose
+**Choose model endpoints** — it lists the workspace's Claude serving
+endpoints and your Unity Catalog model services per tier (free-text entry
+covers anything unlisted). The picker writes the provider entry's optional
+`models:` map in `~/.omnigent/config.yaml`, which you can also edit by hand:
 
 ```yaml
 providers:

@@ -669,6 +669,9 @@ def _entry_models_summary(entry: ProviderEntry) -> str:
     if entry.kind == SUBSCRIPTION_KIND:
         return f"via {entry.cli} CLI"
     if entry.kind == DATABRICKS_KIND:
+        if entry.models:
+            plural = "s" if len(entry.models) != 1 else ""
+            return f"profile: {entry.profile} · {len(entry.models)} model override{plural}"
         return f"profile: {entry.profile}"
     if entry.kind == CLI_CONFIG_KIND:
         return f"~/.{entry.cli}/config.toml: {entry.model_provider}"
@@ -927,12 +930,20 @@ def build_gateway_provider_entry(
     return body
 
 
-def build_databricks_provider_entry(profile: str) -> dict[str, object]:
+def build_databricks_provider_entry(
+    profile: str, models: dict[str, str] | None = None
+) -> dict[str, object]:
     """Build a ``kind: databricks`` provider entry body.
 
     :param profile: The Databricks profile name from
         ``~/.databrickscfg``, e.g. ``"oss"``.
+    :param models: Optional tier→model overrides from the endpoint picker,
+        e.g. ``{"default": "main.agents.my-opus-endpoint"}``. ``None`` /
+        empty omits the ``models:`` key (ucode-driven resolution).
     :returns: A provider entry body, e.g.
         ``{"kind": "databricks", "profile": "oss"}``.
     """
-    return {"kind": DATABRICKS_KIND, "profile": profile}
+    entry: dict[str, object] = {"kind": DATABRICKS_KIND, "profile": profile}
+    if models:
+        entry["models"] = dict(models)
+    return entry

@@ -8976,10 +8976,33 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # Wipe the verbose login + ucode output so the menu we return to (with a
         # "✓ Added databricks" status) renders on a clean screen.
         clear_screen()
+        # Optional per-tier model endpoint overrides (the entry's models:
+        # map). Default is the ucode-managed gateway models; the picker is
+        # for pinning specific serving endpoints / UC model services. Esc
+        # keeps the defaults — never aborts the add (the login + ucode
+        # configure above already succeeded). Skipped on the Codex page:
+        # the map's tiers feed the gateway's Anthropic surface exclusively,
+        # while codex resolves its models from ucode's ``codex_models``.
+        endpoint_models: dict[str, str] = {}
+        if family != OPENAI_FAMILY:
+            endpoint_choice = select(
+                "Model endpoints",
+                [
+                    "Use the workspace defaults (recommended)",
+                    "Choose custom model endpoints",
+                ],
+                descriptions=[
+                    "Route through the models ucode configured for this workspace.",
+                    "Pin a serving endpoint or UC model service per model tier.",
+                ],
+                clear_on_exit=True,
+            )
+            if endpoint_choice == 1:
+                endpoint_models = _pick_databricks_models(profile, {})
         # Databricks name is fixed — no prompt. The provider keys on the
         # profile; runtime resolves profile → workspace URL → ucode state.
         name = "databricks"
-        entry = build_databricks_provider_entry(profile)
+        entry = build_databricks_provider_entry(profile, models=endpoint_models)
 
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.provider_config import (
@@ -9023,6 +9046,195 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         labels = " · ".join(family_label(f) for f in became_default)
         return f"✓ Added {name} — default for {labels}"
     return f"✓ Added {name}"
+
+
+# The model tiers the Databricks endpoint picker prompts for, in order:
+# (config key, human label for the menu title, what the tier drives). These
+# are the ``models:`` keys the runtime consumes — the keys are fixed schema
+# (they mirror ucode's ``claude_models`` tiers plus the FamilyConfig-style
+# ``default``), so only the labels are presentation. ``fable`` stays
+# hand-editable in ~/.omnigent/config.yaml rather than prompted.
+_DATABRICKS_MODEL_TIERS: list[tuple[str, str, str]] = [
+    (
+        "default",
+        "session launch model",
+        "What Claude / Pi sessions launch with when the agent pins no model — "
+        "the one tier every Claude-surface harness uses.",
+    ),
+    (
+        "opus",
+        "Claude Code's Opus alias",
+        "What a native Claude Code session runs when it asks for its Opus tier "
+        "(plan mode, /model, sub-agents pinning model: opus).",
+    ),
+    (
+        "sonnet",
+        "Claude Code's Sonnet alias",
+        "What a native Claude Code session runs when it asks for its Sonnet tier.",
+    ),
+    (
+        "haiku",
+        "Claude Code's Haiku alias",
+        "What a native Claude Code session runs for its fast/background Haiku "
+        "tier (lightweight helper calls).",
+    ),
+]
+
+
+def _pick_databricks_models(profile: str, current: dict[str, str]) -> dict[str, str]:
+    """Run the per-tier Databricks model-endpoint picker.
+
+    For each tier in :data:`_DATABRICKS_MODEL_TIERS` (default / opus /
+    sonnet / haiku) shows one grouped menu with two sections (every tier
+    feeds the gateway's Anthropic surface, which rejects other endpoints,
+    so both listings are Claude-scoped):
+
+    - **Databricks-hosted Claude models** — the workspace's Claude chat
+      serving endpoints the caller can query (best-effort — see
+      :func:`~omnigent.onboarding.databricks_config.list_claude_serving_endpoint_names`).
+    - **Custom endpoints (Unity Catalog)** — the caller's UC model
+      services (Beta securables, best-effort — see
+      :func:`~omnigent.onboarding.databricks_config.list_claude_model_service_fqns`),
+      plus a free-text row for FQNs the listing missed (e.g. a
+      just-created service, or when the Beta API is unavailable).
+
+    The leading keep/skip row advances to the next tier unchanged; a
+    ``Clear override`` row (shown only when the tier has one) removes it.
+    Esc backs out of the picker entirely — picks already made on earlier
+    tiers are kept.
+
+    :param profile: The ``~/.databrickscfg`` profile whose workspace is
+        listed, e.g. ``"oss"``.
+    :param current: The entry's existing tier→model map; not modified.
+    :returns: The updated tier→model map (equal to *current* when every
+        tier was skipped).
+    """
+    from omnigent.onboarding.databricks_config import (
+        claude_context_window,
+        list_claude_endpoints,
+    )
+    from omnigent.onboarding.interactive import console, prompt_text, select
+
+    def _endpoint_row(name: str) -> tuple[str, str, str]:
+        """Build a (label, description, action) endpoint row.
+
+        Displays the model family's max context window for transparency,
+        and pins 1M-capable endpoints at that window by storing the
+        ``[1m]``-suffixed id (Claude Code's long-context convention; the
+        pi producer strips it). Free-text entries stay verbatim — the
+        pin applies only to picked rows, whose family the name reveals.
+        """
+        window = claude_context_window(name)
+        if window == "1M":
+            return (
+                f"{name}  ·  1M context",
+                "Pinned at the 1M-token context window ([1m]).",
+                f"{name}[1m]",
+            )
+        if window == "200K":
+            return (f"{name}  ·  200K context", "This model family caps at 200K tokens.", name)
+        return (name, "Context window unknown from the name — stored verbatim.", name)
+
+    # The two listings take a couple of seconds (an OAuth handshake plus the
+    # permission / detail sweeps) — show progress rather than a frozen prompt.
+    with console.status("Loading this workspace's Claude model endpoints…"):
+        hosted, custom = list_claude_endpoints(profile)
+    if not hosted and not custom:
+        console.print(
+            "  [dim]Could not list this workspace's Claude endpoints — enter "
+            "endpoint names manually (e.g. a UC model service's "
+            "catalog.schema.name).[/dim]"
+        )
+    console.print(
+        "  [dim]Each tier is optional — Skip keeps the workspace default for "
+        "that tier; Esc finishes.[/dim]"
+    )
+    models = dict(current)
+    for tier, tier_label, tier_help in _DATABRICKS_MODEL_TIERS:
+        # (label, description, action) rows. ``None`` marks a section header;
+        # the ``:``-prefixed controls cannot collide with endpoint names
+        # (endpoint names and UC FQNs never contain a colon); anything else
+        # is the endpoint name the row picks.
+        keep_label = (
+            f"Keep {models[tier]}" if tier in models else "Skip — use the workspace default"
+        )
+        entries: list[tuple[str, str, str | None]] = [(keep_label, tier_help, ":skip")]
+        if tier in models:
+            entries.append(
+                (
+                    "Clear override — use the workspace default",
+                    "Remove this tier's override from ~/.omnigent/config.yaml.",
+                    ":clear",
+                )
+            )
+        if hosted:
+            entries.append(("Databricks-hosted Claude models", "", None))
+            entries.extend(_endpoint_row(name) for name in hosted)
+        entries.append(("Custom endpoints (Unity Catalog)", "", None))
+        entries.extend(_endpoint_row(name) for name in custom)
+        entries.append(
+            (
+                "Enter an endpoint name…",
+                "Type a UC model service's catalog.schema.name (e.g. one created moments ago).",
+                ":free",
+            )
+        )
+
+        idx = select(
+            f"Model endpoint · {tier} ({tier_label})",
+            [label for label, _, _ in entries],
+            descriptions=[desc for _, desc, _ in entries],
+            selectable=[action is not None for _, _, action in entries],
+            clear_on_exit=True,
+            max_visible=14,
+        )
+        if idx < 0:  # Esc — back out of the picker; earlier tier picks stay
+            break
+        action = entries[idx][2]
+        if action is None or action == ":skip":  # header rows are unreachable
+            continue
+        if action == ":clear":
+            models.pop(tier, None)
+            continue
+        if action == ":free":
+            value = prompt_text(f"{tier} endpoint name (e.g. catalog.schema.endpoint)").strip()
+            if value:
+                models[tier] = value
+            continue
+        models[tier] = action
+    return models
+
+
+def _configure_databricks_models(provider: str, entry: ProviderEntry) -> str | None:
+    """Run the endpoint picker for an existing databricks provider and persist.
+
+    Opened from the credential's level-3 menu (``Choose model endpoints``).
+    Rewrites only the entry's ``models:`` key — an emptied map drops the key
+    so the entry round-trips to its pre-override shape.
+
+    :param provider: The provider id, e.g. ``"databricks"``.
+    :param entry: The parsed entry (kind ``databricks``).
+    :returns: A status line for the level-2 menu, or ``None`` when nothing
+        changed. Side effect: writes ``~/.omnigent/config.yaml``.
+    """
+    if not entry.profile:
+        return None
+    models = _pick_databricks_models(entry.profile, dict(entry.models))
+    if models == entry.models:
+        return None
+    cfg = _load_global_config()
+    block = cfg.get("providers")
+    raw = block.get(provider) if isinstance(block, dict) else None
+    if not isinstance(block, dict) or not isinstance(raw, dict):
+        return None
+    if models:
+        raw["models"] = models
+    else:
+        raw.pop("models", None)
+    _save_global_config({"providers": block})
+    if not models:
+        return f"✓ Cleared model endpoints for {provider}"
+    return f"✓ Set model endpoints for {provider} ({', '.join(sorted(models))})"
 
 
 def _adopt_detected_providers() -> list[str]:
@@ -10445,7 +10657,9 @@ def _manage_credential(provider: str, family: str) -> str | None:
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
+        ANTHROPIC_FAMILY,
         DATABRICKS_KIND,
+        PI_SURFACE,
         SUBSCRIPTION_KIND,
         load_providers,
         surface_default_provider,
@@ -10468,6 +10682,15 @@ def _manage_credential(provider: str, family: str) -> str | None:
                 f"Make default for {family_label(family)}", action="set_default", provider=provider
             )
         )
+    # A databricks provider's models resolve from ucode state unless the
+    # entry pins per-tier endpoint overrides in its ``models:`` map — offer
+    # the picker that edits that map. Only on the Anthropic-surface pages
+    # (Claude / Pi): the map's tiers feed the gateway's Anthropic surface
+    # exclusively, while codex-family harnesses resolve their models from
+    # ucode's ``codex_models`` — offering Claude endpoints there would pin
+    # models codex cannot use.
+    if entry.kind == DATABRICKS_KIND and family in (ANTHROPIC_FAMILY, PI_SURFACE):
+        rows.append(_HarnessMenuRow("Choose model endpoints", action="models", provider=provider))
     rows.append(_HarnessMenuRow("Remove", action="remove", provider=provider))
     rows.append(_HarnessMenuRow("← Back", action="back"))
 
@@ -10479,6 +10702,8 @@ def _manage_credential(provider: str, family: str) -> str | None:
         return None
     if row.action == "set_default":
         return _set_harness_default(provider, family)
+    if row.action == "models":
+        return _configure_databricks_models(provider, entry)
     # A subscription's credential lives in the harness CLI's own auth file, not
     # our config — so removing it means signing out of that CLI (otherwise the
     # login persists and ambient detection re-adopts it on the next open).
