@@ -40,6 +40,9 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
     TurnComplete,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
@@ -266,6 +269,10 @@ class QwenExecutor(Executor):
         # to allow. See _decide_permission.
         self._policy_evaluator: Any | None = None  # type: ignore[explicit-any]
         self._elicitation_handler: Any | None = None  # type: ignore[explicit-any]
+
+        # ToolCall records for delegated fs ops; run_turn drains them onto the
+        # turn stream so the I/O shows in history.
+        self._fs_events: list[ExecutorEvent] = []
 
     # ------------------------------------------------------------------
     # Low-level ACP helpers
@@ -700,18 +707,65 @@ class QwenExecutor(Executor):
             self._os_environment = env
         return self._os_environment
 
+    async def _fs_content_policy_denies(self, tool_name: str, content: str) -> bool:
+        """Result-phase content policy on a delegated fs op's bytes.
+
+        Returns True on an explicit ``POLICY_ACTION_DENY``; fails open otherwise
+        (``PHASE_TOOL_RESULT`` is advisory). Content-only: the round-trip carries
+        no ``request_data``, so the policy can't see which fs tool ran.
+        """
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        if policy_eval is None:
+            return False
+        try:
+            verdict = await policy_eval("PHASE_TOOL_RESULT", {"result": content})
+        except Exception as exc:  # noqa: BLE001 — result phase fails open
+            logger.warning("qwen TOOL_RESULT policy eval failed for %s: %s", tool_name, exc)
+            return False
+        return getattr(verdict, "action", None) == "POLICY_ACTION_DENY"
+
+    def _record_fs_op(  # type: ignore[explicit-any]
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        status: ToolCallStatus,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        """Buffer a paired ToolCallRequest + ToolCallComplete for a delegated fs op.
+
+        run_turn drains :attr:`_fs_events`; the adapter renders the pair as
+        observed function_call / function_call_output history items.
+        """
+        call_id = f"fsacp_{secrets.token_hex(8)}"
+        self._fs_events.append(
+            ToolCallRequest(name=tool_name, args=args, metadata={"call_id": call_id})
+        )
+        self._fs_events.append(
+            ToolCallComplete(
+                name=tool_name,
+                status=status,
+                result=result,
+                error=error,
+                metadata={"call_id": call_id},
+            )
+        )
+
     async def _handle_fs_read(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
         """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
 
         ACP params: ``{path, line?, limit?}`` where ``line`` is a 1-based start
         line and ``limit`` a max line count (both optional → whole file). Maps
-        onto :meth:`OSEnvironment.read`'s ``offset`` / ``limit``.
+        onto :meth:`OSEnvironment.read`'s ``offset`` / ``limit``. The op is
+        recorded onto the turn stream, and the content runs through result-phase
+        policy before it reaches qwen.
 
         :param params: The request params.
         :returns: ``{"content": <text>}`` per the ACP response shape.
         :raises _AcpRequestError: On a missing path arg, a non-text/binary file,
-            or a read failure (mapped to ENOENT when it looks like a missing
-            file so qwen raises the right error to the model).
+            a read failure (mapped to ENOENT when it looks like a missing file),
+            or a content-policy denial.
         """
         path = params.get("path")
         if not isinstance(path, str) or not path:
@@ -720,28 +774,57 @@ class QwenExecutor(Executor):
         limit = params.get("limit")
         offset = line if isinstance(line, int) and line >= 1 else 1
         read_limit = limit if isinstance(limit, int) and limit >= 1 else None
+        args: dict[str, Any] = {"path": path}  # type: ignore[explicit-any]
+        if line is not None:
+            args["line"] = line
+        if limit is not None:
+            args["limit"] = limit
 
-        env = await self._ensure_os_environment()
-        result = await env.read(path, offset=offset, limit=read_limit)
-        if "error" in result:
-            message = str(result["error"])
-            code = _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
-            raise _AcpRequestError(code, message)
-        # A binary file comes back base64-encoded (or descriptor-only); ACP
-        # read_text_file is text-only, so refuse rather than hand back bytes.
-        if result.get("encoding") != "utf-8":
-            raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
-        return {"content": result.get("content", "")}
+        try:
+            env = await self._ensure_os_environment()
+            result = await env.read(path, offset=offset, limit=read_limit)
+            if "error" in result:
+                message = str(result["error"])
+                code = (
+                    _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
+                )
+                raise _AcpRequestError(code, message)
+            # A binary file comes back base64-encoded (or descriptor-only); ACP
+            # read_text_file is text-only, so refuse rather than hand back bytes.
+            if result.get("encoding") != "utf-8":
+                raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
+        except _AcpRequestError as exc:
+            self._record_fs_op(
+                "read_text_file", args, status=ToolCallStatus.ERROR, error=exc.message
+            )
+            raise
+
+        content = result.get("content", "")
+        if await self._fs_content_policy_denies("read_text_file", content):
+            self._record_fs_op(
+                "read_text_file",
+                args,
+                status=ToolCallStatus.BLOCKED,
+                error="blocked by content policy",
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by content policy")
+        self._record_fs_op(
+            "read_text_file", args, status=ToolCallStatus.SUCCESS, result={"content": content}
+        )
+        return {"content": content}
 
     async def _handle_fs_write(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
         """Serve an ACP ``fs/write_text_file`` by writing through the OSEnvironment.
 
         ACP params: ``{path, content}``. The write goes through the helper, so
-        the spec's sandbox write roots are enforced at the Python layer.
+        the spec's sandbox write roots are enforced at the Python layer. The op
+        is recorded onto the turn stream, and result-phase policy runs before
+        the write so an explicit denial actually prevents it.
 
         :param params: The request params.
         :returns: An empty result object (ACP expects no payload on success).
-        :raises _AcpRequestError: On missing/invalid args or a write failure.
+        :raises _AcpRequestError: On missing/invalid args, a content-policy
+            denial, or a write failure.
         """
         path = params.get("path")
         content = params.get("content")
@@ -749,11 +832,27 @@ class QwenExecutor(Executor):
             raise _AcpRequestError(-32602, "fs/write_text_file requires a string 'path'")
         if not isinstance(content, str):
             raise _AcpRequestError(-32602, "fs/write_text_file requires string 'content'")
+        args: dict[str, Any] = {"path": path, "content": content}  # type: ignore[explicit-any]
 
-        env = await self._ensure_os_environment()
-        result = await env.write(path, content)
-        if "error" in result:
-            raise _AcpRequestError(-32603, str(result["error"]))
+        if await self._fs_content_policy_denies("write_text_file", content):
+            self._record_fs_op(
+                "write_text_file",
+                args,
+                status=ToolCallStatus.BLOCKED,
+                error="blocked by content policy",
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by content policy")
+        try:
+            env = await self._ensure_os_environment()
+            result = await env.write(path, content)
+            if "error" in result:
+                raise _AcpRequestError(-32603, str(result["error"]))
+        except _AcpRequestError as exc:
+            self._record_fs_op(
+                "write_text_file", args, status=ToolCallStatus.ERROR, error=exc.message
+            )
+            raise
+        self._record_fs_op("write_text_file", args, status=ToolCallStatus.SUCCESS)
         return {}
 
     @staticmethod
@@ -1160,6 +1259,10 @@ class QwenExecutor(Executor):
             if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
                 await self._respond_to_agent_request(stale)
 
+        # Stale ops answered above belong to the prior turn; start this turn's
+        # fs-event buffer clean so only ops handled in the loop below record.
+        self._fs_events.clear()
+
         # Send the turn — this is a JSON-RPC *request*, so we wait for
         # both streaming notifications AND the final response.
         self._rpc_id += 1
@@ -1271,6 +1374,10 @@ class QwenExecutor(Executor):
                 # permission goes through policy + elicitation; anything else
                 # gets method-not-found. Blocks while the human decides.
                 await self._respond_to_agent_request(notification)
+                # Surface any fs ToolCall events the handler buffered so the
+                # I/O shows in history.
+                while self._fs_events:
+                    yield self._fs_events.pop(0)
 
             # Inbound message = progress; reset the idle deadline. Runs after the
             # human-approval block above so a slow approval doesn't time out.
