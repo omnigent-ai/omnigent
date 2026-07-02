@@ -126,23 +126,21 @@ function App({ basename }: AppProps = {}) {
               defaults to Appearance. */}
           <Route path={`${prefix}/settings`} element={<SettingsPage />} />
           <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
-          {info.accounts_enabled && (
-            <>
-              {/* Members / Policies are now settings sub-categories
-                  (/settings/members, /settings/policies) so entering them
-                  keeps the settings sidebar nav instead of dropping back to
-                  the conversation list. Redirect the old standalone paths so
-                  existing bookmarks / links still land in the right place. */}
-              <Route
-                path={`${prefix}/members`}
-                element={<Navigate to={`${prefix}/settings/members`} replace />}
-              />
-              <Route
-                path={`${prefix}/policies`}
-                element={<Navigate to={`${prefix}/settings/policies`} replace />}
-              />
-            </>
-          )}
+          {/* Members / Policies are now settings sub-categories
+              (/settings/members, /settings/policies) so entering them
+              keeps the settings sidebar nav instead of dropping back to
+              the conversation list. Redirect the old standalone paths so
+              existing bookmarks / links still land in the right place.
+              Registered in every multi-user mode (accounts AND OIDC) —
+              the sections self-gate to admins. */}
+          <Route
+            path={`${prefix}/members`}
+            element={<Navigate to={`${prefix}/settings/members`} replace />}
+          />
+          <Route
+            path={`${prefix}/policies`}
+            element={<Navigate to={`${prefix}/settings/policies`} replace />}
+          />
           <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
         </Route>
       </Routes>

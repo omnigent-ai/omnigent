@@ -72,10 +72,8 @@ def test_native_coding_agent_resolves() -> None:
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.native_coding_agents import (
-        HERMES_NATIVE_CODING_AGENT,
-        native_coding_agent_for_harness,
-    )
+    from omnigent.harness_plugins import HERMES_NATIVE_CODING_AGENT
+    from omnigent.native_coding_agents import native_coding_agent_for_harness
 
     agent = native_coding_agent_for_harness("native-hermes")
     assert agent is HERMES_NATIVE_CODING_AGENT

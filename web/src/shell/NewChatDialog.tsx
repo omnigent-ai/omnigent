@@ -62,7 +62,7 @@ import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
@@ -1092,10 +1092,12 @@ function BrainHarnessOptions({
   value,
   onValueChange,
   host,
+  labels,
 }: {
   value: string;
   onValueChange: (harness: string) => void;
   host: Host | undefined | null;
+  labels: Record<string, string>;
 }) {
   return (
     <>
@@ -1103,7 +1105,7 @@ function BrainHarnessOptions({
         Agent Harness
       </div>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
-        {Object.entries(BRAIN_HARNESS_LABELS).map(([id, label]) => (
+        {Object.entries(labels).map(([id, label]) => (
           <DropdownMenuRadioItem
             key={id}
             value={id}
@@ -1218,6 +1220,7 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
 function AgentHarnessPicker({
   agentEntries,
   harnessEntries,
+  brainHarnessLabels,
   effectiveAgentId,
   agentLabel,
   hasAgents,
@@ -1244,6 +1247,7 @@ function AgentHarnessPicker({
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
+  brainHarnessLabels: Record<string, string>;
   effectiveAgentId: string | null;
   agentLabel: string;
   hasAgents: boolean;
@@ -1294,7 +1298,7 @@ function AgentHarnessPicker({
     nativeAgentHasCapability(agent, "permissionMode") ||
     nativeAgentHasCapability(agent, "approvalMode") ||
     nativeAgentHasCapability(agent, "cursorMode") ||
-    (agent.harness != null && agent.harness in BRAIN_HARNESS_LABELS);
+    (agent.harness != null && agent.harness in brainHarnessLabels);
 
   // The agent whose knobs page is open, resolved from the live entry lists so
   // it tracks renames / removals. `showMobileKnobs` gates the page: false on
@@ -1445,7 +1449,7 @@ function AgentHarnessPicker({
     }
     // Bundle / custom agent with an overridable brain harness.
     const defaultHarness =
-      agent.harness != null && agent.harness in BRAIN_HARNESS_LABELS ? agent.harness : null;
+      agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
     if (defaultHarness) {
       const value = isSelected ? (pickedHarness ?? defaultHarness) : defaultHarness;
       return (
@@ -1458,6 +1462,7 @@ function AgentHarnessPicker({
             setPickedHarness(h === defaultHarness ? null : h);
           }}
           host={host}
+          labels={brainHarnessLabels}
         />
       );
     }
@@ -1688,6 +1693,7 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
+  const brainHarnessLabels = useBrainHarnessLabels();
   const { data: hosts } = useHosts();
   // Sessions the caller can access, to warn when a new session would share a
   // working directory with a live one (see the conflict tooltip below).
@@ -2024,17 +2030,20 @@ export function NewChatLandingScreen() {
       ? PENDING_AGENT_ID
       : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
         null);
-  const selectedAgent =
-    effectiveAgentId === PENDING_AGENT_ID && pendingAgent
-      ? ({
-          id: PENDING_AGENT_ID,
-          name: pendingAgent.name,
-          display_name: pendingAgent.name,
-          description: pendingAgent.description ?? null,
-          harness: pendingAgent.harness ?? null,
-          skills: [],
-        } satisfies AvailableAgent)
-      : agentList.find((a) => a.id === effectiveAgentId);
+  const selectedAgent = useMemo(
+    () =>
+      effectiveAgentId === PENDING_AGENT_ID && pendingAgent
+        ? ({
+            id: PENDING_AGENT_ID,
+            name: pendingAgent.name,
+            display_name: pendingAgent.name,
+            description: pendingAgent.description ?? null,
+            harness: pendingAgent.harness ?? null,
+            skills: [],
+          } satisfies AvailableAgent)
+        : agentList.find((a) => a.id === effectiveAgentId),
+    [agentList, effectiveAgentId, pendingAgent],
+  );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -2872,6 +2881,7 @@ export function NewChatLandingScreen() {
                 <AgentHarnessPicker
                   agentEntries={agentEntries}
                   harnessEntries={harnessEntries}
+                  brainHarnessLabels={brainHarnessLabels}
                   effectiveAgentId={effectiveAgentId}
                   agentLabel={agentLabel}
                   hasAgents={agentList.length > 0}

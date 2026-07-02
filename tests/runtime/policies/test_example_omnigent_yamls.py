@@ -6,8 +6,7 @@ Complements :mod:`test_enforcement_integration`, which loads
 pre-translated omnigent-native fixtures. The fixtures there
 are hand-maintained ports; any bug in the omnigent → omnigent
 adapter layer (e.g. ``condition: {}`` parse rejection,
-``match_tools`` → ``on:`` expansion, label-schema monotonic
-translation) slips past those tests. This module goes through
+``match_tools`` → ``on:`` expansion) slips past those tests. This module goes through
 :func:`omnigent.spec.load` — the same path ``omnigent run``
 uses — so the adapter is exercised on every run.
 
@@ -86,10 +85,10 @@ def _load_engine_from_yaml(
 
     Goes through :func:`omnigent.spec.load`, so the
     ``_omnigent_compat`` adapter runs on every call. A bug
-    there (condition parsing, match_tools expansion, label
-    monotonic translation) will surface at ``load()`` time
-    and fail the test at fixture setup — exactly where a
-    regression in the adapter would show up in production.
+    there (condition parsing, match_tools expansion) will
+    surface at ``load()`` time and fail the test at fixture
+    setup — exactly where a regression in the adapter would
+    show up in production.
 
     :param yaml_path: Absolute path to the example YAML.
     :param store: Conversation store to back the engine's

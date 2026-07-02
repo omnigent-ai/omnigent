@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -76,12 +77,13 @@ def test_collect_without_base_uses_previous_final_tag(monkeypatch) -> None:
 # --- CLI guard rail ----------------------------------------------------------
 
 
-def test_cli_non_version_tag_without_base_errors(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(sys, "argv", ["generate.py", "--tag", "preview", "--repo", "o/o"])
+def test_cli_non_version_ref_without_base_errors(monkeypatch, capsys) -> None:
+    # A non-version ref (branch/sha) can't be ordered and has no default range.
+    monkeypatch.setattr(sys, "argv", ["generate.py", "--tag", "ci-test", "--repo", "o/o"])
     with pytest.raises(SystemExit) as exc:
         gen.main()
     assert exc.value.code != 0
-    assert "not a final vX.Y.Z" in capsys.readouterr().err
+    assert "not a PEP 440 version" in capsys.readouterr().err
 
 
 # --- pr_numbers_from_subjects ------------------------------------------------
@@ -243,6 +245,33 @@ def test_insert_is_idempotent_and_replaces() -> None:
     doc = gen.insert_section(_SEED, "v0.3.0", _section("v0.3.0", "2026-06-27", "old"))
     doc = gen.insert_section(doc, "v0.3.0", _section("v0.3.0", "2026-06-27", "new"))
     assert doc.count("[v0.3.0]") == 1
+    assert "new (#1)" in doc and "old (#1)" not in doc
+
+
+def test_insert_prerelease_orders_by_pep440_and_coexists() -> None:
+    # A dev tag lands above the previous final; the eventual final sorts above the
+    # dev; an rc sits between them. All three (final/rc/dev) coexist as blocks.
+    doc = gen.insert_section(_SEED, "v0.3.0", _section("v0.3.0", "2026-06-26", "three"))
+    doc = gen.insert_section(doc, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "dev"))
+    doc = gen.insert_section(doc, "v0.4.0", _section("v0.4.0", "2026-07-10", "final"))
+    doc = gen.insert_section(doc, "v0.4.0rc1", _section("v0.4.0rc1", "2026-07-08", "rc"))
+    headers = re.findall(r"(?m)^## \[([^\]]+)\]", doc)
+    assert headers == ["v0.4.0", "v0.4.0rc1", "v0.4.0dev0", "v0.3.0"]
+
+
+def test_insert_final_and_dev_are_distinct_blocks() -> None:
+    # v0.4.0 must NOT overwrite v0.4.0dev0 (no collapse of dev → final).
+    doc = gen.insert_section(_SEED, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "dev"))
+    doc = gen.insert_section(doc, "v0.4.0", _section("v0.4.0", "2026-07-10", "final"))
+    assert doc.count("[v0.4.0dev0]") == 1
+    assert re.search(r"(?m)^## \[v0\.4\.0\]", doc) is not None
+    assert "dev (#1)" in doc and "final (#1)" in doc
+
+
+def test_insert_dev_tag_idempotent() -> None:
+    doc = gen.insert_section(_SEED, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "old"))
+    doc = gen.insert_section(doc, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "new"))
+    assert doc.count("[v0.4.0dev0]") == 1
     assert "new (#1)" in doc and "old (#1)" not in doc
 
 

@@ -24,7 +24,6 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate } from "@/lib/routing";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -44,13 +43,18 @@ import {
   type PasswordReset,
   createInvite,
   deleteUser,
-  getMe,
   listUsers,
   resetUserPassword,
 } from "@/lib/accountsApi";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 export function MembersPage() {
-  const navigate = useNavigate();
+  const info = useServerInfo();
+  // Password-based management (invite / reset / remove) only exists in
+  // accounts mode — OIDC identities are owned by the IdP, so under OIDC
+  // this page is a read-only user list (no action column, no modals).
+  const manageable = info !== "loading" && info.accounts_enabled;
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
   const [users, setUsers] = useState<AccountListEntry[] | null>(null);
@@ -80,21 +84,24 @@ export function MembersPage() {
 
   // Initial load: identity probe + members list. The identity probe
   // gates the UI (non-admins see "no access"); the list is what we
-  // render the table from.
+  // render the table from. Uses the mode-agnostic `/v1/me` identity
+  // (via resolveIdentity) rather than the accounts-only `/auth/me`, so
+  // the page also works under OIDC where `/auth/me` doesn't exist.
   useEffect(() => {
     void (async () => {
-      const me = await getMe();
-      if (me === null) {
-        // Not authenticated — bounce to login. Shouldn't happen
-        // because identity.ts redirects on 401, but defensive.
-        navigate("/login", { replace: true });
+      const userId = await resolveIdentity();
+      if (userId === null) {
+        // Not authenticated — resolveIdentity already redirects to the
+        // provider's login URL when one exists (OIDC/accounts). Nothing
+        // more to do; leave the loading state.
         return;
       }
-      setMeId(me.id);
-      setMeIsAdmin(me.is_admin);
-      if (me.is_admin) await refresh();
+      setMeId(userId);
+      const isAdmin = getCurrentIsAdmin();
+      setMeIsAdmin(isAdmin);
+      if (isAdmin) await refresh();
     })();
-  }, [navigate, refresh]);
+  }, [refresh]);
 
   // Pre-admin-check render: blank loading state. min-h-full so the
   // AppShell's outlet container governs height — we're a child view,
@@ -165,10 +172,22 @@ export function MembersPage() {
     <PageScroll contentClassName="px-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Members</h1>
-        <Button onClick={() => setShowCreateInvite(true)}>
-          <UserPlusIcon /> Invite member
-        </Button>
+        {/* Invite mints a password-backed account — accounts mode only.
+        Under OIDC, accounts are provisioned by the IdP on first login, so
+        there's nothing to invite here. */}
+        {manageable && (
+          <Button onClick={() => setShowCreateInvite(true)}>
+            <UserPlusIcon /> Invite member
+          </Button>
+        )}
       </div>
+
+      {!manageable && (
+        <p className="mb-4 text-sm text-muted-foreground">
+          Users are provisioned automatically on first sign-in through your identity provider. This
+          list is read-only.
+        </p>
+      )}
 
       {loadError !== null && (
         <div
@@ -187,7 +206,7 @@ export function MembersPage() {
                 <th className="px-3 py-2 font-medium">Username</th>
                 <th className="px-3 py-2 font-medium">Role</th>
                 <th className="px-3 py-2 font-medium">Last login</th>
-                <th className="px-3 py-2 text-right font-medium">Actions</th>
+                {manageable && <th className="px-3 py-2 text-right font-medium">Actions</th>}
               </tr>
             </thead>
             <tbody>
@@ -210,28 +229,30 @@ export function MembersPage() {
                   <td className="px-3 py-2 align-middle text-muted-foreground">
                     {formatEpoch(u.last_login_at)}
                   </td>
-                  <td className="px-3 py-2 text-right">
-                    <div className="flex justify-end gap-1">
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        title="Reset password"
-                        onClick={() => void onResetPassword(u.id)}
-                        disabled={pendingAction || !u.has_password}
-                      >
-                        <KeyRoundIcon /> Reset
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        title="Remove user"
-                        onClick={() => setDeleteCandidate(u.id)}
-                        disabled={pendingAction || u.id === meId}
-                      >
-                        <Trash2Icon /> Remove
-                      </Button>
-                    </div>
-                  </td>
+                  {manageable && (
+                    <td className="px-3 py-2 text-right">
+                      <div className="flex justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          title="Reset password"
+                          onClick={() => void onResetPassword(u.id)}
+                          disabled={pendingAction || !u.has_password}
+                        >
+                          <KeyRoundIcon /> Reset
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          title="Remove user"
+                          onClick={() => setDeleteCandidate(u.id)}
+                          disabled={pendingAction || u.id === meId}
+                        >
+                          <Trash2Icon /> Remove
+                        </Button>
+                      </div>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>

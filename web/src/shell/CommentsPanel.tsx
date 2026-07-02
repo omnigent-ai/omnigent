@@ -87,6 +87,7 @@ export function CommentsPanel({
   const [body, setBody] = useState("");
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const selectedCardRef = useRef<HTMLDivElement>(null);
   const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
 
   // Editing or deleting a comment is author-only (the backend enforces this
@@ -117,6 +118,32 @@ export function CommentsPanel({
       return () => cancelAnimationFrame(id);
     }
   }, [activeSelection?.start_index, activeSelection?.end_index, comments]);
+
+  // Selecting a highlighted range in the file activates its comment; if that
+  // comment lives on the other tab, switch to the tab that holds it so its card
+  // is rendered (and can then be scrolled into view below).
+  useEffect(() => {
+    if (!activeSelection) return;
+    const matches = (c: Comment) =>
+      c.start_index === activeSelection.start_index && c.end_index === activeSelection.end_index;
+    if (tab === "open" && !comments.some(matches) && addressedComments.some(matches)) {
+      setTab("addressed");
+    } else if (tab === "addressed" && !addressedComments.some(matches) && comments.some(matches)) {
+      setTab("open");
+    }
+  }, [activeSelection, comments, addressedComments, tab]);
+
+  // Scroll the active comment's card into view within the panel, so selecting a
+  // highlight in the file reveals its card even when the list is long. rAF lets
+  // a tab switch render the card first. `block: nearest` avoids scrolling when
+  // it's already visible.
+  useEffect(() => {
+    if (!activeSelection) return;
+    const id = requestAnimationFrame(() =>
+      selectedCardRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }),
+    );
+    return () => cancelAnimationFrame(id);
+  }, [activeSelection, tab]);
 
   return (
     <div
@@ -242,20 +269,23 @@ export function CommentsPanel({
             </div>
           ) : (
             <div className="space-y-2 p-3">
-              {comments.map((c) => (
-                <CommentCard
-                  key={c.id}
-                  comment={c}
-                  isSelected={
-                    activeSelection?.start_index === c.start_index &&
-                    activeSelection?.end_index === c.end_index
-                  }
-                  onClick={() => onClickComment(c)}
-                  onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
-                  onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
-                  onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
-                />
-              ))}
+              {comments.map((c) => {
+                const isSelected =
+                  activeSelection?.start_index === c.start_index &&
+                  activeSelection?.end_index === c.end_index;
+                return (
+                  <CommentCard
+                    key={c.id}
+                    comment={c}
+                    isSelected={isSelected}
+                    cardRef={isSelected ? selectedCardRef : undefined}
+                    onClick={() => onClickComment(c)}
+                    onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
+                    onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
+                    onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+                  />
+                );
+              })}
             </div>
           )
         ) : addressedComments.length === 0 ? (
@@ -264,14 +294,21 @@ export function CommentsPanel({
           </div>
         ) : (
           <div className="space-y-2 p-3">
-            {addressedComments.map((c) => (
-              <CommentCard
-                key={c.id}
-                comment={c}
-                onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
-                onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
-              />
-            ))}
+            {addressedComments.map((c) => {
+              const isSelected =
+                activeSelection?.start_index === c.start_index &&
+                activeSelection?.end_index === c.end_index;
+              return (
+                <CommentCard
+                  key={c.id}
+                  comment={c}
+                  isSelected={isSelected}
+                  cardRef={isSelected ? selectedCardRef : undefined}
+                  onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
+                  onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+                />
+              );
+            })}
           </div>
         )}
       </div>
@@ -286,6 +323,8 @@ export function CommentsPanel({
 interface CommentCardProps {
   comment: Comment;
   isSelected?: boolean;
+  /** Set on the currently-selected card so the panel can scroll it into view. */
+  cardRef?: RefObject<HTMLDivElement | null>;
   onClick?: () => void;
   onEdit?: (body: string) => void;
   onDelete?: () => void;
@@ -295,6 +334,7 @@ interface CommentCardProps {
 function CommentCard({
   comment: c,
   isSelected,
+  cardRef,
   onClick,
   onEdit,
   onDelete,
@@ -355,6 +395,7 @@ function CommentCard({
 
   return (
     <div
+      ref={cardRef}
       className={cn(
         "rounded-lg border p-3 space-y-2 transition-colors",
         isSelected
