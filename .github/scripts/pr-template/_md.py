@@ -86,6 +86,10 @@ TYPE_TAGS: dict[str, str] = {
 }
 
 _PLACEHOLDER_RE = re.compile(r"^\s*<.*>\s*$")
+# Markers meaning "nothing to announce" — the section is optional and deletable,
+# but authors (and the old template's `skip` sentinel) still write these; treat
+# them as an absent section rather than leaking them in as literal entries.
+_OMIT_MARKERS = frozenset({"skip", "n/a", "na", "none", "-"})
 
 
 def is_placeholder(line: str) -> bool:
@@ -97,15 +101,17 @@ def changelog_description(section_raw: str) -> str:
     """First meaningful line of a "## Changelog" section.
 
     Strips HTML comments, then returns the first non-blank line — unless that
-    line is the ``<…>`` placeholder (author left it untouched), in which case the
-    section counts as absent and this returns ``""``. Multi-line / wrapped bodies
-    collapse to their first line.
+    line is the ``<…>`` placeholder or an omit marker (``skip``/``n/a``/…), in
+    which case the section counts as absent and this returns ``""``. Multi-line /
+    wrapped bodies collapse to their first line.
     """
     for raw in strip_html_comments(section_raw).splitlines():
         line = raw.strip()
         if not line:
             continue
-        return "" if is_placeholder(line) else line
+        if is_placeholder(line) or line.lower() in _OMIT_MARKERS:
+            return ""
+        return line
     return ""
 
 

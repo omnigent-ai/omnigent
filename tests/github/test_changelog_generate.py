@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[2] / ".github" / "scripts" / "changelog" / "generate.py"
 spec = importlib.util.spec_from_file_location("changelog_generate", SCRIPT)
 assert spec and spec.loader
@@ -32,6 +34,54 @@ def test_previous_final_tag_ignores_prereleases() -> None:
 
 def test_previous_final_tag_first_release() -> None:
     assert gen.previous_final_tag("v0.1.0", ["v0.1.0", "v0.1.0rc4"]) is None
+
+
+def test_previous_final_tag_skips_rc_between_finals() -> None:
+    # v0.2.0, v0.3.0rc0, v0.3.0 present → previous of v0.3.0 is v0.2.0 (rc ignored).
+    assert gen.previous_final_tag("v0.3.0", ["v0.2.0", "v0.3.0rc0", "v0.3.0"]) == "v0.2.0"
+
+
+# --- collect() base override -------------------------------------------------
+
+
+def _stub_io(monkeypatch, *, subjects: list[str], all_tags: list[str], date: str = "2026-07-02"):
+    """Stub the git/gh IO so collect() runs offline; records the range args seen."""
+    seen: list[tuple[str | None, str]] = []
+
+    def fake_range_subjects(prev, tag):
+        seen.append((prev, tag))
+        return subjects
+
+    monkeypatch.setattr(gen, "_all_tags", lambda: all_tags)
+    monkeypatch.setattr(gen, "_range_subjects", fake_range_subjects)
+    monkeypatch.setattr(gen, "_tag_date", lambda tag: date)
+    monkeypatch.setattr(gen, "_gh_pr_body", lambda repo, pr: None)
+    _stub_io.seen = seen
+
+
+def test_collect_uses_base_override_as_range_start(monkeypatch) -> None:
+    _stub_io(monkeypatch, subjects=[], all_tags=["v0.3.0"])
+    gen.collect("HEAD", "o/o", base="v0.3.0")
+    # Range start is the explicit base, NOT previous_final_tag (which would raise
+    # on the non-version "HEAD").
+    assert _stub_io.seen == [("v0.3.0", "HEAD")]
+
+
+def test_collect_without_base_uses_previous_final_tag(monkeypatch) -> None:
+    _stub_io(monkeypatch, subjects=[], all_tags=["v0.2.0", "v0.3.0rc0", "v0.3.0"])
+    gen.collect("v0.3.0", "o/o")
+    assert _stub_io.seen == [("v0.2.0", "v0.3.0")]
+
+
+# --- CLI guard rail ----------------------------------------------------------
+
+
+def test_cli_non_version_tag_without_base_errors(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["generate.py", "--tag", "preview", "--repo", "o/o"])
+    with pytest.raises(SystemExit) as exc:
+        gen.main()
+    assert exc.value.code != 0
+    assert "not a final vX.Y.Z" in capsys.readouterr().err
 
 
 # --- pr_numbers_from_subjects ------------------------------------------------
@@ -100,6 +150,14 @@ def test_harvest_placeholder_is_omitted() -> None:
 def test_harvest_deleted_section_is_omitted() -> None:
     result = gen.harvest_pr(123, _body(None))
     assert result.status == "omitted"
+
+
+@pytest.mark.parametrize("marker", ["skip", "n/a", "N/A", "none", "-"])
+def test_harvest_omit_markers_are_omitted(marker: str) -> None:
+    # Leftover `skip`/`n/a` (old template sentinel) must not leak in as an entry.
+    result = gen.harvest_pr(123, _body(marker))
+    assert result.status == "omitted"
+    assert result.description == ""
 
 
 def test_harvest_missing_body() -> None:

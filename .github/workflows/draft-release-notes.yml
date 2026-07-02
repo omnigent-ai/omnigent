@@ -29,9 +29,25 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Final release tag to (re)draft, e.g. v0.3.0
+        description: Release tag/ref to (re)draft (head of the range), e.g. v0.3.0
         required: true
         type: string
+      base:
+        description: >-
+          Optional range-start override (tag/branch/sha). Needed when `tag` is not
+          a final vX.Y.Z. Providing it makes the run a preview unless dry_run=false.
+        required: false
+        type: string
+      dry_run:
+        description: >-
+          Preview only — print the CHANGELOG section + draft notes to the run
+          summary, open no PR and edit no release. `auto` (default) previews when
+          `tag` is not a final vX.Y.Z or a base override is set, and does a real
+          run otherwise; `true`/`false` force the choice.
+        required: false
+        type: choice
+        options: [auto, "true", "false"]
+        default: auto
 
 permissions:
   contents: read
@@ -61,28 +77,52 @@ jobs:
         id: guard
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           # On tag push, workflow_run.head_branch is the tag name (v0.3.0).
           RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$RUN_BRANCH}"
-          proceed=true; is_draft=false
+          base="${INPUT_BASE:-}"
+          proceed=false; is_draft=false; dry_run=false
 
-          # Final vX.Y.Z only — exclude rc/dev/alpha/beta and non-version tags.
+          # Does the tag look like a final release (vX.Y.Z, not rc/dev/alpha/beta)?
+          is_version=true
           case "$tag" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) proceed=false ;;
+            *) is_version=false ;;
           esac
           case "$tag" in
-            *rc*|*dev*|*a[0-9]*|*b[0-9]*) proceed=false ;;
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_version=false ;;
           esac
 
-          # Is there a DRAFT release for this tag? If it's already published (or a
-          # re-push after publish re-fired this workflow), we must NOT touch the
-          # notes — the coordinator has curated them. The CHANGELOG PR is still
-          # safe to (re)open, so we track isDraft separately.
-          if [ "$proceed" = "true" ]; then
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            # Real release cut: strict — only a final version tag proceeds.
+            [ "$is_version" = "true" ] && proceed=true
+          else
+            # Manual dispatch: proceed for a final version tag OR when a base
+            # override is given (arbitrary-ref preview/real run).
+            if [ "$is_version" = "true" ] || [ -n "$base" ]; then
+              proceed=true
+            fi
+            # dry_run: `auto` previews for a non-version tag or a base override,
+            # and does a real run for a plain version tag; true/false force it.
+            case "$INPUT_DRY_RUN" in
+              true)  dry_run=true ;;
+              false) dry_run=false ;;
+              *)     if [ "$is_version" != "true" ] || [ -n "$base" ]; then dry_run=true; fi ;;
+            esac
+          fi
+
+          # For a real (non-dry) run, probe for a DRAFT release. If it's already
+          # published (or a re-push after publish re-fired this workflow), we must
+          # NOT touch the notes — the coordinator has curated them. The CHANGELOG
+          # PR is still safe to (re)open, so we track isDraft separately. Skipped
+          # in dry-run (a preview ref has no matching release).
+          if [ "$proceed" = "true" ] && [ "$dry_run" != "true" ]; then
             state="$(gh release view "$tag" --repo "$SOURCE_REPO" --json isDraft,tagName 2>/dev/null || true)"
             if [ -z "$state" ]; then
               echo "::warning::No release found for ${tag} yet — skipping note draft (CHANGELOG PR still runs)."
@@ -93,9 +133,11 @@ jobs:
           fi
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
           echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
           echo "is_draft=${is_draft}" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=${tag} proceed=${proceed} is_draft=${is_draft}" \
+          echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} base=${base:-<none>} proceed=${proceed} dry_run=${dry_run} is_draft=${is_draft}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Trusted default branch, full history + tags for the range computation.
@@ -121,15 +163,33 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.guard.outputs.tag }}
+          BASE: ${{ steps.guard.outputs.base }}
+          DRY_RUN: ${{ steps.guard.outputs.dry_run }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/changelog/generate.py \
-            --tag "$TAG" --repo "$SOURCE_REPO" \
-            --changelog-file CHANGELOG.md \
-            --draft-notes-out /tmp/mechanical_notes.md \
-            --pr-list-out /tmp/pr_list.txt
+          args=(--tag "$TAG" --repo "$SOURCE_REPO"
+                --draft-notes-out /tmp/mechanical_notes.md
+                --pr-list-out /tmp/pr_list.txt
+                --section-out /tmp/section.md)
+          [ -n "${BASE:-}" ] && args+=(--base "$BASE")
+          if [ "$DRY_RUN" = "true" ]; then
+            # Preview only — render, don't touch CHANGELOG.md.
+            args+=(--no-changelog-update)
+          else
+            args+=(--changelog-file CHANGELOG.md)
+          fi
+          python3 .github/scripts/changelog/generate.py "${args[@]}"
           # The mechanical scaffold is the fallback release-notes body.
           cp /tmp/mechanical_notes.md /tmp/release_notes.md
+
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "## Preview — CHANGELOG.md section for \`${TAG}\`"
+              echo '```markdown'; cat /tmp/section.md; echo '```'
+              echo "## Preview — mechanical draft notes"
+              echo '```markdown'; cat /tmp/mechanical_notes.md; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # --- 2) AI synthesis (primary; degrades to the mechanical scaffold) ---
       - name: Check LLM credentials
@@ -269,7 +329,7 @@ jobs:
       # --- 3) Mint the write-token — ONLY now, after the agent has run ---
       - name: Mint App token (omnigent)
         id: app-token
-        if: steps.guard.outputs.proceed == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
@@ -279,7 +339,7 @@ jobs:
 
       # --- 4) Open/update the CHANGELOG.md PR ---
       - name: Open or update the CHANGELOG.md PR
-        if: steps.guard.outputs.proceed == 'true' && steps.app-token.outputs.token != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.app-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SITE_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -339,7 +399,7 @@ jobs:
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Note draft skipped (already published)
-        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.is_draft != 'true'
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.guard.outputs.is_draft != 'true'
         env:
           TAG: ${{ steps.guard.outputs.tag }}
         run: |

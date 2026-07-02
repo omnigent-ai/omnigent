@@ -275,9 +275,16 @@ def _gh_pr_body(repo: str, pr: int) -> str | None:
     return proc.stdout
 
 
-def collect(tag: str, repo: str) -> tuple[str, list[HarvestResult], str | None]:
-    """Return (rendered_section, results, previous_tag) for *tag*."""
-    prev = previous_final_tag(tag, _all_tags())
+def collect(
+    tag: str, repo: str, base: str | None = None
+) -> tuple[str, list[HarvestResult], str | None]:
+    """Return (rendered_section, results, previous_tag) for *tag*.
+
+    *base* overrides the range start: when given, the harvest range is
+    ``base..tag`` verbatim (any refs — for manual/preview runs). Otherwise the
+    start is the previous final ``vX.Y.Z`` tag, as at release time.
+    """
+    prev = base or previous_final_tag(tag, _all_tags())
     subjects = _range_subjects(prev, tag)
     titles = pr_titles_from_subjects(subjects)
     results = [harvest_pr(pr, _gh_pr_body(repo, pr), title) for pr, title in titles.items()]
@@ -290,8 +297,14 @@ def collect(tag: str, repo: str) -> tuple[str, list[HarvestResult], str | None]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tag", required=True, help="final release tag, e.g. v0.3.0")
+    parser.add_argument("--tag", required=True, help="release tag/ref (head of the range)")
     parser.add_argument("--repo", required=True, help="owner/name for `gh pr view`")
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="override the range start (any ref); default is the previous final "
+        "vX.Y.Z tag. Required when --tag is not a final vX.Y.Z (e.g. a preview run).",
+    )
     parser.add_argument(
         "--changelog-file",
         default="CHANGELOG.md",
@@ -321,9 +334,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    section, results, prev = collect(args.tag, args.repo)
+    # CHANGELOG.md insertion orders blocks by version, so it needs a final
+    # vX.Y.Z tag. A non-version --tag (a preview/test ref) needs an explicit
+    # --base for the range and can only render, never insert.
+    is_version = _version_tuple(args.tag) is not None
+    if not is_version and args.base is None:
+        parser.error(
+            f"--tag {args.tag!r} is not a final vX.Y.Z tag; pass --base <ref> for its range"
+        )
 
-    if not args.no_changelog_update:
+    section, results, prev = collect(args.tag, args.repo, base=args.base)
+
+    if is_version and not args.no_changelog_update:
         path = Path(args.changelog_file)
         existing = path.read_text() if path.exists() else _SEED_CHANGELOG
         path.write_text(insert_section(existing, args.tag, section))
