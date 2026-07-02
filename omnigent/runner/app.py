@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -6013,6 +6014,115 @@ async def _auto_create_repl_terminal(
     return terminal_view
 
 
+async def _delete_native_bridge_dirs(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> None:
+    """
+    Remove any native-harness bridge dirs left behind by a session.
+
+    Each native harness keeps a per-conversation bridge dir under
+    ``/tmp/omnigent-<uid>/<harness>-native/<digest>`` (some use ``~/.omnigent``)
+    holding a bridge token / auth secret + MCP config — secret material. Closing
+    the pane does not remove it, so without this they accumulate even on a clean
+    session delete (issue #1350). We don't know which harness this session used,
+    so delete every candidate dir for all 11 native families
+    (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
+    the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
+    cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
+    Antigravity/claude/codex/opencode bridge ids can be rotated via a session
+    label, so resolve those too (falling back to *session_id*, the un-rotated key);
+    the remaining families key purely on *session_id*.
+
+    :param server_client: Omnigent server client used to resolve rotated bridge
+        id labels. ``None`` skips label resolution (session_id keys only).
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    """
+    from omnigent.antigravity_native_bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.antigravity_native_bridge import (
+        bridge_dir_for_bridge_id as antigravity_bridge_dir,
+    )
+    from omnigent.claude_native_bridge import (
+        BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.claude_native_bridge import (
+        bridge_dir_for_bridge_id as claude_bridge_dir,
+    )
+    from omnigent.codex_native_bridge import (
+        CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.codex_native_bridge import (
+        bridge_dir_for_bridge_id as codex_bridge_dir,
+    )
+    from omnigent.cursor_native_bridge import (
+        bridge_dir_for_session_id as cursor_bridge_dir,
+    )
+    from omnigent.goose_native_bridge import (
+        bridge_dir_for_session_id as goose_bridge_dir,
+    )
+    from omnigent.hermes_native_bridge import (
+        bridge_dir_for_session_id as hermes_bridge_dir,
+    )
+    from omnigent.kimi_native_bridge import (
+        bridge_dir_for_session_id as kimi_bridge_dir,
+    )
+    from omnigent.kiro_native_bridge import (
+        bridge_dir_for_session_id as kiro_bridge_dir,
+    )
+    from omnigent.opencode_native_bridge import (
+        OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.opencode_native_bridge import (
+        bridge_dir_for_bridge_id as opencode_bridge_dir,
+    )
+    from omnigent.pi_native_bridge import (
+        bridge_dir_for_session_id as pi_bridge_dir,
+    )
+    from omnigent.qwen_native_bridge import (
+        bridge_dir_for_session_id as qwen_bridge_dir,
+    )
+
+    labels: dict[str, str] = {}
+    if server_client is not None:
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+
+    targets = {
+        antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        antigravity_bridge_dir(session_id),
+        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
+        claude_bridge_dir(session_id),
+        codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        codex_bridge_dir(session_id),
+        cursor_bridge_dir(session_id),
+        goose_bridge_dir(session_id),
+        hermes_bridge_dir(session_id),
+        kimi_bridge_dir(session_id),
+        kiro_bridge_dir(session_id),
+        opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        opencode_bridge_dir(session_id),
+        pi_bridge_dir(session_id),
+        qwen_bridge_dir(session_id),
+    }
+    for target in targets:
+        try:
+            shutil.rmtree(target, ignore_errors=False)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _logger.debug(
+                "Failed to remove native bridge dir %s for session %s: %s",
+                target,
+                session_id,
+                exc,
+            )
+
+
 async def _claude_native_bridge_id_for_session(
     *,
     server_client: httpx.AsyncClient,
@@ -9819,6 +9929,14 @@ def create_runner_app(
 
         if process_manager is not None:
             await process_manager.release(session_id)
+
+        # Pane close above does not touch the SEPARATE native bridge dir, which
+        # holds the bridge token + MCP config; delete it so secret material does
+        # not accumulate under /tmp on a clean delete (issue #1350).
+        await _delete_native_bridge_dirs(
+            server_client=server_client,
+            session_id=session_id,
+        )
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
@@ -17967,6 +18085,17 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
+        # This is the runner endpoint the SERVER's session-delete actually
+        # drives (server delete_session -> DELETE /v1/sessions/{id}/resources),
+        # so the token-bearing native bridge dir must be removed here, not only
+        # in the bare delete_session route (issue #1350). Delete-only path:
+        # NOT done inside resource_registry.cleanup_session, because the
+        # agent-switch reset (reset_session_state) reuses cleanup_session while
+        # the session — and its bridge — lives on.
+        await _delete_native_bridge_dirs(
+            server_client=server_client,
+            session_id=session_id,
+        )
         return JSONResponse(
             status_code=200,
             content={
