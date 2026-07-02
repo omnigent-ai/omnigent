@@ -1886,6 +1886,106 @@ async def test_copy_files_self_source_is_rejected(
 
 
 @pytest.mark.asyncio
+async def test_copy_files_rejects_over_count_before_any_blob_read(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the file-count limit → 400, with NO blob reads and no copies.
+
+    The cap is enforced from metadata during validation, so a rejected
+    request must not call ``artifact_store.get`` even once — that is the
+    whole point of the bound (a rejected request never buffers a blob).
+    """
+    import omnigent.server.server_config as server_config
+
+    monkeypatch.setattr(server_config, "copy_file_count_limit", lambda: 2)
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"a")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"b")
+    f3 = await _upload_file(file_client, "conv_p", "c.txt", b"c")
+    before = file_store.list(session_id="conv_c").data
+
+    get_calls = {"n": 0}
+    real_get = artifact_store.get
+
+    def _counting_get(key: str) -> bytes:
+        get_calls["n"] += 1
+        return real_get(key)
+
+    artifact_store.get = _counting_get  # type: ignore[assignment]
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2, f3]},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    # No blob was read and nothing was copied.
+    assert get_calls["n"] == 0
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_over_total_bytes_before_any_blob_read(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the total-bytes limit → 400, with NO blob reads and no copies."""
+    import omnigent.server.server_config as server_config
+
+    monkeypatch.setattr(server_config, "copy_total_bytes_limit", lambda: 5)
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+    before = file_store.list(session_id="conv_c").data
+
+    get_calls = {"n": 0}
+    real_get = artifact_store.get
+
+    def _counting_get(key: str) -> bytes:
+        get_calls["n"] += 1
+        return real_get(key)
+
+    artifact_store.get = _counting_get  # type: ignore[assignment]
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert get_calls["n"] == 0
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_at_limit_boundary_succeeds(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly at the count and total-bytes limits → succeeds."""
+    import omnigent.server.server_config as server_config
+
+    monkeypatch.setattr(server_config, "copy_file_count_limit", lambda: 2)
+    monkeypatch.setattr(server_config, "copy_total_bytes_limit", lambda: 6)
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 200, resp.text
+    mapping = resp.json()["mapping"]
+    assert set(mapping.keys()) == {f1, f2}
+
+
+@pytest.mark.asyncio
 async def test_copy_files_then_download_returns_bytes(
     file_client: httpx.AsyncClient,
 ) -> None:

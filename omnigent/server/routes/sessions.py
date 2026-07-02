@@ -17731,13 +17731,21 @@ def create_sessions_router(
         """
         Copy lineage-owned files into this (destination) session.
 
-        Authorizes by spawn lineage: ``body.source_session_id`` must be
-        the destination itself or one of its ``parent_conversation_id``
-        ancestors. Each source file is read and re-stored as a new
-        child-scoped row owned by ``session_id`` — this preserves the
-        session-scoping invariant (the child reads its OWN copy; no
-        cross-session read grant is created). Validation is all-or-
-        nothing: an unauthorized source or a missing file copies nothing.
+        Authorizes by spawn lineage: ``body.source_session_id`` must be a
+        STRICT ancestor of this session up the ``parent_conversation_id``
+        chain — the session may not name itself as the source. Each source
+        file is read and re-stored as a new child-scoped row owned by
+        ``session_id`` — this preserves the session-scoping invariant (the
+        child reads its OWN copy; no cross-session read grant is created).
+        Validation is all-or-nothing: an unauthorized source, a missing
+        file, or a request past the copy limits copies nothing.
+
+        The request is bounded before any blob is read: the file count and
+        the summed ``StoredFile.bytes`` are checked against the copy limits
+        during metadata validation, so an over-limit request is rejected
+        without buffering a single blob. Within the limits, files are copied
+        one at a time (read → create → put) so peak memory is a single blob,
+        not the whole batch.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Destination (child) session/conversation id.
@@ -17745,6 +17753,11 @@ def create_sessions_router(
         :returns: A ``session.files.copied`` object carrying the
             ``{source_file_id: new_file_id}`` mapping.
         """
+        from omnigent.server.server_config import (
+            copy_file_count_limit,
+            copy_total_bytes_limit,
+        )
+
         await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
@@ -17764,11 +17777,20 @@ def create_sessions_router(
                 code=ErrorCode.FORBIDDEN,
             )
 
-        # Validate AND prefetch every source file before writing anything.
-        # Reading the bytes here (not just the metadata row) surfaces a
-        # missing blob before any child row is created, so the copy stays
-        # all-or-nothing under storage failures, not just missing metadata.
-        sources: list[tuple[StoredFile, bytes]] = []
+        # Validate every source file from METADATA ONLY, enforcing the copy
+        # limits before any blob is read. Summing StoredFile.bytes here means
+        # an over-count or over-size request is rejected without buffering a
+        # single blob — a rejected request never spikes memory. The blobs are
+        # fetched one at a time in the write loop below.
+        max_files = copy_file_count_limit()
+        max_total_bytes = copy_total_bytes_limit()
+        if len(body.file_ids) > max_files:
+            raise OmnigentError(
+                f"Cannot copy {len(body.file_ids)} files: limit is {max_files}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sources: list[StoredFile] = []
+        total_bytes = 0
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
             if stored is None:
@@ -17776,15 +17798,24 @@ def create_sessions_router(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
                 )
-            sources.append((stored, artifact_store.get(stored.id)))
+            total_bytes += stored.bytes
+            if total_bytes > max_total_bytes:
+                raise OmnigentError(
+                    f"Cannot copy files: total size exceeds limit of {max_total_bytes} bytes",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            sources.append(stored)
 
-        # Commit the copies. If any write fails mid-batch, roll back the
-        # rows/blobs already created so a partial copy never persists.
+        # Commit the copies one file at a time (read → create → put) so peak
+        # memory is a single blob, not the whole batch. If any step fails
+        # mid-batch, roll back the rows/blobs already created so a partial
+        # copy never persists.
         mapping: dict[str, str] = {}
         created: list[str] = []
         copied: list[StoredFile] = []
         try:
-            for stored, content in sources:
+            for stored in sources:
+                content = artifact_store.get(stored.id)
                 new = file_store.create(
                     session_id=session_id,
                     filename=stored.filename,
