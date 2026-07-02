@@ -26,6 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
+
 # Reuse the exact section + checkbox parsing the merge gate uses.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pr-template"))
 from _md import (
@@ -44,11 +46,20 @@ TYPE_LABELS = tuple(TYPE_TAGS)
 _FINAL_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 # A squash-merge subject ends with "(#1234)"; capture the last such reference.
 _PR_REF_RE = re.compile(r"\(#(\d+)\)\s*$")
-# Existing version headers in CHANGELOG.md, e.g. "## [v0.3.0] — 2026-06-27".
-_VERSION_HEADER_RE = re.compile(r"(?m)^##\s*\[v(\d+)\.(\d+)\.(\d+)\]")
+# Existing version headers in CHANGELOG.md — capture the whole bracketed tag so
+# any version shape (final, rc, dev) is found, e.g. "## [v0.4.0rc1] — 2026-…".
+_VERSION_HEADER_RE = re.compile(r"(?m)^##\s*\[([^\]]+)\]")
 
 
-# --- version helpers (final vX.Y.Z only → plain integer-tuple ordering) -------
+# --- version helpers ---------------------------------------------------------
+#
+# Two notions, deliberately distinct:
+#   * FINALITY (_version_tuple / previous_final_tag): only vX.Y.Z. Governs the
+#     default range start — a real v0.4.0 diffs against the previous *final* tag
+#     (v0.3.0), never an intervening v0.4.0rc1.
+#   * ORDERABILITY (_parse_version): any PEP 440 version, incl. dev/rc. Governs
+#     where a block sorts in CHANGELOG.md, so a manually-drafted dev/rc tag lands
+#     in the right place (and below its eventual final).
 
 
 def _version_tuple(tag: str) -> tuple[int, int, int] | None:
@@ -58,15 +69,31 @@ def _version_tuple(tag: str) -> tuple[int, int, int] | None:
     return tuple(int(p) for p in match.groups())  # type: ignore[return-value]
 
 
+def _parse_version(tag: str) -> Version | None:
+    """PEP 440 version for *tag* (leading ``v`` stripped), or ``None`` if it isn't
+    a version at all (e.g. a branch/sha). ``Version`` sorts dev < rc < final."""
+    try:
+        return Version(tag.strip().lstrip("v"))
+    except InvalidVersion:
+        return None
+
+
 def previous_final_tag(tag: str, all_tags: list[str]) -> str | None:
-    """Highest final tag strictly below *tag*, or ``None`` if there is none."""
-    current = _version_tuple(tag)
+    """Highest *final* (vX.Y.Z) tag strictly below *tag*, or ``None`` if none.
+
+    The reference *tag* may itself be any PEP 440 version (a dev/rc tag drafted
+    manually still diffs against the previous final release); only the candidates
+    are restricted to finals.
+    """
+    current = _parse_version(tag)
     if current is None:
-        raise ValueError(f"{tag!r} is not a final vX.Y.Z tag")
+        raise ValueError(f"{tag!r} is not a PEP 440 version")
     below = [
         (version, candidate)
         for candidate in all_tags
-        if (version := _version_tuple(candidate)) is not None and version < current
+        if _version_tuple(candidate) is not None
+        and (version := _parse_version(candidate)) is not None
+        and version < current
     ]
     if not below:
         return None
@@ -206,31 +233,34 @@ def render_pr_list(results: list[HarvestResult]) -> str:
 def insert_section(changelog: str, tag: str, section: str) -> str:
     """Insert (or replace) *section* for *tag* into *changelog*, version-ordered.
 
-    Newest version first. If the tag is already present its block is replaced,
-    making re-runs idempotent.
+    Newest version first, by PEP 440 — so a final ``v0.4.0`` sorts above its own
+    ``v0.4.0rc1`` / ``v0.4.0.dev0`` blocks, which in turn sort above ``v0.3.0``.
+    Re-running the same tag replaces its own block (matched by exact tag string),
+    making re-runs idempotent; distinct tags (final vs. its pre-releases) coexist.
     """
-    target = _version_tuple(tag)
+    target = _parse_version(tag)
     if target is None:
-        raise ValueError(f"{tag!r} is not a final vX.Y.Z tag")
+        raise ValueError(f"{tag!r} is not a PEP 440 version")
 
     headers = list(_VERSION_HEADER_RE.finditer(changelog))
-    blocks = []  # (version_tuple, start, end)
+    blocks = []  # (header_tag, parsed_version_or_None, start, end)
     for idx, match in enumerate(headers):
-        version = tuple(int(g) for g in match.groups())
+        header_tag = match.group(1).strip()
         start = match.start()
         end = headers[idx + 1].start() if idx + 1 < len(headers) else len(changelog)
-        blocks.append((version, start, end))
+        blocks.append((header_tag, _parse_version(header_tag), start, end))
 
     section_block = section.rstrip() + "\n"
 
-    # Replace an existing block for this exact version.
-    for version, start, end in blocks:
-        if version == target:
+    # Replace an existing block for this exact tag (idempotent re-run).
+    for header_tag, _version, start, end in blocks:
+        if header_tag == tag.strip():
             return changelog[:start] + section_block + "\n" + changelog[end:].lstrip("\n")
 
-    # Otherwise insert before the first existing version that is older than ours.
-    for version, start, _end in blocks:
-        if version < target:
+    # Otherwise insert before the first existing block that sorts below ours. An
+    # unparseable existing header is treated as oldest (sorts last).
+    for _header_tag, version, start, _end in blocks:
+        if version is None or version < target:
             head = changelog[:start].rstrip("\n")
             tail = changelog[start:]
             return f"{head}\n\n{section_block}\n{tail}"
@@ -334,18 +364,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # CHANGELOG.md insertion orders blocks by version, so it needs a final
-    # vX.Y.Z tag. A non-version --tag (a preview/test ref) needs an explicit
-    # --base for the range and can only render, never insert.
-    is_version = _version_tuple(args.tag) is not None
-    if not is_version and args.base is None:
+    # CHANGELOG.md insertion orders blocks by PEP 440, so --tag must be a version
+    # (final, rc, or dev — all orderable). A non-version ref (branch/sha) can only
+    # render a preview, and needs an explicit --base for its range.
+    is_orderable = _parse_version(args.tag) is not None
+    if not is_orderable and args.base is None:
         parser.error(
-            f"--tag {args.tag!r} is not a final vX.Y.Z tag; pass --base <ref> for its range"
+            f"--tag {args.tag!r} is not a PEP 440 version; pass --base <ref> for its range"
         )
 
     section, results, prev = collect(args.tag, args.repo, base=args.base)
 
-    if is_version and not args.no_changelog_update:
+    if is_orderable and not args.no_changelog_update:
         path = Path(args.changelog_file)
         existing = path.read_text() if path.exists() else _SEED_CHANGELOG
         path.write_text(insert_section(existing, args.tag, section))

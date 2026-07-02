@@ -40,10 +40,10 @@ on:
         type: string
       dry_run:
         description: >-
-          Preview only — print the CHANGELOG section + draft notes to the run
-          summary, open no PR and edit no release. `auto` (default) previews when
-          `tag` is not a final vX.Y.Z or a base override is set, and does a real
-          run otherwise; `true`/`false` force the choice.
+          Preview only:
+          auto (default) - preview for dev/rc tags, real PR for final versions;
+          true - print the generated notes, don't open a PR;
+          false - open a real PR to CHANGELOG.md
         required: false
         type: choice
         options: [auto, "true", "false"]
@@ -167,6 +167,9 @@ jobs:
           DRY_RUN: ${{ steps.guard.outputs.dry_run }}
         run: |
           set -euo pipefail
+          # generate.py orders CHANGELOG.md by PEP 440 (packaging). This step runs
+          # bare python3 (before uv sync), so ensure packaging is importable.
+          python3 -m pip install --quiet --disable-pip-version-check packaging
           args=(--tag "$TAG" --repo "$SOURCE_REPO"
                 --draft-notes-out /tmp/mechanical_notes.md
                 --pr-list-out /tmp/pr_list.txt
@@ -382,19 +385,9 @@ jobs:
           TAG: ${{ steps.guard.outputs.tag }}
         run: |
           set -euo pipefail
-          # Preserve the original auto-generated notes in a collapsed section for
-          # the coordinator's reference.
-          orig="$(gh release view "$TAG" --repo "$SOURCE_REPO" --json body -q .body || true)"
-          {
-            cat /tmp/release_notes.md
-            echo
-            echo "<details><summary>Auto-generated notes (reference)</summary>"
-            echo
-            printf '%s\n' "$orig"
-            echo
-            echo "</details>"
-          } > /tmp/final_notes.md
-          gh release edit "$TAG" --repo "$SOURCE_REPO" --notes-file /tmp/final_notes.md
+          # github-release.yml seeds only a short placeholder body (no
+          # auto-generated notes), so replace it wholesale with the curated notes.
+          gh release edit "$TAG" --repo "$SOURCE_REPO" --notes-file /tmp/release_notes.md
           echo "Enriched the ${TAG} release draft with curated notes." \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
