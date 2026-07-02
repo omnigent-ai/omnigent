@@ -248,13 +248,17 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const lastSelectedIdRef = useRef<string | null>(null);
-  const visibleIdsRef = useRef<string[]>([]);
+  const getVisibleIdsRef = useRef<() => string[]>(() => []);
 
   const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (shiftKey && lastSelectedIdRef.current != null) {
-        const range = computeShiftSelectRange(visibleIdsRef.current, lastSelectedIdRef.current, id);
+        const range = computeShiftSelectRange(
+          getVisibleIdsRef.current(),
+          lastSelectedIdRef.current,
+          id,
+        );
         if (range) {
           for (const rid of range) next.add(rid);
           return next;
@@ -578,7 +582,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
-              visibleIdsRef={visibleIdsRef}
+              getVisibleIdsRef={getVisibleIdsRef}
             />
           </nav>
 
@@ -822,7 +826,7 @@ interface ConversationListProps {
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
-  visibleIdsRef: RefObject<string[]>;
+  getVisibleIdsRef: RefObject<() => string[]>;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -841,7 +845,7 @@ function ConversationList({
   selectionMode,
   selectedIds,
   onToggleSelected,
-  visibleIdsRef,
+  getVisibleIdsRef,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -1164,22 +1168,24 @@ function ConversationList({
       ...visible("Shared with me", sections.shared),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
-  // Build the shift-select visible order from actual rendered data for project
-  // folders (each folder reports its IDs via projectRenderedIdsRef), falling back
-  // to orderedConversationIds for non-project sections. This avoids the stale-ref
-  // bug from the previous useEffect-based approach — the map is written
-  // synchronously during each ProjectFolder's render.
-  const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-  const visibleForSection = (title: string, list: readonly Conversation[]) =>
-    effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
-  visibleIdsRef.current = [
-    ...visibleForSection("Pinned", sections.pinned),
-    ...(projectsCollapsed
-      ? []
-      : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
-    ...visibleForSection("Chats", sections.sessions),
-    ...visibleForSection("Shared with me", sections.shared),
-  ];
+  // Getter that builds the shift-select visible order on demand (at click
+  // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
+  // during render — guarantees the project segment is always fresh even when a
+  // ProjectFolder re-renders independently (async query resolve, session
+  // re-sort) without triggering a parent re-render.
+  getVisibleIdsRef.current = () => {
+    const vis = (title: string, list: readonly Conversation[]) =>
+      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
+    const projCollapsed = effectiveCollapsedSections.includes("Projects");
+    return [
+      ...vis("Pinned", sections.pinned),
+      ...(projCollapsed
+        ? []
+        : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
+      ...vis("Chats", sections.sessions),
+      ...vis("Shared with me", sections.shared),
+    ];
+  };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;

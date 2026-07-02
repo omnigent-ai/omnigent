@@ -197,7 +197,7 @@ describe("Sidebar shift-click selection", () => {
     mockConversations(sessions);
 
     // Expand the Alpha project so its sessions are visible
-    localStorage.setItem("omnigent:sidebar-expanded-projects", JSON.stringify(["Alpha"]));
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
 
     renderSidebar();
 
@@ -237,6 +237,41 @@ describe("Sidebar shift-click selection", () => {
 
     // Normal click on s4 (sets new anchor, toggles s4 on)
     fireEvent.click(screen.getByTitle("s4").closest("a")!);
+
+    await waitFor(() => {
+      expect(screen.getByText("3 selected")).toBeInTheDocument();
+    });
+  });
+
+  it("shift-select within a project uses the folder's own rendered IDs, not the global list", async () => {
+    // Seed a project with sessions that differ from the global list:
+    // the global list has p1,p2 but the folder's own query returns p1,p2,p3.
+    projectsMock.push("Alpha");
+    const sessions = [
+      conv("p1", { labels: { omni_project: "Alpha" } }),
+      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("c1"),
+    ];
+    mockConversations(sessions);
+    // The folder's useProjectSessions returns an extra session (p3)
+    // that isn't in the global paginated window.
+    projectSessionsMock.current["Alpha"] = [
+      conv("p1", { labels: { omni_project: "Alpha" } }),
+      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("p3", { labels: { omni_project: "Alpha" } }),
+    ];
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+
+    renderSidebar();
+
+    const selectBtn = screen.getByRole("button", { name: /select/i });
+    fireEvent.click(selectBtn);
+
+    // Click p1 (anchor) then shift-click p3 — the range should include
+    // p1, p2, p3 (all from the folder's own query, including p3 which
+    // isn't in the global list).
+    fireEvent.click(screen.getByTitle("p1").closest("a")!);
+    fireEvent.click(screen.getByTitle("p3").closest("a")!, { shiftKey: true });
 
     await waitFor(() => {
       expect(screen.getByText("3 selected")).toBeInTheDocument();
