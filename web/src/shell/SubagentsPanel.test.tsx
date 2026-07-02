@@ -828,14 +828,14 @@ describe("SubagentsPanel", () => {
       // class (same as idle/done) and the grey --muted-foreground dot is the
       // ONLY color hook — no warning/destructive bleed on the wrapper or the
       // dot, and crucially never the shared amber --warning (owned by "Needs
-      // response"). The blue --disconnected hue is now reserved for the
+      // response"). The blue --session-active hue is now reserved for the
       // launching/idle/done dots, so it must NOT appear here.
       expect(indicator).toHaveClass("text-muted-foreground");
       expect(indicator).not.toHaveClass("text-warning");
       expect(indicator).not.toHaveClass("text-destructive");
       const dot = indicator.querySelector("span.rounded-full");
       expect(dot).toHaveClass("bg-muted-foreground");
-      expect(dot).not.toHaveClass("bg-disconnected");
+      expect(dot).not.toHaveClass("bg-session-active");
       expect(dot).not.toHaveClass("bg-warning");
       expect(dot).not.toHaveClass("bg-destructive");
       // The cause is still surfaced in the accessible label / tooltip.
@@ -913,14 +913,14 @@ describe("SubagentsPanel", () => {
       // Positive quiet-dot guarantee: the wrapper carries the standard muted
       // quiet-dot text class (same path as idle/done) and the grey dot is the
       // ONLY color hook — no warning/destructive class bleeds onto either the
-      // wrapper or the dot. The blue --disconnected hue is reserved for the
+      // wrapper or the dot. The blue --session-active hue is reserved for the
       // launching/idle/done dots, so it must NOT appear here.
       expect(indicator).toHaveClass("text-muted-foreground");
       expect(indicator).not.toHaveClass("text-warning");
       expect(indicator).not.toHaveClass("text-destructive");
       const dot = indicator.querySelector("span.rounded-full");
       expect(dot).toHaveClass("bg-muted-foreground");
-      expect(dot).not.toHaveClass("bg-disconnected");
+      expect(dot).not.toHaveClass("bg-session-active");
       expect(dot).not.toHaveClass("bg-warning");
       expect(dot).not.toHaveClass("bg-destructive");
       // The disconnect cause stays in the tooltip / accessible label.
@@ -1053,24 +1053,24 @@ describe("SubagentsPanel", () => {
     ).not.toBeNull();
 
     // Panel-scoped palette swap: the quiet live/settled states read in the
-    // blue --disconnected hue, each PRESERVING its prior opacity treatment
+    // blue --session-active hue, each PRESERVING its prior opacity treatment
     // (launching kept /70, idle + done kept /55) — only the hue flipped from
     // grey to blue.
     const launchDot = dotOf("c_launch");
-    expect(launchDot).toHaveClass("bg-disconnected/70");
+    expect(launchDot).toHaveClass("bg-session-active/70");
     expect(launchDot).not.toHaveClass("bg-muted-foreground/70");
     const doneDot = dotOf("c_done");
-    expect(doneDot).toHaveClass("bg-disconnected/55");
+    expect(doneDot).toHaveClass("bg-session-active/55");
     expect(doneDot).not.toHaveClass("bg-muted-foreground/55");
     const idleDot = dotOf("c_idle");
-    expect(idleDot).toHaveClass("bg-disconnected/55");
+    expect(idleDot).toHaveClass("bg-session-active/55");
     expect(idleDot).not.toHaveClass("bg-muted-foreground/55");
 
     // Exception: the verbatim "other status" fallthrough STAYS neutral grey —
     // it is the one quiet dot the swap deliberately leaves on --muted-foreground.
     const otherDot = dotOf("c_other");
     expect(otherDot).toHaveClass("bg-muted-foreground/55");
-    expect(otherDot).not.toHaveClass("bg-disconnected/55");
+    expect(otherDot).not.toHaveClass("bg-session-active/55");
 
     // Terminal failures keep destructive text + a destructive dot.
     const failedIndicator = within(childRow(container, "c_fail")).getByTestId(
@@ -1134,13 +1134,13 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "c_cancel")).toHaveTextContent(/cancelled/);
     // Launching is not yet real work, so it shows its word and does not reuse
     // the active running dot. Its inline word now reads in the blue
-    // --disconnected hue (matching its dot), not the neutral muted text.
+    // --session-active hue (matching its dot), not the neutral muted text.
     expect(childRow(container, "c_launch")).toHaveTextContent(/Launching/);
     expect(childRow(container, "c_launch").querySelector('[data-testid="running-dot"]')).toBeNull();
     const launchIndicator = within(childRow(container, "c_launch")).getByTestId(
       "subagent-status-dot",
     );
-    expect(launchIndicator).toHaveClass("text-disconnected");
+    expect(launchIndicator).toHaveClass("text-session-active");
     expect(launchIndicator).not.toHaveClass("text-muted-foreground");
     // The verbatim "other" word stays neutral grey — its wrapper keeps the
     // muted text class (the GREY exception).
@@ -1148,7 +1148,7 @@ describe("SubagentsPanel", () => {
       "subagent-status-dot",
     );
     expect(cancelIndicator).toHaveClass("text-muted-foreground");
-    expect(cancelIndicator).not.toHaveClass("text-disconnected");
+    expect(cancelIndicator).not.toHaveClass("text-session-active");
     // Quiet states render no word — the label lives in the tooltip. Working is
     // quiet too: the pulsing pink dot already reads as "active".
     expect(childRow(container, "c_work")).not.toHaveTextContent(/Working/);

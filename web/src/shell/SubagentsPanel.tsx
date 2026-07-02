@@ -276,15 +276,16 @@ function sessionStatus(
 
 // Dot color per dot-rendered state. Working uses the animated RunningDot
 // and awaiting uses the "Needs response" tag, so both are excluded here.
-// Panel-scoped palette: the quiet live/settled states (launching, idle,
-// done) read in the blue --disconnected hue, while the disconnected runner
-// reads in the neutral grey --muted-foreground. This is a per-state token
-// REASSIGNMENT scoped to this panel — the global --disconnected (blue) and
+// Panel-scoped palette: the quiet connected-but-not-working states
+// (launching, idle, done) read in the blue --session-active hue, while the
+// disconnected runner reads in the neutral grey --muted-foreground. Blue
+// --session-active = session alive but not actively working; grey
+// --muted-foreground = disconnected. The global --session-active (blue) and
 // --muted-foreground (grey) values are unchanged.
 const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
   // Blue, quiet — "done" is an expected outcome, so it reads as a subtle
   // (/55) blue dot rather than a loud green one.
-  done: "bg-disconnected/55",
+  done: "bg-session-active/55",
   failed: "bg-destructive",
   // Grey, not destructive — a disconnect is a transient liveness loss, not a
   // task failure, so it reads distinctly from the red "Failed". Full-strength
@@ -292,8 +293,8 @@ const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> =
   // response" badge keeps its amber and the dot stays notable (it is not a
   // dimmed SETTLED_STATE).
   disconnected: "bg-muted-foreground",
-  idle: "bg-disconnected/55",
-  launching: "bg-disconnected/70",
+  idle: "bg-session-active/55",
+  launching: "bg-session-active/70",
   // Exception: the verbatim "other status" fallthrough stays neutral grey.
   other: "bg-muted-foreground/55",
 };
@@ -445,11 +446,11 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
   // word) — the cause stays in the tooltip / aria-label. Distinct from the
   // red "Failed" pill above, without repurposing the shared amber --warning.
   //
-  // Launching's inline word reads in the blue --disconnected hue to match its
-  // dot; every other state here keeps the neutral muted text — the verbatim
+  // Launching's inline word reads in the blue --session-active hue to match
+  // its dot; every other state here keeps the neutral muted text — the verbatim
   // "other" word stays grey, and idle/done/disconnected show no word at all.
   const wrapperTextClass =
-    activity === "launching" ? "text-disconnected" : "text-muted-foreground";
+    activity === "launching" ? "text-session-active" : "text-muted-foreground";
   return (
     <span
       aria-label={title}
