@@ -1,6 +1,6 @@
 # Publishing the Omnigent VS Code extension
 
-The extension lives in [`editors/vscode`](../editors/vscode). It is published
+This directory holds the Omnigent VS Code extension. It is published
 under the shared **`databricks`** VS Code Marketplace publisher (and the
 `databricks` Open VSX namespace), which means releases flow through the
 Databricks security-hardened release path — direct publishing from this repo is

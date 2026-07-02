@@ -116,4 +116,4 @@ jobs:
             --base main \
             --head "$BRANCH" \
             --title "Release (vscode): v$VERSION" \
-            --body "Bumps the Omnigent VS Code extension to \`v$VERSION\` and adds its CHANGELOG section (fill in the changes before merging). After merge, run the **VS Code Extension Release** workflow to build the \`.vsix\` and cut the draft release. See \`docs/vscode-extension-publishing.md\`."
+            --body "Bumps the Omnigent VS Code extension to \`v$VERSION\` and adds its CHANGELOG section (fill in the changes before merging). After merge, run the **VS Code Extension Release** workflow to build the \`.vsix\` and cut the draft release. See \`editors/vscode/PUBLISHING.md\`."
