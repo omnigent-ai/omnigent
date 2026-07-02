@@ -1766,6 +1766,26 @@ def _delete_daemon_record(record: _HostDaemonRecord) -> None:
             _HOST_PID_PATH.unlink()
 
 
+def _prune_stale_daemon_record(record: _HostDaemonRecord, *, signal_name: str) -> None:
+    """
+    Drop a daemon record that points at an unsignalable PID.
+
+    The record is stale if the PID has been reused by a process we cannot
+    terminate (for example, a kernel thread or another user's process). In
+    that case the CLI should stop treating the registry entry as live rather
+    than crash-looping on repeated stop/reuse attempts.
+
+    :param record: Stale daemon record to remove.
+    :param signal_name: Signal that failed, e.g. ``"SIGTERM"``.
+    """
+    click.echo(
+        f"Pruning stale host daemon record for {record.target!r} "
+        f"(pid {record.pid} is not signalable; {signal_name} failed).",
+        err=True,
+    )
+    _delete_daemon_record(record)
+
+
 def _legacy_daemon_record() -> _HostDaemonRecord | None:
     """
     Build a daemon record from the legacy ``host.pid`` file.
@@ -7626,8 +7646,14 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     if not _pid_alive(record.pid):
         _delete_daemon_record(record)
         return
-    with contextlib.suppress(ProcessLookupError):
+    try:
         os.kill(record.pid, signal.SIGTERM)
+    except PermissionError:
+        _prune_stale_daemon_record(record, signal_name="SIGTERM")
+        return
+    except ProcessLookupError:
+        _delete_daemon_record(record)
+        return
     deadline = time.monotonic() + _HOST_DAEMON_STOP_GRACE_S
     while time.monotonic() < deadline:
         if not _pid_alive(record.pid):
@@ -7635,8 +7661,14 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
             return
         time.sleep(0.1)
     if force:
-        with contextlib.suppress(ProcessLookupError):
+        try:
             os.kill(record.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except PermissionError:
+            _prune_stale_daemon_record(record, signal_name="SIGKILL")
+            return
+        except ProcessLookupError:
+            _delete_daemon_record(record)
+            return
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):

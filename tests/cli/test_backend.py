@@ -1195,6 +1195,33 @@ def test_host_stop_session_stops_only_named_sessions(
     assert stopped == ["conv_a", "conv_b"]
 
 
+def test_terminate_daemon_prunes_stale_record_when_pid_is_unsignalable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale registry entry pointing at an unsignalable PID is pruned, not crashed."""
+    record = cli._HostDaemonRecord(
+        pid=21,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path="/tmp/daemon.log",
+        started_at=100,
+    )
+    deleted: list[str] = []
+
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_delete_daemon_record", lambda rec: deleted.append(rec.target))
+
+    def _raise_permission_error(_pid: int, _sig: int) -> None:
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr(cli.os, "kill", _raise_permission_error)
+
+    cli._terminate_daemon(record, force=True)
+
+    assert deleted == ["local"]
+
+
 def test_ensure_backend_remote_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
     """A remote URL ensures a daemon for it and returns the normalized URL."""
     calls: list[str | None] = []
