@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 from fastapi.responses import JSONResponse, Response
 
-from omnigent.native_coding_agents import CODEX_NATIVE_CODING_AGENT
+from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 
 
 class BridgeStateForSession(Protocol):

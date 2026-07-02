@@ -24,6 +24,8 @@ sibling modules; this ``__init__.py`` is just the registry.
 
 from __future__ import annotations
 
+from omnigent.harness_plugins import harness_modules
+
 # Harness-name → fully-qualified module path. Each module must
 # export ``create_app() -> FastAPI``; the runner imports the module,
 # calls the factory, and serves the result over a Unix socket.
@@ -144,5 +146,9 @@ _HARNESS_MODULES: dict[str, str] = {
     # omnigent/inner/hermes_native_harness.py.
     "hermes-native": "omnigent.inner.hermes_native_harness",
 }
+
+# Keep the historical mutable dict surface while sourcing builtins and
+# community plugins from the dynamic registry.
+_HARNESS_MODULES = harness_modules()
 
 __all__ = ["_HARNESS_MODULES"]

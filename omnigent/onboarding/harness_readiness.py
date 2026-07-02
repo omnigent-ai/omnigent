@@ -25,10 +25,12 @@ that would actually work.
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
@@ -40,6 +42,7 @@ from omnigent.onboarding.harness_install import (
     PI_KEY,
     QWEN_KEY,
     harness_cli_installed,
+    required_cli_for_harness,
 )
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
@@ -253,6 +256,9 @@ def harness_is_configured(harness: str) -> bool:
         and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
+        required_cli = required_cli_for_harness(canonical) or required_cli_for_harness(harness)
+        if required_cli is not None:
+            return shutil.which(required_cli.binary) is not None
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -297,6 +303,8 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
         "claude-sdk": True, "openai-agents": True, "pi": True, "qwen": True}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
+    spellings.update(valid_harnesses())
+    spellings.update(harness_install_keys())
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)

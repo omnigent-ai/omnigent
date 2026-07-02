@@ -138,6 +138,7 @@ def test_configured_harness_map_covers_all_spellings(
         "native-codex",
         "openai-agents",
         "openai-agents-sdk",
+        "open-responses",
         "claude_sdk",
         "agents_sdk",
         "claude",

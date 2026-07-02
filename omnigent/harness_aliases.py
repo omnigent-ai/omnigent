@@ -6,43 +6,9 @@ Omnigent continues to use canonical harness identifiers internally.
 
 from __future__ import annotations
 
-HARNESS_ALIASES: dict[str, str] = {
-    "claude": "claude-sdk",
-    "native-kiro": "kiro-native",
-    "native-pi": "pi-native",
-    # The SDK package / runtime dispatch spelling; specs use "openai-agents".
-    "openai-agents-sdk": "openai-agents",
-    # User-facing spellings for the Google Antigravity SDK harness; the
-    # canonical id is "antigravity" (matches the registry / workflow type).
-    "agy": "antigravity",
-    "google-antigravity": "antigravity",
-    # User-facing spelling for Moonshot AI's Kimi Code CLI; the canonical id
-    # is "kimi" (matches the binary and the registry / workflow type).
-    "kimi-code": "kimi",
-    # User-facing reversed spelling for the Goose native-CLI harness; canonical
-    # id is "goose-native".
-    "native-goose": "goose-native",
-    # Reversed spelling for the native Kimi Code TUI harness; canonical id is
-    # "kimi-native" (the SDK/headless harness keeps the bare "kimi" id).
-    "native-kimi": "kimi-native",
-    # Qwen Code harness alias.
-    "qwen-code": "qwen",
-    # User-facing reversed spelling for the qwen native-CLI harness; canonical
-    # id is "qwen-native" (the ACP-piped harness keeps the bare "qwen" name).
-    "native-qwen": "qwen-native",
-    # OpenCode native-server harness: the bare ``opencode`` name and the
-    # reversed ``native-opencode`` spelling both fold to ``opencode-native``
-    # (there is no separate SDK ``opencode`` harness, so the bare name is free).
-    "opencode": "opencode-native",
-    "native-opencode": "opencode-native",
-    # User-facing reversed spelling for the Hermes native-CLI (TUI) harness;
-    # canonical id is "hermes-native" (the headless subprocess harness keeps the
-    # bare "hermes" name, like goose vs goose-native).
-    "native-hermes": "hermes-native",
-    # User-facing spelling for the GitHub Copilot SDK harness; the canonical id
-    # is "copilot" (matches the registry / workflow type).
-    "github-copilot": "copilot",
-}
+from omnigent.harness_plugins import harness_aliases, native_harnesses
+
+HARNESS_ALIASES: dict[str, str] = harness_aliases()
 
 # Canonical native-CLI harness spellings. These harnesses type messages into
 # a resident terminal process and mirror their transcript back to Omnigent, so
@@ -50,38 +16,7 @@ HARNESS_ALIASES: dict[str, str] = {
 # as a full in-process model turn. ``AgentSpec.harness_kind`` returns these
 # canonical spellings for native agents, so no executor-type aliasing is needed
 # here.
-NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {
-        "claude-native",
-        "native-claude",
-        "codex-native",
-        "native-codex",
-        "pi-native",
-        "native-pi",
-        "cursor-native",
-        "native-cursor",
-        "kiro-native",
-        "native-kiro",
-        # Native Antigravity (agy) TUI bridge used by ``omnigent antigravity``;
-        # the in-process SDK counterpart is the canonical ``antigravity``
-        # harness (see HARNESS_ALIASES / runtime/harnesses/__init__.py).
-        "antigravity-native",
-        "native-antigravity",
-        "goose-native",
-        "native-goose",
-        "qwen-native",
-        "native-qwen",
-        "opencode-native",
-        "native-opencode",
-        "kimi-native",
-        "native-kimi",
-        # Native Hermes (TUI) bridge used by ``omnigent hermes``; the headless
-        # subprocess counterpart is the canonical ``hermes`` harness (see
-        # HARNESS_ALIASES / runtime/harnesses/__init__.py).
-        "hermes-native",
-        "native-hermes",
-    }
-)
+NATIVE_HARNESSES: frozenset[str] = native_harnesses()
 
 
 def canonicalize_harness(harness: str | None) -> str | None:

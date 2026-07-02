@@ -17,16 +17,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
 
 /**
  * Harness options for the picker. "default" uses the server's default
  * executor (no explicit harness in the bundle).
  */
-const HARNESS_OPTIONS: { value: string; label: string }[] = Object.entries(
-  BRAIN_HARNESS_LABELS,
-).map(([value, label]) => ({ value, label }));
+const DEFAULT_HARNESS = Object.keys(BRAIN_HARNESS_LABELS)[0];
 
 /** A single MCP server row in the form. */
 interface MCPFormEntry {
@@ -121,10 +119,15 @@ export function CreateAgentDialog({
   onOpenChange: (open: boolean) => void;
   onCreate: (input: AgentBundleInput) => void;
 }) {
+  const brainHarnessLabels = useBrainHarnessLabels();
+  const harnessOptions = Object.entries(brainHarnessLabels).map(([value, label]) => ({
+    value,
+    label,
+  }));
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [instructions, setInstructions] = useState("");
-  const [harness, setHarness] = useState(HARNESS_OPTIONS[0].value);
+  const [harness, setHarness] = useState(DEFAULT_HARNESS);
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
@@ -133,7 +136,7 @@ export function CreateAgentDialog({
     setName("");
     setDescription("");
     setInstructions("");
-    setHarness(HARNESS_OPTIONS[0].value);
+    setHarness(DEFAULT_HARNESS);
     setModel("");
     setMcpEntries([]);
     setNextKey(0);
@@ -231,7 +234,7 @@ export function CreateAgentDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {HARNESS_OPTIONS.map((opt) => (
+                {harnessOptions.map((opt) => (
                   <SelectItem key={opt.value} value={opt.value}>
                     {opt.label}
                   </SelectItem>

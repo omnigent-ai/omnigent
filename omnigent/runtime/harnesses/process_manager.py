@@ -37,6 +37,7 @@ from pathlib import Path
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -238,6 +239,9 @@ def _resolve_module_path(harness: str) -> str:
     module_path = _HARNESS_MODULES.get(harness)
     if module_path is not None:
         return module_path
+    package = missing_install_packages().get(harness)
+    if package:
+        raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")
     if _HARNESS_MODULES:
         registered = sorted(_HARNESS_MODULES)
         raise RuntimeError(f"unknown harness {harness!r}; registered names: {registered}")
