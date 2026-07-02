@@ -34,6 +34,13 @@ vi.mock("@/lib/lastAssistantText", () => ({
   fetchLastAssistantText: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Web Push (#8): mocked so we can assert the subscribe path (on load when
+// already granted, and on the default→granted gesture) without a real
+// service worker / PushManager.
+vi.mock("@/lib/webPush", () => ({
+  enablePushNotifications: vi.fn().mockResolvedValue(true),
+}));
+
 import { useConversations } from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -43,6 +50,7 @@ import {
 } from "@/lib/browserNotifications";
 import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
+import { enablePushNotifications } from "@/lib/webPush";
 import {
   __resetReadStateForTests,
   markConversationSeen,
@@ -58,6 +66,7 @@ const isNativeMock = vi.mocked(isNativeShell);
 const onNativeActivatedMock = vi.mocked(onNativeNotificationActivated);
 const setBadgeMock = vi.mocked(setBadgeCount);
 const fetchPreviewMock = vi.mocked(fetchLastAssistantText);
+const enablePushMock = vi.mocked(enablePushNotifications);
 
 /**
  * Flush pending microtasks so the async turn-end notification path (preview
@@ -107,6 +116,8 @@ beforeEach(() => {
   onNativeActivatedMock.mockReturnValue(() => {});
   fetchPreviewMock.mockReset();
   fetchPreviewMock.mockResolvedValue(undefined);
+  enablePushMock.mockClear();
+  enablePushMock.mockResolvedValue(true);
   getPermMock.mockReturnValue("granted");
   isNativeMock.mockReturnValue(false);
   // Default: window NOT focused, so attention events surface (the common
@@ -125,6 +136,33 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+});
+
+describe("useIdleNotifications web-push subscription (#8)", () => {
+  it("subscribes to web push on mount when permission is already granted", () => {
+    getPermMock.mockReturnValue("granted");
+    renderHook(() => useIdleNotifications());
+    expect(enablePushMock).toHaveBeenCalled();
+  });
+
+  it("does not subscribe on mount when permission is denied", () => {
+    getPermMock.mockReturnValue("denied");
+    renderHook(() => useIdleNotifications());
+    expect(enablePushMock).not.toHaveBeenCalled();
+  });
+
+  it("subscribes after the user grants on the first gesture (default → granted)", async () => {
+    getPermMock.mockReturnValue("default");
+    requestPermMock.mockResolvedValue("granted");
+    renderHook(() => useIdleNotifications());
+    expect(enablePushMock).not.toHaveBeenCalled();
+    await act(async () => {
+      window.dispatchEvent(new Event("pointerdown"));
+      await Promise.resolve();
+    });
+    expect(requestPermMock).toHaveBeenCalled();
+    expect(enablePushMock).toHaveBeenCalled();
+  });
 });
 
 describe("useIdleNotifications turn-end transitions", () => {
