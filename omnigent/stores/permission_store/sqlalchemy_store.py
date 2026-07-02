@@ -8,9 +8,35 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from omnigent.db.db_models import SqlSessionPermission, SqlUser
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
-from omnigent.entities import ResolvedAccess, SessionPermission
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+from omnigent.entities import Account, ResolvedAccess, SessionPermission
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.stores.permission_store import PermissionStore
+
+# Sentinel rows excluded from list_users() — never real, actionable
+# actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
+# list is identical across auth modes.
+_HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
+
+
+def _to_account(row: SqlUser) -> Account:
+    """Convert a :class:`SqlUser` ORM row to an :class:`Account` entity.
+
+    Strips ``password_hash`` — it never leaves the store via this
+    conversion (see :class:`Account`). Mirrors
+    ``accounts_store._to_account`` so both stores surface the same
+    admin user shape.
+    """
+    return Account(
+        id=row.id,
+        is_admin=row.is_admin,
+        created_at=row.created_at,
+        last_login_at=row.last_login_at,
+        has_password=row.password_hash is not None,
+    )
 
 
 def _to_entity(row: SqlSessionPermission) -> SessionPermission:
@@ -223,6 +249,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .on_conflict_do_nothing(index_elements=["id"])
                 )
             session.execute(stmt)
+
+    def list_users(self) -> list[Account]:
+        """List every real user row. See base class for contract."""
+        with self._session() as session:
+            rows = session.execute(select(SqlUser)).scalars().all()
+            return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
 
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""

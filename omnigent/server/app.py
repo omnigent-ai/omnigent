@@ -1771,21 +1771,27 @@ def create_app(
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
-    async def me(request: Request) -> dict[str, str | None] | JSONResponse:
+    async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
         """Return the current user's identity.
 
         Reads the user from the auth provider (same logic that
         session routes use). The frontend calls this on load to
         discover who it is.
 
+        Also returns ``is_admin`` — the mode-agnostic admin signal
+        (the shared ``users.is_admin`` column, set by the admin-list
+        promotion at login). The SPA gates admin chrome on it in
+        EVERY mode, including OIDC/SSO where the accounts-only
+        ``/auth/me`` endpoint does not exist.
+
         When OIDC is active and the user is unauthenticated,
         returns 401 with a ``login_url`` so the frontend knows
         where to redirect.
 
         :param request: The incoming FastAPI request.
-        :returns: ``{"user_id": "alice@example.com"}``,
-            ``{"user_id": null}`` if unauthenticated in header
-            mode, or 401 with ``login_url`` in OIDC mode.
+        :returns: ``{"user_id": "alice@example.com", "is_admin": true}``,
+            ``{"user_id": null, "is_admin": false}`` if unauthenticated
+            in header mode, or 401 with ``login_url`` in OIDC mode.
         """
         user_id: str | None = None
         if auth_provider is not None:
@@ -1796,7 +1802,12 @@ def create_app(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
             )
-        return {"user_id": user_id}
+        is_admin = (
+            user_id is not None
+            and permission_store is not None
+            and permission_store.is_admin(user_id)
+        )
+        return {"user_id": user_id, "is_admin": is_admin}
 
     app.include_router(
         create_sessions_router(
