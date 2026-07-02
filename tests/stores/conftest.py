@@ -12,6 +12,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleStore
 
 
 @pytest.fixture()
@@ -44,3 +45,11 @@ def artifact_store(tmp_path: Path) -> LocalArtifactStore:
     :returns: A LocalArtifactStore in a temp directory.
     """
     return LocalArtifactStore(str(tmp_path / "artifacts"))
+
+
+@pytest.fixture()
+def schedule_store(db_uri: str) -> SqlAlchemyScheduleStore:
+    """
+    :returns: A SqlAlchemyScheduleStore backed by the test database.
+    """
+    return SqlAlchemyScheduleStore(db_uri)

@@ -3007,6 +3007,7 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.schedule_store.sqlalchemy_store import SqlAlchemyScheduleStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
@@ -3014,6 +3015,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    schedule_store = SqlAlchemyScheduleStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3066,6 +3068,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        schedule_store=schedule_store,
         caps=caps,
     )
 
@@ -3150,6 +3153,9 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.routes.schedules import create_schedules_router
+
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3167,6 +3173,15 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        # Schedules REST API (#6 loops & monitors). Mounted via the generic
+        # extra_routers seam so create_app's signature stays untouched.
+        extra_routers=[
+            (
+                create_schedules_router(schedule_store, auth_provider, permission_store),
+                "/v1",
+                ["schedules"],
+            ),
+        ],
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")

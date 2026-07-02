@@ -70,6 +70,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Schedule (loop) builtins are always auto-registered so an
+        # agent can manage cron loops without the spec opting in.
+        "create_loop",
+        "list_schedules",
+        "delete_schedule",
     }
 )
 

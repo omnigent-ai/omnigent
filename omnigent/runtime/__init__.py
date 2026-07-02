@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     )
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
+    from omnigent.stores.schedule_store import ScheduleStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
 
@@ -37,6 +38,7 @@ def init(
     artifact_store: ArtifactStore | None = None,
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
+    schedule_store: ScheduleStore | None = None,
     caps: RuntimeCaps | None = None,
 ) -> None:
     """
@@ -72,6 +74,7 @@ def init(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        schedule_store=schedule_store,
         caps=caps,
     )
 
@@ -154,6 +157,19 @@ def get_policy_store() -> PolicyStore | None:
     :returns: The PolicyStore set during :func:`init`, or ``None``.
     """
     return _globals._policy_store
+
+
+def get_schedule_store() -> ScheduleStore | None:
+    """
+    Return the ScheduleStore instance, or ``None`` if not configured.
+
+    Returns ``None`` (rather than raising) because schedule_store is
+    optional — the scheduler tools surface a clear error to the agent
+    when invoked without a configured store.
+
+    :returns: The ScheduleStore set during :func:`init`, or ``None``.
+    """
+    return _globals._schedule_store
 
 
 def get_agent_cache() -> AgentCache:

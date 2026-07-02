@@ -1,0 +1,185 @@
+"""Unit tests for the SchedulerService engine (B1).
+
+The clock, sleep, fire callback, and store are all injected, so these tests
+run deterministically with no real waiting and no host coupling.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from typing import Any
+
+from omnigent.entities.schedule import Schedule
+from omnigent.runtime.scheduler import SchedulerService
+
+_FIXED = datetime(2026, 1, 2, 3, 4, 30, tzinfo=timezone.utc)
+
+
+def _schedule(
+    schedule_id: str,
+    *,
+    kind: str = "loop",
+    cron: str | None = "* * * * *",
+) -> Schedule:
+    return Schedule(
+        id=schedule_id,
+        conversation_id="conv_1",
+        name=schedule_id,
+        kind=kind,
+        prompt="do the thing",
+        enabled=True,
+        status="idle",
+        created_at=0,
+        cron=cron,
+    )
+
+
+class _FakeStore:
+    """Minimal ScheduleStore stand-in: preset enabled rows + update recorder."""
+
+    def __init__(self, schedules: list[Schedule]) -> None:
+        self._schedules = schedules
+        self.updates: list[tuple[str, dict[str, Any]]] = []
+        # Set on every update so a test can await the *recorded* fire instead
+        # of the fire callback (which the scheduler runs strictly before the
+        # last_fired_at write — waiting on the callback races the write).
+        self.updated = asyncio.Event()
+
+    def list_enabled(self) -> list[Schedule]:
+        return list(self._schedules)
+
+    def update(self, schedule_id: str, **kwargs: Any) -> None:
+        self.updates.append((schedule_id, kwargs))
+        self.updated.set()
+
+
+def _fire_recorder() -> tuple[
+    Callable[[Schedule], Awaitable[str | None]], list[str], asyncio.Event
+]:
+    fired = asyncio.Event()
+    calls: list[str] = []
+
+    async def fire(s: Schedule) -> str | None:
+        calls.append(s.id)
+        fired.set()
+        # Return the dispatched conversation id — the scheduler stamps
+        # last_fired_at / last_run_id only when a fire actually dispatched.
+        return f"run_{s.id}"
+
+    return fire, calls, fired
+
+
+def _fire_once_then_park() -> Callable[[float], Awaitable[None]]:
+    """A fake sleep that returns immediately the first time, then parks.
+
+    Lets ``_run_loop`` fire exactly once and then block on its second
+    sleep, so a test can assert the single fire without the loop spinning.
+    """
+    count = 0
+
+    async def sleep(_secs: float) -> None:
+        nonlocal count
+        count += 1
+        if count >= 2:
+            await asyncio.Event().wait()
+
+    return sleep
+
+
+async def test_fires_loop_and_records_last_fired() -> None:
+    store = _FakeStore([_schedule("s1", cron="* * * * *")])
+    fire, calls, fired = _fire_recorder()
+
+    svc = SchedulerService(store, fire, now=lambda: _FIXED, sleep=_fire_once_then_park())
+    await svc.start()
+    try:
+        # Wait on the store write (which the scheduler does *after* firing), so
+        # both the fire and its last_fired_at record are guaranteed visible.
+        await asyncio.wait_for(store.updated.wait(), timeout=2)
+    finally:
+        await svc.stop()
+
+    assert fired.is_set()
+    assert calls == ["s1"]
+    assert store.updates[0][0] == "s1"
+    assert store.updates[0][1]["last_fired_at"] == int(_FIXED.timestamp())
+    # The dispatched conversation is recorded so the UI can link the run.
+    assert store.updates[0][1]["last_run_id"] == "run_s1"
+
+
+async def test_soft_skip_does_not_stamp_last_fired() -> None:
+    # A fire that dispatched nothing (no runner / auth failure / no-op) returns
+    # None — the scheduler must NOT stamp last_fired_at, so a broken deployment
+    # never looks like it "fired".
+    store = _FakeStore([_schedule("s1", cron="* * * * *")])
+    fired = asyncio.Event()
+
+    async def fire(s: Schedule) -> str | None:
+        fired.set()
+        return None
+
+    svc = SchedulerService(store, fire, now=lambda: _FIXED, sleep=_fire_once_then_park())
+    await svc.start()
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=2)
+        # Give the loop a beat to (not) write, then assert nothing was stamped.
+        await asyncio.sleep(0.02)
+    finally:
+        await svc.stop()
+
+    assert store.updates == []
+
+
+async def test_skips_monitors_and_cronless_loops() -> None:
+    store = _FakeStore(
+        [
+            _schedule("m1", kind="monitor", cron=None),
+            _schedule("l0", kind="loop", cron=None),
+        ]
+    )
+    fire, calls, _ = _fire_recorder()
+
+    svc = SchedulerService(store, fire, now=lambda: _FIXED, sleep=_fire_once_then_park())
+    await svc.start()
+    try:
+        await asyncio.sleep(0.02)
+        assert calls == []
+        assert svc._tasks == {}  # nothing armed
+    finally:
+        await svc.stop()
+
+
+async def test_invalid_cron_is_skipped_without_firing() -> None:
+    store = _FakeStore([_schedule("bad", cron="not a cron")])
+    fire, calls, _ = _fire_recorder()
+
+    svc = SchedulerService(store, fire, now=lambda: _FIXED)
+    await svc.start()
+    try:
+        await asyncio.sleep(0.02)  # let the task run + return early
+        assert calls == []
+    finally:
+        await svc.stop()
+
+
+async def test_refresh_cancels_removed_schedule() -> None:
+    store = _FakeStore([_schedule("s1", cron="* * * * *")])
+    fire, _, _ = _fire_recorder()
+
+    svc = SchedulerService(store, fire, now=lambda: _FIXED, sleep=_fire_once_then_park())
+    await svc.start()
+    try:
+        assert set(svc._tasks) == {"s1"}
+        store._schedules = []  # s1 disabled/removed
+        await svc.refresh()
+        assert svc._tasks == {}
+    finally:
+        await svc.stop()
+
+
+def test_seconds_until_next_is_within_a_minute() -> None:
+    svc = SchedulerService(_FakeStore([]), _fire_recorder()[0])
+    secs = svc._seconds_until_next("* * * * *")
+    assert 0 <= secs <= 60
