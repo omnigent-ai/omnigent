@@ -15578,9 +15578,24 @@ def create_runner_app(
         # Resolve pending policy approval Futures.
         if body_type == "approval":
             _data = body.get("data") or body
-            pending_approvals.resolve(
-                _data.get("elicitation_id", ""), _data.get("action") == "accept"
-            )
+            _elicit_action = _data.get("action", "")
+            pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
+            if _elicit_action == "decline":
+                # Explicit user decline: send an interrupt to the harness
+                # so the turn aborts cleanly instead of continuing after
+                # the DENY tool result reaches the LLM. This fires before
+                # the ProxyMcpManager task resumes (asyncio cooperative
+                # scheduling), so interrupt_session is called before the
+                # deny propagates to the SDK.
+                try:
+                    _int_client = await process_manager.get_client(conversation_id, "any")
+                    await _int_client.post(
+                        f"/v1/sessions/{conversation_id}/events",
+                        json={"type": "interrupt"},
+                        timeout=5.0,
+                    )
+                except Exception:  # noqa: BLE001 — best-effort; deny path continues
+                    pass
             # The server wraps the verdict as ``{"type": "approval", "data": {…}}``,
             # but the harness scaffold's ``ApprovalEvent`` wants the fields at the
             # top level — forwarding the envelope verbatim 422s and hangs the turn.

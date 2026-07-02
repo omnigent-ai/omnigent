@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.errors import ElicitationDeclinedError
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.runtime.policies import _await_elicitation
@@ -126,17 +127,20 @@ async def _run_ask_cycle(
     assert result.action == PolicyAction.ASK, (
         f"Harness expects ASK from evaluate(); got {result.action}"
     )
-    approved = await _await_elicitation(
-        task_id="task_1",
-        root_task_id="task_1",
-        result=result,
-        phase=ctx.phase,
-        content_preview=str(ctx.content),
-        policy_engine=engine,
-        register=harness.register,
-        emit=harness.emit,
-        park=harness.park,
-    )
+    try:
+        approved = await _await_elicitation(
+            task_id="task_1",
+            root_task_id="task_1",
+            result=result,
+            phase=ctx.phase,
+            content_preview=str(ctx.content),
+            policy_engine=engine,
+            register=harness.register,
+            emit=harness.emit,
+            park=harness.park,
+        )
+    except ElicitationDeclinedError:
+        approved = False
     return result, approved
 
 

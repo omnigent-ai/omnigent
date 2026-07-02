@@ -84,7 +84,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -4179,8 +4179,11 @@ async def _hold_native_ask_gate(
         used by ``POST /policies/evaluate`` retries so a hook retry after
         a transient 5xx / connect-drop does not prompt the human twice.
         ``None`` mints a fresh id (the default for non-retry callers).
-    :returns: ``True`` iff a human accepted; ``False`` on decline /
-        cancel / timeout / disconnect (fail closed).
+    :returns: ``True`` iff a human accepted; ``False`` on cancel /
+        timeout / disconnect (fail closed).
+    :raises ElicitationDeclinedError: when the human explicitly
+        declines (``action == "decline"``). Callers should abort the
+        turn rather than continuing with a DENY.
     """
     tool_name = data.get("name")
     tool_input = data.get("arguments")
@@ -4212,6 +4215,13 @@ async def _hold_native_ask_gate(
         tool_name=tool_name if isinstance(tool_name, str) else None,
         tool_input=tool_input if isinstance(tool_input, dict) else None,
     )
+    # Explicit user decline → raise so callers can abort the turn rather
+    # than feeding a DENY message to the LLM and letting it continue.
+    if verdict is not None and verdict.action == "decline":
+        raise ElicitationDeclinedError(
+            result.reason or "",
+            policy_name=result.deciding_policy,
+        )
     approved = verdict is not None and verdict.action == "accept"
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
@@ -10974,15 +10984,21 @@ async def _evaluate_input_policy(
     # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
     # ALLOW (fall through to forward the message); decline / timeout ->
     # DENY (fail-closed).
-    approved = await _hold_native_ask_gate(
-        request,
-        session_id=session_id,
-        phase=Phase.REQUEST,
-        data=body.data,
-        engine=engine,
-        result=result,
-        conversation_store=conversation_store,
-    )
+    try:
+        approved = await _hold_native_ask_gate(
+            request,
+            session_id=session_id,
+            phase=Phase.REQUEST,
+            data=body.data,
+            engine=engine,
+            result=result,
+            conversation_store=conversation_store,
+        )
+    except ElicitationDeclinedError as exc:
+        return {
+            "verdict": "deny",
+            "reason": exc.args[0] or "Denied by policy",
+        }
     if approved:
         return None
     return {
@@ -16272,16 +16288,37 @@ def create_sessions_router(
                         Phase.LLM_REQUEST,
                         Phase.REQUEST,
                     ):
-                        approved = await _hold_native_ask_gate(
-                            request,
-                            session_id=session_id,
-                            phase=phase,
-                            data=data,
-                            engine=engine,
-                            result=result,
-                            conversation_store=conversation_store,
-                            elicitation_id=hook_elicitation_id,
-                        )
+                        try:
+                            approved = await _hold_native_ask_gate(
+                                request,
+                                session_id=session_id,
+                                phase=phase,
+                                data=data,
+                                engine=engine,
+                                result=result,
+                                conversation_store=conversation_store,
+                                elicitation_id=hook_elicitation_id,
+                            )
+                        except ElicitationDeclinedError as exc:
+                            # Explicit user decline: interrupt the native
+                            # harness BEFORE returning the hook deny so the
+                            # Escape key reaches Claude Code's tmux pane first.
+                            # By the time the DENY response reaches the hook
+                            # subprocess, the abort signal is already queued.
+                            # Best-effort: forwarding failures are swallowed.
+                            await _forward_session_change_to_runner(
+                                session_id,
+                                _server_runner_router,
+                                {"type": "interrupt"},
+                            )
+                            verdict_body = {
+                                "result": "POLICY_ACTION_DENY",
+                                "reason": exc.args[0] or "Approval was declined.",
+                            }
+                            return Response(
+                                content=json.dumps(verdict_body),
+                                media_type="application/json",
+                            )
                         verdict_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
                             if approved
@@ -16389,6 +16426,16 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt Codex before returning the
+            # deny response, same as the Claude-native path. The await
+            # ensures the abort signal reaches Codex before it processes
+            # the decline result and lets the LLM continue.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         body = codex_request.build_response(result)
         return Response(
             content=json.dumps(body),
@@ -16483,6 +16530,14 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt the native harness before
+            # returning the decline so the abort signal arrives first.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         return Response(
             content=result.model_dump_json(),
             media_type="application/json",
@@ -16590,6 +16645,14 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt the native harness before
+            # returning the decline so the abort signal arrives first.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
             media_type="application/json",
@@ -16690,6 +16753,14 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt the native harness before
+            # returning the decline so the abort signal arrives first.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
             media_type="application/json",
