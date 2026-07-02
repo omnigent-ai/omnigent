@@ -276,14 +276,15 @@ async def test_me_header_mode_behaviors(
     # Missing header fails closed: /v1/me itself stays
     # 200 (it's the identity probe the frontend bootstraps from) but
     # reports no user instead of resolving to a shared "local" identity.
+    # is_admin is always present (mode-agnostic signal) and false with no user.
     assert missing.status_code == 200
-    assert missing.json() == {"user_id": None}
-    # Valid header returns the identity.
+    assert missing.json() == {"user_id": None, "is_admin": False}
+    # Valid header returns the identity; alice has no admin flag set.
     assert normal.status_code == 200
-    assert normal.json() == {"user_id": "alice@example.com"}
+    assert normal.json() == {"user_id": "alice@example.com", "is_admin": False}
     # Reserved name is rejected (returns None → route returns null).
     assert reserved.status_code == 200
-    assert reserved.json() == {"user_id": None}
+    assert reserved.json() == {"user_id": None, "is_admin": False}
 
 
 async def test_web_ui_serves_pwa_service_worker_and_manifest(
