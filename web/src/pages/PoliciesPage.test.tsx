@@ -2,29 +2,28 @@
 // add, delete).
 //
 // Browser e2e is impractical (admin/accounts-gated), so the surface is pinned
-// here by mocking getMe (admin gate), useNavigate (unauth bounce), and the
-// react-query policy hooks (useDefaultPolicies / usePolicyRegistry +
-// add/update/delete mutations) so no QueryClient or network is needed.
+// here by mocking the mode-agnostic identity probe (resolveIdentity /
+// getCurrentIsAdmin gate admin — works under OIDC too) and the react-query
+// policy hooks (useDefaultPolicies / usePolicyRegistry + add/update/delete
+// mutations) so no QueryClient or network is needed.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PoliciesPage } from "./PoliciesPage";
-import * as accountsApi from "@/lib/accountsApi";
+import * as identity from "@/lib/identity";
 import * as defaultPolicies from "@/hooks/useDefaultPolicies";
 import * as policies from "@/hooks/usePolicies";
 
-const navigateMock = vi.fn();
 const addMutate = vi.fn();
 const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
 const refetchMock = vi.fn();
 
-vi.mock("@/lib/routing", async (importActual) => ({
-  ...(await importActual<typeof import("@/lib/routing")>()),
-  useNavigate: () => navigateMock,
+vi.mock("@/lib/identity", () => ({
+  resolveIdentity: vi.fn(),
+  getCurrentIsAdmin: vi.fn(),
 }));
-vi.mock("@/lib/accountsApi", () => ({ getMe: vi.fn() }));
 vi.mock("@/hooks/useDefaultPolicies", () => ({
   useDefaultPolicies: vi.fn(),
   useAddDefaultPolicy: vi.fn(),
@@ -74,12 +73,8 @@ function renderPage() {
 }
 
 beforeEach(() => {
-  vi.mocked(accountsApi.getMe).mockResolvedValue({
-    id: "admin",
-    is_admin: true,
-    created_at: null,
-    last_login_at: null,
-  });
+  vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
+  vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   setPolicies([]);
   vi.mocked(policies.usePolicyRegistry).mockReturnValue({ data: [] } as never);
   vi.mocked(defaultPolicies.useAddDefaultPolicy).mockReturnValue(mutationStub(addMutate) as never);
@@ -98,28 +93,27 @@ afterEach(() => {
 
 describe("PoliciesPage gating", () => {
   it("shows a loading state until the identity probe resolves", () => {
-    vi.mocked(accountsApi.getMe).mockReturnValue(new Promise(() => {}));
+    vi.mocked(identity.resolveIdentity).mockReturnValue(new Promise(() => {}));
     renderPage();
     expect(screen.getByText("Loading...")).toBeInTheDocument();
   });
 
   it("blocks non-admins with a permission message", async () => {
-    vi.mocked(accountsApi.getMe).mockResolvedValue({
-      id: "alice",
-      is_admin: false,
-      created_at: null,
-      last_login_at: null,
-    });
+    vi.mocked(identity.resolveIdentity).mockResolvedValue("alice");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
     renderPage();
     expect(
       await screen.findByText("You don't have permission to manage global policies."),
     ).toBeInTheDocument();
   });
 
-  it("bounces an unauthenticated visitor to /login", async () => {
-    vi.mocked(accountsApi.getMe).mockResolvedValue(null);
+  it("stays loading for an unauthenticated visitor (resolveIdentity redirects)", async () => {
+    // resolveIdentity returns null AND owns the login redirect, so the page
+    // never resolves its admin flag — it stays in the loading state.
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
     renderPage();
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/login", { replace: true }));
+    await waitFor(() => expect(identity.getCurrentIsAdmin).not.toHaveBeenCalled());
+    expect(screen.getByText("Loading...")).toBeInTheDocument();
   });
 });
 

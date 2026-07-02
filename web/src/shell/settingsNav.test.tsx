@@ -13,14 +13,23 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 const mocks = vi.hoisted(() => ({
   accountsEnabled: false,
-  me: null as { id: string; is_admin: boolean } | null,
+  // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
+  // header single-user. Gates the Account section + the bare-/settings default.
+  loginUrl: null as string | null,
+  isAdmin: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ accounts_enabled: mocks.accountsEnabled }),
+  useServerInfo: () => ({
+    accounts_enabled: mocks.accountsEnabled,
+    login_url: mocks.loginUrl,
+  }),
 }));
-vi.mock("@/hooks/useMe", () => ({
-  useMe: () => ({ data: mocks.me }),
+// Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
+// (not the accounts-only `/auth/me` useMe hook), so the Admin group appears
+// under OIDC too.
+vi.mock("@/hooks/useIsAdmin", () => ({
+  useIsAdmin: () => mocks.isAdmin,
 }));
 
 import { SettingsSidebarBody, settingsNavGroups, useSettingsRoute } from "./settingsNav";
@@ -40,7 +49,8 @@ function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}
 
 beforeEach(() => {
   mocks.accountsEnabled = false;
-  mocks.me = null;
+  mocks.loginUrl = null;
+  mocks.isAdmin = false;
 });
 afterEach(cleanup);
 
@@ -54,18 +64,20 @@ describe("settingsNavGroups", () => {
     }
   });
 
-  it("includes Account (leading) only when accounts auth is enabled", () => {
+  it("includes Account (leading) whenever a login session exists (accounts OR OIDC)", () => {
+    // First arg is hasAuthSession (login_url != null), not accounts-specific.
+    // Header single-user (no session) → no Account section.
     expect(
       settingsNavGroups(false, false)
         .flatMap((g) => g.items)
         .map((i) => i.id),
     ).not.toContain("account");
-    const withAccounts = settingsNavGroups(true, false)
+    // Any login session → Account appears and leads its group.
+    const withAccount = settingsNavGroups(true, false)
       .flatMap((g) => g.items)
       .map((i) => i.id);
-    expect(withAccounts).toContain("account");
-    // Account leads its group — it's the most-visited section on accounts deploys.
-    expect(withAccounts[0]).toBe("account");
+    expect(withAccount).toContain("account");
+    expect(withAccount[0]).toBe("account");
   });
 
   it("includes the Local CLI section only in the desktop shell", () => {
@@ -77,18 +89,21 @@ describe("settingsNavGroups", () => {
     expect(ids(true)).toContain("cli");
   });
 
-  it("includes the Admin group (Members / Policies) only for admins on accounts deploys", () => {
+  it("includes the Admin group (Members / Policies) for any admin, in accounts OR OIDC mode", () => {
     const ids = (accountsEnabled: boolean, isAdmin: boolean) =>
       settingsNavGroups(accountsEnabled, false, isAdmin)
         .flatMap((g) => g.items)
         .map((i) => i.id);
-    // Non-admin, or non-accounts deploy → no Members / Policies.
+    // Non-admin → no Members / Policies, regardless of auth mode.
     expect(ids(true, false)).not.toContain("members");
-    expect(ids(false, true)).not.toContain("members");
+    expect(ids(false, false)).not.toContain("members");
     // Admin on an accounts deploy → both appear, grouped under "Admin".
-    const adminGroups = settingsNavGroups(true, false, true);
-    const admin = adminGroups.find((g) => g.title === "Admin");
-    expect(admin?.items.map((i) => i.id)).toEqual(["members", "policies"]);
+    const accountsAdmin = settingsNavGroups(true, false, true).find((g) => g.title === "Admin");
+    expect(accountsAdmin?.items.map((i) => i.id)).toEqual(["members", "policies"]);
+    // Admin under OIDC (accountsEnabled false) → still appears. This is the
+    // #1489 fix: OIDC previously had no admin chrome at all.
+    const oidcAdmin = settingsNavGroups(false, false, true).find((g) => g.title === "Admin");
+    expect(oidcAdmin?.items.map((i) => i.id)).toEqual(["members", "policies"]);
   });
 });
 
@@ -118,7 +133,7 @@ describe("SettingsSidebarBody", () => {
 
   it("renders Members / Policies sub-categories for an admin, linking under /settings", () => {
     mocks.accountsEnabled = true;
-    mocks.me = { id: "admin", is_admin: true };
+    mocks.isAdmin = true;
     renderBody();
     const members = screen.getByTestId("settings-nav-members");
     const policies = screen.getByTestId("settings-nav-policies");
@@ -126,9 +141,21 @@ describe("SettingsSidebarBody", () => {
     expect(policies).toHaveAttribute("href", "/settings/policies");
   });
 
+  it("renders the admin sub-categories for an admin under OIDC (accounts off)", () => {
+    // #1489: admin chrome must surface under OIDC, where accounts is off.
+    mocks.accountsEnabled = false;
+    mocks.isAdmin = true;
+    renderBody();
+    expect(screen.getByTestId("settings-nav-members")).toHaveAttribute("href", "/settings/members");
+    expect(screen.getByTestId("settings-nav-policies")).toHaveAttribute(
+      "href",
+      "/settings/policies",
+    );
+  });
+
   it("hides the admin sub-categories for a non-admin", () => {
     mocks.accountsEnabled = true;
-    mocks.me = { id: "bob", is_admin: false };
+    mocks.isAdmin = false;
     renderBody();
     expect(screen.queryByTestId("settings-nav-members")).toBeNull();
     expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
@@ -154,14 +181,14 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
   });
 
-  it("falls back from the accounts-only admin sections when accounts is off", () => {
-    // Members / Policies aren't real destinations off an accounts deploy — the
-    // sidebar never shows them and the page would render an empty panel. Only
-    // reachable by typing the URL, but resolve to the default section (still
-    // in-settings) instead of a dead admin section.
+  it("treats the admin sections as valid destinations even when accounts is off (OIDC)", () => {
+    // #1489: Members / Policies are admin sections valid in ANY multi-user
+    // mode (accounts AND OIDC). They no longer fall back to the default
+    // section off an accounts deploy — the nav gates them on is_admin and the
+    // pages self-gate / the server 403s.
     mocks.accountsEnabled = false;
-    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "appearance" });
-    expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "appearance" });
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "members" });
+    expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
   });
 
   it("reports NOT in settings for the legacy standalone /members and /policies paths", () => {
@@ -176,14 +203,16 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: "appearance",
     });
-    // Bare /settings: in-settings, defaulting to Appearance when accounts is off.
+    // Bare /settings: in-settings, defaulting to Appearance in header mode
+    // (no login session — loginUrl null per beforeEach).
     expect(routeHook("/settings")).toEqual({ inSettings: true, section: "appearance" });
     // A non-settings route is out of settings.
     expect(routeHook("/inbox").inSettings).toBe(false);
   });
 
-  it("defaults bare /settings to Account when accounts auth is enabled", () => {
-    mocks.accountsEnabled = true;
+  it("defaults bare /settings to Account when a login session exists", () => {
+    // login_url set (accounts OR OIDC) → Account is the landing section.
+    mocks.loginUrl = "/login";
     expect(routeHook("/settings")).toEqual({ inSettings: true, section: "account" });
   });
 

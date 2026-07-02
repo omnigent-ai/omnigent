@@ -7,7 +7,7 @@ sentinel user ID represents public read access.
 
 from abc import ABC, abstractmethod
 
-from omnigent.entities import ResolvedAccess, SessionPermission
+from omnigent.entities import Account, ResolvedAccess, SessionPermission
 
 
 class PermissionStore(ABC):
@@ -125,6 +125,22 @@ class PermissionStore(ABC):
             ``"alice@example.com"`` or ``"local"``.
         :param is_admin: Set to ``True`` for the ``"local"`` user
             in single-user mode.
+        """
+        ...
+
+    @abstractmethod
+    def list_users(self) -> list[Account]:
+        """Return every real user row, for the admin user list.
+
+        Excludes the reserved sentinels (``"__public__"`` and
+        ``"local"``) that aren't real actors, mirroring
+        :meth:`SqlAlchemyAccountStore.list_users` so the OIDC/header
+        admin surface can reuse the accounts-mode ``Account`` shape.
+        The ``password_hash`` is never included (see :class:`Account`).
+
+        Result is unordered; callers sort for display.
+
+        :returns: List of :class:`Account` rows.
         """
         ...
 

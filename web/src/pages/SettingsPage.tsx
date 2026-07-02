@@ -46,7 +46,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
-import { changePassword, type CurrentAccount, getMe, logout } from "@/lib/accountsApi";
+import { changePassword, logout } from "@/lib/accountsApi";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
@@ -82,14 +83,19 @@ const PoliciesPage = lazy(() =>
  */
 export function SettingsPage() {
   const info = useServerInfo();
-  const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  // A login session exists (accounts OR OIDC) when the server advertises a
+  // login_url; gates the Account section so SSO users get it too.
+  const hasAuthSession = info !== "loading" && info.login_url !== null;
   const { section } = useSettingsRoute();
 
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
   // NOT inside the shared section PageScroll below, which would nest two
   // scroll containers. Both self-gate to admins server-side and client-side.
-  if (accountsEnabled && (section === "members" || section === "policies")) {
+  // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
+  // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
+  // read-only under OIDC (no password actions).
+  if (section === "members" || section === "policies") {
     return (
       <Suspense fallback={null}>
         {section === "members" ? <MembersPage /> : <PoliciesPage />}
@@ -101,7 +107,7 @@ export function SettingsPage() {
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
       {section === "shortcuts" && <ShortcutsSection />}
-      {section === "account" && accountsEnabled && <AccountSection />}
+      {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
     </PageScroll>
@@ -279,9 +285,14 @@ function LocalCliSection() {
 }
 
 function AccountSection() {
-  const [me, setMe] = useState<CurrentAccount | null | "unknown">("unknown");
+  const info = useServerInfo();
+  const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  // Identity for display. Sourced from the mode-agnostic `/v1/me` probe so it
+  // works under OIDC too (the accounts-only `/auth/me` doesn't exist there).
+  const [me, setMe] = useState<{ id: string; is_admin: boolean } | null | "unknown">("unknown");
 
   // Change-password dialog state (lifted verbatim from the old AccountMenu).
+  // Only used in accounts mode — OIDC identities have no local password.
   const [pwOpen, setPwOpen] = useState(false);
   const [oldPw, setOldPw] = useState("");
   const [newPw, setNewPw] = useState("");
@@ -291,14 +302,27 @@ function AccountSection() {
   const [pwDone, setPwDone] = useState(false);
 
   useEffect(() => {
-    void (async () => setMe(await getMe()))();
+    void (async () => {
+      const userId = await resolveIdentity();
+      setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
+    })();
   }, []);
 
   const onSignOut = useCallback(async () => {
-    await logout();
-    // Hard navigation so the chat store / react-query cache reset.
-    window.location.href = "/login";
-  }, []);
+    if (accountsEnabled) {
+      // Accounts: clear the cookie via the JSON logout endpoint, then land on
+      // the SPA login form.
+      await logout();
+      // Hard navigation so the chat store / react-query cache reset.
+      window.location.href = "/login";
+      return;
+    }
+    // OIDC: logout is a server-side GET redirect at /auth/logout that clears
+    // the session cookie (and honors the IdP end-session endpoint when
+    // configured). A hard navigation lets the browser follow it and resets
+    // client caches.
+    window.location.href = "/auth/logout";
+  }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {
     setOldPw("");
@@ -355,16 +379,20 @@ function AccountSection() {
             instead of navigating away from /settings. */}
 
         <div className="flex flex-col gap-1">
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-2"
-            onClick={() => {
-              resetPwForm();
-              setPwOpen(true);
-            }}
-          >
-            <KeyRoundIcon className="size-4" /> Change password
-          </Button>
+          {/* Change password is accounts-only — an OIDC identity's password
+              lives with the IdP, so there's nothing to change here. */}
+          {accountsEnabled && (
+            <Button
+              variant="ghost"
+              className="w-full justify-start gap-2"
+              onClick={() => {
+                resetPwForm();
+                setPwOpen(true);
+              }}
+            >
+              <KeyRoundIcon className="size-4" /> Change password
+            </Button>
+          )}
           <Button
             variant="ghost"
             className="w-full justify-start gap-2"

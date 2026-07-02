@@ -12,7 +12,6 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate } from "@/lib/routing";
 import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -33,7 +32,7 @@ import {
   type DefaultPolicy,
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
-import { getMe } from "@/lib/accountsApi";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { coercePolicyParams } from "@/lib/policyParams";
 
 // ---------------------------------------------------------------------------
@@ -351,7 +350,6 @@ function AddDefaultPolicyDialog({
 // ---------------------------------------------------------------------------
 
 export function PoliciesPage() {
-  const navigate = useNavigate();
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const { data: policies = [], refetch } = useDefaultPolicies();
   const { data: registry = [] } = usePolicyRegistry();
@@ -369,16 +367,16 @@ export function PoliciesPage() {
     void refetch();
   }, [refetch]);
 
+  // Admin probe via the mode-agnostic `/v1/me` identity (works under OIDC
+  // too, unlike the accounts-only `/auth/me`). resolveIdentity handles the
+  // login redirect when unauthenticated, so we only set the admin flag here.
   useEffect(() => {
     void (async () => {
-      const me = await getMe();
-      if (me === null) {
-        navigate("/login", { replace: true });
-        return;
-      }
-      setMeIsAdmin(me.is_admin);
+      const userId = await resolveIdentity();
+      if (userId === null) return;
+      setMeIsAdmin(getCurrentIsAdmin());
     })();
-  }, [navigate]);
+  }, []);
 
   if (meIsAdmin === null) {
     return (

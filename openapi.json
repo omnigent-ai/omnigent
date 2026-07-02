@@ -6570,7 +6570,7 @@
     },
     "/v1/me": {
       "get": {
-        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\"}`, `{\"user_id\": null}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
+        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nAlso returns `is_admin` \u2014 the mode-agnostic admin signal\n(the shared `users.is_admin` column, set by the admin-list\npromotion at login). The SPA gates admin chrome on it in\nEVERY mode, including OIDC/SSO where the accounts-only\n`/auth/me` endpoint does not exist.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\", \"is_admin\": true}`, `{\"user_id\": null, \"is_admin\": false}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
         "operationId": "me_v1_me_get",
         "responses": {
           "200": {
