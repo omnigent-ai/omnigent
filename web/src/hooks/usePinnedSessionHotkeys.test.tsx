@@ -168,6 +168,20 @@ describe("usePinnedSessionHotkeys", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c");
   });
 
+  it("browser: ignores AltGr chords (AltGr+digit composes characters on intl layouts)", () => {
+    // AltGr reports as Ctrl+Alt on Windows/Linux — typing AltGr+2 must
+    // compose the character (event untouched), not navigate to a session.
+    isNativeShell.mockReturnValue(false);
+    renderHook(() => usePinnedSessionHotkeys(ids, undefined));
+    const altGraph = vi
+      .spyOn(KeyboardEvent.prototype, "getModifierState")
+      .mockImplementation((keyArg) => keyArg === "AltGraph");
+    const e = press("\u00b2", { ctrlKey: true, altKey: true }, document.body, "Digit2");
+    expect(navigate).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
+    altGraph.mockRestore();
+  });
+
   it("browser: Cmd+Alt+Digit0 opens the tenth pinned session", () => {
     isNativeShell.mockReturnValue(false);
     const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];

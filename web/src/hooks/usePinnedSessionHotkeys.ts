@@ -62,6 +62,11 @@ export function usePinnedSessionHotkeys(
         // Browser: plain Cmd/Ctrl+digit is the native tab-switch, so own the
         // Cmd/Ctrl+Alt+digit chord instead. Alt rewrites e.key → match e.code.
         if (!e.altKey) return;
+        // AltGr reports as Ctrl+Alt on Windows/Linux intl layouts — typing
+        // AltGr+digit must compose the character, not yank the user to a
+        // pinned session. Same guard (and same feature-detect, so synthetic
+        // events without the method don't throw) as useSidebarToggleHotkeys.
+        if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return;
         index = PINNED_HOTKEY_CODES.indexOf(e.code as (typeof PINNED_HOTKEY_CODES)[number]);
       }
       if (index === -1) return;
