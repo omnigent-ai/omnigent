@@ -269,6 +269,7 @@ and a key. The base URL depends on which agent you point it at:
 |---|---|---|---|
 | **OpenRouter** | Claude Code | `https://openrouter.ai/api` | your OpenRouter key (`sk-or-…`) |
 | **OpenRouter** | Codex / OpenAI agents | `https://openrouter.ai/api/v1` | your OpenRouter key (`sk-or-…`) |
+| **Eden AI** | Codex / OpenAI agents | `https://api.edenai.run/v3` | your Eden AI key (`EDENAI_API_KEY`) |
 | **Ollama** (local) | Codex / OpenAI agents | `http://localhost:11434/v1` | any value (Ollama ignores it) |
 
 For Claude Code, point at OpenRouter's Anthropic-compatible endpoint

@@ -352,3 +352,18 @@ def test_unknown_provider_gets_default_api_key_mode() -> None:
     assert config.default_mode == "api_key"
     assert len(config.auth_modes) == 1
     assert config.auth_modes[0].fields[0].name == "api_key"
+
+
+def test_edenai_registered_as_openai_gateway() -> None:
+    """Eden AI is a recognized OpenAI-compatible gateway (mirrors OpenRouter)."""
+    from omnigent.llms.routing import PROVIDER_CONFIGS
+    from omnigent.onboarding.ambient import _ENV_KEY_FAMILY
+    from omnigent.onboarding.configure_models import _CATALOG_PROVIDER_FAMILY
+    from omnigent.onboarding.provider_config import OPENAI_FAMILY
+
+    assert PROVIDER_CONFIGS["edenai"] == "https://api.edenai.run/v3"
+    assert _providers_mod.PROVIDER_ENV_VARS["edenai"] == "EDENAI_API_KEY"
+    assert _providers_mod.format_provider_name("edenai") == "Eden AI"
+    assert "edenai" in _providers_mod.COMMON_PROVIDERS
+    assert _ENV_KEY_FAMILY["edenai"] == OPENAI_FAMILY
+    assert _CATALOG_PROVIDER_FAMILY["edenai"] == OPENAI_FAMILY

@@ -283,6 +283,7 @@ COMMON_PROVIDERS: list[str] = [
     "groq",
     "deepseek",
     "openrouter",
+    "edenai",
     "ollama",
     "together_ai",
     "cohere",
@@ -729,6 +730,7 @@ _PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "cerebras": "Cerebras",
     "deepseek": "DeepSeek",
     "openrouter": "OpenRouter",
+    "edenai": "Eden AI",
     "ollama": "Ollama",
 }
 
@@ -759,6 +761,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "edenai": "EDENAI_API_KEY",
     "togetherai": "TOGETHERAI_API_KEY",
     "cohere": "COHERE_API_KEY",
     "ai21": "AI21_API_KEY",

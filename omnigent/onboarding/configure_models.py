@@ -154,6 +154,7 @@ _CATALOG_PROVIDER_FAMILY: dict[str, str] = {
     # SDK directly with a GEMINI_API_KEY).
     "gemini": GEMINI_FAMILY,
     "openrouter": OPENAI_FAMILY,
+    "edenai": OPENAI_FAMILY,
     "groq": OPENAI_FAMILY,
     "deepseek": OPENAI_FAMILY,
     "xai": OPENAI_FAMILY,
@@ -244,6 +245,7 @@ _PROVIDER_DISPLAY_NAME: dict[str, str] = {
     "openai": "OpenAI",
     "anthropic": "Anthropic",
     "openrouter": "OpenRouter",
+    "edenai": "Eden AI",
     "groq": "Groq",
     "deepseek": "DeepSeek",
     "xai": "xAI",
