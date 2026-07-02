@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any
 
 import pytest
@@ -476,8 +476,10 @@ class _RecordingLabelStore:
 
     The disconnect path persists the failure cause as durable labels so
     snapshots and child summaries can tell a benign runner disconnect
-    from a real task failure (Option B). Only ``set_labels`` is exercised
-    by the tunnel-close path, so that is all this fake implements.
+    from a real task failure (Option B). ``set_labels`` is exercised by
+    the tunnel-close path; ``get_conversation`` is read by
+    ``_publish_runner_recovered_status`` to gate the clear on the
+    persisted disconnect code, so both are implemented here.
     """
 
     def __init__(self) -> None:
@@ -485,6 +487,14 @@ class _RecordingLabelStore:
 
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
+
+    def get_conversation(self, conversation_id: str) -> Any:
+        """Return a conversation-shaped object exposing ``.labels``.
+
+        Only ``.labels`` is read by the recovery guard, so a lightweight
+        namespace over the recorded labels is enough.
+        """
+        return SimpleNamespace(labels=dict(self.labels.get(conversation_id, {})))
 
 
 @pytest.mark.asyncio
