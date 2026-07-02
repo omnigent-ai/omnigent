@@ -8,15 +8,18 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner.tool_dispatch import _execute_session_control_tool, should_dispatch_locally
 from omnigent.spec.types import AgentSpec
 from omnigent.tools import ToolManager
 from omnigent.tools.builtins.compact import SysCompactTool
-from omnigent.runner.tool_dispatch import _execute_session_control_tool, should_dispatch_locally
 
 
 def test_sys_compact_is_registered_and_runner_dispatched() -> None:
     """ToolManager exposes sys_compact and the runner owns dispatch."""
-    schemas = {s["function"]["name"]: s["function"] for s in ToolManager(AgentSpec(spec_version=1)).get_tool_schemas()}
+    schemas = {
+        s["function"]["name"]: s["function"]
+        for s in ToolManager(AgentSpec(spec_version=1)).get_tool_schemas()
+    }
 
     assert SysCompactTool.name() in schemas
     assert schemas[SysCompactTool.name()]["parameters"] == {
