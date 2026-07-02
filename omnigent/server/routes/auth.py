@@ -756,6 +756,11 @@ def _resolve_oidc_email(
     allowed domain. This mirrors the GitHub path, which
     requires ``verified`` on the primary email.
 
+    ``config.skip_email_verification`` (from
+    ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION``) waives the gate for
+    IdPs that omit the claim for directory-managed users (e.g. Okta
+    without custom API Access Management).
+
     :param token_json: The token endpoint response JSON containing
         ``id_token``.
     :param config: The OIDC configuration with JWKS URI and
@@ -763,7 +768,7 @@ def _resolve_oidc_email(
     :returns: The user's email from the ``id_token`` when present and
         marked verified; ``None`` if the token is missing/invalid,
         the email claim is absent, or ``email_verified`` is not
-        truthy.
+        truthy (and verification is not skipped via config).
     """
     id_token = token_json.get("id_token")
     if not id_token:
@@ -789,8 +794,17 @@ def _resolve_oidc_email(
 
     # Reject unless the IdP affirmatively verified the email. A signed
     # token only proves IdP provenance, not mailbox ownership.
-    # Absent/false ``email_verified`` is a hard reject.
+    # Absent/false ``email_verified`` is a hard reject — unless the
+    # operator opted out (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION) for
+    # IdPs like Okta that omit the claim for directory-managed users.
     if not _claim_is_verified_true(claims.get("email_verified")):
+        if config.skip_email_verification:
+            _logger.info(
+                "Accepting id_token email %r without email_verified "
+                "(OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                email,
+            )
+            return email
         _logger.warning(
             "Rejecting id_token: email %r present but email_verified is not true",
             email,

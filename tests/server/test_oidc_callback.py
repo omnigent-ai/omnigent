@@ -44,11 +44,14 @@ _ISSUER = "https://accounts.google.com"
 _CLIENT_ID = "cid"
 
 
-def _oidc_config() -> OIDCConfig:
+def _oidc_config(skip_email_verification: bool = False) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
     ``allowed_domains=None`` means admit-all, so the test isolates the
     ``email_verified`` gate from the domain-allowlist check.
+
+    :param skip_email_verification: Waive the ``email_verified`` gate,
+        as ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION`` would.
     """
     return OIDCConfig(
         issuer=_ISSUER,
@@ -66,6 +69,7 @@ def _oidc_config() -> OIDCConfig:
         jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
         userinfo_endpoint=None,
         allow_invites=False,
+        skip_email_verification=skip_email_verification,
     )
 
 
@@ -108,7 +112,10 @@ class _IdpKeys:
 
 @pytest.fixture
 def callback_client(
-    tmp_path: Path, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> Iterator[tuple[TestClient, _IdpKeys]]:
     """Mount the OIDC router and stub the IdP token endpoint + JWKS lookup.
 
@@ -116,13 +123,16 @@ def callback_client(
     one-element ``pending_id_token`` list captured by the monkeypatched
     ``post`` — exposed on ``app.state.pending_id_token`` so ``_do_callback``
     can set the signed token the IdP should return.
+
+    Indirect parametrization (``request.param``, default ``False``) sets
+    the config's ``skip_email_verification`` flag.
     """
     keys = _IdpKeys()
     perm_store = SqlAlchemyPermissionStore(db_uri)
     admins = tmp_path / "admins"
     admins.write_text("")
 
-    config = _oidc_config()
+    config = _oidc_config(skip_email_verification=getattr(request, "param", False))
     provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
 
     # The signed id_token the mocked token endpoint will return. Each
@@ -251,6 +261,37 @@ def test_callback_unverified_email_rejected(
     assert "Could not determine user email" in resp.json()["error"]
     # No session was minted for the spoofable email.
     assert resp.cookies.get("ap_session") is None
+
+
+@pytest.mark.parametrize("callback_client", [True], indirect=True)
+@pytest.mark.parametrize(
+    "claims",
+    [
+        pytest.param({"email": "carol@example.com"}, id="absent"),
+        pytest.param({"email": "carol@example.com", "email_verified": False}, id="false"),
+    ],
+)
+def test_callback_skip_verification_flag_admits_unverified(
+    callback_client: tuple[TestClient, _IdpKeys],
+    claims: dict[str, object],
+) -> None:
+    """With ``skip_email_verification`` on, the gate is waived.
+
+    Models Okta tiers that drop ``email_verified`` for
+    directory-provisioned users: the same absent-claim token rejected
+    by default (covered above) mints a session when the operator has
+    opted out via ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION``.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token(claims)
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    session_cookie = resp.cookies.get("ap_session")
+    assert session_cookie is not None
+    decoded = jwt.decode(session_cookie, _TEST_SECRET, algorithms=["HS256"])
+    assert decoded["sub"] == "carol@example.com"
 
 
 @pytest.mark.parametrize("verified_value", [True, "true", "True", "TRUE"])
