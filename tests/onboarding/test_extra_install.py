@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import tomllib
 
 from omnigent.onboarding import extra_install
+from omnigent.onboarding.antigravity_auth import ANTIGRAVITY_EXTRA
+from omnigent.onboarding.copilot_auth import COPILOT_EXTRA
+from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
 from omnigent.onboarding.extra_install import (
     _installed_vcs_url,
     _is_uv_tool_install,
@@ -124,3 +129,31 @@ def test_extra_install_display_matches_command(
     display = extra_install_display("cursor")
     assert "omnigent[cursor]" in display
     assert display.startswith("uv")
+
+
+# -- extra names stay in sync with pyproject packaging -----------------------
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [CURSOR_EXTRA, ANTIGRAVITY_EXTRA, COPILOT_EXTRA],
+    ids=["cursor", "antigravity", "copilot"],
+)
+def test_harness_extra_is_a_real_pyproject_extra(extra: str) -> None:
+    """Each harness ``*_EXTRA`` must name a real ``optional-dependencies`` key.
+
+    The install command interpolates the constant into ``omnigent[<extra>]``; a
+    typo or a rename in ``pyproject.toml`` would silently produce a command that
+    installs a nonexistent extra. This ties the code's name to the packaging.
+    """
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if not pyproject.is_file():
+        # Installed wheel with no source tree — nothing to check.
+        return
+    extras = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]
+    assert extra in extras, (
+        f"{extra!r} is not a declared optional-dependencies extra in "
+        f"pyproject.toml (have: {sorted(extras)})"
+    )
