@@ -524,7 +524,7 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
           disabled={busy}
           onClick={() => setDeleteOpen(true)}
         >
-          <Trash2Icon className="size-4" />
+          <Trash2Icon className="size-4 text-destructive" />
         </Button>
         <Button
           type="button"
