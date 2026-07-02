@@ -1293,6 +1293,63 @@
         "title": "ElicitationResolvedEvent",
         "type": "object"
       },
+      "ElicitationResult": {
+        "description": "Consumer reply to an outstanding elicitation.\n\nField names + semantics mirror MCP's `ElicitResult` verbatim.\nOmnigent clients deliver this shape inside the session-scoped\n`approval` event body, alongside the `elicitation_id`\ncorrelation key.",
+        "properties": {
+          "action": {
+            "description": "User action per MCP semantics. `\"accept\"` = approved (form submitted / confirmation given). `\"decline\"` = explicit refusal. `\"cancel\"` = dismissed without an explicit choice (also the verdict the server synthesizes on elicitation timeout).",
+            "enum": [
+              "accept",
+              "decline",
+              "cancel"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Form data when `action == \"accept\"` and the `requestedSchema` had fields. `None` (or omitted) for binary approve/reject elicitations and for `decline` / `cancel` actions. Values are restricted to JSON scalars and string lists per the MCP spec.",
+            "title": "Content"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ElicitationResult",
+        "type": "object"
+      },
       "ErrorData": {
         "description": "Data for a persisted error banner item.\n\nThese items mirror `response.error` events so clients can render\nthe same error banner after reconnect / refresh. They are listed in\n`NON_CONTENT_ITEM_TYPES` because they are operator-visible\ntranscript metadata, not content the next agent turn should receive.",
         "properties": {
@@ -8317,6 +8374,68 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve": {
+      "post": {
+        "description": "Resolve an outstanding elicitation by its URL (URL-based\nelicitation).\n\nThe dedicated, RESTful counterpart to delivering a verdict\nvia the `type == \"approval\"` event on\n`POST /v1/sessions/{id}/events`. An elicitation request\npublished in `mode == \"url\"` carries this endpoint's path\nas its `params.url`; the client hits it directly with the\nMCP `ElicitationResult` body instead of POSTing a\ngeneric approval event. The verdict routes through the\nshared `_resolve_elicitation`, so resolution semantics\nare identical to the event path.\n\nThe `elicitation_id` is taken from the URL rather than the\nbody, so the unguessable id (`secrets.token_hex(16)`) is\nthe capability scoping the resolution \u2014 combined with the\nsession-owner `LEVEL_EDIT` gate below and the server-side\nownership check inside `_resolve_elicitation`.\n\n**Parameters**\n\n- `body` \u2014 The MCP-shaped verdict \u2014 `action` (`\"accept\"` / `\"decline\"` / `\"cancel\"`) plus optional form `content`.\n\n**Returns:** `{\"queued\": False}` \u2014 resolution is synchronous and persists no conversation item.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
+        "operationId": "resolve_elicitation_v1_sessions__session_id__elicitations__elicitation_id__resolve_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Correlation id of the elicitation to resolve, e.g. `\"elicit_abc123\"`. Taken from the URL path, not the body.",
+            "in": "path",
+            "name": "elicitation_id",
+            "required": true,
+            "schema": {
+              "title": "Elicitation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ElicitationResult"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Elicitation",
+        "tags": [
+          "sessions"
         ]
       }
     },

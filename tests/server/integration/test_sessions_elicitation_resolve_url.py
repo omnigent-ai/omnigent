@@ -530,6 +530,16 @@ async def test_resolve_url_allow_round_trip(client: httpx.AsyncClient) -> None:
     }
 
 
+def test_resolve_url_is_documented_in_openapi(app: FastAPI) -> None:
+    """The dedicated resolve endpoint is surfaced in the FastAPI schema."""
+    path = "/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve"
+    spec = app.openapi()
+    assert path in spec["paths"], spec["paths"].keys()
+    operation = spec["paths"][path]["post"]
+    assert operation["responses"]["202"]["description"]
+    assert operation["requestBody"]["content"]["application/json"]
+
+
 async def test_child_codex_elicitation_bubbles_to_parent_stream(
     client: httpx.AsyncClient,
     db_uri: str,

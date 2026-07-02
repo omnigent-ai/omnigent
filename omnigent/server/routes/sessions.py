@@ -18230,8 +18230,7 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
-        # Internal elicitation flow — hidden from the public API reference.
-        include_in_schema=False,
+        # Supported URL-based elicitation resolution for approval UIs.
         status_code=202,
         # response_model=None: the body is a small acknowledgement
         # dict, not a domain model.
