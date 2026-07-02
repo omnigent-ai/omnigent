@@ -20,5 +20,9 @@ vitest.config.ts
 # Dependencies are bundled into dist/ by esbuild — not needed in the package
 node_modules/**
 
+# Transient OMC runtime/telemetry state and prior package artifacts — never ship
+.omc/**
+*.vsix
+
 # Keep (NOT ignored): dist/** (the bundled extension), media/** (icons),
 # package.json, README.md, LICENSE

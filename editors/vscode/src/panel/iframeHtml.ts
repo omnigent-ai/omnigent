@@ -23,11 +23,17 @@ export interface BuildIframeHtmlOptions {
   csp: string;
   /** Nonce stamped on the inline <style>. */
   nonce: string;
+  /**
+   * Optional route to deep-link within the framed app (e.g. "/c/<id>"). Appended
+   * to the base URL to form the iframe src; defaults to the app root ("/"). The
+   * route stays same-origin, so the host CSP's origin-based frame-src is unchanged.
+   */
+  route?: string;
 }
 
 export function buildIframeHtml(opts: BuildIframeHtmlOptions): string {
-  const { baseUrl, csp, nonce } = opts;
-  const src = baseUrl.replace(/\/$/, "");
+  const { baseUrl, csp, nonce, route } = opts;
+  const src = `${baseUrl.replace(/\/$/, "")}${route ?? ""}`;
 
   return `<!DOCTYPE html>
 <html lang="en">

@@ -1,12 +1,12 @@
 /**
- * Omnigent VS Code extension entry point (minimal iframe-only build).
+ * Omnigent VS Code extension entry point (iframe + sessions sidebar).
  *
  * activate() wires:
  *  - Config / local-server discovery
- *  - A minimal Sessions/home tree view (so the activity-bar icon renders) whose
- *    welcome content offers an "Open Omnigent" button
+ *  - A native Sessions tree view (omnigent.sessions) listing the local server's
+ *    sessions; clicking one deep-links the editor panel to /c/<id>
  *  - EditorPanelController: the single editor-beside iframe surface
- *  - The omnigent.open command
+ *  - The omnigent.open command + the sessions refresh / open-from-tree commands
  */
 import * as vscode from "vscode";
 import { discoverLocalServer, DEFAULT_HEALTH_TIMEOUT_MS } from "./discovery";
@@ -14,26 +14,14 @@ import { resolveServerTarget } from "./config";
 import { readSettings } from "./config/vscodeSettings";
 import { EditorPanelController } from "./panel/EditorPanelController";
 import { registerOpenPanel } from "./commands/openPanel";
-
-/** Id of the minimal activity-bar view (declared in package.json contributes.views). */
-const HOME_VIEW_ID = "omnigent.home";
+import { SessionsTreeProvider, SESSIONS_VIEW_ID } from "./sessions/SessionsTreeProvider";
+import {
+  registerOpenSessionFromTree,
+  registerRefreshSessions,
+} from "./commands/openSessionFromTree";
 
 let output: vscode.OutputChannel | undefined;
 let controller: EditorPanelController | undefined;
-
-/**
- * A no-op tree provider. A `viewsContainer` only renders its activity-bar icon
- * when it has at least one registered view; this provides that view. The actual
- * call-to-action is the `viewsWelcome` "Open Omnigent" button in package.json.
- */
-class HomeTreeProvider implements vscode.TreeDataProvider<never> {
-  getTreeItem(element: never): vscode.TreeItem {
-    return element;
-  }
-  getChildren(): never[] {
-    return [];
-  }
-}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   output = vscode.window.createOutputChannel("Omnigent");
@@ -42,14 +30,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // ── Single editor-beside iframe surface ───────────────────────────────────
   controller = new EditorPanelController(context.extensionUri, output);
+  const panelController = controller;
 
-  // ── Minimal activity-bar view (makes the container icon render) ────────────
+  // ── Sessions tree view (the activity-bar surface) ──────────────────────────
+  const sessionsProvider = new SessionsTreeProvider(
+    () => panelController.getClientOpts(),
+    output,
+  );
+  const treeView = vscode.window.createTreeView(SESSIONS_VIEW_ID, {
+    treeDataProvider: sessionsProvider,
+  });
+  context.subscriptions.push(treeView);
+  // Refresh the list whenever the tree becomes visible (cheap, no timer).
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider(HOME_VIEW_ID, new HomeTreeProvider()),
+    treeView.onDidChangeVisibility((e) => {
+      if (e.visible) void sessionsProvider.refresh();
+    }),
   );
 
-  // ── omnigent.open command ──────────────────────────────────────────────────
+  // ── Commands ───────────────────────────────────────────────────────────────
   registerOpenPanel(context, controller);
+  registerOpenSessionFromTree(context, controller, output);
+  registerRefreshSessions(context, sessionsProvider);
 
   // ── Resolve the local server at activation ────────────────────────────────
   try {
@@ -67,6 +69,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.appendLine(
         `[omnigent] target: ${target.baseUrl} (hostType=${target.hostType}, source=${target.source})`,
       );
+      // Now that a server target is known, populate the Sessions tree.
+      void sessionsProvider.refresh();
     } else {
       output.appendLine(
         `[omnigent] no local server (${resolution.reason}); start \`omnigent server\` or set omnigent.serverUrl to a localhost URL`,
