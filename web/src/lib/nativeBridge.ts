@@ -35,7 +35,7 @@ export type SidebarDragPhase = "begin" | "move" | "open" | "close";
  */
 interface NativeShellApi {
   /** Discriminator so feature detection is unambiguous. */
-  kind: "electron" | "ios";
+  kind: "electron" | "ios" | "android";
   /** Paint the dock/taskbar badge; 0 clears it. */
   setBadgeCount: (count: number) => void;
   /** Fire an OS notification; resolves true when it was shown. */
@@ -184,7 +184,7 @@ function electronApi(): ElectronDesktopApi | undefined {
 function nativeApi(): NativeShellApi | undefined {
   if (typeof window === "undefined") return undefined;
   const api = (window as unknown as { omnigentNative?: NativeShellApi }).omnigentNative;
-  if (api?.kind === "ios" || api?.kind === "electron") return api;
+  if (api?.kind === "ios" || api?.kind === "android" || api?.kind === "electron") return api;
   return electronApi();
 }
 
@@ -207,6 +207,17 @@ export function isMacElectronShell(): boolean {
 /** True when running inside the iOS WKWebView native shell. */
 export function isIOSShell(): boolean {
   return nativeApi()?.kind === "ios";
+}
+
+/**
+ * True when running inside the native Android WebView shell. A sibling to
+ * {@link isIOSShell} — deliberately NOT folded into it, since the iOS-only
+ * chrome (viewport lock, native keyboard inset, server switcher) keys off
+ * `isIOSShell()` and must stay off on Android, which uses its own WebView
+ * keyboard/inset behavior and the web in-page fallbacks.
+ */
+export function isAndroidShell(): boolean {
+  return nativeApi()?.kind === "android";
 }
 
 /**

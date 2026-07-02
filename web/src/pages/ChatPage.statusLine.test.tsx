@@ -37,6 +37,18 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
 }));
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  useBrainHarnessLabels: () => ({
+    "claude-sdk": "Claude SDK",
+    "openai-agents": "OpenAI Agents SDK",
+    codex: "Codex",
+    cursor: "Cursor",
+    pi: "Pi",
+    antigravity: "Antigravity",
+    copilot: "Copilot",
+  }),
+}));
 
 import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
 

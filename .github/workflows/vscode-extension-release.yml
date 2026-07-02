@@ -1,0 +1,95 @@
+# Build the VS Code extension and attach a SHA256-verified `.vsix` to a DRAFT
+# GitHub release. Triggered manually (workflow_dispatch), typically after a
+# "Release (vscode): vX.Y.Z" PR (from vscode-release-pr.yml) has merged. The
+# release version comes from `editors/vscode/package.json` — never typed by
+# hand here — so the tag and the packaged version can't diverge. A human
+# reviews the draft and clicks publish.
+#
+# This produces the ARTIFACT ONLY — it does NOT publish to the VS Code
+# Marketplace or Open VSX. That runs from the central secure-release repo
+# (databricks/secure-public-registry-releases-eng), on hardened runners, where
+# a workflow downloads this `.vsix`, verifies its `.sha256`, scans it, and
+# publishes. Keeping the two halves separate is deliberate: this job only
+# builds and uploads; the secured half holds the marketplace tokens and scan
+# gate.
+#
+# The release/tag is named `vscode-v<version>`, a dedicated namespace kept
+# separate from the Python release tags (`v[0-9]*`) consumed by
+# github-release.yml.
+name: VS Code Extension Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/SHA to build from (default: the merged release commit on the default branch)."
+        required: false
+        type: string
+
+# Least privilege: creating a release + tag requires `contents: write`.
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: editors/vscode
+
+jobs:
+  build-and-release:
+    # Inert in forks / mirrors — only the canonical repo cuts releases.
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+
+      - name: Install, build, and package
+        run: |
+          npm ci
+          npm run build
+          npm run package
+
+      - name: Resolve version and tag from package.json
+        id: meta
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=vscode-v$version" >> "$GITHUB_OUTPUT"
+          # Target the commit we actually built (inputs.ref may differ from the
+          # dispatch ref, so $GITHUB_SHA is not necessarily the built commit).
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building vscode-v$version" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Compute SHA256 checksum
+        run: |
+          vsix=$(ls omnigent-vscode-*.vsix)
+          sha256sum "$vsix" > "$vsix.sha256"
+          echo "Built $vsix" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat "$vsix.sha256" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish draft GitHub release with the .vsix + checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          # Rerun-safe: upload assets to an existing release, else create a draft
+          # one (which creates the vscode-v<version> tag on the built commit).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --target "${{ steps.meta.outputs.sha }}" \
+              --title "VS Code extension $TAG" \
+              --notes "Omnigent VS Code extension \`$TAG\`. Marketplace / Open VSX publishing runs from the secure-release repo, which downloads and SHA256-verifies the attached \`.vsix\`."
+          fi
+          echo "Drafted release $TAG with the .vsix + .sha256 — review and publish it from the Releases page." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

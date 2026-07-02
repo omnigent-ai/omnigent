@@ -828,6 +828,36 @@ describe("Sidebar default section collapse", () => {
   });
 });
 
+// Pinning a session while the Pinned section is collapsed auto-expands it, so
+// the just-pinned chat can't silently hide inside the collapsed group.
+describe("Sidebar auto-expand Pinned on pin", () => {
+  it("expands a collapsed Pinned section when a session is newly pinned", () => {
+    localStorage.setItem("omnigent:collapsed-sidebar-sections", JSON.stringify(["Pinned"]));
+    // Start with one already-pinned session (so the Pinned section renders) and
+    // one unpinned session to pin.
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    mockConversations([conv("conv_pinned", "Claude Code"), conv("conv_plain", "Claude Code")]);
+    renderSidebar();
+
+    // Collapsed to start: the header reports collapsed and the pinned row hides.
+    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+
+    // Pin the plain row via its quick-pin control.
+    const plainRow = screen.getByRole("link", { name: /conv_plain/ }).closest("li")!;
+    fireEvent.click(within(plainRow).getByTestId("quick-pin-conversation"));
+
+    // The Pinned section auto-expands so the freshly-pinned session is visible,
+    // and the expansion is persisted (dropped from the collapsed list).
+    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute("aria-expanded", "true");
+    expect(JSON.parse(localStorage.getItem("omnigent:collapsed-sidebar-sections")!)).not.toContain(
+      "Pinned",
+    );
+  });
+});
+
 // The quick-pin affordance is hover-revealed on every row — including pinned
 // ones. A pinned row no longer keeps a persistent pin marker (the "Pinned"
 // section header already conveys the state); on hover it reveals the UNPIN

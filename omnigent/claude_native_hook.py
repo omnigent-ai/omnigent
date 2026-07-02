@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import secrets
 import sys
 import time
@@ -43,6 +45,14 @@ from omnigent.native_policy_hook import (
 # answers in the terminal). Kept in lockstep with the server-side
 # ``_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S`` and Claude Code's own
 # command-hook ``timeout`` so no single layer caps the wait early.
+#
+# NOTE: this bounds a SINGLE long-poll (a slow human), NOT the retry loop.
+# Re-POST attempts after a *failure* are bounded separately by
+# ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` — see :func:`_post_hook_with_reattach`.
+# Before #1782 the retry deadline was also one day, so a persistently
+# sick/unreachable server made the hook re-POST (each re-driving the turn and
+# respawning harness/tool subprocesses) every ≤30s for 24h — the spin-loop half
+# of the zombie pileup.
 _PERMISSION_TIMEOUT_S = 86400.0
 # First retry must land inside the server's re-park grace (proxies
 # sever idle long-polls); later retries back off.
@@ -51,6 +61,94 @@ _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 # Fail unreachable-server connects fast into the backoff loop instead
 # of inheriting the day-long read budget.
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env override, ignoring a malformed value.
+
+    A non-integer value must not crash the hook subprocess at import time —
+    that would defeat the terminal-fallback design elsewhere in this file. Bad
+    input logs a diagnostic and falls back to *default*.
+
+    :param name: Environment variable name.
+    :param default: Value used when unset or unparseable.
+    :returns: The parsed int, or *default*.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"omnigent hook: ignoring non-integer {name}={raw!r}; using {default}",
+            file=sys.stderr,
+        )
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env override, ignoring a malformed value.
+
+    Float sibling of :func:`_env_int`; a bad value logs and falls back to
+    *default* rather than crashing the hook at import time.
+
+    :param name: Environment variable name.
+    :param default: Value used when unset or unparseable.
+    :returns: The parsed float, or *default*.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    # Reject non-finite too: ``float("inf"/"nan")`` parses without ValueError,
+    # but an ``inf`` floor would classify every sever as a held poll (disabling
+    # flap detection) and ``nan`` makes every ``held_s < floor`` comparison
+    # False — both silent footguns, so treat them as malformed.
+    if not math.isfinite(value):
+        print(
+            f"omnigent hook: ignoring non-finite {name}={raw!r}; using {default}",
+            file=sys.stderr,
+        )
+        return default
+    return value
+
+
+# Cap on CONSECUTIVE HARD failures before the reattach loop gives up and lets
+# the caller fail-ask. A "hard failure" is the server being sick or unreachable
+# (5xx, or a connection that never established) — i.e. the #1782 spin. It is
+# distinguished from a proxy severing a *held* poll (a connection that WAS
+# established and then dropped mid-wait), which is the re-park mechanism working
+# as intended and does NOT count — see :func:`_post_hook_with_reattach`. So a
+# legitimately-parked approval behind a severing proxy is never capped, while a
+# down server can no longer re-POST for a day. Overridable for operators who
+# want more slack against a flaky upstream.
+_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
+# httpx errors that mean the request never reached a live server (no response
+# was ever begun). These are unambiguous hard failures — the server is down /
+# unreachable, not holding a poll. Everything else under ``httpx.HTTPError``
+# that is not a 4xx/5xx status (RemoteProtocolError, ReadError, ReadTimeout, …)
+# means the connection was established and then severed mid-poll.
+_NEVER_CONNECTED_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+)
+# An established connection that drops in under this many seconds is treated as
+# a flapping/crash-looping server (a hard failure), NOT a genuinely-parked poll
+# a proxy severed. Comfortably below any real idle-proxy timeout (typically
+# 30-60s+) but above an instant accept-then-reset crash drop, so it tells a
+# legitimate long-poll sever from a tight establish-drop spin. Operators behind
+# an unusually aggressive proxy/LB whose idle timeout is under 10s can lower
+# this via OMNIGENT_HOOK_HELD_POLL_FLOOR_S so their legitimate slow-human severs
+# stay classified as held polls (not flaps) and are never capped; the default
+# suits typical proxies. Floored at 0 (a negative would make every sever a
+# held poll, disabling flap detection).
+_PERMISSION_HELD_POLL_FLOOR_S = max(0.0, _env_float("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", 10.0))
 # Fail-fast budget for the synchronous ``/clear`` and ``/fork`` session
 # rotations that run inside the SessionStart hook to gate Claude's
 # welcome banner. Unlike the permission long-poll these are quick
@@ -532,8 +630,49 @@ def _post_hook_with_reattach(
     watches on a headless sub-agent. Re-POSTs with one stable
     ``_omnigent_elicitation_id`` so the server re-parks the SAME
     elicitation and can hand back a gap verdict via its pre-resolved
-    tombstone. Retries transport errors and 5xx within the
-    ``_PERMISSION_TIMEOUT_S`` budget; a 4xx is final.
+    tombstone. Retries transport errors and 5xx; a 4xx is final.
+
+    Retries are bounded by ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` consecutive
+    *hard* failures, classified by kind — NOT by wall-clock. This is the #1782
+    fix: before it the retry deadline was ``_PERMISSION_TIMEOUT_S`` (a day), so
+    a persistently down server re-POSTed — re-driving the turn and respawning
+    harness/tool subprocesses — every ≤30s for 24h.
+
+    Failure classification:
+
+    * **Hard failure → count toward the cap.** A 5xx, or a connection that
+      never established (:data:`_NEVER_CONNECTED_ERRORS`), or an established
+      connection that dropped in under :data:`_PERMISSION_HELD_POLL_FLOOR_S`
+      (a flapping/crash-looping server). This is the spin.
+    * **Held-poll sever → reset the counter.** An established connection that
+      dropped mid-poll after being held ≥ the floor. That is a proxy severing
+      an idle long-poll — the re-park mechanism working as intended — so it
+      must NOT count, or a legitimately-parked human approval behind a
+      severing proxy would be capped after a handful of severs. Classifying by
+      *how the request failed* (established-then-severed vs never-connected),
+      not by elapsed wall-clock, is what makes "a slow human is never capped"
+      hold even when the proxy severs every 30-60s.
+
+    A hard 4xx is final (bad request won't succeed on retry).
+
+    Residual limitation (by design): a *sick* backend behind a proxy/LB that
+    accepts the connection and then silently severs it after its upstream
+    timeout (>= the floor) is indistinguishable at the transport layer from a
+    proxy severing a genuinely-parked human poll — both surface as an
+    established-then-severed error after N seconds, and the server holds the
+    POST silently with no client-visible "parked" ack. So this case resets the
+    counter and is NOT caught by the consecutive-hard-failure cap; it is bounded
+    only by the absolute :data:`_PERMISSION_TIMEOUT_S` ceiling below (the same
+    day-long human-answer window). That is the tightest safe client-side bound:
+    capping it sooner would necessarily cap a real slow human on the same
+    topology. The blast radius is limited — this loop only re-POSTs over HTTP
+    from one hook process (it does not itself respawn harness/tool
+    subprocesses), and the host-side orphan reaper (#1782 Bug A) reclaims any
+    subprocesses a re-driven turn does spawn — so the worst case is one hook
+    slow-retrying for up to a day, not the original zombie pileup.
+
+    The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
+    every path, matching the day-long human-answer window.
 
     :param url: Absolute hook endpoint URL, e.g.
         ``"http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request"``.
@@ -554,11 +693,16 @@ def _post_hook_with_reattach(
         **payload,
         "_omnigent_elicitation_id": f"elicit_claude_{secrets.token_hex(16)}",
     }
-    deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
+    # Absolute backstop: even a run of held-poll severs (which don't count
+    # toward the hard-failure cap) can't loop past the day-long human-answer
+    # window — matches the read budget and the server's ask_timeout.
+    deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     reauthed = False
+    consecutive_hard_failures = 0
     while True:
+        attempt_started = time.monotonic()
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=body)
@@ -590,24 +734,54 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
                 return None
+            # 5xx: server responded but is sick — a hard failure (the spin).
+            is_hard_failure = True
             print(
                 f"omnigent {hook_label} hook: Omnigent request failed; retrying: {exc}",
                 file=sys.stderr,
             )
         except httpx.HTTPError as exc:
+            # Classify by HOW it failed, not by elapsed time (a proxy severs a
+            # legitimately-held poll in seconds-to-minutes, so wall-clock can't
+            # tell it from a down server — #1782 Polly review).
+            never_connected = isinstance(exc, _NEVER_CONNECTED_ERRORS)
+            held_s = time.monotonic() - attempt_started
+            # Hard failure iff the server was never reached, OR an established
+            # connection dropped so fast it's a flap rather than a parked poll.
+            is_hard_failure = never_connected or held_s < _PERMISSION_HELD_POLL_FLOOR_S
+            kind = (
+                "unreachable"
+                if never_connected
+                else ("flapping" if is_hard_failure else "held-poll severed")
+            )
             print(
-                f"omnigent {hook_label} hook: Omnigent request failed; retrying: {exc}",
+                f"omnigent {hook_label} hook: Omnigent request failed ({kind}); retrying: {exc}",
                 file=sys.stderr,
             )
-        if time.monotonic() + backoff_s >= deadline:
+        if is_hard_failure:
+            consecutive_hard_failures += 1
+        else:
+            # A proxy severed a genuinely-held poll — the re-park mechanism
+            # working as intended. Reset so a slow human is never capped.
+            consecutive_hard_failures = 0
+        if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
             print(
-                f"omnigent {hook_label} hook: retry budget exhausted",
+                f"omnigent {hook_label} hook: giving up after "
+                f"{consecutive_hard_failures} consecutive hard failures "
+                "(server unreachable/sick) — failing ask",
                 file=sys.stderr,
             )
             return None
         # Two-line backoff; not worth a retry lib in this dependency-light hook.
         time.sleep(backoff_s)
         backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
+        if time.monotonic() >= deadline:
+            print(
+                f"omnigent {hook_label} hook: retry budget exhausted "
+                f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
+                file=sys.stderr,
+            )
+            return None
 
 
 def _main_permission_request(argv: list[str]) -> int:

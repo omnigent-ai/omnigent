@@ -364,7 +364,7 @@ class PolicyEngine:
             # silently dropped per POLICIES.md §9.
             filtered_labels = _filter_writable_labels(result.set_labels, policy.spec)
             if filtered_labels:
-                _merge_monotonic_writes(accumulated, filtered_labels, self.label_defs)
+                accumulated.update(filtered_labels)
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
             if result.action == PolicyAction.DENY:
@@ -495,9 +495,6 @@ class PolicyEngine:
 
         - The key has a declared ``LabelDef.values`` list and
           the new value is not in it.
-        - The key has a declared ``LabelDef.monotonic`` and
-          the new position (relative to the current cache
-          value) violates the direction.
 
         Keys with no ``LabelDef`` are set freely (omnigent
         parity — "unschema'd labels set freely"). The engine
@@ -841,12 +838,6 @@ class PolicyEngine:
                 continue
             if ldef.values is not None and value not in ldef.values:
                 continue
-            if ldef.monotonic is not None and not _monotonic_ok(
-                ldef,
-                self._labels.get(key),
-                value,
-            ):
-                continue
             result[key] = value
         return result
 
@@ -1112,126 +1103,6 @@ def _filter_writable_labels(
     if not isinstance(whitelist, list):
         return dict(set_labels)
     return {k: v for k, v in set_labels.items() if k in whitelist}
-
-
-def _merge_monotonic_writes(
-    accumulated: dict[str, str],
-    new_writes: dict[str, str],
-    label_defs: dict[str, LabelDef],
-) -> None:
-    """
-    Merge a per-policy ``set_labels`` batch into the in-flight
-    accumulator, preserving each label's monotonic direction.
-
-    The composed semantics for one ``evaluate()`` call: when
-    multiple policies fire and write the SAME key, the
-    accumulator must end up holding the most-restrictive value
-    in the direction the label declares — not whichever write
-    happened to come last in YAML order. Without this, a
-    ``monotonic: increasing`` label (e.g. taint level) can be
-    silently lowered by a later policy in the same evaluation
-    that writes a smaller value, even though the LabelDef
-    says "labels only move upwards." Symmetric for
-    ``decreasing``: a later write of a higher value cannot
-    raise a label that a prior policy already lowered.
-
-    Behaviour:
-
-    - Key not yet in *accumulated*: insert *new_value*.
-    - Key has no :class:`LabelDef` (schemaless), or the
-      ``LabelDef`` has no monotonic direction, or
-      ``LabelDef.values`` is unset: last-write-wins (matches
-      the historical behaviour for the unconstrained case).
-    - Key is monotonic ``increasing``: keep the higher-index
-      value among ``existing`` and *new_value*.
-    - Key is monotonic ``decreasing``: keep the lower-index
-      value among ``existing`` and *new_value*.
-    - Either side outside ``LabelDef.values``: last-write-wins.
-      ``_filter_schema_valid`` will drop the out-of-enum value
-      at apply time, so the merge result doesn't change the
-      end persistence.
-
-    Mutates *accumulated* in place; symmetric in argument
-    order — running the policy chain in reverse YAML order
-    yields the same final dict.
-
-    :param accumulated: The in-flight accumulator dict.
-        Mutated in place.
-    :param new_writes: One policy's filtered ``set_labels``.
-    :param label_defs: The engine's per-key schema map.
-    """
-    for key, new_value in new_writes.items():
-        existing = accumulated.get(key)
-        if existing is None:
-            accumulated[key] = new_value
-            continue
-        ldef = label_defs.get(key)
-        if ldef is None or ldef.monotonic is None or ldef.values is None:
-            # Schemaless or unconstrained — preserve historical
-            # last-write-wins behaviour.
-            accumulated[key] = new_value
-            continue
-        if existing not in ldef.values or new_value not in ldef.values:
-            # Out-of-enum on either side — defer to the schema
-            # filter at apply time. Keep the latest write so the
-            # filter has something to reject.
-            accumulated[key] = new_value
-            continue
-        existing_idx = ldef.values.index(existing)
-        new_idx = ldef.values.index(new_value)
-        if ldef.monotonic == "increasing":
-            accumulated[key] = new_value if new_idx > existing_idx else existing
-        elif ldef.monotonic == "decreasing":
-            accumulated[key] = new_value if new_idx < existing_idx else existing
-        # No else: any other monotonic value is rejected at
-        # spec parse, so this branch is unreachable.
-
-
-def _monotonic_ok(
-    ldef: LabelDef,
-    current: str | None,
-    new_value: str,
-) -> bool:
-    """
-    Check whether a monotonic label write is permitted.
-
-    Direction semantics (POLICIES.md §10):
-
-    - ``"increasing"``: new_value's index in
-      ``ldef.values`` must be ``>=`` current's index.
-    - ``"decreasing"``: new_value's index must be ``<=``
-      current's index.
-    - Seeding an unset label (``current is None``) is
-      always permitted — nothing to compare against yet.
-
-    Values outside ``ldef.values`` never reach this helper
-    (the values-check runs first in
-    :meth:`PolicyEngine._filter_schema_valid`).
-
-    :param ldef: The label's schema declaration.
-    :param current: Current value in the hot cache, or
-        ``None`` when the label is unset.
-    :param new_value: The value the caller wants to write.
-    :returns: ``True`` when the write is permitted.
-    """
-    if current is None:
-        return True
-    # ldef.values is guaranteed non-None here because the
-    # caller only invokes this helper when monotonic is set,
-    # and the parser rejects monotonic-without-values at
-    # spec load (POLICIES.md §13). Assert rather than branch
-    # so any regression fails loud.
-    assert ldef.values is not None, "monotonic without values reached runtime — parser regression?"
-    current_idx = ldef.values.index(current) if current in ldef.values else -1
-    new_idx = ldef.values.index(new_value)
-    if ldef.monotonic == "increasing":
-        return new_idx >= current_idx
-    if ldef.monotonic == "decreasing":
-        return new_idx <= current_idx
-    # Unknown direction — fall through to reject. Parser
-    # rejects unknown values at spec load so this is
-    # defensive.
-    return False
 
 
 def _condition_matches(

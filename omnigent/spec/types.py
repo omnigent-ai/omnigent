@@ -1231,21 +1231,14 @@ class LabelDef:
     :param initial: Seed value written at conversation start.
         ``None`` means the label is unset until a policy
         writes it for the first time, e.g. ``"0"``.
-    :param values: Ordered list of allowed values. Position
-        defines ranking when ``monotonic`` is set. ``None``
+    :param values: Ordered list of allowed values. ``None``
         means schemaless — writes are unconstrained, e.g.
         ``["0", "1"]`` or
         ``["public", "internal", "confidential"]``.
-    :param monotonic: Update constraint when ``values`` is
-        declared. ``"increasing"`` means new index must be
-        ``>=`` current; ``"decreasing"`` means ``<=``.
-        ``None`` means free transitions between declared
-        values.
     """
 
     initial: str | None = None
     values: list[str] | None = None
-    monotonic: Literal["increasing", "decreasing"] | None = None
 
 
 @dataclass(frozen=True)

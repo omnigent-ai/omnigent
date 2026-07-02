@@ -75,8 +75,7 @@ def _tool(name: str, args: dict[str, object] | None = None) -> EvaluationContext
 async def test_initial_labels_seeded_from_combined_spec(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """All declared initial values are seeded on build —
-    both labels with explicit monotonic constraints."""
+    """All declared initial values are seeded on build."""
     engine = _engine(conversation_store)
     assert engine.labels == {"integrity": "1", "sensitivity": "public"}
 

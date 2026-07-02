@@ -926,7 +926,7 @@ function McpServersSection({
   if (!showSection) return null;
 
   return (
-    <div className="flex flex-col gap-1.5">
+    <div className="flex flex-col gap-1.5 py-3">
       <div className="flex items-center justify-between">
         <SectionLabel>Tools</SectionLabel>
         {canEdit && (
@@ -1000,7 +1000,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
   );
 
   return (
-    <div className="flex flex-col gap-1.5">
+    <div className="flex flex-col gap-1.5 py-3">
       <div className="flex items-center justify-between">
         <SectionLabel>Policies</SectionLabel>
         <button
@@ -1166,9 +1166,9 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   }
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col divide-y divide-border/50">
       {displayName && (
-        <div className="flex flex-col gap-0.5">
+        <div className="flex flex-col gap-0.5 pb-3">
           <span className="font-medium text-sm">{displayName}</span>
           {agent?.description && (
             <span className="text-xs text-muted-foreground">{agent.description}</span>
@@ -1176,7 +1176,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
         </div>
       )}
       {sessionId && owner && isSessionShared && (
-        <div className="flex flex-col gap-1.5">
+        <div className="flex flex-col gap-1.5 py-3">
           <SectionLabel>Owner</SectionLabel>
           <span
             className="truncate font-mono text-xs text-muted-foreground"
@@ -1189,7 +1189,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
         </div>
       )}
       {sessionId && (
-        <div className="flex flex-col gap-1.5">
+        <div className="flex flex-col gap-1.5 py-3">
           <SectionLabel>Session ID</SectionLabel>
           <div className="flex items-center gap-2">
             <code
@@ -1217,22 +1217,28 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
           </div>
         </div>
       )}
-      {sessionId && sessionCostUsd != null && (
-        <div className="flex flex-col gap-1.5">
-          <SectionLabel>Session cost</SectionLabel>
-          <span
-            className="font-mono text-xs tabular-nums text-muted-foreground"
-            data-testid="agent-info-session-cost"
-          >
-            {formatSessionCostUsd(sessionCostUsd)}
-          </span>
-        </div>
-      )}
-      {sessionId && usageByModel != null && Object.keys(usageByModel).length > 0 && (
-        <ModelUsageBreakdown usageByModel={usageByModel} />
-      )}
+      {sessionId &&
+        (sessionCostUsd != null ||
+          (usageByModel != null && Object.keys(usageByModel).length > 0)) && (
+          <div className="flex flex-col gap-2 py-3">
+            {sessionCostUsd != null && (
+              <div className="flex items-baseline justify-between gap-3">
+                <SectionLabel>Session cost</SectionLabel>
+                <span
+                  className="font-mono text-xs tabular-nums text-muted-foreground"
+                  data-testid="agent-info-session-cost"
+                >
+                  {formatSessionCostUsd(sessionCostUsd)}
+                </span>
+              </div>
+            )}
+            {usageByModel != null && Object.keys(usageByModel).length > 0 && (
+              <ModelUsageBreakdown usageByModel={usageByModel} />
+            )}
+          </div>
+        )}
       {showRestartWithModel && sessionId && (
-        <div className="flex flex-col gap-1.5">
+        <div className="flex flex-col gap-1.5 py-3">
           <SectionLabel>Model</SectionLabel>
           <Button
             type="button"
@@ -1255,7 +1261,7 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
       <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
       {versionFooter && (
-        <div className="border-t border-border pt-2">
+        <div className="py-3">
           <span
             className="font-mono text-[10px] text-muted-foreground/70"
             data-testid="agent-info-versions"

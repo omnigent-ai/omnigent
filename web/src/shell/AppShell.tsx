@@ -11,7 +11,12 @@ import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
-import { isIOSShell, isMacElectronShell, onNativeSidebarDrag } from "@/lib/nativeBridge";
+import {
+  isAndroidShell,
+  isIOSShell,
+  isMacElectronShell,
+  onNativeSidebarDrag,
+} from "@/lib/nativeBridge";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   Dialog,
@@ -1057,6 +1062,7 @@ export function AppShell() {
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
+            data-android-native={isAndroidShell() ? "true" : undefined}
           >
             {/* Frameless-window titlebar stand-in (macOS Electron only): the
           sidebar's electron top margin (see index.css) frees this strip of

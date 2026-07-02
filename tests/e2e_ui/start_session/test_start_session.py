@@ -937,9 +937,9 @@ def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
 
     Unlike Claude Code — whose submenu shows permission/model knobs — Polly and
     Debby declare a brain harness, so their config submenu renders an "Agent
-    Harness" radio group. Selecting a non-default harness ("Pi") must (a) show
-    all four harness options and (b) reach ``POST /v1/sessions`` as
-    ``harness_override: "pi"``.
+    Harness" radio group. Selecting a dynamically registered community harness
+    must (a) show the label from ``/v1/harnesses`` and (b) reach
+    ``POST /v1/sessions`` as ``harness_override: "community-brain"``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_harness(base_url, session_id))
@@ -957,6 +957,17 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 create_bodies=create_bodies,
                 agents_body=_bundle_agents_body(),
             )
+
+            async def handle_harness_catalog(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {"data": [{"id": "community-brain", "label": "Community Brain"}]}
+                    ),
+                )
+
+            await page.route("**/v1/harnesses", handle_harness_catalog)
 
             # Neutralize agent discovery so only the stubbed bundle agents
             # (Polly/Debby) feed the picker. The landing picker merges
@@ -996,9 +1007,14 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
                 ).to_be_visible()
+            # Dynamic harness labels from `/v1/harnesses` extend the built-in
+            # fallback catalog in the user-visible picker.
+            community_harness = page.get_by_test_id("new-chat-landing-harness-community-brain")
+            await expect(community_harness).to_be_visible()
+            await expect(community_harness).to_contain_text("Community Brain")
             # Picking a harness commits and closes the menu (the agent chip keeps
             # the bare agent label "Polly"); the override rides along on create.
-            await page.get_by_test_id("new-chat-landing-harness-pi").click()
+            await community_harness.click()
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -1008,7 +1024,7 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_polly_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("harness_override") == "pi", body
+            assert body.get("harness_override") == "community-brain", body
         finally:
             await browser.close()
 

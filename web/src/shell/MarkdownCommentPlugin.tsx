@@ -15,7 +15,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Editor } from "@tiptap/react";
-import type { RefObject } from "react";
+import type { ReactElement, RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { commentDecorationKey, type CommentDecorationState } from "./TipTapCommentExtension";
@@ -68,7 +68,7 @@ export function MarkdownCommentPlugin({
   onSetActiveSelection,
   pendingBodyRef,
   canEdit = true,
-}: MarkdownCommentPluginProps): JSX.Element | null {
+}: MarkdownCommentPluginProps): ReactElement | null {
   const [buttonPos, setButtonPos] = useState<{ top: number; left: number } | null>(null);
 
   // Stable refs so callbacks always see the latest values.

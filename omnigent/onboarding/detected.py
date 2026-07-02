@@ -22,8 +22,7 @@ Two surfaces:
 
 from __future__ import annotations
 
-import os
-
+from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -170,10 +169,13 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
             # ``api.openai.com`` and every request 401s — the credential is a
             # gateway token, not an OpenAI key. Scoped to the openai family's
             # canonical vendor (not a third-party endpoint, handled above).
-            if det.family == OPENAI_FAMILY and env_var == "OPENAI_API_KEY":
-                env_base_url = os.environ.get("OPENAI_BASE_URL")
-                if env_base_url:
-                    base_url = env_base_url
+            if det.family == OPENAI_FAMILY and env_var in (
+                "OPENAI_API_KEY",
+                "OMNIGENT_OPENAI_API_KEY",
+            ):
+                env_base_url = getenv_nonempty_with_omnigent_prefix("OPENAI_BASE_URL")
+                if env_base_url is not None:
+                    base_url = env_base_url[1]
         # No pinned model — the spec / catalog default picks it; /model then
         # shows "(no model pinned)" rather than a fabricated one.
         return build_key_provider_entry(det.family, base_url, api_key_ref, None, wire_api=wire_api)

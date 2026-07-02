@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -50,6 +51,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -6013,6 +6015,115 @@ async def _auto_create_repl_terminal(
     return terminal_view
 
 
+async def _delete_native_bridge_dirs(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> None:
+    """
+    Remove any native-harness bridge dirs left behind by a session.
+
+    Each native harness keeps a per-conversation bridge dir under
+    ``/tmp/omnigent-<uid>/<harness>-native/<digest>`` (some use ``~/.omnigent``)
+    holding a bridge token / auth secret + MCP config — secret material. Closing
+    the pane does not remove it, so without this they accumulate even on a clean
+    session delete (issue #1350). We don't know which harness this session used,
+    so delete every candidate dir for all 11 native families
+    (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
+    the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
+    cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
+    Antigravity/claude/codex/opencode bridge ids can be rotated via a session
+    label, so resolve those too (falling back to *session_id*, the un-rotated key);
+    the remaining families key purely on *session_id*.
+
+    :param server_client: Omnigent server client used to resolve rotated bridge
+        id labels. ``None`` skips label resolution (session_id keys only).
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    """
+    from omnigent.antigravity_native_bridge import (
+        ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.antigravity_native_bridge import (
+        bridge_dir_for_bridge_id as antigravity_bridge_dir,
+    )
+    from omnigent.claude_native_bridge import (
+        BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.claude_native_bridge import (
+        bridge_dir_for_bridge_id as claude_bridge_dir,
+    )
+    from omnigent.codex_native_bridge import (
+        CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.codex_native_bridge import (
+        bridge_dir_for_bridge_id as codex_bridge_dir,
+    )
+    from omnigent.cursor_native_bridge import (
+        bridge_dir_for_session_id as cursor_bridge_dir,
+    )
+    from omnigent.goose_native_bridge import (
+        bridge_dir_for_session_id as goose_bridge_dir,
+    )
+    from omnigent.hermes_native_bridge import (
+        bridge_dir_for_session_id as hermes_bridge_dir,
+    )
+    from omnigent.kimi_native_bridge import (
+        bridge_dir_for_session_id as kimi_bridge_dir,
+    )
+    from omnigent.kiro_native_bridge import (
+        bridge_dir_for_session_id as kiro_bridge_dir,
+    )
+    from omnigent.opencode_native_bridge import (
+        OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
+    )
+    from omnigent.opencode_native_bridge import (
+        bridge_dir_for_bridge_id as opencode_bridge_dir,
+    )
+    from omnigent.pi_native_bridge import (
+        bridge_dir_for_session_id as pi_bridge_dir,
+    )
+    from omnigent.qwen_native_bridge import (
+        bridge_dir_for_session_id as qwen_bridge_dir,
+    )
+
+    labels: dict[str, str] = {}
+    if server_client is not None:
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+
+    targets = {
+        antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        antigravity_bridge_dir(session_id),
+        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
+        claude_bridge_dir(session_id),
+        codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        codex_bridge_dir(session_id),
+        cursor_bridge_dir(session_id),
+        goose_bridge_dir(session_id),
+        hermes_bridge_dir(session_id),
+        kimi_bridge_dir(session_id),
+        kiro_bridge_dir(session_id),
+        opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        opencode_bridge_dir(session_id),
+        pi_bridge_dir(session_id),
+        qwen_bridge_dir(session_id),
+    }
+    for target in targets:
+        try:
+            shutil.rmtree(target, ignore_errors=False)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _logger.debug(
+                "Failed to remove native bridge dir %s for session %s: %s",
+                target,
+                session_id,
+                exc,
+            )
+
+
 async def _claude_native_bridge_id_for_session(
     *,
     server_client: httpx.AsyncClient,
@@ -9819,6 +9930,14 @@ def create_runner_app(
 
         if process_manager is not None:
             await process_manager.release(session_id)
+
+        # Pane close above does not touch the SEPARATE native bridge dir, which
+        # holds the bridge token + MCP config; delete it so secret material does
+        # not accumulate under /tmp on a clean delete (issue #1350).
+        await _delete_native_bridge_dirs(
+            server_client=server_client,
+            session_id=session_id,
+        )
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
@@ -15459,9 +15578,24 @@ def create_runner_app(
         # Resolve pending policy approval Futures.
         if body_type == "approval":
             _data = body.get("data") or body
-            pending_approvals.resolve(
-                _data.get("elicitation_id", ""), _data.get("action") == "accept"
-            )
+            _elicit_action = _data.get("action", "")
+            pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
+            if _elicit_action == "decline":
+                # Explicit user decline: send an interrupt to the harness
+                # so the turn aborts cleanly instead of continuing after
+                # the DENY tool result reaches the LLM. This fires before
+                # the ProxyMcpManager task resumes (asyncio cooperative
+                # scheduling), so interrupt_session is called before the
+                # deny propagates to the SDK.
+                try:
+                    _int_client = await process_manager.get_client(conversation_id, "any")
+                    await _int_client.post(
+                        f"/v1/sessions/{conversation_id}/events",
+                        json={"type": "interrupt"},
+                        timeout=5.0,
+                    )
+                except Exception:  # noqa: BLE001 — best-effort; deny path continues
+                    pass
             # The server wraps the verdict as ``{"type": "approval", "data": {…}}``,
             # but the harness scaffold's ``ApprovalEvent`` wants the fields at the
             # top level — forwarding the envelope verbatim 422s and hangs the turn.
@@ -16269,7 +16403,22 @@ def create_runner_app(
             declared_terminal = terminals_map.get(terminal_name)
 
         if declared_terminal is not None:
-            env_spec = declared_terminal
+            # Resolve a placeholder cwd (``.``/``./``/unset) to the session
+            # workspace before launch — same as the synthesised branch and
+            # the sys_terminal_launch tool. Otherwise the placeholder reaches
+            # the inner builder and lands the shell in the runner's process
+            # cwd. Baked into the spec, not cwd_override (which is gated by
+            # allow_cwd_override).
+            from omnigent.tools.builtins.sys_terminal import (
+                _materialize_terminal_spec_for_launch,
+                _synthesize_parent_os_env,
+            )
+
+            default_root = resource_registry.compute_default_env_root(session_id, agent_spec)
+            env_spec = _materialize_terminal_spec_for_launch(declared_terminal, default_root)
+            # Covers terminals whose os_env inherits: the inner builder
+            # falls back to this parent, whose cwd would else be the placeholder.
+            agent_os_env = _synthesize_parent_os_env(agent_os_env, default_root)
             # Body's ``spec.cwd`` becomes a cwd_override (still
             # subject to the spec's allow_cwd_override gate and
             # the launch-time containment check).
@@ -17952,6 +18101,17 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
+        # This is the runner endpoint the SERVER's session-delete actually
+        # drives (server delete_session -> DELETE /v1/sessions/{id}/resources),
+        # so the token-bearing native bridge dir must be removed here, not only
+        # in the bare delete_session route (issue #1350). Delete-only path:
+        # NOT done inside resource_registry.cleanup_session, because the
+        # agent-switch reset (reset_session_state) reuses cleanup_session while
+        # the session — and its bridge — lives on.
+        await _delete_native_bridge_dirs(
+            server_client=server_client,
+            session_id=session_id,
+        )
         return JSONResponse(
             status_code=200,
             content={
@@ -18906,6 +19066,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
 }
+_HARNESS_MODEL_ENV_KEY = model_env_keys()
 
 
 def _build_spawn_env_from_spec(
@@ -18967,15 +19128,20 @@ def _build_spawn_env_from_spec(
         elif harness == "copilot":
             env = _build_copilot_spawn_env(spec, workdir=workdir)
         else:
-            # Native terminal harnesses and unknown harnesses build env elsewhere.
-            return None
+            builder_path = spawn_env_builders().get(harness)
+            if builder_path is not None:
+                builder = load_object(builder_path)
+                env = builder(spec, cwd=cwd, workdir=workdir)
+            else:
+                # Native terminal harnesses and unknown harnesses build env elsewhere.
+                return None
     except ImportError:
         return None
 
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the
     # readout but the turn still uses the provider/catalog default.
-    if model_override:
+    if model_override and env is not None:
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override
