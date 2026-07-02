@@ -56,8 +56,8 @@ def test_submit_needle_prefers_last_qualifying_line() -> None:
     assert b._submit_needle("ok") == ""
 
 
-def test_inject_user_message_clears_pastes_and_submits(tmp_path, monkeypatch) -> None:
-    calls: list[tuple[str, ...]] = []
+def _patch_inject_tmux(monkeypatch, calls: list[tuple[str, ...]]) -> None:
+    """Common monkeypatches: live pane, instant settle, capture shows needle."""
     monkeypatch.setattr(
         b, "_wait_for_tmux_info", lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"}
     )
@@ -67,6 +67,13 @@ def test_inject_user_message_clears_pastes_and_submits(tmp_path, monkeypatch) ->
     monkeypatch.setattr(b, "_capture_pane", lambda *_a, **_k: "do something now")
     monkeypatch.setattr(b.time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(b, "_run_tmux", lambda _sock, *args: calls.append(args))
+
+
+def test_inject_user_message_clears_pastes_and_submits(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    # No readable store → best-effort single delivery (no confirmation loop).
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: None)
 
     b.inject_user_message(tmp_path, content="do something now")
 
@@ -78,11 +85,102 @@ def test_inject_user_message_clears_pastes_and_submits(tmp_path, monkeypatch) ->
     assert calls[-1] == ("send-keys", "-t", "t", "Enter")
     # The temp paste file is cleaned up.
     assert not list(tmp_path.glob("paste_*.bin"))
+    # Exactly one delivery: one load-buffer, one Enter.
+    assert sum(1 for a in calls if a[0] == "load-buffer") == 1
+    assert sum(1 for a in calls if a[-1] == "Enter") == 1
+
+
+def test_inject_user_message_single_delivery_when_store_confirms(tmp_path, monkeypatch) -> None:
+    """Store row appears after the first delivery → no retry."""
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    # Baseline 0, then a new row (id=1) confirms delivery on the first check.
+    ids = iter([0, 1])
+    monkeypatch.setattr(b, "_max_message_id", lambda _p: next(ids))
+
+    b.inject_user_message(tmp_path, content="do something now")
+
+    assert sum(1 for a in calls if a[0] == "load-buffer") == 1, "no retry when confirmed"
+    assert sum(1 for a in calls if a[-1] == "Enter") == 1
+
+
+def test_inject_user_message_retries_once_when_first_not_confirmed(tmp_path, monkeypatch) -> None:
+    """No new store row after delivery #1 → re-deliver once, then confirm."""
+    calls: list[tuple[str, ...]] = []
+    settle_calls: list[tuple] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    monkeypatch.setattr(b, "_settle_pane", lambda *a, **k: settle_calls.append((a, k)))
+    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)  # first confirm fails fast
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    # baseline=0 → confirm#1 sees 0 (fail) → confirm#2 sees 1 (success after retry).
+    seq = iter([0, 0, 1])
+    monkeypatch.setattr(b, "_max_message_id", lambda _p: next(seq))
+
+    b.inject_user_message(tmp_path, content="do something now")
+
+    # Two deliveries: two settles, two pastes, two Enters (one per attempt).
+    assert len(settle_calls) == 2
+    assert sum(1 for a in calls if a[0] == "load-buffer") == 2
+    assert sum(1 for a in calls if a[-1] == "Enter") == 2
+
+
+def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) -> None:
+    """Store row never appears after two deliveries → raise (FIFO-safe failure)."""
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    monkeypatch.setattr(b, "_max_message_id", lambda _p: 0)  # never advances
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        b.inject_user_message(tmp_path, content="do something now")
+
+    # Both attempts ran (two pastes) before giving up.
+    assert sum(1 for a in calls if a[0] == "load-buffer") == 2
 
 
 def test_inject_user_message_requires_content(tmp_path) -> None:
     with pytest.raises(RuntimeError):
         b.inject_user_message(tmp_path, content="")
+
+
+def test_state_db_path_prefers_per_session_home(tmp_path, monkeypatch) -> None:
+    # No per-session home, no $HERMES_HOME, no ~/.hermes → None.
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path / "nohome"))
+    assert b._state_db_path(tmp_path) is None
+    # Per-session HERMES_HOME under the bridge dir wins, even before state.db exists.
+    home = tmp_path / b._HERMES_HOME_SUBDIR
+    home.mkdir()
+    assert b._state_db_path(tmp_path) == home / "state.db"
+
+
+def test_max_message_id_reads_high_water_mark(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    # Missing file → 0.
+    assert b._max_message_id(db) == 0
+    con = sqlite3.connect(str(db))
+    con.executescript(b._MESSAGES_DDL)
+    # Empty table → 0.
+    assert b._max_message_id(db) == 0
+    con.execute(
+        "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?,?,?,?,?)",
+        (7, "s1", "user", "hi", 0.0),
+    )
+    con.commit()
+    con.close()
+    assert b._max_message_id(db) == 7
+
+
+def test_await_new_message_checks_at_least_once(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(b.time, "sleep", lambda *_a, **_k: None)
+    # Even with a zero timeout, one check runs: baseline 5, current 6 → True.
+    monkeypatch.setattr(b, "_max_message_id", lambda _p: 6)
+    assert b._await_new_message(tmp_path / "state.db", 5, 0.0) is True
+    # No advance → False.
+    monkeypatch.setattr(b, "_max_message_id", lambda _p: 5)
+    assert b._await_new_message(tmp_path / "state.db", 5, 0.0) is False
 
 
 def test_inject_user_message_dead_pane_raises(tmp_path, monkeypatch) -> None:
@@ -186,13 +284,16 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     assert hermes_home == bridge_dir / "hermes_home"
     assert hermes_home.is_dir()
 
-    # Wrapper shell script exists and is executable.
+    # Wrapper shell script exists and is owner-only (it bakes a one-shot auth
+    # token, so the secret is never world-readable).
     wrapper = hermes_home / "omnigent-policy-hook.sh"
     assert wrapper.is_file()
-    assert wrapper.stat().st_mode & 0o111
+    assert wrapper.stat().st_mode & 0o777 == 0o700
     wrapper_text = wrapper.read_text()
-    assert "_OMNIGENT_SERVER_URL='http://localhost:6767'" in wrapper_text
-    assert "_OMNIGENT_SESSION_ID='session-123'" in wrapper_text
+    # Values are shlex-quoted (shell-safe URLs/ids need no quotes).
+    assert "_OMNIGENT_SERVER_URL=http://localhost:6767" in wrapper_text
+    assert "_OMNIGENT_SESSION_ID=session-123" in wrapper_text
+    assert "_OMNIGENT_AUTH_HEADERS=" in wrapper_text
     assert sys.executable in wrapper_text
     assert "hermes_policy_hook.py" in wrapper_text
 

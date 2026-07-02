@@ -119,7 +119,15 @@ deploy/
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
 | Access your server privately from **your phone, tablet, or other personal devices** without exposing it to the internet | Tailscale | [`tailscale/README.md`](tailscale/README.md): `tailscale serve https / http://localhost:8000` |
 | Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
-| Deploy on a Databricks workspace (Lakebase + UC Volumes) | Databricks Apps | [`databricks/README.md`](databricks/README.md): uses Asset Bundles |
+| Deploy on a Databricks workspace (Lakebase + UC Volumes), self-managed | Databricks Apps | [`databricks/README.md`](databricks/README.md): uses Asset Bundles |
+
+> **On Databricks?** The fully managed
+> [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
+> (Beta) is the recommended path: Databricks operates the server for
+> you, wired to workspace identity, Foundation Models, AI Gateway, and
+> MLflow Tracing. Enable the **Omnigent** preview in your workspace
+> settings. The self-managed Databricks Apps bundle above is for when
+> you need control the managed service does not expose yet.
 
 All non-Databricks deploy paths share the same image (`docker/Dockerfile`): a
 slim Python container running the FastAPI / WebSocket coordinator, with Postgres
@@ -296,12 +304,17 @@ and list it in the config. Its env vars are injected into every managed
 sandbox, and the in-sandbox host forwards the standard harness credential
 vars (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY`,
-`OPENAI_BASE_URL`, `GEMINI_API_KEY`) to its runners:
+`OPENAI_BASE_URL`, `GEMINI_API_KEY`, plus their `OMNIGENT_`-prefixed
+aliases) to its runners:
 
 ```bash
 modal secret create omnigent-llm \
-  ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
+  OMNIGENT_ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
 ```
+
+Prefer `OMNIGENT_ANTHROPIC_API_KEY` for Claude Code API-key auth. Omnigent
+resolves it into Claude Code's `apiKeyHelper`, avoiding a raw
+`ANTHROPIC_API_KEY` in the Claude CLI process.
 
 ```yaml
 sandbox:

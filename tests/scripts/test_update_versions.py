@@ -9,25 +9,43 @@ fails here.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
 
-from scripts import update_versions
-
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# ``scripts`` is a namespace package (no ``__init__.py``), so a bare
+# ``from scripts import update_versions`` is shadowed by the regular
+# ``tests/scripts`` package when both resolve as a top-level ``scripts`` during
+# a full-suite collection (pytest's default "prepend" import mode), failing with
+# ``ImportError: cannot import name 'update_versions' from 'scripts'``. Load the
+# module by its repo-root file path instead, which is immune to the collision.
+_UPDATE_VERSIONS_SPEC = importlib.util.spec_from_file_location(
+    "_update_versions_under_test", _REPO_ROOT / "scripts" / "update_versions.py"
+)
+assert _UPDATE_VERSIONS_SPEC is not None and _UPDATE_VERSIONS_SPEC.loader is not None
+update_versions = importlib.util.module_from_spec(_UPDATE_VERSIONS_SPEC)
+# Register before exec so dataclasses defined in the module can resolve their
+# defining module via ``sys.modules`` during class creation.
+sys.modules[_UPDATE_VERSIONS_SPEC.name] = update_versions
+_UPDATE_VERSIONS_SPEC.loader.exec_module(update_versions)
 _PYPROJECTS = [
     "pyproject.toml",
     "sdks/python-client/pyproject.toml",
     "sdks/ui/pyproject.toml",
 ]
+# The runtime version constant is stamped/verified alongside the pyprojects.
+_VERSION_PY = "omnigent/version.py"
 
 
 @pytest.fixture
 def repo_copy(tmp_path: Path) -> Path:
-    """Copy the three real pyproject.toml files into a temp repo root."""
+    """Copy the real pyproject.toml files + version.py into a temp repo root."""
     root = tmp_path / "repo"
-    for rel in _PYPROJECTS:
+    for rel in (*_PYPROJECTS, _VERSION_PY):
         dst = root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text((_REPO_ROOT / rel).read_text())
@@ -36,13 +54,46 @@ def repo_copy(tmp_path: Path) -> Path:
 
 def test_set_version_rewrites_every_location(repo_copy: Path) -> None:
     changed = update_versions.set_version(repo_copy, "9.9.9")
-    assert len(changed) == 3
+    # Three pyprojects plus omnigent/version.py.
+    assert len(changed) == 4
     # root: version line + two sibling pins; SDKs: version line + one pin.
     assert (repo_copy / "pyproject.toml").read_text().count("9.9.9") == 3
     assert (repo_copy / "sdks/python-client/pyproject.toml").read_text().count("9.9.9") == 2
     assert (repo_copy / "sdks/ui/pyproject.toml").read_text().count("9.9.9") == 2
+    # The runtime constant is stamped too.
+    assert 'VERSION = "9.9.9"' in (repo_copy / _VERSION_PY).read_text()
     # check() round-trips: all agree and pins are exact.
     assert update_versions.check(repo_copy, expect="9.9.9") == "9.9.9"
+
+
+def test_set_version_updates_runtime_constant(repo_copy: Path) -> None:
+    """The bump path keeps omnigent/version.py's VERSION in lockstep.
+
+    This is the gap that would otherwise make the automated bot bump commit a
+    stale constant and trip the ``test_version_matches_pyproject`` backstop.
+    """
+    version_py = repo_copy / _VERSION_PY
+    assert 'VERSION = "9.9.9"' not in version_py.read_text()
+    changed = update_versions.set_version(repo_copy, "9.9.9")
+    assert version_py in changed
+    assert 'VERSION = "9.9.9"' in version_py.read_text()
+
+
+def test_check_detects_version_py_drift(repo_copy: Path) -> None:
+    """A stale VERSION constant (pyprojects consistent) fails check()."""
+    update_versions.set_version(repo_copy, "9.9.9")
+    version_py = repo_copy / _VERSION_PY
+    version_py.write_text(version_py.read_text().replace('VERSION = "9.9.9"', 'VERSION = "9.9.8"'))
+    with pytest.raises(ValueError, match=r"omnigent/version\.py VERSION"):
+        update_versions.check(repo_copy)
+
+
+def test_set_version_fails_loud_when_constant_absent(repo_copy: Path) -> None:
+    """A version.py missing the VERSION line must raise, not silently no-op."""
+    version_py = repo_copy / _VERSION_PY
+    version_py.write_text('"""No constant here."""\n')
+    with pytest.raises(ValueError, match="expected exactly 1 match"):
+        update_versions.set_version(repo_copy, "9.9.9")
 
 
 def test_set_version_preserves_unrelated_version_literals(repo_copy: Path) -> None:

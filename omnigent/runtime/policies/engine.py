@@ -112,6 +112,7 @@ class PolicyEngine:
         initial_labels: dict[str, str],
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
+        initial_subtree_usage: dict[str, float] | None = None,
         initial_user_daily_cost: dict[str, float | str] | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
@@ -145,6 +146,13 @@ class PolicyEngine:
         # persisted usage that predates cache-token tracking.
         self._usage.setdefault("cache_read_input_tokens", 0)
         self._usage.setdefault("cache_creation_input_tokens", 0)
+        # Subtree-scoped usage seed (this conversation + its descendants
+        # only, not the whole session tree). Seeded at build time ONLY when
+        # a ``subagent_cost_budget`` policy is configured — ``None``
+        # otherwise, so sessions without that policy pay no subtree lookup.
+        self._subtree_usage: dict[str, float] | None = (
+            dict(initial_subtree_usage) if initial_subtree_usage is not None else None
+        )
         # The session owner's per-UTC-day cost rollup
         # ({"cost_usd", "ask_approved_usd"}), seeded at build time ONLY
         # when a policy needs it (per-user daily cost-budget configured).
@@ -226,6 +234,60 @@ class PolicyEngine:
         read_only: bool = False,
     ) -> PolicyResult:
         """
+        Evaluate the composed policy decision, recording a span.
+
+        Thin tracing wrapper over :meth:`_evaluate_composed`. Opens a
+        ``policy.evaluate`` span tagged with the phase, resolved tool
+        name, and read-only flag, then records the resulting decision
+        (and reason / deciding policies on a non-ALLOW). This is the one
+        in-process policy choke point — every enforcement site routes
+        through it — so the span makes policy decisions visible inline
+        in the request trace.
+
+        :param ctx: The current evaluation context
+            (phase + content + resolved tool_name).
+        :param read_only: When ``True``, skip persistent side effects;
+            see :meth:`_evaluate_composed`.
+        :returns: The composed :class:`PolicyResult`.
+        """
+        from omnigent.runtime import telemetry
+
+        with telemetry.span(
+            "policy.evaluate",
+            attributes={
+                "policy.phase": getattr(ctx.phase, "name", str(ctx.phase)),
+                "policy.tool_name": ctx.tool_name or "",
+                "policy.read_only": read_only,
+            },
+        ) as evaluate_span:
+            if self._conversation_id:
+                evaluate_span.set_attribute("session.id", self._conversation_id)
+            # The content under evaluation (tool args / prompt) is recorded
+            # only when content capture is on (redacted + capped).
+            telemetry.record_message_payload(
+                {"content": ctx.content},
+                span=evaluate_span,
+                key="policy.content",
+            )
+            result = await self._evaluate_composed(ctx, read_only=read_only)
+            evaluate_span.set_attribute(
+                "policy.decision",
+                getattr(result.action, "name", str(result.action)),
+            )
+            if result.reason:
+                evaluate_span.set_attribute("policy.reason", result.reason)
+            deciding = getattr(result, "deciding_policies", None)
+            if deciding:
+                evaluate_span.set_attribute("policy.deciding_policies", list(deciding))
+            return result
+
+    async def _evaluate_composed(
+        self,
+        ctx: EvaluationContext,
+        *,
+        read_only: bool = False,
+    ) -> PolicyResult:
+        """
         Evaluate the composed policy decision for one phase.
 
         Runs the pipeline from POLICIES.md §4:
@@ -287,6 +349,7 @@ class PolicyEngine:
         ctx = self._populate_trajectory(ctx)
         ctx = self._inject_session_state(ctx)
         ctx = self._inject_usage(ctx)
+        ctx = self._inject_subtree_usage(ctx)
         ctx = self._inject_user_daily_cost(ctx)
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
@@ -481,6 +544,7 @@ class PolicyEngine:
             return
         from omnigent.policies.schema import (
             SESSION_COST_ASK_APPROVED_STATE_KEY,
+            SESSION_COST_UNPRICED_APPROVED_KEY,
             USER_DAILY_ASK_APPROVED_STATE_KEY,
         )
 
@@ -496,7 +560,7 @@ class PolicyEngine:
             if op.key == USER_DAILY_ASK_APPROVED_STATE_KEY:
                 self._record_user_daily_ask_approved(op.value)
             elif (
-                op.key == SESSION_COST_ASK_APPROVED_STATE_KEY
+                op.key in (SESSION_COST_ASK_APPROVED_STATE_KEY, SESSION_COST_UNPRICED_APPROVED_KEY)
                 and self._root_conversation_id != self._conversation_id
             ):
                 self._record_root_cost_ask_approved(op)
@@ -615,7 +679,17 @@ class PolicyEngine:
                 "cache_read_input_tokens": cache_read_input_tokens,
                 "cache_creation_input_tokens": cache_creation_input_tokens,
             }
-            self._usage["total_cost_usd"] += compute_llm_cost(delta_usage, self._token_pricing)
+            delta_cost = compute_llm_cost(delta_usage, self._token_pricing)
+            self._usage["total_cost_usd"] += delta_cost
+        else:
+            delta_cost = 0.0
+        if self._subtree_usage is not None:
+            self._subtree_usage["input_tokens"] += input_tokens
+            self._subtree_usage["output_tokens"] += output_tokens
+            self._subtree_usage["total_tokens"] += total_tokens
+            self._subtree_usage["cache_read_input_tokens"] += cache_read_input_tokens
+            self._subtree_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
+            self._subtree_usage["total_cost_usd"] += delta_cost
         self._store.set_session_usage(self._conversation_id, dict(self._usage))
 
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
@@ -633,6 +707,25 @@ class PolicyEngine:
             set to a defensive copy of the cumulative counters.
         """
         return replace(ctx, usage=dict(self._usage))
+
+    def _inject_subtree_usage(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``subtree_usage`` populated, when seeded.
+
+        Injects the engine's subtree-scoped cumulative cost so the
+        ``subagent_cost_budget`` policy can gate on the child's own
+        subtree spend rather than the whole session total. When the
+        engine was built without it (``None`` — no policy needs it),
+        *ctx* is returned unchanged.
+
+        :param ctx: Original :class:`EvaluationContext` from the
+            caller.
+        :returns: *ctx* unchanged when no subtree usage was seeded,
+            else a copy with ``subtree_usage`` set to a defensive copy.
+        """
+        if self._subtree_usage is None:
+            return ctx
+        return replace(ctx, subtree_usage=dict(self._subtree_usage))
 
     def _inject_user_daily_cost(self, ctx: EvaluationContext) -> EvaluationContext:
         """

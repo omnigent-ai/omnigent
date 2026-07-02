@@ -71,7 +71,7 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # so it survives reload without a schema migration. The web UI gates turning
 # this on behind a typed confirmation + a persistent red warning banner; any
 # value other than ``"1"`` (incl. absent) leaves the session in Codex's
-# normal approval/sandbox stance. See issue #657.
+# normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
 # Reserved label key that stores a session's sidebar "project" membership
@@ -176,6 +176,29 @@ class NameAlreadyExistsError(Exception):
     builtins) can surface a clean ``name_already_exists`` tool
     error to the LLM.
     """
+
+
+def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) -> None:
+    """
+    Apply a usage *delta* to *current* in place (add semantics, nested-aware).
+
+    Flat numeric keys are summed; ``"by_model"`` sub-dicts are merged by
+    model id, summing each model's sub-keys independently. Used by
+    :meth:`ConversationStore.increment_session_usage` implementations to
+    keep the merge logic in one place.
+
+    :param current: Existing ``session_usage`` dict (mutated in place).
+    :param delta: Increments to apply (same layout as ``session_usage``).
+    """
+    for key, value in delta.items():
+        if key == "by_model":
+            by_model = current.setdefault("by_model", {})
+            for model_id, model_delta in value.items():
+                bucket = by_model.setdefault(model_id, {})
+                for sub_key, sub_value in model_delta.items():
+                    bucket[sub_key] = bucket.get(sub_key, 0) + sub_value
+        else:
+            current[key] = current.get(key, 0) + value
 
 
 class ConversationStore(ABC):
@@ -770,6 +793,43 @@ class ConversationStore(ABC):
             ``{"input_tokens": 1500, "output_tokens": 350,
             "total_tokens": 1850}``. May carry a nested ``"by_model"``
             sub-dict (per-model token/cost buckets), hence ``Any``.
+        """
+        ...
+
+    @abstractmethod
+    def increment_session_usage(
+        self,
+        conversation_id: str,
+        delta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Atomically apply a usage delta to a conversation's ``session_usage``.
+
+        Reads the current JSON, applies *delta* (adding each key's value to the
+        existing value, with ``by_model`` merged recursively), and writes back —
+        all within a single database transaction. Concurrent writers are
+        serialised via dialect-appropriate locking: ``SELECT FOR UPDATE`` on
+        PostgreSQL / MySQL / MariaDB; ``BEGIN IMMEDIATE`` (write lock before
+        the first read) on SQLite, which avoids ``SQLITE_BUSY_SNAPSHOT`` that
+        a plain deferred ``SELECT``-then-``UPDATE`` would raise under concurrent
+        writers. This prevents the read-modify-write
+        race that caused concurrent relay completions to silently drop each
+        other's cost / token deltas (#9).
+
+        *delta* uses the same key layout as ``session_usage``:
+        - flat numeric keys (``"input_tokens"``, ``"total_cost_usd"``, …) are
+          added to the existing value (``0`` when absent).
+        - ``"by_model"`` is a nested dict ``{model_id: {sub_key: value}}``; each
+          model's sub-keys are added independently, creating the bucket on first
+          use.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param delta: Usage increments to apply, e.g.
+            ``{"input_tokens": 1000, "total_cost_usd": 0.05,
+            "by_model": {"claude-sonnet-4-6": {"input_tokens": 1000,
+            "total_cost_usd": 0.05}}}``.
+        :returns: The updated ``session_usage`` dict after the increment.
         """
         ...
 

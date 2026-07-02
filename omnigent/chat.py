@@ -648,9 +648,9 @@ def _remote_headers(
     # workspace or the request routes to the account. Merged onto the result
     # because these ad-hoc requests carry no httpx Auth.
     if server_url:
-        from omnigent.cli_auth import databricks_org_id_headers
+        from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_org_id_headers(server_url))
+        headers.update(databricks_request_headers(server_url))
     return headers
 
 
@@ -771,9 +771,9 @@ class _DatabricksTokenAuth(httpx.Auth):
         # Workspace routing (empty when none recorded); independent of the
         # credential branch below.
         if self._server_url:
-            from omnigent.cli_auth import databricks_org_id_headers
+            from omnigent.cli_auth import databricks_request_headers
 
-            request.headers.update(databricks_org_id_headers(self._server_url))
+            request.headers.update(databricks_request_headers(self._server_url))
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
             yield request

@@ -188,7 +188,13 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
     # required, or plain-string sends would break.
     assert object_schema["required"] == ["input"]
     assert object_schema["additionalProperties"] is False
-    assert set(object_schema["properties"]) == {"input", "purpose", "model", "file_ids"}
+    assert set(object_schema["properties"]) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "cost_budget",
+    }
     assert "dispatch metadata" in object_schema["properties"]["purpose"]["description"]
     # The model property must say it is create-time-only and optional,
     # so the LLM doesn't attach it to continuation sends.
@@ -223,7 +229,13 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
     plain = SysSessionSendTool(
         {"claude": AgentSpec(spec_version=1, name="claude", description="Review helper.")}
     )
-    assert _object_branch_props(plain) == {"input", "purpose", "model", "file_ids"}
+    assert _object_branch_props(plain) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "cost_budget",
+    }
 
     # Opted in: a sub-agent whose executor.config.allowed_harnesses declares a
     # non-empty allowlist (the polly/debby `codex`/`opencode` worker shape) →
@@ -241,7 +253,14 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         ),
     )
     opted_in = SysSessionSendTool({"codex": opted_in_spec})
-    assert _object_branch_props(opted_in) == {"input", "purpose", "model", "file_ids", "harness"}
+    assert _object_branch_props(opted_in) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "harness",
+        "cost_budget",
+    }
     object_schema = next(
         b
         for b in opted_in.get_schema()["function"]["parameters"]["properties"]["args"]["anyOf"]
@@ -260,7 +279,14 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
             "codex": opted_in_spec,
         }
     )
-    assert _object_branch_props(mixed) == {"input", "purpose", "model", "file_ids", "harness"}
+    assert _object_branch_props(mixed) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "harness",
+        "cost_budget",
+    }
 
 
 def test_peek_schema_required_fields_and_no_extra_props() -> None:

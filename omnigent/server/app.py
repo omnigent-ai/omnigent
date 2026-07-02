@@ -4,7 +4,9 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 import tarfile
+import uuid
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -49,6 +51,9 @@ from omnigent.server.performance_metrics import (
     ServerPerformanceMetrics,
     publish_server_metrics_periodically,
     set_request_duration_for_access_log,
+    set_request_id_for_access_log,
+    set_request_session_id_for_access_log,
+    set_request_user_agent_for_access_log,
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
@@ -79,6 +84,17 @@ from omnigent.stores.policy_store import PolicyStore
 _logger = logging.getLogger(__name__)
 
 
+def _server_version() -> str:
+    """Return the server version exposed to clients.
+
+    Reads :data:`omnigent.version.VERSION`, the single source of truth shared
+    with the CLI and the host/runner hello frames.
+    """
+    from omnigent.version import VERSION
+
+    return VERSION
+
+
 def _register_web_mimetypes() -> None:
     """Pin Content-Type for web UI assets regardless of the OS MIME registry.
 
@@ -98,13 +114,23 @@ def _register_web_mimetypes() -> None:
         (".map", "application/json"),
         (".wasm", "application/wasm"),
         (".svg", "image/svg+xml"),
+        # Python's mimetypes DB has no ``.webmanifest`` entry, so without this
+        # Starlette serves the PWA manifest as ``application/octet-stream`` and
+        # browsers silently refuse to install the app.
+        (".webmanifest", "application/manifest+json"),
     ):
         mimetypes.add_type(ctype, ext)
 
 
 _register_web_mimetypes()
 
-_WEB_UI_DIST = Path(__file__).parent / "static" / "web-ui"
+# Default: the SPA bundled into the installed wheel's package data. A deploy
+# that ships the SPA outside the wheel (e.g. as loose files in the app source
+# tree, to keep the wheel under a per-file size cap) can point here instead via
+# OMNIGENT_WEB_UI_DIST, without rebuilding or repackaging.
+_WEB_UI_DIST = Path(
+    os.environ.get("OMNIGENT_WEB_UI_DIST") or (Path(__file__).parent / "static" / "web-ui")
+)
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
@@ -122,6 +148,7 @@ _KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
+_SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
@@ -1288,19 +1315,35 @@ def create_app(
         call_next: _FastAPICallNext,
     ) -> Response:
         """
-        Count each HTTP request while it is being processed.
+        Count each HTTP request and enrich access logs.
+
+        Generates a per-request correlation ID, captures the
+        ``User-Agent`` header and session ID from the URL path, and
+        stores them in context variables for the Uvicorn access
+        formatter.
 
         :param request: Incoming FastAPI request, e.g. ``GET /health``.
         :param call_next: FastAPI middleware continuation that executes
             the matched route and returns its response.
         :returns: The downstream route response.
         """
+        request_id = uuid.uuid4().hex
+        set_request_id_for_access_log(request_id)
+        set_request_user_agent_for_access_log(
+            request.headers.get("user-agent"),
+        )
+        session_match = _SESSION_PATH_RE.search(request.url.path)
+        set_request_session_id_for_access_log(
+            session_match.group(1) if session_match else None,
+        )
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
         try:
             response = await call_next(request)
             status_code = response.status_code
+            response.headers["X-Request-Id"] = request_id
             return response
         except Exception:
             failed = True
@@ -1633,9 +1676,7 @@ def create_app(
         :returns: ``{"version": "<semver string>"}``,
             e.g. ``{"version": "0.1.0"}``.
         """
-        from importlib.metadata import version as _pkg_version
-
-        return {"version": _pkg_version("omnigent")}
+        return {"version": _server_version()}
 
     @app.get("/v1/info")
     async def info() -> dict[str, bool | str | None]:
@@ -1705,8 +1746,6 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        from importlib.metadata import version as _pkg_version
-
         # smart_routing_enabled: true when the server can route — either
         # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
         # + llm: config) or the managed deployment registered a
@@ -1727,7 +1766,7 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
-            "server_version": _pkg_version("omnigent"),
+            "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
         }
 
@@ -2015,6 +2054,26 @@ def create_app(
                 conversation_store,
             )
 
+    def _resolve_managed_runner_owner(runner_id: str) -> str | None:
+        """Owner for a server-managed sandbox runner, by its bound session.
+
+        Managed runners authenticate with a server-minted binding token,
+        not a user session, so the runner tunnel cannot resolve their
+        owner from the handshake. The server wrote ``runner_id`` onto the
+        session row at launch (``replace_runner_id``), so the bound
+        conversation's owner is authoritative — the runner-side analog of
+        the host tunnel's ``resolve_launch_token``.
+
+        :param runner_id: Token-bound runner id from the tunnel handshake.
+        :returns: The session owner's user id, or ``None`` when no session
+            is bound to this runner (the handshake is then refused).
+        """
+        for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+            owner = conversation_store.get_session_owner(conv.id)
+            if owner is not None:
+                return owner
+        return None
+
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
         create_runner_tunnel_router(
@@ -2024,6 +2083,7 @@ def create_app(
             on_runner_connect=_on_runner_connect,
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
+            resolve_managed_runner_owner=_resolve_managed_runner_owner,
         ),
         prefix="/v1",
         tags=["runners"],
@@ -2129,9 +2189,9 @@ def create_app(
                 tags=["auth"],
             )
 
-    # Mount the built ap-web SPA at "/" if a build is present. The SPA is
-    # built into ``omnigent/server/static/web-ui/`` by ``ap-web/``'s Vite
-    # build (see ``ap-web/vite.config.ts`` ``build.outDir``). The mount is
+    # Mount the built web SPA at "/" if a build is present. The SPA is
+    # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
+    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is
     # registered AFTER all API routers so router routes win on overlap.
     # Skipping the mount when no build is present keeps API-only
     # deployments working (and ``/`` 404s cleanly instead of exploding at
@@ -2310,6 +2370,11 @@ def _apply_web_ui_cache_headers(response: Response, path: str) -> Response:
     media_type = content_type.partition(";")[0].lower() if content_type is not None else None
     if path.startswith("assets/"):
         response.headers["Cache-Control"] = _WEB_UI_ASSET_CACHE_CONTROL
+    elif path in {"sw.js", "version.json"}:
+        # The service worker and the version sentinel it precaches must
+        # revalidate on every load, or the HTTP cache could mask a deploy for up
+        # to an hour and defeat prompt-to-reload.
+        response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     elif media_type == "text/html" or path in {"", ".", "index.html"}:
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     else:

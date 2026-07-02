@@ -1693,11 +1693,11 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
         )
         # No interactive approval banner tunneled to the root REPL —
         # the sub-agent TOOL_CALL ASK is a non-interactive pass-through
-        # today (see #765), exactly like the sub-agent INPUT-phase ASK.
+        # today, exactly like the sub-agent INPUT-phase ASK.
         assert "approval required" not in full_turn, (
             "A sub-agent TOOL_CALL ASK banner surfaced on the root REPL — "
-            "interactive tunneled mid-flight ASK is not implemented (see "
-            "#765); the sub-agent ASK is non-interactive today.\n"
+            "interactive tunneled mid-flight ASK is not implemented; "
+            "the sub-agent ASK is non-interactive today.\n"
             f"Captured:\n{full_turn[:1500]}"
         )
     finally:

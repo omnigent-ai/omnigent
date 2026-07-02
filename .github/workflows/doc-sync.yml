@@ -1,6 +1,6 @@
 # Keep omnigent-site docs in sync with merged PRs: on push to main, resolve the
 # merged PR from the commit, classify its doc impact, label it, and — if it needs
-# docs — draft an omnigent-site PR tagging the author. Plan → classify
+# docs — draft an omnigent-site PR tagging the merging maintainer. Plan → classify
 # (doc-classifier) → label → draft (doc-drafter) → open site PR.
 #
 # Why push:[main], not pull_request_target: a fork PR's `closed` event is gated by
@@ -64,33 +64,71 @@ jobs:
         run: |
           set -euo pipefail
           python3 -u <<'PYEOF'
-          import json, os, subprocess
+          import json, os, re, subprocess, time
           NEEDS, NO = "needs-doc-update", "no-doc-update"
           event = os.environ.get("GITHUB_EVENT_NAME", "")
           payload = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
           classify = predraft = False
-          pr = author = title = ""
+          pr = author = title = merger = ""
+          labels = []
 
           repo = os.environ["CODE_REPO"]
           if event == "workflow_dispatch":
               pr = os.environ.get("INPUT_PR", "").strip()
               meta = json.loads(subprocess.run(
                   ["gh", "pr", "view", pr, "--repo", repo,
-                   "--json", "author,title"], capture_output=True, text=True).stdout or "{}")
+                   "--json", "author,title,mergedBy,labels"], capture_output=True, text=True).stdout or "{}")
               author = (meta.get("author") or {}).get("login", "")
+              merger = (meta.get("mergedBy") or {}).get("login", "")
               title = meta.get("title", "")
-              classify = True  # manual run: classify, and draft if needs-doc
+              labels = [l.get("name", "") for l in (meta.get("labels") or [])]
           elif event == "push":
               # Resolve the merged PR from the push tip — works for fork and internal
               # PRs (trusted main history, not a PR event). Single-tip assumption: a
               # normal merge is one push whose tip is the merge commit; a push carrying
               # MULTIPLE merges (merge queue / batched) only processes the tip's PR.
               sha = os.environ.get("GITHUB_SHA", "")
-              out = subprocess.run(
-                  ["gh", "api", f"repos/{repo}/commits/{sha}/pulls", "--jq",
-                   "[.[] | {number, author: (.user.login // \"\"), title, labels: [.labels[].name]}]"],
-                  capture_output=True, text=True).stdout.strip()
-              prs = json.loads(out) if out else []
+
+              # GitHub's commit→PR association index is populated asynchronously,
+              # so a query fired seconds after the merge can return [] even though
+              # the PR exists (eventual consistency — observed a ~7s lag). Retry
+              # with backoff before concluding there's no PR.
+              def query_pulls():
+                  out = subprocess.run(
+                      ["gh", "api", f"repos/{repo}/commits/{sha}/pulls", "--jq",
+                       "[.[] | {number, author: (.user.login // \"\"), title, labels: [.labels[].name]}]"],
+                      capture_output=True, text=True).stdout.strip()
+                  return json.loads(out) if out else []
+
+              prs = []
+              for delay in (0, 3, 6, 9):
+                  if delay:
+                      time.sleep(delay)
+                  prs = query_pulls()
+                  if prs:
+                      break
+
+              # Fallback: the index never caught up (or this merge strategy isn't
+              # indexed). The squash/merge commit subject embeds the PR number, so
+              # parse it from the push payload (the repo isn't checked out yet at
+              # this step) and fetch that PR directly.
+              if not prs:
+                  subject = (((payload.get("head_commit") or {}).get("message") or "")
+                             .splitlines() or [""])[0]
+                  m = (re.search(r"\(#(\d+)\)\s*$", subject)
+                       or re.search(r"^Merge pull request #(\d+)", subject))
+                  if m:
+                      num = m.group(1)
+                      meta = json.loads(subprocess.run(
+                          ["gh", "api", f"repos/{repo}/pulls/{num}", "--jq",
+                           "{number, author: (.user.login // \"\"), title, "
+                           "labels: [.labels[].name]}"],
+                          capture_output=True, text=True).stdout or "{}")
+                      if meta.get("number"):
+                          print(f"::notice::commit {sha[:8]} not in PR index yet; "
+                                f"resolved #{num} from the commit subject.")
+                          prs = [meta]
+
               if not prs:
                   print(f"::notice::commit {sha[:8]} has no associated PR (direct push?) — nothing to do.")
               else:
@@ -100,24 +138,38 @@ jobs:
                   p = prs[0]
                   pr = str(p["number"]); author = p.get("author") or ""; title = p.get("title", "")
                   labels = p.get("labels", [])
-                  if NO in labels:
-                      pass                       # human set no-doc-update → skip
-                  elif NEEDS in labels:
-                      predraft = True            # human set needs-doc-update → draft
-                  else:
-                      classify = True            # unlabeled → let the classifier decide
+                  # The commits→pulls list omits merged_by; fetch it from the PR
+                  # object. The merger is the maintainer who clicked merge — the right
+                  # docs reviewer even when the author is an outside contributor.
+                  merger = subprocess.run(
+                      ["gh", "api", f"repos/{repo}/pulls/{pr}", "--jq", ".merged_by.login // \"\""],
+                      capture_output=True, text=True).stdout.strip()
+
+          # Label-driven decision, shared by push and manual runs. A pre-existing
+          # label is authoritative — trust it and skip the (slow, costly) classifier:
+          #   no-doc-update    → skip entirely
+          #   needs-doc-update → draft directly
+          #   unlabeled        → let the classifier decide
+          if pr:
+              if NO in labels:
+                  pass                           # already labeled no-doc → skip
+              elif NEEDS in labels:
+                  predraft = True                # already labeled needs-doc → draft
+              else:
+                  classify = True                # unlabeled → classify
 
           proceed = classify or predraft
           out = os.environ["GITHUB_OUTPUT"]
           with open(out, "a") as fh:
               fh.write(f"pr={pr}\n")
               fh.write(f"author={author}\n")
+              fh.write(f"merger={merger}\n")
               fh.write(f"classify={'true' if classify else 'false'}\n")
               fh.write(f"predraft={'true' if predraft else 'false'}\n")
               fh.write(f"proceed={'true' if proceed else 'false'}\n")
           # Title can contain anything → pass via file, not output.
           open("/tmp/pr_title.txt", "w").write(title)
-          print(f"event={event} pr={pr} author={author} classify={classify} predraft={predraft}")
+          print(f"event={event} pr={pr} author={author} merger={merger} classify={classify} predraft={predraft}")
           PYEOF
 
       - name: Check LLM credentials
@@ -477,28 +529,36 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.site-token.outputs.token || github.token }}
           AUTHOR: ${{ steps.plan.outputs.author }}
+          MERGER: ${{ steps.plan.outputs.merger }}
           PR_NUMBER: ${{ steps.plan.outputs.pr }}
         run: |
           set -euo pipefail
           python3 -u <<'PYEOF'
-          import os, re, json, subprocess, pathlib
+          import os, re, pathlib
           site = os.environ["SITE_REPO_SLUG"]; code = os.environ["CODE_REPO"]
-          author = os.environ.get("AUTHOR", ""); pr = os.environ["PR_NUMBER"]
+          author = os.environ.get("AUTHOR", ""); merger = os.environ.get("MERGER", "")
+          pr = os.environ["PR_NUMBER"]
           title = pathlib.Path("/tmp/pr_title.txt").read_text().strip()
           raw = pathlib.Path("/tmp/draft_out.txt").read_text()
           m = re.search(r"<!--\s*DOC_DRAFT_SUMMARY\s*-->", raw)
           summary = raw[m.end():].strip() if m else "_(drafter produced edits but no summary)_"
 
-          # Tag the source-PR author: request review if they're a site collaborator,
-          # else @-mention. Skip bots / the CI identity.
-          reviewer = ""; mention = ""
-          if author and not author.endswith("[bot]") and author != "omnigent-ci":
-              r = subprocess.run(["gh", "api", f"repos/{site}/collaborators/{author}", "--silent"],
-                                 capture_output=True, text=True)
-              if r.returncode == 0:
-                  reviewer = author
-              else:
-                  mention = f"@{author}"
+          # Tag the maintainer who MERGED the PR — the author may be an outside
+          # contributor with no site access, but a maintainer always merges. Fall back
+          # to the author when there's no usable merger (e.g. a manual run on an
+          # unmerged PR). Skip bots / the CI identity.
+          def usable(login):
+              return bool(login) and not login.endswith("[bot]") and login != "omnigent-ci"
+          if usable(merger):
+              reviewer, role = merger, "merged by"
+          elif usable(author):
+              reviewer, role = author, "author"
+          else:
+              reviewer, role = "", ""
+          # @-mention in the body AND request review downstream: the review request is
+          # best-effort (GitHub rejects non-collaborators), so the mention is the
+          # durable ping — it reaches concealed org members too.
+          mention = f" · {role} @{reviewer}" if reviewer else ""
 
           body = f"""<!-- doc-sync -->
           Documentation update for **{code}#{pr}** — {title}
@@ -506,7 +566,7 @@ jobs:
           {summary}
 
           ---
-          Source PR: {code}#{pr}{(' · author ' + mention) if mention else ''}
+          Source PR: {code}#{pr}{mention}
           <sub>Drafted automatically by the doc-sync workflow. Review for accuracy before merging.</sub>
           """
           body = "\n".join(l[10:] if l.startswith(" "*10) else l for l in body.splitlines())
@@ -564,24 +624,32 @@ jobs:
           # bot commits.
           git push --force "$PUSH_URL" "$BRANCH"
 
-          REVIEWER_ARG=()
-          [ -n "${REVIEWER}" ] && REVIEWER_ARG=(--reviewer "${REVIEWER}")
           EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
               --json number --jq '.[0].number // empty' 2>/dev/null || true)"
           if [ -n "$EXISTING" ]; then
             gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --body-file /tmp/site_pr_body.md || true
-            [ -n "${REVIEWER}" ] && gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --add-reviewer "${REVIEWER}" || true
             echo "Updated site PR #$EXISTING."
           else
             gh label create automated-docs --repo "$SITE_REPO_SLUG" --color 0E8A16 \
               --description "Automated documentation update" 2>/dev/null || true
             if gh pr create --repo "$SITE_REPO_SLUG" --base main --head "$BRANCH" \
                 --title "docs: document ${CODE_REPO}#${PR_NUMBER}" \
-                --label automated-docs --body-file /tmp/site_pr_body.md "${REVIEWER_ARG[@]}"; then
+                --label automated-docs --body-file /tmp/site_pr_body.md; then
+              EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
+                  --json number --jq '.[0].number // empty' 2>/dev/null || true)"
               echo "Opened site PR for $BRANCH."
             else
               echo "::warning::Could not open the site PR automatically. Branch '$BRANCH' is pushed."
             fi
+          fi
+
+          # Always attempt the review request, decoupled from PR creation so a
+          # non-addable reviewer can't fail the open. GitHub returns 422 for users it
+          # can't add (non-collaborators / concealed org members); tolerate it — the
+          # reviewer is also @-mentioned in the body as a durable fallback ping.
+          if [ -n "${REVIEWER}" ] && [ -n "${EXISTING}" ]; then
+            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --add-reviewer "${REVIEWER}" \
+              || echo "::notice::Could not request review from ${REVIEWER} (not addable); they're @-mentioned in the PR body."
           fi
 
       - name: Note draft skipped (no site token)

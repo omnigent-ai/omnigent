@@ -1,6 +1,6 @@
 name: Code Coverage
 
-# Coverage ratchet for both suites — backend pytest (`Coverage`) and the ap-web
+# Coverage ratchet for both suites — backend pytest (`Coverage`) and the web
 # vitest frontend (`Coverage (ui)`). One job handles both: it triggers on either
 # producing workflow and branches on github.event.workflow_run.name to pick the
 # artifact, status context, and wording. Runs on workflow_run (privileged,
@@ -20,7 +20,7 @@ name: Code Coverage
 
 on:
   workflow_run:
-    workflows: [CI, ap-web Tests]
+    workflows: [CI, web Tests]
     types: [completed]
 
 # Read-only at the top level; write scopes live on the job below.
@@ -112,8 +112,8 @@ jobs:
 
           # On a PR: baseline = the most recent $CONTEXT status recorded on main.
           # We can't just read main's HEAD: the two producers are path-filtered
-          # against each other (backend CI ignores ap-web/**, ap-web Tests only
-          # runs on ap-web/**), so a one-sided merge leaves HEAD carrying only one
+          # against each other (backend CI ignores web/**, web Tests only
+          # runs on web/**), so a one-sided merge leaves HEAD carrying only one
           # suite's status. Reading HEAD alone would then report "no baseline yet"
           # and silently disable the other gate. Instead scan recent main commits
           # and take the most recent that actually carries $CONTEXT. A single

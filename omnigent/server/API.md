@@ -471,7 +471,7 @@ Fields:
     means no override is active and the bound agent's spec model
     applies. Persisted on `conversations.model_override`; set via
     `PATCH /v1/sessions/{id}` (also the path the REPL's `/model`
-    command uses) so the ap-web picker and the TUI stay in sync.
+    command uses) so the web picker and the TUI stay in sync.
 
   cost_control_mode_override (string or null)
     Per-session cost-control switch: `"on"` activates the spec's

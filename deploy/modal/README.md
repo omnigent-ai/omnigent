@@ -312,7 +312,7 @@ credential vars to its runners:
 
 ```bash
 modal secret create omnigent-llm \
-  ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
+  OMNIGENT_ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
 ```
 
 The forwarded set covers the variables the harnesses themselves
@@ -324,7 +324,7 @@ like [OpenRouter](https://openrouter.ai) and
 
 | Variable | Enables |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude models on the Anthropic API (claude-sdk, pi, claude-code harnesses) |
+| `OMNIGENT_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY` | Claude models on the Anthropic API (claude-sdk, pi, claude-code harnesses). Prefer the `OMNIGENT_` form for Claude Code so the raw `ANTHROPIC_API_KEY` env var is not present in the CLI process. |
 | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | Anthropic-compatible gateways — point claude-code at a LiteLLM proxy, a Bedrock/Vertex bridge, or a corporate gateway |
 | `CLAUDE_CODE_OAUTH_TOKEN` | claude-code with a Claude subscription (no API key) |
 | `OPENAI_API_KEY` | OpenAI models on the OpenAI API (codex, openai-agents harnesses) |
@@ -334,7 +334,10 @@ like [OpenRouter](https://openrouter.ai) and
 
 Common setups:
 
-- **Claude with an API key** — put `ANTHROPIC_API_KEY` in the secret.
+- **Claude with an API key** — put `OMNIGENT_ANTHROPIC_API_KEY` in the secret.
+  Omnigent resolves it into Claude Code's `apiKeyHelper`; do not also set
+  `ANTHROPIC_API_KEY` unless you are okay with Claude Code detecting the raw
+  custom key env var.
 - **Claude with a subscription** — run `claude setup-token` on your own
   machine (one-time browser auth) and store the resulting long-lived
   token as `CLAUDE_CODE_OAUTH_TOKEN`.

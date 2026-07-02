@@ -66,11 +66,12 @@ _PTY_READ_CHUNK: Final[int] = 4096
 # Default per-frame cap: merge queued PTY chunks into bounded sends so
 # huge bursts stream.
 _WS_COALESCE_MAX_BYTES: Final[int] = 64 * 1024
-# Keep these in sync with ap-web's SYNC_ECHO_* constants so the server
+# Keep these in sync with web's SYNC_ECHO_* constants so the server
 # emits frames the browser is still willing to write synchronously after
 # input.
 _INTERACTIVE_WS_COALESCE_MAX_BYTES: Final[int] = 2048
 _INTERACTIVE_ECHO_WINDOW_S: Final[float] = 0.75
+_PANE_LIVENESS_CHECK_CACHE_S: Final[float] = 0.1  # 100ms cache to avoid per-keystroke probe
 
 _TMUX_ATTACH_WAIT_GRACE_S: Final[float] = 0.5
 _TMUX_ATTACH_WAIT_POLL_S: Final[float] = 0.02
@@ -146,7 +147,7 @@ class _SpawnedPty:
 
 
 # Terminal type advertised to tmux for the attach client. The far end
-# of this bridge is always an xterm.js-compatible emulator (the ap-web
+# of this bridge is always an xterm.js-compatible emulator (the web
 # terminal or the REPL's embedded terminal), never the bridging
 # process's own controlling terminal — so its capabilities, not the
 # ambient ``TERM``, describe the client. Inheriting ambient ``TERM``
@@ -311,6 +312,56 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
     # remain-on-exit. Both mean the agent is gone.
     panes = stdout.decode().split()
     return proc.returncode == 0 and bool(panes) and "1" not in panes
+
+
+async def _check_pane_dead_definitive(socket_path: str, tmux_target: str) -> bool | None:
+    """
+    Check if a pane is definitely dead or if the probe is inconclusive.
+
+    This is a variant of :func:`_tmux_session_alive` that distinguishes between
+    a confirmed dead pane and a transient probe error, so the caller can avoid
+    closing a live session due to a temporary tmux hiccup.
+
+    :param socket_path: Filesystem path to the tmux server socket.
+    :param tmux_target: The ``-t`` target identifying the session.
+    :returns: ``True`` only when we're certain the pane is dead
+        (rc == 0 and "1" in panes); ``False`` when certain the pane is alive
+        (rc == 0 and "1" not in panes); ``None`` when the probe is inconclusive
+        (any spawn/timeout/rc!=0 error).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux",
+            "-S",
+            socket_path,
+            "list-panes",
+            "-t",
+            tmux_target,
+            "-F",
+            "#{pane_dead}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):
+        _logger.debug("tmux-attach: pane-dead probe spawn failed", exc_info=True)
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=_TMUX_HAS_SESSION_TIMEOUT_S,
+        )
+    except (asyncio.TimeoutError, OSError):
+        _logger.debug("tmux-attach: pane-dead probe timed out", exc_info=True)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return None
+    # Inconclusive: session is gone (rc != 0).
+    if proc.returncode != 0:
+        _logger.debug("tmux-attach: pane-dead probe got non-zero rc=%s", proc.returncode)
+        return None
+    panes = stdout.decode().split()
+    # Conclusive: either all panes alive (no "1") or at least one dead ("1" in panes).
+    return "1" in panes
 
 
 async def _write_all_nonblocking(
@@ -541,6 +592,7 @@ async def bridge_tmux_pty_to_websocket(
     loop = asyncio.get_running_loop()
     pty_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
     last_client_input_at: float | None = None
+    last_pane_check_at: float | None = None
 
     def _current_ws_coalesce_limit() -> int:
         """
@@ -569,7 +621,7 @@ async def bridge_tmux_pty_to_websocket(
     loop.add_reader(master_fd, _on_pty_readable)
 
     async def _ws_to_pty() -> None:
-        nonlocal last_client_input_at
+        nonlocal last_client_input_at, last_pane_check_at
         try:
             while True:
                 msg = await websocket.receive()
@@ -599,6 +651,30 @@ async def bridge_tmux_pty_to_websocket(
                         with contextlib.suppress(OSError):
                             fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
                 elif data is not None and not read_only:
+                    # Probe pane liveness only if we haven't checked recently (cache
+                    # for ~100ms to avoid a subprocess per keystroke). When remain-on-exit
+                    # keeps a dead pane alive, Ctrl-C silently fails; detect and close
+                    # immediately. Only close if we're certain the pane is dead, not on
+                    # transient probe errors (timeouts, spawning hiccups).
+                    pane_check_due = (
+                        last_pane_check_at is None
+                        or _monotonic() - last_pane_check_at > _PANE_LIVENESS_CHECK_CACHE_S
+                    )
+                    if pane_check_due:
+                        last_pane_check_at = _monotonic()
+                        is_dead = await _check_pane_dead_definitive(socket_path, tmux_target)
+                        if is_dead is True:
+                            _logger.debug(
+                                "tmux-attach: pane is dead; closing websocket target=%s",
+                                tmux_target,
+                            )
+                            with contextlib.suppress(RuntimeError):
+                                await websocket.close(
+                                    code=WS_CLOSE_TERMINAL_NOT_FOUND,
+                                    reason="terminal session ended",
+                                )
+                            return
+                        # is_dead is False (live) or None (inconclusive) → continue
                     last_client_input_at = _monotonic()
                     await _write_all_nonblocking(loop, master_fd, data)
         except WebSocketDisconnect:
@@ -647,15 +723,23 @@ async def bridge_tmux_pty_to_websocket(
         # client tears the whole session and runner down.
         with contextlib.suppress(RuntimeError):
             if pty_ended_first:
-                if await _tmux_session_alive(socket_path, tmux_target):
-                    await websocket.close(
-                        code=WS_CLOSE_TERMINAL_DETACHED,
-                        reason="terminal detached",
-                    )
-                else:
+                # Use the tri-state probe so a dead pane (session alive but
+                # pane_dead=1) is treated as NOT_FOUND rather than DETACHED.
+                # With remain-on-exit the session outlives the inner CLI, so
+                # _tmux_session_alive alone would wrongly signal a detach and
+                # the reconnect loop would re-attach to the dead pane forever.
+                pane_dead = await _check_pane_dead_definitive(socket_path, tmux_target)
+                if pane_dead is True or (
+                    pane_dead is None and not await _tmux_session_alive(socket_path, tmux_target)
+                ):
                     await websocket.close(
                         code=WS_CLOSE_TERMINAL_NOT_FOUND,
                         reason="terminal session ended",
+                    )
+                else:
+                    await websocket.close(
+                        code=WS_CLOSE_TERMINAL_DETACHED,
+                        reason="terminal detached",
                     )
             else:
                 await websocket.close()

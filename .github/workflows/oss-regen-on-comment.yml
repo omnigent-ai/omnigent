@@ -1,5 +1,5 @@
 # A maintainer comments `/regen` on a PR to regenerate the repo's lockfiles
-# (uv.lock + ap-web/package-lock.json) against public PyPI/npm and commit them
+# (uv.lock + web/package-lock.json) against public PyPI/npm and commit them
 # ONTO that PR's branch. Use when the PR itself moved a dependency; complements
 # oss-regenerate-and-smoke.yml (standalone rolling PR on dispatch).
 #
@@ -171,7 +171,7 @@ jobs:
 
       # 7-day cooldown comes from uv.toml (`exclude-newer = "P7D"`), recorded as
       # a relative span; an env-var cutoff would stamp an absolute date and break
-      # later `uv sync --locked`. npm's cooldown (ap-web/.npmrc min-release-age=7)
+      # later `uv sync --locked`. npm's cooldown (web/.npmrc min-release-age=7)
       # is only honored by npm >= 11.10.0; node 20 ships npm 10.x which ignores it.
       # Pin the EXACT version (not a range) and keep it in lockstep with
       # .github/actions/setup-node (npm 11.12.1): this workflow generates the
@@ -203,7 +203,7 @@ jobs:
           else
             uv lock
           fi
-          ( cd ap-web && rm -f package-lock.json && npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund )
+          ( cd web && rm -f package-lock.json && npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund )
 
       # Mint the App token only AFTER `uv lock` so untrusted PR build backends
       # never see it. Skipped when the App isn't configured (push then falls back
@@ -229,12 +229,12 @@ jobs:
           git config user.name "omnigent-ci[bot]"
           git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
           # --porcelain (not git diff) so first-time UNTRACKED lockfiles count too.
-          if [ -z "$(git status --porcelain -- uv.lock ap-web/package-lock.json)" ]; then
+          if [ -z "$(git status --porcelain -- uv.lock web/package-lock.json)" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Lockfiles already current — nothing to commit."
             exit 0
           fi
-          git add uv.lock ap-web/package-lock.json
+          git add uv.lock web/package-lock.json
           git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git" "HEAD:$HEAD_REF"
           echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -256,7 +256,7 @@ jobs:
             upgraded=" (upgraded: $UPGRADE_PKGS)"
           fi
           if [ "$CHANGED" = "true" ]; then
-            base="✅ Regenerated \`uv.lock\`$upgraded + \`ap-web/package-lock.json\` against public PyPI/npm and pushed to this PR."
+            base="✅ Regenerated \`uv.lock\`$upgraded + \`web/package-lock.json\` against public PyPI/npm and pushed to this PR."
             if [ "$APP_USED" = "true" ]; then
               body="$base CI will re-run on the new commit."
             else

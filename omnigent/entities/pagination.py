@@ -43,6 +43,14 @@ def paginate_in_memory(
     using ``after``/``before`` cursors keyed by item id and returns
     at most ``limit`` items.
 
+    Forward pagination (``after``) returns up to ``limit`` items
+    immediately after the cursor. Backward pagination (``before``)
+    returns up to ``limit`` items immediately *before* the cursor,
+    anchored to the end of the range — not the first page. ``has_more``
+    reports whether more items remain in the pagination direction:
+    after the page for ``after``, before the page for ``before``. An
+    unknown cursor id is ignored.
+
     :param items: Pre-sorted items to paginate.
     :param id_fn: Callable that extracts the id from an item.
     :param limit: Maximum items to return, default 20.
@@ -55,24 +63,40 @@ def paginate_in_memory(
     if order == "desc":
         working = list(reversed(working))
 
+    # Resolve the cursors to a ``[start, end)`` window over ``working``.
+    # An unknown cursor leaves its bound untouched (it is ignored).
+    start = 0
+    end = len(working)
+
     if after is not None:
         idx = next(
             (i for i, item in enumerate(working) if id_fn(item) == after),
             None,
         )
         if idx is not None:
-            working = working[idx + 1 :]
+            start = idx + 1
 
+    before_found = False
     if before is not None:
         idx = next(
             (i for i, item in enumerate(working) if id_fn(item) == before),
             None,
         )
         if idx is not None:
-            working = working[:idx]
+            end = idx
+            before_found = True
 
-    has_more = len(working) > limit
-    page = working[:limit]
+    if before_found:
+        # Backward: the ``limit`` items immediately preceding the cursor,
+        # anchored to the end of the window (not the first page).
+        page_start = max(start, end - limit)
+        page = working[page_start:end]
+        has_more = page_start > start
+    else:
+        # Forward, or no/unknown cursor: the first ``limit`` items.
+        page = working[start:end][:limit]
+        has_more = end - start > limit
+
     return PagedList(
         data=page,
         first_id=id_fn(page[0]) if page else None,

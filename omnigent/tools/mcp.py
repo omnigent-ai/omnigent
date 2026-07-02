@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlparse
 
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
@@ -339,6 +340,23 @@ _discovery_cache: TTLCache[str, list[McpToolDef]] = TTLCache(
     maxsize=_DEFAULT_CACHE_MAX_SIZE,
     ttl=_DEFAULT_CACHE_TTL_SECONDS,
 )
+
+
+def _is_sse_endpoint(url: str) -> bool:
+    """
+    Whether an HTTP MCP URL points at a legacy SSE endpoint.
+
+    True when the URL path's last segment is ``sse`` (e.g.
+    ``http://host/mcp/sse`` or a bare ``/sse``). Such servers speak
+    only the legacy SSE transport; the Streamable HTTP client hangs in
+    teardown when pointed at them, so :meth:`_open_http_transport`
+    routes these straight to the SSE client instead of trying — and
+    hanging on — Streamable HTTP first.
+
+    :param url: The configured MCP server URL.
+    :returns: ``True`` for an ``…/sse`` path, ``False`` otherwise.
+    """
+    return urlparse(url).path.rstrip("/").endswith("/sse")
 
 
 def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
@@ -855,10 +873,13 @@ class McpServerConnection:
         """
         Open an HTTP MCP transport — Streamable HTTP or legacy SSE.
 
-        Tries the Streamable HTTP transport first (the current MCP
-        spec default, used by Databricks MCP gateways and newer
-        servers). Falls back to legacy SSE if the Streamable HTTP
-        handshake fails, so older servers still work.
+        URLs whose path ends in ``/sse`` are routed straight to the
+        legacy SSE client (see :func:`_is_sse_endpoint`), since the
+        Streamable HTTP client hangs in teardown against SSE-only
+        servers. Otherwise tries the Streamable HTTP transport first
+        (the current MCP spec default, used by Databricks MCP gateways
+        and newer servers) and falls back to legacy SSE if the
+        Streamable HTTP handshake fails, so older servers still work.
 
         :param stack: The lifecycle task's exit stack.
         :returns: A ``(read_stream, write_stream)`` tuple of
@@ -876,6 +897,20 @@ class McpServerConnection:
             )
         timeout = self.config.timeout
         headers = self._resolve_http_headers()
+        if _is_sse_endpoint(self.config.url):
+            # Legacy-SSE servers (e.g. crawl4ai's /mcp/sse) hang the
+            # Streamable HTTP client in teardown, which would block the
+            # except-clause SSE fallback below from ever running. Route
+            # straight to SSE.
+            #
+            # Note: this routing is one-way and purely path-based, not
+            # capability-based. A server that speaks Streamable HTTP but
+            # happens to live at a /sse path is sent only to the SSE
+            # client, with no reverse fallback to Streamable HTTP. That
+            # is the intended trade-off: it matches the /sse convention
+            # and avoiding the teardown hang takes priority over covering
+            # a misnamed-endpoint case that is not known to occur.
+            return await self._open_sse_transport(stack, timeout, headers)
         try:
             return await self._open_streamable_http_transport(stack, timeout, headers)
         except Exception as exc:

@@ -1,7 +1,7 @@
 """E2E: auth-aware Codex availability in the New Chat landing screen.
 
 The landing composer (``NewChatLandingScreen`` in
-``ap-web/src/shell/NewChatDialog.tsx``) warns — but does not block — when the
+``web/src/shell/NewChatDialog.tsx``) warns — but does not block — when the
 selected agent's harness is not ready on the selected host. For Codex the
 readiness signal is structured: the host's ``host.hello`` readiness map flows
 through ``host_store`` and ``GET /v1/hosts`` as a per-harness
@@ -13,8 +13,8 @@ available (absent / ``true``). This PR makes the picker render that distinction:
   ``"<agent> needs Codex authentication on <host> — run codex login on that
   machine."`` — shown for any selected Codex agent (native or brain harness).
 * the **needs-auth badge** (``new-chat-landing-harness-warning-codex``,
-  text ``"needs auth"``) on the Codex row inside a bundle agent's Advanced
-  "Agent Harness" menu.
+  text ``"needs auth"``) on the Codex row inside a bundle agent's per-entry
+  "Agent Harness" config submenu.
 
 Why the ``page.route`` stubbing (mirrors
 ``start_session/test_start_session.py``): the e2e harness's runner tunnels
@@ -186,6 +186,27 @@ async def _register_routes(
     await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
 
+async def _open_entry_config(page, agent_id: str) -> None:
+    """Open the agent/harness picker and drill into one entry's config submenu.
+
+    The redesigned composer replaces the old harness trigger with a single
+    agent/harness dropdown (``new-chat-landing-agent-select``). A bundle agent's
+    brain-harness radios (the "Agent Harness" group, with the per-row readiness
+    badges) live in its per-entry **submenu**. A plain *click* on a knobbed row
+    COMMITS that agent and closes the menu, so this hovers the row and nudges it
+    with ``ArrowRight`` to open the submenu without committing — the Playwright
+    counterpart of the unit test's ``openAgentConfig`` helper.
+
+    :param page: The Playwright page (the landing picker is already mounted).
+    :param agent_id: The stubbed agent id whose submenu to open, e.g.
+        ``"ag_polly_e2e"``.
+    """
+    await page.get_by_test_id("new-chat-landing-agent-select").click()
+    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
+    await row.hover()
+    await row.press("ArrowRight")
+
+
 def test_codex_needs_auth_warns_and_clears_when_available(
     seeded_session: tuple[str, str],
 ) -> None:
@@ -311,9 +332,9 @@ async def _drive_codex_badge(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Polly auto-selects (sole agent), so the harness picker opens the
-            # brain-harness radio group.
-            await page.get_by_test_id("new-chat-landing-harness-trigger").click()
+            # Polly auto-selects (sole agent); its brain-harness radio group lives
+            # in the picker's per-entry config submenu.
+            await _open_entry_config(page, "ag_polly_e2e")
             badge = page.get_by_test_id("new-chat-landing-harness-warning-codex")
             await expect(badge).to_be_visible(timeout=30_000)
             await expect(badge).to_contain_text("needs auth")

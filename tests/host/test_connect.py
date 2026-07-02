@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -671,6 +672,28 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert host._unreported_exits == {}
 
 
+async def test_hello_advertises_installed_version() -> None:
+    """The ``host.hello`` frame reports the omnigent version, not a placeholder.
+
+    A hard-coded placeholder would make every host look like the same
+    stale build in the server's version popover. The hello must carry the
+    shared resolved version this host is actually running.
+    """
+    from omnigent.version import VERSION
+
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.version == VERSION
+    # Guard against the old hard-coded literal creeping back.
+    assert hello.version != "0.1.0"
+
+
 def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
@@ -785,6 +808,157 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
         assert proc.poll() is not None, f"Runner pid={proc.pid} should be dead after cleanup"
     # Tracking dict should be empty.
     assert host._runners == {}
+
+
+def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
+    """Regression for #1782: orphaned children are reaped, not leaked.
+
+    In production the leak is a harness tool subprocess (node/chromium/tmux)
+    whose runner parent died: it is orphaned and reparented to the host
+    (PID 1 in a container, or a subreaper). Once reparented it is a *direct*
+    child of the host that nothing ``wait()``s — so it lingers as a
+    ``<defunct>`` zombie forever. This test models that end state directly by
+    forking a child the host does not track and never waits: ``os.fork`` is
+    portable (no ``PR_SET_CHILD_SUBREAPER``, which macOS lacks), and a
+    reparented orphan is indistinguishable from a plain unwaited child to the
+    reaper. ``_reap_orphans_once`` must drain it.
+    """
+    import errno
+    import os
+
+    host = _make_host_process()
+
+    # Fork a bare child (NOT a tracked runner, NOT wrapped in Popen) that
+    # exits immediately — the faithful model of an orphan reparented to us.
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+
+    # Let it exit and become a zombie parented to this process.
+    deadline = time.monotonic() + 5.0
+    reaped_total = 0
+    while time.monotonic() < deadline:
+        reaped_total += host._reap_orphans_once()
+        if reaped_total >= 1:
+            break
+        time.sleep(0.05)
+
+    assert reaped_total >= 1, "orphaned child was not reaped (zombie leak — #1782)"
+    # It is truly reaped: a direct waitpid now raises ECHILD (no such child).
+    with pytest.raises(OSError) as exc_info:
+        os.waitpid(pid, 0)
+    assert exc_info.value.errno == errno.ECHILD
+    # A second sweep with no orphans left is a clean no-op.
+    assert host._reap_orphans_once() == 0
+
+
+def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> None:
+    """The reaper must not consume a tracked runner's exit status (#1782).
+
+    A naive ``waitpid(-1)`` reaper would reap a just-exited tracked runner
+    behind ``Popen``'s back, making ``_watch_runner``'s ``poll()`` report a
+    bogus exit 0 for a crash. ``_reap_orphans_once`` peeks with ``WNOWAIT``
+    and skips tracked pids, so the runner's real exit code survives for the
+    ``host.runner_exited`` report.
+    """
+    host = _make_host_process()
+
+    # A tracked runner that exits non-zero (a "crash").
+    runner = subprocess.Popen(["python3", "-c", "import sys; sys.exit(42)"])
+    host._runners["runner_crash"] = _RunnerHandle(
+        proc=runner, log_path=tmp_path / "runner-crash.log"
+    )
+    # Wait until the OS reports it as exited (zombie), WITHOUT Popen.wait().
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and runner.poll() is None:
+        # poll() would itself reap; instead peek via the reaper repeatedly.
+        host._reap_orphans_once()
+        time.sleep(0.05)
+
+    # The reaper ran while the crashed runner was reapable; it must NOT have
+    # stolen it. Popen must still see the true exit code.
+    assert runner.poll() == 42, "reaper corrupted the tracked runner's exit code"
+
+    runner.wait()
+
+
+def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:
+    """The reaper must not reap a host-owned subprocess's child (#1782).
+
+    Regression for the Polly-flagged race: the host also spawns *direct*
+    children that are not tracked runners — the ``git`` commands in
+    :mod:`omnigent.host.git_worktree`, run via ``subprocess.run`` under
+    ``asyncio.to_thread`` from the worktree handlers. If the 2s reaper sweep
+    fires after such a git child has exited but before ``subprocess``'s own
+    ``wait()`` collects it, a blind reaper would ``waitpid`` it — and CPython
+    then swallows the resulting ``ECHILD`` and reports ``returncode == 0``,
+    silently turning a *failed* ``git worktree`` op into a success.
+
+    ``_host_subprocess_op`` pauses the reaper for exactly that window. Here a
+    ``sh -c 'exit 42'`` stands in for a failing git command: while the op is
+    marked in flight, ``_reap_orphans_once`` must be a no-op and must NOT
+    consume the child, so the owner still reads the true exit code 42.
+    """
+    host = _make_host_process()
+
+    # A host-owned subprocess (git stand-in) that FAILS with a distinctive
+    # code. NOT a tracked runner — indistinguishable from an orphan to a naive
+    # reaper.
+    proc = subprocess.Popen(["sh", "-c", "exit 42"])
+    # Let it exit so it is reapable (the dangerous window subprocess.run has
+    # between the child exiting and its internal wait()).
+    time.sleep(0.3)
+
+    with host._host_subprocess_op():
+        # Every sweep during the op must be a no-op — the reaper is paused.
+        for _ in range(5):
+            assert host._reap_orphans_once() == 0, "reaper ran during a host-owned op"
+            time.sleep(0.02)
+
+    # The owner still collects its child's TRUE exit code — not corrupted to 0.
+    assert proc.poll() == 42, "reaper stole the host-owned subprocess's exit code (#1782)"
+    proc.wait()
+
+
+def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> None:
+    """``_host_subprocess_op`` nests correctly and always rebalances (#1782).
+
+    The reaper resumes only when the counter returns to 0, and the decrement
+    must survive an exception in the guarded body (``finally``), or a raising
+    worktree op would wedge the reaper off permanently.
+    """
+    host = _make_host_process()
+    assert host._owned_subprocess_ops == 0
+
+    with host._host_subprocess_op():
+        assert host._owned_subprocess_ops == 1
+        with host._host_subprocess_op():  # re-entrant
+            assert host._owned_subprocess_ops == 2
+        assert host._owned_subprocess_ops == 1
+    assert host._owned_subprocess_ops == 0
+
+    # An exception inside the guarded body must still rebalance the counter.
+    with pytest.raises(RuntimeError):
+        with host._host_subprocess_op():
+            assert host._owned_subprocess_ops == 1
+            raise RuntimeError("worktree op blew up")
+    assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
+
+
+def test_install_child_subreaper_is_safe_to_call() -> None:
+    """``_install_child_subreaper`` never raises and reports a bool.
+
+    ``True`` on Linux where ``prctl`` set the bit; ``False`` on non-Linux or
+    when ``prctl`` is unavailable — both are acceptable, non-fatal outcomes.
+    """
+    import sys
+
+    from omnigent.host.connect import _install_child_subreaper
+
+    result = _install_child_subreaper()
+    assert isinstance(result, bool)
+    if sys.platform != "linux":
+        assert result is False
 
 
 def test_host_spawned_runner_has_parent_pid_env(
@@ -1161,6 +1335,30 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     # but never invented into the env.
     assert "ANTHROPIC_AUTH_TOKEN" in HARNESS_CREDENTIAL_ENV_VARS
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+
+def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
+    """Prefixed harness credential aliases forward without creating raw names."""
+    from omnigent.host.connect import HARNESS_CREDENTIAL_ENV_VARS
+
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "OMNIGENT_ANTHROPIC_API_KEY": "sk-prefixed",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert "OMNIGENT_ANTHROPIC_API_KEY" in HARNESS_CREDENTIAL_ENV_VARS
+    assert env["OMNIGENT_ANTHROPIC_API_KEY"] == "sk-prefixed"
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
