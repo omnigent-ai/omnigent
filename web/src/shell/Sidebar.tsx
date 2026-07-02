@@ -708,6 +708,7 @@ function ProjectFolder({
   selectedIds,
   onToggleSelected,
   onProjectAssigned,
+  projectRenderedIdsRef,
 }: {
   name: string;
   expanded: boolean;
@@ -722,6 +723,7 @@ function ProjectFolder({
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
 }) {
   const query = useProjectSessions(name, expanded);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
@@ -733,6 +735,16 @@ function ProjectFolder({
       activeOverride,
     );
   }, [query.data, pinnedSet, activeOverride]);
+
+  // Register this folder's rendered IDs synchronously during render so the
+  // shift-select range uses the real per-project data, not the global list.
+  const renderedIds = useMemo(
+    () => (expanded ? conversations.map((c) => c.id) : []),
+    [expanded, conversations],
+  );
+  if (projectRenderedIdsRef) {
+    projectRenderedIdsRef.current.set(name, renderedIds);
+  }
 
   // While the first page loads, show a "Loading…" footer instead of the "No
   // chats" empty state (which would otherwise flash before rows arrive).
@@ -840,6 +852,11 @@ function ConversationList({
 
   // Project names for grouping sessions by their reserved project label.
   const { data: projectNames = [] } = useProjects();
+
+  // Each ProjectFolder registers its actually-rendered conversation IDs here
+  // (synchronously during render) so shift-select ranges use the real rendered
+  // order, not the global paginated list which can diverge.
+  const projectRenderedIdsRef = useRef<Map<string, string[]>>(new Map());
 
   // Backfill pinned sessions that aren't in the loaded set.
   const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
@@ -1147,7 +1164,22 @@ function ConversationList({
       ...visible("Shared with me", sections.shared),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
-  visibleIdsRef.current = orderedConversationIds;
+  // Build the shift-select visible order from actual rendered data for project
+  // folders (each folder reports its IDs via projectRenderedIdsRef), falling back
+  // to orderedConversationIds for non-project sections. This avoids the stale-ref
+  // bug from the previous useEffect-based approach — the map is written
+  // synchronously during each ProjectFolder's render.
+  const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
+  const visibleForSection = (title: string, list: readonly Conversation[]) =>
+    effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
+  visibleIdsRef.current = [
+    ...visibleForSection("Pinned", sections.pinned),
+    ...(projectsCollapsed
+      ? []
+      : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
+    ...visibleForSection("Chats", sections.sessions),
+    ...visibleForSection("Shared with me", sections.shared),
+  ];
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
@@ -1332,6 +1364,7 @@ function ConversationList({
                     selectedIds={selectedIds}
                     onToggleSelected={onToggleSelected}
                     onProjectAssigned={expandProject}
+                    projectRenderedIdsRef={projectRenderedIdsRef}
                   />
                 ))}
               </SectionGroup>
