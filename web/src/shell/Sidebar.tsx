@@ -902,6 +902,25 @@ function ConversationList({
     });
   }, []);
 
+  // Auto-expand the Pinned section when a session is newly pinned, so a
+  // freshly-pinned chat can't hide inside a collapsed group. Only reacts to
+  // pins being *added* — unpinning or reordering leaves the collapsed
+  // preference alone.
+  const prevPinnedIds = useRef(pinnedConversationIds);
+  useEffect(() => {
+    const prev = new Set(prevPinnedIds.current);
+    const wasPinned = pinnedConversationIds.some((id) => !prev.has(id));
+    prevPinnedIds.current = pinnedConversationIds;
+    if (wasPinned) {
+      setCollapsedSections((prevCollapsed) => {
+        if (!prevCollapsed.includes("Pinned")) return prevCollapsed;
+        const next = prevCollapsed.filter((t) => t !== "Pinned");
+        writeCollapsedSidebarSections(next);
+        return next;
+      });
+    }
+  }, [pinnedConversationIds]);
+
   // When a search query appears, auto-expand all sections so results
   // in collapsed groups are visible. The user can still manually collapse
   // sections while searching. When the search is cleared, restore the
