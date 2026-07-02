@@ -46,6 +46,7 @@ struct ConnectView: View {
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
             .keyboardType(.URL)
+            .accessibilityIdentifier("server-url-field")
             .font(.system(size: 14))
             .padding(.horizontal, 12)
             .frame(height: 38)
@@ -70,6 +71,7 @@ struct ConnectView: View {
           }
         }
         .buttonStyle(PrimaryButtonStyle(background: primary, foreground: primaryForeground))
+        .accessibilityIdentifier("connect-button")
         .padding(.top, 16)
         .disabled(isConnecting)
         // Fires the moment connect() flips isConnecting, so the tap is
