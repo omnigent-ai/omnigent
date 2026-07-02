@@ -17,12 +17,17 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from omnigent.db.utils import generate_canvas_id
-from omnigent.entities.canvas import CANVAS_CONTENT_TYPES, Canvas
+from omnigent.entities.canvas import (
+    CANVAS_CONTENT_TYPES,
+    MAX_CANVAS_CONTENT_BYTES,
+    Canvas,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import get_caps
-from omnigent.server.auth import AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
+from omnigent.server.routes._auth_helpers import get_user_id, require_access
 from omnigent.stores.canvas_store import CanvasStore
+from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -52,8 +57,17 @@ def create_canvas_router(
     store: CanvasStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> APIRouter:
-    """Build the canvas router (mounted at ``/canvas/{conversation_id}``)."""
+    """Build the canvas router (mounted at ``/canvas/{conversation_id}``).
+
+    In multi-user mode (``permission_store`` set) the caller must have access
+    to the target conversation — a canvas is conversation-scoped data, so
+    reading or writing one requires the same permission as the conversation
+    itself (read to GET, edit to PUT). ``require_access`` returns 404 (not 403)
+    when the caller has no access at all, so it never leaks which conversation
+    ids exist. Single-user deployments (no ``permission_store``) skip the check.
+    """
     router = APIRouter()
 
     @router.get("/canvas/{conversation_id}")
@@ -62,8 +76,9 @@ def create_canvas_router(
         if not get_caps().canvas_enabled:
             raise OmnigentError("Canvas is not enabled on this server", code=ErrorCode.NOT_FOUND)
         user_id = get_user_id(request, auth_provider)
-        if permission_store is not None and user_id is None:
-            raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
+        await require_access(
+            user_id, conversation_id, LEVEL_READ, permission_store, conversation_store
+        )
         canvas = await asyncio.to_thread(store.get_by_conversation, conversation_id)
         if canvas is None:
             raise OmnigentError("No canvas for this conversation", code=ErrorCode.NOT_FOUND)
@@ -77,11 +92,17 @@ def create_canvas_router(
         if not get_caps().canvas_enabled:
             raise OmnigentError("Canvas is not enabled on this server", code=ErrorCode.NOT_FOUND)
         user_id = get_user_id(request, auth_provider)
-        if permission_store is not None and user_id is None:
-            raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
+        await require_access(
+            user_id, conversation_id, LEVEL_EDIT, permission_store, conversation_store
+        )
         if body.content_type not in CANVAS_CONTENT_TYPES:
             raise OmnigentError(
                 f"content_type must be one of {sorted(CANVAS_CONTENT_TYPES)}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if len(body.content.encode("utf-8")) > MAX_CANVAS_CONTENT_BYTES:
+            raise OmnigentError(
+                f"canvas content exceeds the {MAX_CANVAS_CONTENT_BYTES}-byte limit",
                 code=ErrorCode.INVALID_INPUT,
             )
         canvas = await asyncio.to_thread(

@@ -3195,7 +3195,9 @@ def server(
         # seam so create_app's signature stays untouched.
         extra_routers=[
             (
-                create_canvas_router(canvas_store, auth_provider, permission_store),
+                create_canvas_router(
+                    canvas_store, auth_provider, permission_store, conversation_store
+                ),
                 "/v1",
                 ["canvas"],
             ),

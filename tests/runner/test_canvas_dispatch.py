@@ -56,6 +56,21 @@ async def test_set_canvas_defaults_content_type_html() -> None:
     assert json.loads(reqs[0].content)["content_type"] == "html"
 
 
+async def test_set_canvas_ignores_conversation_id_arg() -> None:
+    # An agent can't retarget another conversation's canvas: a conversation_id
+    # in the tool args is ignored; the ambient session id is always used.
+    reqs: list[httpx.Request] = []
+    client = _recording_client(reqs)
+    await _execute_canvas_tool(
+        "set_canvas",
+        json.dumps({"title": "T", "content": "x", "conversation_id": "conv_OTHER"}),
+        conversation_id="conv_mine",
+        server_client=client,
+    )
+    await client.aclose()
+    assert reqs[0].url.path == "/v1/canvas/conv_mine"
+
+
 async def test_guards() -> None:
     # No server client -> clear error, no crash.
     out = await _execute_canvas_tool("set_canvas", "{}", conversation_id="c", server_client=None)

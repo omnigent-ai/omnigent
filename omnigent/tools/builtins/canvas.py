@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from omnigent.entities.canvas import CANVAS_CONTENT_TYPES
+from omnigent.entities.canvas import CANVAS_CONTENT_TYPES, MAX_CANVAS_CONTENT_BYTES
 from omnigent.tools.base import Tool, ToolContext
 
 _CONTENT_TYPES = sorted(CANVAS_CONTENT_TYPES)
@@ -56,10 +56,6 @@ class SetCanvasTool(Tool):
                             "enum": _CONTENT_TYPES,
                             "description": "How to render content (default 'html').",
                         },
-                        "conversation_id": {
-                            "type": "string",
-                            "description": "Target conversation (defaults to the current one).",
-                        },
                     },
                     "required": ["title", "content"],
                     "additionalProperties": False,
@@ -85,7 +81,14 @@ class SetCanvasTool(Tool):
         if content_type not in CANVAS_CONTENT_TYPES:
             return json.dumps({"error": f"content_type must be one of {_CONTENT_TYPES}"})
 
-        conversation_id = args.get("conversation_id") or ctx.conversation_id
+        if len(content.encode("utf-8")) > MAX_CANVAS_CONTENT_BYTES:
+            return json.dumps(
+                {"error": f"content exceeds the {MAX_CANVAS_CONTENT_BYTES}-byte limit"}
+            )
+
+        # Always the ambient conversation — the tool can't target another
+        # conversation's canvas (an agent writes only to its own session).
+        conversation_id = ctx.conversation_id
         if not conversation_id:
             return json.dumps({"error": "set_canvas requires a conversation context"})
 

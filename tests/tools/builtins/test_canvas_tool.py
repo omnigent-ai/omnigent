@@ -63,3 +63,31 @@ def test_validation_and_context(wired: tuple[str, SqlAlchemyCanvasStore]) -> Non
         SetCanvasTool().invoke(json.dumps({"title": "t", "content": "x"}), no_ctx)
     )
     assert "error" in no_conv and "conversation" in no_conv["error"]
+
+
+def test_set_canvas_ignores_conversation_id_arg(
+    wired: tuple[str, SqlAlchemyCanvasStore], db_uri: str
+) -> None:
+    # A conversation_id in the args is ignored — the tool writes only to the
+    # ambient (ctx) conversation, so an agent can't target another session.
+    conv, store = wired
+    other = SqlAlchemyConversationStore(db_uri).create_conversation(title="other").id
+    ctx = ToolContext(task_id="t", agent_id="a", conversation_id=conv)
+
+    SetCanvasTool().invoke(
+        json.dumps({"title": "T", "content": "x", "conversation_id": other}), ctx
+    )
+    assert store.get_by_conversation(conv) is not None  # wrote to the ctx conversation
+    assert store.get_by_conversation(other) is None  # NOT the arg-supplied one
+
+
+def test_set_canvas_rejects_oversized_content(
+    wired: tuple[str, SqlAlchemyCanvasStore],
+) -> None:
+    from omnigent.entities.canvas import MAX_CANVAS_CONTENT_BYTES
+
+    conv, _ = wired
+    ctx = ToolContext(task_id="t", agent_id="a", conversation_id=conv)
+    huge = "x" * (MAX_CANVAS_CONTENT_BYTES + 1)
+    out = json.loads(SetCanvasTool().invoke(json.dumps({"title": "T", "content": huge}), ctx))
+    assert "error" in out and "limit" in out["error"]
