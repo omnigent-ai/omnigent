@@ -857,7 +857,23 @@ def test_repl_tool_call_refusal_blocks_tool(
     than feeding a denial marker to the LLM and letting it continue.
     The tool must never execute: its raw output must not appear in the
     terminal or reach the mock LLM as a function_call_output.
+
+    The mock LLM is scripted to emit the ``echo`` ``function_call`` so
+    the TOOL_CALL ASK fires. (The follow-up text is never reached: the
+    turn aborts on decline before any second LLM call.)
     """
+    _configure_mock_tool_then_text(
+        mock_llm_server_url,
+        [
+            {
+                "call_id": "tc2",
+                "name": "echo",
+                "arguments": json.dumps({"message": "testing456"}),
+            }
+        ],
+        "tool-call-refuse-followup-marker",
+        match="testing456",
+    )
     child = pexpect.spawn(
         ap_cli,
         ["run", str(_TOOL_GATE_DIR)],
