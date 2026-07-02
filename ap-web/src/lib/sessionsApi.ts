@@ -15,6 +15,7 @@ import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
 import { authenticatedFetch } from "./identity";
 import type {
+  HarnessProvider,
   ModelUsage,
   NestedSessionItem,
   SandboxStatus,
@@ -185,6 +186,12 @@ interface SessionResponseWire {
    */
   skills?: SkillSummary[];
   /**
+   * Harness-owned provider/model list (opencode). Populated by the
+   * background single-flight fetch that mirrors `skills`; empty/absent
+   * for harnesses that don't own their own model catalog.
+   */
+  harness_models?: HarnessProvider[];
+  /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
    * snapshots (treated as false).
@@ -277,6 +284,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    harnessModels: wire.harness_models ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
   };
