@@ -70,6 +70,8 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Current-session control tools are always available.
+        "sys_compact",
     }
 )
 

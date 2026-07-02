@@ -27,6 +27,7 @@ from omnigent.tools.builtins import (
     SysAgentListTool,
     SysCallAsyncTool,
     SysCancelAsyncTool,
+    SysCompactTool,
     SysListModelsTool,
     SysReadInboxTool,
     SysSessionCloseTool,
@@ -182,6 +183,11 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        self._register_session_control_tools()
+
+    def _register_session_control_tools(self) -> None:
+        """Auto-register current-session control tools."""
+        self._tools[SysCompactTool.name()] = SysCompactTool()
 
     def _register_policy_tools(self) -> None:
         """
