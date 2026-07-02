@@ -165,6 +165,42 @@ def create_host_tunnel_router(
             # (consistent with get_user_id returning None on the HTTP side).
             tunnel_owner = RESERVED_USER_LOCAL
 
+        # Reject a cross-owner takeover before accept(). ``host_id`` is
+        # UNIQUE, so a peer authenticated as one user dialing in on a
+        # host_id owned by another collides inside ``upsert_on_connect`` —
+        # but only AFTER accept(), as an opaque IntegrityError that drops
+        # the tunnel post-handshake while the host keeps printing
+        # "✓ Connected" and reconnect-loops. Catching it here makes the
+        # refusal clean and fatal. Skipped for the single-user local server
+        # (allow_host_id_reown re-owns in place); the IntegrityError stays
+        # the backstop for the connect/connect race this can't lock.
+        if not allow_host_id_reown:
+            existing = await asyncio.to_thread(host_store.get_host, host_id)
+            if existing is not None and existing.owner != tunnel_owner:
+                _logger.warning(
+                    "Refusing host %s: registered to owner %r but the "
+                    "connecting peer authenticated as %r. Cross-owner "
+                    "re-registration is not allowed — remove the stale "
+                    "registration or reset the host id.",
+                    host_id,
+                    existing.owner,
+                    tunnel_owner,
+                )
+                # Don't name the existing owner to this peer: in a multi-user
+                # server that discloses another account's identity. The log
+                # above carries the detail for the operator.
+                await _refuse_upgrade(
+                    ws,
+                    status=409,
+                    reason=(
+                        "This machine is already registered to a different "
+                        "account on this server. An administrator must remove "
+                        "the existing host registration, or reset this host's "
+                        "id, before it can reconnect."
+                    ),
+                )
+                return
+
         await ws.accept()
         conn: HostConnection | None = None
         try:
@@ -296,6 +332,27 @@ def create_host_tunnel_router(
     return router
 
 
+async def _refuse_upgrade(ws: WebSocket, *, status: int, reason: str) -> None:
+    """Refuse a WebSocket upgrade before ``accept()`` with a real HTTP status.
+
+    Uses the WebSocket Denial Response extension so the host sees a
+    specific status (e.g. ``409``) instead of the generic ``403`` a plain
+    pre-accept close yields; falls back to a close when the server doesn't
+    advertise the extension.
+
+    :param ws: The unaccepted WebSocket.
+    :param status: HTTP status for the denial response, e.g. ``409``.
+    :param reason: Explanation, sent as the response body or close reason.
+    """
+    extensions = ws.scope.get("extensions") or {}
+    if "websocket.http.response" in extensions:
+        from starlette.responses import PlainTextResponse
+
+        await ws.send_denial_response(PlainTextResponse(reason, status_code=status))
+    else:
+        await ws.close(code=4009, reason=reason)
+
+
 async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
     """Send queued frames on the WebSocket owner loop.
 
@@ -357,6 +414,14 @@ async def _receive_loop(
                 )
                 continue
             if isinstance(runner_frame, PongFrame):
+                # Host-tunnel keepalive round-trip. DEBUG because pings are
+                # frequent — opt in via log level. ``ts`` is epoch-ms stamped
+                # when the server pinged, so now - ts is the daemon round-trip.
+                _logger.debug(
+                    "host %s tunnel keepalive: pong rtt=%dms",
+                    host_id,
+                    int(time.time() * 1000) - runner_frame.ts,
+                )
                 continue
             _logger.warning(
                 "Host %s sent unexpected runner frame; dropping: kind=%s",

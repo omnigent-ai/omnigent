@@ -1,5 +1,5 @@
 name: "setup-node"
-description: "Set up Node and pin npm, with npm dependency caching keyed on the ap-web lockfile."
+description: "Set up Node and pin npm, with npm dependency caching keyed on the web lockfile."
 
 # Single source of truth for the JS toolchain across CI. Pins npm to the
 # EXACT version that regenerates the lockfile in oss-regenerate-and-smoke.yml
@@ -20,7 +20,7 @@ inputs:
     required: false
   cache-dependency-path:
     description: "Lockfile path used as the cache key."
-    default: "ap-web/package-lock.json"
+    default: "web/package-lock.json"
     required: false
 
 runs:

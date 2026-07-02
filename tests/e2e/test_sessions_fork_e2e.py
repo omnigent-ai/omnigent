@@ -38,6 +38,7 @@ from tests.e2e.conftest import (
     register_inline_agent,
     reset_mock_llm,
     send_user_message_to_session,
+    set_fallback_mock_llm,
 )
 
 # The fork-switch TARGET. Only BUILT-IN agents (``session_id IS NULL``)
@@ -391,8 +392,10 @@ def test_fork_with_agent_switch_carries_history(
     In mock mode the source agent is an inline ``openai-agents`` agent
     pointed at the mock LLM server, and the ``sdk-chat-builtin`` built-in
     is wired to the mock server via ``executor.auth.base_url`` (seeded in
-    ``conftest._materialize_builtin_sdk_chat_spec``). The mock server
-    keys responses by model name so each agent gets its own queue.
+    ``conftest._materialize_builtin_sdk_chat_spec``). The source agent's
+    queue is keyed by its unique model; the recall queue is claimed by a
+    token unique to the recall turn (content-routing ``match``) so a
+    stray request under the shared target model cannot drain it.
 
     **What breaks if wrong:**
 
@@ -413,23 +416,36 @@ def test_fork_with_agent_switch_carries_history(
             prompt="You are a terse assistant.",
             mock_llm_base_url=f"{mock_llm_server_url}/v1",
         )
-        # Target: the sdk-chat-builtin built-in uses model
-        # "claude-sonnet-4-20250514" — key the mock queue on that.
-        target_model = "claude-sonnet-4-20250514"
+        # The sdk-chat-builtin built-in uses the SHARED model name
+        # "claude-sonnet-4-20250514", and the recall turn makes MORE than
+        # one call to it: newer claude-code follows the recall with a
+        # skills/system-reminder call. Two fragilities follow, both fixed
+        # here:
+        #   1. Keying the recall queue on the shared model name lets a
+        #      stray request under the same model drain it. Instead claim
+        #      the queue by a token unique to the recall turn (the #523
+        #      content-routing "match"), carried only in the recall
+        #      message, so only this turn's calls can draw it.
+        #   2. A single queued entry is consumed by the first recall call;
+        #      the follow-up call then falls through to the mock's default
+        #      "Mock LLM response", which becomes the final assistant text
+        #      and fails the assertion. A fallback on the same key answers
+        #      every recall-turn call with the codeword, robust to count.
+        recall_token = f"recall-{uid}"
+        recall_key = f"fork-tgt-{uid}"
         reset_mock_llm(mock_llm_server_url)
         configure_mock_llm(
             mock_llm_server_url,
             [{"text": "OK"}],
             key=source_model,
         )
-        # The fork+switch passes the copied transcript as context to the
-        # first real LLM call (the recall turn itself) — no separate
-        # replay request is made. Queue only the codeword for the recall.
         configure_mock_llm(
             mock_llm_server_url,
             [{"text": _CODEWORD_1}],
-            key=target_model,
+            key=recall_key,
+            match=recall_token,
         )
+        set_fallback_mock_llm(mock_llm_server_url, key=recall_key, text=_CODEWORD_1)
     else:
         source_agent = claude_coder_agent
 
@@ -461,10 +477,15 @@ def test_fork_with_agent_switch_carries_history(
     # History carried across the switch — items and live context.
     fork_text = _session_item_texts(http_client, fork["id"])
     assert _CODEWORD_1 in fork_text, f"switched fork lost the source history: {fork_text!r}"
+    recall_prompt = "What is the nickname of my project? Reply with just the nickname."
+    if using_mock_llm:
+        # Carry the recall-only token so this request claims its own mock
+        # queue regardless of the shared target model name.
+        recall_prompt = f"{recall_prompt} ({recall_token})"
     recall_id = send_user_message_to_session(
         http_client,
         session_id=fork["id"],
-        content="What is the nickname of my project? Reply with just the nickname.",
+        content=recall_prompt,
     )
     recall = poll_session_until_terminal(http_client, session_id=fork["id"], response_id=recall_id)
     assert recall["status"] == "completed", f"switched fork turn failed: {recall.get('error')}"

@@ -33,12 +33,12 @@ on:
       - 'deploy/docker/Dockerfile'
       - 'deploy/docker/entrypoint.py'
       - 'omnigent/**'
-      - 'ap-web/**'
+      - 'web/**'
       - 'sdks/**'
       - 'pyproject.toml'
       - 'setup.py'
       - 'uv.lock'
-      - 'ap-web/package-lock.json'
+      - 'web/package-lock.json'
       - '.github/workflows/oss-publish-images.yml'
   # Daily nightly promotion (07:00 UTC). Retags the current :latest-dev as
   # :latest-nightly — handled by promote-nightly, not a rebuild.

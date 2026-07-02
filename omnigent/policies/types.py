@@ -41,18 +41,24 @@ if TYPE_CHECKING:
 # cross the harness↔runner boundary) for which an unavailable policy
 # evaluation must fail CLOSED (default ``POLICY_ACTION_DENY``).
 #
-# Only ``PHASE_TOOL_CALL`` qualifies: for connector-native MCP tools the
-# in-band verdict is the only enforcement point — the call is never
-# re-checked server-side — so an unevaluable policy must not let the call
-# through. ``PHASE_TOOL_RESULT`` is intentionally NOT here: by the time the
-# result phase runs the tool has already executed, so failing it closed
-# would only block an already-incurred side effect; it fails OPEN like the
-# advisory LLM phases.
+# ``PHASE_TOOL_CALL``: for connector-native MCP tools the in-band verdict is
+# the only enforcement point — the call is never re-checked server-side — so
+# an unevaluable policy must not let the call through.
 #
-# Defined once here so the two enforcement sites
+# ``PHASE_REQUEST``: the request gate runs before the LLM turn and is the
+# sole pre-turn enforcement point for native sessions (UserPromptSubmit). A
+# server hiccup must not let an over-budget or otherwise-blocked request
+# proceed, so this phase also fails CLOSED.
+#
+# ``PHASE_TOOL_RESULT`` is intentionally NOT here: by the time the result
+# phase runs the tool has already executed, so failing it closed would only
+# block an already-incurred side effect; it fails OPEN like the advisory LLM
+# phases.
+#
+# Defined once here so the enforcement sites
 # (``omnigent.runner.app`` and ``omnigent.runtime.harnesses._scaffold``)
 # can't drift if the set of fail-closed phases changes.
-FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL",)
+FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_REQUEST")
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,13 @@ class EvaluationContext:
         callable. ``None`` means "engine not yet populated"
         (test contexts); empty dict means "no usage recorded
         yet."
+    :param subtree_usage: Subtree-scoped cumulative LLM cost for
+        this conversation and its descendants only (not the whole
+        session tree). Same shape as ``usage``. Injected by the
+        engine ONLY when a ``subagent_cost_budget`` policy is
+        configured — ``None`` otherwise, so sessions without that
+        policy pay no subtree-cost lookup. Surfaced as
+        ``event["context"]["subtree_usage"]`` to the callable.
     :param user_daily_cost: The session owner's per-UTC-day cost
         rollup, shape
         ``{"cost_usd": <float>, "ask_approved_usd": <float>}``,
@@ -179,6 +192,7 @@ class EvaluationContext:
     request_data: Any = None
     session_state: dict[str, Any] | None = None
     usage: dict[str, float] | None = None
+    subtree_usage: dict[str, float] | None = None
     user_daily_cost: dict[str, float | str] | None = None
     model: str | None = None
     harness: str | None = None

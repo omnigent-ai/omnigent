@@ -1,4 +1,4 @@
-"""Fixtures for browser-driven e2e tests of the ap-web SPA.
+"""Fixtures for browser-driven e2e tests of the web SPA.
 
 The suite spawns a real ``omnigent server --agent`` subprocess against
 ``examples/hello_world.yaml`` and drives the rendered SPA with
@@ -17,7 +17,7 @@ Local usage::
     uv run pytest tests/e2e_ui -v
 
     # iterate against an already-running server (dev hosts/ports need opt-in)
-    cd ap-web && npm run dev &
+    cd web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
     OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
       uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -95,7 +96,7 @@ def open_right_rail(page: Page) -> None:
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
 _server_state: dict[str, int | str] = {}
-_AP_WEB_DIR = _REPO_ROOT / "ap-web"
+_WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
 # ``omnigent server --agent`` runs the spec through the strict
@@ -579,15 +580,73 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
     return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
 
 
+def _assert_pwa_build(build_output: Path) -> None:
+    """Fail if the built SPA is missing the PWA outputs or the SW won't update.
+
+    The standalone build must ship the installable-PWA assets, and the
+    hand-rolled service worker must (a) embed the per-build fingerprint so its
+    bytes change every deploy — or the update prompt never fires — and (b) NOT
+    cache or serve the app shell: Omnigent is a cloud app, so a stale cached
+    shell would white-screen users after every deploy.
+    """
+    for name in ("index.html", "sw.js", "manifest.webmanifest", "version.json"):
+        if not (build_output / name).is_file():
+            pytest.fail(f"SPA build is missing {name} at {build_output}")
+    build = json.loads((build_output / "version.json").read_text(encoding="utf-8")).get("build")
+    sw = (build_output / "sw.js").read_text(encoding="utf-8")
+    if not build or build not in sw:
+        pytest.fail(
+            "sw.js does not embed the version.json build fingerprint — the PWA "
+            "update prompt would never fire on a JS-only deploy"
+        )
+    # Installability-only contract — enforce the *dangerous* direction too, not
+    # just "the fingerprint is present". The service worker must NOT precache or
+    # serve the app shell or intercept navigations; otherwise a deploy
+    # white-screens users behind a stale shell. Strip line comments first so
+    # prose that mentions these tokens can neither fake nor mask a regression.
+    sw_code = re.sub(r"//[^\n]*", "", sw)
+    if "index.html" in sw_code:
+        pytest.fail("sw.js references index.html — it must not cache or serve the app shell")
+    shell_precache = re.search(r"(?:cache\.add|addAll|precache)[^\n]*\.(?:js|html)\b", sw_code)
+    if shell_precache is not None:
+        pytest.fail(
+            f"sw.js precaches an app-shell asset ({shell_precache.group(0)}) — "
+            "it must precache only version.json"
+        )
+    # The architecture rests on "navigations always hit the network". Enforce it
+    # by marker AND structurally: the SW must call respondWith() exactly once,
+    # inside the /version.json branch. A fetch handler that serves navigations or
+    # the shell from cache would pass every check above yet white-screen users
+    # behind a stale shell after each deploy.
+    if re.search(r"request\.mode|NavigationRoute|navigationPreload", sw_code):
+        pytest.fail(
+            "sw.js inspects navigation requests — navigations must always reach "
+            "the network (a stale cached shell white-screens users after a deploy)"
+        )
+    responders = sw_code.count("respondWith")
+    if responders != 1:
+        pytest.fail(
+            f"sw.js has {responders} respondWith() call(s); expected exactly 1 (the "
+            "/version.json sentinel). Any other responder risks serving a stale shell."
+        )
+    # The single respondWith must sit inside the `=== "/version.json"` block —
+    # i.e. no `}` (block close) between the pathname check and the respondWith.
+    if not re.search(r'"/version\.json"[^}]*?respondWith', sw_code, re.DOTALL):
+        pytest.fail(
+            "sw.js's respondWith() is not guarded by a `/version.json` pathname "
+            "check — the service worker must not serve the shell or intercept navigations"
+        )
+
+
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
-    Build the ap-web SPA into ``omnigent/server/static/web-ui/``.
+    Build the web SPA into ``omnigent/server/static/web-ui/``.
 
-    Vite's ``emptyOutDir: true`` (see ``ap-web/vite.config.ts``)
+    Vite's ``emptyOutDir: true`` (see ``web/vite.config.ts``)
     nukes the output directory before writing, so concurrent
     pytest sessions or worktrees would clobber each other. A
-    cross-process file lock at ``ap-web/.build.lock`` serializes
+    cross-process file lock at ``web/.build.lock`` serializes
     builds; the second caller waits for the first to finish and
     then no-ops past its own build (npm is idempotent enough that
     double-building is harmless, but the lock keeps the static
@@ -600,14 +659,10 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-base-url"):
         return
     if request.config.getoption("--ui-skip-build"):
-        if not (_BUILD_OUTPUT / "index.html").is_file():
-            pytest.fail(
-                f"--ui-skip-build was passed but no SPA build exists at "
-                f"{_BUILD_OUTPUT}. Run `cd ap-web && npm run build` first."
-            )
+        _assert_pwa_build(_BUILD_OUTPUT)
         return
 
-    lock_path = _AP_WEB_DIR / ".build.lock"
+    lock_path = _WEB_DIR / ".build.lock"
     with filelock.FileLock(str(lock_path), timeout=600):
         # --legacy-peer-deps: package-lock.json already pins the tree;
         # without this flag npm spends the full job re-resolving the
@@ -616,10 +671,12 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         # where conftest installs override CI's build.
         subprocess.run(
             ["npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-            cwd=_AP_WEB_DIR,
+            cwd=_WEB_DIR,
             check=True,
         )
-        subprocess.run(["npm", "run", "build"], cwd=_AP_WEB_DIR, check=True)
+        subprocess.run(["npm", "run", "build"], cwd=_WEB_DIR, check=True)
+
+    _assert_pwa_build(_BUILD_OUTPUT)
 
 
 def _spawn_runner_against_external_server(

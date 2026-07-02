@@ -17,10 +17,8 @@ labels:
 label_schema:
   integrity:
     values: ["0", "1"]
-    monotonic: min
   sensitivity:
     values: [public, internal, confidential]
-    monotonic: max
 
 policies:
   taint_web:

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -261,17 +262,29 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 # two antigravity-native sessions (or a session + the user's interactive agy)
 # would fight over the one global file.
 #
-# CHOSEN DESIGN — per-session ISOLATED HOME. The runner launches agy with
-# ``HOME`` pointed at a per-bridge-dir tree (:func:`agy_home_dir`) seeded with a
-# COPY of the user's OAuth token + onboarding/migration markers and a
-# bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
-# This (1) NEVER touches the user's real ``~/.gemini``, (2) gives each session its
-# own ``mcp_config.json`` so concurrent sessions never clobber one another, and
-# (3) was verified live: agy under the isolated HOME does NOT re-demand OAuth and
-# its ``/mcp`` panel shows ``✓ omnigent`` with the ``sys_*`` tools discovered. agy
-# resolves ``GeminiDir`` from ``$HOME/.gemini`` (its hardcoded default), so the
-# only thing the isolated HOME relocates is the *config + state* tree; auth still
-# works because the seeded token is a copy of the user's real one.
+# CHOSEN DESIGN — per-session ISOLATED GEMINI DIR. The runner keeps agy's real
+# ``HOME`` intact (needed for platform auth such as macOS keyring-backed tokens)
+# and launches agy with its hidden ``--gemini_dir=<bridge_dir>/agy-home/.gemini``
+# flag. That isolated Gemini dir is seeded with onboarding/migration markers and
+# a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
+# This (1) NEVER touches the user's real ``~/.gemini/config/mcp_config.json`` and
+# (2) gives each session its own config so concurrent sessions never clobber one
+# another. Known file-based OAuth markers are copied best-effort for platforms
+# whose agy auth provider uses them, but HOME is deliberately not relocated.
+#
+# WHY NOT RELOCATE HOME (#1477). An earlier isolation design pointed ``HOME`` at
+# the per-session tree. That broke auth on macOS: agy stores its OAuth token in
+# the OS keyring (verified against agy 1.0.12 — the binary's auth path is
+# ``keyring`` / "load token from keyring", NOT a ``~/.gemini`` file), and the
+# keyring item is bound to the real login HOME, so any relocated HOME stalled
+# every turn at the interactive OAuth prompt. The alternative of dropping HOME
+# isolation entirely on macOS (#1493) restored auth but reintroduced the
+# HOME-global ``mcp_config.json`` footgun (#1194) there — concurrent sessions
+# would clobber one another's relay config. ``--gemini_dir`` resolves both at
+# once: real HOME ⇒ keyring auth works on every platform; isolated gemini dir ⇒
+# per-session MCP config. Verified live (agy 1.0.12): ``agy --gemini_dir=<dir>``
+# materializes its ``antigravity-cli`` + ``config`` state under ``<dir>`` while
+# authenticating from the real-HOME keyring.
 _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
@@ -311,29 +324,45 @@ _AGY_ENABLED_TOOLS = [
 ]
 
 # Files copied from the user's real ``~/.gemini`` into the per-session isolated
-# HOME so agy does not re-run OAuth / onboarding. The OAuth token is the only
-# secret; it is COPIED (the real file is never moved or modified). Missing files
-# are skipped (agy regenerates onboarding/migration state, and a missing token
-# only means agy re-auths in that session — never a corruption of the real tree).
+# Gemini dir for platforms whose agy auth provider uses file-backed credentials,
+# plus installation markers. Keep the OAuth credential paths in sync with
+# ``omnigent.onboarding.gemini_auth``: macOS writes ``oauth_creds.json`` while
+# Linux writes ``antigravity-cli/antigravity-oauth-token``. The OAuth credential
+# is the only secret; it is COPIED (the real file is never moved or modified).
+# Missing files are skipped (agy regenerates onboarding/migration state, and a
+# missing credential only means agy re-auths in that session — never corruption
+# of the real tree).
 _AGY_SEED_FILES = (
+    Path("oauth_creds.json"),
     Path("antigravity-cli") / "antigravity-oauth-token",
+    Path("installation_id"),
     Path("antigravity-cli") / "installation_id",
 )
 
 
 def agy_home_dir(bridge_dir: Path) -> Path:
-    """Return the per-session isolated ``HOME`` for an agy launch.
+    """Return the parent directory for this session's isolated agy state.
 
-    A subdirectory of *bridge_dir* so it is naturally per-session (the bridge dir
-    is hash-scoped to the bridge id) and torn down with the bridge. agy reads its
-    MCP config + state from ``$HOME/.gemini``; pinning ``HOME`` here keeps the
-    relay's ``mcp_config.json`` out of the user's real ``~/.gemini`` and prevents
-    two concurrent sessions from sharing one global config.
+    The actual agy config/state root is :func:`agy_gemini_dir`, passed to agy via
+    ``--gemini_dir``. Keeping this parent below *bridge_dir* makes it naturally
+    per-session and easy to tear down with the bridge, while preserving the real
+    ``HOME`` for auth providers that depend on platform state such as macOS
+    Keychain.
 
     :param bridge_dir: Native Antigravity bridge directory.
-    :returns: Absolute path to this session's isolated agy HOME.
+    :returns: Absolute parent path for this session's isolated agy state.
     """
     return bridge_dir / "agy-home"
+
+
+def agy_gemini_dir(bridge_dir: Path) -> Path:
+    """Return the per-session ``--gemini_dir`` path for an agy launch.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: Absolute ``.gemini`` directory that should receive agy's session
+        config/state and the Omnigent MCP config.
+    """
+    return agy_home_dir(bridge_dir) / ".gemini"
 
 
 def build_mcp_config(
@@ -350,14 +379,12 @@ def build_mcp_config(
     The server command is the SAME shared relay claude/codex/cursor use:
     ``<python> -I -m omnigent.claude_native_bridge serve-mcp --bridge-dir <dir>``.
 
-    **HOME pinning (critical for the isolated-HOME design).** agy spawns this relay
-    as a child, so the relay inherits agy's environment — including the per-session
-    isolated ``HOME`` agy runs under. But the relay validates its ``--bridge-dir``
-    against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``), which must
-    resolve to the RUNNER's real home where the bridge dir actually lives — not the
-    isolated agy HOME (a child of the bridge dir). So the relay's ``env`` pins
-    ``HOME`` back to the runner's real home. ``-I`` does not clear ``HOME``; it only
-    ignores ``PYTHON*`` vars and user site-packages, so this override takes effect.
+    **HOME pinning.** agy spawns this relay as a child. The relay validates its
+    ``--bridge-dir`` against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``),
+    which must resolve to the RUNNER's real home where the bridge dir actually
+    lives. Pinning ``HOME`` in the relay env keeps that invariant true even when a
+    future agy launch path customizes process environment. ``-I`` does not clear
+    ``HOME``; it only ignores ``PYTHON*`` vars and user site-packages.
 
     :param bridge_dir: Native Antigravity bridge directory whose relay this
         config points at.
@@ -382,8 +409,7 @@ def build_mcp_config(
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
                     # Pin the relay to the RUNNER's real home so its bridge-root
-                    # validation matches where the bridge dir lives (agy runs under
-                    # an isolated HOME; the relay must not inherit it). See docstring.
+                    # validation matches where the bridge dir lives. See docstring.
                     "HOME": str(Path.home()),
                 },
             }
@@ -417,25 +443,25 @@ def write_mcp_config(
     *,
     python_executable: str | None = None,
 ) -> Path:
-    """Write the per-session agy MCP config + relay token into the isolated HOME.
+    """Write the per-session agy MCP config + relay token.
 
     Writes (1) ``bridge.json`` (the relay token) into *bridge_dir* and (2) the
     ``mcp_config.json`` for the Omnigent relay into the per-session isolated agy
-    HOME at ``<agy_home>/.gemini/config/mcp_config.json`` — the path agy actually
-    loads MCP servers from. Because the HOME is per-session and never the user's
-    real ``~``, this never clobbers the user's interactive agy config and two
-    concurrent sessions never share one config. Mirrors cursor #742's
-    :func:`omnigent.cursor_native_bridge.write_mcp_config`, adapted to agy's
-    HOME-global config path + isolated-HOME scoping.
+    Gemini dir at ``<bridge_dir>/agy-home/.gemini/config/mcp_config.json`` — the
+    path agy loads when launched with ``--gemini_dir``. Because the Gemini dir is
+    per-session and not the user's real ``~/.gemini``, this never clobbers the
+    user's interactive agy config and two concurrent sessions never share one
+    config. Mirrors cursor #742's :func:`omnigent.cursor_native_bridge.write_mcp_config`,
+    adapted to agy's hidden ``--gemini_dir`` flag.
 
     :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
-        and the isolated agy HOME).
+        and the isolated agy Gemini dir).
     :param python_executable: Python interpreter for the relay command;
         defaults to the current interpreter.
     :returns: Absolute path to the written ``mcp_config.json``.
     """
     write_mcp_bridge_config(bridge_dir)
-    config_dir = agy_home_dir(bridge_dir) / ".gemini" / _MCP_CONFIG_DIR
+    config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = config_dir / _MCP_CONFIG_FILE
     payload = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -445,27 +471,33 @@ def write_mcp_config(
     return path
 
 
-def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
-    """Seed the per-session isolated agy HOME and return the launch env override.
+def seed_isolated_agy_home(
+    bridge_dir: Path,
+    *,
+    trusted_workspace: Path | str | None = None,
+) -> dict[str, str]:
+    """Seed the per-session isolated agy Gemini dir and return env overrides.
 
-    Copies the user's real agy OAuth token + onboarding/migration state (NEVER
-    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini`` so
-    a launch under this isolated HOME does not re-demand OAuth or re-run the
-    onboarding wizard. The relay's ``mcp_config.json`` is written separately by
-    :func:`write_mcp_config` so it lands in this same isolated tree rather than
-    the user's real ``~/.gemini`` (the footgun this whole design avoids).
-
-    Verified live (agy 1.0.12): under this isolated HOME agy logs in as the real
-    user from the seeded token and its ``/mcp`` panel shows ``✓ omnigent`` with the
-    ``sys_*`` tools discovered.
+    Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
+    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini``.
+    The runner keeps agy's real ``HOME`` intact and passes this directory through
+    ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
+    auth that is not portable to a relocated ``HOME``. The relay's
+    ``mcp_config.json`` is written separately by :func:`write_mcp_config` so it
+    lands in this same isolated tree rather than the user's real ``~/.gemini``
+    (the footgun this whole design avoids).
 
     :param bridge_dir: Native Antigravity bridge directory.
-    :returns: An env-override mapping (``{"HOME": <iso_home>}``) to layer onto the
-        agy launch environment.
+    :param trusted_workspace: Optional workspace path to pre-trust inside the
+        isolated agy settings file. This suppresses agy's unhookable first-run
+        "Do you trust this project?" TUI gate for host-spawned sessions, mirroring
+        ``ensure_claude_workspace_trusted`` while keeping trust scoped to this
+        bridge-owned ``--gemini_dir``.
+    :returns: Env overrides to layer onto the agy launch environment. Currently
+        empty because ``HOME`` must stay real for platform auth.
     """
     real_home = Path.home()
-    iso_home = agy_home_dir(bridge_dir)
-    iso_gemini = iso_home / ".gemini"
+    iso_gemini = agy_gemini_dir(bridge_dir)
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)
     (iso_gemini / _MCP_CONFIG_DIR).mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -499,11 +531,153 @@ def seed_isolated_agy_home(bridge_dir: Path) -> dict[str, str]:
         )
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
-    # first launch under the fresh HOME (cosmetic; agy creates it itself otherwise).
+    # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
     with contextlib.suppress(OSError):
         (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
 
-    return {"HOME": str(iso_home)}
+    if trusted_workspace is not None:
+        _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
+
+    return {}
+
+
+# agy's periodic engagement survey ("How's the CLI experience so far?") is gated by
+# this ``settings.json`` key. Its modal footer line ``esc to cancel`` is identical
+# to :data:`_AGY_ACTIVE_MARKER` (the running-turn signal the TUI inject path keys
+# on), so a web turn typed into the pane while the survey is up is misread as a
+# mid-turn steer and silently lost (#1494). Disabling the survey removes the
+# trigger. Verified live: toggling agy's ``/config`` "Show Feedback Survey" off
+# writes exactly ``"showFeedbackSurvey": false`` here (``disableFeedback`` is an
+# unrelated internal proto field, NOT a settings key — it would be ignored).
+_AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
+
+
+def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+    """
+    Disable agy's feedback survey in the launch HOME's ``settings.json``.
+
+    agy periodically renders an engagement survey whose modal footer
+    (``esc to cancel``) collides with :data:`_AGY_ACTIVE_MARKER`; with it up, a
+    web turn injected into the TUI is mistaken for a running turn and lost
+    (#1494). The survey is governed by ``showFeedbackSurvey`` in
+    ``<home>/.gemini/antigravity-cli/settings.json`` — set it ``false`` before
+    launch so the survey never appears (deterministic prevention; text-matching
+    the survey itself would be brittle to agy wording changes).
+
+    Merge-only + idempotent: existing keys (``model``, ``trustedWorkspaces``,
+    ``enableTelemetry``, …) are preserved; a missing file is created with just
+    this key; a malformed / non-object file is left UNTOUCHED rather than
+    clobbered. Best-effort — a read/write failure is logged and the launch
+    proceeds (the survey is a degradation, not a hard blocker).
+
+    :param home: The HOME agy launches under (the per-session isolated home, or
+        the real home when the harness runs agy under it). Settings live at
+        ``<home>/.gemini/antigravity-cli/settings.json``.
+    :returns: None.
+    """
+    # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
+    # its real target, so the atomic os.replace below rewrites the linked file rather
+    # than silently replacing the symlink with a regular one. strict=False is a no-op
+    # for a normal or not-yet-existing path (it only resolves parent symlinks).
+    settings_path = (home / ".gemini" / "antigravity-cli" / "settings.json").resolve(strict=False)
+    data: dict[str, object] = {}
+    try:
+        raw = settings_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = ""  # no settings yet -> create a fresh one carrying just this key
+    except OSError:
+        # An EXISTING but unreadable file (perms, stale NFS, …) must NOT be
+        # recreated from scratch — that would drop the user's real settings.
+        _logger.warning(
+            "could not read agy settings.json at %s; leaving it untouched",
+            settings_path,
+            exc_info=True,
+        )
+        return
+    except UnicodeDecodeError:
+        # read_text raises this (a ValueError, not an OSError) on non-UTF-8 bytes;
+        # treat it like malformed JSON and never clobber the file (mirrors the
+        # ``(OSError, ValueError)`` read guard in ensure_agy_onboarding_complete).
+        _logger.warning(
+            "agy settings.json at %s is not valid UTF-8; leaving it untouched",
+            settings_path,
+        )
+        return
+    if raw.strip():
+        try:
+            loaded = json.loads(raw)
+        except ValueError:
+            # json.JSONDecodeError subclasses ValueError; catch the supertype to
+            # match the decode-family guard in ensure_agy_onboarding_complete.
+            _logger.warning(
+                "agy settings.json at %s is not valid JSON; leaving it untouched "
+                "(the feedback survey may still appear)",
+                settings_path,
+            )
+            return
+        if not isinstance(loaded, dict):
+            _logger.warning(
+                "agy settings.json at %s is not a JSON object; leaving it untouched",
+                settings_path,
+            )
+            return
+        data = loaded
+    if data.get(_AGY_FEEDBACK_SURVEY_SETTING) is False:
+        return  # already disabled — avoid a needless rewrite
+    data[_AGY_FEEDBACK_SURVEY_SETTING] = False
+    # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer
+    # never sees a torn file. On macOS the harness runs agy under the user's REAL
+    # ~/.gemini (the #1477 Keychain trade-off), so this file is shared across
+    # concurrent sessions and with agy itself: the atomic replace prevents
+    # corruption but not lost updates. That window is self-limiting — the
+    # idempotent short-circuit above makes every launch after the first disable
+    # read-only, so a racing agy trust/model write can only be clobbered on the
+    # one-time first disable, and the clobbered values fail safe (lost trust is
+    # re-prompted, lost model defaults). A cross-process lock is intentionally not
+    # taken (a separately-launched agy would not honor it).
+    try:
+        settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())  # crash-safe, mirrors ensure_agy_onboarding_complete
+            os.replace(tmp_name, settings_path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        _logger.warning(
+            "could not write agy settings.json at %s to disable the feedback survey",
+            settings_path,
+            exc_info=True,
+        )
+
+
+def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> None:
+    """Add *workspace* to isolated agy ``trustedWorkspaces`` settings."""
+    settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+    data: dict[str, object] = {}
+    if settings_path.is_file():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+    workspace_key = str(workspace.resolve())
+    existing = data.get("trustedWorkspaces")
+    trusted = list(existing) if isinstance(existing, list) else []
+    if workspace_key in trusted:
+        return
+    trusted.append(workspace_key)
+    data["trustedWorkspaces"] = trusted
+    settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, settings_path)
 
 
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
@@ -677,8 +851,33 @@ _MAX_SUBMIT_ATTEMPTS = 3
 _PASTE_BUFFER = "omnigent-agy-paste"
 # agy TUI footer when idle (input box mounted, ready for a turn).
 _AGY_IDLE_MARKER = "? for shortcuts"
-# agy TUI footer while a turn is running — the positive "submit took" signal.
+# agy TUI footer while a turn is running. Used as a readiness hint and to detect
+# a mid-turn steer; submission itself is verified by draft disappearance, NOT by
+# this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
+# Patterns redacted from a pane tail before it is surfaced in a delivery-failure
+# error. The agy header shows the signed-in account email, and the transcript
+# region can echo tokens/keys agy printed; redaction is best-effort and biased
+# toward over-redaction so a secret never leaks into a user-facing error.
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+")
+_SECRET_RES = (
+    re.compile(r"\b(?:sk|rk)-[A-Za-z0-9_-]{16,}"),  # OpenAI-style keys
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),  # GitHub tokens
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),  # Slack tokens
+    re.compile(r"\bya29\.[A-Za-z0-9._-]{10,}"),  # Google OAuth access tokens
+    re.compile(r"\bAIza[A-Za-z0-9_-]{30,}"),  # Google API keys
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key ids
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"),  # JWTs
+    re.compile(r"(?i)\b(?:bearer|token|api[_-]?key|secret|password)\b\s*[:=]?\s*\S{6,}"),
+)
+# TUI horizontal separator around agy's bottom composer.
+_AGY_SEPARATOR_CHAR = "─"
+# Box-drawing glyphs agy may use to frame/decorate the composer rule. A rule is
+# detected when its non-space chars are all box-drawing AND it carries a run of
+# the horizontal rule char, so a future agy that frames the composer with
+# corner/join glyphs (e.g. ``╭────╮``) is still detected, while ordinary text
+# (which carries non-box chars) never matches.
+_AGY_BOX_GLYPHS = frozenset("─━╌╍┄┅┈┉╭╮╰╯┌┐└┘├┤┬┴┼│║╔╗╚╝═╠╣╦╩╬╴╵╶╷")
 
 
 def write_tmux_target(
@@ -888,6 +1087,122 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
+def _redact_pane_secrets(text: str) -> str:
+    """Redact emails and common secret shapes from a pane tail.
+
+    Best-effort and biased toward over-redaction: the tail is embedded in a
+    user-facing delivery error, and agy may have printed the signed-in account
+    email or tokens/keys in the transcript region.
+    """
+    redacted = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    for pattern in _SECRET_RES:
+        redacted = pattern.sub("[REDACTED_SECRET]", redacted)
+    return redacted
+
+
+def _format_pane_debug_tail(pane: str) -> str:
+    """
+    Return a short, redacted pane tail for delivery failure diagnostics.
+
+    The agy pane header can include the authenticated user's email address and
+    the transcript region can echo secrets agy printed. Keep this diagnostic safe
+    to surface in an executor error by redacting emails + common secret shapes
+    (see :func:`_redact_pane_secrets`) and limiting the output to a small tail.
+    """
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    tail = "\n".join(lines[-12:])
+    return _redact_pane_secrets(tail) or "<empty pane>"
+
+
+def _agy_input_region(pane: str) -> str:
+    """
+    Return agy's live bottom composer region, excluding transcript history.
+
+    agy renders the editable composer between horizontal separator lines. After
+    a successful submit, the submitted prompt remains in transcript history
+    above a fresh empty composer, so checking the full pane would falsely think
+    the draft is still present. The last separator pair scopes matching to the
+    currently editable input box, mirroring Kiro's input-region guard.
+    """
+    lines = pane.splitlines()
+    separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
+    if len(separator_indexes) >= 2:
+        start = separator_indexes[-2] + 1
+        end = separator_indexes[-1]
+        return "\n".join(lines[start:end])
+    return "\n".join(lines[-8:])
+
+
+def _agy_separator_line(line: str) -> bool:
+    """Return whether *line* is one of agy's composer separator rules.
+
+    Accepts a pure ``─`` rule (agy 1.0.14) and a box-decorated rule (corner/join
+    glyphs) so a future agy that frames the composer is still detected, while an
+    ordinary text/draft line (which carries non-box chars) never matches. A short
+    dash run (< 8 rule chars) is not treated as a separator.
+    """
+    stripped = line.strip()
+    if stripped.count(_AGY_SEPARATOR_CHAR) < 8:
+        return False
+    return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
+
+
+def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool:
+    """
+    Return whether the pasted draft is still visible in agy's composer.
+
+    The baseline region prevents matching the empty prompt or stale text that was
+    already present before this paste. Candidate lines are normalized by removing
+    agy's leading ``>`` prompt glyph.
+
+    When *needle* is empty (a message too short for a stable needle, e.g.
+    ``"ok"``), any draft-like content in a composer that differs from the
+    pre-paste baseline counts as present — so short messages are still render- and
+    submit-verified by composer state instead of being submitted blind.
+    """
+    region = _agy_input_region(pane)
+    if region == baseline_region:
+        return False
+    candidates = _agy_draft_candidate_lines(region)
+    normalized_needle = needle.strip() if needle else ""
+    if not normalized_needle:
+        return bool(candidates)
+    return any(
+        line == normalized_needle
+        or line.startswith(normalized_needle)
+        or normalized_needle in line
+        for line in candidates
+    )
+
+
+def _agy_draft_candidate_lines(region: str) -> list[str]:
+    """Return composer lines that can represent editable draft text.
+
+    A line carrying agy's ``>`` prompt glyph is editable draft content and is
+    kept verbatim (after the glyph is stripped) even when the user's own text
+    contains a word like ``Generating`` or a footer phrase — otherwise a
+    legitimate message would be filtered out and misread as "never rendered".
+    Status/footer rows (idle/active/"Generating …") carry no ``>`` prompt, so the
+    chrome filters apply only to those non-draft lines.
+    """
+    candidates: list[str] = []
+    for raw_line in region.splitlines():
+        line = raw_line.strip()
+        if not line or line == ">":
+            continue
+        if line.startswith(">"):
+            draft = line[1:].strip()
+            if draft:
+                candidates.append(draft)
+            continue
+        if _AGY_IDLE_MARKER in line or _AGY_ACTIVE_MARKER in line:
+            continue
+        if "Generating" in line:
+            continue
+        candidates.append(line)
+    return candidates
+
+
 def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
     """
     Best-effort wait until agy's input box is mounted (its footer is rendered).
@@ -914,51 +1229,57 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
-def _submit_and_verify(socket_path: str, tmux_target: str) -> None:
+def _submit_and_verify(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str = "",
+    baseline_region: str = "",
+    draft_seen: bool = False,
+) -> None:
     """
-    Press Enter to submit the pasted draft, verifying the submit where possible.
+    Press Enter to submit the pasted draft, verifying by composer state.
 
-    There are two cases, distinguished by the footer BEFORE the Enter:
+    This mirrors the stronger Claude/Kiro native bridge contract. Footer text is
+    only a readiness hint: it can change across agy builds, be truncated in narrow
+    panes, or redraw independently from the editable draft. The reliable local
+    submit signal is that the draft which was visible before Enter is no longer
+    present in the live bottom composer region (for an empty needle this keys off
+    the composer returning to the pre-paste baseline). If the same draft remains
+    visible, Enter was likely folded into the paste burst and is re-sent within a
+    bounded retry budget. ``inject_user_message_via_tui`` fails earlier when a
+    text draft never renders into an idle composer.
 
-    **Idle (a sequential turn — the common case).** agy shows
-    :data:`_AGY_IDLE_MARKER`. The agy TUI coalesces a rapid stdin burst into a
-    paste, so an Enter that lands while the paste is still being consumed is
-    folded in as a newline and the draft sits unsent. After each Enter this polls
-    for the footer leaving idle — :data:`_AGY_ACTIVE_MARKER` appears (accepted on
-    first sighting) OR :data:`_AGY_IDLE_MARKER` is gone for TWO consecutive polls
-    (robust to a future agy renaming/truncating the running footer, while a single
-    transient redraw frame cannot be misread as started). If neither holds within
-    :data:`_SUBMIT_VERIFY_TIMEOUT_S` the Enter is re-sent (the draft is still in
-    the box; an Enter on an emptied box is a no-op).
-
-    **Mid-turn (a steer).** agy already shows :data:`_AGY_ACTIVE_MARKER`, so the
-    idle→running transition this function watches for is unavailable and a second
-    Enter could queue a spurious empty turn. agy queues a mid-turn paste as the
-    next ``USER_INPUT`` (verified against agy 1.0.10), and the caller's
-    paste-commit poll already confirmed the draft rendered in the input box, so a
-    single best-effort Enter is sent and the function returns WITHOUT a footer
-    confirmation. The forwarder is the system-of-record for whether the steer
-    actually registered (it mirrors the resulting ``USER_INPUT`` step); this path
-    deliberately does not re-send or hard-fail on the unverifiable mid-turn case.
+    **Mid-turn steer.** When agy already shows :data:`_AGY_ACTIVE_MARKER`, a turn
+    is running: the draft-disappearance signal is unreliable (agy queues the steer
+    as the next ``USER_INPUT`` and the composer may not clear promptly) and a
+    second Enter could queue a spurious empty turn. So a single best-effort Enter
+    is sent and the function returns without re-sending or hard-failing — the
+    forwarder is the system-of-record for whether the queued steer registered.
 
     :param socket_path: tmux server socket path.
     :param tmux_target: tmux pane target.
     :returns: None.
-    :raises RuntimeError: When the agy TUI exits mid-submit, or (idle case only)
-        the footer never leaves idle after :data:`_MAX_SUBMIT_ATTEMPTS` attempts.
+    :raises RuntimeError: When the agy TUI exits mid-submit, or the visible
+        draft remains in the composer after :data:`_MAX_SUBMIT_ATTEMPTS` attempts.
     """
     if not _session_alive(socket_path, tmux_target):
         raise RuntimeError(
             "the agy terminal exited before the message could be submitted; restart the session"
         )
+    # Mid-turn steer: a turn is already running, so verifying via draft
+    # disappearance is unreliable and a re-sent Enter could queue an empty turn.
+    # Deliver one best-effort Enter and return (see the docstring).
     if _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target):
-        # Mid-turn steer: footer-transition verification is unavailable (see the
-        # docstring). Deliver one best-effort Enter; do not re-send.
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         return
+    if not draft_seen:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        return
+    last_pane = _capture_pane(socket_path, tmux_target)
     for _ in range(_MAX_SUBMIT_ATTEMPTS):
         # Re-check liveness each attempt: if the TUI exited between the paste and
-        # now, every capture returns "" and the footer never changes — so fail
+        # now, every capture returns "" and the draft never clears — so fail
         # fast with the real cause instead of spinning the full budget and then
         # blaming paste-coalescing.
         if not _session_alive(socket_path, tmux_target):
@@ -968,23 +1289,22 @@ def _submit_and_verify(socket_path: str, tmux_target: str) -> None:
             )
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        non_idle_polls = 0
         while time.monotonic() < deadline:
+            if not _session_alive(socket_path, tmux_target):
+                raise RuntimeError(
+                    "the agy terminal exited before the message could be submitted; "
+                    "restart the session"
+                )
             pane = _capture_pane(socket_path, tmux_target)
-            if pane and _AGY_ACTIVE_MARKER in pane:
+            last_pane = pane or last_pane
+            if pane and not _draft_in_input_region(pane, needle, baseline_region):
                 return
-            if pane and _AGY_IDLE_MARKER not in pane:
-                non_idle_polls += 1
-                if non_idle_polls >= 2:
-                    return
-            else:
-                # Idle footer present, or an empty capture (tmux failure): reset
-                # so the two confirmations must be consecutive, not cumulative.
-                non_idle_polls = 0
             time.sleep(_TMUX_POLL_INTERVAL_S)
+    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region)
     raise RuntimeError(
-        "agy did not start a turn after the message was submitted to its terminal "
-        "(the submit Enter may have been folded into the paste)"
+        "agy did not accept the submitted message; the draft is still visible "
+        "in the input box; "
+        f"draft_visible={draft_visible}; pane_tail:\n{_format_pane_debug_tail(last_pane)}"
     )
 
 
@@ -1009,7 +1329,7 @@ def inject_user_message_via_tui(
     kill-to-end), stream the content through a named tmux buffer
     (``load-buffer``/``paste-buffer -p`` so interior newlines stay data and a
     large message is not capped by the send-keys argv limit), wait for the draft
-    to render, then submit (footer-verified when idle; best-effort mid-turn — see
+    to render, then submit and verify the draft left the live composer (see
     :func:`_submit_and_verify`).
 
     :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
@@ -1044,6 +1364,7 @@ def inject_user_message_via_tui(
     # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k).
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
     # ``delete=False`` + name captured BEFORE the write, so a write failure still
     # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
     paste_path: str | None = None
@@ -1070,16 +1391,41 @@ def inject_user_message_via_tui(
             with contextlib.suppress(OSError):
                 os.unlink(paste_path)
     # Wait until the paste is visibly committed to the input box before Enter, so
-    # the submit is not folded into the paste burst (see _submit_and_verify).
+    # the submit is not folded into the paste burst (see _submit_and_verify). This
+    # runs for EVERY message — including short ones with no stable needle — so a
+    # paste that never lands in the composer is caught rather than submitted blind
+    # (``_draft_in_input_region`` keys off composer change when the needle is "").
     needle = _submit_needle(content)
-    if needle:
-        commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-        while time.monotonic() < commit_deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
-                break
-            time.sleep(_TMUX_POLL_INTERVAL_S)
+    # A mid-turn steer (agy already running a turn) is delivered best-effort: agy
+    # queues it as the next turn and may not surface the draft in the composer the
+    # same way an idle turn does, so a non-render is NOT a swallowed message here.
+    # The render hard-fail below is for the idle/sequential case, where a paste
+    # that never lands in the composer (e.g. eaten by an unhooked modal such as
+    # the first-run trust gate) must fail loudly instead of vanishing.
+    mid_turn = _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target)
+    draft_seen = False
+    last_commit_pane = ""
+    commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < commit_deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        last_commit_pane = pane or last_commit_pane
+        if _draft_in_input_region(pane, needle, baseline_region):
+            draft_seen = True
+            break
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+    if not draft_seen and not mid_turn:
+        raise RuntimeError(
+            "agy did not render the pasted message in its input box before submit; "
+            f"pane_tail:\n{_format_pane_debug_tail(last_commit_pane)}"
+        )
     time.sleep(_PASTE_SETTLE_S)
-    _submit_and_verify(socket_path, tmux_target)
+    _submit_and_verify(
+        socket_path,
+        tmux_target,
+        needle=needle,
+        baseline_region=baseline_region,
+        draft_seen=draft_seen,
+    )
 
 
 def send_interaction_keys_via_tui(

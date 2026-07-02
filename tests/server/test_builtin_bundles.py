@@ -104,7 +104,7 @@ def test_bundle_builder_is_reproducible(
 
 # (name, bundle source dir, sub-agents the shipped definition declares today)
 _SHIPPED_SUB_AGENT_EXAMPLES = [
-    ("polly", app._POLLY_BUNDLE_SOURCE, {"claude_code", "codex", "pi"}),
+    ("polly", app._POLLY_BUNDLE_SOURCE, {"claude_code", "codex", "opencode", "pi"}),
     ("debby", app._DEBBY_BUNDLE_SOURCE, {"claude", "gpt"}),
 ]
 

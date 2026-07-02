@@ -22,7 +22,8 @@ CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     cwd TEXT,
-    started_at REAL NOT NULL
+    started_at REAL NOT NULL,
+    parent_session_id TEXT
 );
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,7 +33,8 @@ CREATE TABLE messages (
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -95,6 +97,27 @@ def test_discover_skips_excluded_session(tmp_path: Path) -> None:
     assert (
         f._discover_session_id(db, workspace, 1000.0, excluded=frozenset({"20260620_1"})) is None
     )
+
+
+def test_discover_child_session_returns_newest_child(tmp_path: Path) -> None:
+    """After compaction Hermes forks a child via parent_session_id; pick the newest."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.executemany(
+        "INSERT INTO sessions(id, source, cwd, started_at, parent_session_id) VALUES (?,?,?,?,?)",
+        [
+            ("parent", "cli", "/w", 1000.0, None),
+            ("child_old", "cli", "/w", 1005.0, "parent"),
+            ("child_new", "cli", "/w", 1010.0, "parent"),
+            ("unrelated", "cli", "/w", 1011.0, None),
+        ],
+    )
+    con.commit()
+    con.close()
+    assert f._discover_child_session(db, "parent") == "child_new"
+    # No children -> None (forwarder stays pinned to the parent).
+    assert f._discover_child_session(db, "child_new") is None
 
 
 def test_read_new_items_maps_roles_and_strips_attachments(tmp_path: Path) -> None:
@@ -370,6 +393,81 @@ async def test_forward_loop_patches_external_session_id_once(tmp_path, monkeypat
     url, body = patch_calls[0]
     assert url == "/v1/sessions/conv_patch"
     assert body["external_session_id"] == "20260620_1"
+
+
+async def test_forward_loop_repins_to_child_after_compaction(tmp_path, monkeypatch) -> None:
+    """Compaction forks a child session; the forwarder re-pins and mirrors its messages.
+
+    Pre-pins the parent (so discovery is skipped), seeds a compacted parent plus a
+    child whose parent_session_id is the parent, then drives a bounded number of
+    poll cycles. The first cycle persists the compaction and re-pins to the child;
+    the next mirrors the child's messages and persists state under the child id.
+    """
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.executemany(
+        "INSERT INTO sessions(id, source, cwd, started_at, parent_session_id) VALUES (?,?,?,?,?)",
+        [
+            ("parent_1", "cli", workspace, 1000.0, None),
+            ("child_1", "cli", workspace, 1005.0, "parent_1"),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO messages(session_id, role, content, active, compacted) VALUES (?,?,?,?,?)",
+        [
+            ("parent_1", "assistant", "compacted summary", 1, 1),  # parent has compaction
+            ("child_1", "user", "child hi", 1, 0),
+            ("child_1", "assistant", "child reply", 1, 0),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Pre-pin the parent so the loop tails it directly (last_id past the parent's
+    # only message so we don't mirror it; compaction triggers the re-pin).
+    f._write_state(bridge_dir, f._ForwardState(hermes_session_id="parent_1", last_id=1))
+
+    posted: list[f._MirrorItem] = []
+
+    async def _fake_post(_client, *, session_id, item):
+        posted.append(item)
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fake_post)
+    monkeypatch.setattr(f, "_persist_hermes_compaction_item", lambda *a, **k: _noop())
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # Re-pinned to the child and mirrored its messages.
+    roles = [i.item_data.get("role") for i in posted]
+    assert roles == ["user", "assistant"]
+    assert f._read_state(bridge_dir).hermes_session_id == "child_1"
+
+
+async def _noop() -> None:
+    return None
 
 
 # --- Usage tracker tests ---------------------------------------------------

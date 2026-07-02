@@ -37,6 +37,7 @@ from pathlib import Path
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -99,6 +100,44 @@ _DEFAULT_IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
 # without hammering ``time.monotonic()`` more than necessary.
 _DEFAULT_REAPER_INTERVAL_S = 60
 
+# Env override for the harness idle-reap window, so operators can tune it
+# without code changes (mirrors the runner-level ``runner.idle_timeout_s``).
+# ``0`` disables harness reaping entirely.
+_HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
+
+
+def _resolve_harness_idle_timeout_s() -> float:
+    """Resolve the harness idle-reap window in seconds.
+
+    Honors :envvar:`OMNIGENT_HARNESS_IDLE_TIMEOUT_S` (``0`` disables reaping);
+    otherwise the 30-minute default. An unparseable or negative value logs a
+    warning and falls back to the default rather than failing the runner at
+    boot — an env typo shouldn't take the runner down.
+    """
+    raw = os.environ.get(_HARNESS_IDLE_TIMEOUT_ENV)
+    if not raw:
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not a number; using default %ss",
+            _HARNESS_IDLE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_IDLE_TIMEOUT_S,
+        )
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    if value < 0:
+        _logger.warning(
+            "%s=%r is negative; using default %ss",
+            _HARNESS_IDLE_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_IDLE_TIMEOUT_S,
+        )
+        return float(_DEFAULT_IDLE_TIMEOUT_S)
+    return value
+
+
 # Grace period between SIGTERM and SIGKILL when releasing a
 # subprocess. Long enough for a well-behaved harness to flush
 # in-flight responses + close the FastAPI app cleanly; short
@@ -138,6 +177,10 @@ _SPAWN_POLL_INTERVAL_S = 0.05
 # normal lifecycle — if SIGTERM doesn't land in 3 s, SIGKILL is
 # the only recourse.
 _ORPHAN_SIGTERM_GRACE_S = 3.0
+
+
+class NoLiveHarnessError(RuntimeError):
+    """Raised when ``get_client`` is called with ``harness="any"`` and no subprocess is live."""
 
 
 def _default_tmp_parent() -> Path:
@@ -196,6 +239,9 @@ def _resolve_module_path(harness: str) -> str:
     module_path = _HARNESS_MODULES.get(harness)
     if module_path is not None:
         return module_path
+    package = missing_install_packages().get(harness)
+    if package:
+        raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")
     if _HARNESS_MODULES:
         registered = sorted(_HARNESS_MODULES)
         raise RuntimeError(f"unknown harness {harness!r}; registered names: {registered}")
@@ -484,25 +530,32 @@ class HarnessProcessManager:
     def __init__(
         self,
         *,
-        idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
+        idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
         tmp_parent: Path | None = None,
     ) -> None:
-        self._idle_timeout_s = idle_timeout_s
+        # ``None`` (the default at both construction sites) resolves from the
+        # OMNIGENT_HARNESS_IDLE_TIMEOUT_S env var, else the 30-minute default.
+        self._idle_timeout_s = (
+            idle_timeout_s if idle_timeout_s is not None else _resolve_harness_idle_timeout_s()
+        )
         self._reaper_interval_s = reaper_interval_s
         self._tmp_parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
         # Pre-allocate the instance dir path so it stays stable
         # across re-entrant ``start()`` calls (idempotent boot).
         self._instance_dir = self._tmp_parent / f"ap-{uuid.uuid4().hex}"
         self._entries: dict[str, _SubprocessEntry] = {}
-        # Per-conversation in-flight harness response_id, populated
-        # by callers when the harness emits ``response.created``
-        # and cleared on ``response.completed``/``response.failed``
-        # /``response.cancelled``. :meth:`forward_cancel` reads it to translate
-        # an AP-side cancel into the harness's own response_id —
-        # AP's ``task_id`` and the harness's ``resp_<uuid>`` are
-        # different identifiers; the harness scaffold's ``/cancel``
-        # route keys ``_in_flight`` by the harness id only.
+        # Per-conversation in-flight harness response_id. The runner's
+        # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
+        # the harness emits ``response.created`` and clears it via
+        # :meth:`clear_in_flight` at stream end (``_on_proxy_stream_end``,
+        # reached on every terminal path). Two readers depend on it:
+        # :meth:`forward_cancel` translates an AP-side cancel into the
+        # harness's own response_id (AP's ``task_id`` and the harness's
+        # ``resp_<uuid>`` are different identifiers; the harness scaffold's
+        # ``/cancel`` route keys ``_in_flight`` by the harness id only),
+        # and the idle reaper skips any conversation present here so an
+        # actively-streaming turn is never reaped mid-flight.
         self._in_flight_response_ids: dict[str, str] = {}
         # Per-conversation spawn lock — see §Process management:
         # Spawn lock. The lock guards the lazy-init window in
@@ -684,6 +737,10 @@ class HarnessProcessManager:
                     await self._close_entry(entry)
                     entry = None
             if entry is None:
+                if harness == "any":
+                    raise NoLiveHarnessError(
+                        f"no live harness subprocess for conversation {conversation_id!r}"
+                    )
                 entry = await self._spawn_entry(conversation_id, harness, env)
                 self._entries[conversation_id] = entry
             # Use ``time.monotonic()`` directly rather than
@@ -723,10 +780,11 @@ class HarnessProcessManager:
         REPL.
 
         The harness-side ``response_id`` is looked up from
-        ``_in_flight_response_ids``, which callers populate on
-        ``response.created`` (currently no writers wired up — the
-        mapping is always empty in production, so this method is a
-        no-op until in-flight tracking is restored).
+        ``_in_flight_response_ids``, which the runner's ``proxy_stream``
+        populates on ``response.created`` (via :meth:`mark_in_flight`)
+        and clears at stream end (via :meth:`clear_in_flight`). If no
+        turn is currently live the mapping has no entry and this method
+        is a silent no-op.
 
         Best-effort: a missing harness (no entry registered for
         this conversation) OR a missing in-flight mapping (no turn
@@ -802,6 +860,40 @@ class HarnessProcessManager:
             registered.
         """
         return conversation_id in self._in_flight_response_ids
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """
+        Record that *conversation_id* has a live harness turn.
+
+        Called by the runner's ``proxy_stream`` on ``response.created``.
+        Registering the response id keeps the idle reaper from killing
+        an actively-streaming turn (the reaper skips any conversation
+        present in ``_in_flight_response_ids``) and lets
+        :meth:`forward_cancel` translate an AP-side cancel into the
+        harness's own response id. Always paired with a later
+        :meth:`clear_in_flight`.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        :param response_id: The harness-side ``resp_<uuid>`` from the
+            ``response.created`` event.
+        """
+        self._in_flight_response_ids[conversation_id] = response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """
+        Clear the live-turn marker for *conversation_id*.
+
+        Called by the runner from ``_on_proxy_stream_end``, which is
+        reached on every terminal path (success, error, status-fail,
+        interrupt) — so a dropped or late terminal SSE event cannot
+        leave an entry permanently marked in-flight and therefore never
+        reaped. No-op if no marker is set.
+
+        :param conversation_id: AP-allocated conversation id,
+            e.g. ``"conv_abc123"``.
+        """
+        self._in_flight_response_ids.pop(conversation_id, None)
 
     async def release(self, conversation_id: str) -> None:
         """
@@ -994,25 +1086,43 @@ class HarnessProcessManager:
         Close the httpx client, terminate the subprocess, and
         remove its socket file.
 
+        Teardown is best-effort and ordered so the process kill — the
+        step that actually reclaims the OS resource — always runs even
+        if an earlier step raises. ``release`` has already popped the
+        entry from ``_entries`` before calling this, so a bare
+        ``client.aclose()`` raise (a broken transport, a wedged client)
+        that skipped the kill would otherwise leak an *un-tracked*
+        subprocess. ``CancelledError`` (a ``BaseException``, not
+        ``Exception``) still propagates, so shutdown cancellation is
+        unaffected.
+
         :param entry: The bookkeeping record to tear down.
         """
-        await entry.client.aclose()
-        if entry.process.returncode is None:
-            try:
-                entry.process.send_signal(signal.SIGTERM)
-                await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
-            except asyncio.TimeoutError:
-                # Wedged subprocess — kill outright. The harness
-                # author is responsible for clean SIGTERM handling
-                # if they want graceful shutdown of in-flight
-                # responses.
-                entry.process.kill()
-                await entry.process.wait()
-        close_subprocess_transport(entry.process)
-        # Best-effort socket cleanup. uvicorn's atexit usually
-        # handles this when SIGTERM lands cleanly, but a
-        # hard-killed runner won't. No-op for TCP endpoints.
-        entry.endpoint.cleanup()
+        try:
+            await entry.client.aclose()
+        except Exception:
+            # A broken transport must not skip the subprocess kill below.
+            _logger.exception("error closing harness client during teardown; continuing")
+        finally:
+            if entry.process.returncode is None:
+                try:
+                    entry.process.send_signal(signal.SIGTERM)
+                    await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                except Exception:
+                    # Graceful SIGTERM didn't complete — it timed out, or
+                    # send_signal/wait raised (e.g. the process vanished
+                    # mid-teardown). Force-kill best-effort; a process that
+                    # is already gone is already done.
+                    with contextlib.suppress(Exception):
+                        entry.process.kill()
+                        await entry.process.wait()
+            with contextlib.suppress(Exception):
+                close_subprocess_transport(entry.process)
+            # Best-effort socket cleanup. uvicorn's atexit usually
+            # handles this when SIGTERM lands cleanly, but a
+            # hard-killed runner won't. No-op for TCP endpoints.
+            with contextlib.suppress(Exception):
+                entry.endpoint.cleanup()
 
     async def _idle_reaper_loop(self) -> None:
         """
@@ -1022,7 +1132,10 @@ class HarnessProcessManager:
         ``last_used_at`` is older than ``idle_timeout_s`` AND
         has no in-flight response on the harness. Sleeps for
         ``reaper_interval_s`` between passes. Terminates on
-        :class:`asyncio.CancelledError` from :meth:`shutdown`.
+        :class:`asyncio.CancelledError` from :meth:`shutdown`. A
+        non-positive ``idle_timeout_s`` (e.g.
+        ``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``) disables reaping — each
+        pass is a no-op.
 
         Two safety guards beyond raw ``last_used_at`` checks:
 
@@ -1056,6 +1169,12 @@ class HarnessProcessManager:
                 await asyncio.sleep(self._reaper_interval_s)
             except asyncio.CancelledError:
                 return
+            # ``idle_timeout_s <= 0`` disables harness reaping entirely
+            # (``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``). Without this guard a 0
+            # window makes ``cutoff == now``, so every entry (``last_used_at``
+            # always <= now) is reaped on each pass — the inverse of "disabled".
+            if self._idle_timeout_s <= 0:
+                continue
             now = time.monotonic()
             cutoff = now - self._idle_timeout_s
             stale: list[str] = []
@@ -1072,7 +1191,22 @@ class HarnessProcessManager:
                     "reaping idle harness subprocess for conversation %s",
                     conv_id,
                 )
-                await self.release(conv_id)
+                try:
+                    await self.release(conv_id)
+                except Exception:
+                    # A release failure (e.g. ``client.aclose()`` on a broken
+                    # transport, or ``process.wait()`` raising) must not escape
+                    # the loop: an unguarded raise here exits the reaper task
+                    # permanently — and silently, since nothing awaits it — so
+                    # the instance never reclaims another idle subprocess for
+                    # the rest of its lifetime (FD / memory / socket leak). Log
+                    # and continue; the entry stays registered and is retried
+                    # on a later pass.
+                    _logger.exception(
+                        "failed to reap idle harness subprocess for "
+                        "conversation %s; will retry on a later pass",
+                        conv_id,
+                    )
 
     async def _sweep_orphans(self) -> None:
         """

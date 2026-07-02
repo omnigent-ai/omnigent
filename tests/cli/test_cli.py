@@ -63,7 +63,11 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
-from omnigent.runner.transports.ws_tunnel.limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+from omnigent.runner.transports.ws_tunnel.limits import (
+    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -396,7 +400,7 @@ def test_claude_command_profile_startup_threads_profiler(
         _fake_run_claude_native_capture(captured),
     )
 
-    result = CliRunner(mix_stderr=False).invoke(
+    result = CliRunner().invoke(
         cli,
         ["claude", "--server", "https://example.com", "--profile-startup"],
     )
@@ -1212,6 +1216,10 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert result.exit_code == 0, result.output
     assert captured.get("uvicorn_called") is True
     assert captured["uvicorn_kwargs"]["ws_max_size"] == RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+    # Tunnel protocol keepalive aligned to the 90s app-level budget, not uvicorn's
+    # 20s default that drops a busy-but-healthy tunnel with 1011 (issue #1116).
+    assert captured["uvicorn_kwargs"]["ws_ping_interval"] == TUNNEL_KEEPALIVE_PING_INTERVAL_S
+    assert captured["uvicorn_kwargs"]["ws_ping_timeout"] == TUNNEL_KEEPALIVE_PING_TIMEOUT_S
     assert (
         captured["uvicorn_kwargs"]["log_config"]["formatters"]["access"]["()"]
         == "omnigent.server.performance_metrics.RequestDurationAccessFormatter"
@@ -2577,7 +2585,9 @@ def test_removed_runner_flow_flags_are_rejected(flag: str) -> None:
     result = CliRunner().invoke(cli, ["run", "tests/resources/examples/hello_world.yaml", flag])
 
     assert result.exit_code != 0
-    assert f"No such option: {flag}" in result.output
+    # click 8.2 reworded this from "No such option: --x" to "No such option
+    # '--x'." (and may append a "Did you mean" suggestion), so match loosely.
+    assert "No such option" in result.output and flag in result.output
 
 
 def test_attach_without_server_errors_loud(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3525,7 +3535,7 @@ def test_config_set_local_writes_project_config(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", tmp_path / "global.yaml")
 
-    result = CliRunner(mix_stderr=False).invoke(cli, ["config", "set", "model=my-model"])
+    result = CliRunner().invoke(cli, ["config", "set", "model=my-model"])
 
     assert result.exit_code == 0, result.output
     local_path = tmp_path / ".omnigent" / "config.yaml"

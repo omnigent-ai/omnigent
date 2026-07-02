@@ -40,6 +40,7 @@ import asyncio
 import logging
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -350,6 +351,30 @@ class TerminalRegistry:
             )
             for (name, key), instance in slot.items()
         ]
+
+    def native_panes(self) -> list[tuple[str, str, Path]]:
+        """Return live native-harness CLI panes as ``(conversation_id, name, socket_path)``.
+
+        A "native pane" is a terminal whose name is a native harness short name
+        (``claude`` / ``codex`` / ``cursor`` / ...) with session key ``"main"``.
+        This is a cheap NAME pre-filter for the native idle reaper
+        (:mod:`omnigent.terminals.pane_reaper`); the reaper's wiring additionally
+        confirms the resource ROLE is a native harness before reaping, so a user
+        terminal that merely shares the name is never reclaimed. Snapshot
+        semantics; sync (map read only, no tmux I/O).
+
+        :returns: ``(conversation_id, terminal_name, tmux_socket_path)`` per live
+            name-matching native pane.
+        """
+        from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
+
+        out: list[tuple[str, str, Path]] = []
+        with self._lock:
+            for conv_id, slot in self._by_conversation.items():
+                for (name, key), instance in slot.items():
+                    if key == "main" and name in NATIVE_PANE_TERMINAL_NAMES:
+                        out.append((conv_id, name, instance.socket_path))
+        return out
 
     def transfer(
         self,

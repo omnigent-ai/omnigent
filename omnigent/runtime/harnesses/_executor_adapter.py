@@ -36,7 +36,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import secrets
 import uuid
 from collections import deque
@@ -45,6 +44,7 @@ from typing import Any
 
 from fastapi import Response
 
+from omnigent.errors import ElicitationDeclinedError
 from omnigent.inner.executor import (
     CompactionComplete,
     Executor,
@@ -108,34 +108,6 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
-
-
-def _finalize_trace_status(response_id: str) -> None:
-    """PATCH the trace status to OK on the MLflow server.
-
-    OTLP-ingested traces stay "In progress" because the server has
-    no signal that all spans have arrived. This call explicitly
-    marks the trace as complete after the OTel provider is flushed.
-    """
-    try:
-        from omnigent.runtime.telemetry import trace_id_from_response_id
-
-        trace_id = trace_id_from_response_id(response_id)
-        request_id = f"tr-{trace_id}"
-
-        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI") or os.environ.get(
-            "OTEL_EXPORTER_OTLP_ENDPOINT", ""
-        )
-        if not tracking_uri:
-            return
-        import httpx
-
-        httpx.Client(timeout=5).patch(
-            f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/traces/{request_id}",
-            json={"status": "OK"},
-        ).close()
-    except Exception:
-        _logger.debug("failed to finalize trace status", exc_info=True)
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -361,8 +333,15 @@ class ExecutorAdapter(HarnessApp):
         # trace ID from the response_id so operators can look up
         # traces by response ID without a mapping table.
         tracing = is_tracing_enabled()
+        from omnigent.runtime.telemetry import current_session_id, session_scope
+
+        # Prefer the conversation id the request hook already bound
+        # (authoritative, from the /sessions/<conv>/events path); fall back to
+        # the adapter session key, which can be a random uuid for harnesses
+        # built without one.
+        turn_session_id = current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
-            self._tracing_ctx = TracingContext()
+            self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
         agent_span = None
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
@@ -400,7 +379,11 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with trace_cm:
+            # Bind the session for the whole turn so every span the harness
+            # creates (agent/LLM/tool, the native tmux inject, DB/httpx child
+            # spans) is tagged with session.id by the span processor — no
+            # per-harness code. (session_scope imported above with current_session_id.)
+            with session_scope(turn_session_id), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -420,7 +403,7 @@ class ExecutorAdapter(HarnessApp):
                             from omnigent.runtime.telemetry import record_cancellation
 
                             record_cancellation(agent_span)
-                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                            tctx.end_agent_span(agent_span, response=None)
                             agent_span = None
                         await executor.interrupt_session(self._session_key)
                         return
@@ -437,7 +420,6 @@ class ExecutorAdapter(HarnessApp):
                                 tctx.end_tool_span(
                                     _active_tool_span,
                                     result=event.result,
-                                    status="ERROR" if event.error else "OK",
                                     error=event.error,
                                     duration_ms=event.duration_ms,
                                     parent_span=_active_tool_parent,
@@ -465,25 +447,44 @@ class ExecutorAdapter(HarnessApp):
                             from omnigent.runtime.telemetry import record_cancellation
 
                             record_cancellation(agent_span)
-                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                            tctx.end_agent_span(agent_span, response=None)
                         return
                     if isinstance(event, ExecutorError):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
                                 agent_span,
                                 response=None,
-                                status="ERROR",
                                 error=event.message,
                             )
                             agent_span = None
                         raise RuntimeError(f"inner executor error: {event.message}")
+        except ElicitationDeclinedError:
+            # Fallback for executors that propagate the exception directly
+            # (non-SDK / non-spawned-task paths). SDK-based executors use
+            # ctx.cancelled.set() from _stable_elicitation_handler instead,
+            # because the SDK wraps its control-request callbacks in their
+            # own tasks and would swallow a raised exception before it
+            # reached this handler. Either way the turn ends as cancelled.
+            _logger.info(
+                "elicitation explicitly declined for response %s — aborting turn",
+                ctx.response_id,
+            )
+            if tctx is not None and agent_span is not None:
+                from omnigent.runtime.telemetry import record_cancellation
+
+                record_cancellation(agent_span)
+                tctx.end_agent_span(agent_span, response=None)
+            ctx.cancelled.set()
+            # Interrupt the inner executor session so the in-flight
+            # generation stops immediately, same as the normal
+            # cancellation path.
+            if self._executor is not None:
+                await self._executor.interrupt_session(self._session_key)
         except BaseException:
             # End agent span on unhandled exceptions so it's not
             # left open (which would leak on the OTel provider).
             if tctx is not None and agent_span is not None:
-                tctx.end_agent_span(
-                    agent_span, response=None, status="ERROR", error="unhandled exception"
-                )
+                tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
                 agent_span = None
             raise
         finally:
@@ -510,7 +511,6 @@ class ExecutorAdapter(HarnessApp):
                         provider.force_flush(timeout_millis=5000)
                 except Exception:
                     pass
-                _finalize_trace_status(ctx.response_id)
             # Clear the per-turn pointers so a stray late callback
             # (e.g. one fired after the SDK's stream closed) sees
             # ``None`` and returns an explicit error rather than
@@ -757,6 +757,13 @@ class ExecutorAdapter(HarnessApp):
             content_preview=f"{tool_name}({preview})",
         )
         result = await ctx.elicit(elicitation_id, params)
+        if result.action == "decline":
+            # The SDK invokes this callback from a spawned control-request
+            # task whose try/except would swallow a raised exception before
+            # it could reach run_turn's except block. Signal the cancellation
+            # via ctx.cancelled instead — the run_turn event loop checks this
+            # flag between events and takes the existing interrupt path.
+            ctx.cancelled.set()
         return result.action == "accept"
 
     async def _stable_policy_evaluator(
@@ -928,7 +935,7 @@ class ExecutorAdapter(HarnessApp):
                 )
             )
         elif isinstance(event, ToolCallComplete):
-            # Paired function_call_output. Downstream consumers (ap-web
+            # Paired function_call_output. Downstream consumers (web
             # blockStream, runner persistence) pair results to requests
             # STRICTLY by call_id and discard empty ones — there is NO
             # positional correlation, so a ToolCallComplete that reaches

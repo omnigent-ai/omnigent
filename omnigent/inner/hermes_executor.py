@@ -232,15 +232,14 @@ def _populate_hermes_home(
     """
     hermes_home.mkdir(parents=True, exist_ok=True)
 
-    # Write the wrapper shell script that sets env vars and execs the hook.
+    # Write the wrapper shell script that sets env vars and execs the hook. It
+    # bakes a one-shot auth token + workspace-routing header, so it is
+    # owner-only (0o700) — the secret is never world-readable.
+    from omnigent.native_policy_hook import policy_hook_wrapper_script
+
     wrapper = hermes_home / "omnigent-policy-hook.sh"
-    wrapper.write_text(
-        f"#!/bin/sh\n"
-        f"export _OMNIGENT_SERVER_URL='{server_url}'\n"
-        f"export _OMNIGENT_SESSION_ID='{session_id}'\n"
-        f"exec '{sys.executable}' '{hook_script_path}'\n"
-    )
-    wrapper.chmod(0o755)
+    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.chmod(0o700)
 
     # Start from the user's config so model/provider/auth settings carry over.
     # Hermes scopes everything to HERMES_HOME, so without this merge it won't
@@ -296,6 +295,7 @@ def _build_hermes_args(
     *,
     model: str | None = None,
     session_id: str | None = None,
+    skills_filter: str | list[str] | None = None,
 ) -> list[str]:
     """
     Build the argument list for a Hermes subprocess call.
@@ -304,6 +304,9 @@ def _build_hermes_args(
     :param message: The user message text.
     :param model: Optional model override (``-m`` flag).
     :param session_id: Optional session ID to resume (``--resume``).
+    :param skills_filter: Skills to preload. A non-empty list preloads
+        those named skills (``-s a,b``); ``"none"`` skips preloaded
+        skills (``--ignore-rules``); ``"all"``/``None``/empty adds nothing.
     :returns: A list of CLI arguments.
     """
     args = [
@@ -319,6 +322,10 @@ def _build_hermes_args(
         args.extend(["-m", model])
     if session_id:
         args.extend(["--resume", session_id])
+    if isinstance(skills_filter, list) and skills_filter:
+        args.extend(["-s", ",".join(skills_filter)])
+    elif skills_filter == "none":
+        args.append("--ignore-rules")
     return args
 
 
@@ -471,6 +478,7 @@ class HermesExecutor(Executor):
             message=user_text,
             model=model,
             session_id=hermes_sid,
+            skills_filter=self._skills_filter,
         )
 
         # Build subprocess env with per-session HERMES_HOME for policy hooks.

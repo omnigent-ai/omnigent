@@ -354,16 +354,15 @@ def main(argv: list[str] | None = None) -> None:
     """
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
-    # Initialize MLflow tracing in the harness subprocess so
-    # ExecutorAdapter can emit spans for agent turns, tool calls,
-    # and LLM interactions. No-op when OTEL_EXPORTER_OTLP_ENDPOINT
-    # is unset or mlflow is not installed.
+    # Initialize OTel tracing in the harness subprocess so ExecutorAdapter
+    # can emit spans for agent turns, tool calls, and LLM interactions.
+    # No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
     try:
         from omnigent.runtime import telemetry
 
-        telemetry.init()
+        telemetry.init("omni-harness")
     except Exception:
-        pass  # mlflow not installed or init failed; tracing disabled
+        pass  # tracing init failed; continue without tracing
 
     app = _load_harness_app(args.harness, args.module, args.conversation_id)
     if args.parent_pid is not None:

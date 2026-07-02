@@ -15,9 +15,13 @@ Key differences from the retired transcript-based ``step_to_events`` mapper:
    steps (no token streaming), so the delta round-trip causes a double-render
    in the UI. This mapper drops it entirely.
 
-2. **USER_INPUT → ``[]`` (skip).** The user turn is already persisted by the
-   direct ``POST /events`` that the server hook fires before agy processes it.
-   Emitting it again from the RPC transcript would duplicate the user message.
+2. **USER_INPUT is committed (not skipped).** The user turn is mapped to a
+   ``message`` item via :func:`_user_message_event` so the web UI reconciles its
+   optimistic bubble against a committed item. This is NOT redundant: the
+   TUI-inject write path (and the prior pure-RPC ``SendUserCascadeMessage`` path)
+   fire no ``POST /events`` for the user turn, so without this the user message
+   would never be committed (#1155). The reader dedups USER_INPUT by its per-turn
+   ``executionId``, so the message commits exactly once per turn.
 
 3. **RPC field names.** The RPC response uses ``CORTEX_STEP_TYPE_*`` type
    enums, camelCase keys (``plannerResponse``, ``runCommand``, ``stepIndex``),
@@ -878,17 +882,20 @@ def map_step_to_events(
     """
     Map one agy RPC step to Omnigent conversation-item events.
 
-    This is the pure, no-delta, no-USER_INPUT mapping layer for the RPC-based
-    read path. It produces ``external_conversation_item`` events
+    This is the pure, no-delta mapping layer for the RPC-based read path. It
+    produces ``external_conversation_item`` events
     (``message`` / ``function_call`` / ``function_call_output``) and emits no
-    ``external_output_text_delta`` and no user-message mirror (the user turn is
-    persisted by the direct ``POST /events`` hook).
+    ``external_output_text_delta``. The user turn IS mirrored here (see below) —
+    nothing else commits it on the TUI-inject write path.
 
     Mapping:
 
-    * ``CORTEX_STEP_TYPE_USER_INPUT`` → ``[]`` (skipped — the user turn is
-      already persisted by the direct ``POST /events`` hook; emitting it here
-      would duplicate the user message).
+    * ``CORTEX_STEP_TYPE_USER_INPUT`` → one ``message`` item (role user)
+      committing the user's turn, so the web UI reconciles its optimistic bubble
+      against a committed item. The write path fires no ``POST /events`` for the
+      user turn, so without this the user message would never be committed
+      (#1155). The reader dedups USER_INPUT by its per-turn ``executionId``, so
+      this commits exactly once. An empty user turn → ``[]``.
     * ``CORTEX_STEP_TYPE_PLANNER_RESPONSE`` **at status DONE** → one ``message``
       item (role assistant) when ``plannerResponse.modifiedResponse`` (or
       ``response``) is non-empty, then one ``function_call`` item per
@@ -917,7 +924,8 @@ def map_step_to_events(
 
     Step-index handling: ``sourceTrajectoryStepInfo.stepIndex`` is proto-omitted
     when zero.  A missing index is treated as ``0`` so slot-0 steps (which in
-    practice are USER_INPUT and are already skipped) are never silently dropped.
+    practice are the turn-opening USER_INPUT, committed as a ``message`` item)
+    are never silently dropped.
 
     :param step: One step dict from ``GetCascadeTrajectorySteps``.
     :param conversation_id: agy conversation id (namespaces response ids and

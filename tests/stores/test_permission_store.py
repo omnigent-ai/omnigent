@@ -430,6 +430,50 @@ def test_ensure_user_does_not_overwrite_admin_flag(
     )
 
 
+# ── list_users ───────────────────────────────────────────────────────────────
+
+
+def test_list_users_returns_real_users_with_admin_flag(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """``list_users`` returns every real user with the admin flag set.
+
+    Backs the OIDC/header admin user list — the analog of the
+    accounts-mode ``account_store.list_users()``.
+    """
+    store.ensure_user("alice@test.com", is_admin=True)
+    store.ensure_user("bob@test.com")
+
+    users = {u.id: u for u in store.list_users()}
+    assert set(users) == {"alice@test.com", "bob@test.com"}
+    assert users["alice@test.com"].is_admin is True
+    assert users["bob@test.com"].is_admin is False
+    # Header/OIDC rows have no password — the Account shape must reflect that.
+    assert users["bob@test.com"].has_password is False
+
+
+def test_list_users_excludes_reserved_sentinels(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """``list_users`` hides the ``local`` and ``__public__`` sentinels.
+
+    They aren't real, actionable actors, matching
+    ``account_store.list_users()`` so the admin list is identical
+    across auth modes.
+    """
+    store.ensure_user("local", is_admin=True)
+    store.ensure_user("__public__")
+    store.ensure_user("real@test.com")
+
+    ids = {u.id for u in store.list_users()}
+    assert ids == {"real@test.com"}
+
+
+def test_list_users_empty(store: SqlAlchemyPermissionStore) -> None:
+    """``list_users`` returns an empty list when there are no real users."""
+    assert store.list_users() == []
+
+
 # ── is_admin ─────────────────────────────────────────────────────────────────
 
 

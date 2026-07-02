@@ -236,6 +236,62 @@ async def test_lifecycle_emits_running_then_idle() -> None:
     assert statuses == ["running", "idle"]
 
 
+async def test_session_error_auth_posts_failed_with_reauth() -> None:
+    """A ProviderAuthError surfaces a `failed` edge flagged for re-auth.
+
+    opencode reports an expired/invalid provider key as `session.error` with a
+    `ProviderAuthError`; the forwarder must post `external_session_status:
+    failed` carrying both the error message and the re-auth hint plus
+    `reauth_required` so the web UI prompts a re-login instead of rendering a
+    silent idle.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.error",
+            error={
+                "name": "ProviderAuthError",
+                "data": {"providerID": "anthropic", "message": "invalid api key"},
+            },
+        )
+    )
+    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
+    assert status["status"] == "failed"
+    assert status["reauth_required"] is True
+    assert "invalid api key" in status["output"]
+    assert fwd_mod._OPENCODE_REAUTH_HINT in status["output"]
+
+
+async def test_session_error_generic_posts_failed_without_reauth() -> None:
+    """A non-auth error surfaces a `failed` edge with the message, no re-auth."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.error",
+            error={"name": "APIError", "data": {"statusCode": 500, "message": "upstream boom"}},
+        )
+    )
+    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
+    assert status["status"] == "failed"
+    assert status["output"] == "upstream boom"
+    assert "reauth_required" not in status
+
+
+async def test_session_error_message_aborted_takes_idle_path() -> None:
+    """A MessageAbortedError is a user interrupt → the normal idle path."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event("session.error", error={"name": "MessageAbortedError", "data": {}})
+    )
+    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
+    assert status["status"] == "idle"
+    assert "reauth_required" not in status
+    assert "output" not in status
+
+
 async def test_permission_asked_rejects_when_no_policy_wired() -> None:
     """Absent a policy evaluator the forwarder FAILS CLOSED (no auto-approve).
 
@@ -429,6 +485,45 @@ async def test_seed_dedupe_from_history_swallows_errors() -> None:
     fwd = _forwarder(server, opencode)
     await fwd.seed_dedupe_from_history()  # best-effort → no raise
     assert fwd._msg_role == {}
+
+
+async def test_seed_dedupe_from_history_seeds_usage() -> None:
+    """Resume seeding rebuilds cumulative usage and re-posts it immediately."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [
+        {
+            "info": {
+                "id": "msg_1",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-5",
+                "providerID": "anthropic",
+                "cost": 0.01,
+                "tokens": {"input": 1000, "output": 50, "cache": {"read": 200, "write": 0}},
+            },
+            "parts": [],
+        },
+        {
+            "info": {
+                "id": "msg_2",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-5",
+                "providerID": "anthropic",
+                "cost": 0.02,
+                "tokens": {"input": 2000, "output": 100, "cache": {"read": 300, "write": 0}},
+            },
+            "parts": [],
+        },
+        {"info": {"id": "msg_u", "role": "user"}, "parts": []},
+    ]
+    fwd = _forwarder(server, opencode)
+    await fwd.seed_dedupe_from_history()
+    # Usage is rebuilt per assistant message id (user messages contribute none).
+    assert set(fwd._usage_by_message) == {"msg_1", "msg_2"}
+    usage = next(b for _u, b in server.posts if b["type"] == "external_session_usage")["data"]
+    assert usage["cumulative_cost_usd"] == 0.03  # 0.01 + 0.02
+    assert usage["cumulative_input_tokens"] == 3000  # 1000 + 2000
+    assert usage["cumulative_output_tokens"] == 150  # 50 + 100
+    assert usage["cumulative_cache_read_input_tokens"] == 500  # 200 + 300
 
 
 async def test_compaction_started_posts_in_progress() -> None:

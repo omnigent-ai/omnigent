@@ -36,7 +36,11 @@ def _goal_response(session_id: str, method: str, suffix: str = ""):
     return _matches
 
 
-@pytest.mark.timeout(900)
+# Boots a real native Codex CLI and drives it via a prebuilt codex-parity
+# sidecar (CI supplies the binary through CODEX_PARITY_SIDECAR_BIN, so no
+# multi-minute cargo build runs here). timeout(300) matches the sibling
+# native-Codex render-parity tests now that the sidecar build is out of band.
+@pytest.mark.timeout(300)
 def test_codex_goal_mode_with_mocked_responses(
     page: Page,
     mocked_native_codex_goal_session: MockedCodexNativeSession,

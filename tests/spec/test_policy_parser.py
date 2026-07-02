@@ -111,29 +111,26 @@ def test_parse_labels_bare_string_shorthand() -> None:
     # Bare-string shorthand sets only `initial`; no schema declared.
     assert d.initial == "1"
     assert d.values is None
-    assert d.monotonic is None
 
 
 def test_parse_labels_schema_with_initial() -> None:
-    """Full-schema dict: initial + values + monotonic all land."""
+    """Full-schema dict: initial + values both land."""
     spec = _parse_guardrails(
         _yaml("""
 labels:
   sensitivity:
     initial: public
     values: [public, internal, confidential]
-    monotonic: increasing
 """)
     )
     assert spec is not None and spec.labels is not None
     d = spec.labels["sensitivity"]
     assert d.initial == "public"
     assert d.values == ["public", "internal", "confidential"]
-    assert d.monotonic == "increasing"
 
 
 def test_parse_labels_schema_without_initial() -> None:
-    """`{values: [...], monotonic: ...}` without initial —
+    """`{values: [...]}` without initial —
     label is unset until a policy writes it (§10)."""
     spec = _parse_guardrails(
         _yaml("""
@@ -151,23 +148,11 @@ labels:
 def test_parse_labels_empty_dict_rejected() -> None:
     """`integrity: {}` → typo guard (POLICIES.md §13).
 
-    An empty dict declaring neither `initial`, `values`, nor
-    `monotonic` is almost always an unfinished edit.
+    An empty dict declaring neither `initial` nor `values`
+    is almost always an unfinished edit.
     """
     with pytest.raises(OmnigentError, match=r"empty dict"):
         _parse_guardrails(_yaml("labels: {integrity: {}}"))
-
-
-def test_parse_labels_monotonic_without_values_rejected() -> None:
-    """`monotonic` without `values` has no positions to order."""
-    with pytest.raises(OmnigentError, match=r"monotonic.*requires a .values. list"):
-        _parse_guardrails(
-            _yaml("""
-labels:
-  bad:
-    monotonic: increasing
-""")
-        )
 
 
 def test_parse_labels_initial_not_in_values_rejected() -> None:
@@ -179,19 +164,6 @@ labels:
   level:
     initial: "5"
     values: ["1", "2"]
-""")
-        )
-
-
-def test_parse_labels_monotonic_unknown_direction_rejected() -> None:
-    """`monotonic: up` → clear error listing the two valid values."""
-    with pytest.raises(OmnigentError, match=r"must be 'increasing' or 'decreasing'"):
-        _parse_guardrails(
-            _yaml("""
-labels:
-  x:
-    values: ["0", "1"]
-    monotonic: up
 """)
         )
 

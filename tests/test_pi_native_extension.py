@@ -2518,3 +2518,78 @@ def test_policy_fast_error_racing_abort_is_bounded_fails_closed(
 });
 """
     _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_outbound_requests_reread_refreshed_bearer(tmp_path: Path) -> None:
+    """Each outbound POST re-reads ``authHeaders``, picking up the runner's re-mint.
+
+    The bearer baked into ``config.json`` at launch dies with the ~1h
+    Databricks OAuth lifetime. The runner re-mints it into the config each
+    turn; the extension must read the bearer fresh per request (not the
+    launch snapshot it closed over at startup) so its POSTs stay
+    authenticated mid-session instead of failing closed. Drives two
+    ``message_end`` flushes with a config rewrite between them and asserts the
+    second POST carries the new bearer.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const configPath = path.join(require("os").tmpdir(), `pi-reauth-${process.pid}.json`);
+function writeConfig(bearer) {
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      serverUrl: "http://omnigent.test",
+      sessionId: "session-1",
+      authHeaders: { authorization: bearer },
+    }),
+  );
+}
+writeConfig("Bearer stale");
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+const sentAuth = [];
+global.fetch = async (_url, request) => {
+  sentAuth.push(request.headers.authorization);
+  return { ok: true };
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const handlers = {};
+const pi = { registerCommand() {}, on(name, handler) { handlers[name] = handler; } };
+require(extensionPath)(pi);
+const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
+
+function usage(id) {
+  return {
+    message: {
+      id,
+      role: "assistant",
+      model: "databricks-claude-sonnet-4-6",
+      usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11 },
+    },
+  };
+}
+
+(async () => {
+  await handlers.message_end(usage("m1"), ctx);
+  // The runner re-mints the bearer into config.json mid-session.
+  writeConfig("Bearer fresh");
+  await handlers.message_end(usage("m2"), ctx);
+
+  // First POST used the launch token; the second re-read the rewritten config
+  // and carried the fresh bearer — not the stale one closed over at startup.
+  assert.deepEqual(sentAuth, ["Bearer stale", "Bearer fresh"], JSON.stringify(sentAuth));
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    _run_extension_script(node, _extension_path(), script)

@@ -91,6 +91,16 @@ def isolated_config(tmp_path, monkeypatch):
     # Redirect CLI-detected credential homes so a developer's real
     # ~/.claude / ~/.codex logins don't leak into ambient detection.
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Stub out the two ambient-detection helpers that read real machine
+    # state regardless of HOME / env-var isolation:
+    # - _ollama_reachable: TCP-probes localhost:11434; a running Ollama
+    #   would otherwise add an entry to the harness menu and shift option
+    #   numbers, making input sequences non-deterministic.
+    # - _claude_login_detected: on macOS falls back to `claude auth status`
+    #   which reads the Keychain (not HOME), so a real Claude subscription
+    #   leaks through even with HOME redirected to tmp_path.
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._claude_login_detected", lambda: False)
     return tmp_path
 
 
