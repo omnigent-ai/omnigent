@@ -1010,5 +1010,17 @@ class DatabricksExecutor(Executor):
                 except (json.JSONDecodeError, TypeError):
                     args = {"raw": tc["arguments"]}
                 yield ToolCallRequest(name=tc["name"], args=args)
-        else:
+        elif full_text:
+            # Truncated stream that still produced content: surface what we got
+            # but warn — a missing finish_reason means the turn may be incomplete.
+            logger.warning(
+                "DatabricksExecutor: stream ended without finish_reason; "
+                "returning %d chars of partial content",
+                len(full_text),
+            )
             yield TurnComplete(response=full_text)
+        else:
+            # No finish_reason, no content, no tool calls: the worker stream died
+            # mid-turn. Fail loudly instead of yielding a silent empty success
+            # that masks the aborted turn (#1118).
+            yield ExecutorError(message="Stream ended without finish_reason")
