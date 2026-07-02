@@ -78,25 +78,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          # rc / dev / alpha / beta versions are flagged as pre-releases.
-          pre=""
-          case "$TAG" in
-            *rc*|*dev*|*a[0-9]*|*b[0-9]*) pre="--prerelease" ;;
-          esac
           # Rerun-safe: upload assets to an existing release, else create a draft
           # one (which creates the vscode-v<version> tag on the built commit).
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
               --repo "$GITHUB_REPOSITORY" --clobber
           else
-            # $pre word-splits to nothing when empty; only ever "" or "--prerelease".
             gh release create "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
               --repo "$GITHUB_REPOSITORY" \
               --draft \
               --target "${{ steps.meta.outputs.sha }}" \
               --title "VS Code extension $TAG" \
-              --notes "Omnigent VS Code extension \`$TAG\`. Marketplace / Open VSX publishing runs from the secure-release repo, which downloads and SHA256-verifies the attached \`.vsix\`." \
-              $pre
+              --notes "Omnigent VS Code extension \`$TAG\`. Marketplace / Open VSX publishing runs from the secure-release repo, which downloads and SHA256-verifies the attached \`.vsix\`."
           fi
           echo "Drafted release $TAG with the .vsix + .sha256 — review and publish it from the Releases page." \
             | tee -a "$GITHUB_STEP_SUMMARY"

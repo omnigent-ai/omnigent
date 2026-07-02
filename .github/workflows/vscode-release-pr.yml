@@ -51,9 +51,13 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          # Semver X.Y.Z with an optional prerelease suffix (rc1, dev0, …).
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-]?[a-z]+[0-9]*)?$ ]]; then
-            echo "::error::Version '$VERSION' is not a valid X.Y.Z[suffix]."
+          # Strict X.Y.Z only. VS Code Marketplace versions are numeric
+          # major.minor.patch — `vsce package` rejects prerelease suffixes
+          # (pre-releases use the --pre-release flag, not a version suffix), so
+          # accepting a suffix here would produce a version bump that later
+          # fails at package time.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' is not a valid X.Y.Z."
             exit 1
           fi
 
