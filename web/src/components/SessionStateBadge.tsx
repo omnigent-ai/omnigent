@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { SessionState } from "@/hooks/useSessionState";
 import { cn } from "@/lib/utils";
+import type { ReactElement } from "react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
@@ -16,7 +17,7 @@ interface Visual {
   kind: SessionState["kind"];
   ariaLabel: string;
   tooltip: string;
-  render: () => JSX.Element;
+  render: () => ReactElement;
 }
 
 function describe(state: SessionState): Visual {
