@@ -61,6 +61,8 @@ from omnigent_ui_sdk.terminal._formatter import FormattedItem
 from omnigent_ui_sdk.terminal._theme import LIGHT_THEME, get_theme
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion, merge_completers
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import StyleAndTextTuples
+from prompt_toolkit.lexers import Lexer
 from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
@@ -3829,6 +3831,14 @@ async def run_repl(
     # nested closure can rebind the value.
     _bang_cwd: list[str] = [os.getcwd()]
 
+    # Paint the composer in the omnigent-logo green while the line is a "!"
+    # shell command, so bang mode is visible before Enter is pressed.
+    # ``PromptSession`` reads ``.lexer`` through a ``DynamicLexer``, so setting
+    # it here takes effect live.
+    _prompt_session = getattr(host, "_prompt", None)
+    if _prompt_session is not None:
+        _prompt_session.lexer = _BangInputLexer()
+
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
 
@@ -3891,9 +3901,7 @@ async def run_repl(
             if cd_target is not None:
                 if os.path.isdir(cd_target):
                     _bang_cwd[0] = cd_target
-                    host.output(
-                        Text.from_markup(f"  [{fmt.accent}]![/{fmt.accent}] {escape(cmd)}")
-                    )
+                    host.output(Text.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
                     host.output(
                         Text.from_markup(
                             f"   [{fmt.muted}]now in {escape(cd_target)}[/{fmt.muted}]"
@@ -8313,6 +8321,34 @@ _BANG_TIMEOUT_S: float = float(os.environ.get("OMNIGENT_BANG_TIMEOUT_S") or 120.
 _BANG_DISPLAY_MAX: int = int(os.environ.get("OMNIGENT_BANG_DISPLAY_MAX") or 30_000)
 _BANG_CONTEXT_MAX: int = int(os.environ.get("OMNIGENT_BANG_CONTEXT_MAX") or 16_000)
 
+# The omnigent-logo green. Marks a "!" shell command consistently: the composer
+# while it's being typed, and the echoed command line once it runs.
+_BANG_GREEN = "#26a079"
+_BANG_INPUT_STYLE = f"fg:{_BANG_GREEN} bold"  # prompt-toolkit composer style
+# Rich-markup style for the echoed "! <cmd>" line (see _run_bang_command).
+_BANG_ECHO_MARKUP = f"bold {_BANG_GREEN}"
+
+
+class _BangInputLexer(Lexer):
+    """
+    Color the composer green while the current line is a "!" shell command.
+
+    A line that begins with ``!`` (but not the ``!!`` literal-escape) runs in
+    the shell via the passthrough; painting it in the omnigent-logo green is
+    live feedback that bang mode is active. Any other input renders unstyled.
+    """
+
+    def lex_document(self, document: Document) -> Callable[[int], StyleAndTextTuples]:
+        text = document.text
+        is_bang = text.startswith("!") and not text.startswith("!!")
+        style = _BANG_INPUT_STYLE if is_bang else ""
+        lines = document.lines
+
+        def get_line(lineno: int) -> StyleAndTextTuples:
+            return [(style, lines[lineno])]
+
+        return get_line
+
 
 def _bang_shell_argv(cmd: str) -> list[str]:
     """Argv to run ``cmd`` via the platform shell.
@@ -8427,7 +8463,7 @@ async def _run_bang_command(
     from rich.text import Text as _RText
 
     host.output(_RText.from_markup(""))
-    host.output(_RText.from_markup(f"  [{fmt.accent}]![/{fmt.accent}] {escape(cmd)}"))
+    host.output(_RText.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
 
     loop = asyncio.get_running_loop()
     start = loop.time()

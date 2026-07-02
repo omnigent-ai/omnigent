@@ -13,10 +13,13 @@ import os
 import pathlib
 
 import pytest
+from prompt_toolkit.document import Document
 
 from omnigent.repl import _repl
 from omnigent.repl._repl import (
+    _BANG_INPUT_STYLE,
     _bang_shell_argv,
+    _BangInputLexer,
     _build_bang_context,
     _clip_text,
     _resolve_cd,
@@ -132,6 +135,16 @@ async def test_run_respects_cwd(tmp_path: pathlib.Path) -> None:
     assert "marker.txt" in block
 
 
+@pytest.mark.posix_only
+async def test_run_echoes_command_in_logo_green() -> None:
+    # The echoed "! <cmd>" line is rendered in the omnigent-logo green so it
+    # matches the green composer input.
+    host = _FakeHost()
+    await _run_bang_command("echo hi", host, _FakeFmt())
+    styles = [str(span.style) for item in host.items for span in getattr(item, "spans", [])]
+    assert any("#26a079" in s for s in styles), styles
+
+
 # ── cross-platform shell selection ──────────────────────
 
 
@@ -183,3 +196,29 @@ def test_write_overflow_writes_full_capture(monkeypatch: pytest.MonkeyPatch) -> 
 def test_build_context_notes_overflow_path() -> None:
     block = _build_bang_context("c", "x", "", "exit: 0", overflow_path="/tmp/x.log")
     assert "/tmp/x.log" in block and "full output" in block
+
+
+# ── _BangInputLexer (composer coloring) ─────────────────
+
+
+def test_bang_input_style_is_the_logo_green() -> None:
+    # The omnigent-logo green (#26a079) must be the exact hex used.
+    assert "#26a079" in _BANG_INPUT_STYLE
+
+
+@pytest.mark.parametrize(
+    ("text", "colored"),
+    [
+        ("!echo hi", True),  # a "!" shell command → green
+        ("!", True),  # bare "!" (bang mode active) → green
+        ("!cd /tmp", True),  # "!cd" is still a bang command → green
+        ("!!literal", False),  # "!!" escape → ordinary prompt, not green
+        ("ls -la", False),  # normal prompt → unstyled
+        ("", False),  # empty composer → unstyled
+    ],
+)
+def test_bang_input_lexer_colors_only_bang_lines(text: str, colored: bool) -> None:
+    get_line = _BangInputLexer().lex_document(Document(text))
+    style, rendered = get_line(0)[0]
+    assert rendered == text
+    assert (style == _BANG_INPUT_STYLE) is colored
