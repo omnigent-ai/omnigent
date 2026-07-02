@@ -133,6 +133,8 @@ class TestModelFamilyMismatch:
         ("harness", "model"),
         [
             ("claude-native", "databricks-claude-sonnet-4-6"),
+            ("claude-native", "claude-sonnet-5"),
+            ("claude-sdk", "databricks-claude-sonnet-5"),
             ("claude-sdk", "claude-opus-4-8"),
             ("codex-native", "databricks-gpt-5-4"),
             ("codex", "gpt-5.1-codex"),
@@ -141,6 +143,7 @@ class TestModelFamilyMismatch:
             # Claude tool-calling turn over the chat wire), so it accepts the
             # Claude / Kimi / Llama families the gateway also serves it.
             ("openai-agents", "databricks-claude-sonnet-4-6"),
+            ("openai-agents", "databricks-claude-sonnet-5"),
             ("openai-agents", "databricks-kimi-k2-6"),
             ("openai-agents", "databricks-meta-llama-3.3-70b-instruct"),
             # The "-sdk" / executor-type spellings canonicalize_harness
@@ -177,6 +180,7 @@ class TestModelFamilyMismatch:
             ("native-claude", "gpt-5.4", "only runs Claude models"),
             ("claude-sdk", "databricks-meta-llama-3.3-70b-instruct", "only runs Claude models"),
             ("codex-native", "databricks-claude-sonnet-4-6", "only runs GPT models"),
+            ("codex-native", "claude-sonnet-5", "only runs GPT models"),
             ("native-codex", "claude-opus-4-8", "only runs GPT models"),
             ("codex", "databricks-meta-llama-3.3-70b-instruct", "only runs GPT models"),
             # antigravity is Gemini-native: syntactically valid non-Gemini ids
@@ -186,6 +190,7 @@ class TestModelFamilyMismatch:
             # also covers the no-gateway-path prefix rejection.
             ("antigravity", "gpt-5.4-mini", "Gemini-native"),
             ("antigravity", "databricks-claude-sonnet-4-6", "Gemini-native"),
+            ("antigravity", "claude-sonnet-5", "Gemini-native"),
             ("antigravity", "claude-opus-4-8", "Gemini-native"),
             ("agy", "gpt-5.4-mini", "Gemini-native"),
             ("google-antigravity", "databricks-gpt-5-4", "Gemini-native"),
@@ -223,6 +228,7 @@ class TestModelFamilyMismatch:
     [
         # Bare canonical vendor ids gain the gateway prefix mechanically.
         ("claude-opus-4-8", "databricks-claude-opus-4-8"),
+        ("claude-sonnet-5", "databricks-claude-sonnet-5"),
         ("claude-sonnet-4-6", "databricks-claude-sonnet-4-6"),
         ("gpt-5-4", "databricks-gpt-5-4"),
         ("gpt-5.4-mini", "databricks-gpt-5.4-mini"),
@@ -253,6 +259,7 @@ def test_normalize_localizes_canonical_ids_for_gateway_children(model: str, expe
     [
         # Gateway-local ids lose the prefix for vendor-direct children.
         ("databricks-claude-opus-4-8", "claude-opus-4-8"),
+        ("databricks-claude-sonnet-5", "claude-sonnet-5"),
         ("databricks-gpt-5-4", "gpt-5-4"),
         # The stripped remainder must itself be a mechanical claude/gpt
         # id — other families have no canonical vendor counterpart.
@@ -301,9 +308,11 @@ def test_normalize_passes_through_for_unmapped_provider_kinds(
     [
         # Mechanical gateway counterparts strip to the canonical id.
         ("databricks-claude-haiku-4-5", "claude-haiku-4-5"),
+        ("databricks-claude-sonnet-5", "claude-sonnet-5"),
         ("databricks-gpt-5-4-mini", "gpt-5-4-mini"),
         # Already canonical: unchanged.
         ("claude-haiku-4-5", "claude-haiku-4-5"),
+        ("claude-sonnet-5", "claude-sonnet-5"),
         # Non-claude/gpt remainders have no mechanical counterpart —
         # stripping would fabricate a vendor id that does not exist.
         ("databricks-meta-llama-3.3-70b-instruct", "databricks-meta-llama-3.3-70b-instruct"),

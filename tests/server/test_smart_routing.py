@@ -78,11 +78,13 @@ def test_infer_models_claude_sdk() -> None:
     models = infer_models("claude-sdk")
     assert models is not None
     assert any("haiku" in m for m in models)
+    assert "databricks-claude-sonnet-5" in models
     assert any("opus" in m for m in models)
     # Ordered cheapest → most powerful
     haiku_idx = next(i for i, m in enumerate(models) if "haiku" in m)
+    sonnet5_idx = models.index("databricks-claude-sonnet-5")
     opus_idx = next(i for i, m in enumerate(models) if "opus" in m)
-    assert haiku_idx < opus_idx
+    assert haiku_idx < sonnet5_idx < opus_idx
 
 
 def test_infer_models_native_harnesses() -> None:
@@ -105,6 +107,7 @@ def test_infer_models_pi() -> None:
     models = infer_models("pi")
     assert models is not None
     assert any("haiku" in m for m in models)
+    assert "databricks-claude-sonnet-5" in models
     assert any("gpt" in m for m in models)
 
 

@@ -7,8 +7,8 @@ website under `/releases`.
 
 ## [Unreleased]
 
-- [Runtime] Add `claude-sonnet-5` to the static Claude subscription catalog used
-  by `sys_list_models`.
+- [Runtime] Add `claude-sonnet-5` to static Claude model catalogs used by
+  `sys_list_models` and smart routing fallbacks.
 
 ## [v0.3.0] — 2026-06-26
 

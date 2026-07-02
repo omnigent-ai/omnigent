@@ -29,6 +29,7 @@ MODEL_LISTS: dict[str, list[str]] = {
     "claude": [
         "databricks-claude-haiku-4-5",
         "databricks-claude-sonnet-4-6",
+        "databricks-claude-sonnet-5",
         "databricks-claude-opus-4-8",
     ],
     "gpt": [
@@ -43,6 +44,7 @@ MODEL_LISTS: dict[str, list[str]] = {
         "databricks-claude-haiku-4-5",
         "databricks-gpt-5-4-mini",
         "databricks-claude-sonnet-4-6",
+        "databricks-claude-sonnet-5",
         "databricks-gpt-5-4",
         "databricks-claude-opus-4-8",
         "databricks-gpt-5-5",
