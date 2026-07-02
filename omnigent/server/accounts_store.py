@@ -36,9 +36,13 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.db.db_models import SqlAccountToken, SqlUser
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Account, AccountToken
-from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_MEMBERS,
+    RESERVED_USER_PUBLIC,
+)
 
-_HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
+_HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_MEMBERS, RESERVED_USER_LOCAL})
 
 
 def _to_account(row: SqlUser) -> Account:
@@ -174,11 +178,13 @@ class SqlAlchemyAccountStore:
     def list_users(self) -> list[Account]:
         """Return all users for the admin members page.
 
-        Excludes two sentinel rows that aren't actionable in
+        Excludes the sentinel rows that aren't actionable in
         accounts mode:
 
         - ``"__public__"`` — anonymous-grant sentinel, never a
           real user.
+        - ``"__members__"`` — all-signed-in-members grant sentinel,
+          likewise never a real user.
         - ``"local"`` — backfilled by the original session-permissions
           migration so pre-accounts deploys had a default owner row
           for existing conversations. In accounts mode the name is

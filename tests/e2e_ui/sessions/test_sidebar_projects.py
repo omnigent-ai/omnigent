@@ -105,6 +105,8 @@ def test_remove_session_from_project(
 
     Moves the row into a fresh project first, then uses the kebab's
     "Remove from <project>" item and asserts the row returns to "Chats".
+    Projects are first-class, so unfiling the last chat leaves the (now
+    empty) project folder in place rather than deleting it.
     """
     base_url, session_id = seeded_session
     title = f"e2e-proj-rm-{uuid.uuid4().hex[:8]}"
@@ -133,10 +135,10 @@ def test_remove_session_from_project(
     project_row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
     # The kebab item names the project it removes from ("Remove from <name>").
+    # Unfiling is immediate now — no confirmation (the project is first-class
+    # and survives with zero chats).
     page.get_by_role("menuitem", name=re.compile(rf"Remove from {re.escape(project)}")).click()
-    # Removal is confirmed (it may delete the implicit project) — accept it.
-    page.get_by_role("button", name="Remove from project", exact=True).click()
 
-    # Back under "Chats", and the now-empty project folder is gone.
+    # Back under "Chats"; the (now empty) project folder is still present.
     expect(_section(page, "Chats").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(page.get_by_role("button", name=project, exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()

@@ -1711,6 +1711,7 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    project_id: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
@@ -1818,6 +1819,11 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param project_id: File the session under a first-class project.
+        A project id sets it; the empty string ``""`` unfiles it; ``None``
+        leaves it unchanged (mirrors the removed ``omni_project`` label's
+        empty-string-clears convention). The caller must be able to manage
+        the session and (when filing) manage the target project.
     """
 
     runner_id: str | None = None
@@ -1830,6 +1836,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    project_id: str | None = None
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")
@@ -2117,6 +2124,7 @@ class SessionListItem(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    project_id: str | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
     reasoning_effort: str | None = None
@@ -2184,6 +2192,66 @@ class PermissionObject(BaseModel):
 
     user_id: str
     conversation_id: str
+    level: int
+
+
+class ProjectObject(BaseModel):
+    """
+    API representation of a first-class project.
+
+    :param id: Project id, e.g. ``"proj_e4f5a6b7..."``.
+    :param name: Human-readable name, e.g. ``"Q3 launch"``.
+    :param created_by: The owner's user id, or ``None`` if that account was
+        deleted.
+    :param created_at: Unix epoch seconds when the project was created.
+    :param updated_at: Unix epoch seconds of the last mutation.
+    :param permission_level: The requesting caller's effective level on the
+        project (1=read, 2=edit, 3=manage, 4=owner), or ``None`` when
+        permissions are disabled.
+    :param members: ``True`` when the project is shared with all signed-in
+        members (``__members__`` grant present).
+    :param public: ``True`` when the project is shared via public link
+        (``__public__`` grant present).
+    """
+
+    id: str
+    name: str
+    created_by: str | None = None
+    created_at: int
+    updated_at: int
+    permission_level: int | None = None
+    members: bool = False
+    public: bool = False
+
+
+class ProjectCreateRequest(BaseModel):
+    """Request body for ``POST /v1/projects``.
+
+    :param name: The project name, e.g. ``"Q3 launch"``.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+
+
+class ProjectPatchRequest(BaseModel):
+    """Request body for ``PATCH /v1/projects/{id}`` (rename).
+
+    :param name: The new project name.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+
+
+class ProjectMember(BaseModel):
+    """
+    One grantee on a project.
+
+    :param user_id: The grantee — a real user id, or the ``"__members__"`` /
+        ``"__public__"`` sentinel.
+    :param level: The grant level (1=read, 2=edit, 3=manage, 4=owner).
+    """
+
+    user_id: str
     level: int
 
 

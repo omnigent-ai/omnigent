@@ -177,6 +177,7 @@ export function normalizePinnedConversationIds(
     it's already pinned. */
 export interface SidebarDragSource {
   id: string;
+  /** The project id the session is filed under, or ``null`` if unfiled. */
   project: string | null;
   isPinned: boolean;
 }
@@ -187,7 +188,7 @@ export interface SidebarDragSource {
     drop that landed on nothing droppable (e.g. "Shared with me", which is
     never a target — sessions can't be filed there). */
 export type SidebarDropTarget =
-  | { type: "project"; name: string }
+  | { type: "project"; projectId: string }
   | { type: "ungroup" }
   | { type: "pin" }
   | null;
@@ -234,8 +235,8 @@ export function resolveSidebarDrop(
     // Same project, not pinned → nothing to do. Same project but pinned → the
     // session is hidden up in Pinned, so re-file it (a no-op label write) and
     // unpin so it drops into this folder.
-    if (target.name === source.project && !source.isPinned) return { kind: "none" };
-    return { kind: "move", project: target.name, unpin: source.isPinned };
+    if (target.projectId === source.project && !source.isPinned) return { kind: "none" };
+    return { kind: "move", project: target.projectId, unpin: source.isPinned };
   }
   if (target.type === "pin") {
     // Pinning an already-pinned session is a no-op; otherwise pin it (the list

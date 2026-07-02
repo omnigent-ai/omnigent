@@ -4413,25 +4413,25 @@ def test_delete_label_is_noop_when_absent(
 def test_list_conversations_filters_by_project(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """``project="X"`` returns only sessions carrying that exact project label."""
+    """``project="<id>"`` returns only sessions filed under that project id."""
     filed = conversation_store.create_conversation()
     other = conversation_store.create_conversation()
     conversation_store.create_conversation()  # unfiled
 
-    conversation_store.set_labels(filed.id, {"omni_project": "X"})
-    conversation_store.set_labels(other.id, {"omni_project": "Y"})
+    conversation_store.set_project(filed.id, "proj_x")
+    conversation_store.set_project(other.id, "proj_y")
 
-    ids = {c.id for c in conversation_store.list_conversations(project="X").data}
+    ids = {c.id for c in conversation_store.list_conversations(project="proj_x").data}
     assert ids == {filed.id}
 
 
 def test_list_conversations_empty_project_returns_unfiled(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """``project=""`` returns only sessions with NO project label (Unfiled)."""
+    """``project=""`` returns only sessions not filed under any project (Unfiled)."""
     filed = conversation_store.create_conversation()
     unfiled = conversation_store.create_conversation()
-    conversation_store.set_labels(filed.id, {"omni_project": "X"})
+    conversation_store.set_project(filed.id, "proj_x")
 
     ids = {c.id for c in conversation_store.list_conversations(project="").data}
     assert unfiled.id in ids
@@ -4444,7 +4444,7 @@ def test_list_conversations_project_none_disables_filter(
     """``project=None`` (the default) returns filed and unfiled alike."""
     filed = conversation_store.create_conversation()
     unfiled = conversation_store.create_conversation()
-    conversation_store.set_labels(filed.id, {"omni_project": "X"})
+    conversation_store.set_project(filed.id, "proj_x")
 
     ids = {c.id for c in conversation_store.list_conversations().data}
     assert ids >= {filed.id, unfiled.id}

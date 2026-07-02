@@ -233,6 +233,86 @@ class SqlSessionPermission(Base):
     )
 
 
+class SqlProject(Base):
+    """
+    SQLAlchemy model for the ``projects`` table.
+
+    A project is a first-class, shareable collection of conversations.
+    Conversations reference their project via ``conversations.project_id``;
+    a project's access-control lives in ``project_permissions``, and a
+    session's effective access *inherits* from its project (so sharing a
+    project covers every chat in it, including chats filed later).
+
+    Names are unique per owner (``(created_by, name)``), so two users can
+    each own a project called ``"Client X"`` without collision.
+
+    :param id: Unique project identifier, e.g. ``"proj_e4f5a6b7..."``.
+    :param name: Human-readable project name, e.g. ``"Q3 launch"``.
+    :param created_by: The user id of the creator/owner, or ``None`` if
+        the owner's account was deleted (``ON DELETE SET NULL``).
+    :param created_at: Unix epoch seconds when the project was created.
+    :param updated_at: Unix epoch seconds of the last mutation (rename).
+    """
+
+    __tablename__ = "projects"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_by: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("created_by", "name", name="uq_projects_owner_name"),
+        Index("ix_projects_created_by", "created_by"),
+    )
+
+
+class SqlProjectPermission(Base):
+    """
+    SQLAlchemy model for the ``project_permissions`` table.
+
+    The ACL for a project — the direct analogue of
+    :class:`SqlSessionPermission`, keyed by ``(user_id, project_id)``.
+    A session's access resolver ORs a project grant in for any session
+    whose ``project_id`` points here, which is how project sharing
+    *inherits* to the project's chats (current and future).
+
+    The ``"__public__"`` (anyone with the link) and ``"__members__"``
+    (every signed-in user) sentinel ``user_id`` values work exactly as
+    they do for sessions.
+
+    :param user_id: The grantee, e.g. ``"alice@example.com"`` or a
+        sentinel (``"__public__"`` / ``"__members__"``).
+    :param project_id: The project being shared, e.g. ``"proj_e4f5..."``.
+    :param level: Numeric permission level: ``1`` = read, ``2`` = edit,
+        ``3`` = manage, ``4`` = owner. Comparison is ``>=``.
+    """
+
+    __tablename__ = "project_permissions"
+
+    user_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("level IN (1, 2, 3, 4)", name="ck_project_permissions_level"),
+        Index("ix_project_permissions_project_id", "project_id"),
+    )
+
+
 class SqlConversation(Base):
     """
     SQLAlchemy model for the ``conversations`` table.
@@ -344,6 +424,19 @@ class SqlConversation(Base):
         ForeignKey("hosts.host_id", ondelete="SET NULL"),
         nullable=True,
     )
+    # First-class project this conversation is filed under, replacing the
+    # old ``omni_project`` label. FK to projects.id; ON DELETE SET NULL so
+    # deleting a project unfiles its chats rather than deleting them. The
+    # session access resolver inherits the project's grants for any row
+    # whose project_id is set. Like host_id (see a7b3c9d1e5f2), the
+    # migration adds this as a plain column (no DB-level FK) to avoid a
+    # batch rebuild of the large conversations table; the FK here is ORM
+    # metadata only and materializes just on fresh create_all DBs.
+    project_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     # Per-session reasoning-effort hint, e.g. "high". Nullable;
     # None means use the agent default.
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -421,6 +514,9 @@ class SqlConversation(Base):
         # Reconnect reconciliation queries conversations by host_id on
         # every host reconnect; index it to avoid a full scan.
         Index("ix_conversations_host_id", "host_id"),
+        # The listing ACL unions "sessions whose project I can access", and
+        # the sidebar filters sessions by project_id — both scan on this.
+        Index("ix_conversations_project_id", "project_id"),
         Index("ix_conversations_root_conversation_id", "root_conversation_id"),
         # Phase 4: partial unique index on (parent_conversation_id,
         # title) prevents two same-named children under the same

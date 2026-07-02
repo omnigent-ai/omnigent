@@ -60,6 +60,7 @@ from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -81,6 +82,7 @@ from omnigent.stores.conversation_store import SessionConnectivity
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -1002,6 +1004,7 @@ def create_app(
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
+    project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1834,6 +1837,7 @@ def create_app(
             runner_router=runner_router,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            project_store=project_store,
             agent_cache=agent_cache,
             mcp_pool=_mcp_pool,
             # Lets WS /v1/sessions/updates fold runner + host liveness into
@@ -1853,6 +1857,17 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sessions"],
+    )
+    # First-class projects: CRUD + sharing (sessions inherit a project's ACL).
+    app.include_router(
+        create_projects_router(
+            project_store=project_store,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["projects"],
     )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only

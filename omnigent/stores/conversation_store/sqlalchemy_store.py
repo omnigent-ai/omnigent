@@ -102,6 +102,7 @@ def _to_conversation(
         agent_id=row.agent_id,
         runner_id=row.runner_id,
         host_id=row.host_id,
+        project_id=row.project_id,
         labels=labels if labels is not None else {},
         session_state=session_state,
         session_usage=session_usage,
@@ -1193,9 +1194,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         (4) grant outranks any read (1) / edit (2) / manage (3)
         grant, so ``ORDER BY level DESC LIMIT 1`` yields the owner
         without hardcoding the owner-level integer. The
-        ``"__public__"`` public-access sentinel is excluded, so a
-        session that only carries a public grant (and no real
-        owner) returns ``None`` rather than the sentinel.
+        ``"__public__"`` and ``"__members__"`` access sentinels are
+        excluded, so a session that only carries a public/members
+        grant (and no real owner) returns ``None`` rather than a
+        sentinel.
 
         :param conversation_id: The session to look up, e.g.
             ``"conv_abc123"``.
@@ -1204,13 +1206,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             permission grants.
         """
         from omnigent.db.db_models import SqlSessionPermission
-        from omnigent.server.auth import RESERVED_USER_PUBLIC
+        from omnigent.server.auth import RESERVED_USER_MEMBERS, RESERVED_USER_PUBLIC
 
         with self._session() as session:
             return session.execute(
                 select(SqlSessionPermission.user_id)
                 .where(SqlSessionPermission.conversation_id == conversation_id)
-                .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+                .where(
+                    SqlSessionPermission.user_id.notin_(
+                        (RESERVED_USER_PUBLIC, RESERVED_USER_MEMBERS)
+                    )
+                )
                 .order_by(SqlSessionPermission.level.desc())
                 .limit(1)
             ).scalar_one_or_none()
@@ -1551,9 +1557,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if accessible_by is not None:
                 from omnigent.db.db_models import SqlSessionPermission
+                from omnigent.server.auth import RESERVED_USER_MEMBERS
 
+                # A ``__members__`` grant makes the session visible to every
+                # authenticated user, so an authenticated caller's accessible
+                # set is their own grants ∪ the members-shared sessions.
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.user_id == accessible_by
+                    SqlSessionPermission.user_id.in_((accessible_by, RESERVED_USER_MEMBERS))
                 )
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
             return [row[0] for row in session.execute(stmt).all()]
@@ -1578,6 +1588,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationLabel.key == key,
                 )
             )
+
+    def set_project(self, conversation_id: str, project_id: str | None) -> None:
+        """File/unfile a conversation under a project. See base class."""
+        with self._session() as session:
+            session.execute(
+                update(SqlConversation)
+                .where(SqlConversation.id == conversation_id)
+                .values(project_id=project_id)
+            )
+
+    def clear_project(self, project_id: str) -> int:
+        """Unfile every conversation in a project. See base class."""
+        with self._session() as session:
+            result = session.execute(
+                update(SqlConversation)
+                .where(SqlConversation.project_id == project_id)
+                .values(project_id=None)
+            )
+            return result.rowcount
 
     def list_conversations(
         self,
@@ -1680,12 +1709,29 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # because their agent_id column is NULL.
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if accessible_by is not None:
-                from omnigent.db.db_models import SqlSessionPermission
-
-                accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.user_id == accessible_by
+                from omnigent.db.db_models import (
+                    SqlProjectPermission,
+                    SqlSessionPermission,
                 )
-                stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
+                from omnigent.server.auth import RESERVED_USER_MEMBERS
+
+                # A session is visible if the caller has a direct session grant
+                # OR a grant on the session's project (inheritance). The
+                # ``__members__`` sentinel folds in for both, matching the
+                # point-lookup resolver in server/permissions.py.
+                grantees = (accessible_by, RESERVED_USER_MEMBERS)
+                accessible_session_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.user_id.in_(grantees)
+                )
+                accessible_project_ids = select(SqlProjectPermission.project_id).where(
+                    SqlProjectPermission.user_id.in_(grantees)
+                )
+                stmt = stmt.where(
+                    or_(
+                        SqlConversation.id.in_(accessible_session_ids),
+                        SqlConversation.project_id.in_(accessible_project_ids),
+                    )
+                )
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
@@ -1697,24 +1743,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 if project == "":
-                    # Unfiled: sessions with no project label at all.
-                    stmt = stmt.where(
-                        SqlConversation.id.not_in(
-                            select(SqlConversationLabel.conversation_id).where(
-                                SqlConversationLabel.key == PROJECT_LABEL_KEY
-                            )
-                        )
-                    )
+                    # Unfiled: sessions not filed under any project.
+                    stmt = stmt.where(SqlConversation.project_id.is_(None))
                 else:
-                    # Specific project: session must have this project label.
-                    stmt = stmt.where(
-                        SqlConversation.id.in_(
-                            select(SqlConversationLabel.conversation_id).where(
-                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                                SqlConversationLabel.value == project,
-                            )
-                        )
-                    )
+                    # Specific project, addressed by its first-class id.
+                    stmt = stmt.where(SqlConversation.project_id == project)
             if after:
                 stmt = self._apply_cursor(
                     stmt,

@@ -89,7 +89,7 @@ import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFile
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import { useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import { useCreateProject, useProjects } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -714,10 +714,12 @@ function LandingProjectPicker({
   value,
   onChange,
 }: {
+  /** The selected project id, or ``""`` for "No project". */
   value: string;
-  onChange: (project: string) => void;
+  onChange: (projectId: string) => void;
 }) {
   const { data: projects = [] } = useProjects();
+  const createProject = useCreateProject();
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [creatingNew, setCreatingNew] = useState(false);
@@ -729,11 +731,12 @@ function LandingProjectPicker({
   }, [creatingNew]);
 
   const filtered = search
-    ? projects.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
+  const selectedName = projects.find((p) => p.id === value)?.name ?? "";
 
-  function pick(project: string) {
-    onChange(project);
+  function pick(projectId: string) {
+    onChange(projectId);
     setOpen(false);
     setSearch("");
     setCreatingNew(false);
@@ -742,7 +745,7 @@ function LandingProjectPicker({
 
   function commitNew() {
     const name = newName.trim();
-    if (name) pick(name);
+    if (name) createProject.mutate(name, { onSuccess: (project) => pick(project.id) });
   }
 
   const itemClass =
@@ -760,7 +763,7 @@ function LandingProjectPicker({
           {/* Label collapses to icon-only on narrow viewports (mobile),
               matching the host/workspace/worktree chips. */}
           <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
-            {value || "No project"}
+            {selectedName || "No project"}
           </span>
           <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
         </button>
@@ -789,10 +792,10 @@ function LandingProjectPicker({
             <span className="flex-1 truncate">No project</span>
             {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
           </button>
-          {filtered.map((name) => (
-            <button key={name} type="button" className={itemClass} onClick={() => pick(name)}>
-              <span className="flex-1 truncate">{name}</span>
-              {value === name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
+          {filtered.map((p) => (
+            <button key={p.id} type="button" className={itemClass} onClick={() => pick(p.id)}>
+              <span className="flex-1 truncate">{p.name}</span>
+              {value === p.id && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
             </button>
           ))}
           {filtered.length === 0 && !creatingNew && (
@@ -2504,16 +2507,15 @@ export function NewChatLandingScreen() {
         }
         data = (await res.json()) as { id: string };
       }
-      // File the new session under the chosen project (an implicit collection
-      // stored as a conversation_labels row). Awaited so the conversations
-      // refetch below already sees the label; non-fatal if it fails — the
-      // session is created either way, just unfiled.
+      // File the new session under the chosen first-class project. Awaited so
+      // the conversations refetch below already sees it; non-fatal if it fails
+      // — the session is created either way, just unfiled.
       if (selectedProject) {
         try {
           await authenticatedFetch(`/v1/sessions/${data.id}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: selectedProject } }),
+            body: JSON.stringify({ project_id: selectedProject }),
           });
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new

@@ -47,7 +47,7 @@ describe("computeShiftSelectRange", () => {
 
 const { projectsMock, conversationsRef, projectSessionsMock } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  conversationsRef: { current: [] as { id: string; project_id?: string | null }[] },
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
 }));
 
@@ -62,14 +62,27 @@ vi.mock("@/hooks/useConversations", () => ({
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: projectsMock }),
+  useProjects: () => ({
+    data: projectsMock.map((name) => ({
+      id: name,
+      name,
+      created_by: "me",
+      created_at: 0,
+      updated_at: 0,
+      permission_level: 4,
+      members: false,
+      public: false,
+    })),
+  }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useProjectSessions: (project: string, enabled: boolean) => {
     const override = projectSessionsMock.current[project];
     const rows = !enabled
       ? []
       : (override ??
         conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+          (c) => (c.project_id ?? null) === project && (c as any).archived !== true,
         ));
     return {
       data: enabled
@@ -88,8 +101,12 @@ vi.mock("@/hooks/useConversations", () => ({
   },
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
-  PROJECT_LABEL_KEY: "omni_project",
+}));
+vi.mock("@/hooks/useProjectShare", () => ({
+  useLeaveProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectMembers: () => ({ data: [], isLoading: false }),
+  useShareProject: () => ({ mutate: vi.fn(), isPending: false }),
+  useUnshareProject: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -188,8 +205,8 @@ describe("Sidebar shift-click selection", () => {
     // Set up project "Alpha" with 2 sessions, plus 3 unfiled chat sessions
     projectsMock.push("Alpha");
     const sessions = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("p1", { project_id: "Alpha" }),
+      conv("p2", { project_id: "Alpha" }),
       conv("c1"),
       conv("c2"),
       conv("c3"),
@@ -248,17 +265,17 @@ describe("Sidebar shift-click selection", () => {
     // the global list has p1,p2 but the folder's own query returns p1,p2,p3.
     projectsMock.push("Alpha");
     const sessions = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
+      conv("p1", { project_id: "Alpha" }),
+      conv("p2", { project_id: "Alpha" }),
       conv("c1"),
     ];
     mockConversations(sessions);
     // The folder's useProjectSessions returns an extra session (p3)
     // that isn't in the global paginated window.
     projectSessionsMock.current["Alpha"] = [
-      conv("p1", { labels: { omni_project: "Alpha" } }),
-      conv("p2", { labels: { omni_project: "Alpha" } }),
-      conv("p3", { labels: { omni_project: "Alpha" } }),
+      conv("p1", { project_id: "Alpha" }),
+      conv("p2", { project_id: "Alpha" }),
+      conv("p3", { project_id: "Alpha" }),
     ];
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
 

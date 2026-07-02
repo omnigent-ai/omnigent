@@ -382,7 +382,7 @@ describe("resolveSidebarDrop", () => {
   });
 
   it("files an unfiled session into the project it's dropped on", () => {
-    expect(resolveSidebarDrop(src(), { type: "project", name: "Sprint 42" })).toEqual({
+    expect(resolveSidebarDrop(src(), { type: "project", projectId: "Sprint 42" })).toEqual({
       kind: "move",
       project: "Sprint 42",
       unpin: false,
@@ -391,13 +391,16 @@ describe("resolveSidebarDrop", () => {
 
   it("moves a filed session into a different project", () => {
     expect(
-      resolveSidebarDrop(src({ project: "Backlog" }), { type: "project", name: "Sprint 42" }),
+      resolveSidebarDrop(src({ project: "Backlog" }), { type: "project", projectId: "Sprint 42" }),
     ).toEqual({ kind: "move", project: "Sprint 42", unpin: false });
   });
 
   it("is a no-op when dropped on its own project folder (no pointless PATCH)", () => {
     expect(
-      resolveSidebarDrop(src({ project: "Sprint 42" }), { type: "project", name: "Sprint 42" }),
+      resolveSidebarDrop(src({ project: "Sprint 42" }), {
+        type: "project",
+        projectId: "Sprint 42",
+      }),
     ).toEqual({ kind: "none" });
   });
 
@@ -433,7 +436,7 @@ describe("resolveSidebarDrop", () => {
     expect(
       resolveSidebarDrop(src({ project: "Backlog", isPinned: true }), {
         type: "project",
-        name: "Sprint 42",
+        projectId: "Sprint 42",
       }),
     ).toEqual({ kind: "move", project: "Sprint 42", unpin: true });
   });
@@ -444,7 +447,7 @@ describe("resolveSidebarDrop", () => {
     expect(
       resolveSidebarDrop(src({ project: "Sprint 42", isPinned: true }), {
         type: "project",
-        name: "Sprint 42",
+        projectId: "Sprint 42",
       }),
     ).toEqual({ kind: "move", project: "Sprint 42", unpin: true });
   });

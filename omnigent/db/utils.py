@@ -626,6 +626,16 @@ def generate_conversation_id() -> str:
     return f"conv_{uuid.uuid4().hex}"
 
 
+def generate_project_id() -> str:
+    """
+    Generate a unique project identifier.
+
+    :returns: A string of the form ``"proj_<32-char hex>"``,
+        e.g. ``"proj_e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
+    """
+    return f"proj_{uuid.uuid4().hex}"
+
+
 def generate_task_id() -> str:
     """
     Generate a unique task (response) identifier.

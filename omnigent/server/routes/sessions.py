@@ -152,6 +152,7 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_MEMBERS,
     RESERVED_USER_PUBLIC,
     AuthProvider,
     local_single_user_enabled,
@@ -169,6 +170,9 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
+    SessionAccess,
+)
+from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -181,10 +185,10 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
-    require_access as _require_access,
+    require_access as _require_access_impl,
 )
 from omnigent.server.routes._auth_helpers import (
-    require_access_and_level as _require_access_and_level,
+    require_access_and_level as _require_access_and_level_impl,
 )
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
@@ -278,6 +282,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
@@ -1873,13 +1878,16 @@ def _permission_level_from_grants(
     user_id: str | None,
     grants: list[SessionPermission],
     is_admin: bool,
+    project_level: int | None = None,
 ) -> int | None:
     """
     Derive a user's permission level from a pre-fetched list of grants.
 
-    Mirrors :func:`omnigent.server.routes._auth_helpers._get_permission_level_sync`
-    but operates on grants already held in memory so callers can batch the
-    permission-store query across many sessions at once.
+    Mirrors :func:`omnigent.server.permissions.resolved_level` but operates on
+    grants already held in memory so callers can batch the permission-store
+    query across many sessions at once. The effective level is the strongest
+    of the user's own grant, the ``__public__`` / ``__members__`` sentinels,
+    and the session's inherited project grant.
 
     :param user_id: The authenticated user, or ``None`` for unauthenticated
         requests, e.g. ``"alice@example.com"``.
@@ -1888,6 +1896,9 @@ def _permission_level_from_grants(
     :param is_admin: Whether the user holds the admin flag.  Pass the result
         of a single ``permission_store.is_admin(user_id)`` call made once
         for the whole page rather than repeating it per session.
+    :param project_level: The caller's effective level on the session's
+        project (from ``project_store.get_permission_level``), or ``None``.
+        Folded in so a project member's list row shows the inherited level.
     :returns: Numeric level (1–4), or ``None`` when permissions are disabled
         or the user is unauthenticated.
     """
@@ -1895,13 +1906,19 @@ def _permission_level_from_grants(
         return None
     if is_admin:
         return LEVEL_OWNER
+    candidates: list[int] = []
     user_grant = next((g for g in grants if g.user_id == user_id), None)
     if user_grant is not None:
-        return user_grant.level
+        candidates.append(user_grant.level)
     public_grant = next((g for g in grants if g.user_id == RESERVED_USER_PUBLIC), None)
     if public_grant is not None:
-        return public_grant.level
-    return None
+        candidates.append(public_grant.level)
+    members_grant = next((g for g in grants if g.user_id == RESERVED_USER_MEMBERS), None)
+    if members_grant is not None:
+        candidates.append(members_grant.level)
+    if project_level is not None:
+        candidates.append(project_level)
+    return max(candidates) if candidates else None
 
 
 def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
@@ -1918,6 +1935,32 @@ def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
         :data:`LEVEL_OWNER`, or ``None`` if no such grant exists.
     """
     return next((g.user_id for g in grants if g.level >= LEVEL_OWNER), None)
+
+
+async def _project_levels_for_page(
+    convs: list[Conversation],
+    user_id: str | None,
+    project_store: ProjectStore | None,
+) -> dict[str, int]:
+    """Resolve the caller's effective level on each project across a page.
+
+    One lookup per *distinct* project id (not per session), so a filtered
+    project view or a mixed page pays only for the projects actually present.
+
+    :param convs: The conversations on the page.
+    :param user_id: The authenticated caller, or ``None``.
+    :param project_store: Project store, or ``None`` (returns ``{}``).
+    :returns: ``{project_id: level}`` for projects the caller can access.
+    """
+    if project_store is None or user_id is None:
+        return {}
+    project_ids = {c.project_id for c in convs if c.project_id is not None}
+    levels: dict[str, int] = {}
+    for pid in project_ids:
+        level = await asyncio.to_thread(project_store.get_permission_level, user_id, pid)
+        if level is not None:
+            levels[pid] = level
+    return levels
 
 
 def _session_status_from_cache(conversation_id: str) -> Literal["idle", "running", "failed"]:
@@ -2032,6 +2075,7 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    project_level: int | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -2078,7 +2122,7 @@ def _build_session_list_item(
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
     # only); assert for the type checker without a runtime branch.
     assert conv.agent_id is not None
-    level = _permission_level_from_grants(user_id, grants, user_is_admin)
+    level = _permission_level_from_grants(user_id, grants, user_is_admin, project_level)
     owner = _owner_from_grants(grants) if permissions_enabled else None
     # Per-viewer read tracking, embedded so the client hydrates the unread
     # dots straight from the list (no separate fetch). Built per-user here —
@@ -2098,6 +2142,7 @@ def _build_session_list_item(
         reasoning_effort=conv.reasoning_effort,
         permission_level=level,
         owner=owner,
+        project_id=conv.project_id,
         external_session_id=conv.external_session_id,
         pending_elicitations_count=pending_count,
         workspace=conv.workspace,
@@ -2478,6 +2523,7 @@ def _build_session_response(
         labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,
+        project_id=conv.project_id,
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
@@ -12028,6 +12074,7 @@ async def _create_session_from_existing_agent(
     agent_cache: AgentCache | None = None,
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
+    project_store: ProjectStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
@@ -12079,12 +12126,13 @@ async def _create_session_from_existing_agent(
     # session — otherwise they can execute another user's private
     # agent by guessing the raw agent id.
     if agent.session_id is not None:
-        await _require_access(
+        await _require_access_impl(
             user_id,
             agent.session_id,
             LEVEL_READ,
             permission_store,
             conversation_store,
+            project_store,
         )
 
     # Authorize parent_session_id before inheriting anything.
@@ -12093,12 +12141,13 @@ async def _create_session_from_existing_agent(
     # bindings and establish a parent-child relationship with a
     # session they don't control.
     if body.parent_session_id is not None:
-        await _require_access(
+        await _require_access_impl(
             user_id,
             body.parent_session_id,
             LEVEL_READ,
             permission_store,
             conversation_store,
+            project_store,
         )
 
     # The persisted override reaches a native CLI as a ``--model`` argv
@@ -12566,6 +12615,7 @@ async def _authorize_bundled_parent_and_inherit_runner(
     user_id: str | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None,
     runner_router: RunnerRouter | None,
 ) -> str | None:
     """
@@ -12592,12 +12642,13 @@ async def _authorize_bundled_parent_and_inherit_runner(
     :raises OmnigentError: 403/404 when the caller may not access the
         parent session.
     """
-    await _require_access(
+    await _require_access_impl(
         user_id,
         parent_session_id,
         LEVEL_READ,
         permission_store,
         conversation_store,
+        project_store,
     )
     parent_conv = await asyncio.to_thread(
         conversation_store.get_conversation,
@@ -13764,6 +13815,7 @@ def create_sessions_router(
     runner_router: RunnerRouter | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    project_store: ProjectStore | None = None,
     agent_cache: AgentCache | None = None,
     mcp_pool: ServerMcpPool | None = None,  # noqa: ARG001 — retained for API compat
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
@@ -13829,6 +13881,42 @@ def create_sessions_router(
         ``/sessions`` endpoints.
     """
     router = APIRouter()
+
+    # Bind ``project_store`` into the access helpers once, so every route
+    # handler below gets project-grant inheritance without threading the
+    # store through each of its ~30 call sites. These shadow the module
+    # aliases within the factory scope only.
+    async def _require_access(
+        user_id: str | None,
+        conversation_id: str,
+        required_level: int,
+        permission_store: PermissionStore | None,
+        conversation_store: ConversationStore,
+    ) -> None:
+        await _require_access_impl(
+            user_id,
+            conversation_id,
+            required_level,
+            permission_store,
+            conversation_store,
+            project_store,
+        )
+
+    async def _require_access_and_level(
+        user_id: str | None,
+        conversation_id: str,
+        required_level: int,
+        permission_store: PermissionStore | None,
+        conversation_store: ConversationStore,
+    ) -> SessionAccess:
+        return await _require_access_and_level_impl(
+            user_id,
+            conversation_id,
+            required_level,
+            permission_store,
+            conversation_store,
+            project_store,
+        )
 
     # ── POST /sessions ───────────────────────────────────────────
 
@@ -13916,6 +14004,7 @@ def create_sessions_router(
             agent_cache=agent_cache,
             user_id=user_id,
             permission_store=permission_store,
+            project_store=project_store,
             liveness_lookup=liveness_lookup,
             file_store=file_store,
             artifact_store=artifact_store,
@@ -14192,6 +14281,7 @@ def create_sessions_router(
                 user_id=user_id,
                 permission_store=permission_store,
                 conversation_store=conversation_store,
+                project_store=project_store,
                 runner_router=runner_router,
             )
 
@@ -14213,35 +14303,6 @@ def create_sessions_router(
                 runner_router,
             )
         return result
-
-    # ── GET /sessions/projects ────────────────────────────────────
-    #
-    # MUST be registered before ``GET /sessions/{session_id}``: FastAPI
-    # matches routes in registration order, so a literal ``/sessions/projects``
-    # would otherwise be captured by the ``{session_id}`` path param and 404
-    # as a missing conversation.
-
-    @router.get(
-        "/sessions/projects",
-        response_model=None,
-    )
-    async def list_session_projects(
-        request: Request,
-    ) -> list[str]:
-        """
-        Return all project names for the authenticated user, ordered
-        alphabetically.
-
-        Projects are implicit: they exist while at least one session
-        has a ``conversation_labels`` row with ``key="omni_project"``.
-
-        :returns: List of project names.
-        """
-        user_id = _require_user(request, auth_provider)
-        return await asyncio.to_thread(
-            conversation_store.list_projects,
-            accessible_by=user_id,
-        )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #
@@ -14534,6 +14595,10 @@ def create_sessions_router(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        # The caller's effective level on each project on this page, so a
+        # project member's rows show the inherited level (one lookup per
+        # distinct project, not per session).
+        project_levels = await _project_levels_for_page(page.data, user_id, project_store)
         items: list[SessionListItem] = [
             _build_session_list_item(
                 conv,
@@ -14545,6 +14610,7 @@ def create_sessions_router(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                project_level=(project_levels.get(conv.project_id) if conv.project_id else None),
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -14617,6 +14683,14 @@ def create_sessions_router(
         """
         if not watched:
             return []
+        # Load the watched conversations once (one batched store round-trip) and
+        # reuse the rows for both the access filter and the item build — a
+        # session may be accessible only through its project, so the filter
+        # needs each row's project_id.
+        watched_convs = await asyncio.to_thread(conversation_store.get_conversations, watched)
+        project_levels = await _project_levels_for_page(
+            list(watched_convs.values()), user_id, project_store
+        )
         if permission_store is not None:
             perms_by_conv = await asyncio.to_thread(permission_store.list_for_sessions, watched)
             user_is_admin = (
@@ -14627,8 +14701,12 @@ def create_sessions_router(
             accessible = [
                 cid
                 for cid in watched
-                if _permission_level_from_grants(
-                    user_id, perms_by_conv.get(cid, []), user_is_admin
+                if (conv := watched_convs.get(cid)) is not None
+                and _permission_level_from_grants(
+                    user_id,
+                    perms_by_conv.get(cid, []),
+                    user_is_admin,
+                    project_levels.get(conv.project_id) if conv.project_id else None,
                 )
                 is not None
             ]
@@ -14636,21 +14714,12 @@ def create_sessions_router(
             perms_by_conv = {}
             user_is_admin = False
             accessible = list(watched)
-        if not accessible:
-            return []
-
-        def _load_sessions(ids: list[str]) -> list[Conversation]:
-            """Bulk-load the accessible conversations that are sessions
-            (non-null ``agent_id``) in one batched store call, preserving
-            the caller's id order for deterministic output."""
-            by_id = conversation_store.get_conversations(ids)
-            return [
-                conv
-                for cid in ids
-                if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
-            ]
-
-        convs = await asyncio.to_thread(_load_sessions, accessible)
+        # Sessions only (non-null agent_id), in the caller's watch order.
+        convs = [
+            conv
+            for cid in accessible
+            if (conv := watched_convs.get(cid)) is not None and conv.agent_id is not None
+        ]
         if not convs:
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
@@ -14675,6 +14744,7 @@ def create_sessions_router(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                project_level=(project_levels.get(conv.project_id) if conv.project_id else None),
             )
             for conv in convs
         ]
@@ -14997,7 +15067,12 @@ def create_sessions_router(
         )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
-                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+                user_id,
+                session_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+                project_store,
             ):
                 raise OmnigentError(
                     f"Only the session owner can attach a runner to session {session_id!r}. "
@@ -15299,6 +15374,25 @@ def create_sessions_router(
             await asyncio.to_thread(conversation_store.delete_label, session_id, PROJECT_LABEL_KEY)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        # File / unfile the session under a first-class project. "" unfiles
+        # (project_id -> NULL); a project id files it, but only into a project
+        # the caller can manage (so you can't attach your chat to someone
+        # else's project). The edit-level gate above already covers the session.
+        if body.project_id is not None:
+            if body.project_id == "":
+                await asyncio.to_thread(conversation_store.set_project, session_id, None)
+            else:
+                if project_store is not None and not await asyncio.to_thread(
+                    project_store.check_access, user_id, body.project_id, LEVEL_MANAGE
+                ):
+                    raise OmnigentError(
+                        f"{user_id!r} cannot file sessions into project "
+                        f"{body.project_id!r} (needs manage access)",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+                await asyncio.to_thread(
+                    conversation_store.set_project, session_id, body.project_id
+                )
         if requested_codex_collaboration_mode is not None:
             _publish_collaboration_mode(
                 session_id,

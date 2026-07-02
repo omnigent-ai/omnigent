@@ -22,6 +22,27 @@ class SessionPermission:
     level: int
 
 
+@dataclasses.dataclass
+class ProjectPermission:
+    """A single permission grant on a project.
+
+    The project analogue of :class:`SessionPermission`. A conversation
+    inherits its project's grants, so this is what makes "share a project"
+    cover every chat in it.
+
+    :param user_id: The grantee, e.g. ``"alice@example.com"`` or a sentinel
+        (``"__public__"`` / ``"__members__"``).
+    :param project_id: The project this grant applies to, e.g.
+        ``"proj_e4f5a6b7..."``.
+    :param level: Numeric permission level: ``1`` = read, ``2`` = edit,
+        ``3`` = manage, ``4`` = owner. Comparison is ``>=``.
+    """
+
+    user_id: str
+    project_id: str
+    level: int
+
+
 @dataclasses.dataclass(frozen=True)
 class ResolvedAccess:
     """The raw permission inputs for one ``(user, conversation)`` pair.
@@ -39,8 +60,20 @@ class ResolvedAccess:
     :param public_grant_level: The ``"__public__"`` sentinel grant level
         on the conversation (same ``1``–``4`` scale), or ``None`` if the
         session is not public.
+    :param members_grant_level: The ``"__members__"`` sentinel grant level
+        (same scale), or ``None`` if the session is not shared with all
+        members. Only populated for an authenticated user — it is ``None``
+        for an anonymous resolution, so anonymous viewers never gain access
+        through it.
+    :param project_grant_level: The caller's effective grant level on the
+        session's project (``max`` of their own, ``__members__``, and
+        ``__public__`` project grants), or ``None`` if the session has no
+        project or the caller has no project grant. This is how project
+        sharing inherits down to the project's chats.
     """
 
     is_admin: bool
     user_grant_level: int | None
     public_grant_level: int | None
+    members_grant_level: int | None = None
+    project_grant_level: int | None = None

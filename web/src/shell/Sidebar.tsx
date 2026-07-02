@@ -27,6 +27,7 @@ import {
   InboxIcon,
   ListChecksIcon,
   Loader2Icon,
+  LogOutIcon,
   MailIcon,
   Maximize2Icon,
   Minimize2Icon,
@@ -99,18 +100,22 @@ import {
   useConversations,
   useMoveToProject,
   useDeleteProject,
-  fetchProjectSessionIds,
-  PROJECT_LABEL_KEY,
+  useCreateProject,
+  useRenameProject,
   usePinnedConversationBackfill,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
+import type { ProjectSummary } from "@/lib/projectsApi";
+import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
+import { ShareProjectModal } from "@/components/ShareProjectModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useLeaveProject } from "@/hooks/useProjectShare";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
@@ -699,7 +704,7 @@ function InfiniteScrollSentinel({
  * window) since a collapsed folder hasn't fetched yet.
  */
 function ProjectFolder({
-  name,
+  project,
   expanded,
   marker,
   onToggleCollapsed,
@@ -714,7 +719,7 @@ function ProjectFolder({
   onProjectAssigned,
   projectRenderedIdsRef,
 }: {
-  name: string;
+  project: ProjectSummary;
   expanded: boolean;
   marker: SessionState | null;
   onToggleCollapsed: () => void;
@@ -726,10 +731,11 @@ function ProjectFolder({
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectId: string) => void;
   projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
 }) {
-  const query = useProjectSessions(name, expanded);
+  const name = project.name;
+  const query = useProjectSessions(project.id, expanded);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
@@ -747,7 +753,7 @@ function ProjectFolder({
     [expanded, conversations],
   );
   if (projectRenderedIdsRef) {
-    projectRenderedIdsRef.current.set(name, renderedIds);
+    projectRenderedIdsRef.current.set(project.id, renderedIds);
   }
 
   // While the first page loads, show a "Loading…" footer instead of the "No
@@ -759,8 +765,8 @@ function ProjectFolder({
   // `project:` prefix keeps the droppable id clear of conversation ids (the
   // draggable ids) and the ungroup sentinel.
   const { setNodeRef, isOver } = useDroppable({
-    id: `project:${name}`,
-    data: { type: "project", name },
+    id: `project:${project.id}`,
+    data: { type: "project", projectId: project.id },
   });
 
   return (
@@ -795,7 +801,7 @@ function ProjectFolder({
         onProjectAssigned={onProjectAssigned}
         emptyMessage={loadingFirstPage ? undefined : "No chats"}
         indentRows
-        headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
+        headerAction={<ProjectFolderActions project={project} onNavigate={onRowClick} />}
         footer={
           loadingFirstPage ? (
             <p className="px-2 py-1 pl-7 text-muted-foreground text-xs">Loading…</p>
@@ -854,8 +860,8 @@ function ConversationList({
     [conversationsQuery.data],
   );
 
-  // Project names for grouping sessions by their reserved project label.
-  const { data: projectNames = [] } = useProjects();
+  // First-class projects (owned + shared), for grouping sessions by project_id.
+  const { data: projects = [] } = useProjects();
 
   // Each ProjectFolder registers its actually-rendered conversation IDs here
   // (synchronously during render) so shift-select ranges use the real rendered
@@ -899,15 +905,14 @@ function ConversationList({
     // pinned member is excluded here (it lives under Pinned instead), so
     // pinning a project's last session leaves the folder showing "No chats".
     const filedIds = new Set<string>();
-    const projectGroups: { name: string; conversations: Conversation[] }[] = projectNames.map(
-      (name) => {
+    const projectGroups: { project: ProjectSummary; conversations: Conversation[] }[] =
+      projects.map((project) => {
         const inProject = notArchived.filter(
-          (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
+          (c) => c.project_id === project.id && !pinnedIdSet.has(c.id),
         );
         inProject.forEach((c) => filedIds.add(c.id));
-        return { name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
-      },
-    );
+        return { project, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
+      });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
@@ -935,7 +940,7 @@ function ConversationList({
     pinnedSet,
     pinnedConversationIds,
     activeOverride,
-    projectNames,
+    projects,
   ]);
 
   // Collapsed section titles — persisted like pins so the preference
@@ -1049,15 +1054,6 @@ function ConversationList({
     project: string | null;
     isPinned: boolean;
   } | null>(null);
-  // A drop-to-ungroup that turned out to remove the project's last session —
-  // held here to confirm (the implicit project vanishes with it), mirroring the
-  // kebab's "Remove from project" flow. `unpin` carries through whether the
-  // dragged session was also pinned (and so must be unpinned to leave Pinned).
-  const [pendingUngroup, setPendingUngroup] = useState<{
-    id: string;
-    project: string;
-    unpin: boolean;
-  } | null>(null);
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
   // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
@@ -1087,11 +1083,11 @@ function ConversationList({
         target,
       );
       if (action.kind === "move") {
-        moveToProject.mutate({ id: dragged.id, project: action.project });
+        moveToProject.mutate({ id: dragged.id, projectId: action.project });
         // Unpin a pinned session so it actually drops into the folder instead of
         // staying floated up in Pinned (pin outranks project membership).
         if (action.unpin) onTogglePinned(dragged.id);
-        // Open the (possibly brand-new) folder so the session is visible in it.
+        // Open the folder so the session is visible in it.
         expandProject(action.project);
         return;
       }
@@ -1103,25 +1099,10 @@ function ConversationList({
         return;
       }
       if (action.kind === "ungroup") {
-        const unpin = action.unpin;
-        // Removing a project's LAST session deletes the implicit project, so
-        // confirm that case (server-side check, accurate regardless of the
-        // loaded window); otherwise remove silently. Mirrors the kebab flow.
-        void (async () => {
-          let isLastSession = true;
-          try {
-            const ids = await fetchProjectSessionIds(action.project);
-            isLastSession = ids.every((id) => id === dragged.id);
-          } catch {
-            isLastSession = true;
-          }
-          if (isLastSession) {
-            setPendingUngroup({ id: dragged.id, project: action.project, unpin });
-          } else {
-            moveToProject.mutate({ id: dragged.id, project: "" });
-            if (unpin) onTogglePinned(dragged.id);
-          }
-        })();
+        // Unfile the session (project_id -> null). Projects are first-class now,
+        // so removing a chat never deletes the project — no confirmation needed.
+        moveToProject.mutate({ id: dragged.id, projectId: null });
+        if (action.unpin) onTogglePinned(dragged.id);
       }
     },
     [activeDrag, moveToProject, expandProject, onTogglePinned],
@@ -1157,17 +1138,17 @@ function ConversationList({
   // as a primitive so the auto-expand effect below only fires when the
   // selection (or its project) changes — not on every background list refetch,
   // which would re-open a folder the user just collapsed.
-  const activeProjectName = useMemo(() => {
+  const activeProjectId = useMemo(() => {
     if (!activeId) return null;
     const active = allConversations.find((c) => c.id === activeId);
-    return active?.labels?.[PROJECT_LABEL_KEY] ?? null;
+    return active?.project_id ?? null;
   }, [activeId, allConversations]);
   // Auto-expand the project folder holding the selected session, so navigating
   // to a filed session reveals it instead of leaving it hidden in a collapsed
   // folder. Fires on selection only; the user can still collapse it afterward.
   useEffect(() => {
-    if (activeProjectName) expandProject(activeProjectName);
-  }, [activeProjectName, expandProject]);
+    if (activeProjectId) expandProject(activeProjectId);
+  }, [activeProjectId, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
@@ -1178,11 +1159,11 @@ function ConversationList({
     // expanded AND that individual project folder is expanded (folders are
     // collapsed unless explicitly opened — inverse of the fixed sections).
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (name: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(name) ? list : [];
+    const projectVisible = (projectId: string, list: readonly Conversation[]) =>
+      !projectsCollapsed && expandedProjects.includes(projectId) ? list : [];
     return [
       ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...sections.projectGroups.flatMap((g) => projectVisible(g.project.id, g.conversations)),
       ...visible("Chats", sections.sessions),
       ...visible("Shared with me", sections.shared),
     ].map((c) => c.id);
@@ -1200,7 +1181,9 @@ function ConversationList({
       ...vis("Pinned", sections.pinned),
       ...(projCollapsed
         ? []
-        : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
+        : sections.projectGroups.flatMap(
+            (g) => projectRenderedIdsRef.current.get(g.project.id) ?? [],
+          )),
       ...vis("Chats", sections.sessions),
       ...vis("Shared with me", sections.shared),
     ];
@@ -1321,12 +1304,12 @@ function ConversationList({
                   // rendered, so expand-all / revert would be a no-op — show no
                   // control at all.
                   if (effectiveCollapsedSections.includes("Projects")) return null;
-                  const allNames = sections.projectGroups.map((g) => g.name);
+                  const allIds = sections.projectGroups.map((g) => g.project.id);
                   // Once every folder is open the only useful move is to undo it,
                   // so the control flips to "revert" — which restores the set open
                   // before "Expand all", or collapses everything when there's no
                   // real last state (folders opened by hand). Otherwise it expands.
-                  const allExpanded = allNames.every((n) => expandedProjects.includes(n));
+                  const allExpanded = allIds.every((n) => expandedProjects.includes(n));
                   if (allExpanded) {
                     return (
                       <Tooltip>
@@ -1360,7 +1343,7 @@ function ConversationList({
                           data-testid="expand-all-projects"
                           onClick={(e) => {
                             e.stopPropagation();
-                            expandAllProjects(allNames);
+                            expandAllProjects(allIds);
                           }}
                         >
                           <Maximize2Icon className="size-3.5" />
@@ -1373,13 +1356,13 @@ function ConversationList({
               >
                 {sections.projectGroups.map((group) => (
                   <ProjectFolder
-                    key={group.name}
-                    name={group.name}
-                    expanded={expandedProjects.includes(group.name)}
+                    key={group.project.id}
+                    project={group.project}
+                    expanded={expandedProjects.includes(group.project.id)}
                     // Best-effort marker from the globally-loaded window: a
                     // collapsed folder hasn't fetched its own sessions yet.
                     marker={projectMarkerState(group.conversations)}
-                    onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                    onToggleCollapsed={() => toggleProjectExpanded(group.project.id)}
                     pinnedConversationIds={pinnedConversationIds}
                     activeOverride={activeOverride}
                     scrollRoot={scrollContainerRef}
@@ -1457,53 +1440,6 @@ function ConversationList({
           </div>
         ) : null}
       </DragOverlay>
-      {/* Confirm a drag-to-ungroup that removes the project's last session (the
-          implicit project disappears with it). Mirrors the kebab's dialog. */}
-      <Dialog
-        open={pendingUngroup != null}
-        onOpenChange={(open) => {
-          if (!open) setPendingUngroup(null);
-        }}
-      >
-        <DialogContent onClick={(e) => e.stopPropagation()}>
-          <DialogHeader>
-            <DialogTitle>Remove from project?</DialogTitle>
-            <DialogDescription>
-              This is the only session in{" "}
-              <span className="break-all font-medium">{pendingUngroup?.project}</span>, so{" "}
-              <span className="font-medium">the project will be removed as well</span>. The session
-              itself is kept.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setPendingUngroup(null)}
-              disabled={moveToProject.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              disabled={moveToProject.isPending}
-              onClick={() => {
-                if (!pendingUngroup) return;
-                moveToProject.mutate(
-                  { id: pendingUngroup.id, project: "" },
-                  { onSuccess: () => setPendingUngroup(null) },
-                );
-                // A pinned session must also be unpinned to leave Pinned and
-                // land in the flat list.
-                if (pendingUngroup.unpin) onTogglePinned(pendingUngroup.id);
-              }}
-            >
-              Remove from project
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </DndContext>
   );
 }
@@ -1890,7 +1826,6 @@ function ConversationMenuItems({
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
-  setRemoveProjectOpen,
   setMenuOpen,
   runArchive,
 }: {
@@ -1915,7 +1850,6 @@ function ConversationMenuItems({
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
-  setRemoveProjectOpen: (open: boolean) => void;
   // Closes the controlled kebab after a project pick; a no-op for the
   // (uncontrolled) context menu, which Radix closes on select automatically.
   setMenuOpen: (open: boolean) => void;
@@ -2005,37 +1939,18 @@ function ConversationMenuItems({
             <ProjectPickerMenu
               components={C}
               currentProject={currentProject}
-              onSelect={(project) => {
+              onSelect={(projectId) => {
                 setMenuOpen(false);
-                // Moving to another project is harmless — apply it now,
-                // and expand that (possibly new) project so the session
-                // is visible in it rather than hidden in a collapsed folder.
-                if (project !== "") {
-                  moveToProject.mutate({ id: conversation.id, project });
-                  onProjectAssigned?.(project);
+                // "" removes the session from its project (unfile). Projects are
+                // first-class, so removing a chat never deletes the project — no
+                // confirmation needed. A project id files it there (and expands
+                // that folder so it's visible).
+                if (projectId === "") {
+                  moveToProject.mutate({ id: conversation.id, projectId: null });
                   return;
                 }
-                // Removing: only confirm when this is the project's LAST
-                // session (removing it would delete the implicit project).
-                // Otherwise remove silently. The check is server-side so
-                // it's accurate regardless of the loaded window / pins.
-                void (async () => {
-                  let isLastSession = true;
-                  if (currentProject) {
-                    try {
-                      const ids = await fetchProjectSessionIds(currentProject);
-                      isLastSession = ids.every((id) => id === conversation.id);
-                    } catch {
-                      // If the check fails, fall back to confirming.
-                      isLastSession = true;
-                    }
-                  }
-                  if (isLastSession) {
-                    setRemoveProjectOpen(true);
-                  } else {
-                    moveToProject.mutate({ id: conversation.id, project: "" });
-                  }
-                })();
+                moveToProject.mutate({ id: conversation.id, projectId });
+                onProjectAssigned?.(projectId);
               }}
             />
           </C.SubContent>
@@ -2203,9 +2118,6 @@ function ConversationRow({
   const [isEditing, setIsEditing] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
-  // True while confirming "Remove from project" — implicit projects vanish when
-  // their last session leaves, so the removal is confirmed to make that explicit.
-  const [removeProjectOpen, setRemoveProjectOpen] = useState(false);
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
@@ -2234,7 +2146,7 @@ function ConversationRow({
 
   // The session's current project (reserved label), or null when unfiled —
   // drives the kebab submenu label ("Add to project" vs "Change project").
-  const currentProject = conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
+  const currentProject = conversation.project_id ?? null;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -2432,7 +2344,6 @@ function ConversationRow({
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
-    setRemoveProjectOpen,
     runArchive,
   };
 
@@ -2731,42 +2642,6 @@ function ConversationRow({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <Dialog open={removeProjectOpen} onOpenChange={setRemoveProjectOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
-          <DialogHeader>
-            <DialogTitle>Remove from project?</DialogTitle>
-            <DialogDescription>
-              This is the only session in{" "}
-              <span className="break-all font-medium">{currentProject}</span>, so{" "}
-              <span className="font-medium">the project will be removed as well</span>. The session
-              itself is kept.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setRemoveProjectOpen(false)}
-              disabled={moveToProject.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              disabled={moveToProject.isPending}
-              onClick={() =>
-                moveToProject.mutate(
-                  { id: conversation.id, project: "" },
-                  { onSuccess: () => setRemoveProjectOpen(false) },
-                )
-              }
-            >
-              Remove from project
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </li>
   );
 }
@@ -2866,27 +2741,27 @@ function ArchivingRow({ label }: { label: string }) {
  * lands already selected.
  */
 function ProjectFolderActions({
-  projectName,
+  project,
   onNavigate,
 }: {
-  projectName: string;
+  project: ProjectSummary;
   /** Plain-left-click nav handler — closes the mobile overlay so the
       pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   return (
     <div className="flex items-center">
-      <ProjectFolderMenu projectName={projectName} />
+      <ProjectFolderMenu project={project} />
       <Button
         asChild
         type="button"
         variant="ghost"
         size="icon-sm"
-        aria-label={`New session in ${projectName}`}
+        aria-label={`New session in ${project.name}`}
         data-testid="project-new-session"
       >
         <Link
-          to={`/?project=${encodeURIComponent(projectName)}`}
+          to={`/?project=${encodeURIComponent(project.id)}`}
           onClick={(e) => {
             // Keep the click off the folder's collapse toggle, then run the
             // shared nav handler (closes the sidebar overlay on mobile).
@@ -2903,16 +2778,33 @@ function ProjectFolderActions({
 
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
+// Manage-or-above (or unknown level → treat as owner, matching the rest of the
+// UI's permissive-on-null stance; the backend enforces regardless).
+const canManageProject = (level: number | null) => level == null || level >= 3;
+const isProjectOwner = (level: number | null) => level == null || level >= 4;
+
 /**
- * The kebab on a project-folder header. Currently just "Delete project", which
- * removes every session filed under the project (the implicit project then
- * disappears). Confirmation is required since it deletes sessions, not just the
- * grouping.
+ * The kebab on a project-folder header. Share / Rename for managers, Leave for
+ * a non-owner member, Delete for the owner. Access is read straight off the
+ * project's `permission_level` (no extra fetch); the backend re-checks.
  */
-function ProjectFolderMenu({ projectName }: { projectName: string }) {
+function ProjectFolderMenu({ project }: { project: ProjectSummary }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [leaveOpen, setLeaveOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [newName, setNewName] = useState(project.name);
   const deleteProject = useDeleteProject();
+  const renameProject = useRenameProject();
+  const leaveProject = useLeaveProject(project.id);
+
+  const level = project.permission_level;
+  const canManage = canManageProject(level);
+  const owner = isProjectOwner(level);
+  // A non-owner with access can leave (drops their own grant). Owners can't
+  // orphan their own project this way.
+  const canLeave = level != null && level < 4;
 
   return (
     <>
@@ -2922,7 +2814,7 @@ function ProjectFolderMenu({ projectName }: { projectName: string }) {
             type="button"
             variant="ghost"
             size="icon-sm"
-            aria-label={`Project actions for ${projectName}`}
+            aria-label={`Project actions for ${project.name}`}
             data-testid="project-actions"
             // Sits on the folder header; keep its click off the collapse toggle.
             onClick={(e) => e.stopPropagation()}
@@ -2931,32 +2823,143 @@ function ProjectFolderMenu({ projectName }: { projectName: string }) {
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
-          <DropdownMenuItem
-            data-testid="delete-project"
-            variant="destructive"
-            onSelect={() => setDeleteOpen(true)}
-          >
-            <Trash2Icon className="size-3.5" />
-            Delete project
-          </DropdownMenuItem>
+          {canManage && (
+            <DropdownMenuItem data-testid="share-project" onSelect={() => setShareOpen(true)}>
+              <ShareIcon className="size-3.5" />
+              Share project
+            </DropdownMenuItem>
+          )}
+          {canManage && (
+            <DropdownMenuItem
+              data-testid="rename-project"
+              onSelect={() => {
+                setNewName(project.name);
+                setRenameOpen(true);
+              }}
+            >
+              <PencilIcon className="size-3.5" />
+              Rename project
+            </DropdownMenuItem>
+          )}
+          {canLeave && (
+            <DropdownMenuItem data-testid="leave-project" onSelect={() => setLeaveOpen(true)}>
+              <LogOutIcon className="size-3.5" />
+              Leave project
+            </DropdownMenuItem>
+          )}
+          {owner && (
+            <DropdownMenuItem
+              data-testid="delete-project"
+              variant="destructive"
+              onSelect={() => setDeleteOpen(true)}
+            >
+              <Trash2Icon className="size-3.5" />
+              Delete project
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
+      <ShareProjectModal
+        projectId={project.id}
+        projectName={project.name}
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+      />
+      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
+        <DialogContent onClick={(e) => e.stopPropagation()}>
+          <DialogHeader>
+            <DialogTitle>Rename project</DialogTitle>
+          </DialogHeader>
+          <Input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Project name"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && newName.trim()) {
+                renameProject.mutate(
+                  { projectId: project.id, name: newName.trim() },
+                  { onSuccess: () => setRenameOpen(false) },
+                );
+              }
+            }}
+          />
+          {renameProject.isError && (
+            <p className="text-sm text-destructive" role="alert">
+              Couldn't rename the project (the name may already be in use).
+            </p>
+          )}
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={!newName.trim() || renameProject.isPending}
+              onClick={() =>
+                renameProject.mutate(
+                  { projectId: project.id, name: newName.trim() },
+                  { onSuccess: () => setRenameOpen(false) },
+                )
+              }
+            >
+              {renameProject.isPending ? "Renaming…" : "Rename"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
+        <DialogContent onClick={(e) => e.stopPropagation()}>
+          <DialogHeader>
+            <DialogTitle>Leave project?</DialogTitle>
+            <DialogDescription>
+              You'll lose access to the chats in <span className="font-medium">{project.name}</span>{" "}
+              that were shared with you. The owner can re-share them later.
+            </DialogDescription>
+          </DialogHeader>
+          {leaveProject.isError && (
+            <p className="text-sm text-destructive" role="alert">
+              Couldn't leave the project. Please try again.
+            </p>
+          )}
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setLeaveOpen(false)}
+              disabled={leaveProject.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={leaveProject.isPending}
+              onClick={() => {
+                leaveProject.mutate(undefined, {
+                  onSuccess: () => {
+                    setLeaveOpen(false);
+                    setMenuOpen(false);
+                  },
+                });
+              }}
+            >
+              {leaveProject.isPending ? "Leaving…" : "Leave project"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent onClick={(e) => e.stopPropagation()}>
           <DialogHeader>
             <DialogTitle>Delete project?</DialogTitle>
             <DialogDescription>
-              This archives the project{" "}
-              <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em] break-all">
-                {projectName}
-              </span>{" "}
-              and <span className="font-medium">all of its sessions</span>. Their history is kept.
-              You can find and restore them anytime from Settings.
+              This deletes the project <span className="font-medium">{project.name}</span> and
+              everyone's access to it. Its chats are <span className="font-medium">kept</span> —
+              they move back to "Chats".
             </DialogDescription>
           </DialogHeader>
           {deleteProject.isError && (
             <p className="text-sm text-destructive" role="alert">
-              Some sessions couldn't be archived (you may not own them); the rest were archived.
+              Couldn't delete the project. Please try again.
             </p>
           )}
           <DialogFooter className="border-t-0 bg-transparent">
@@ -2973,7 +2976,7 @@ function ProjectFolderMenu({ projectName }: { projectName: string }) {
               variant="destructive"
               disabled={deleteProject.isPending}
               onClick={() => {
-                deleteProject.mutate(projectName, {
+                deleteProject.mutate(project.id, {
                   onSuccess: () => {
                     setDeleteOpen(false);
                     setMenuOpen(false);
@@ -3006,10 +3009,13 @@ function ProjectPickerMenu({
   onSelect,
 }: {
   components: MenuComponents;
+  /** The session's current project id, or ``null`` when unfiled. */
   currentProject: string | null;
-  onSelect: (project: string) => void;
+  /** Called with a project id to file into, or ``""`` to unfile. */
+  onSelect: (projectId: string) => void;
 }) {
   const { data: projects = [] } = useProjects();
+  const createProject = useCreateProject();
   const [search, setSearch] = useState("");
   const [creatingNew, setCreatingNew] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
@@ -3022,14 +3028,17 @@ function ProjectPickerMenu({
   }, [creatingNew]);
 
   const filtered = search
-    ? projects.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
+  const currentName = projects.find((p) => p.id === currentProject)?.name ?? null;
 
   function handleNewProjectCommit() {
     const name = newProjectName.trim();
     setCreatingNew(false);
     setNewProjectName("");
-    if (name) onSelect(name);
+    if (!name) return;
+    // Create the first-class project, then file the session into it by id.
+    createProject.mutate(name, { onSuccess: (project) => onSelect(project.id) });
   }
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
@@ -3051,10 +3060,10 @@ function ProjectPickerMenu({
         />
       </div>
       <div className="max-h-48 overflow-y-auto">
-        {filtered.map((name) => (
-          <C.Item key={name} onSelect={() => onSelect(name)}>
-            <span className="flex-1 truncate text-left">{name}</span>
-            {currentProject === name && (
+        {filtered.map((p) => (
+          <C.Item key={p.id} onSelect={() => onSelect(p.id)}>
+            <span className="flex-1 truncate text-left">{p.name}</span>
+            {currentProject === p.id && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
             )}
           </C.Item>
@@ -3101,7 +3110,7 @@ function ProjectPickerMenu({
           <C.Item onSelect={() => onSelect("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
-              {currentProject}
+              {currentName ?? "project"}
             </span>
           </C.Item>
         )}

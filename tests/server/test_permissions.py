@@ -919,3 +919,26 @@ def test_resolved_level_none_when_no_access() -> None:
     access = ResolvedAccess(is_admin=False, user_grant_level=None, public_grant_level=None)
     assert resolved_level(access) is None
     assert resolved_allows(access, LEVEL_READ) is False
+
+
+def test_resolved_allows_via_project_grant() -> None:
+    """A project grant satisfies access even with no session-level grant."""
+    access = ResolvedAccess(
+        is_admin=False,
+        user_grant_level=None,
+        public_grant_level=None,
+        project_grant_level=LEVEL_READ,
+    )
+    assert resolved_allows(access, LEVEL_READ) is True
+    assert resolved_allows(access, LEVEL_EDIT) is False
+
+
+def test_resolved_level_project_grant_can_exceed_session_grant() -> None:
+    """A project manager who only reads a chat still sees manage-level for it."""
+    access = ResolvedAccess(
+        is_admin=False,
+        user_grant_level=LEVEL_READ,
+        public_grant_level=None,
+        project_grant_level=LEVEL_MANAGE,
+    )
+    assert resolved_level(access) == LEVEL_MANAGE

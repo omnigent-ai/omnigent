@@ -58,7 +58,21 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // the create-POST call-count / call-order assertions below).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
-  useProjects: () => ({ data: [] }),
+  // The chip resolves a project's display name from this list by id. Tests
+  // land with ?project=<id>, so include those ids (id == name here).
+  useProjects: () => ({
+    data: ["docs", "Sprint 42"].map((name) => ({
+      id: name,
+      name,
+      created_by: "me",
+      created_at: 0,
+      updated_at: 0,
+      permission_level: 4,
+      members: false,
+      public: false,
+    })),
+  }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -1271,9 +1285,9 @@ describe("NewChatLandingScreen", () => {
     expect(patchUrl).toBe("/v1/sessions/conv_new");
     expect((patchInit as RequestInit).method).toBe("PATCH");
     const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
-      labels: Record<string, string>;
+      project_id: string;
     };
-    expect(patchBody.labels).toEqual({ omni_project: "docs" });
+    expect(patchBody.project_id).toEqual("docs");
 
     // The target folder fetches its own paginated list (useProjectSessions),
     // so filing the new session must invalidate it — otherwise the row only
@@ -1325,9 +1339,9 @@ describe("NewChatLandingScreen", () => {
     const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
     expect(patchUrl).toBe("/v1/sessions/conv_new");
     const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
-      labels: Record<string, string>;
+      project_id: string;
     };
-    expect(patchBody.labels).toEqual({ omni_project: "Sprint 42" });
+    expect(patchBody.project_id).toEqual("Sprint 42");
   });
 
   it.each([

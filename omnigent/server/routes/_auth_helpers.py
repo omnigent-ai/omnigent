@@ -37,6 +37,7 @@ from omnigent.server.permissions import (
 )
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 
 _LEVEL_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
 
@@ -100,6 +101,7 @@ def _require_access_sync(
     required_level: int,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """Synchronous core of :func:`require_access`.
 
@@ -125,12 +127,17 @@ def _require_access_sync(
             code=ErrorCode.UNAUTHORIZED,
         )
     if check_session_access(
-        user_id, conversation_id, required_level, permission_store, conversation_store
+        user_id,
+        conversation_id,
+        required_level,
+        permission_store,
+        conversation_store,
+        project_store,
     ):
         return
     # Distinguish "has some access but not enough" from "no access at all".
     has_any = check_session_access(
-        user_id, conversation_id, 1, permission_store, conversation_store
+        user_id, conversation_id, 1, permission_store, conversation_store, project_store
     )
     if has_any:
         level_name = _LEVEL_NAMES.get(required_level, str(required_level))
@@ -150,6 +157,7 @@ async def require_access(
     required_level: int,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None = None,
 ) -> None:
     """Check permission, raising 403 or 404 on failure.
 
@@ -177,6 +185,7 @@ async def require_access(
         required_level,
         permission_store,
         conversation_store,
+        project_store,
     )
 
 
@@ -256,6 +265,7 @@ def _require_access_and_level_sync(
     required_level: int,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None = None,
 ) -> SessionAccess:
     """Synchronous core of :func:`require_access_and_level`.
 
@@ -310,6 +320,15 @@ def _require_access_and_level_sync(
             code=ErrorCode.NOT_FOUND,
         )
 
+    # Fold the session's project grant into the resolved access so both the
+    # decision and the displayed level inherit it (a project reader sees the
+    # chat; a project manager sees manage-level on it).
+    if project_store is not None and conv.project_id is not None:
+        project_level = project_store.get_permission_level(user_id, conv.project_id)
+        if project_level is not None:
+            access = dataclasses.replace(access, project_grant_level=project_level)
+            level = resolved_level(access)
+
     if conv.parent_conversation_id is None:
         # Top-level session: the access-governing grant lives on this same
         # conversation, so reuse the rows already fetched — no extra reads.
@@ -324,6 +343,7 @@ def _require_access_and_level_sync(
             required_level,
             permission_store,
             conversation_store,
+            project_store,
         )
     if allowed:
         return SessionAccess(level=level, conversation=conv)
@@ -334,7 +354,12 @@ def _require_access_and_level_sync(
         has_any = resolved_allows(access, 1)
     else:
         has_any = check_session_access(
-            user_id, conv.parent_conversation_id, 1, permission_store, conversation_store
+            user_id,
+            conv.parent_conversation_id,
+            1,
+            permission_store,
+            conversation_store,
+            project_store,
         )
     if has_any:
         level_name = _LEVEL_NAMES.get(required_level, str(required_level))
@@ -354,6 +379,7 @@ async def require_access_and_level(
     required_level: int,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    project_store: ProjectStore | None = None,
 ) -> SessionAccess:
     """Authorize a caller and resolve their display level in one threaded pass.
 
@@ -381,6 +407,7 @@ async def require_access_and_level(
         required_level,
         permission_store,
         conversation_store,
+        project_store,
     )
 
 

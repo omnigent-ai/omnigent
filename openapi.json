@@ -2217,6 +2217,130 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "ProjectCreateRequest": {
+        "description": "Request body for `POST /v1/projects`.",
+        "properties": {
+          "name": {
+            "description": "The project name, e.g. `\"Q3 launch\"`.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ProjectCreateRequest",
+        "type": "object"
+      },
+      "ProjectMember": {
+        "description": "One grantee on a project.",
+        "properties": {
+          "level": {
+            "description": "The grant level (1=read, 2=edit, 3=manage, 4=owner).",
+            "title": "Level",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "The grantee \u2014 a real user id, or the `\"__members__\"` / `\"__public__\"` sentinel.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "level"
+        ],
+        "title": "ProjectMember",
+        "type": "object"
+      },
+      "ProjectObject": {
+        "description": "API representation of a first-class project.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds when the project was created.",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner's user id, or `None` if that account was deleted.",
+            "title": "Created By"
+          },
+          "id": {
+            "description": "Project id, e.g. `\"proj_e4f5a6b7...\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "members": {
+            "default": false,
+            "description": "`True` when the project is shared with all signed-in members (`__members__` grant present).",
+            "title": "Members",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Human-readable name, e.g. `\"Q3 launch\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "permission_level": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The requesting caller's effective level on the project (1=read, 2=edit, 3=manage, 4=owner), or `None` when permissions are disabled.",
+            "title": "Permission Level"
+          },
+          "public": {
+            "default": false,
+            "description": "`True` when the project is shared via public link (`__public__` grant present).",
+            "title": "Public",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of the last mutation.",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ProjectObject",
+        "type": "object"
+      },
+      "ProjectPatchRequest": {
+        "description": "Request body for `PATCH /v1/projects/{id}` (rename).",
+        "properties": {
+          "name": {
+            "description": "The new project name.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ProjectPatchRequest",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -3761,6 +3885,17 @@
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled.",
             "title": "Permission Level"
           },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -4489,6 +4624,17 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -5656,6 +5802,18 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "File the session under a first-class project. A project id sets it; the empty string `\"\"` unfiles it; `None` leaves it unchanged (mirrors the removed `omni_project` label's empty-string-clears convention). The caller must be able to manage the session and (when filing) manage the target project.",
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -6834,6 +6992,379 @@
         ]
       }
     },
+    "/v1/projects": {
+      "get": {
+        "description": "List every project the caller can access, with their level.",
+        "operationId": "list_projects_v1_projects_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectObject"
+                  },
+                  "title": "Response 200 List Projects V1 Projects Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Projects",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "description": "Create a project owned by the caller.",
+        "operationId": "create_project_v1_projects_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "delete": {
+        "description": "Delete a project (owner only); its chats survive as unfiled.",
+        "operationId": "delete_project_v1_projects__project_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project",
+        "tags": [
+          "projects"
+        ]
+      },
+      "get": {
+        "description": "Fetch a single project (read access required).",
+        "operationId": "get_project_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "description": "Rename a project (manage access required).",
+        "operationId": "rename_project_v1_projects__project_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/membership": {
+      "delete": {
+        "description": "Leave a project: drop the caller's own non-owner grant. Idempotent.",
+        "operationId": "leave_project_v1_projects__project_id__membership_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Leave Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/permissions": {
+      "get": {
+        "description": "List a project's grantees (manage access required).",
+        "operationId": "list_project_permissions_v1_projects__project_id__permissions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectMember"
+                  },
+                  "title": "Response 200 List Project Permissions V1 Projects  Project Id  Permissions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Project Permissions",
+        "tags": [
+          "projects"
+        ]
+      },
+      "put": {
+        "description": "Share a project with a user, or all members / anyone with the link.",
+        "operationId": "grant_project_permission_v1_projects__project_id__permissions_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantPermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant Project Permission",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/permissions/{target_user_id}": {
+      "delete": {
+        "description": "Revoke a grantee from a project (manage access required).",
+        "operationId": "revoke_project_permission_v1_projects__project_id__permissions__target_user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target_user_id",
+            "required": true,
+            "schema": {
+              "title": "Target User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Project Permission",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/runners": {
       "get": {
         "description": "Return currently online runners owned by the requesting user.\n\nWhen auth is active, only runners whose tunnel was\nestablished by the same user are returned. Without auth,\nall online runners are listed (single-user / dev mode).\n\n**Returns:** A `{\"data\": [...]}` list with runner ids and advertised harnesses.",
@@ -7127,26 +7658,6 @@
           }
         },
         "summary": "Create Session",
-        "tags": [
-          "sessions"
-        ]
-      }
-    },
-    "/v1/sessions/projects": {
-      "get": {
-        "description": "Return all project names for the authenticated user, ordered\nalphabetically.\n\nProjects are implicit: they exist while at least one session\nhas a `conversation_labels` row with `key=\"omni_project\"`.\n\n**Returns:** List of project names.",
-        "operationId": "list_session_projects_v1_sessions_projects_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "List Session Projects",
         "tags": [
           "sessions"
         ]

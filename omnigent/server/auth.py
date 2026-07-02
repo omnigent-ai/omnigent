@@ -44,7 +44,14 @@ _AUTH_ENABLED_ENV_DEPRECATED = "OMNIGENT_ACCOUNTS_ENABLED"
 
 RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
-_RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
+# Sentinel grantee for "everyone signed in to this Omnigent". Unlike
+# ``__public__`` (anyone with the link, including anonymous visitors), a
+# ``__members__`` grant only resolves for an *authenticated* user — but it
+# resolves for *every* authenticated user, current or future, and surfaces the
+# session in their listings (see the conversation store's ``accessible_by``
+# filter). Read-only, like ``__public__``.
+RESERVED_USER_MEMBERS = "__members__"
+_RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, RESERVED_USER_MEMBERS})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
 # Explicit single-user marker. Set by the managed local-server spawn

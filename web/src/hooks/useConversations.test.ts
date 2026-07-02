@@ -681,8 +681,19 @@ describe("useBulkStopSessions", () => {
 });
 
 describe("useProjects", () => {
-  it("GETs /v1/sessions/projects and returns the project list", async () => {
-    const projects = ["Customer X", "Sprint 42"];
+  it("GETs /v1/projects and returns the project list", async () => {
+    const projects = [
+      {
+        id: "proj_1",
+        name: "Customer X",
+        created_by: "me",
+        created_at: 0,
+        updated_at: 0,
+        permission_level: 4,
+        members: false,
+        public: false,
+      },
+    ];
     fetchMock.mockResolvedValueOnce(mockResponse(projects));
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -691,7 +702,7 @@ describe("useProjects", () => {
     const { result } = renderHook(() => useProjects(), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/projects");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects");
     expect(result.current.data).toEqual(projects);
   });
 
@@ -711,7 +722,7 @@ describe("useProjectSessions", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    renderHook(() => useProjectSessions("Sprint 42", false), { wrapper });
+    renderHook(() => useProjectSessions("proj_sprint42", false), { wrapper });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -727,12 +738,12 @@ describe("useProjectSessions", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useProjectSessions("Sprint 42", true), { wrapper });
+    const { result } = renderHook(() => useProjectSessions("proj_sprint42", true), { wrapper });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("/v1/sessions?");
-    expect(url).toContain("project=Sprint+42");
+    expect(url).toContain("project=proj_sprint42");
     expect(url).toContain("order=desc");
     expect(url).toContain("sort_by=updated_at");
     expect(url).toContain("limit=20");
@@ -759,13 +770,13 @@ describe("useMoveToProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useMoveToProject(), { wrapper });
 
-    result.current.mutate({ id: "conv_move", project: "Sprint 42" });
+    result.current.mutate({ id: "conv_move", projectId: "proj_sprint42" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_move");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({ labels: { omni_project: "Sprint 42" } });
+    expect(JSON.parse(init.body as string)).toEqual({ project_id: "proj_sprint42" });
   });
 
   it("invalidates both the conversations and projects queries on success", async () => {
@@ -785,7 +796,7 @@ describe("useMoveToProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useMoveToProject(), { wrapper });
 
-    result.current.mutate({ id: "conv_move", project: "" });
+    result.current.mutate({ id: "conv_move", projectId: null });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // Both keys must refresh: conversations so the row re-groups into its new
@@ -828,34 +839,8 @@ describe("useArchiveConversation", () => {
 });
 
 describe("useDeleteProject", () => {
-  function archivedConv(id: string) {
-    return mockResponse({
-      id,
-      object: "conversation",
-      title: id,
-      created_at: 0,
-      updated_at: 10,
-      archived: true,
-      labels: { omni_project: "Sprint 42" },
-    });
-  }
-
-  it("archives every session in the project (keeping the label) and refreshes the lists", async () => {
-    // 1st call: page of project members. Then one PATCH archive per member.
-    fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 1 },
-            { id: "conv_b", object: "conversation", title: "B", created_at: 0, updated_at: 2 },
-          ],
-          first_id: "conv_a",
-          last_id: "conv_b",
-          has_more: false,
-        }),
-      )
-      .mockResolvedValueOnce(archivedConv("conv_a"))
-      .mockResolvedValueOnce(archivedConv("conv_b"));
+  it("DELETEs /v1/projects/{id} and refreshes the lists", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { status: 204 }));
 
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
@@ -863,63 +848,14 @@ describe("useDeleteProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useDeleteProject(), { wrapper });
 
-    result.current.mutate("Sprint 42");
+    result.current.mutate("proj_sprint42");
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // The list fetch is filtered by project and includes archived members.
-    const listUrl = fetchMock.mock.calls[0][0] as string;
-    expect(listUrl).toContain("project=Sprint+42");
-    expect(listUrl).toContain("include_archived=true");
-
-    // Each member is archived via PATCH — NOT deleted, and the project label is
-    // left intact so unarchiving restores the session to its project.
-    const patches = (fetchMock.mock.calls.slice(1) as [string, RequestInit][]).map(
-      ([url, init]) => ({ url, init }),
-    );
-    expect(patches.map((p) => p.url).sort()).toEqual([
-      "/v1/sessions/conv_a",
-      "/v1/sessions/conv_b",
-    ]);
-    for (const { init } of patches) {
-      expect(init.method).toBe("PATCH");
-      expect(JSON.parse(init.body as string)).toEqual({ archived: true });
-    }
-
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/proj_sprint42");
+    expect(init.method).toBe("DELETE");
+    // Chats survive as unfiled, so both lists must refresh.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
-  });
-
-  it("throws with succeeded/failed split when some archives fail", async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          data: [
-            { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 1 },
-            { id: "conv_b", object: "conversation", title: "B", created_at: 0, updated_at: 2 },
-          ],
-          first_id: "conv_a",
-          last_id: "conv_b",
-          has_more: false,
-        }),
-      )
-      .mockResolvedValueOnce(archivedConv("conv_a"))
-      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
-
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useDeleteProject(), { wrapper });
-
-    result.current.mutate("Sprint 42");
-    await waitFor(() => expect(result.current.isError).toBe(true));
-
-    const err = result.current.error as unknown as {
-      failed: string[];
-      succeeded: string[];
-      total: number;
-    };
-    expect(err.failed).toEqual(["conv_b"]);
-    expect(err.succeeded).toEqual(["conv_a"]);
-    expect(err.total).toBe(2);
   });
 });

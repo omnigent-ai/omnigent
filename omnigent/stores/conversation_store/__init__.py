@@ -728,6 +728,32 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_project(self, conversation_id: str, project_id: str | None) -> None:
+        """File a conversation under a project (or unfile it).
+
+        Sets ``conversations.project_id``. Passing ``None`` unfiles the
+        session (it returns to the sidebar's "Chats" group). The caller is
+        responsible for authorizing both the session and the project.
+
+        :param conversation_id: The session to (re)file, e.g. ``"conv_abc"``.
+        :param project_id: The target project id, or ``None`` to unfile.
+        """
+        ...
+
+    @abstractmethod
+    def clear_project(self, project_id: str) -> int:
+        """Unfile every conversation in a project (``project_id -> NULL``).
+
+        Used when deleting a project so its chats survive as unfiled. Needed
+        explicitly because the ``project_id`` FK is ORM-only on migrated DBs
+        (no DB-level ``ON DELETE SET NULL`` to rely on).
+
+        :param project_id: The project whose sessions to unfile.
+        :returns: The number of conversations updated.
+        """
+        ...
+
+    @abstractmethod
     def list_projects(
         self,
         accessible_by: str | None = None,

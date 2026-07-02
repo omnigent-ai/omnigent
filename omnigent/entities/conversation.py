@@ -64,6 +64,9 @@ class Conversation:
         retry-on-reconnect: if the server restarts before the
         runner connects, the server re-sends the launch request
         to this host.
+    :param project_id: The first-class project this session is filed
+        under, or ``None`` when unfiled. The session inherits the
+        project's access grants (share a project → its chats follow).
     :param labels: Session-scoped guardrails labels persisted
         in ``conversation_labels``. Populated by
         :meth:`ConversationStore.get_conversation` via a JOIN;
@@ -192,6 +195,7 @@ class Conversation:
     agent_id: str | None = None
     runner_id: str | None = None
     host_id: str | None = None
+    project_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)

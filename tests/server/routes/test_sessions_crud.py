@@ -137,40 +137,14 @@ async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
     assert resp.status_code == 404
 
 
-# ── GET /v1/sessions/projects ────────────────────────────────────────
-
-
-async def test_list_projects_empty(client: httpx.AsyncClient) -> None:
-    """No project labels anywhere → empty project list."""
-    resp = await client.get("/v1/sessions/projects")
-    assert resp.status_code == 200
-    assert resp.json() == []
-
-
-async def test_list_projects_returns_names_sorted(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """Projects surface as a sorted list of names."""
-    conv_store = SqlAlchemyConversationStore(db_uri)
-    a = conv_store.create_conversation()
-    b = conv_store.create_conversation()
-    conv_store.set_labels(a.id, {"omni_project": "Sprint 42"})
-    conv_store.set_labels(b.id, {"omni_project": "Customer X"})
-
-    resp = await client.get("/v1/sessions/projects")
-    assert resp.status_code == 200
-    assert resp.json() == ["Customer X", "Sprint 42"]
-
-
-# ── GET /v1/sessions?project= (filter) ───────────────────────────────
+# ── GET /v1/sessions?project=<id> (first-class project filter) ───────
 
 
 async def test_list_sessions_filtered_by_project(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """``?project=X`` returns only sessions in that project."""
+    """``?project=<id>`` returns only sessions filed under that project."""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     # GET /v1/sessions filters has_agent_id=True, so bind the conversations to
@@ -179,9 +153,9 @@ async def test_list_sessions_filtered_by_project(
     agent_store.create(agent_id, name="project-agent", bundle_location="test:///bundle")
     filed = conv_store.create_conversation(agent_id=agent_id)
     conv_store.create_conversation(agent_id=agent_id)  # unfiled
-    conv_store.set_labels(filed.id, {"omni_project": "X"})
+    conv_store.set_project(filed.id, "proj_x")
 
-    resp = await client.get("/v1/sessions?project=X")
+    resp = await client.get("/v1/sessions?project=proj_x")
     assert resp.status_code == 200
     ids = [s["id"] for s in resp.json()["data"]]
     assert ids == [filed.id]
@@ -191,14 +165,14 @@ async def test_list_sessions_empty_project_returns_unfiled(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """``?project=`` (empty) returns only sessions with no project label."""
+    """``?project=`` (empty) returns only sessions not filed under any project."""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     agent_id = generate_agent_id()
     agent_store.create(agent_id, name="project-agent", bundle_location="test:///bundle")
     filed = conv_store.create_conversation(agent_id=agent_id)
     unfiled = conv_store.create_conversation(agent_id=agent_id)
-    conv_store.set_labels(filed.id, {"omni_project": "X"})
+    conv_store.set_project(filed.id, "proj_x")
 
     resp = await client.get("/v1/sessions?project=")
     assert resp.status_code == 200
