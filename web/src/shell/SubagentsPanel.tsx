@@ -221,9 +221,7 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
     return {
       activity: "disconnected",
       label: "Disconnected",
-      details: child.last_task_error
-        ? firstErrorLine(child.last_task_error.message)
-        : undefined,
+      details: child.last_task_error ? firstErrorLine(child.last_task_error.message) : undefined,
     };
   }
   if (child.last_task_error) {
