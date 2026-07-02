@@ -35,6 +35,7 @@ import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
+import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
 import { KiroIcon } from "@/components/icons/KiroIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
@@ -317,6 +318,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
+  if (nativeAgent?.iconKind === "hermes") return HermesIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
