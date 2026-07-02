@@ -219,7 +219,7 @@ async def test_parallel_conversations_with_different_specs(
     are spec-scoped)."""
     from omnigent.spec.types import LabelDef
 
-    # Spec A: has a schema for `integrity` with monotonic.
+    # Spec A: has a schema for `integrity`.
     policy_a = make_fixed_policy(
         name="write_integrity",
         on=[PhaseSelector(phase=Phase.REQUEST)],
@@ -230,7 +230,7 @@ async def test_parallel_conversations_with_different_specs(
     engine_a = PolicyEngine(
         policies=[policy_a],
         label_defs={
-            "integrity": LabelDef(values=["0", "1"], monotonic="decreasing"),
+            "integrity": LabelDef(values=["0", "1"]),
         },
         ask_timeout=30,
         conversation_id=conv_a.id,

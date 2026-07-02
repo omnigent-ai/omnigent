@@ -64,6 +64,16 @@ repos:
         files: ^web/ios/.*\.swift$
         exclude: ^web/ios/(build|vendor)/
 
+      # Keep omnigent/version.py's VERSION constant equal to the canonical
+      # [project].version in pyproject.toml (the runtime imports the constant;
+      # the build reads pyproject). Fixer: rewrites the constant and re-stages.
+      - id: sync-version-py
+        name: sync omnigent/version.py to pyproject version
+        language: system
+        entry: .venv/bin/python scripts/sync_version_py.py
+        files: ^(pyproject\.toml|omnigent/version\.py)$
+        pass_filenames: false
+
       # Local `uv` runs rewrite uv.lock's registry to whatever index is
       # configured on the developer's machine (e.g. the Databricks PyPI
       # proxy). This OSS repo must always commit the public PyPI URL, so

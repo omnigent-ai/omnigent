@@ -31,6 +31,7 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
 )
+from omnigent.env_credentials import expand_envvars_with_omnigent_prefix
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms import Client as LLMClient
 from omnigent.onboarding.databricks_config import (
@@ -1499,12 +1500,12 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
         # Expand $VAR references (the config file may store the literal
         # env-var reference; expand at use-time so the secret never
         # needs to live in the YAML file itself).
-        api_key = os.path.expandvars(api_key)
+        api_key = expand_envvars_with_omnigent_prefix(api_key)
         check_unresolved_env_vars("auth.api_key", api_key)
         raw_base_url = raw_auth.get("base_url")
         base_url: str | None = None
         if raw_base_url:
-            base_url = os.path.expandvars(str(raw_base_url))
+            base_url = expand_envvars_with_omnigent_prefix(str(raw_base_url))
             check_unresolved_env_vars("auth.base_url", base_url)
         return ApiKeyAuth(api_key=api_key, base_url=base_url)
     if auth_type == "databricks":

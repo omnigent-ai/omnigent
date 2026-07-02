@@ -9,9 +9,8 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT, PI_NATIVE_CODING_AGENT
 from omnigent.native_coding_agents import (
-    KIRO_NATIVE_CODING_AGENT,
-    PI_NATIVE_CODING_AGENT,
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
     public_agent_name,

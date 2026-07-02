@@ -1,0 +1,455 @@
+name: Draft release notes
+
+# At release CUT (a vX.Y.Z tag is pushed → the "GitHub Release" workflow creates
+# the draft), prepare everything the release coordinator needs before they hit
+# Publish:
+#
+#   1. Open a PR to omnigent/main updating the granular CHANGELOG.md (harvested
+#      from each merged PR's "## Changelog" section), so the draft's
+#      "Full Changelog" link resolves before the release goes public.
+#   2. Synthesize concise, curated two-section release notes (an Omnigent agent
+#      collapses the merged PRs into ~4-5 themed highlights per section) and drop
+#      them into the GitHub Release DRAFT body for the coordinator to edit.
+#
+# Why `workflow_run` (not extending github-release.yml): that workflow is
+# deliberately minimal — it runs NO project code, only `gh release create`, so a
+# malicious tagged commit can't execute anything. We keep that guarantee by
+# running the heavy work (LLM + git harvest) in this SEPARATE workflow, which
+# runs from the trusted default branch (workflow_run always does), never from the
+# tagged commit. Same "harvester runs from main" posture as autoformat-pr.yml.
+#
+# The LLM machinery (creds gate, Claude Code CLI, provider config, secret-scan,
+# token-minted-after-agent, artifact redaction) mirrors doc-sync.yml. The agent
+# only ever sees already-merged, released history.
+
+on:
+  workflow_run:
+    workflows: ["GitHub Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag/ref to (re)draft (head of the range), e.g. v0.3.0
+        required: true
+        type: string
+      base:
+        description: >-
+          Optional range-start override (tag/branch/sha). Needed when `tag` is not
+          a final vX.Y.Z. Providing it makes the run a preview unless dry_run=false.
+        required: false
+        type: string
+      dry_run:
+        description: >-
+          Preview only:
+          auto (default) - preview for dev/rc tags, real PR for final versions;
+          true - print the generated notes, don't open a PR;
+          false - open a real PR to CHANGELOG.md
+        required: false
+        type: choice
+        options: [auto, "true", "false"]
+        default: auto
+
+permissions:
+  contents: read
+
+concurrency:
+  group: draft-release-notes-${{ github.event.workflow_run.head_branch || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: omnigent-ai/omnigent
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+jobs:
+  draft:
+    name: Harvest CHANGELOG and draft release notes
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      # --- Resolve the tag and decide whether to proceed (no code run yet) ---
+      - name: Resolve tag and guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          # On tag push, workflow_run.head_branch is the tag name (v0.3.0).
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$RUN_BRANCH}"
+          base="${INPUT_BASE:-}"
+          proceed=false; dry_run=false
+
+          # Does the tag look like a final release (vX.Y.Z, not rc/dev/alpha/beta)?
+          is_version=true
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) is_version=false ;;
+          esac
+          case "$tag" in
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_version=false ;;
+          esac
+
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            # Real release cut: strict — only a final version tag proceeds.
+            [ "$is_version" = "true" ] && proceed=true
+          else
+            # Manual dispatch: proceed for a final version tag OR when a base
+            # override is given (arbitrary-ref preview/real run).
+            if [ "$is_version" = "true" ] || [ -n "$base" ]; then
+              proceed=true
+            fi
+            # dry_run: `auto` previews for a non-version tag or a base override,
+            # and does a real run for a plain version tag; true/false force it.
+            case "$INPUT_DRY_RUN" in
+              true)  dry_run=true ;;
+              false) dry_run=false ;;
+              *)     if [ "$is_version" != "true" ] || [ -n "$base" ]; then dry_run=true; fi ;;
+            esac
+          fi
+
+          # NOTE: we do NOT probe for the draft release here. This step runs with
+          # the read-only GITHUB_TOKEN, and GitHub hides DRAFT releases from tokens
+          # without push access — the probe would always come back empty and wrongly
+          # report "no draft". Draft detection happens after the App token is minted
+          # (see "Resolve draft release"), which can see drafts.
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} base=${base:-<none>} proceed=${proceed} dry_run=${dry_run}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Trusted default branch, full history + tags for the range computation.
+      - name: Checkout omnigent (main)
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      # --- 1) Harvest CHANGELOG.md + the mechanical scaffold + agent input ---
+      - name: Harvest changelog and PR material
+        id: harvest
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+          BASE: ${{ steps.guard.outputs.base }}
+          DRY_RUN: ${{ steps.guard.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # generate.py orders CHANGELOG.md by PEP 440 (packaging). This step runs
+          # bare python3 (before uv sync), so ensure packaging is importable.
+          python3 -m pip install --quiet --disable-pip-version-check packaging
+          args=(--tag "$TAG" --repo "$SOURCE_REPO"
+                --draft-notes-out /tmp/mechanical_notes.md
+                --pr-list-out /tmp/pr_list.txt
+                --section-out /tmp/section.md)
+          [ -n "${BASE:-}" ] && args+=(--base "$BASE")
+          if [ "$DRY_RUN" = "true" ]; then
+            # Preview only — render, don't touch CHANGELOG.md.
+            args+=(--no-changelog-update)
+          else
+            args+=(--changelog-file CHANGELOG.md)
+          fi
+          python3 .github/scripts/changelog/generate.py "${args[@]}"
+          # The mechanical scaffold is the fallback release-notes body.
+          cp /tmp/mechanical_notes.md /tmp/release_notes.md
+
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "## Preview — CHANGELOG.md section for \`${TAG}\`"
+              echo '```markdown'; cat /tmp/section.md; echo '```'
+              echo "## Preview — mechanical draft notes"
+              echo '```markdown'; cat /tmp/mechanical_notes.md; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # --- 2) AI synthesis (primary; degrades to the mechanical scaffold) ---
+      - name: Check LLM credentials
+        id: creds
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "${LLM_API_KEY:-}" ]; then
+            echo "::warning::No LLM credentials — using the mechanical draft scaffold."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::add-mask::${LLM_API_KEY}"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up uv
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install dependencies
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        run: uv sync --extra all --extra dev
+
+      - name: Install Claude Code CLI
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Write Omnigent provider config
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          mkdir -p "$HOME/.omnigent"
+          python3 -c "
+          import pathlib, os, json
+          gw = os.environ['GATEWAY_BASE_URL']
+          cfg = {'providers': {'databricks-gateway': {
+              'kind': 'gateway', 'default': ['anthropic'],
+              'anthropic': {
+                  'base_url': gw + '/anthropic',
+                  'api_key_ref': 'env:LLM_API_KEY',
+                  'models': {'default': 'databricks-claude-opus-4-8'},
+              }}}}
+          pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
+          "
+
+      - name: Build drafter prompt
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import os, pathlib
+          tag = os.environ["TAG"]
+          # The agent is tools-less, so its input must be inline — but `omnigent run
+          # -p` passes the whole prompt as one argv string, capped at ~128 KiB on
+          # Linux (MAX_ARG_STRLEN). Cap the PR list well under that; the mechanical
+          # scaffold already covers everything, so a partial list still drafts.
+          MAX = 100_000
+          pr_list = pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")
+          mech = pathlib.Path("/tmp/mechanical_notes.md").read_text(encoding="utf-8", errors="replace")
+          truncated = len(pr_list) > MAX
+          pr_list = pr_list[:MAX]
+          note = ("\n> NOTE: the PR list was truncated — theme what's visible and keep the "
+                  "mechanical draft's coverage.\n" if truncated else "")
+          prompt = f"""Draft the curated release notes for {tag}.
+          {note}
+          ## Merged PRs (number, title, and author changelog entries)
+          {pr_list}
+
+          ## Mechanical draft (raw material — curate, don't copy verbatim)
+          {mech}
+
+          Produce the RELEASE_NOTES block per your instructions."""
+          pathlib.Path("/tmp/draft_prompt.txt").write_text(prompt)
+          PYEOF
+
+      - name: Run release-notes drafter
+        id: draft
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          prompt="$(cat /tmp/draft_prompt.txt)"
+          uv run --project "${GITHUB_WORKSPACE}" omnigent run \
+            "${GITHUB_WORKSPACE}/.github/agents/release-notes-drafter" \
+            -p "$prompt" --no-session \
+            2>draft-stderr.log | tee /tmp/draft_out.txt \
+            || { echo "::warning::drafter exited non-zero — keeping mechanical draft"; cat draft-stderr.log; }
+
+      - name: Scan drafter output for secrets
+        if: steps.draft.outcome == 'success'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" /tmp/draft_out.txt 2>/dev/null; then
+            echo "::error::Drafter output contains LLM_API_KEY — aborting."
+            exit 1
+          fi
+
+      - name: Extract synthesized notes (fall back to mechanical)
+        if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import pathlib, re
+          raw = pathlib.Path("/tmp/draft_out.txt").read_text(encoding="utf-8", errors="replace") \
+              if pathlib.Path("/tmp/draft_out.txt").is_file() else ""
+          m = re.search(r"<!--\s*RELEASE_NOTES\s*-->(.*?)<!--\s*/RELEASE_NOTES\s*-->", raw, re.DOTALL)
+          notes = (m.group(1).strip() if m else "")
+          if notes:
+              pathlib.Path("/tmp/release_notes.md").write_text(notes + "\n")
+              print("Using AI-synthesized release notes.")
+          else:
+              print("::warning::No RELEASE_NOTES block parsed — keeping mechanical draft.")
+          PYEOF
+
+      # --- 3) Mint the write-token — ONLY now, after the agent has run ---
+      - name: Mint App token (omnigent)
+        id: app-token
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent
+
+      # Find the DRAFT release for this tag using the App token (push access) — a
+      # read-only token can't see drafts. Match by tag_name over the release list:
+      # GitHub's get-by-tag REST endpoint 404s on drafts (their tag isn't "real"
+      # until published), so only a list-and-filter finds them. Sets:
+      #   is_draft   — true only when a matching UNPUBLISHED draft exists (so we
+      #                never clobber notes a maintainer already published).
+      #   release_id — numeric id to edit by (editing by tag would 404 on a draft).
+      - name: Resolve draft release
+        id: release
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.app-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Read TAG via jq's `env`, not by interpolating it into the jq program —
+          # a tag containing `"` or jq syntax would otherwise alter the filter.
+          # (gh api's built-in --jq has no --arg; env keeps the value as data.)
+          match="$(gh api "repos/${SOURCE_REPO}/releases" --paginate \
+            --jq 'map(select(.tag_name == env.TAG)) | first // empty')"
+          is_draft=false; release_id=""
+          if [ -n "$match" ]; then
+            is_draft="$(printf '%s' "$match" | jq -r '.draft')"
+            release_id="$(printf '%s' "$match" | jq -r '.id')"
+          fi
+          if [ "$is_draft" != "true" ]; then
+            echo "::notice::No unpublished draft release found for ${TAG} — leaving release notes untouched (the CHANGELOG PR still runs)."
+          fi
+          echo "is_draft=${is_draft}" >> "$GITHUB_OUTPUT"
+          echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+          echo "Draft release for ${TAG}: is_draft=${is_draft} release_id=${release_id:-<none>}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # --- 4) Open/update the CHANGELOG.md PR ---
+      - name: Open or update the CHANGELOG.md PR
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.app-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SITE_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- CHANGELOG.md)" ]; then
+            echo "CHANGELOG.md already up to date for ${TAG} — nothing to do." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BRANCH="auto/changelog/${TAG}"
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+          # No credentials persisted in .git/config (the unsandboxed agent ran
+          # earlier); push via the token URL, which GitHub masks in logs.
+          PUSH_URL="https://x-access-token:${SITE_TOKEN}@github.com/${SOURCE_REPO}.git"
+          git switch -C "$BRANCH"
+          git add CHANGELOG.md
+          git commit -m "docs(changelog): record ${TAG}"
+          git push --force "$PUSH_URL" "$BRANCH"
+
+          if [ -n "$(gh pr list --repo "$SOURCE_REPO" --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "CHANGELOG PR already open for ${BRANCH} — force-push updated it."
+            exit 0
+          fi
+          body="$(printf 'Records **%s** in `CHANGELOG.md`, harvested from the `## Changelog` section of each merged PR. Merge as part of cutting the release so the draft notes '"'"'Full Changelog'"'"' link resolves.\n\nGenerated by `.github/workflows/draft-release-notes.yml`.' "$TAG")"
+          gh pr create \
+            --repo "$SOURCE_REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "docs(changelog): record ${TAG}" \
+            --body "$body"
+
+      # --- 5) Enrich the GitHub Release DRAFT body (only while still a draft) ---
+      - name: Enrich the release draft body
+        if: steps.guard.outputs.proceed == 'true' && steps.release.outputs.is_draft == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # github-release.yml seeds only a short placeholder body (no
+          # auto-generated notes), so replace it wholesale with the curated notes.
+          # Edit by release ID: a draft release can't be addressed by tag (the
+          # get/edit-by-tag REST endpoint 404s until the release is published).
+          gh api --method PATCH "repos/${SOURCE_REPO}/releases/${RELEASE_ID}" \
+            --field body=@/tmp/release_notes.md > /dev/null
+          echo "Enriched the ${TAG} release draft with curated notes." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ::add-mask:: redacts rendered logs, not artifact files — scrub the key
+      # from artifacts (incl. the unscanned stderr) before upload.
+      - name: Redact secrets from artifacts
+        if: always() && steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${LLM_API_KEY:-}" ] || exit 0
+          python3 - <<'PYEOF'
+          import os, pathlib
+          key = os.environ.get("LLM_API_KEY", "")
+          for f in ["draft-stderr.log", "/tmp/draft_out.txt", "/tmp/draft_prompt.txt",
+                    "/tmp/release_notes.md"]:
+              p = pathlib.Path(f)
+              if not p.is_file() or not key:
+                  continue
+              t = p.read_text(encoding="utf-8", errors="replace")
+              if key in t:
+                  p.write_text(t.replace(key, "***REDACTED***"), encoding="utf-8")
+                  print(f"redacted key from {f}")
+          PYEOF
+
+      - name: Upload logs on failure
+        if: always() && steps.guard.outputs.proceed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: draft-release-notes-${{ steps.guard.outputs.tag }}-${{ github.run_id }}
+          path: |
+            draft-stderr.log
+            /tmp/draft_out.txt
+            /tmp/release_notes.md
+            /tmp/mechanical_notes.md
+          retention-days: 7
+          if-no-files-found: ignore

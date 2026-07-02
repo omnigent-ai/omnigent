@@ -553,6 +553,57 @@ def create_auth_router(
             },
         )
 
+    # ── Admin: read-only user list ────────────────────────────────
+
+    @router.get("/users")
+    async def list_users(request: Request) -> Response:
+        """List all users (admin only).
+
+        The OIDC analog of the accounts provider's ``GET /auth/users``
+        — same response shape, so the SPA's Members surface renders
+        identically. This is the read-only discovery half of the
+        admin surface: OIDC identities are owned by the IdP, so there
+        are no server-side password actions (invite/reset/delete) to
+        offer here, and the SPA hides those controls in OIDC mode.
+
+        Admin is gated on the same ``is_admin`` flag the rest of the
+        app uses (set by the admin-list promotion at login), with the
+        admin list as a direct fallback — matching the OIDC invite
+        route above.
+
+        :param request: The incoming request (carries the session cookie).
+        :returns: 200 with ``{"users": [...]}``, 401 if unauthenticated,
+            403 if not an admin, or 200 with an empty list if no
+            permission store is wired.
+        """
+        from fastapi.responses import JSONResponse
+
+        caller = auth_provider.get_user_id(request)
+        if caller is None:
+            return JSONResponse(status_code=401, content={"error": "not authenticated"})
+        is_admin = (
+            permission_store is not None and permission_store.is_admin(caller)
+        ) or admin_list.is_admin(caller)
+        if not is_admin:
+            return JSONResponse(status_code=403, content={"error": "admin only"})
+
+        users = permission_store.list_users() if permission_store is not None else []
+        return JSONResponse(
+            status_code=200,
+            content={
+                "users": [
+                    {
+                        "id": u.id,
+                        "is_admin": u.is_admin,
+                        "created_at": u.created_at,
+                        "last_login_at": u.last_login_at,
+                        "has_password": u.has_password,
+                    }
+                    for u in users
+                ]
+            },
+        )
+
     return router
 
 

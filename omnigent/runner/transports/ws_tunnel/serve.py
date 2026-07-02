@@ -45,7 +45,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_body,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+from omnigent.runner.transports.ws_tunnel.limits import (
+    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -545,6 +549,11 @@ async def _serve_tunnel_once(
         additional_headers=headers,
         close_timeout=_RUNNER_TUNNEL_CLOSE_TIMEOUT_S,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        # Protocol keepalive aligned to the server's 90 s app-level budget (not the
+        # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
+        # Also the runner's only liveness probe for a silently-dead server.
+        ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+        ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     ) as ws:
         await _send_hello(ws.send, runner_version)
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)

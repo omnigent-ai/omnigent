@@ -25,13 +25,14 @@ Or per-session::
 Span hierarchy for a typical turn::
 
     agent:<name>  (openinference.span.kind=AGENT)
-    ├── llm_call  (openinference.span.kind=LLM)
     ├── tool:<tool_name>  (openinference.span.kind=TOOL)
     │   └── agent:<sub_agent>  (openinference.span.kind=AGENT)
-    │       ├── llm_call
     │       └── tool:<sub_tool>
-    ├── policy:<policy_name>  (openinference.span.kind=GUARDRAIL)
-    └── llm_call
+    └── policy:<policy_name>  (openinference.span.kind=GUARDRAIL)
+
+LLM-level spans are not emitted from this module. Real ``llm_call``
+spans originate inside the spawned executor subprocess via the SDK's
+own tracing.
 """
 
 from __future__ import annotations
@@ -43,7 +44,10 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
-from .executor import Message
+from omnigent.runtime.telemetry import (
+    parse_provider_name,
+    should_capture_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,6 @@ TraceValue: TypeAlias = Any  # type: ignore[explicit-any]
 # OpenInference semantic conventions for span kinds.
 _SPAN_KIND_ATTR = "openinference.span.kind"
 _SPAN_KIND_AGENT = "AGENT"
-_SPAN_KIND_LLM = "LLM"
 _SPAN_KIND_TOOL = "TOOL"
 _SPAN_KIND_GUARDRAIL = "GUARDRAIL"
 
@@ -61,6 +64,19 @@ _SPAN_KIND_GUARDRAIL = "GUARDRAIL"
 _INPUT_VALUE = "input.value"
 _OUTPUT_VALUE = "output.value"
 _LLM_MODEL_NAME = "llm.model_name"
+
+# OTel GenAI semantic-convention attribute keys (Agent Spans + Tool Spans).
+# See https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
+_GEN_AI_OP_NAME = "gen_ai.operation.name"
+_GEN_AI_AGENT_NAME = "gen_ai.agent.name"
+_GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
+_GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+_GEN_AI_TOOL_NAME = "gen_ai.tool.name"
+_TOOL_NAME = "tool.name"
+
+# Error text can echo user input or tool payloads, so it is gated behind
+# content capture just like input.value / output.value.
+_ERROR_MESSAGE = "error.message"
 
 # ---------------------------------------------------------------------------
 # Global enable/disable
@@ -105,17 +121,23 @@ class TracingContext:
     """Holds the active span stack for a single session/turn.
 
     Spans are created with an explicit parent reference so we are not tied to
-    thread-local or async-context-var storage — the Session explicitly
+    thread-local or async-context-var storage. the Session explicitly
     passes its ``TracingContext`` to every helper that needs to create
     child spans.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: str | None = None) -> None:
         self._root_span: Span | None = None
         self._current_span: Span | None = None
         # parent span from parent context (for sub-agents)
         self._inherited_parent: Span | None = None
         self.enabled: bool = True
+        # Omnigent session (conversation) id, stamped as ``session.id`` on
+        # every span this context creates. An agent turn can root its own
+        # trace (the response-id-seeded root, decoupled from the request
+        # trace), so this attribute is what keeps those spans groupable by
+        # session in the backend even when they share no trace id.
+        self.session_id: str | None = session_id
 
     @property
     def active(self) -> bool:
@@ -140,9 +162,18 @@ class TracingContext:
         attrs: dict[str, str] = {
             _SPAN_KIND_ATTR: _SPAN_KIND_AGENT,
             "agent.name": agent_name,
+            _GEN_AI_OP_NAME: "invoke_agent",
+            _GEN_AI_AGENT_NAME: agent_name,
         }
+        if self.session_id:
+            attrs["session.id"] = self.session_id
         if model:
             attrs[_LLM_MODEL_NAME] = model
+            provider, model_name = parse_provider_name(model)
+            if provider:
+                attrs[_GEN_AI_PROVIDER_NAME] = provider
+            if model_name:
+                attrs[_GEN_AI_REQUEST_MODEL] = model_name
         if parent_ended and parent is not None:
             ctx = parent.get_span_context()
             if ctx is not None:
@@ -153,7 +184,7 @@ class TracingContext:
             # No explicit parent span. Check if the current OTel context
             # contains the sentinel parent injected by trace_context_for_response.
             # If so, build a context that carries the trace ID but has no
-            # parent span — this makes the agent span a true root span in
+            # parent span. this makes the agent span a true root span in
             # the OTLP export (parent_span_id absent), so MLflow finalizes
             # the trace status to OK instead of leaving it IN_PROGRESS.
             from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
@@ -181,7 +212,8 @@ class TracingContext:
             context=ctx_carrier,
             attributes=attrs,
         )
-        span.set_attribute(_INPUT_VALUE, _truncate_str(user_message))
+        if should_capture_content():
+            span.set_attribute(_INPUT_VALUE, _truncate_str(user_message))
         if self._root_span is None:
             self._root_span = span
         self._current_span = span
@@ -198,11 +230,16 @@ class TracingContext:
             return
         from opentelemetry.trace import StatusCode
 
-        if response is not None:
+        if response is not None and should_capture_content():
             span.set_attribute(_OUTPUT_VALUE, _truncate_str(response))
         if error:
-            span.set_attribute("error.message", error)
-            span.set_status(StatusCode.ERROR, error)
+            # Always mark the span errored, but record the (potentially
+            # PII-bearing) error text only when content capture is on.
+            if should_capture_content():
+                span.set_attribute(_ERROR_MESSAGE, error)
+                span.set_status(StatusCode.ERROR, error)
+            else:
+                span.set_status(StatusCode.ERROR)
         else:
             span.set_status(StatusCode.OK)
         span.end()
@@ -211,51 +248,6 @@ class TracingContext:
             self._current_span = self._inherited_parent
         elif span is self._current_span:
             self._current_span = self._inherited_parent
-
-    def start_llm_span(
-        self,
-        messages: list[Message] | None = None,
-        model: str | None = None,
-    ) -> Span:
-        """Begin an LLM span for an executor.run_turn call."""
-        from opentelemetry import trace
-
-        attrs: dict[str, str] = {_SPAN_KIND_ATTR: _SPAN_KIND_LLM}
-        if model:
-            attrs[_LLM_MODEL_NAME] = model
-
-        ctx_carrier = (
-            trace.set_span_in_context(self._current_span)
-            if self._current_span is not None
-            else None
-        )
-        span = _tracer().start_span(
-            name="llm_call",
-            context=ctx_carrier,
-            attributes=attrs,
-        )
-        truncated = _truncate_messages(messages)
-        span.set_attribute(_INPUT_VALUE, json.dumps(truncated))
-        return span
-
-    def end_llm_span(
-        self,
-        span: Span | None,
-        response_text: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        if span is None:
-            return
-        from opentelemetry.trace import StatusCode
-
-        if response_text is not None:
-            span.set_attribute(_OUTPUT_VALUE, _truncate_str(response_text))
-        if error:
-            span.set_attribute("error.message", error)
-            span.set_status(StatusCode.ERROR, error)
-        else:
-            span.set_status(StatusCode.OK)
-        span.end()
 
     def start_tool_span(
         self,
@@ -275,8 +267,13 @@ class TracingContext:
             context=ctx_carrier,
             attributes={_SPAN_KIND_ATTR: _SPAN_KIND_TOOL},
         )
-        span.set_attribute("tool.name", tool_name)
-        span.set_attribute(_INPUT_VALUE, _safe_serialize_str(tool_args))
+        if self.session_id:
+            span.set_attribute("session.id", self.session_id)
+        span.set_attribute(_TOOL_NAME, tool_name)
+        span.set_attribute(_GEN_AI_TOOL_NAME, tool_name)
+        span.set_attribute(_GEN_AI_OP_NAME, "execute_tool")
+        if should_capture_content():
+            span.set_attribute(_INPUT_VALUE, _safe_serialize_str(tool_args))
         self._current_span = span
         return span
 
@@ -292,12 +289,18 @@ class TracingContext:
             return
         from opentelemetry.trace import StatusCode
 
-        span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(result))
+        if should_capture_content():
+            span.set_attribute(_OUTPUT_VALUE, _safe_serialize_str(result))
         if duration_ms:
             span.set_attribute("duration_ms", duration_ms)
         if error:
-            span.set_attribute("error.message", error)
-            span.set_status(StatusCode.ERROR, error)
+            # Always mark the span errored, but record the (potentially
+            # PII-bearing) error text only when content capture is on.
+            if should_capture_content():
+                span.set_attribute(_ERROR_MESSAGE, error)
+                span.set_status(StatusCode.ERROR, error)
+            else:
+                span.set_status(StatusCode.ERROR)
         else:
             span.set_status(StatusCode.OK)
         span.end()
@@ -327,7 +330,10 @@ class TracingContext:
                 "policy.phase": phase,
             },
         )
-        span.set_attribute(_INPUT_VALUE, _safe_serialize_str(content))
+        if self.session_id:
+            span.set_attribute("session.id", self.session_id)
+        if should_capture_content():
+            span.set_attribute(_INPUT_VALUE, _safe_serialize_str(content))
         return span
 
     def end_policy_span(
@@ -341,7 +347,9 @@ class TracingContext:
         from opentelemetry.trace import StatusCode
 
         span.set_attribute("policy.action", action)
-        if reason is not None:
+        # policy.reason can echo flagged user content, so gate it behind
+        # content capture like the other I/O attributes.
+        if reason is not None and should_capture_content():
             span.set_attribute("policy.reason", reason)
         if action == "deny":
             span.set_status(StatusCode.ERROR)
@@ -352,7 +360,7 @@ class TracingContext:
     def create_child_context(self) -> TracingContext:
         """Create a child TracingContext for a sub-agent, parented to the
         current span of this context."""
-        child = TracingContext()
+        child = TracingContext(session_id=self.session_id)
         child.enabled = self.enabled
         child._current_span = self._current_span
         child._inherited_parent = self._current_span
@@ -405,25 +413,3 @@ def _truncate_str(value: str, max_len: int = 4000) -> str:
     if len(value) > max_len:
         return value[:max_len] + "...(truncated)"
     return value
-
-
-def _truncate_messages(
-    messages: list[Message] | None,
-    max_messages: int = 20,
-) -> list[Message]:
-    """Keep the last N messages for LLM span inputs."""
-    if not messages:
-        return []
-    truncated = messages[-max_messages:]
-    result = []
-    for m in truncated:
-        content = m.get("content")
-        if isinstance(content, str) and len(content) > 2000:
-            content = content[:2000] + "...(truncated)"
-        result.append(
-            {
-                "role": m.get("role", "unknown"),
-                "content": content if content is not None else "",
-            }
-        )
-    return result

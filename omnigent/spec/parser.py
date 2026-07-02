@@ -181,6 +181,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             model=executor.model or llm.model,
             extra=llm.extra,
             connection=executor.connection,
+            profile=llm.profile,
             request_timeout=llm.request_timeout,
             retry=llm.retry,
         )
@@ -2589,7 +2590,7 @@ def _parse_guardrails(
     :param raw: The ``guardrails:`` mapping from config.yaml,
         or ``None`` when the block was absent. Example:
         ``{"labels": {"integrity": {"initial": "1",
-        "values": ["0", "1"], "monotonic": "decreasing"}},
+        "values": ["0", "1"]}},
         "policies": {"block_canada_input": {"type": "prompt",
         ...}}, "ask_timeout": 30}``.
     :param expand_env: Whether to expand ``${VAR}`` references
@@ -2662,16 +2663,15 @@ def _parse_label_defs(
     - Bare string: ``integrity: "1"`` → schemaless with
       ``initial="1"``.
     - Dict (schema'd with initial):
-      ``{initial: "1", values: [...], monotonic: ...}``.
+      ``{initial: "1", values: [...]}``.
     - Dict (schema'd without initial):
-      ``{values: [...], monotonic: ...}``.
+      ``{values: [...]}``.
 
     :param raw: The ``labels:`` mapping, or ``None``.
     :returns: Dict mapping each label key to its
         :class:`LabelDef`. ``None`` when *raw* is ``None``.
     :raises OmnigentError: On malformed entries — empty
-        dict, ``initial`` not in ``values``, unknown
-        ``monotonic`` direction, etc.
+        dict, ``initial`` not in ``values``, etc.
     """
     if raw is None:
         return None
@@ -2694,7 +2694,7 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         ``"integrity"``.
     :param entry: Either a string (shorthand: value becomes
         ``initial``) or a dict with one or more of
-        ``initial``, ``values``, ``monotonic``.
+        ``initial``, ``values``.
     :returns: A populated :class:`LabelDef`.
     :raises OmnigentError: On any malformed value.
     """
@@ -2715,14 +2715,13 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         # Empty-dict typo guard — matches POLICIES.md §13.
         raise OmnigentError(
             f"label {key!r} declares an empty dict — must contain at "
-            f"least one of `initial`, `values`, or `monotonic`",
+            f"least one of `initial` or `values`",
             code=ErrorCode.INVALID_INPUT,
         )
     initial = _coerce_label_initial(entry.get("initial"))
     values = _coerce_label_values(key, entry.get("values"))
-    monotonic = _coerce_label_monotonic(key, entry.get("monotonic"))
-    _validate_label_def_cross_fields(key, initial, values, monotonic)
-    return LabelDef(initial=initial, values=values, monotonic=monotonic)
+    _validate_label_def_cross_fields(key, initial, values)
+    return LabelDef(initial=initial, values=values)
 
 
 def _coerce_label_initial(raw: Any) -> str | None:
@@ -2751,59 +2750,24 @@ def _coerce_label_values(key: str, raw: Any) -> list[str] | None:
     return [str(v) for v in raw]
 
 
-def _coerce_label_monotonic(
-    key: str,
-    raw: Any,
-) -> Literal["increasing", "decreasing"] | None:
-    """
-    Validate a ``monotonic:`` direction.
-
-    :param key: Label key, for error messages.
-    :param raw: Raw ``monotonic:`` value from YAML — must
-        be ``"increasing"``, ``"decreasing"``, or absent.
-    :returns: The validated direction, or ``None`` when
-        *raw* is ``None``.
-    :raises OmnigentError: On any other value.
-    """
-    if raw is None:
-        return None
-    if raw == "increasing":
-        return "increasing"
-    if raw == "decreasing":
-        return "decreasing"
-    raise OmnigentError(
-        f"label {key!r}: `monotonic` must be 'increasing' or 'decreasing', got {raw!r}",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
 def _validate_label_def_cross_fields(
     key: str,
     initial: str | None,
     values: list[str] | None,
-    monotonic: Literal["increasing", "decreasing"] | None,
 ) -> None:
     """
     Enforce cross-field constraints on a :class:`LabelDef`.
 
     Per POLICIES.md §13:
 
-    - ``monotonic`` requires ``values`` (no positions to
-      order without them).
     - When both ``initial`` and ``values`` are declared,
       ``initial`` must be in ``values``.
 
     :param key: Label key, for error messages.
     :param initial: Pre-coerced initial value.
     :param values: Pre-coerced values list.
-    :param monotonic: Pre-validated direction.
     :raises OmnigentError: On any cross-field violation.
     """
-    if monotonic is not None and values is None:
-        raise OmnigentError(
-            f"label {key!r}: `monotonic` requires a `values` list to order against",
-            code=ErrorCode.INVALID_INPUT,
-        )
     if initial is not None and values is not None and initial not in values:
         raise OmnigentError(
             f"label {key!r}: `initial` value {initial!r} is not in declared `values` {values!r}",

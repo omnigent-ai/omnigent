@@ -66,26 +66,35 @@ jobs:
       # These run before the LLM and use the GitHub token directly.
       # The LLM never sees GH_TOKEN.
 
-      - name: Read issue assignees
+      - name: Read areas (owner allowlist + definitions)
         if: steps.creds.outputs.available == 'true'
         id: assignees
         run: |
-          # Parse ISSUE_ASSIGNEES into a JSON map: {"username": ["domain1", ...], ...}
-          # This is consumed by the "Apply triage labels" step for domain-aware routing.
+          # Derive everything downstream needs from the single source of truth,
+          # .github/areas.json:
+          #   /tmp/owners.json   -- flat allowlist of every area owner (the ONLY
+          #                         logins the assignment step may ever pick).
+          #   /tmp/components.json -- the set of comp:* labels the validator allows.
+          #   /tmp/areas_prompt.txt -- the AREAS block injected into the triage
+          #                         prompt so the LLM can rank owners by area fit.
           python3 <<'PYEOF'
           import json, pathlib
 
-          assignees = {}
-          for line in pathlib.Path(".github/ISSUE_ASSIGNEES").read_text().splitlines():
-              line = line.strip()
-              if not line or line.startswith("#"):
-                  continue
-              parts = line.split()
-              username = parts[0]
-              domains = parts[1].split(",") if len(parts) > 1 else []
-              assignees[username] = domains
+          areas = json.loads(pathlib.Path(".github/areas.json").read_text())["areas"]
 
-          pathlib.Path("/tmp/assignees.json").write_text(json.dumps(assignees))
+          owners, components, lines = [], set(), []
+          for a in areas:
+              for o in a.get("owners", []):
+                  if o not in owners:
+                      owners.append(o)
+              components.add(a["label"])
+              lines.append(
+                  f"- {a['key']}: {a['definition']} Owners: {', '.join(a.get('owners', []))}."
+              )
+
+          pathlib.Path("/tmp/owners.json").write_text(json.dumps(owners))
+          pathlib.Path("/tmp/components.json").write_text(json.dumps(sorted(components)))
+          pathlib.Path("/tmp/areas_prompt.txt").write_text("\n".join(lines))
           PYEOF
 
       - name: Fetch issue content and duplicate candidates
@@ -235,6 +244,9 @@ jobs:
 
           issue = json.loads(pathlib.Path("/tmp/issue.json").read_text())
           dupes = json.loads(pathlib.Path("/tmp/duplicates.json").read_text())
+          # Trusted area definitions + owners (from .github/areas.json). Used by
+          # the LLM to fill `ranked_owners`.
+          areas_block = pathlib.Path("/tmp/areas_prompt.txt").read_text()
 
           # Cap issue body to 8 KB to stay within prompt limits.
           body = (issue.get("body") or "")[:8192]
@@ -260,6 +272,10 @@ jobs:
           ## CANDIDATE DUPLICATES
 
           {dupe_section}
+
+          ## AREAS (trusted — for the components and ranked_owners fields)
+
+          {areas_block}
 
           ## TASK
 
@@ -354,10 +370,9 @@ jobs:
 
           # Validate fields against allowed values to prevent label injection.
           ALLOWED_TYPES = {"bug", "enhancement", "documentation"}
-          ALLOWED_COMPONENTS = {
-              "comp:server", "comp:runner", "comp:repr",
-              "comp:web-ui", "comp:tui", "comp:policies", "comp:harnesses", "comp:infra",
-          }
+          # Component labels come from .github/areas.json (single source of truth),
+          # so the validator can never drift from the area definitions.
+          ALLOWED_COMPONENTS = set(json.loads(pathlib.Path("/tmp/components.json").read_text()))
           ALLOWED_PRIORITIES = {"P0-critical", "P1-high", "P2-medium", "P3-low"}
 
           # Read existing labels so we only remove labels that are present
@@ -417,10 +432,23 @@ jobs:
           valid_components = [c for c in result.get("components", [])
                               if isinstance(c, str) and c in ALLOWED_COMPONENTS]
 
+          # Validate ranked_owners against the areas.json owner allowlist. This is
+          # the hard constraint: the assignment step can ONLY ever pick a real
+          # area owner, so a prompt-injected or hallucinated login is dropped here
+          # (same posture as the component/duplicate allowlists above). Order is
+          # preserved (the LLM's ranking); duplicates are removed.
+          allowed_owners = set(json.loads(pathlib.Path("/tmp/owners.json").read_text()))
+          ranked_owners, seen = [], set()
+          for u in result.get("ranked_owners", []):
+              if isinstance(u, str) and u in allowed_owners and u not in seen:
+                  ranked_owners.append(u)
+                  seen.add(u)
+
           output = {
               "labels_add": labels_add,
               "labels_remove": labels_remove,
               "components": valid_components,
+              "ranked_owners": ranked_owners,
               "duplicate_of": dup if isinstance(dup, int) else None,
               "priority": result.get("priority") if result.get("priority") in ALLOWED_PRIORITIES else None,
               "reasoning": result.get("reasoning", ""),
@@ -475,40 +503,50 @@ jobs:
             maintainer_assigned=true
           fi
 
-          # Round-robin assign engineer for P0/P1 issues, with domain routing.
-          # Skip if already assigned to the maintainer-author above.
+          # Otherwise, assign an owner for P0/P1 issues: the LLM's top-ranked area
+          # owner, breaking ties by open-assigned-issue load (fairness). Symmetric
+          # with the PR reviewer path (rank primary, load secondary). Skipped if
+          # the maintainer-author was already assigned above.
           priority=$(jq -r '.priority // empty' /tmp/triage_result.json)
           if [ "$maintainer_assigned" = "false" ] && { [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; }; then
+            # Open-issue load per candidate (fewest assigned open issues wins ties).
+            # One trusted query; the LLM never sees GH_TOKEN.
+            gh issue list --repo "$REPO" --state open --limit 500 \
+              --json assignees > /tmp/open_issues.json 2>/dev/null || echo "[]" > /tmp/open_issues.json
             python3 <<'PYEOF'
-          import json, pathlib, os
+          import json, pathlib, collections
 
-          assignees = json.loads(pathlib.Path("/tmp/assignees.json").read_text())
           triage = json.loads(pathlib.Path("/tmp/triage_result.json").read_text())
-          issue_number = int(os.environ["ISSUE_NUMBER"])
+          owners = json.loads(pathlib.Path("/tmp/owners.json").read_text())
 
-          # Extract domains from comp:* labels (e.g. "comp:server" → "server").
-          domains = [c.removeprefix("comp:") for c in triage.get("components", [])]
+          # Candidates: the validated ranked owners (LLM preference order). If the
+          # LLM gave none, fall back to the full owner pool so a P0/P1 is never
+          # left unassigned — load then picks the least-loaded owner.
+          ranked = triage.get("ranked_owners") or []
+          candidates = ranked if ranked else owners
+          rank_of = {u: i for i, u in enumerate(ranked)}  # unranked -> +inf below
 
-          # Filter to engineers matching ANY of the domains; fall back to full list.
-          if domains:
-              candidates = [u for u, ds in assignees.items()
-                            if any(d in ds for d in domains)]
+          # Tally open issues assigned per login.
+          load = collections.Counter()
+          for it in json.loads(pathlib.Path("/tmp/open_issues.json").read_text()):
+              for a in it.get("assignees", []):
+                  if a.get("login"):
+                      load[a["login"]] += 1
+
+          # Sort by (rank, load, login): LLM rank first, then fewest open issues,
+          # then a stable alphabetical tie-break (deterministic, unlike a random
+          # one — matches the previous round-robin's determinism guarantee).
+          candidates = sorted(
+              candidates,
+              key=lambda u: (rank_of.get(u, float("inf")), load[u], u),
+          )
+          assignee = candidates[0] if candidates else ""
+          if assignee:
+              print(f"Assigning to {assignee} "
+                    f"(ranked={ranked or 'none->full pool'}, load={load[assignee]})")
           else:
-              candidates = []
-
-          if not candidates:
-              candidates = list(assignees.keys())
-
-          if candidates:
-              candidates.sort()  # deterministic order
-              index = issue_number % len(candidates)
-              assignee = candidates[index]
-              print(f"Assigning to {assignee} (domains={domains or ['any']}, "
-                    f"index {index} of {len(candidates)} candidates)")
-              pathlib.Path("/tmp/assignee.txt").write_text(assignee)
-          else:
-              print("No assignees configured")
-              pathlib.Path("/tmp/assignee.txt").write_text("")
+              print("No owners configured; leaving unassigned.")
+          pathlib.Path("/tmp/assignee.txt").write_text(assignee)
           PYEOF
 
             assignee=$(cat /tmp/assignee.txt)

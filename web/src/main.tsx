@@ -3,6 +3,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
+import { PWAUpdateBanner } from "./components/pwa/PWAUpdateBanner";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
@@ -12,8 +13,14 @@ import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
+import { initBrowserTelemetry } from "./lib/telemetry";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
+
+// Start tracing before any request fires so fetch/XHR are patched in time
+// and a trace begins in the browser. No-op unless a collector endpoint is
+// configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
+initBrowserTelemetry();
 
 // Single client at module scope — shared across the whole app.
 //
@@ -73,6 +80,7 @@ void _bootProbe.then((info) => {
       <CapabilitiesProvider info={info}>
         <QueryClientProvider client={queryClient}>
           <ThemeProvider>
+            <PWAUpdateBanner />
             <TooltipProvider>
               <ImageLightboxProvider>
                 <BrowserRouter>

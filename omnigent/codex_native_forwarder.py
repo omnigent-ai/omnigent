@@ -4878,7 +4878,7 @@ def _codex_tool_call_from_item(item: dict[str, Any]) -> _CodexToolCall | None:
 # that sandbox cannot start and every command hard-fails with this raw bwrap
 # error, with no hint at how to recover. Detect the marker and append actionable
 # guidance so a top-level session degrades with direction instead of an opaque
-# failure (issue #657; mirrors the degrade-not-crash ask in #517). The codex
+# failure. The codex
 # ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
 # access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
 _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
@@ -4939,7 +4939,7 @@ def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexTo
         suffix = f"[exit code: {exit_code}]"
         output_text = f"{output_text}\n{suffix}" if output_text else suffix
     # Turn codex's opaque "sandbox can't start" bwrap failure into actionable
-    # recovery guidance (issue #657); a no-op for any other output.
+    # recovery guidance; a no-op for any other output.
     output_text = _augment_sandbox_namespace_error(output_text)
     return _CodexToolCall(call_id=call_id, name="shell", arguments=arguments, output=output_text)
 
@@ -5874,7 +5874,7 @@ async def _post_session_event_inner(
         # An HTTP response (no transport error) proves the server is reachable,
         # so clear any stale connectivity-failure record — otherwise a recovered
         # connection could have an old failure misattributed to a later,
-        # unrelated idle-watchdog stall (issue #1119).
+        # unrelated idle-watchdog stall.
         note_native_post_success()
         if _post_response_is_final(response, attempt, max_attempts):
             return _PostResult(response=response)
@@ -5928,7 +5928,7 @@ def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError, max_attem
     # Surface this connectivity failure to the harness idle-turn watchdog: if
     # the turn stalls because events can't reach the server, the watchdog
     # attaches this cause to the failure reason instead of a generic
-    # "wedged LLM" message (issue #1119).
+    # "wedged LLM" message.
     record_native_post_failure(event_type, exc)
 
 

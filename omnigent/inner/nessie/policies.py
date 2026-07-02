@@ -577,15 +577,20 @@ def read_only_os(
     ),
 ) -> Callable[[_Json, _Json], _Json]:
     """
-    Factory: deny every file-mutating tool call (report-only agents).
+    Factory: deny the file-write/edit tools (best-effort report-only guardrail).
 
     DENIES ``sys_os_write`` / ``sys_os_edit`` and the Claude/Codex/Pi native
-    ``Write`` / ``Edit`` / ``MultiEdit`` aliases. Reads, searches, and shell
-    commands are left untouched — pair with :func:`blast_radius` to also bound
-    shell blast radius. Use on agents whose contract is to investigate and
-    report, never to change code (e.g. a security reviewer and its read-only
-    sub-agents): unlike prompt discipline alone, an accidental ``sys_os_edit``
-    is refused at the policy layer.
+    ``Write`` / ``Edit`` / ``MultiEdit`` aliases, so an accidental edit is
+    refused at the policy layer rather than only discouraged in prose.
+
+    NOT a containment boundary. Reads, searches, and shell are left enabled, so
+    an agent can still mutate files via the shell (``echo > f``, ``sed -i``,
+    ``tee``) — this policy does not gate that, and command parsing cannot
+    reliably catch it. For a hard guarantee (e.g. reviewing untrusted input),
+    run the agent sandboxed — ``os_env.sandbox.type: linux_bwrap`` (Linux) /
+    ``darwin_seatbelt`` (macOS) binds cwd read-only — and treat this policy as
+    defense-in-depth. Use for agents whose contract is to investigate and
+    report (a security reviewer and its read-only sub-agents).
 
     :param deny_reason: Reason text surfaced on a DENY decision.
     :returns: An evaluator ``fn(event, config)`` returning DENY for any
@@ -626,7 +631,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
     {
         "handler": "omnigent.inner.nessie.policies.blast_radius",
         "kind": "factory",
-        "name": "Block Dangerous Shell Commands (force-push, rm -rf)",
+        "name": "Block Dangerous Shell Commands force-push, rm -rf",
         "description": "Classifies shell commands (sys_os_shell, Claude/Codex native Bash, "
         "and Pi native bash) as safe, risky (ASK), or catastrophic (DENY) to prevent "
         "destructive operations like force-push or rm -rf /",
@@ -656,9 +661,11 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
     {
         "handler": "omnigent.inner.nessie.policies.read_only_os",
         "kind": "factory",
-        "name": "Report-Only (Deny File Writes)",
-        "description": "Denies every file-mutating tool (sys_os_write/edit, Claude/Codex "
-        "native Write/Edit/MultiEdit, and Pi native write/edit) so a report-only agent "
-        "can read and run shell but never change code",
+        "name": "Report-Only (Deny File-Write Tools)",
+        "description": "Best-effort report-only guardrail: denies the file-write/edit tools "
+        "(sys_os_write/edit, Claude/Codex native Write/Edit/MultiEdit, and Pi native "
+        "write/edit). Shell stays enabled, so shell-based writes (echo >, sed -i) are NOT "
+        "blocked -- for a hard boundary against untrusted input, sandbox the agent "
+        "(os_env.sandbox.type: linux_bwrap / darwin_seatbelt binds cwd read-only)",
     },
 ]

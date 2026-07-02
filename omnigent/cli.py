@@ -1087,11 +1087,11 @@ def _format_version() -> str:
         ``"omnigent 0.1.0 (010cf77c, built 2026-05-21T14:34:45Z)"``.
     """
     import datetime
-    import importlib.metadata
 
     from omnigent.update_check import _read_build_info
+    from omnigent.version import VERSION
 
-    version_str = importlib.metadata.version("omnigent")
+    version_str = VERSION
     info = _read_build_info()
     if info is None:
         return f"omnigent {version_str}"
@@ -1145,15 +1145,11 @@ class _OmnigentCLI(click.Group):
         from omnigent.inner import ui
 
         if ui.show_banner():
-            import importlib.metadata
+            from omnigent.version import VERSION
 
-            try:
-                version = importlib.metadata.version("omnigent")
-            except importlib.metadata.PackageNotFoundError:  # pragma: no cover
-                version = ""
             epilogue = [("Get started", "omnigent setup")]
-            if version:
-                epilogue.insert(0, ("Version", version))
+            if VERSION:
+                epilogue.insert(0, ("Version", VERSION))
             ui.print_landing(tagline="all your agents, one cli", epilogue=epilogue)
         super().format_help(ctx, formatter)
 
@@ -2979,6 +2975,8 @@ def server(
 
     from omnigent.runner.transports.ws_tunnel.limits import (
         RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+        TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     )
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider
@@ -3076,7 +3074,7 @@ def server(
     # designs/OBSERVABILITY.md for the env var reference.
     from omnigent.runtime import telemetry
 
-    telemetry.init()
+    telemetry.init("omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally
@@ -3229,6 +3227,25 @@ def server(
             port=port,
             log_config=_server_uvicorn_log_config(),
             ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # Server side of the runner/host tunnels' protocol keepalive, aligned
+            # to the 90 s app-level budget instead of uvicorn's 20 s default that
+            # drops a busy-but-healthy tunnel with 1011 — issue #1116.
+            #
+            # uvicorn's ws_ping_* is server-global (no per-route override), so this
+            # 30 s/90 s budget also applies to the app's other WebSocket routes —
+            # /v1/sessions/updates (browser stream) and .../terminals/{id}/attach.
+            # Deliberate and acceptable: for an IDLE such socket the protocol
+            # PING/PONG is the only half-open detector (the sessions-updates
+            # heartbeat is a server->client send, and an idle terminal has no
+            # traffic), so widening it means a dead idle browser/terminal socket is
+            # reaped at worst ~120 s (30 s interval + 90 s timeout) instead of
+            # ~40 s — a slightly later half-open cleanup (e.g. the out-of-process
+            # terminal-attach proxy holds its runner socket + tmux child ~80 s
+            # longer), bounded and eventually reaped, not a leak or correctness
+            # change. The tunnels are the sockets that actually need the looser
+            # budget (issue #1116).
+            ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+            ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         )
     finally:

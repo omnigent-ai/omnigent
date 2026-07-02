@@ -13,25 +13,27 @@
  *   home of the theme control that used to sit in the sidebar header.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
- *   the old sidebar AccountMenu: signed-in identity, admin-only Members /
- *   Policies links, change password, and sign out.
+ *   the old sidebar AccountMenu: signed-in identity, change password, and
+ *   sign out.
+ * - **Members** / **Policies** — admin-only, accounts deploys. Server-wide
+ *   management surfaces rendered as settings sub-categories (previously
+ *   standalone `/members` and `/policies` pages linked from Account) so
+ *   entering them stays inside settings — the sidebar keeps the section nav
+ *   instead of snapping back to the conversation list.
  * - **Archived sessions** — archived sessions, moved out of the sidebar
  *   list. Not clickable; each row reveals Delete / Unarchive on hover.
  */
 
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArchiveRestoreIcon,
   KeyRoundIcon,
   LogOutIcon,
-  ShieldCheckIcon,
   Trash2Icon,
   UserCogIcon,
-  UsersIcon,
 } from "lucide-react";
 import { LaptopMinimalIcon, MoonIcon, SunIcon } from "lucide-react";
 import { useTheme } from "next-themes";
-import { Link } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -44,7 +46,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
-import { changePassword, type CurrentAccount, getMe, logout } from "@/lib/accountsApi";
+import { changePassword, logout } from "@/lib/accountsApi";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
@@ -60,6 +63,17 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
+// Admin-only management surfaces, rendered as the Members / Policies settings
+// sub-categories. Lazy-loaded so non-accounts deploys (where these sections
+// never appear) don't pull them into the settings chunk — mirrors the
+// route-level lazy loading these had when they were standalone pages.
+const MembersPage = lazy(() =>
+  import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
+);
+const PoliciesPage = lazy(() =>
+  import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
+);
+
 /**
  * Settings content panel. The section nav lives in the sidebar card
  * (SettingsSidebarBody); this renders only the selected section into the
@@ -69,14 +83,31 @@ import { cn } from "@/lib/utils";
  */
 export function SettingsPage() {
   const info = useServerInfo();
-  const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  // A login session exists (accounts OR OIDC) when the server advertises a
+  // login_url; gates the Account section so SSO users get it too.
+  const hasAuthSession = info !== "loading" && info.login_url !== null;
   const { section } = useSettingsRoute();
+
+  // Members / Policies are admin-only management surfaces that own their full
+  // layout (their own PageScroll + admin gating), so they render directly —
+  // NOT inside the shared section PageScroll below, which would nest two
+  // scroll containers. Both self-gate to admins server-side and client-side.
+  // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
+  // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
+  // read-only under OIDC (no password actions).
+  if (section === "members" || section === "policies") {
+    return (
+      <Suspense fallback={null}>
+        {section === "members" ? <MembersPage /> : <PoliciesPage />}
+      </Suspense>
+    );
+  }
 
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
       {section === "shortcuts" && <ShortcutsSection />}
-      {section === "account" && accountsEnabled && <AccountSection />}
+      {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
     </PageScroll>
@@ -254,9 +285,14 @@ function LocalCliSection() {
 }
 
 function AccountSection() {
-  const [me, setMe] = useState<CurrentAccount | null | "unknown">("unknown");
+  const info = useServerInfo();
+  const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  // Identity for display. Sourced from the mode-agnostic `/v1/me` probe so it
+  // works under OIDC too (the accounts-only `/auth/me` doesn't exist there).
+  const [me, setMe] = useState<{ id: string; is_admin: boolean } | null | "unknown">("unknown");
 
   // Change-password dialog state (lifted verbatim from the old AccountMenu).
+  // Only used in accounts mode — OIDC identities have no local password.
   const [pwOpen, setPwOpen] = useState(false);
   const [oldPw, setOldPw] = useState("");
   const [newPw, setNewPw] = useState("");
@@ -266,14 +302,27 @@ function AccountSection() {
   const [pwDone, setPwDone] = useState(false);
 
   useEffect(() => {
-    void (async () => setMe(await getMe()))();
+    void (async () => {
+      const userId = await resolveIdentity();
+      setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
+    })();
   }, []);
 
   const onSignOut = useCallback(async () => {
-    await logout();
-    // Hard navigation so the chat store / react-query cache reset.
-    window.location.href = "/login";
-  }, []);
+    if (accountsEnabled) {
+      // Accounts: clear the cookie via the JSON logout endpoint, then land on
+      // the SPA login form.
+      await logout();
+      // Hard navigation so the chat store / react-query cache reset.
+      window.location.href = "/login";
+      return;
+    }
+    // OIDC: logout is a server-side GET redirect at /auth/logout that clears
+    // the session cookie (and honors the IdP end-session endpoint when
+    // configured). A hard navigation lets the browser follow it and resets
+    // client caches.
+    window.location.href = "/auth/logout";
+  }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {
     setOldPw("");
@@ -324,32 +373,26 @@ function AccountSection() {
           </div>
         </div>
 
-        {me.is_admin && (
-          <div className="flex flex-col gap-1">
-            <Button asChild variant="ghost" className="w-full justify-start gap-2">
-              <Link to="/members">
-                <UsersIcon className="size-4" /> Members
-              </Link>
-            </Button>
-            <Button asChild variant="ghost" className="w-full justify-start gap-2">
-              <Link to="/policies">
-                <ShieldCheckIcon className="size-4" /> Policies
-              </Link>
-            </Button>
-          </div>
-        )}
+        {/* Members / Policies used to live here as links to standalone pages.
+            They're now first-class settings sub-categories in the sidebar nav
+            (Admin group), so entering them keeps the settings surface put
+            instead of navigating away from /settings. */}
 
         <div className="flex flex-col gap-1">
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-2"
-            onClick={() => {
-              resetPwForm();
-              setPwOpen(true);
-            }}
-          >
-            <KeyRoundIcon className="size-4" /> Change password
-          </Button>
+          {/* Change password is accounts-only — an OIDC identity's password
+              lives with the IdP, so there's nothing to change here. */}
+          {accountsEnabled && (
+            <Button
+              variant="ghost"
+              className="w-full justify-start gap-2"
+              onClick={() => {
+                resetPwForm();
+                setPwOpen(true);
+              }}
+            >
+              <KeyRoundIcon className="size-4" /> Change password
+            </Button>
+          )}
           <Button
             variant="ghost"
             className="w-full justify-start gap-2"
@@ -509,7 +552,7 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
           disabled={busy}
           onClick={() => setDeleteOpen(true)}
         >
-          <Trash2Icon className="size-4" />
+          <Trash2Icon className="size-4 text-destructive" />
         </Button>
         <Button
           type="button"

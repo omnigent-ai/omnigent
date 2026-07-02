@@ -466,11 +466,15 @@ async def test_serve_tunnel_once_sends_bearer_header(
         :param additional_headers: Optional handshake headers.
         :param close_timeout: WebSocket close-handshake timeout.
         :param max_size: Maximum inbound WebSocket message size.
+        :param ping_interval: Protocol keepalive ping interval (seconds).
+        :param ping_timeout: Protocol keepalive PONG timeout (seconds).
         """
 
         additional_headers: dict[str, str] | None
         close_timeout: float
         max_size: int
+        ping_interval: float
+        ping_timeout: float
 
     captured: dict[str, str | _ConnectKwargs] = {}
 
@@ -568,6 +572,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
         },
         "close_timeout": serve_module._RUNNER_TUNNEL_CLOSE_TIMEOUT_S,
         "max_size": serve_module.RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        "ping_interval": serve_module.TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+        "ping_timeout": serve_module.TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     }
     assert isinstance(captured["sent"], str)
 

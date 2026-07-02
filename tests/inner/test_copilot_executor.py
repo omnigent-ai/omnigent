@@ -28,6 +28,7 @@ from omnigent.inner.copilot_executor import (
     _encode_tool_result,
     _event_data,
     _finalize_usage,
+    _permission_policy_input,
     _resolve_model,
     _resolve_reasoning_effort,
 )
@@ -203,7 +204,33 @@ def _install_fake_copilot(
     module.ToolResult = _ToolResult  # type: ignore[attr-defined]
     module.PermissionHandler = _PermissionHandler  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "copilot", module)
+    # ``copilot.rpc`` re-exports the permission-decision classes the executor's
+    # on_permission_request handler returns.
+    rpc = types.ModuleType("copilot.rpc")
+    rpc.PermissionDecisionApproveOnce = _ApproveOnce  # type: ignore[attr-defined]
+    rpc.PermissionDecisionReject = _Reject  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "copilot.rpc", rpc)
     return state
+
+
+class _ApproveOnce:
+    kind = "approve-once"
+
+
+class _Reject:
+    kind = "reject"
+
+    def __init__(self, feedback: str | None = None) -> None:
+        self.feedback = feedback
+
+
+def _perm_request(kind: str = "shell", tool_name: str | None = None, **data: Any) -> Any:
+    """A fake Copilot ``PermissionRequest`` variant (kind discriminator + to_dict)."""
+    return types.SimpleNamespace(
+        kind=kind,
+        tool_name=tool_name,
+        to_dict=lambda: {"kind": kind, **data},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +640,8 @@ async def test_system_message_and_model_threaded(monkeypatch: pytest.MonkeyPatch
     assert kwargs["model"] is None
     # system prompt delivered as an append-mode system_message.
     assert kwargs["system_message"] == {"mode": "append", "content": "SYS"}
-    assert kwargs["on_permission_request"] == _PermissionHandler.approve_all
+    # native-tool permission requests route through the policy-gating handler.
+    assert kwargs["on_permission_request"] == ex._on_permission_request
     await ex.close()
 
 
@@ -823,6 +851,158 @@ async def test_policy_allow_consults_both_phases_and_completes(
     completes = [e for e in events if isinstance(e, TurnComplete)]
     assert completes and completes[0].response == "hi"
     assert phases == ["PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE"]
+    await ex.close()
+
+
+# ---------------------------------------------------------------------------
+# Native-tool permission gating (on_permission_request -> PHASE_TOOL_CALL).
+# ---------------------------------------------------------------------------
+
+
+def test_permission_policy_input_name_and_args() -> None:
+    # mcp/custom-tool/hook carry tool_name; others fall back to the kind.
+    assert _permission_policy_input(_perm_request("mcp", tool_name="fetch", url="x")) == (
+        "fetch",
+        {"kind": "mcp", "url": "x"},
+    )
+    assert _permission_policy_input(_perm_request("shell", fullCommandText="ls")) == (
+        "shell",
+        {"kind": "shell", "fullCommandText": "ls"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_permission_policy_deny_rejects_native_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    async def deny(phase: str, ctx: dict[str, Any]) -> Any:
+        seen.append((phase, ctx))
+        return _verdict("POLICY_ACTION_DENY", "blast radius")
+
+    ex._policy_evaluator = deny
+    req = _perm_request("shell", fullCommandText="rm -rf /")
+    decision = await ex._on_permission_request(req, {"session_id": "conv1"})
+    assert decision.kind == "reject"
+    assert "blast radius" in decision.feedback
+    # The native tool was evaluated at the tool-call phase with name + arguments.
+    assert seen == [
+        (
+            "PHASE_TOOL_CALL",
+            {"name": "shell", "arguments": {"kind": "shell", "fullCommandText": "rm -rf /"}},
+        )
+    ]
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_policy_allow_approves_native_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def allow(phase: str, ctx: dict[str, Any]) -> Any:
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    ex._policy_evaluator = allow
+    decision = await ex._on_permission_request(_perm_request("write", fileName="a.py"), {})
+    assert decision.kind == "approve-once"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_no_policy_approves(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No policy evaluator wired -> preserve the SDK's default-approve behavior.
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+    decision = await ex._on_permission_request(_perm_request("read", path="/x"), {})
+    assert decision.kind == "approve-once"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_elicitation_approved(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No policy evaluator; elicitation handler approves -> approve-once.
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def approve(name: str, args: dict[str, Any]) -> bool:
+        return True
+
+    ex._elicitation_handler = approve
+    decision = await ex._on_permission_request(_perm_request("shell", fullCommandText="ls"), {})
+    assert decision.kind == "approve-once"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_elicitation_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No policy evaluator; elicitation handler denies -> reject with UI message.
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def deny(name: str, args: dict[str, Any]) -> bool:
+        return False
+
+    ex._elicitation_handler = deny
+    req = _perm_request("shell", fullCommandText="rm -rf /")
+    decision = await ex._on_permission_request(req, {})
+    assert decision.kind == "reject"
+    assert "approval UI" in decision.feedback
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_policy_deny_skips_elicitation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Policy DENY short-circuits before elicitation handler is reached.
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    elicitation_called = False
+
+    async def deny_policy(phase: str, ctx: dict[str, Any]) -> Any:
+        return _verdict("POLICY_ACTION_DENY", "blast radius")
+
+    async def elicitation(name: str, args: dict[str, Any]) -> bool:
+        nonlocal elicitation_called
+        elicitation_called = True
+        return True
+
+    ex._policy_evaluator = deny_policy
+    ex._elicitation_handler = elicitation
+    req = _perm_request("shell", fullCommandText="rm -rf /")
+    decision = await ex._on_permission_request(req, {})
+    assert decision.kind == "reject"
+    assert "blast radius" in decision.feedback
+    assert not elicitation_called
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_policy_allow_then_elicitation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Policy ALLOW proceeds to elicitation stage.
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    elicitation_calls: list[str] = []
+
+    async def allow_policy(phase: str, ctx: dict[str, Any]) -> Any:
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    async def elicitation(name: str, args: dict[str, Any]) -> bool:
+        elicitation_calls.append(name)
+        return True
+
+    ex._policy_evaluator = allow_policy
+    ex._elicitation_handler = elicitation
+    decision = await ex._on_permission_request(_perm_request("write", fileName="a.py"), {})
+    assert decision.kind == "approve-once"
+    assert elicitation_calls == ["write"]
     await ex.close()
 
 

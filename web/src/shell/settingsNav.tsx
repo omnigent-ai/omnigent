@@ -12,22 +12,34 @@ import {
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
+  ShieldCheckIcon,
   TerminalIcon,
   UserCogIcon,
+  UsersIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
-export type SettingsSectionId = "appearance" | "shortcuts" | "account" | "archived" | "cli";
+export type SettingsSectionId =
+  | "appearance"
+  | "shortcuts"
+  | "account"
+  | "members"
+  | "policies"
+  | "archived"
+  | "cli";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "shortcuts",
   "account",
+  "members",
+  "policies",
   "archived",
   "cli",
 ];
@@ -46,20 +58,26 @@ interface SettingsNavGroup {
 }
 
 /**
- * Nav groups for the current deploy. The Account section is auth-gated; the
+ * Nav groups for the current deploy. The Account section appears whenever the
+ * deploy has a login session (accounts OR OIDC/SSO — i.e. a `login_url`
+ * exists), so an SSO user can see who they're signed in as and sign out; it's
+ * absent only in header single-user mode. The Admin group (Members / Policies)
+ * appears for admins in ANY multi-user mode since both accounts and OIDC share
+ * the `users.is_admin` flag and the server enforces admin on every route; the
  * Desktop group (Local CLI) appears only in the Electron shell.
  */
 export function settingsNavGroups(
-  accountsEnabled: boolean,
+  hasAuthSession: boolean,
   isDesktop: boolean,
+  isAdmin = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
   ];
-  if (accountsEnabled) {
+  if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
-    // on accounts deploys.
+    // on a deploy with sign-in.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
   const groups: SettingsNavGroup[] = [];
@@ -71,13 +89,27 @@ export function settingsNavGroups(
       items: [{ id: "cli", label: "Local CLI", icon: TerminalIcon }],
     });
   }
-  groups.push(
-    { title: "General", items: general },
-    {
-      title: "Archived",
-      items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
-    },
-  );
+  groups.push({ title: "General", items: general });
+  // Admin: server-wide management, admin-only. Nested here as sub-categories
+  // (rather than links out of the Account section) so entering them stays
+  // inside /settings — the sidebar keeps the settings nav instead of snapping
+  // back to the conversation list. Gated on `isAdmin` alone (not
+  // `accountsEnabled`) so the surface also appears under OIDC/SSO, the one
+  // mode where there's otherwise no admin chrome at all. Members runs
+  // read-only under OIDC (no password actions); Policies is identical.
+  if (isAdmin) {
+    groups.push({
+      title: "Admin",
+      items: [
+        { id: "members", label: "Members", icon: UsersIcon },
+        { id: "policies", label: "Policies", icon: ShieldCheckIcon },
+      ],
+    });
+  }
+  groups.push({
+    title: "Archived",
+    items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
+  });
   return groups;
 }
 
@@ -91,16 +123,22 @@ export function settingsNavGroups(
  */
 export function useSettingsRoute(): { inSettings: boolean; section: SettingsSectionId } {
   const info = useServerInfo();
-  const accountsEnabled = info !== "loading" && info.accounts_enabled;
-  const defaultSection: SettingsSectionId = accountsEnabled ? "account" : "appearance";
+  // A login session exists (accounts OR OIDC) when the server advertises a
+  // login_url; header single-user mode reports null. The Account section —
+  // and the bare-/settings default landing on it — follows that, not
+  // accounts specifically.
+  const hasAuthSession = info !== "loading" && info.login_url !== null;
+  const defaultSection: SettingsSectionId = hasAuthSession ? "account" : "appearance";
 
   const segments = useLocation().pathname.split("/").filter(Boolean);
   const idx = segments.lastIndexOf("settings");
   if (idx === -1) return { inSettings: false, section: defaultSection };
   const next = segments[idx + 1];
-  const section = (SECTION_IDS as readonly string[]).includes(next)
-    ? (next as SettingsSectionId)
-    : defaultSection;
+  // Members / Policies are admin sections valid in ANY multi-user mode
+  // (accounts AND OIDC). They're gated in the nav on `is_admin` and the
+  // pages self-gate + the server 403s, so no accounts-mode carve-out here.
+  const isValidSection = (SECTION_IDS as readonly string[]).includes(next);
+  const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   return { inSettings: true, section };
 }
 
@@ -117,9 +155,14 @@ export function SettingsSidebarBody({
   onClose: () => void;
 }) {
   const info = useServerInfo();
-  const accountsEnabled = info !== "loading" && info.accounts_enabled;
+  // Account section shows whenever there's a login session (accounts OR OIDC).
+  const hasAuthSession = info !== "loading" && info.login_url !== null;
+  // Admin gating for the Members / Policies sub-categories. Sourced from
+  // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
+  // not just accounts deploys. Non-admins never see it.
+  const isAdmin = useIsAdmin();
   const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(accountsEnabled, isElectronShell());
+  const groups = settingsNavGroups(hasAuthSession, isElectronShell(), isAdmin);
 
   return (
     <>

@@ -28,8 +28,11 @@ import pytest
 from omnigent.policies.builtins.routing import (
     _CACHE_KEY_PREFIX,
     _CLASSIFICATION_SCHEMA,
+    _INTENT_CHECK_PREFIX,
+    _INTENT_KEY,
     POLICY_REGISTRY,
     deny_trivial_to_expensive_model,
+    intent_gate,
 )
 
 from .helpers import llm_request_event
@@ -482,19 +485,244 @@ async def test_different_message_not_cached() -> None:
 
 def test_registry_entry_well_formed() -> None:
     """
-    The ``POLICY_REGISTRY`` has one entry with the expected handler
-    path and kind, and ``expensive_models`` is required.
+    The ``POLICY_REGISTRY`` has entries with the expected handler
+    paths and kinds, and ``expensive_models`` is required for
+    ``deny_trivial_to_expensive_model``.
 
     What breaks if this fails: the server startup scan won't
     discover the routing policy, or operators can omit the
     required ``expensive_models`` parameter.
     """
-    assert len(POLICY_REGISTRY) == 1
-    entry = POLICY_REGISTRY[0]
-    assert entry["handler"] == (
-        "omnigent.policies.builtins.routing.deny_trivial_to_expensive_model"
+    handlers = {e["handler"] for e in POLICY_REGISTRY}
+    assert "omnigent.policies.builtins.routing.deny_trivial_to_expensive_model" in handlers
+    assert "omnigent.policies.builtins.routing.intent_gate" in handlers
+
+    trivial_entry = next(
+        e
+        for e in POLICY_REGISTRY
+        if e["handler"] == "omnigent.policies.builtins.routing.deny_trivial_to_expensive_model"
     )
-    assert entry["kind"] == "factory"
-    schema = entry["params_schema"]
+    assert trivial_entry["kind"] == "factory"
+    schema = trivial_entry["params_schema"]
     assert "expensive_models" in schema["properties"]
     assert "expensive_models" in schema["required"]
+
+    intent_entry = next(
+        e
+        for e in POLICY_REGISTRY
+        if e["handler"] == "omnigent.policies.builtins.routing.intent_gate"
+    )
+    assert intent_entry["kind"] == "factory"
+    assert intent_entry["params_schema"]["required"] == []
+
+
+# ── intent_gate ───────────────────────────────────────────────────────────────
+
+
+def _request_event(message: str, *, state: dict | None = None) -> dict[str, Any]:
+    return {
+        "type": "request",
+        "target": None,
+        "data": message,
+        "context": {},
+        "session_state": state or {},
+    }
+
+
+def _tool_call_event(
+    tool: str,
+    args: dict | None = None,
+    *,
+    state: dict | None = None,
+    llm_client: Any = None,
+) -> dict[str, Any]:
+    return {
+        "type": "tool_call",
+        "target": tool,
+        "data": {"name": tool, "arguments": args or {}},
+        "context": {},
+        "session_state": state or {},
+        "llm_client": llm_client,
+    }
+
+
+def _on_task_response() -> _FakeResponse:
+    return _FakeResponse(json.dumps({"verdict": "ON_TASK"}))
+
+
+def _off_task_response() -> _FakeResponse:
+    return _FakeResponse(json.dumps({"verdict": "OFF_TASK"}))
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_captures_first_request() -> None:
+    """First request records intent in session_state."""
+    policy = intent_gate()
+    result = await policy(_request_event("fix the login bug"))
+    assert result is not None
+    assert result["result"] == "ALLOW"
+    updates = {u["key"]: u["value"] for u in result["state_updates"]}
+    assert updates[_INTENT_KEY] == "fix the login bug"
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_ignores_subsequent_requests() -> None:
+    """Once intent is recorded, further request events are ignored."""
+    policy = intent_gate()
+    result = await policy(
+        _request_event(
+            "now write a poem",
+            state={_INTENT_KEY: "fix the login bug"},
+        )
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_empty_request_abstains() -> None:
+    """Blank first message abstains — nothing to record."""
+    policy = intent_gate()
+    assert await policy(_request_event("   ")) is None
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_non_tool_phases_abstain() -> None:
+    """Non-request, non-tool_call phases are ignored."""
+    policy = intent_gate()
+    for phase in ("tool_result", "response", "llm_request", "llm_response"):
+        event: dict[str, Any] = {
+            "type": phase,
+            "target": None,
+            "data": {},
+            "context": {},
+            "session_state": {_INTENT_KEY: "fix bug"},
+        }
+        assert await policy(event) is None, f"expected None for phase={phase}"
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_on_task_allows_and_caches() -> None:
+    """ON_TASK verdict allows and caches in session_state."""
+    client = _FakePolicyLLMClient(_on_task_response())
+    policy = intent_gate()
+    result = await policy(
+        _tool_call_event(
+            "read_file",
+            state={_INTENT_KEY: "fix the login bug"},
+            llm_client=client,
+        )
+    )
+    assert result is not None
+    assert result["result"] == "ALLOW"
+    updates = {u["key"]: u["value"] for u in result["state_updates"]}
+    cache_key = next(k for k in updates if k.startswith(_INTENT_CHECK_PREFIX))
+    assert updates[cache_key] == "ON_TASK"
+    client._mock_create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_off_task_denies_and_caches() -> None:
+    """OFF_TASK verdict denies with reason and caches."""
+    client = _FakePolicyLLMClient(_off_task_response())
+    policy = intent_gate()
+    result = await policy(
+        _tool_call_event(
+            "send_email",
+            state={_INTENT_KEY: "fix the login bug"},
+            llm_client=client,
+        )
+    )
+    assert result is not None
+    assert result["result"] == "DENY"
+    assert "send_email" in result["reason"]
+    assert "fix the login bug" in result["reason"]
+    updates = {u["key"]: u["value"] for u in result["state_updates"]}
+    cache_key = next(k for k in updates if k.startswith(_INTENT_CHECK_PREFIX))
+    assert updates[cache_key] == "OFF_TASK"
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_cached_on_task_skips_llm() -> None:
+    """Cached ON_TASK allows without calling the classifier."""
+    client = _FakePolicyLLMClient(_off_task_response())
+    policy = intent_gate()
+
+    intent = "fix the login bug"
+    tool = "read_file"
+    args_repr = json.dumps({}, sort_keys=True, default=str)
+    check_hash = hashlib.sha256(f"{intent}\x00{tool}\x00{args_repr}".encode()).hexdigest()[:16]
+    cache_key = f"{_INTENT_CHECK_PREFIX}{check_hash}"
+
+    result = await policy(
+        _tool_call_event(
+            tool,
+            state={_INTENT_KEY: intent, cache_key: "ON_TASK"},
+            llm_client=client,
+        )
+    )
+    assert result is None
+    client._mock_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_cached_off_task_denies_without_llm() -> None:
+    """Cached OFF_TASK denies without calling the classifier."""
+    client = _FakePolicyLLMClient(_on_task_response())
+    policy = intent_gate()
+
+    intent = "fix the login bug"
+    tool = "send_email"
+    args_repr = json.dumps({}, sort_keys=True, default=str)
+    check_hash = hashlib.sha256(f"{intent}\x00{tool}\x00{args_repr}".encode()).hexdigest()[:16]
+    cache_key = f"{_INTENT_CHECK_PREFIX}{check_hash}"
+
+    result = await policy(
+        _tool_call_event(
+            tool,
+            state={_INTENT_KEY: intent, cache_key: "OFF_TASK"},
+            llm_client=client,
+        )
+    )
+    assert result is not None
+    assert result["result"] == "DENY"
+    client._mock_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_no_intent_abstains() -> None:
+    """tool_call without a stored intent abstains (fail-open)."""
+    client = _FakePolicyLLMClient(_off_task_response())
+    policy = intent_gate()
+    result = await policy(_tool_call_event("send_email", llm_client=client))
+    assert result is None
+    client._mock_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_no_llm_client_abstains() -> None:
+    """tool_call with no llm_client abstains (fail-open)."""
+    policy = intent_gate()
+    result = await policy(
+        _tool_call_event(
+            "send_email",
+            state={_INTENT_KEY: "fix the login bug"},
+            llm_client=None,
+        )
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_intent_gate_classifier_failure_abstains() -> None:
+    """LLM exception during classification abstains (fail-open)."""
+    client = _FakePolicyLLMClient(_on_task_response())
+    client._mock_create.side_effect = RuntimeError("timeout")
+    policy = intent_gate()
+    result = await policy(
+        _tool_call_event(
+            "read_file",
+            state={_INTENT_KEY: "fix the login bug"},
+            llm_client=client,
+        )
+    )
+    assert result is None

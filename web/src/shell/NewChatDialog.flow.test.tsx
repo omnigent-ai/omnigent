@@ -74,6 +74,20 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: [] }),
 }));
+// Dynamic harness-label fetching is covered separately. Keep it synchronous
+// here so exact create-POST call-count assertions only observe the POST.
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  useBrainHarnessLabels: () => ({
+    "claude-sdk": "Claude SDK",
+    "openai-agents": "OpenAI Agents SDK",
+    codex: "Codex",
+    cursor: "Cursor",
+    pi: "Pi",
+    antigravity: "Antigravity",
+    copilot: "Copilot",
+  }),
+}));
 
 function host(overrides: Partial<Host> = {}): Host {
   return {

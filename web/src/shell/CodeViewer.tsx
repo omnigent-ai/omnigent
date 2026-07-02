@@ -47,17 +47,17 @@ import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
   type ActiveSelection,
   type SaveStatus,
-  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
   isImageFile,
   lineOverlapsSelection,
-  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
 import { renderLineTokens } from "./codeViewerRendering";
+import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
@@ -101,6 +101,7 @@ const CHECKERBOARD_STYLE: React.CSSProperties = {
 function ImageViewer({ data, path }: { data: FileContentResponse; path: string }) {
   const [url, setUrl] = useState<string | null>(null);
   const [errored, setErrored] = useState(false);
+  const { open } = useLightbox();
 
   // Create the object URL in an effect and revoke it on cleanup so the blob is
   // released when the file changes or the viewer unmounts (avoids a leak).
@@ -134,8 +135,10 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
           src={url}
           alt={filename}
           onError={() => setErrored(true)}
-          className="max-h-full max-w-full object-contain"
+          onClick={() => open({ src: url, alt: filename })}
+          className="max-h-full max-w-full cursor-zoom-in object-contain"
           style={CHECKERBOARD_STYLE}
+          title="Click to zoom"
         />
       )}
     </div>
@@ -497,19 +500,24 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "preview" && (lang === "markdown" || lang === "html")) {
-    const preview =
-      lang === "markdown" ? (
-        <MarkdownPreview content={content} />
-      ) : (
-        <iframe
-          srcDoc={prepareHtmlPreviewDoc(content)}
-          // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
-          sandbox={HTML_PREVIEW_SANDBOX}
-          title="HTML preview"
-          className="w-full h-full border-0"
-        />
-      );
+  // HTML preview gets its own comment-enabled viewer (selection capture +
+  // highlights relayed over a bridge into the still-sandboxed iframe), so it
+  // owns the truncated banner internally.
+  if (viewMode === "preview" && lang === "html") {
+    return (
+      <HtmlCommentViewer
+        conversationId={conversationId}
+        content={content}
+        truncated={truncated}
+        comments={comments}
+        activeSelection={activeSelection}
+        onSetActiveSelection={onSetActiveSelection}
+      />
+    );
+  }
+
+  if (viewMode === "preview" && lang === "markdown") {
+    const preview = <MarkdownPreview content={content} />;
     // A truncated preview renders incomplete content; warn the user (the editor
     // and source surfaces already do). No layout change when not truncated.
     if (!truncated) return preview;

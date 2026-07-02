@@ -1961,6 +1961,35 @@ def test_parse_llm_timeout_defaults(tmp_path: Path) -> None:
     assert spec.llm.retry.max_retries == 7
 
 
+def test_parse_llm_profile_survives_consolidation(tmp_path: Path) -> None:
+    """``llm.profile`` must survive the llm/executor consolidation rebuild.
+
+    When an ``llm:`` block is present, ``parse`` rebuilds ``LLMConfig`` to
+    keep model/connection in sync with the authoritative executor fields.
+    That rebuild used to omit ``profile``, silently dropping the credentials
+    profile. Downstream, the policy/guardrail builder resolves a Databricks
+    workspace connection from ``spec.llm.profile``
+    (``omnigent/runtime/policies/builder.py``), so losing it makes those
+    paths fall back to env/default auth instead of the declared profile.
+
+    Regression guard: pre-fix ``spec.llm.profile`` is ``None`` here.
+    """
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "databricks/databricks-claude-sonnet-4",
+            "profile": "my-workspace",
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+    assert spec.llm.profile == "my-workspace", (
+        f"spec.llm.profile is {spec.llm.profile!r}, expected 'my-workspace' — the "
+        "consolidation rebuild dropped the declared credentials profile."
+    )
+
+
 def test_parse_tools_global_timeout_and_retry(tmp_path: Path) -> None:
     """Tools block with explicit timeout and retry overrides."""
     config = {

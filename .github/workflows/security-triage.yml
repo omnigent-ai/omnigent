@@ -370,6 +370,10 @@ jobs:
               verdict = d.get("verdict")
               conf = float(d.get("confidence", 0) or 0)
               reason = (d.get("reason") or "")[:280]
+              # GitHub caps dismissed_comment at 280 chars, and the
+              # "auto-triage: " prefix counts against that budget -- cap the
+              # whole comment or the Dependabot API rejects it (HTTP 422).
+              comment = f"auto-triage: {reason}"[:280]
               meta = valid[(kind, num)]
 
               if verdict == "serious":
@@ -388,7 +392,7 @@ jobs:
                           f"/repos/{repo}/code-scanning/alerts/{num}",
                           "-f", "state=dismissed",
                           "-f", f"dismissed_reason={CS_REASON[verdict]}",
-                          "-f", f"dismissed_comment=auto-triage: {reason}"], gh_token)
+                          "-f", f"dismissed_comment={comment}"], gh_token)
                   dismissed.append((kind, num, verdict, conf, reason,
                                     "OK" if r.returncode == 0 else f"ERR {r.stderr[:120]}"))
               else:  # dependabot — needs elevated token
@@ -408,15 +412,21 @@ jobs:
                           f"/repos/{repo}/dependabot/alerts/{num}",
                           "-f", "state=dismissed",
                           "-f", f"dismissed_reason={DEP_REASON[verdict]}",
-                          "-f", f"dismissed_comment=auto-triage: {reason}"], elevated)
+                          "-f", f"dismissed_comment={comment}"], elevated)
                   dismissed.append((kind, num, verdict, conf, reason,
                                     "OK" if r.returncode == 0 else f"ERR {r.stderr[:120]}"))
 
           # ── Run summary ──────────────────────────────────────────────────
+          # A row whose status starts with "ERR" is a failed API call, not a
+          # real dismissal -- count it separately so the headline is honest.
+          applied = [x for x in dismissed if not str(x[5]).startswith("ERR")]
+          failed = [x for x in dismissed if str(x[5]).startswith("ERR")]
+          if failed:
+              print(f"::warning::{len(failed)} dismissal(s) failed (API error) -- see run summary")
           out = ["# Security Alert Triage", "",
                  f"- Mode: {'DRY-RUN (no mutations)' if dry_run else 'APPLY'}",
                  f"- Alerts classified: {len(decisions)}",
-                 f"- Auto-dismissed: {len(dismissed)} | Escalated (serious): {len(escalated)} | Left for human: {len(skipped)}",
+                 f"- Auto-dismissed: {len(applied)} | Failed: {len(failed)} | Escalated (serious): {len(escalated)} | Left for human: {len(skipped)}",
                  ""]
           if dismissed:
               out += ["## Dismissed", "", "| kind | # | verdict | conf | status | reason |",

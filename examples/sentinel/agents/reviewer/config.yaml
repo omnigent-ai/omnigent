@@ -16,18 +16,18 @@ executor:
     harness: codex
 
 # Filesystem access so the reviewer can verify claims against the real files.
-# `sandbox: type: none` runs unsandboxed in the caller's repo. The bundled
-# `sys_os_write` / `sys_os_edit` tools are denied by the `read_only_os` policy
-# below, so the reviewer can read to fact-check but never edits the code or the
-# draft.
+# Sandboxed by default: omitting `sandbox.type` auto-selects the platform
+# backend (`linux_bwrap` / `darwin_seatbelt`), binding cwd read-only so shell
+# writes are contained. Linux needs `bwrap` installed (fails loud with a hint if
+# missing); macOS uses the built-in sandbox-exec. See the orchestrator config.
+# `read_only_os` below is defense-in-depth (refuses the file-write tools early);
+# add `sandbox: {type: none}` only for code you fully trust.
 os_env:
   type: caller_process
   cwd: .
-  sandbox:
-    type: none
 
 # Same guardrails the rest of the bundle uses: blast_radius bounds shell, and
-# read_only_os denies every file-mutating tool so the reviewer can never edit.
+# read_only_os denies the file-write/edit tools (best-effort; shell not gated).
 guardrails:
   policies:
     blast_radius:
