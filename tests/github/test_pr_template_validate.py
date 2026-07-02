@@ -40,7 +40,7 @@ def _valid_body(
 """,
     coverage_notes: str | None = None,
     demo: str | None = None,
-    changelog: str | None = "Fixed: stale polling no longer blocks the REPL handoff",
+    changelog: str | None = "Stale polling no longer blocks the REPL handoff",
 ) -> str:
     notes_section = "" if coverage_notes is None else f"\n## Coverage notes\n\n{coverage_notes}\n"
     demo_section = "" if demo is None else f"\n## Demo\n\n{demo}\n"
@@ -255,50 +255,46 @@ def test_ui_change_with_demo_passes() -> None:
     assert result.ok, result.errors
 
 
-def test_changelog_skip_is_valid() -> None:
-    result = module.validate_pr_body(_valid_body(changelog="skip"))
-    assert result.ok, result.errors
-
-
-def test_changelog_multiple_category_lines_valid() -> None:
-    body = _valid_body(
-        changelog="Added: `--watch` reruns on file changes\nFixed: REPL no longer hangs",
-    )
+def test_changelog_free_text_line_is_valid() -> None:
+    body = _valid_body(changelog="`--watch` reruns an agent when files change")
     result = module.validate_pr_body(body)
     assert result.ok, result.errors
 
 
-def test_changelog_missing_heading_rejected() -> None:
+def test_changelog_section_is_optional() -> None:
+    # A non-breaking PR may omit the Changelog section entirely.
     result = module.validate_pr_body(_valid_body(changelog=None))
-    assert not result.ok
-    assert "Missing required section: ## Changelog" in result.errors
+    assert result.ok, result.errors
 
 
-def test_changelog_malformed_line_rejected() -> None:
-    body = _valid_body(changelog="this is just prose with no category prefix")
+def test_changelog_placeholder_left_in_is_allowed_for_non_breaking() -> None:
+    # Leaving the untouched placeholder is treated like deleting the section.
+    body = _valid_body(changelog="<Add a line to describe the change, else delete this section>")
+    result = module.validate_pr_body(body)
+    assert result.ok, result.errors
+
+
+def test_breaking_change_requires_a_description() -> None:
+    body = _valid_body(type_checkboxes=_BREAKING_TYPE, changelog=None)
     result = module.validate_pr_body(body)
     assert not result.ok
-    assert any(error.startswith("Changelog lines must be") for error in result.errors)
+    assert any(error.startswith("A Breaking change must describe") for error in result.errors)
 
 
-def test_changelog_unknown_category_rejected() -> None:
-    body = _valid_body(changelog="Improved: faster startup")
-    result = module.validate_pr_body(body)
-    assert not result.ok
-    assert any(error.startswith("Changelog lines must be") for error in result.errors)
-
-
-def test_breaking_change_requires_changelog_entry() -> None:
-    body = _valid_body(type_checkboxes=_BREAKING_TYPE, changelog="skip")
-    result = module.validate_pr_body(body)
-    assert not result.ok
-    assert any(error.startswith("Changelog must not be 'skip'") for error in result.errors)
-
-
-def test_breaking_change_with_entry_passes() -> None:
+def test_breaking_change_with_placeholder_is_rejected() -> None:
     body = _valid_body(
         type_checkboxes=_BREAKING_TYPE,
-        changelog="Removed: dropped the deprecated `--legacy` flag",
+        changelog="<Add a line to describe the change, else delete this section>",
+    )
+    result = module.validate_pr_body(body)
+    assert not result.ok
+    assert any(error.startswith("A Breaking change must describe") for error in result.errors)
+
+
+def test_breaking_change_with_description_passes() -> None:
+    body = _valid_body(
+        type_checkboxes=_BREAKING_TYPE,
+        changelog="Dropped the deprecated `--legacy` flag",
     )
     result = module.validate_pr_body(body)
     assert result.ok, result.errors

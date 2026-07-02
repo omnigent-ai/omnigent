@@ -26,14 +26,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Reuse the exact section + changelog parsing the merge gate uses.
+# Reuse the exact section + checkbox parsing the merge gate uses.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pr-template"))
 from _md import (
-    CHANGELOG_CATEGORIES,
-    is_changelog_skip,
-    parse_changelog_entries,
+    TYPE_TAGS,
+    changelog_description,
+    checked_labels,
     section_text,
+    type_tag,
 )
+
+# The "Type of change" checkbox labels, in the order they appear in the template
+# (mirrors validate.TYPE_LABELS). Kept here so the harvester needn't import the
+# gate module; TYPE_TAGS in _md.py is the source of truth for which map to a tag.
+TYPE_LABELS = tuple(TYPE_TAGS)
 
 _FINAL_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 # A squash-merge subject ends with "(#1234)"; capture the last such reference.
@@ -99,88 +105,78 @@ class HarvestResult:
     def __init__(self, pr: int, title: str = "") -> None:
         self.pr = pr
         self.title = title
-        self.entries: list[tuple[str, str]] = []  # (category, text)
-        self.status = "skip"  # skip | included | no-section | unparseable
+        self.description = ""  # first-line, free-text changelog description
+        self.type_tags: list[str] = []  # checked Type-of-change labels
+        self.status = "omitted"  # included | omitted
 
 
 def harvest_pr(pr: int, body: str | None, title: str = "") -> HarvestResult:
     result = HarvestResult(pr, title)
     if body is None:
-        result.status = "no-section"
         return result
-    if "changelog" not in _headings(body):
-        result.status = "no-section"
-        return result
-    raw = section_text(body, "Changelog")
-    if is_changelog_skip(raw):
-        result.status = "skip"
-        return result
-    entries, malformed = parse_changelog_entries(raw)
-    result.entries = entries
-    result.status = "included" if entries else ("unparseable" if malformed else "skip")
+    result.description = changelog_description(section_text(body, "Changelog"))
+    result.type_tags = sorted(checked_labels(section_text(body, "Type of change"), TYPE_LABELS))
+    # A PR is in the changelog iff its author wrote a description line; the tag
+    # comes from the Type-of-change boxes but never puts a PR in on its own.
+    if result.description:
+        result.status = "included"
     return result
 
 
-def _headings(body: str) -> set[str]:
-    return {m.group(1).strip().lower() for m in re.finditer(r"(?im)^\s*##\s+(.+?)\s*$", body)}
+def _bullet(result: HarvestResult) -> str:
+    """One CHANGELOG.md bullet: ``- [Tag] description (#NNNN)`` (tag optional)."""
+    tag = type_tag(set(result.type_tags))
+    prefix = f"{tag} " if tag else ""
+    return f"- {prefix}{result.description} (#{result.pr})"
 
 
 def render_section(tag: str, date: str, results: list[HarvestResult]) -> str:
-    """Render the Keep-a-Changelog block for one version."""
-    by_category: dict[str, list[tuple[int, str]]] = {c: [] for c in CHANGELOG_CATEGORIES}
-    for result in results:
-        for category, text in result.entries:
-            by_category[category].append((result.pr, text))
+    """Render the changelog block for one version — a flat, PR-sorted list.
 
+    Each documented PR is one bullet prefixed with the bracket tag derived from
+    its Type-of-change checkboxes. PRs with no description are omitted entirely.
+    """
+    included = sorted((r for r in results if r.status == "included"), key=lambda r: r.pr)
     lines = [f"## [{tag}] — {date}", ""]
-    any_entries = False
-    for category in CHANGELOG_CATEGORIES:
-        items = sorted(by_category[category])
-        if not items:
-            continue
-        any_entries = True
-        lines.append(f"### {category}")
-        for pr, text in items:
-            lines.append(f"- {text} (#{pr})")
-        lines.append("")
-    if not any_entries:
+    if included:
+        lines.extend(_bullet(r) for r in included)
+    else:
         lines.append("_No user-facing changes._")
-        lines.append("")
+    lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
-# Two-section draft for the GitHub Release body: the six Keep-a-Changelog
-# categories collapse into the two buckets the release coordinator curates by
-# hand (see RELEASING.md / the release-notes-drafter agent). This is the
-# deterministic scaffold — the AI drafter refines it, and it is also the
-# fallback when the LLM is unavailable.
+# Two-section draft for the GitHub Release body: the Type-of-change tags collapse
+# into the two buckets the release coordinator curates by hand (see RELEASING.md /
+# the release-notes-drafter agent). This is the deterministic scaffold — the AI
+# drafter refines it, and it is also the fallback when the LLM is unavailable.
+# Values are "Type of change" checkbox labels (see _md.TYPE_TAGS).
 DRAFT_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Major new features", ("Added", "Changed")),
-    ("Bug fixes & hardening", ("Fixed", "Security", "Removed", "Deprecated")),
+    ("Major new features", ("Feature", "UI / frontend change")),
+    ("Bug fixes & hardening", ("Bug fix", "Breaking change")),
 )
 
 
 def render_draft_notes(results: list[HarvestResult], repo: str) -> str:
     """Render the two-section curated-draft scaffold for the GitHub Release body.
 
-    Groups the harvested one-liners into "Major new features" and "Bug fixes &
-    hardening", sorted by PR number, and appends the CHANGELOG.md link. Empty
-    sections keep their heading with a placeholder so the coordinator sees what
-    to fill in.
+    Groups documented PRs into "Major new features" and "Bug fixes & hardening"
+    by their Type-of-change labels, sorted by PR number, and appends the
+    CHANGELOG.md link. Empty sections keep their heading with a placeholder so
+    the coordinator sees what to fill in.
     """
-    by_category: dict[str, list[tuple[int, str]]] = {c: [] for c in CHANGELOG_CATEGORIES}
-    for result in results:
-        for category, text in result.entries:
-            by_category[category].append((result.pr, text))
+    included = [r for r in results if r.status == "included"]
 
     lines: list[str] = []
-    for heading, categories in DRAFT_SECTIONS:
+    for heading, labels in DRAFT_SECTIONS:
         lines.append(f"## {heading}")
         lines.append("")
-        items = sorted({item for cat in categories for item in by_category[cat]})
-        if items:
-            for pr, text in items:
-                lines.append(f"- {text} (#{pr})")
+        bucket = sorted(
+            (r for r in included if any(label in r.type_tags for label in labels)),
+            key=lambda r: r.pr,
+        )
+        if bucket:
+            lines.extend(f"- {r.description} (#{r.pr})" for r in bucket)
         else:
             lines.append("<!-- no entries harvested for this section — add highlights -->")
         lines.append("")
@@ -192,15 +188,18 @@ def render_draft_notes(results: list[HarvestResult], repo: str) -> str:
 def render_pr_list(results: list[HarvestResult]) -> str:
     """Render the PR material fed to the release-notes-drafter agent.
 
-    One line per PR: number, title, and the author-written changelog entries
-    (if any). Titles come from the squash-commit subjects, so even PRs that
-    predate the `## Changelog` field still give the agent something to theme on.
+    One line per PR: number, title, and — when the author documented it — the
+    type tag and description. Titles come from the squash-commit subjects, so
+    even PRs that predate the `## Changelog` field give the agent something to
+    theme on.
     """
     lines: list[str] = []
     for result in sorted(results, key=lambda r: r.pr):
         lines.append(f"#{result.pr}: {result.title or '(no title)'}")
-        for category, text in result.entries:
-            lines.append(f"    - [{category}] {text}")
+        if result.description:
+            tag = type_tag(set(result.type_tags))
+            prefix = f"{tag} " if tag else ""
+            lines.append(f"    - {prefix}{result.description}")
     return "\n".join(lines) + "\n"
 
 
@@ -338,27 +337,21 @@ def main() -> int:
     if args.pr_list_out:
         Path(args.pr_list_out).write_text(render_pr_list(results))
 
-    # Surface gaps so a maintainer can backfill (non-fatal).
+    # Summarize what landed (non-fatal). PRs without a description line are simply
+    # omitted from the changelog by design — no per-PR gap warnings.
     included = [r.pr for r in results if r.status == "included"]
-    skipped = [r.pr for r in results if r.status == "skip"]
-    missing = [r.pr for r in results if r.status == "no-section"]
-    unparseable = [r.pr for r in results if r.status == "unparseable"]
     print(f"Range: {prev or '(start)'}..{args.tag}")
-    print(f"Included {len(included)} entr(y/ies) from PRs: {included}")
-    print(f"Skipped (explicit `skip`): {skipped}")
-    if missing:
-        print(f"::warning::PRs with no `## Changelog` section: {missing}")
-    if unparseable:
-        print(f"::warning::PRs with unparseable `## Changelog`: {unparseable}")
+    print(f"Documented {len(included)} of {len(results)} PR(s) in the changelog: {included}")
+    print(f"Omitted (no changelog description): {len(results) - len(included)} PR(s).")
     return 0
 
 
 _SEED_CHANGELOG = (
     "# Changelog\n\n"
     "All notable user-facing changes to omnigent are documented here. This file is "
-    "generated at release time from each PR's `## Changelog` section; the concise, "
-    "curated highlights live on the website under `/releases`.\n\n"
-    "The format follows [Keep a Changelog](https://keepachangelog.com/).\n"
+    "generated at release time from each PR's `## Changelog` section, tagged by the "
+    "PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on "
+    "the website under `/releases`.\n"
 )
 
 

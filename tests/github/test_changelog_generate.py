@@ -62,61 +62,94 @@ def test_pr_titles_strip_ref_and_dedupe() -> None:
 
 # --- harvest_pr --------------------------------------------------------------
 
+_TYPE_SECTION = {
+    "UI / frontend change": "- [x] UI / frontend change\n- [ ] Bug fix\n",
+    "Bug fix": "- [ ] UI / frontend change\n- [x] Bug fix\n",
+    "Breaking change": "- [ ] Bug fix\n- [x] Breaking change\n",
+    "none": "- [ ] Bug fix\n- [ ] Feature\n",
+}
 
-def _body(changelog: str) -> str:
-    return f"## Summary\n\nThing.\n\n## Changelog\n\n{changelog}\n"
+
+def _body(changelog: str | None, kind: str = "Bug fix") -> str:
+    type_block = _TYPE_SECTION[kind]
+    changelog_block = "" if changelog is None else f"\n## Changelog\n\n{changelog}\n"
+    return f"## Summary\n\nThing.\n\n## Type of change\n\n{type_block}{changelog_block}"
 
 
-def test_harvest_includes_entries() -> None:
-    result = gen.harvest_pr(123, _body("Added: a new flag\nFixed: a crash"))
+def test_harvest_included_with_description_and_tag() -> None:
+    body = _body("Projects workspace groups sessions", "UI / frontend change")
+    result = gen.harvest_pr(123, body)
     assert result.status == "included"
-    assert result.entries == [("Added", "a new flag"), ("Fixed", "a crash")]
+    assert result.description == "Projects workspace groups sessions"
+    assert result.type_tags == ["UI / frontend change"]
 
 
-def test_harvest_skip() -> None:
-    result = gen.harvest_pr(123, _body("skip"))
-    assert result.status == "skip"
-    assert result.entries == []
+def test_harvest_takes_first_line_of_multiline() -> None:
+    result = gen.harvest_pr(123, _body("first line of the change\n\nmore detail\nand more"))
+    assert result.status == "included"
+    assert result.description == "first line of the change"
 
 
-def test_harvest_no_section() -> None:
-    result = gen.harvest_pr(123, "## Summary\n\nNo changelog heading here.\n")
-    assert result.status == "no-section"
+def test_harvest_placeholder_is_omitted() -> None:
+    placeholder = "<Add a line to describe the change, else delete this section>"
+    result = gen.harvest_pr(123, _body(placeholder))
+    assert result.status == "omitted"
+    assert result.description == ""
+
+
+def test_harvest_deleted_section_is_omitted() -> None:
+    result = gen.harvest_pr(123, _body(None))
+    assert result.status == "omitted"
 
 
 def test_harvest_missing_body() -> None:
-    assert gen.harvest_pr(123, None).status == "no-section"
-
-
-def test_harvest_unparseable() -> None:
-    result = gen.harvest_pr(123, _body("just prose, no category"))
-    assert result.status == "unparseable"
-    assert result.entries == []
+    assert gen.harvest_pr(123, None).status == "omitted"
 
 
 # --- render_section ----------------------------------------------------------
 
 
-def _result(pr: int, entries: list[tuple[str, str]]) -> object:
+def _result(pr: int, description: str, type_tags: list[str] | None = None) -> object:
     r = gen.HarvestResult(pr)
-    r.entries = entries
-    r.status = "included"
+    r.description = description
+    r.type_tags = type_tags or []
+    r.status = "included" if description else "omitted"
     return r
 
 
-def test_render_section_groups_by_category() -> None:
+def test_render_section_flat_list_with_tags_sorted_by_pr() -> None:
     results = [
-        _result(10, [("Added", "watch flag")]),
-        _result(20, [("Fixed", "a crash")]),
-        _result(5, [("Added", "another thing")]),
+        _result(20, "a crash fix", ["Bug fix"]),
+        _result(5, "another thing", ["Feature"]),
+        _result(10, "watch flag", ["UI / frontend change"]),
     ]
     section = gen.render_section("v0.3.0", "2026-06-27", results)
     assert section.startswith("## [v0.3.0] — 2026-06-27")
-    assert "### Added" in section and "### Fixed" in section
-    # Sorted by PR number within a category.
+    # Flat list, sorted by PR number, each with its bracket tag.
     assert section.index("another thing (#5)") < section.index("watch flag (#10)")
-    # Category order follows CHANGELOG_CATEGORIES (Added before Fixed).
-    assert section.index("### Added") < section.index("### Fixed")
+    assert section.index("watch flag (#10)") < section.index("a crash fix (#20)")
+    assert "- [UI] watch flag (#10)" in section
+    assert "- [Bug fix] a crash fix (#20)" in section
+    # No category sub-headings.
+    assert "### " not in section
+
+
+def test_render_section_multiple_tags_join() -> None:
+    section = gen.render_section(
+        "v0.3.0", "2026-06-27", [_result(7, "did a thing", ["UI / frontend change", "Bug fix"])]
+    )
+    assert "- [UI / Bug fix] did a thing (#7)" in section
+
+
+def test_render_section_untagged_entry_has_no_bracket() -> None:
+    section = gen.render_section("v0.3.0", "2026-06-27", [_result(7, "did a thing", [])])
+    assert "- did a thing (#7)" in section
+
+
+def test_render_section_omits_undocumented_prs() -> None:
+    results = [_result(10, "documented", ["Bug fix"]), _result(20, "", [])]
+    section = gen.render_section("v0.3.0", "2026-06-27", results)
+    assert "(#10)" in section and "(#20)" not in section
 
 
 def test_render_section_no_entries() -> None:
@@ -160,26 +193,26 @@ def test_insert_is_idempotent_and_replaces() -> None:
 _REPO = "omnigent-ai/omnigent"
 
 
-def test_draft_notes_groups_into_two_sections() -> None:
+def test_draft_notes_groups_into_two_sections_by_type() -> None:
     results = [
-        _result(10, [("Added", "a new flag")]),
-        _result(20, [("Changed", "moved a button")]),
-        _result(30, [("Fixed", "a crash")]),
-        _result(40, [("Security", "patched an SSRF")]),
+        _result(10, "a new capability", ["Feature"]),
+        _result(20, "moved a button", ["UI / frontend change"]),
+        _result(30, "a crash fix", ["Bug fix"]),
+        _result(40, "dropped a flag", ["Breaking change"]),
     ]
     notes = gen.render_draft_notes(results, _REPO)
     assert "## Major new features" in notes
     assert "## Bug fixes & hardening" in notes
-    # Added/Changed land in features; Fixed/Security in hardening.
+    # Feature/UI land in features; Bug fix/Breaking in hardening.
     feat, hard = notes.split("## Bug fixes & hardening")
-    assert "a new flag (#10)" in feat and "moved a button (#20)" in feat
-    assert "a crash (#30)" in hard and "patched an SSRF (#40)" in hard
+    assert "a new capability (#10)" in feat and "moved a button (#20)" in feat
+    assert "a crash fix (#30)" in hard and "dropped a flag (#40)" in hard
     # Features section comes first.
     assert notes.index("## Major new features") < notes.index("## Bug fixes & hardening")
 
 
 def test_draft_notes_has_full_changelog_footer() -> None:
-    notes = gen.render_draft_notes([_result(1, [("Added", "x")])], _REPO)
+    notes = gen.render_draft_notes([_result(1, "x", ["Feature"])], _REPO)
     assert notes.rstrip().endswith(
         "Full Changelog: https://github.com/omnigent-ai/omnigent/blob/main/CHANGELOG.md"
     )
@@ -187,16 +220,16 @@ def test_draft_notes_has_full_changelog_footer() -> None:
 
 def test_draft_notes_empty_section_keeps_placeholder() -> None:
     # Only a feature entry — the hardening section should still appear with a hint.
-    notes = gen.render_draft_notes([_result(1, [("Added", "x")])], _REPO)
+    notes = gen.render_draft_notes([_result(1, "x", ["Feature"])], _REPO)
     assert "## Bug fixes & hardening" in notes
     assert "no entries harvested" in notes
 
 
 def test_draft_notes_sorted_by_pr_within_section() -> None:
     results = [
-        _result(30, [("Added", "third")]),
-        _result(10, [("Added", "first")]),
-        _result(20, [("Changed", "second")]),
+        _result(30, "third", ["Feature"]),
+        _result(10, "first", ["Feature"]),
+        _result(20, "second", ["UI / frontend change"]),
     ]
     notes = gen.render_draft_notes(results, _REPO)
     assert notes.index("first (#10)") < notes.index("second (#20)") < notes.index("third (#30)")
@@ -205,26 +238,27 @@ def test_draft_notes_sorted_by_pr_within_section() -> None:
 # --- render_pr_list (agent input) --------------------------------------------
 
 
-def _titled(pr: int, title: str, entries: list[tuple[str, str]]) -> object:
+def _titled(pr: int, title: str, description: str, type_tags: list[str] | None = None) -> object:
     r = gen.HarvestResult(pr, title)
-    r.entries = entries
-    r.status = "included" if entries else "no-section"
+    r.description = description
+    r.type_tags = type_tags or []
+    r.status = "included" if description else "omitted"
     return r
 
 
-def test_pr_list_includes_title_and_entries() -> None:
+def test_pr_list_includes_title_and_tagged_description() -> None:
     results = [
-        _titled(20, "feat(web): projects workspace", [("Added", "group sessions")]),
-        _titled(10, "chore: bump deps", []),  # no changelog entry — title only
+        _titled(20, "feat(web): projects workspace", "group sessions", ["UI / frontend change"]),
+        _titled(10, "chore: bump deps", ""),  # no changelog description — title only
     ]
     listing = gen.render_pr_list(results)
     # Sorted by PR number.
     assert listing.index("#10:") < listing.index("#20:")
     assert "#10: chore: bump deps" in listing
     assert "#20: feat(web): projects workspace" in listing
-    assert "    - [Added] group sessions" in listing
+    assert "    - [UI] group sessions" in listing
 
 
 def test_pr_list_handles_missing_title() -> None:
-    listing = gen.render_pr_list([_titled(5, "", [])])
+    listing = gen.render_pr_list([_titled(5, "", "")])
     assert "#5: (no title)" in listing

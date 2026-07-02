@@ -17,11 +17,8 @@ from pathlib import Path
 # (.github/scripts/changelog/generate.py) so the gate and the harvester can
 # never disagree on what the "## Changelog" section means.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _md import (
-    CHANGELOG_CATEGORIES,
-    is_changelog_skip,
-    parse_changelog_entries,
-)
+from _md import changelog_description
+from _md import checked_labels as _checked_labels
 from _md import heading_spans as _heading_spans
 from _md import section as _section
 from _md import strip_html_comments as _strip_html_comments
@@ -31,7 +28,6 @@ REQUIRED_HEADINGS = (
     "Test Plan",
     "Type of change",
     "Test coverage",
-    "Changelog",
 )
 
 TYPE_LABELS = (
@@ -68,17 +64,6 @@ class ValidationResult:
 
 
 _CHECKBOX_RE = re.compile(r"(?im)^\s*-\s*\[(?P<mark>[ xX])\]\s*(?P<label>.+?)\s*$")
-
-
-def _checked_labels(section: str, expected_labels: tuple[str, ...]) -> set[str]:
-    expected_by_lower = {label.lower(): label for label in expected_labels}
-    checked: set[str] = set()
-    for match in _CHECKBOX_RE.finditer(section):
-        label = match.group("label").strip()
-        canonical = expected_by_lower.get(label.lower())
-        if canonical and match.group("mark").lower() == "x":
-            checked.add(canonical)
-    return checked
 
 
 def _missing_labels(section: str, expected_labels: tuple[str, ...]) -> list[str]:
@@ -165,26 +150,17 @@ def validate_pr_body(body: str) -> ValidationResult:
         elif _contains_placeholder(coverage_notes):
             errors.append("Coverage notes still contains template placeholder text.")
 
-    # Changelog feeds the release-time CHANGELOG.md harvester, so it must be the
-    # `skip` sentinel or one or more `<Category>: description` lines it can parse
-    # deterministically. A breaking change must always carry an entry — those are
-    # exactly what users need announced.
-    if "changelog" in spans:
-        changelog_section = _section(body, spans, "Changelog")
-        if is_changelog_skip(changelog_section):
-            if "Breaking change" in checked_types:
-                errors.append(
-                    "Changelog must not be 'skip' when 'Breaking change' is checked "
-                    "— add a '<Category>: description' line announcing it."
-                )
-        else:
-            _entries, malformed = parse_changelog_entries(changelog_section)
-            if malformed:
-                errors.append(
-                    "Changelog lines must be 'skip' or '<Category>: description' "
-                    f"(Category one of: {', '.join(CHANGELOG_CATEGORIES)}). "
-                    "Offending line(s): " + "; ".join(malformed)
-                )
+    # The Changelog section is optional — an author deletes it (or leaves the
+    # `<…>` placeholder) when the change isn't noteworthy, and the PR is simply
+    # omitted from the changelog. The one exception: a Breaking change is always
+    # noteworthy, so it must carry a real description line.
+    if "Breaking change" in checked_types:
+        changelog_section = _section(body, spans, "Changelog") if "changelog" in spans else ""
+        if not changelog_description(changelog_section):
+            errors.append(
+                "A Breaking change must describe the change in the Changelog section "
+                "(otherwise it would be omitted from the changelog)."
+            )
 
     return ValidationResult(ok=not errors, errors=errors)
 
