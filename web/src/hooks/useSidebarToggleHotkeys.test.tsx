@@ -88,6 +88,22 @@ describe("useSidebarToggleHotkeys", () => {
     altGraph.mockRestore();
   });
 
+  it("still fires when getModifierState is unavailable (no throw)", () => {
+    const { onToggleLeft } = setup();
+    const ev = new KeyboardEvent("keydown", {
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    // Some environments / synthetic events lack getModifierState; the handler
+    // must guard the call rather than throw on every keydown.
+    Object.defineProperty(ev, "getModifierState", { value: undefined, configurable: true });
+    expect(() => document.body.dispatchEvent(ev)).not.toThrow();
+    expect(onToggleLeft).toHaveBeenCalledTimes(1);
+  });
+
   it("claims the event (preventDefault + stopPropagation)", () => {
     setup();
     const ev = new KeyboardEvent("keydown", {
