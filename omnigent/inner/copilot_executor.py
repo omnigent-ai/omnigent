@@ -488,10 +488,12 @@ class CopilotExecutor(Executor):
         try:
             from copilot import CopilotClient
         except ImportError as exc:
+            from omnigent.onboarding.copilot_auth import COPILOT_EXTRA
+            from omnigent.onboarding.extra_install import extra_install_display
+
             raise ImportError(
                 "CopilotExecutor requires the 'github-copilot-sdk' package. "
-                "Install it with: uv pip install github-copilot-sdk "
-                "(or `pip install 'omnigent[copilot]'`)."
+                f"Install it with: {extra_install_display(COPILOT_EXTRA)}"
             ) from exc
 
         # The Copilot SDK rejects a relative working_directory ("Directory path
