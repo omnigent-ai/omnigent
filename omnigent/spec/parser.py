@@ -41,7 +41,6 @@ from omnigent.spec.types import (
     ModalityConfig,
     Phase,
     PhaseSelector,
-    PolicyAction,
     PolicySpec,
     ProviderAuth,
     RetryPolicy,
@@ -2626,8 +2625,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
     rejects ``<= 0`` at spec load per POLICIES.md §13. The
     ambiguity between "instant DENY" and "wait forever"
     drove the strict > 0 rule — both intents have explicit
-    paths (omit ASK from action list; use a large finite
-    number).
+    paths (use a large finite number for long waits).
 
     :param raw: Raw ``guardrails.ask_timeout:`` value.
     :returns: Validated timeout in seconds.
@@ -2931,7 +2929,6 @@ def _parse_function_policy(
             f"policy {name!r}: `function` policies require a `function:` or `handler:` field",
             code=ErrorCode.INVALID_INPUT,
         )
-    action = _parse_action_list(data["action"], policy_name=name) if "action" in data else None
     set_labels = (
         _parse_writable_labels(data["set_labels"], policy_name=name)
         if "set_labels" in data
@@ -2946,7 +2943,6 @@ def _parse_function_policy(
     return FunctionPolicySpec(
         **base_kwargs,
         function=_parse_function_ref(function_raw, policy_name=name),
-        action=action,
         set_labels=set_labels,
         config=config,
     )
@@ -3119,53 +3115,6 @@ def _parse_condition(
     return coerced
 
 
-def _parse_action_list(
-    raw: Any,
-    *,
-    policy_name: str,
-) -> list[PolicyAction]:
-    """
-    Parse a policy's ``action:`` whitelist into a list of
-    :class:`PolicyAction` enums.
-
-    Accepts a bare string (single-element list sugar) or a
-    list of strings. Validates each entry against the enum.
-
-    :param raw: The ``action:`` value from YAML.
-    :param policy_name: Enclosing policy name for error
-        messages.
-    :returns: List of :class:`PolicyAction` values.
-    :raises OmnigentError: On empty list or unknown
-        action value.
-    """
-    if isinstance(raw, str):
-        strings = [raw]
-    elif isinstance(raw, list):
-        strings = [str(s) for s in raw]
-    else:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` must be a string or "
-            f"list of strings, got {type(raw).__name__}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not strings:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` list must be non-empty",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    actions: list[PolicyAction] = []
-    for s in strings:
-        try:
-            actions.append(PolicyAction(s))
-        except ValueError as exc:
-            raise OmnigentError(
-                f"policy {policy_name!r}: invalid action {s!r} "
-                f"(must be one of 'allow', 'ask', 'deny')",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
-    return actions
-
-
 def _parse_writable_labels(
     raw: Any,
     *,
@@ -3279,7 +3228,7 @@ def _parse_policy_ask_timeout(
     if value <= 0:
         raise OmnigentError(
             f"policy {policy_name!r}: `ask_timeout` must be > 0 "
-            f"(omit ASK from the policy's action list for instant-DENY)",
+            "(use large finite values for long waits)",
             code=ErrorCode.INVALID_INPUT,
         )
     return value
