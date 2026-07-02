@@ -33,7 +33,9 @@ def verify_github_signature(secret: str, body: bytes, signature_header: str | No
     if not secret or not signature_header:
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
+    # Compare as bytes: comparing two str raises TypeError on a non-ASCII header
+    # (a malformed/hostile signature), which would 500 instead of cleanly failing.
+    return hmac.compare_digest(expected.encode(), signature_header.encode())
 
 
 def verify_slack_signature(
@@ -64,7 +66,7 @@ def verify_slack_signature(
         return False
     basestring = b"v0:" + timestamp.encode() + b":" + body
     expected = "v0=" + hmac.new(secret.encode(), basestring, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
+    return hmac.compare_digest(expected.encode(), signature_header.encode())
 
 
 def verify_bearer(secret: str, authorization_header: str | None) -> bool:
@@ -79,4 +81,4 @@ def verify_bearer(secret: str, authorization_header: str | None) -> bool:
     prefix = "Bearer "
     if not authorization_header.startswith(prefix):
         return False
-    return hmac.compare_digest(authorization_header[len(prefix) :], secret)
+    return hmac.compare_digest(authorization_header[len(prefix) :].encode(), secret.encode())

@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from omnigent.entities import WORK_ITEM_SOURCES, WORK_ITEM_STATUSES, WorkItem
+from sqlalchemy.exc import IntegrityError
+
+from omnigent.entities import WORK_ITEM_SOURCES, WORK_ITEM_STATUSES, WorkItem, is_http_url
 from omnigent.tools.base import Tool, ToolContext
 
 # Sorted for stable schema enums / deterministic error messages.
@@ -138,7 +140,6 @@ class CreateWorkItemTool(Tool):
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """Create (or resolve an existing) work item; return it as JSON."""
-        del ctx
         try:
             args = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError as exc:
@@ -173,17 +174,27 @@ class CreateWorkItemTool(Tool):
         if existing is not None:
             return json.dumps({"created": False, "work_item": _item_dict(existing)})
 
-        item = store.create(
-            work_item_id,
-            source,
-            title.strip(),
-            dedup_key=dedup_key,
-            external_id=external_id,
-            body=args.get("body"),
-            status=status,
-            conversation_id=args.get("conversation_id"),
-            plan=args.get("plan"),
-        )
+        # Default to the ambient conversation (like the runner proxy) so an
+        # item created mid-session links back to the session that spawned it.
+        conversation_id = args.get("conversation_id") or ctx.conversation_id
+        try:
+            item = store.create(
+                work_item_id,
+                source,
+                title.strip(),
+                dedup_key=dedup_key,
+                external_id=external_id,
+                body=args.get("body"),
+                status=status,
+                conversation_id=conversation_id,
+                plan=args.get("plan"),
+            )
+        except IntegrityError:
+            # Lost a dedup_key race — return the existing item (stay idempotent).
+            existing = store.get_by_dedup_key(dedup_key)
+            if existing is None:
+                raise
+            return json.dumps({"created": False, "work_item": _item_dict(existing)})
         return json.dumps({"created": True, "work_item": _item_dict(item)})
 
 
@@ -334,6 +345,10 @@ class UpdateWorkItemTool(Tool):
         if status is not None and status not in WORK_ITEM_STATUSES:
             return json.dumps({"error": f"status must be one of {_STATUSES}"})
 
+        pr_url = args.get("pr_url")
+        if pr_url is not None and pr_url != "" and not is_http_url(pr_url):
+            return json.dumps({"error": "pr_url must be an http(s) URL"})
+
         store, err = _store_or_error()
         if err is not None:
             return err
@@ -341,7 +356,7 @@ class UpdateWorkItemTool(Tool):
         updated = store.update(
             work_item_id,
             status=status,
-            pr_url=args.get("pr_url"),
+            pr_url=pr_url,
             plan=args.get("plan"),
             title=args.get("title"),
             conversation_id=args.get("conversation_id"),

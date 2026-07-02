@@ -12,6 +12,7 @@ conversation that does the work.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 # Allowed lifecycle states. Single source of truth for the store, tools, and
 # API so they validate the same set.
@@ -21,6 +22,23 @@ WORK_ITEM_STATUSES: frozenset[str] = frozenset(
 
 # Allowed intake sources.
 WORK_ITEM_SOURCES: frozenset[str] = frozenset({"manual", "slack", "email", "github", "jira"})
+
+
+def is_http_url(url: str) -> bool:
+    """Return ``True`` iff ``url`` is a syntactically valid http/https URL.
+
+    A work item's ``pr_url`` is rendered as a clickable link in the UI, so a
+    non-http(s) scheme (``javascript:``, ``file:``, ``data:``…) must be
+    rejected to avoid a stored-XSS / phishing link.
+
+    :param url: The candidate URL.
+    :returns: ``True`` only for an ``http``/``https`` URL with a host.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 @dataclass

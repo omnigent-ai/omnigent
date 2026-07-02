@@ -105,3 +105,33 @@ def test_store_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("omnigent.runtime.get_work_item_store", lambda: None)
     out = json.loads(ListWorkItemsTool().invoke(json.dumps({}), _CTX))
     assert "error" in out
+
+
+def test_create_defaults_conversation_id_from_ctx(
+    wired_store: SqlAlchemyWorkItemStore, db_uri: str
+) -> None:
+    # Like the runner proxy, an item created mid-session links to the ambient
+    # conversation when none is given explicitly.
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="c").id
+    ctx = ToolContext(task_id="t1", agent_id="a1", conversation_id=conv)
+    out = json.loads(
+        CreateWorkItemTool().invoke(json.dumps({"title": "T", "source": "manual"}), ctx)
+    )
+    assert out["work_item"]["conversation_id"] == conv
+
+
+def test_update_rejects_non_http_pr_url(wired_store: SqlAlchemyWorkItemStore) -> None:
+    created = json.loads(
+        CreateWorkItemTool().invoke(json.dumps({"title": "T", "source": "manual"}), _CTX)
+    )
+    wid = created["work_item"]["id"]
+    bad = json.loads(
+        UpdateWorkItemTool().invoke(
+            json.dumps({"work_item_id": wid, "pr_url": "file:///etc/passwd"}), _CTX
+        )
+    )
+    assert "error" in bad and "pr_url" in bad["error"]

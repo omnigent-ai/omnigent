@@ -33,6 +33,36 @@ def _gh_headers(secret: str, body: bytes) -> dict[str, str]:
     return {"X-Hub-Signature-256": sig, "Content-Type": "application/json"}
 
 
+def _slack_headers(secret: str, body: bytes, ts: str) -> dict[str, str]:
+    base = b"v0:" + ts.encode() + b":" + body
+    sig = "v0=" + hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
+    return {
+        "X-Slack-Request-Timestamp": ts,
+        "X-Slack-Signature": sig,
+        "Content-Type": "application/json",
+    }
+
+
+def test_slack_url_verification_echoes_challenge(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Slack's Events API handshake: a signed url_verification must get its
+    # challenge echoed back — and must NOT create a work item.
+    import time
+
+    monkeypatch.setenv("OMNIGENT_SLACK_SIGNING_SECRET", "shh")
+    ts = str(int(time.time()))
+    raw = json.dumps({"type": "url_verification", "challenge": "c123"}).encode()
+
+    res = client.post(
+        "/v1/work-items/intake/slack", content=raw, headers=_slack_headers("shh", raw, ts)
+    )
+    assert res.status_code == 200
+    assert res.json() == {"challenge": "c123"}
+    # The handshake created nothing.
+    assert client.get("/v1/work-items").json()["data"] == []
+
+
 def test_github_intake_creates_and_is_idempotent(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

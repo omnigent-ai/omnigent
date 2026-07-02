@@ -58,3 +58,12 @@ def test_bearer() -> None:
     assert verify_bearer("tok", "tok") is False  # missing prefix
     assert verify_bearer("tok", None) is False
     assert verify_bearer("", "Bearer ") is False
+
+
+def test_non_ascii_signatures_fail_cleanly() -> None:
+    # A non-ASCII signature/token must return False, not raise TypeError —
+    # comparisons happen on bytes, so a hostile header can't 500 the endpoint.
+    body = b'{"x":1}'
+    assert verify_github_signature("s3cret", body, "sha256=café") is False
+    assert verify_slack_signature("sign", "1000", body, "v0=café", now=1000) is False
+    assert verify_bearer("tok", "Bearer café") is False
