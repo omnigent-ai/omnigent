@@ -1,13 +1,15 @@
 """Schedule entity — persisted in the ``schedules`` table.
 
-A schedule drives recurring agent work within a conversation:
+A schedule drives recurring agent work:
 
 - a **loop** fires a prompt on a cron cadence (e.g. a Friday-night weekly
-  report);
+  report) — either into an owning conversation, or (global) into a FRESH
+  session spawned for a registered agent on each fire;
 - a **monitor** streams a shell command and fires a prompt per output line.
 
 The row holds the definition + lifecycle bookkeeping; the scheduler service
-executes it (firing a turn in the owning conversation).
+executes it (firing a turn into the owning conversation, or a freshly-spawned
+one for a global loop).
 """
 
 from __future__ import annotations
@@ -24,7 +26,8 @@ class Schedule:
     A schedule persisted in the ``schedules`` table.
 
     :param id: Opaque primary key, e.g. ``"sch_a1b2c3..."``.
-    :param conversation_id: The conversation this schedule fires into.
+    :param conversation_id: The conversation this schedule fires into, or
+        ``None`` for a **global** loop (which spawns a fresh session per fire).
     :param name: Human-readable name, unique within the conversation.
     :param kind: ``"loop"`` (cron-driven) or ``"monitor"`` (stream-driven).
     :param prompt: The prompt fired on each tick. For monitors this is a
@@ -37,13 +40,16 @@ class Schedule:
     :param command: Shell command to stream for ``kind="monitor"`` (else
         ``None``).
     :param created_by_user_id: User id that created the schedule, or ``None``.
+    :param agent_name: Registered agent to spawn a fresh run for on each fire
+        (**global** loops); ``None`` for conversation-scoped schedules.
+        Mutually exclusive with ``conversation_id``.
     :param last_fired_at: Unix epoch seconds of the last fire, or ``None``.
     :param last_run_id: Id of the run produced by the last fire, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
     """
 
     id: str
-    conversation_id: str
+    conversation_id: str | None
     name: str
     kind: str
     prompt: str
@@ -53,6 +59,7 @@ class Schedule:
     cron: str | None = None
     command: str | None = None
     created_by_user_id: str | None = None
+    agent_name: str | None = None
     last_fired_at: int | None = None
     last_run_id: str | None = None
     updated_at: int | None = None

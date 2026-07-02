@@ -81,6 +81,25 @@ def test_list_for_conversation_and_list_enabled(
     assert "sch_off" not in enabled_ids
 
 
+def test_global_loop_and_list_all(
+    schedule_store: SqlAlchemyScheduleStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation(title="a").id
+    schedule_store.create("sch_conv", conv, "conv-loop", "loop", "p", cron="* * * * *")
+    # Global loop: no conversation, targets a registered agent by name.
+    glob = schedule_store.create(
+        "sch_glob", None, "nightly", "loop", "p", cron="0 0 * * *", agent_name="reporter"
+    )
+    assert glob.conversation_id is None
+    assert glob.agent_name == "reporter"
+    # list_all returns both; list_for_conversation returns only the scoped one.
+    assert {s.id for s in schedule_store.list_all()} == {"sch_conv", "sch_glob"}
+    assert {s.id for s in schedule_store.list_for_conversation(conv)} == {"sch_conv"}
+    # A global loop is enabled by default → armed by the scheduler.
+    assert "sch_glob" in {s.id for s in schedule_store.list_enabled()}
+
+
 def test_update_and_delete(
     schedule_store: SqlAlchemyScheduleStore,
     conversation_store: SqlAlchemyConversationStore,

@@ -707,11 +707,17 @@ class SqlSchedule(Base):
     __tablename__ = "schedules"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    conversation_id: Mapped[str] = mapped_column(
+    # Nullable: NULL for a GLOBAL loop (spawns a fresh session for ``agent_name``
+    # on each fire); set for a conversation-scoped loop/monitor.
+    conversation_id: Mapped[str | None] = mapped_column(
         String(64),
         ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=True,
     )
     created_by_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Registered agent to spawn a fresh run for on each fire (GLOBAL loops);
+    # mutually exclusive with ``conversation_id`` (enforced above the DB).
+    agent_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     name: Mapped[str] = mapped_column(String(256))
     kind: Mapped[str] = mapped_column(String(16))
     prompt: Mapped[str] = mapped_column(Text)

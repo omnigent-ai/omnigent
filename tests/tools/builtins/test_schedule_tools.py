@@ -27,6 +27,34 @@ def conv_id(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> str:
     return conv_store.create_conversation(title="ops").id
 
 
+def test_create_loop_rejects_global_agent(conv_id: str) -> None:
+    # The in-process tool path carries no acting-user identity, so it can't OWN
+    # a spawned run — a GLOBAL loop (with 'agent') must be created via the
+    # authenticated API. Here it's rejected with a clear, directing error.
+    ctx = ToolContext(task_id="t1", agent_id="a1", conversation_id=conv_id)
+    err = json.loads(
+        CreateLoopTool().invoke(
+            json.dumps(
+                {"name": "nightly", "prompt": "p", "cron": "0 0 * * *", "agent": "reporter"}
+            ),
+            ctx,
+        )
+    )
+    assert "error" in err and "global loops" in err["error"].lower()
+
+
+def test_create_loop_rejects_invalid_cron(conv_id: str) -> None:
+    # A malformed cron would silently disarm at fire time — reject it up front.
+    ctx = ToolContext(task_id="t1", agent_id="a1", conversation_id=conv_id)
+    err = json.loads(
+        CreateLoopTool().invoke(
+            json.dumps({"name": "bad", "prompt": "p", "cron": "not a cron"}),
+            ctx,
+        )
+    )
+    assert "error" in err and "cron" in err["error"].lower()
+
+
 def test_create_list_delete_flow(conv_id: str) -> None:
     ctx = ToolContext(task_id="t1", agent_id="a1", conversation_id=conv_id)
 

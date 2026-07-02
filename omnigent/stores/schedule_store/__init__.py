@@ -24,7 +24,7 @@ class ScheduleStore(ABC):
     def create(
         self,
         schedule_id: str,
-        conversation_id: str,
+        conversation_id: str | None,
         name: str,
         kind: str,
         prompt: str,
@@ -33,6 +33,7 @@ class ScheduleStore(ABC):
         command: str | None = None,
         enabled: bool = True,
         created_by_user_id: str | None = None,
+        agent_name: str | None = None,
     ) -> Schedule:
         """
         Insert a new schedule. Composite uniqueness on
@@ -40,7 +41,8 @@ class ScheduleStore(ABC):
         duplicate raises ``IntegrityError``.
 
         :param schedule_id: Pre-generated id, e.g. ``"sch_a1b2c3..."``.
-        :param conversation_id: The conversation the schedule fires into.
+        :param conversation_id: The conversation the schedule fires into, or
+            ``None`` for a global loop (paired with ``agent_name``).
         :param name: Name, unique within the conversation.
         :param kind: ``"loop"`` or ``"monitor"``.
         :param prompt: The prompt (or monitor template) to fire.
@@ -48,6 +50,8 @@ class ScheduleStore(ABC):
         :param command: Shell command to stream (monitors).
         :param enabled: Whether the scheduler runs it (default ``True``).
         :param created_by_user_id: Creating user id, or ``None``.
+        :param agent_name: Registered agent to spawn a fresh run for on each
+            fire (global loops); ``None`` for conversation-scoped schedules.
         :returns: The created :class:`Schedule`.
         """
         ...
@@ -77,6 +81,16 @@ class ScheduleStore(ABC):
         scheduler service to arm jobs at startup.
 
         :returns: List of enabled :class:`Schedule`.
+        """
+        ...
+
+    @abstractmethod
+    def list_all(self) -> list[Schedule]:
+        """
+        List every schedule (global + conversation-scoped), newest first —
+        used by the global Schedules panel.
+
+        :returns: List of :class:`Schedule`.
         """
         ...
 

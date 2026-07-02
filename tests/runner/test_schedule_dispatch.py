@@ -45,6 +45,25 @@ async def test_create_loop_posts_body_with_default_conversation() -> None:
     assert json.loads(out) == {"ok": True}
 
 
+async def test_create_loop_with_agent_posts_global_body() -> None:
+    reqs: list[httpx.Request] = []
+    client = _recording_client(reqs)
+    await _execute_schedule_tool(
+        "create_loop",
+        json.dumps({"name": "L", "prompt": "p", "cron": "0 2 * * *", "agent": "reporter"}),
+        conversation_id="conv_default",
+        server_client=client,
+    )
+    await client.aclose()
+    assert reqs[0].method == "POST"
+    assert reqs[0].url.path == "/v1/schedules"
+    body = json.loads(reqs[0].content)
+    # Global loop → carries agent_name, NOT the current session id.
+    assert body["agent_name"] == "reporter"
+    assert "conversation_id" not in body
+    assert body["kind"] == "loop"
+
+
 async def test_explicit_conversation_id_overrides_default() -> None:
     reqs: list[httpx.Request] = []
     client = _recording_client(reqs)

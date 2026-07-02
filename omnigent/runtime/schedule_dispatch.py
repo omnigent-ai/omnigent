@@ -24,6 +24,7 @@ went offline) and is logged, not raised, so the cron loop endures.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -46,7 +47,11 @@ def build_inprocess_fire(
     identity_header: str,
     reserved_identities: frozenset[str] = frozenset(),
     timeout_s: float = 60.0,
-) -> Callable[[Schedule], Awaitable[None]]:
+    conversation_store: Any = None,
+    agent_store: Any = None,
+    tunnel_registry: Any = None,
+    permission_store: Any = None,
+) -> Callable[[Schedule], Awaitable[str | None]]:
     """Build a scheduler ``fire`` callback that injects the loop's prompt.
 
     The returned coroutine POSTs the schedule's ``prompt`` as a ``user``
@@ -77,14 +82,96 @@ def build_inprocess_fire(
         :class:`~omnigent.runtime.scheduler.SchedulerService`.
     """
 
-    async def fire(schedule: Schedule) -> None:
-        """Inject ``schedule.prompt`` as a user message into its conversation.
+    async def _spawn_conversation(schedule: Schedule) -> str | None:
+        """Create a fresh conversation for a GLOBAL loop's agent + bind a runner.
 
-        :param schedule: The loop schedule that just fired. ``monitor`` kinds
-            and prompt-less rows are no-ops (monitors live on the host side).
+        Returns the new conversation id, or ``None`` (logged, loop endures)
+        when the spawn deps aren't wired, the agent isn't found, or no runner is
+        online (a fresh run needs a live host).
+
+        :param schedule: The global loop (``conversation_id is None``,
+            ``agent_name`` set) that just fired.
+        """
+        if conversation_store is None or agent_store is None or tunnel_registry is None:
+            _logger.warning(
+                "scheduler: global loop %s can't fire — spawn deps not wired", schedule.id
+            )
+            return None
+        if not schedule.agent_name:
+            _logger.warning("scheduler: global loop %s has no agent_name", schedule.id)
+            return None
+        agent = await asyncio.to_thread(agent_store.get_by_name, schedule.agent_name)
+        if agent is None:
+            _logger.warning(
+                "scheduler: global loop %s → agent %r not found; skipping",
+                schedule.id,
+                schedule.agent_name,
+            )
+            return None
+        creator = schedule.created_by_user_id
+        # Bind a runner OWNED BY the loop's creator — never execute the creator's
+        # prompt on another user's host. Unowned runners (single-user / dev,
+        # owner is None) are usable by anyone.
+        runner_id: str | None = None
+        for rid in tunnel_registry.online_runner_ids():
+            session = tunnel_registry.get(rid)
+            owner = session.owner if session is not None else None
+            if owner is None or owner == creator:
+                runner_id = rid
+                break
+        if runner_id is None:
+            _logger.info(
+                "scheduler: global loop %s → no usable runner online; skipping this tick",
+                schedule.id,
+            )
+            return None
+        conv = await asyncio.to_thread(
+            conversation_store.create_conversation,
+            agent_id=agent.id,
+            runner_id=runner_id,
+            title=schedule.name,
+        )
+        # Own the fresh run so it's visible to its creator: the session list
+        # filters by ``accessible_by``, and normal session creation grants the
+        # creator LEVEL_OWNER. Mirror that exactly (ensure_user first, like
+        # session create) or the spawned run is orphaned + invisible in the
+        # sidebar — and grant would FK-fail on a not-yet-persisted user.
+        if permission_store is not None and creator:
+            from omnigent.server.auth import LEVEL_OWNER
+
+            await asyncio.to_thread(permission_store.ensure_user, creator)
+            await asyncio.to_thread(permission_store.grant, creator, conv.id, LEVEL_OWNER)
+        _logger.info(
+            "scheduler: global loop %s spawned conversation %s for agent %s (runner %s)",
+            schedule.id,
+            conv.id,
+            schedule.agent_name,
+            runner_id,
+        )
+        return conv.id
+
+    async def fire(schedule: Schedule) -> str | None:
+        """Fire a loop: dispatch its prompt into a conversation.
+
+        Conversation-scoped loops fire into their ``conversation_id``; **global**
+        loops (``conversation_id is None``) first spawn a fresh session for their
+        ``agent_name``. The prompt then runs through the same
+        ``POST /v1/sessions/{id}/events`` dispatch path a human message takes.
+        ``monitor`` kinds and prompt-less rows are no-ops.
+
+        :param schedule: The loop schedule that just fired.
+        :returns: The conversation id a run was actually dispatched into, or
+            ``None`` when the tick was a no-op, soft-skip (no runner), or failure
+            — so the scheduler stamps ``last_fired_at``/``last_run_id`` only when
+            a run truly ran, and a broken deployment doesn't look healthy.
         """
         if schedule.kind != "loop" or not schedule.prompt:
-            return
+            return None
+        target_conv = schedule.conversation_id
+        if target_conv is None:
+            target_conv = await _spawn_conversation(schedule)
+            if target_conv is None:
+                return None
         headers: dict[str, str] = {}
         creator = schedule.created_by_user_id
         if creator and creator not in reserved_identities:
@@ -103,7 +190,7 @@ def build_inprocess_fire(
                 timeout=timeout_s,
             ) as client:
                 resp = await client.post(
-                    f"/v1/sessions/{schedule.conversation_id}/events",
+                    f"/v1/sessions/{target_conv}/events",
                     json=body,
                     headers=headers,
                 )
@@ -111,18 +198,18 @@ def build_inprocess_fire(
             _logger.exception(
                 "scheduler: fire POST errored for schedule %s (conversation %s)",
                 schedule.id,
-                schedule.conversation_id,
+                target_conv,
             )
-            return
+            return None
         if resp.status_code in _SOFT_SKIP_STATUSES:
             _logger.info(
                 "scheduler: schedule %s fired but no live runner for conversation "
                 "%s (HTTP %s) — skipping this tick",
                 schedule.id,
-                schedule.conversation_id,
+                target_conv,
                 resp.status_code,
             )
-            return
+            return None
         if resp.status_code >= 400:
             _logger.warning(
                 "scheduler: fire for schedule %s → HTTP %s: %s",
@@ -130,11 +217,12 @@ def build_inprocess_fire(
                 resp.status_code,
                 resp.text[:300],
             )
-            return
+            return None
         _logger.info(
             "scheduler: fired schedule %s into conversation %s",
             schedule.id,
-            schedule.conversation_id,
+            target_conv,
         )
+        return target_conv
 
     return fire

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import asc, select
+from sqlalchemy import asc, desc, select
 
 from omnigent.db.db_models import SqlSchedule
 from omnigent.db.utils import (
@@ -33,6 +33,7 @@ def _to_entity(row: SqlSchedule) -> Schedule:
         cron=row.cron,
         command=row.command,
         created_by_user_id=row.created_by_user_id,
+        agent_name=row.agent_name,
         last_fired_at=row.last_fired_at,
         last_run_id=row.last_run_id,
         updated_at=row.updated_at,
@@ -56,7 +57,7 @@ class SqlAlchemyScheduleStore(ScheduleStore):
     def create(
         self,
         schedule_id: str,
-        conversation_id: str,
+        conversation_id: str | None,
         name: str,
         kind: str,
         prompt: str,
@@ -65,14 +66,17 @@ class SqlAlchemyScheduleStore(ScheduleStore):
         command: str | None = None,
         enabled: bool = True,
         created_by_user_id: str | None = None,
+        agent_name: str | None = None,
     ) -> Schedule:
-        """Insert a new schedule.
+        """Insert a new schedule (conversation-scoped or global).
 
         Raises ``IntegrityError`` on a ``(conversation_id, name)`` collision.
+        A global loop passes ``conversation_id=None`` + ``agent_name``.
         """
         row = SqlSchedule(
             id=schedule_id,
             conversation_id=conversation_id,
+            agent_name=agent_name,
             name=name,
             kind=kind,
             prompt=prompt,
@@ -114,6 +118,13 @@ class SqlAlchemyScheduleStore(ScheduleStore):
                 .where(SqlSchedule.enabled)
                 .order_by(asc(SqlSchedule.created_at), asc(SqlSchedule.id))
             )
+            rows = session.execute(stmt).scalars().all()
+            return [_to_entity(r) for r in rows]
+
+    def list_all(self) -> list[Schedule]:
+        """List every schedule (global + conversation-scoped), newest first."""
+        with self._session() as session:
+            stmt = select(SqlSchedule).order_by(desc(SqlSchedule.created_at), asc(SqlSchedule.id))
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
