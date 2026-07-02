@@ -5502,7 +5502,10 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     return None
 
 
-def _publish_runner_recovered_status(session_id: str) -> None:
+async def _publish_runner_recovered_status(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
     """
     Clear a stale failed session status after runner recovery.
 
@@ -5513,8 +5516,16 @@ def _publish_runner_recovered_status(session_id: str) -> None:
     stale and should not keep the conversation marked failed until the
     next user turn emits ``running``.
 
+    Recovery also clears the durable ``last_task_error`` labels the
+    disconnect relay persisted. Those labels survive reload so an
+    ongoing disconnect still projects a "Disconnected" pill, but once
+    the runner is reachable again the session is healthy and idle — the
+    pill must drop without waiting for the next ``running`` edge.
+
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
+    :param conversation_store: Store used to clear the persisted error
+        labels on genuine recovery.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
@@ -5527,6 +5538,7 @@ def _publish_runner_recovered_status(session_id: str) -> None:
         error=None,
     )
     session_stream.publish(session_id, event.model_dump())
+    await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
 def _publish_terminal_pending(session_id: str, pending: bool) -> None:
@@ -6790,6 +6802,7 @@ async def _ensure_runner_session_initialized(
     session_id: str,
     conv: Conversation,
     runner_client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -6828,6 +6841,8 @@ async def _ensure_runner_session_initialized(
         ``agent_id`` and ``sub_agent_name`` for the handshake body.
     :param runner_client: Runner client already resolved for
         *session_id* (its tunnel is up).
+    :param conversation_store: Store used to clear persisted disconnect
+        error labels once the handshake proves the runner recovered.
     :returns: None.
     """
     try:
@@ -6845,7 +6860,7 @@ async def _ensure_runner_session_initialized(
         # via the same warning path rather than silently forwarding into a
         # half-initialized runner.
         resp.raise_for_status()
-        _publish_runner_recovered_status(session_id)
+        await _publish_runner_recovered_status(session_id, conversation_store)
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
@@ -15139,7 +15154,7 @@ def create_sessions_router(
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:
-                            _publish_runner_recovered_status(session_id)
+                            await _publish_runner_recovered_status(session_id, conversation_store)
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
                         # (same source as the relay's except clause).
@@ -19219,7 +19234,9 @@ def create_sessions_router(
             # forwarded into a TUI whose forwarder isn't attached, the
             # round-trip never mirrors back, and the optimistic bubble
             # sticks with no reply (host-restart bug).
-            await _ensure_runner_session_initialized(session_id, conv, runner_client)
+            await _ensure_runner_session_initialized(
+                session_id, conv, runner_client, conversation_store
+            )
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
