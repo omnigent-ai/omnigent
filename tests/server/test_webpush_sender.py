@@ -20,13 +20,13 @@ from tests.server.webpush_test_keys import make_push_subscription, new_signing_k
 class _FakeStore:
     def __init__(self, subs: list[PushSubscription]) -> None:
         self._subs = subs
-        self.deleted: list[str] = []
+        self.deleted: list[tuple[str, str]] = []
 
     def list_for_user(self, user_id: str) -> list[PushSubscription]:
         return [s for s in self._subs if s.user_id == user_id]
 
-    def delete_by_endpoint(self, endpoint: str) -> bool:
-        self.deleted.append(endpoint)
+    def delete_by_endpoint(self, user_id: str, endpoint: str) -> bool:
+        self.deleted.append((user_id, endpoint))
         return True
 
 
@@ -53,7 +53,8 @@ async def test_fan_out_counts_successes_and_prunes_gone(monkeypatch: pytest.Monk
     await client.aclose()
 
     assert sent == 1
-    assert store.deleted == ["http://push.test/B"]
+    # The prune is scoped to the subscription's owner, not just the endpoint.
+    assert store.deleted == [("u", "http://push.test/B")]
 
 
 async def test_noop_without_vapid_key(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -3065,7 +3065,18 @@ def server(
 
     _vapid_cfg = cfg.get("vapid") or {}
     vapid_private_key = load_or_create_vapid_key(Path(art_loc) / "vapid_private_key.pem")
-    vapid_subject = str(_vapid_cfg.get("subject") or "mailto:admin@localhost")
+    _VAPID_SUBJECT_DEFAULT = "mailto:admin@localhost"
+    vapid_subject = str(_vapid_cfg.get("subject") or _VAPID_SUBJECT_DEFAULT)
+    if vapid_subject == _VAPID_SUBJECT_DEFAULT:
+        # The VAPID `sub` is the operator contact in every push JWT; some push
+        # services reject a placeholder/localhost contact. Warn so a real
+        # deployment sets `vapid.subject` to a reachable mailto:/https: URL.
+        click.echo(
+            f"  warning: vapid.subject is the default {_VAPID_SUBJECT_DEFAULT!r} — "
+            "set it to a real mailto:/https: contact or some push services may "
+            "reject deliveries",
+            err=True,
+        )
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),

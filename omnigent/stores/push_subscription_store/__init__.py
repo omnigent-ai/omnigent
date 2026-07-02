@@ -55,10 +55,14 @@ class PushSubscriptionStore(ABC):
         ...
 
     @abstractmethod
-    def delete_by_endpoint(self, endpoint: str) -> bool:
+    def delete_by_endpoint(self, user_id: str, endpoint: str) -> bool:
         """
-        Remove a subscription by endpoint. Idempotent.
+        Remove a subscription by endpoint, scoped to its owner. Idempotent.
 
+        Scoping by ``user_id`` prevents one user from deleting another user's
+        subscription by guessing/replaying its endpoint.
+
+        :param user_id: The owning user; only that user's row is removed.
         :param endpoint: The push-service endpoint.
         :returns: ``True`` if a row was removed; ``False`` if none existed.
         """
