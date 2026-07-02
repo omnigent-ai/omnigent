@@ -23,8 +23,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import socket
 import struct
 import time
 from dataclasses import dataclass
@@ -39,6 +41,39 @@ _CURVE = ec.SECP256R1()
 # RFC 8188 record size header. 4096 matches the published RFC 8291 example and
 # is comfortably larger than any notification payload we send.
 _RECORD_SIZE = 4096
+
+
+def validate_push_endpoint(endpoint: str) -> None:
+    """Reject a push endpoint the server must not POST to (SSRF guard).
+
+    A subscription ``endpoint`` is a URL the server later POSTs encrypted
+    payloads to, so an unvalidated one is a Server-Side Request Forgery vector:
+    a client could register ``https://169.254.169.254/…`` (cloud metadata) or an
+    internal host and have the server fetch it. We require HTTPS and reject any
+    endpoint whose host resolves to a non-global address (loopback, private,
+    link-local, reserved, multicast, unspecified).
+
+    Note: this is a subscribe-time check; a host that resolves publicly now but
+    privately later (DNS rebinding) is a residual the sender would need to
+    re-check — tracked as a follow-up.
+
+    :param endpoint: The browser ``PushSubscription.endpoint`` URL.
+    :raises ValueError: If the endpoint is not a safe, public HTTPS URL.
+    """
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https":
+        raise ValueError("push endpoint must be an https URL")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("push endpoint has no host")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 443, proto=socket.IPPROTO_TCP)
+    except OSError as exc:
+        raise ValueError(f"push endpoint host does not resolve: {host}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError(f"push endpoint resolves to a non-public address ({ip})")
 
 
 def b64url_decode(value: str) -> bytes:

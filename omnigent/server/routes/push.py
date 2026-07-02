@@ -11,6 +11,7 @@ off the reserved ``"local"`` identity.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -20,6 +21,7 @@ from omnigent.db.utils import generate_push_subscription_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
+from omnigent.server.webpush import validate_push_endpoint
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.push_subscription_store import PushSubscriptionStore
 
@@ -86,13 +88,20 @@ def create_push_router(
             raise OmnigentError(
                 "endpoint and keys.{p256dh,auth} are required", code=ErrorCode.INVALID_INPUT
             )
+        # The server will POST encrypted payloads to this endpoint, so reject an
+        # SSRF-shaped one (non-HTTPS, or a host resolving to an internal address)
+        # before it's ever persisted. getaddrinfo blocks → run off the loop.
+        try:
+            await asyncio.to_thread(validate_push_endpoint, body.endpoint)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         sub = store.upsert(generate_push_subscription_id(), user_id, body.endpoint, p256dh, auth)
         return {"id": sub.id, "object": "push_subscription"}
 
     @router.delete("/push/subscriptions")
     async def unsubscribe(request: Request, body: UnsubscribeBody) -> dict[str, bool]:
-        """Unregister a browser push subscription by endpoint. Idempotent."""
-        _caller(request, auth_provider, permission_store)
-        return {"deleted": store.delete_by_endpoint(body.endpoint)}
+        """Unregister the caller's push subscription by endpoint. Idempotent."""
+        user_id = _caller(request, auth_provider, permission_store)
+        return {"deleted": store.delete_by_endpoint(user_id, body.endpoint)}
 
     return router

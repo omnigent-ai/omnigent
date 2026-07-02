@@ -74,7 +74,7 @@ async def notify_user_push(
                 _logger.warning("web push POST failed for %s", sub.endpoint, exc_info=True)
                 continue
             if resp.status_code in _GONE_STATUSES:
-                await asyncio.to_thread(store.delete_by_endpoint, sub.endpoint)
+                await asyncio.to_thread(store.delete_by_endpoint, sub.user_id, sub.endpoint)
                 _logger.info(
                     "pruned gone push subscription %s (HTTP %s)",
                     sub.endpoint,

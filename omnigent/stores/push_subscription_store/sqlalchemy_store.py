@@ -84,12 +84,15 @@ class SqlAlchemyPushSubscriptionStore(PushSubscriptionStore):
             session.flush()
             return _to_entity(row)
 
-    def delete_by_endpoint(self, endpoint: str) -> bool:
-        """Delete a subscription by endpoint. Idempotent."""
+    def delete_by_endpoint(self, user_id: str, endpoint: str) -> bool:
+        """Delete a subscription by endpoint, scoped to its owner. Idempotent."""
         with self._session() as session:
             row = (
                 session.execute(
-                    select(SqlPushSubscription).where(SqlPushSubscription.endpoint == endpoint)
+                    select(SqlPushSubscription).where(
+                        SqlPushSubscription.endpoint == endpoint,
+                        SqlPushSubscription.user_id == user_id,
+                    )
                 )
                 .scalars()
                 .first()

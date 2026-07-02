@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
@@ -21,6 +22,7 @@ from omnigent.server.webpush import (
     build_vapid_auth_header,
     decrypt,
     encrypt,
+    validate_push_endpoint,
 )
 
 # RFC 8291 §5 "Push Message Encryption Example" — verbatim base64url values.
@@ -39,6 +41,36 @@ _RFC_SALT = "DGv6ra1nlYgDCS1FRnbzlw"
 
 def _as_private_key(b64: str) -> ec.EllipticCurvePrivateKey:
     return ec.derive_private_key(int.from_bytes(b64url_decode(b64), "big"), ec.SECP256R1())
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://push.example.com/x",  # not https
+        "https:///no-host",  # no host
+        "https://127.0.0.1/x",  # loopback
+        "https://169.254.169.254/latest/meta-data",  # cloud metadata (link-local)
+        "https://10.0.0.5/x",  # private
+        "https://[::1]/x",  # IPv6 loopback
+    ],
+)
+def test_validate_push_endpoint_rejects_ssrf(endpoint: str) -> None:
+    # An endpoint the server would POST to must be a public HTTPS URL — reject
+    # non-https and any host that resolves to a non-global address (SSRF guard).
+    with pytest.raises(ValueError):
+        validate_push_endpoint(endpoint)
+
+
+def test_validate_push_endpoint_accepts_public_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A normal push-service endpoint (host resolves to a public IP) is accepted.
+    import omnigent.server.webpush as wp
+
+    monkeypatch.setattr(
+        wp.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    validate_push_endpoint("https://push.example.com/sub/xyz")  # no raise
 
 
 def test_rfc8291_sender_key_handling() -> None:
