@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from omnigent.onboarding import extra_install
 from omnigent.onboarding.extra_install import (
+    _installed_vcs_url,
     _is_uv_tool_install,
     extra_install_command,
     extra_install_display,
@@ -35,12 +38,37 @@ def test_is_uv_tool_install(monkeypatch: pytest.MonkeyPatch, prefix: str, expect
     assert _is_uv_tool_install() is expected
 
 
+# -- _installed_vcs_url() ----------------------------------------------------
+
+
+def test_installed_vcs_url_git_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Surfaces the ``vcs_url`` recorded for a git-source install."""
+    url = "git+https://github.com/omnigent-ai/omnigent.git"
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info",
+        lambda: SimpleNamespace(vcs_url=url),
+    )
+    assert _installed_vcs_url() == url
+
+
+@pytest.mark.parametrize(
+    "info",
+    [SimpleNamespace(vcs_url=None), None],
+    ids=["registry-install", "not-installed"],
+)
+def test_installed_vcs_url_none(monkeypatch: pytest.MonkeyPatch, info: object) -> None:
+    """Returns ``None`` for registry installs and when the dist is absent."""
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
+    assert _installed_vcs_url() is None
+
+
 # -- extra_install_command() -------------------------------------------------
 
 
 def test_extra_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inside a uv tool venv, produces the ``uv tool install --with`` argv."""
+    """A registry uv tool venv produces the ``uv tool install --with`` argv."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
+    monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: None)
     cmd = extra_install_command("cursor")
     assert cmd == [
         "uv",
@@ -51,6 +79,15 @@ def test_extra_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
         "omnigent",
         "--force",
     ]
+
+
+def test_extra_install_command_uv_tool_git_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A git-source uv tool install reinstalls from that source, not PyPI."""
+    url = "git+https://github.com/omnigent-ai/omnigent.git"
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
+    monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: url)
+    cmd = extra_install_command("cursor")
+    assert cmd == ["uv", "tool", "install", "--force", f"omnigent[cursor] @ {url}"]
 
 
 def test_extra_install_command_uv_on_path(monkeypatch: pytest.MonkeyPatch) -> None:

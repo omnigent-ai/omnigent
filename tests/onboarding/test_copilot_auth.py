@@ -204,6 +204,7 @@ def test_copilot_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPat
 def test_copilot_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     """Inside a ``uv tool`` venv, the install uses ``uv tool install --with``."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
+    monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: None)
     cmd = copilot_install_command()
     assert cmd == [
         "uv",
