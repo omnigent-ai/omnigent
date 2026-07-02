@@ -52,9 +52,11 @@ No tags are pushed by hand — the version flows from a reviewed PR into the
    code --install-extension omnigent-vscode-<version>.vsix
    ```
 
-   Reload VS Code, start a local server (`omnigent server`), and check that
-   **Omnigent: Open** frames it. This catches packaging problems (missing files,
-   a broken bundle) before anything reaches the marketplaces.
+   Reload VS Code, start a local server (`omnigent server`), and run the
+   **Omnigent: Open** command — confirm it opens an editor pane showing the
+   running server's UI (not a blank pane or an error). This catches packaging
+   problems (missing files, a broken bundle) before anything reaches the
+   marketplaces.
 5. **Publish to the marketplaces.** Dispatch `omnigent-vscode.yml` in the
    secure-release repo (once it exists), pointing at the `vscode-v<version>`
    tag; run with `dry-run: true` first, then publish for real.
