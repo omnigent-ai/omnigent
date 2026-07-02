@@ -16,10 +16,11 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
 from omnigent.db.utils import generate_work_item_id
-from omnigent.entities import WORK_ITEM_SOURCES, WORK_ITEM_STATUSES, WorkItem
+from omnigent.entities import WORK_ITEM_SOURCES, WORK_ITEM_STATUSES, WorkItem, is_http_url
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
@@ -38,13 +39,19 @@ _INTAKE_SOURCES = frozenset({"github", "slack", "jira", "email", "generic"})
 
 
 class _Verified(BaseModel):
-    """Normalized result of verifying + mapping an inbound intake payload."""
+    """Normalized result of verifying + mapping an inbound intake payload.
 
-    work_item_source: str
-    title: str
-    dedup_key: str
+    When ``challenge`` is set, the payload was a handshake (e.g. Slack's
+    ``url_verification``) rather than a work item — the route echoes it back
+    and creates nothing.
+    """
+
+    work_item_source: str = ""
+    title: str = ""
+    dedup_key: str = ""
     external_id: str | None = None
     body: str | None = None
+    challenge: str | None = None
 
 
 def _verify_and_map(source: str, headers: Headers, raw: bytes) -> _Verified:
@@ -103,6 +110,11 @@ def _verify_and_map(source: str, headers: Headers, raw: bytes) -> _Verified:
         if not ok:
             raise OmnigentError("invalid slack signature", code=ErrorCode.UNAUTHORIZED)
         payload = _payload()
+        # Slack Events API handshake: when the request URL is (re)configured,
+        # Slack POSTs a signed url_verification and expects its challenge echoed
+        # back. Handle it after the signature check; create no work item.
+        if payload.get("type") == "url_verification":
+            return _Verified(challenge=str(payload.get("challenge") or ""))
         event = payload.get("event")
         if not isinstance(event, dict):
             event = {}
@@ -250,19 +262,26 @@ def create_work_items_router(
         if existing is not None:
             return {"created": False, **_entity_to_response(existing)}
 
-        item = store.create(
-            work_item_id,
-            body.source,
-            body.title.strip(),
-            dedup_key=dedup_key,
-            external_id=body.external_id,
-            body=body.body,
-            status=body.status,
-            conversation_id=body.conversation_id,
-            assignee_user_id=body.assignee_user_id,
-            created_by=user_id,
-            plan=body.plan,
-        )
+        try:
+            item = store.create(
+                work_item_id,
+                body.source,
+                body.title.strip(),
+                dedup_key=dedup_key,
+                external_id=body.external_id,
+                body=body.body,
+                status=body.status,
+                conversation_id=body.conversation_id,
+                assignee_user_id=body.assignee_user_id,
+                created_by=user_id,
+                plan=body.plan,
+            )
+        except IntegrityError:
+            # Lost a dedup_key race to a concurrent create — return the winner.
+            existing = store.get_by_dedup_key(dedup_key)
+            if existing is None:
+                raise
+            return {"created": False, **_entity_to_response(existing)}
         return {"created": True, **_entity_to_response(item)}
 
     @router.get("/work-items")
@@ -300,6 +319,8 @@ def create_work_items_router(
         _require_auth(request, auth_provider, permission_store)
         if body.status is not None and body.status not in WORK_ITEM_STATUSES:
             raise OmnigentError(f"status must be one of {_STATUSES}", code=ErrorCode.INVALID_INPUT)
+        if body.pr_url is not None and body.pr_url != "" and not is_http_url(body.pr_url):
+            raise OmnigentError("pr_url must be an http(s) URL", code=ErrorCode.INVALID_INPUT)
         item = store.update(
             work_item_id,
             title=body.title,
@@ -328,17 +349,28 @@ def create_work_items_router(
         idempotent by dedup_key so a sender's retries don't duplicate."""
         raw = await request.body()
         verified = _verify_and_map(source, request.headers, raw)
+        if verified.challenge is not None:
+            return {"challenge": verified.challenge}
         existing = store.get_by_dedup_key(verified.dedup_key)
         if existing is not None:
             return {"created": False, **_entity_to_response(existing)}
-        item = store.create(
-            generate_work_item_id(),
-            verified.work_item_source,
-            verified.title,
-            dedup_key=verified.dedup_key,
-            external_id=verified.external_id,
-            body=verified.body,
-        )
+        try:
+            item = store.create(
+                generate_work_item_id(),
+                verified.work_item_source,
+                verified.title,
+                dedup_key=verified.dedup_key,
+                external_id=verified.external_id,
+                body=verified.body,
+            )
+        except IntegrityError:
+            # A concurrent intake with the same dedup_key won the race and
+            # tripped the UNIQUE constraint. Re-fetch and return that row so a
+            # sender's retries stay idempotent instead of surfacing a 500.
+            existing = store.get_by_dedup_key(verified.dedup_key)
+            if existing is None:
+                raise
+            return {"created": False, **_entity_to_response(existing)}
         return {"created": True, **_entity_to_response(item)}
 
     return router

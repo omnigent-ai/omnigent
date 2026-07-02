@@ -86,3 +86,15 @@ def test_validation_and_not_found(client: TestClient) -> None:
 
     missing = client.patch("/v1/work-items/wi_nope", json={"status": "done"})
     assert missing.status_code == 404
+
+
+def test_patch_rejects_non_http_pr_url(client: TestClient) -> None:
+    # pr_url is rendered as a link, so a non-http(s) scheme is rejected.
+    created = client.post("/v1/work-items", json={"title": "t", "source": "manual"}).json()
+    wid = created["id"]
+    bad = client.patch(f"/v1/work-items/{wid}", json={"pr_url": "javascript:alert(1)"})
+    assert bad.status_code == 400
+    ok = client.patch(
+        f"/v1/work-items/{wid}", json={"pr_url": "https://github.com/acme/app/pull/1"}
+    )
+    assert ok.status_code == 200

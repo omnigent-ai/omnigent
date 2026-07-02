@@ -38,6 +38,7 @@ from omnigent.entities.work_item import (
     WORK_ITEM_SOURCES,
     WORK_ITEM_STATUSES,
     WorkItem,
+    is_http_url,
 )
 
 __all__ = [
@@ -75,6 +76,7 @@ __all__ = [
     "WorkItem",
     "filter_resources_by_type",
     "get_resource_by_id",
+    "is_http_url",
     "parse_item_data",
     "resolve_terminal_entry_by_resource_id",
     "synthesize_conversation_title",
