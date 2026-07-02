@@ -66,6 +66,7 @@ from omnigent.server.routes.session_policies import create_session_policies_rout
 from omnigent.server.routes.sessions import (
     SessionLiveness,
     create_sessions_router,
+    create_supervisor_sessions_router,
     set_server_runner_router,
 )
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
@@ -1852,6 +1853,17 @@ def create_app(
             runner_exit_reports=runner_exit_reports,
         ),
         prefix="/v1",
+        tags=["sessions"],
+    )
+    app.include_router(
+        create_supervisor_sessions_router(
+            conversation_store,
+            agent_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            runner_router=runner_router,
+        ),
+        prefix="/api",
         tags=["sessions"],
     )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).

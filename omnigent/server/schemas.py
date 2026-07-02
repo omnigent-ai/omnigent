@@ -1044,6 +1044,37 @@ class ElicitationResult(BaseModel):
     content: dict[str, str | int | float | bool | list[str] | None] | None = None
 
 
+class SupervisorSessionResolveRequest(BaseModel):
+    """
+    Adapter request for resolving the pending elicitation on a supervisor session.
+
+    This is a stable, externally owned shape that intentionally does
+    not expose the internal elicitation id or the internal MCP action
+    literals. The route layer translates ``decision`` into the
+    existing :class:`ElicitationResult` primitive.
+
+    :param decision: External verdict label, ``"approve"`` or
+        ``"deny"``.
+    :param auditMetadata: Opaque caller-provided audit data that is
+        accepted for logging / future transport and does not affect
+        resolution semantics.
+    """
+
+    decision: Literal["approve", "deny"]
+    auditMetadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SupervisorSessionResolveResponse(BaseModel):
+    """
+    Acknowledge a supervisor-session resolve request.
+
+    :param queued: Always ``False`` for the synchronous adapter
+        path.
+    """
+
+    queued: bool = False
+
+
 # ── Sessions (/v1/sessions) ────────────────────────────────────
 
 
