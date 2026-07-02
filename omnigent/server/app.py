@@ -1287,6 +1287,16 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
+    # Admin roster: the config ``admins:`` list (canonical) union'd with the
+    # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
+    # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
+    # same source — otherwise an identity listed in the file but not yet
+    # promoted (``promote_if_listed`` runs at login) would be authorized by the
+    # routes yet see no admin chrome. The file portion lazily reloads on mtime
+    # change (no restart).
+    from omnigent.server.admin_list import load_admin_list
+
+    admin_list = load_admin_list(extra=frozenset(admins or ()))
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -1802,10 +1812,15 @@ def create_app(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
             )
-        is_admin = (
-            user_id is not None
-            and permission_store is not None
-            and permission_store.is_admin(user_id)
+        # Mirror the admin check the auth routes use
+        # (``permission_store.is_admin(caller) or admin_list.is_admin(caller)``)
+        # so the SPA's admin chrome never under-reports relative to what the
+        # endpoints actually authorize — e.g. for an identity added to the
+        # admin-list file who hasn't re-logged-in yet (so ``promote_if_listed``
+        # hasn't flipped the DB flag).
+        is_admin = user_id is not None and (
+            (permission_store is not None and permission_store.is_admin(user_id))
+            or admin_list.is_admin(user_id)
         )
         return {"user_id": user_id, "is_admin": is_admin}
 
@@ -2143,16 +2158,12 @@ def create_app(
     # Must be registered BEFORE the SPA static mount because the SPA's
     # HTML5-history fallback catches all unmatched extensionless paths.
     if auth_provider is not None and getattr(auth_provider, "login_url", None):
-        from omnigent.server.admin_list import load_admin_list
         from omnigent.server.auth import UnifiedAuthProvider
 
-        # Admin roster: the config ``admins:`` list (canonical) union'd
-        # with the runtime-editable ``<data_dir>/admins`` file. Consulted
-        # on each login to promote listed identities — the only admin
-        # path for OIDC, and an additive convenience for accounts. The
-        # file portion lazily reloads on mtime change (no restart).
-        admin_list = load_admin_list(extra=frozenset(admins or ()))
-
+        # ``admin_list`` is built once near app creation (see above) so the
+        # auth routes and ``/v1/me`` share one roster. Consulted on each login
+        # to promote listed identities — the only admin path for OIDC, and an
+        # additive convenience for accounts.
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
