@@ -229,27 +229,31 @@ def _spawn_server_handler(
     *,
     events: list[dict[str, Any]],
     copies: list[dict[str, Any]],
-    mapping: dict[str, str],
-    file_meta: dict[str, dict[str, Any]],
+    mapping: dict[str, dict[str, Any]],
     copy_status: int = 200,
     copy_error: dict[str, Any] | None = None,
     deletes: list[str] | None = None,
     events_status: int = 202,
+    meta_gets: list[str] | None = None,
 ):
     """
     Build a mock Omnigent-server handler for a fresh named spawn.
 
     Serves the no-existing-child lookup, the child create, the copy
     endpoint (recording its body and answering with ``mapping`` or an
-    error), per-file metadata GETs, and the child events POST (recording
-    its body).
+    error), and the child events POST (recording its body). The enriched
+    copy response now carries filename + content_type per file, so the
+    dispatch path needs no per-file metadata GET — any such GET is recorded
+    in ``meta_gets`` so a test can assert it never happens.
 
     :param events: List the handler appends each child events body to.
     :param copies: List the handler appends each copy request body to.
-    :param mapping: ``{old_id: new_id}`` returned by the copy endpoint.
-    :param file_meta: ``{new_id: resource_dict}`` for the metadata GETs.
+    :param mapping: ``{old_id: {new_id, filename, content_type}}`` returned
+        by the copy endpoint.
     :param copy_status: HTTP status the copy endpoint returns.
     :param copy_error: Error body for a non-2xx copy response.
+    :param meta_gets: If provided, the handler records the path of any
+        per-file metadata GET here (expected to stay empty).
     """
 
     async def _handler(request: httpx.Request) -> httpx.Response:
@@ -273,11 +277,11 @@ def _spawn_server_handler(
         if request.method == "GET" and path.startswith(
             f"/v1/sessions/{_CHILD_ID}/resources/files/"
         ):
-            new_id = path.rsplit("/", 1)[-1]
-            meta = file_meta.get(new_id)
-            if meta is None:
-                return httpx.Response(404, json={"error": {"message": "missing"}})
-            return httpx.Response(200, json=meta)
+            # The enriched copy response makes this GET unnecessary; record it
+            # so a test can prove the dispatch path no longer issues it.
+            if meta_gets is not None:
+                meta_gets.append(path)
+            return httpx.Response(404, json={"error": {"message": "should not be called"}})
         if request.method == "POST" and path == f"/v1/sessions/{_CHILD_ID}/events":
             events.append(json.loads(request.content))
             if events_status >= 400:
@@ -290,6 +294,11 @@ def _spawn_server_handler(
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
+
+
+def _copied(new_id: str, filename: str, content_type: str | None) -> dict[str, Any]:
+    """An enriched copy-response mapping entry for one file."""
+    return {"new_id": new_id, "filename": filename, "content_type": content_type}
 
 
 async def _run_spawn(
@@ -324,18 +333,6 @@ async def _run_spawn(
             runner_app._session_inboxes_ref.pop(_PARENT_ID, None)
 
 
-def _file_resource(new_id: str, filename: str) -> dict[str, Any]:
-    """A ``session.resource`` (type file) metadata dict for ``new_id``."""
-    return {
-        "id": new_id,
-        "object": "session.resource",
-        "type": "file",
-        "session_id": _CHILD_ID,
-        "name": filename,
-        "metadata": {"filename": filename, "bytes": 10, "created_at": 0},
-    }
-
-
 @pytest.mark.asyncio
 async def test_send_with_file_ids_copies_then_attaches_input_file(
     monkeypatch: pytest.MonkeyPatch,
@@ -347,14 +344,17 @@ async def test_send_with_file_ids_copies_then_attaches_input_file(
     Asserts the copy endpoint receives ``(parent_session, file_ids)`` and
     that the posted block references the new child-scoped id, not the
     original parent id — proving the runner threads the mapping through.
+    The content type comes from the copy response, so no per-file metadata
+    GET is issued.
     """
     events: list[dict[str, Any]] = []
     copies: list[dict[str, Any]] = []
+    meta_gets: list[str] = []
     handler = _spawn_server_handler(
         events=events,
         copies=copies,
-        mapping={"file_parent": "file_child"},
-        file_meta={"file_child": _file_resource("file_child", "notes.txt")},
+        mapping={"file_parent": _copied("file_child", "notes.txt", "text/plain")},
+        meta_gets=meta_gets,
     )
 
     output = await _run_spawn(
@@ -372,20 +372,22 @@ async def test_send_with_file_ids_copies_then_attaches_input_file(
     content = events[0]["data"]["content"]
     assert content[0] == {"type": "input_text", "text": "use this"}
     assert content[1] == {"type": "input_file", "file_id": "file_child"}
+    # The enriched copy response carried the content type, so the dispatch
+    # path never fetched per-file metadata.
+    assert meta_gets == [], "content type comes from the copy response — no metadata GET"
 
 
 @pytest.mark.asyncio
 async def test_send_with_image_file_id_attaches_input_image(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An ``image/*`` file (by filename) yields an ``input_image`` block."""
+    """An ``image/*`` content type yields an ``input_image`` block."""
     events: list[dict[str, Any]] = []
     copies: list[dict[str, Any]] = []
     handler = _spawn_server_handler(
         events=events,
         copies=copies,
-        mapping={"file_pic": "file_child_pic"},
-        file_meta={"file_child_pic": _file_resource("file_child_pic", "chart.png")},
+        mapping={"file_pic": _copied("file_child_pic", "chart.png", "image/png")},
     )
 
     output = await _run_spawn(
@@ -400,6 +402,31 @@ async def test_send_with_image_file_id_attaches_input_image(
 
 
 @pytest.mark.asyncio
+async def test_send_image_file_falls_back_to_filename_when_no_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied file with no content_type falls back to the filename guess."""
+    events: list[dict[str, Any]] = []
+    copies: list[dict[str, Any]] = []
+    handler = _spawn_server_handler(
+        events=events,
+        copies=copies,
+        mapping={"file_pic": _copied("file_child_pic", "chart.png", None)},
+    )
+
+    output = await _run_spawn(
+        monkeypatch,
+        args_payload={"input": "look", "file_ids": ["file_pic"]},
+        handler=handler,
+    )
+
+    assert json.loads(output)["status"] == "launching"
+    content = events[0]["data"]["content"]
+    # No content_type on the copy row → filename ".png" drives the split.
+    assert content[1] == {"type": "input_image", "file_id": "file_child_pic"}
+
+
+@pytest.mark.asyncio
 async def test_send_multiple_file_ids_preserve_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,11 +436,10 @@ async def test_send_multiple_file_ids_preserve_order(
     handler = _spawn_server_handler(
         events=events,
         copies=copies,
-        mapping={"f_a": "c_a", "f_b": "c_b", "f_c": "c_c"},
-        file_meta={
-            "c_a": _file_resource("c_a", "a.pdf"),
-            "c_b": _file_resource("c_b", "b.png"),
-            "c_c": _file_resource("c_c", "c.csv"),
+        mapping={
+            "f_a": _copied("c_a", "a.pdf", "application/pdf"),
+            "f_b": _copied("c_b", "b.png", "image/png"),
+            "f_c": _copied("c_c", "c.csv", "text/csv"),
         },
     )
 
@@ -447,7 +473,6 @@ async def test_send_without_file_ids_is_unchanged_and_skips_copy(
         events=events,
         copies=copies,
         mapping={},
-        file_meta={},
     )
 
     output = await _run_spawn(
@@ -476,7 +501,6 @@ async def test_send_with_bad_file_id_surfaces_copy_error_and_posts_nothing(
         events=events,
         copies=copies,
         mapping={},
-        file_meta={},
         copy_status=404,
         copy_error={"error": {"message": "File 'file_bogus' not found in source session"}},
         deletes=deletes,
@@ -514,8 +538,7 @@ async def test_send_message_failure_after_copy_tears_down_child(
     handler = _spawn_server_handler(
         events=events,
         copies=copies,
-        mapping={"file_parent": "file_child"},
-        file_meta={"file_child": _file_resource("file_child", "notes.txt")},
+        mapping={"file_parent": _copied("file_child", "notes.txt", "text/plain")},
         deletes=deletes,
         events_status=500,
     )

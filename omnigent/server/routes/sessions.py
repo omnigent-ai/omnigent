@@ -200,6 +200,7 @@ from omnigent.server.schemas import (
     ChildSessionSummary,
     CompletedEvent,
     ConversationDeleted,
+    CopiedFile,
     CopyFilesRequest,
     CopyFilesResponse,
     CreatedSessionResponse,
@@ -17810,7 +17811,7 @@ def create_sessions_router(
         # memory is a single blob, not the whole batch. If any step fails
         # mid-batch, roll back the rows/blobs already created so a partial
         # copy never persists.
-        mapping: dict[str, str] = {}
+        mapping: dict[str, CopiedFile] = {}
         created: list[str] = []
         copied: list[StoredFile] = []
         try:
@@ -17824,7 +17825,13 @@ def create_sessions_router(
                 )
                 created.append(new.id)
                 artifact_store.put(new.id, content)
-                mapping[stored.id] = new.id
+                # Carry the preserved filename + content_type back so the
+                # caller can attach the copy without a follow-up metadata GET.
+                mapping[stored.id] = CopiedFile(
+                    new_id=new.id,
+                    filename=new.filename,
+                    content_type=new.content_type,
+                )
                 copied.append(new)
         except Exception:
             for new_id in created:

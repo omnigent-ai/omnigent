@@ -976,6 +976,24 @@ async def _teardown_failed_child(
             await server_client.delete(f"/v1/sessions/{child_session_id}", timeout=30.0)
 
 
+@dataclass(frozen=True)
+class CopyResult:
+    """
+    Outcome of building a subagent's first-turn content.
+
+    Exactly one field is set: ``content`` on success, ``error`` on failure.
+    Replaces the earlier ``(value, error)`` tuple union — the dispatch path
+    branches on ``error is not None`` to tear down the child and surface the
+    message to the parent agent.
+
+    :param content: The first-turn content blocks, or ``None`` on failure.
+    :param error: A human-readable error string, or ``None`` on success.
+    """
+
+    content: list[dict[str, Any]] | None = None
+    error: str | None = None
+
+
 async def _build_subagent_message_content(
     message: str,
     file_ids: list[str],
@@ -983,7 +1001,7 @@ async def _build_subagent_message_content(
     child_session_id: str,
     parent_session_id: str,
     server_client: httpx.AsyncClient,
-) -> tuple[list[dict[str, Any]], None] | tuple[None, str]:
+) -> CopyResult:
     """
     Build the child's first-turn content, copying parent files first.
 
@@ -995,9 +1013,10 @@ async def _build_subagent_message_content(
 
     The block type mirrors ``_resolve_forwarded_message_content``: an
     ``image/*`` content type yields ``input_image``; everything else
-    yields ``input_file``. Content type is guessed from the copied
-    file's filename (the copy response carries only an id mapping), read
-    back from the child file's metadata.
+    yields ``input_file``. The content type comes straight from the copy
+    response (preserved from the source row), so no per-file metadata
+    fetch is needed; when the source had no recorded type, the filename is
+    the fallback signal.
 
     :param message: The user message text.
     :param file_ids: Parent-owned source file ids to forward, in order.
@@ -1005,12 +1024,12 @@ async def _build_subagent_message_content(
     :param parent_session_id: Source session id (the dispatching runner's
         own session), passed as the copy ``source_session_id``.
     :param server_client: Authenticated Omnigent server client.
-    :returns: ``(content, None)`` on success, or ``(None, error)`` when
-        the copy or metadata lookup fails — surfaced to the parent agent.
+    :returns: A :class:`CopyResult` — ``content`` set on success, ``error``
+        set when the copy fails (surfaced to the parent agent).
     """
     content: list[dict[str, Any]] = [{"type": "input_text", "text": str(message)}]
     if not file_ids:
-        return content, None
+        return CopyResult(content=content)
 
     try:
         copy_resp = await server_client.post(
@@ -1019,46 +1038,44 @@ async def _build_subagent_message_content(
             timeout=30.0,
         )
     except httpx.HTTPError as exc:
-        return None, (f"Error: failed to copy files to child: {type(exc).__name__}: {exc}")
+        return CopyResult(
+            error=f"Error: failed to copy files to child: {type(exc).__name__}: {exc}"
+        )
     if copy_resp.status_code >= 400:
-        return None, (
-            f"Error: failed to copy files to child: {copy_resp.status_code} {copy_resp.text[:200]}"
+        return CopyResult(
+            error=(
+                f"Error: failed to copy files to child: "
+                f"{copy_resp.status_code} {copy_resp.text[:200]}"
+            )
         )
 
     mapping = copy_resp.json().get("mapping")
     if not isinstance(mapping, dict):
-        return None, "Error: file copy response missing 'mapping'"
+        return CopyResult(error="Error: file copy response missing 'mapping'")
 
     import mimetypes
 
     for old_id in file_ids:
-        new_id = mapping.get(old_id)
+        entry = mapping.get(old_id)
+        if not isinstance(entry, dict):
+            return CopyResult(error=f"Error: file copy mapping missing entry for {old_id!r}")
+        new_id = entry.get("new_id")
         if not isinstance(new_id, str) or not new_id:
-            return None, f"Error: file copy mapping missing new id for {old_id!r}"
-        try:
-            meta_resp = await server_client.get(
-                f"/v1/sessions/{child_session_id}/resources/files/{new_id}",
-                timeout=10.0,
+            return CopyResult(error=f"Error: file copy mapping missing new id for {old_id!r}")
+        # The copy response preserves the source's content_type, so the
+        # image-vs-file split uses the true type — no per-file metadata GET.
+        # Fall back to a filename guess only when the source had none.
+        content_type = entry.get("content_type")
+        if not content_type:
+            filename = entry.get("filename")
+            guessed, _ = (
+                mimetypes.guess_type(filename) if isinstance(filename, str) else (None, None)
             )
-        except httpx.HTTPError as exc:
-            return None, (
-                f"Error: failed to read copied file {new_id!r}: {type(exc).__name__}: {exc}"
-            )
-        if meta_resp.status_code >= 400:
-            return None, (
-                f"Error: failed to read copied file {new_id!r}: "
-                f"{meta_resp.status_code} {meta_resp.text[:200]}"
-            )
-        meta = meta_resp.json()
-        # The file resource carries no content_type; the filename is the
-        # cheap, reliable signal for the image-vs-file split (mirrors how
-        # the upload path guesses a content type from the path).
-        filename = meta.get("name") or (meta.get("metadata") or {}).get("filename")
-        guessed, _ = mimetypes.guess_type(filename) if isinstance(filename, str) else (None, None)
-        block_type = "input_image" if (guessed or "").startswith("image/") else "input_file"
+            content_type = guessed or ""
+        block_type = "input_image" if content_type.startswith("image/") else "input_file"
         content.append({"type": block_type, "file_id": new_id})
 
-    return content, None
+    return CopyResult(content=content)
 
 
 def _find_subagent_spec(sub_agent_name: str, agent_spec: Any | None) -> Any | None:
@@ -1685,16 +1702,17 @@ async def _execute_subagent_tool(
     # On copy failure we surface the error to the parent and post no
     # event — but first undo the registrations made above so a failed
     # spawn doesn't leak a phantom child.
-    message_content, content_error = await _build_subagent_message_content(
+    copy_result = await _build_subagent_message_content(
         message,
         file_ids,
         child_session_id=child_session_id,
         parent_session_id=conversation_id,
         server_client=server_client,
     )
-    if content_error is not None:
+    if copy_result.error is not None:
         await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
-        return content_error
+        return copy_result.error
+    message_content = copy_result.content
 
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child

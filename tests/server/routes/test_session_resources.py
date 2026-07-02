@@ -1716,9 +1716,14 @@ async def test_copy_files_from_direct_parent(
     body = resp.json()
     assert body["object"] == "session.files.copied"
     assert body["session_id"] == "conv_c"
-    new_id = body["mapping"][parent_file]
+    entry = body["mapping"][parent_file]
+    new_id = entry["new_id"]
     # A copy, not an alias: the new row is distinct from the source.
     assert new_id != parent_file
+    # The enriched mapping carries the preserved filename + content type so
+    # the caller can attach the copy without a follow-up metadata fetch.
+    assert entry["filename"] == "doc.txt"
+    assert entry["content_type"] == "text/plain"
 
     # The new row is child-scoped and readable by the child only.
     copied = file_store.get(new_id, session_id="conv_c")
@@ -1751,9 +1756,9 @@ async def test_copy_files_multi_file_mapping(
     assert resp.status_code == 200, resp.text
     mapping = resp.json()["mapping"]
     assert set(mapping.keys()) == {f1, f2}
-    assert len(set(mapping.values())) == 2
-    for src, new_id in mapping.items():
-        del src
+    new_ids = {entry["new_id"] for entry in mapping.values()}
+    assert len(new_ids) == 2
+    for new_id in new_ids:
         assert file_store.get(new_id, session_id="conv_c") is not None
 
 
@@ -1770,7 +1775,7 @@ async def test_copy_files_from_grandparent_in_chain(
         json={"source_session_id": "conv_gp", "file_ids": [gp_file]},
     )
     assert resp.status_code == 200, resp.text
-    new_id = resp.json()["mapping"][gp_file]
+    new_id = resp.json()["mapping"][gp_file]["new_id"]
     assert file_store.get(new_id, session_id="conv_c") is not None
 
 
@@ -1996,7 +2001,7 @@ async def test_copy_files_then_download_returns_bytes(
         "/v1/sessions/conv_c/resources/files:copy",
         json={"source_session_id": "conv_p", "file_ids": [parent_file]},
     )
-    new_id = copy_resp.json()["mapping"][parent_file]
+    new_id = copy_resp.json()["mapping"][parent_file]["new_id"]
 
     resp = await file_client.get(
         f"/v1/sessions/conv_c/resources/files/{new_id}/content",
