@@ -923,3 +923,84 @@ async def test_text_without_json_schema_not_translated(
     # (popped from extra but no response_format injected).
     assert "response_format" not in extra
     assert "text" not in extra
+
+
+# ── reasoning_effort per-model gating (xAI / Grok) ──────────────────
+
+
+async def _capture_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    """Drive a non-streaming chat call and return the captured ``extra`` dict.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param provider: Routed provider id, e.g. ``"xai"``.
+    :param model: Model name without prefix, e.g. ``"grok-4"``.
+    :returns: The ``extra`` dict the adapter received.
+    """
+    from omnigent.llms.routing import RoutedModel
+
+    captured: list[dict[str, Any]] = []
+    adapter = _CapturingAdapter(captured)
+    routed = RoutedModel(provider=provider, model=model)
+
+    monkeypatch.setattr("omnigent.llms.client.parse_model_string", lambda model: routed)
+    monkeypatch.setattr("omnigent.llms.client.get_adapter", lambda provider: adapter)
+    monkeypatch.setattr(
+        "omnigent.llms.client.responses_input_to_chat_messages",
+        lambda input, instructions: [{"role": "user", "content": "test"}],
+    )
+    monkeypatch.setattr(
+        "omnigent.llms.client.chat_response_to_response",
+        lambda result: _make_response(),
+    )
+
+    client = Client()
+    await client.responses.create(
+        input=[{"role": "user", "content": "test"}],
+        model=f"{provider}/{model}",
+        reasoning={"effort": "high"},
+    )
+    assert len(captured) == 1, f"Expected 1 call, got {len(captured)}"
+    return captured[0]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_dropped_for_unsupported_xai_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xAI rejects ``reasoning_effort`` on models like ``grok-4`` with HTTP 400.
+
+    The Chat Completions path must NOT forward ``reasoning_effort`` for an xAI
+    model outside the supported allow-set, otherwise every reasoning-configured
+    ``grok-4`` / ``grok-code-fast-1`` / ``grok-4-fast-reasoning`` call 400s.
+    """
+    extra = await _capture_reasoning_effort(monkeypatch, provider="xai", model="grok-4")
+    assert "reasoning_effort" not in extra, (
+        f"reasoning_effort leaked to an unsupported xAI model: {extra!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_sent_for_supported_xai_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xAI ``grok-4.3`` does accept ``reasoning_effort`` — it must be forwarded."""
+    extra = await _capture_reasoning_effort(monkeypatch, provider="xai", model="grok-4.3")
+    assert extra.get("reasoning_effort") == "high", (
+        f"reasoning_effort should be forwarded for grok-4.3, got {extra!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_unchanged_for_non_xai_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-xAI providers keep the prior unconditional pass-through behavior."""
+    extra = await _capture_reasoning_effort(monkeypatch, provider="databricks", model="some-model")
+    assert extra.get("reasoning_effort") == "high", (
+        f"reasoning_effort should pass through for non-xAI providers, got {extra!r}"
+    )
