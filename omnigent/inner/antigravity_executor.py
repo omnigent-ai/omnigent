@@ -130,10 +130,11 @@ def _ensure_antigravity_sdk() -> ModuleType:
         # would resolve to ``Any`` and trip ``warn_return_any``).
         return importlib.import_module("google.antigravity")
     except ImportError as exc:
+        from omnigent.onboarding.extra_install import extra_install_display
+
         raise ImportError(
             "AntigravityExecutor requires the 'google-antigravity' package. "
-            "Install it with: pip install google-antigravity (or "
-            "pip install 'omnigent[antigravity]')."
+            f"Install it with: {extra_install_display('antigravity')}"
         ) from exc
 
 

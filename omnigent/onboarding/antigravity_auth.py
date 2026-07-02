@@ -13,11 +13,10 @@ key from being mis-consumed by claude-sdk / codex / pi / openai-agents. Mirrors
 from __future__ import annotations
 
 import importlib.util
-import shutil
 import subprocess
-import sys
 
 from omnigent.errors import OmnigentError
+from omnigent.onboarding.extra_install import extra_install_command
 from omnigent.onboarding.provider_config import load_config, resolve_secret
 
 # Stable secret-store name (and thus ``keychain:<name>``) so setup and the
@@ -26,11 +25,8 @@ ANTIGRAVITY_SECRET_NAME = "antigravity"
 
 # The Gemini-native SDK (``google-antigravity``) ships in an OPTIONAL extra, so a
 # user can configure the ``antigravity:`` key in setup and still have no SDK to run
-# the harness; setup surfaces this command when the extra is missing. (Cursor needs
-# no parallel: ``cursor-sdk`` is a baseline dep.) The literal brackets must be
-# escaped on any markup-rendered surface.
+# the harness; setup surfaces this command when the extra is missing.
 ANTIGRAVITY_EXTRA = "antigravity"
-ANTIGRAVITY_EXTRA_INSTALL_COMMAND = 'pip install "omnigent[antigravity]"'
 
 
 def antigravity_sdk_installed() -> bool:
@@ -54,19 +50,12 @@ def antigravity_sdk_installed() -> bool:
 def antigravity_install_command() -> list[str]:
     """Return the argv that installs the ``antigravity`` extra into this env.
 
-    Prefers ``uv pip install`` when ``uv`` is on ``PATH``, else this interpreter's own
-    pip (``sys.executable -m pip``) so the package lands in the running install.
-    Deliberately carries **no index URL**: pip/uv pick up the user's own configured
-    index, so a private proxy is honored without hardcoding one into committed code.
+    Delegates to :func:`~omnigent.onboarding.extra_install.extra_install_command`
+    which detects ``uv tool`` / ``uv`` / ``pip`` installs automatically.
 
-    :returns: The install argv, e.g.
-        ``["uv", "pip", "install", "omnigent[antigravity]"]`` or
-        ``[sys.executable, "-m", "pip", "install", "omnigent[antigravity]"]``.
+    :returns: The install argv.
     """
-    target = f"omnigent[{ANTIGRAVITY_EXTRA}]"
-    if shutil.which("uv") is not None:
-        return ["uv", "pip", "install", target]
-    return [sys.executable, "-m", "pip", "install", target]
+    return extra_install_command(ANTIGRAVITY_EXTRA)
 
 
 def install_antigravity_sdk() -> bool:
