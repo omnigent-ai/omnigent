@@ -1473,6 +1473,10 @@ class _InMemoryArtifactStore:
         """Remove bytes."""
         self._blobs.pop(key, None)
 
+    def exists(self, key: str) -> bool:
+        """Whether a blob is stored for ``key`` (cheap metadata probe)."""
+        return key in self._blobs
+
 
 @pytest.fixture
 def file_conv_store() -> _ConversationStore:
@@ -1821,6 +1825,36 @@ async def test_copy_files_missing_source_file_is_all_or_nothing(
 
     # The valid file in the batch must NOT have been committed: validation
     # is all-or-nothing, so the destination is unchanged.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_missing_blob_surfaces_before_any_write(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A source row whose blob is gone fails the request before any child write.
+
+    The metadata-only validation probes ``artifact_store.exists`` (a cheap
+    metadata check, not a blob read), so a dangling row — present metadata,
+    absent blob — is caught during validation and copies nothing, preserving
+    the "missing blob surfaces before any child row is created" guarantee.
+    """
+    good = await _upload_file(file_client, "conv_p", "good.txt", b"ok")
+    dangling = await _upload_file(file_client, "conv_p", "gone.txt", b"bye")
+    # Drop the blob but leave the metadata row — a dangling source.
+    artifact_store.delete(dangling)
+    before = file_store.list(session_id="conv_c").data
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [good, dangling]},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "not_found"
+    # The valid file in the batch was NOT committed — validation is all-or-nothing.
     after = file_store.list(session_id="conv_c").data
     assert len(after) == len(before)
 

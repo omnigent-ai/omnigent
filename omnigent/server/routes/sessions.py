@@ -17778,10 +17778,14 @@ def create_sessions_router(
                 code=ErrorCode.FORBIDDEN,
             )
 
-        # Validate every source file from METADATA ONLY, enforcing the copy
+        # Validate every source file WITHOUT reading a blob, enforcing the copy
         # limits before any blob is read. Summing StoredFile.bytes here means
         # an over-count or over-size request is rejected without buffering a
-        # single blob — a rejected request never spikes memory. The blobs are
+        # single blob — a rejected request never spikes memory. artifact_store
+        # .exists() is a cheap metadata probe (S3 HEAD / local stat / DB row),
+        # NOT a blob read, so checking it here preserves the original
+        # "missing blob surfaces before any child row is created" guarantee
+        # without reintroducing the batch prefetch. The blobs themselves are
         # fetched one at a time in the write loop below.
         max_files = copy_file_count_limit()
         max_total_bytes = copy_total_bytes_limit()
@@ -17794,7 +17798,7 @@ def create_sessions_router(
         total_bytes = 0
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
-            if stored is None:
+            if stored is None or not artifact_store.exists(stored.id):
                 raise OmnigentError(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
