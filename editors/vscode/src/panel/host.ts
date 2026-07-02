@@ -25,6 +25,8 @@ export function shouldUseIframe(target: ServerTarget): boolean {
 export interface RenderIntoOptions {
   /** Resolved (local) server target. */
   target: ServerTarget;
+  /** Optional route to deep-link within the framed app (e.g. "/c/<id>"). */
+  route?: string;
   /** Optional diagnostic logger. */
   log?: (msg: string) => void;
 }
@@ -37,9 +39,14 @@ export function renderInto(webview: vscode.Webview, opts: RenderIntoOptions): vo
     nonce,
     cspSource: webview.cspSource,
   });
-  webview.html = buildIframeHtml({ baseUrl: opts.target.baseUrl, csp, nonce });
+  webview.html = buildIframeHtml({
+    baseUrl: opts.target.baseUrl,
+    csp,
+    nonce,
+    route: opts.route,
+  });
   opts.log?.(
-    `[omnigent] iframe rendered (origin=${opts.target.origin}, nonce=${nonce.slice(0, 8)}...)`,
+    `[omnigent] iframe rendered (origin=${opts.target.origin}, route=${opts.route ?? "/"}, nonce=${nonce.slice(0, 8)}...)`,
   );
 }
 

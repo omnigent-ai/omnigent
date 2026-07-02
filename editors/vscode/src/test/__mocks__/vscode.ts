@@ -46,8 +46,44 @@ export const ColorThemeKind = { Light: 1, Dark: 2, HighContrast: 3, HighContrast
 export const TreeItem = class {
   label: string;
   collapsibleState: number;
+  id?: string;
+  description?: string;
+  tooltip?: unknown;
+  iconPath?: unknown;
+  contextValue?: string;
+  command?: unknown;
   constructor(label: string, collapsibleState = 0) {
     this.label = label;
     this.collapsibleState = collapsibleState;
   }
+};
+
+export const TreeItemCollapsibleState = { None: 0, Collapsed: 1, Expanded: 2 };
+
+export const ThemeIcon = class {
+  id: string;
+  constructor(id: string) {
+    this.id = id;
+  }
+};
+
+export const MarkdownString = class {
+  value: string;
+  constructor(value = "") {
+    this.value = value;
+  }
+};
+
+export const EventEmitter = class {
+  private listeners: Array<(e: unknown) => void> = [];
+  event = (listener: (e: unknown) => void) => {
+    this.listeners.push(listener);
+    return { dispose: () => {} };
+  };
+  fire = (e?: unknown) => {
+    for (const l of this.listeners) l(e);
+  };
+  dispose = () => {
+    this.listeners = [];
+  };
 };

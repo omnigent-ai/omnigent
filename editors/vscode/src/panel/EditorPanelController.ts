@@ -10,9 +10,12 @@
 import * as vscode from "vscode";
 import { renderInto, renderResolvingHtml } from "./host";
 import type { ServerTarget } from "../config";
+import type { ClientOptions } from "../api/client";
 
 export class EditorPanelController {
   private panel?: vscode.WebviewPanel;
+  // Empty = the app root (no trailing slash added); navigate() sets "/c/<id>".
+  private route = "";
   private resolved?: { target: ServerTarget };
 
   constructor(
@@ -60,6 +63,25 @@ export class EditorPanelController {
     this.output.appendLine("[omnigent] opened editor-beside panel");
   }
 
+  /**
+   * Navigate the editor panel to `route` (e.g. "/c/<id>"). Sole mutator of
+   * `this.route`. Ensures the panel exists, then re-renders the iframe at the
+   * routed URL. `ensure()` re-renders via `this.render`, which reads `this.route`.
+   */
+  navigate(route: string): void {
+    this.route = route;
+    this.ensure();
+  }
+
+  /**
+   * Client options for the resolved server, or undefined when nothing has
+   * resolved yet. Local-only: no token. The Sessions tree consumes this to call
+   * the /v1 API.
+   */
+  getClientOpts(): ClientOptions | undefined {
+    return this.resolved ? { baseUrl: this.resolved.target.baseUrl } : undefined;
+  }
+
   /** Whether the editor panel is currently open. */
   isOpen(): boolean {
     return this.panel !== undefined;
@@ -80,6 +102,7 @@ export class EditorPanelController {
     }
     renderInto(webview, {
       target: this.resolved.target,
+      route: this.route,
       log: (m) => this.output.appendLine(m),
     });
   }

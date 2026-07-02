@@ -53,6 +53,25 @@ describe("buildIframeHtml", () => {
     expect(html).toContain("&quot;");
   });
 
+  it("appends a route to the base URL when given", () => {
+    const html = buildIframeHtml({ ...baseOpts, route: "/c/conv_123" });
+    expect(html).toContain('src="http://127.0.0.1:6767/c/conv_123"');
+  });
+
+  it("composes a trailing-slash base URL with a route without doubling the slash", () => {
+    const html = buildIframeHtml({
+      ...baseOpts,
+      baseUrl: "http://127.0.0.1:6767/",
+      route: "/c/x",
+    });
+    expect(html).toContain('src="http://127.0.0.1:6767/c/x"');
+    expect(html).not.toContain("6767//c/x");
+  });
+
+  it("renders the bare base URL when no route is given", () => {
+    expect(buildIframeHtml(baseOpts)).toContain('src="http://127.0.0.1:6767"');
+  });
+
   it("has a root div filling the pane", () => {
     expect(buildIframeHtml(baseOpts)).toContain('<div id="root">');
   });

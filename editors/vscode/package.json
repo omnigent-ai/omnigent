@@ -2,7 +2,7 @@
   "name": "omnigent-vscode",
   "displayName": "Omnigent",
   "description": "Open your running local Omnigent server inside VS Code, in an editor-beside iframe.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "omnigent-ai",
   "license": "Apache-2.0",
   "icon": "media/omnigent-icon.png",
@@ -40,25 +40,35 @@
       "omnigent-container": [
         {
           "type": "tree",
-          "id": "omnigent.home",
-          "name": "Omnigent"
+          "id": "omnigent.sessions",
+          "name": "Sessions"
         }
       ]
     },
-    "viewsWelcome": [
-      {
-        "view": "omnigent.home",
-        "contents": "Open the running Omnigent server UI in an editor tab.\n[Open Omnigent](command:omnigent.open)\nStart a local server with `omnigent server`, or set `omnigent.serverUrl` to a localhost URL."
-      }
-    ],
     "commands": [
       {
         "command": "omnigent.open",
         "title": "Omnigent: Open",
         "icon": "media/omnigent-icon.svg"
+      },
+      {
+        "command": "omnigent.sessions.refresh",
+        "title": "Omnigent: Refresh Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "omnigent.openSessionFromTree",
+        "title": "Omnigent: Open Session"
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "omnigent.sessions.refresh",
+          "when": "view == omnigent.sessions",
+          "group": "navigation@1"
+        }
+      ],
       "editor/title": [
         {
           "command": "omnigent.open",
@@ -68,6 +78,13 @@
       "commandPalette": [
         {
           "command": "omnigent.open"
+        },
+        {
+          "command": "omnigent.sessions.refresh"
+        },
+        {
+          "command": "omnigent.openSessionFromTree",
+          "when": "false"
         }
       ]
     }

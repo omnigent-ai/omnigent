@@ -95,6 +95,33 @@ describe("EditorPanelController", () => {
     expect(fake.panel.webview.html.toLowerCase()).not.toContain("token");
   });
 
+  it("navigate() opens the panel and renders the iframe at the routed URL", () => {
+    const controller = makeController();
+    controller.setResolved(LOCAL_TARGET);
+    controller.navigate("/c/conv_42");
+
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(fake.panel.webview.html).toContain('src="http://127.0.0.1:6767/c/conv_42"');
+  });
+
+  it("revealing an already-navigated panel does not reset the route to /", () => {
+    const controller = makeController();
+    controller.setResolved(LOCAL_TARGET);
+    controller.navigate("/c/conv_42");
+    // A subsequent omnigent.open (ensure) must preserve the navigated route.
+    controller.ensure();
+
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(fake.panel.webview.html).toContain('src="http://127.0.0.1:6767/c/conv_42"');
+  });
+
+  it("getClientOpts() is undefined before resolve and returns the baseUrl after", () => {
+    const controller = makeController();
+    expect(controller.getClientOpts()).toBeUndefined();
+    controller.setResolved(LOCAL_TARGET);
+    expect(controller.getClientOpts()).toEqual({ baseUrl: "http://127.0.0.1:6767" });
+  });
+
   it("dispose() disposes the panel and nulls the ref; onDidDispose does not double-clear", () => {
     const controller = makeController();
     controller.setResolved(LOCAL_TARGET);
