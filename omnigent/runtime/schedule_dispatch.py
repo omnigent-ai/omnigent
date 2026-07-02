@@ -53,7 +53,7 @@ def build_inprocess_fire(
     agent_store: Any = None,
     tunnel_registry: Any = None,
     permission_store: Any = None,
-    service_secret: str | None = None,
+    service_token: str | None = None,
 ) -> Callable[[Schedule], Awaitable[str | None]]:
     """Build a scheduler ``fire`` callback that injects the loop's prompt.
 
@@ -64,7 +64,7 @@ def build_inprocess_fire(
 
     Attribution: when ``schedule.created_by_user_id`` is set, the request
     carries it in ``identity_header`` (honored by header-auth deployments) and
-    — when ``service_secret`` is wired — as the in-process service identity
+    — when ``service_token`` is wired — as the in-process service identity
     (secret + acting-user headers, accepted by ``get_user_id`` on every auth
     mode). The latter is what lets a fire authenticate on cookie/OIDC
     deployments, which ignore proxy identity headers.
@@ -83,8 +83,8 @@ def build_inprocess_fire(
     :param timeout_s: Per-fire request timeout. A turn may take a while to
         accept (host relaunch); kept generous but bounded so a wedged dispatch
         can't pin the loop forever.
-    :param service_secret: The per-boot in-process service secret (also set on
-        ``app.state.service_identity_secret``), or ``None`` to send only the
+    :param service_token: The per-boot in-process service token (also set on
+        ``app.state.service_identity_token``), or ``None`` to send only the
         identity header. Memory-only; never persisted or logged.
     :returns: An awaitable ``fire(schedule)`` suitable for
         :class:`~omnigent.runtime.scheduler.SchedulerService`.
@@ -189,8 +189,8 @@ def build_inprocess_fire(
             headers[identity_header] = creator
             # …and every auth mode (cookie/OIDC included) honors the in-process
             # service identity: per-boot secret + the user this fire acts as.
-            if service_secret is not None:
-                headers[SERVICE_TOKEN_HEADER] = service_secret
+            if service_token is not None:
+                headers[SERVICE_TOKEN_HEADER] = service_token
                 headers[SERVICE_ACTING_USER_HEADER] = creator
         body = {
             "type": "message",

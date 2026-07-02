@@ -101,13 +101,13 @@ async def test_fire_sends_service_identity_when_configured() -> None:
     # the identity header (header-auth) and the service identity (every mode).
     app, captured = _capture_app(200)
     fire = build_inprocess_fire(
-        app, identity_header="X-Forwarded-Email", service_secret="boot-secret"
+        app, identity_header="X-Forwarded-Email", service_token="boot-token"
     )
 
     await fire(_loop())
 
     assert captured["headers"]["x-forwarded-email"] == "alice@example.com"
-    assert captured["headers"]["x-omnigent-service-token"] == "boot-secret"
+    assert captured["headers"]["x-omnigent-service-token"] == "boot-token"
     assert captured["headers"]["x-omnigent-acting-user"] == "alice@example.com"
 
 
@@ -119,7 +119,7 @@ async def test_fire_omits_service_identity_for_reserved_identity() -> None:
         app,
         identity_header="X-Forwarded-Email",
         reserved_identities=frozenset({"local"}),
-        service_secret="boot-secret",
+        service_token="boot-token",
     )
 
     await fire(_loop(created_by_user_id="local"))
@@ -159,9 +159,9 @@ async def test_fire_authenticates_on_cookie_mode_via_service_identity() -> None:
     # End-to-end S1 proof: a cookie/OIDC-style app (ignores identity headers)
     # accepts the fire as the loop's creator when the service secret is wired…
     app, captured = _auth_enforcing_app()
-    app.state.service_identity_secret = "boot-secret"
+    app.state.service_identity_token = "boot-token"
     fire = build_inprocess_fire(
-        app, identity_header="X-Forwarded-Email", service_secret="boot-secret"
+        app, identity_header="X-Forwarded-Email", service_token="boot-token"
     )
 
     fired = await fire(_loop())
@@ -170,7 +170,7 @@ async def test_fire_authenticates_on_cookie_mode_via_service_identity() -> None:
     assert captured["user"] == "alice@example.com"
 
 
-async def test_fire_without_service_secret_still_401s_on_cookie_mode() -> None:
+async def test_fire_without_service_token_still_401s_on_cookie_mode() -> None:
     # …and without it the fire is rejected (logged, returns None → no stamp).
     app, captured = _auth_enforcing_app()
     fire = build_inprocess_fire(app, identity_header="X-Forwarded-Email")

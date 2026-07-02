@@ -54,7 +54,7 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 # :func:`omnigent.server.routes._auth_helpers.get_user_id`, so it works on
 # every auth mode — cookie/OIDC deployments rightly ignore proxy identity
 # headers and would otherwise 401 a scheduled fire. The secret exists only in
-# process memory (``app.state.service_identity_secret``), is minted fresh each
+# process memory (``app.state.service_identity_token``), is minted fresh each
 # boot, and is never persisted or logged.
 SERVICE_TOKEN_HEADER = "X-Omnigent-Service-Token"
 SERVICE_ACTING_USER_HEADER = "X-Omnigent-Acting-User"

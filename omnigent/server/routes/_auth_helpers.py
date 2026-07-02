@@ -52,7 +52,7 @@ def get_user_id(
 
     Checked first: the in-process **service identity** (#6) — a same-process
     caller (the scheduler's fire callback) presents the per-boot secret from
-    ``app.state.service_identity_secret`` plus the user it acts as. This is
+    ``app.state.service_identity_token`` plus the user it acts as. This is
     how a scheduled fire authenticates on cookie/OIDC deployments, which
     rightly ignore proxy identity headers and would otherwise 401 it. A
     missing or wrong token simply falls through to the auth provider.
@@ -62,13 +62,13 @@ def get_user_id(
     :returns: User ID string, or ``None`` if no auth provider.
     """
     scope_app = request.scope.get("app")
-    secret = getattr(scope_app.state, "service_identity_secret", None) if scope_app else None
-    if secret:
+    expected = getattr(scope_app.state, "service_identity_token", None) if scope_app else None
+    if expected:
         token = request.headers.get(SERVICE_TOKEN_HEADER)
         acting = request.headers.get(SERVICE_ACTING_USER_HEADER)
         # Compare as bytes: comparing two str raises TypeError on a non-ASCII
         # (malformed/hostile) header, which would 500 instead of falling through.
-        if token and acting and hmac.compare_digest(token.encode(), secret.encode()):
+        if token and acting and hmac.compare_digest(token.encode(), expected.encode()):
             return acting
     if auth_provider is None:
         return None
