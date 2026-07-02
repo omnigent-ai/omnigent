@@ -224,6 +224,39 @@ describe("findAnchorInSource", () => {
     });
   });
 
+  it("anchors occurrence 0 to the wrapped first copy, not a later verbatim one", () => {
+    // Regression: the old occurrence-0 fast path used a verbatim indexOf, which
+    // skipped the whitespace-wrapped first rendered copy and landed on the
+    // second (verbatim) one — storing the comment at the wrong offset.
+    const src = "<p>then\n   latency</p><p>then latency</p>";
+    const firstWrapped = src.indexOf("then\n   latency");
+    const res = findAnchorInSource(src, "then latency", 0);
+    expect(res).not.toBeNull();
+    expect(res!.start_index).toBe(firstWrapped);
+    expect(src.slice(res!.start_index, res!.end_index)).toBe("then\n   latency");
+  });
+
+  it("skips matches inside tags/attributes when counting occurrences", () => {
+    // "Submit" appears first in an attribute (non-rendered), then as button
+    // text. Occurrence 0 must resolve to the rendered text, not the attribute.
+    const src = '<button aria-label="Submit">Submit</button>';
+    const rendered = src.indexOf("Submit</button>");
+    const res = findAnchorInSource(src, "Submit", 0);
+    expect(res).not.toBeNull();
+    expect(res!.start_index).toBe(rendered);
+  });
+
+  it("skips matches inside <title>, comments, and <script>", () => {
+    const src =
+      "<head><title>Report</title></head>" +
+      "<!-- Report draft -->" +
+      "<script>var x = 'Report';</script>" +
+      "<h1>Report</h1>";
+    const heading = src.lastIndexOf("Report");
+    const res = findAnchorInSource(src, "Report", 0);
+    expect(res!.start_index).toBe(heading);
+  });
+
   it("returns null when the requested occurrence doesn't exist", () => {
     expect(findAnchorInSource("only once here", "once", 3)).toBeNull();
   });
@@ -256,5 +289,13 @@ describe("anchorOccurrence", () => {
 
   it("returns 0 for empty anchor text", () => {
     expect(anchorOccurrence(src, "   ", 0)).toBe(0);
+  });
+
+  it("does not count matches in non-rendered regions (attributes/comments)", () => {
+    // An attribute "Submit" precedes the rendered button text; the rendered copy
+    // must still be occurrence 0 so its count aligns with the in-frame bridge.
+    const withAttr = '<button title="Submit"><!-- Submit --><span>Submit</span></button>';
+    const rendered = withAttr.lastIndexOf("Submit");
+    expect(anchorOccurrence(withAttr, "Submit", rendered)).toBe(0);
   });
 });
