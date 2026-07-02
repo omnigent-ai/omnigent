@@ -37,7 +37,7 @@ import contextlib
 import io
 import json
 import tarfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1094,8 +1094,8 @@ async def _reconnect_fires_connect_hook(
     real_recover = sessions_routes._publish_runner_recovered_status
     recovered_calls: list[str] = []
 
-    async def _spy_recover(sid, store):  # type: ignore[no-untyped-def]
-        await real_recover(sid, store)
+    async def _spy_recover(sid, store, **kwargs):  # type: ignore[no-untyped-def]
+        await real_recover(sid, store, **kwargs)
         recovered_calls.append(sid)
 
     sessions_routes._publish_runner_recovered_status = _spy_recover  # type: ignore[assignment]
@@ -1201,7 +1201,31 @@ async def _bind_failed_session(
     return session_id
 
 
+@pytest.fixture()
+def _isolated_session_status_cache() -> Iterator[None]:
+    """Snapshot + clear + restore the module-global session-status cache.
+
+    ``_session_status_cache`` lives at module scope in the sessions
+    route, so it survives across tests while each test rebuilds its own
+    conversation store on a fresh ``tmp_path`` DB. A prior test can leave
+    entries behind (and per-test session ids can collide), which makes
+    the reconnect-recovery assertions non-deterministic when the whole
+    suite runs. Start each guarded test from an empty cache and restore
+    the pre-test contents afterward so nothing leaks in either direction.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    saved = dict(sessions_module._session_status_cache)
+    sessions_module._session_status_cache.clear()
+    try:
+        yield
+    finally:
+        sessions_module._session_status_cache.clear()
+        sessions_module._session_status_cache.update(saved)
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
     tunnel_three_layer_stack: _TunnelStack,
 ) -> None:
@@ -1255,6 +1279,7 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_on_runner_connect_preserves_genuine_failure_on_reconnect(
     tunnel_three_layer_stack: _TunnelStack,
 ) -> None:

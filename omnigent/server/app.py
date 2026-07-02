@@ -2066,7 +2066,9 @@ def create_app(
             # is reachable again. The helper self-guards: it only clears a
             # session whose persisted failure is ``runner_disconnected``, so
             # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(conv.id, conversation_store)
+            await _publish_runner_recovered_status(
+                conv.id, conversation_store, require_disconnect_code=True
+            )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a server-managed sandbox runner, by its bound session.

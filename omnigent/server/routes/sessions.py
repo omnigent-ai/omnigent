@@ -5505,6 +5505,8 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
 async def _publish_runner_recovered_status(
     session_id: str,
     conversation_store: ConversationStore,
+    *,
+    require_disconnect_code: bool = False,
 ) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -5522,31 +5524,41 @@ async def _publish_runner_recovered_status(
     the runner is reachable again the session is healthy and idle — the
     pill must drop without waiting for the next ``running`` edge.
 
-    Only a ``runner_disconnected`` failure is stale-on-recovery. A
-    genuine task failure (``response.failed`` / a setup error with any
-    other ``last_task_error`` code) is a real terminal state that a
-    runner reconnect or rebind must not erase — clearing it here would
-    silently flip the red "Failed" pill back to idle and hide the error.
-    So the recovery is gated on the persisted disconnect code, not on the
-    bare ``failed`` cache value.
+    An explicit rebind/handshake (a PATCH ``/clear`` or ``/switch``, or
+    the message-forward session-init) is a user-driven proof the runner
+    is live, so it clears any stale ``failed`` state. A *passive* tunnel
+    reconnect is weaker: the process merely came back on its own, saying
+    nothing about a genuine task error. Callers on that path pass
+    ``require_disconnect_code=True`` so only a ``runner_disconnected``
+    failure is cleared — a genuine task failure (``response.failed`` / a
+    setup error with any other ``last_task_error`` code) survives the
+    reconnect, keeping the red "Failed" pill instead of silently flipping
+    it back to idle and hiding the error.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conversation_store: Store used to read the persisted error
         code and clear the labels on genuine recovery.
+    :param require_disconnect_code: When ``True`` (passive-reconnect
+        caller), only clear if the persisted ``last_task_error.code`` is
+        ``runner_disconnected``; when ``False`` (default, explicit
+        rebind/handshake), clear any stale ``failed`` state. Labels are
+        cleared in both cases.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
         return
-    # Distinguish a benign runner disconnect from a real task failure:
-    # both land the cache on "failed", but only the disconnect persists
-    # a ``runner_disconnected`` label. A reconnect/rebind proves the
-    # runner is reachable again, which invalidates a disconnect failure
-    # but says nothing about a genuine task error — leave that one alone.
-    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
-    if last_error is None or last_error.get("code") != "runner_disconnected":
-        return
+    # A passive reconnect must distinguish a benign runner disconnect
+    # from a real task failure: both land the cache on "failed", but only
+    # the disconnect persists a ``runner_disconnected`` label. The
+    # reconnect proves the runner is reachable again, which invalidates a
+    # disconnect failure but says nothing about a genuine task error —
+    # leave that one alone. Explicit rebinds skip this guard.
+    if require_disconnect_code:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
+        if last_error is None or last_error.get("code") != "runner_disconnected":
+            return
     _session_status_cache[session_id] = "idle"
     event = SessionStatusEvent(
         type="session.status",
