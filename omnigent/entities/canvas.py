@@ -14,6 +14,12 @@ from dataclasses import dataclass
 # renders via the app's markdown viewer.
 CANVAS_CONTENT_TYPES: frozenset[str] = frozenset({"html", "markdown"})
 
+# Upper bound on canvas content, measured as UTF-8 bytes. A canvas is a single
+# rendered artifact, not a file store — cap it so a runaway agent (or a hostile
+# caller hitting the REST endpoint) can't persist an unbounded blob per
+# conversation. 1 MB comfortably fits a rich report / interactive widget.
+MAX_CANVAS_CONTENT_BYTES: int = 1_000_000
+
 
 @dataclass
 class Canvas:

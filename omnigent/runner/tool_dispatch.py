@@ -2600,7 +2600,9 @@ async def _execute_canvas_tool(
             )
         return json.dumps(resp.json())
 
-    scoped_conv = args.get("conversation_id") or conversation_id
+    # Always the ambient session — never a conversation_id from the tool args,
+    # so an agent can't write to another conversation's canvas.
+    scoped_conv = conversation_id
 
     try:
         if tool_name == "set_canvas":
