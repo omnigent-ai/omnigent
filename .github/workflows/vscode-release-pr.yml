@@ -1,0 +1,123 @@
+# Open a "Release (vscode): vX.Y.Z" PR that bumps the extension version and
+# rolls the CHANGELOG. This is step 1 of the two-step release: a human reviews
+# and merges this PR, then dispatches `vscode-extension-release.yml` to build
+# the `.vsix` and cut the draft GitHub release. Doing the version bump through a
+# reviewed PR keeps `package.json` and the tag from ever diverging (the tag is
+# derived from the merged `package.json`, never typed by hand).
+name: VS Code Extension Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Extension release version, e.g. 0.2.0 (no leading v)."
+        required: true
+        type: string
+
+# Opening a PR needs contents + pull-requests write.
+permissions:
+  contents: write
+  pull-requests: write
+
+defaults:
+  run:
+    working-directory: editors/vscode
+
+jobs:
+  release-pr:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Only repo collaborators (write or higher) may cut a release. This is a
+      # sanity gate on top of GitHub's Actions-write dispatch permission; the
+      # real ship gate is PR review on merge and the secure repo's own checks.
+      - name: Check actor
+        # Runs before checkout, so the default editors/vscode workdir does not
+        # exist yet — run from the workspace root.
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          role=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${GITHUB_ACTOR}/permission" --jq '.role_name')
+          if [[ "$role" != "admin" && "$role" != "maintain" && "$role" != "write" ]]; then
+            echo "::error::Actor '${GITHUB_ACTOR}' has '${role}' role, but 'write' or higher is required."
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Strict X.Y.Z only. VS Code Marketplace versions are numeric
+          # major.minor.patch — `vsce package` rejects prerelease suffixes
+          # (pre-releases use the --pre-release flag, not a version suffix), so
+          # accepting a suffix here would produce a version bump that later
+          # fails at package time.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' is not a valid X.Y.Z."
+            exit 1
+          fi
+
+      - name: Bump package.json version
+        env:
+          VERSION: ${{ inputs.version }}
+        # `npm pkg set` edits ONLY package.json (unlike `npm version`, which also
+        # rewrites package-lock.json). Keeps the release PR to package.json +
+        # CHANGELOG.md.
+        run: npm pkg set version="$VERSION"
+
+      - name: Add the CHANGELOG section
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Insert a fresh "## [<version>]" section above the newest existing
+          # version heading. Skip if that version already has a section. The
+          # reviewer fills in the bullet points on the release PR.
+          python3 - "$VERSION" <<'PY'
+          import sys, re, pathlib
+          version = sys.argv[1]
+          p = pathlib.Path("CHANGELOG.md")
+          text = p.read_text()
+          if f"## [{version}]" in text:
+              print(f"CHANGELOG already has a [{version}] section — leaving as-is.")
+              sys.exit(0)
+          m = re.search(r"^## \[", text, re.MULTILINE)
+          section = f"## [{version}]\n\n- _Describe changes here._\n\n"
+          if m:
+              text = text[:m.start()] + section + text[m.start():]
+          else:
+              text = text.rstrip("\n") + "\n\n" + section
+          p.write_text(text)
+          print(f"Added CHANGELOG section for {version}")
+          PY
+          head -20 CHANGELOG.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH="release/vscode-v$VERSION"
+          git checkout -b "$BRANCH"
+          # Paths are relative to editors/vscode (the step's working dir), so
+          # only the extension's own files are ever staged.
+          git add package.json CHANGELOG.md
+          # Guard: the release PR must never touch anything outside
+          # editors/vscode (e.g. web/, lockfiles). Fail loudly if it does.
+          if git diff --cached --name-only | grep -qv '^editors/vscode/'; then
+            echo "::error::Release PR staged files outside editors/vscode:"
+            git diff --cached --name-only | grep -v '^editors/vscode/'
+            exit 1
+          fi
+          git commit -m "Release (vscode): v$VERSION"
+          git push --force-with-lease origin "$BRANCH"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "Release (vscode): v$VERSION" \
+            --body "Bumps the Omnigent VS Code extension to \`v$VERSION\` and adds its CHANGELOG section (fill in the changes before merging). After merge, run the **VS Code Extension Release** workflow to build the \`.vsix\` and cut the draft release. See \`editors/vscode/PUBLISHING.md\`."
