@@ -43,7 +43,19 @@ No tags are pushed by hand — the version flows from a reviewed PR into the
    attached `.vsix` + `.sha256` and the notes look right, then click **Publish
    release**. Publishing creates the tag and makes the release downloadable by
    the secure-repo workflow.
-4. **Publish to the marketplaces.** Dispatch `omnigent-vscode.yml` in the
+4. **Smoke-test the `.vsix` locally.** Download the `.vsix` from the published
+   release and install it into a clean VS Code, then confirm the extension
+   activates and opens a local server:
+
+   ```bash
+   gh release download vscode-v<version> --repo omnigent-ai/omnigent --pattern '*.vsix'
+   code --install-extension omnigent-vscode-<version>.vsix
+   ```
+
+   Reload VS Code, start a local server (`omnigent server`), and check that
+   **Omnigent: Open** frames it. This catches packaging problems (missing files,
+   a broken bundle) before anything reaches the marketplaces.
+5. **Publish to the marketplaces.** Dispatch `omnigent-vscode.yml` in the
    secure-release repo (once it exists), pointing at the `vscode-v<version>`
    tag; run with `dry-run: true` first, then publish for real.
 
