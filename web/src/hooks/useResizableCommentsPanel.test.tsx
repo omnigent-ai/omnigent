@@ -47,3 +47,41 @@ describe("useResizableCommentsPanel persistence", () => {
     restored.unmount();
   });
 });
+
+describe("useResizableCommentsPanel drag overlay", () => {
+  const overlaySelector = () =>
+    [...document.body.children].find(
+      (c): c is HTMLElement =>
+        c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
+    ) ?? null;
+
+  it("mounts a full-window overlay during a drag so mouseup isn't lost to the preview iframe", () => {
+    // The divider sits between the HTML-preview iframe and this panel. Without
+    // an overlay, dragging over the frame routes mousemove/mouseup into it and
+    // the parent never sees the release, so the drag sticks to the cursor.
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    expect(overlaySelector()).toBeNull();
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    const overlay = overlaySelector();
+    expect(overlay).not.toBeNull();
+    expect(overlay?.style.cursor).toBe("col-resize");
+
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(overlaySelector()).toBeNull();
+    unmount();
+  });
+
+  it("removes the overlay if unmounted mid-drag", () => {
+    const { result, unmount } = renderHook(() => useResizableCommentsPanel());
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    expect(overlaySelector()).not.toBeNull();
+
+    unmount();
+    expect(overlaySelector()).toBeNull();
+  });
+});

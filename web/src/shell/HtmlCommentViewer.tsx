@@ -17,6 +17,7 @@ import { useCanEdit } from "@/hooks/usePermissions";
 import { getEmbedRoot } from "@/lib/host";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import {
+  anchorOccurrence,
   BRIDGE_MSG,
   BRIDGE_SOURCE,
   findAnchorInSource,
@@ -48,6 +49,27 @@ function genNonce(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
   // Deterministic-enough fallback for environments without crypto.randomUUID.
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+
+/** Bridge payload for one comment: its id, anchor text, and which occurrence of
+ * that text (by source offset) it belongs to — so repeated anchor text such as
+ * a title reused in the body highlights only the commented instance. */
+function commentPayload(content: string, c: Comment) {
+  const anchor = c.anchor_content ?? "";
+  return {
+    id: c.id,
+    anchor_content: anchor,
+    occ: anchorOccurrence(content, anchor, c.start_index),
+  };
+}
+
+/** Bridge payload for the active selection, or null. */
+function activePayload(content: string, sel: ActiveSelection | null) {
+  if (!sel) return null;
+  return {
+    anchor_content: sel.anchor_content,
+    occ: anchorOccurrence(content, sel.anchor_content, sel.start_index),
+  };
 }
 
 export function HtmlCommentViewer({
@@ -96,8 +118,24 @@ export function HtmlCommentViewer({
         // Flush current state now that the frame is connected.
         postState();
       } else if (msg.type === BRIDGE_MSG.selection) {
+        const offsets = findAnchorInSource(contentRef.current, msg.text, msg.occ);
+        // Selecting a range that already has a comment activates it (which
+        // scrolls the panel to its card) rather than offering to add a new one.
+        const existing =
+          offsets &&
+          commentsRef.current.find(
+            (c) => c.start_index === offsets.start_index && c.end_index === offsets.end_index,
+          );
+        if (existing) {
+          onSetActiveSelectionRef.current({
+            start_index: existing.start_index,
+            end_index: existing.end_index,
+            anchor_content: existing.anchor_content ?? "",
+          });
+          setFloating(null);
+          return;
+        }
         const rect = iframe.getBoundingClientRect();
-        const offsets = findAnchorInSource(contentRef.current, msg.text);
         setFloating({
           x: rect.left + msg.rect.left,
           y: rect.top + msg.rect.top - 6,
@@ -128,18 +166,13 @@ export function HtmlCommentViewer({
         source: BRIDGE_SOURCE,
         nonce,
         type: BRIDGE_MSG.setComments,
-        comments: commentsRef.current.map((c) => ({
-          id: c.id,
-          anchor_content: c.anchor_content ?? "",
-        })),
+        comments: commentsRef.current.map((c) => commentPayload(contentRef.current, c)),
       });
       port.postMessage({
         source: BRIDGE_SOURCE,
         nonce,
         type: BRIDGE_MSG.setActive,
-        active: activeSelectionRef.current
-          ? { anchor_content: activeSelectionRef.current.anchor_content }
-          : null,
+        active: activePayload(contentRef.current, activeSelectionRef.current),
       });
     };
 
@@ -172,9 +205,9 @@ export function HtmlCommentViewer({
       source: BRIDGE_SOURCE,
       nonce,
       type: BRIDGE_MSG.setComments,
-      comments: comments.map((c) => ({ id: c.id, anchor_content: c.anchor_content ?? "" })),
+      comments: comments.map((c) => commentPayload(content, c)),
     });
-  }, [comments, nonce]);
+  }, [comments, content, nonce]);
 
   // Push active-selection changes into the frame (drives the active highlight).
   useEffect(() => {
@@ -182,9 +215,9 @@ export function HtmlCommentViewer({
       source: BRIDGE_SOURCE,
       nonce,
       type: BRIDGE_MSG.setActive,
-      active: activeSelection ? { anchor_content: activeSelection.anchor_content } : null,
+      active: activePayload(content, activeSelection),
     });
-  }, [activeSelection, nonce]);
+  }, [activeSelection, content, nonce]);
 
   // Dismiss the floating button on any mousedown in the parent outside of it.
   // (Clicks inside the iframe are relayed as selection/clear messages instead.)

@@ -62,6 +62,9 @@ export interface BridgeSelection {
   type: typeof BRIDGE_MSG.selection;
   /** The selected rendered text, used as the comment anchor_content. */
   text: string;
+  /** Which occurrence (0-based, document order) of `text` was selected, so the
+   * parent anchors to the copy the user picked rather than the first match. */
+  occ: number;
   rect: BridgeRect;
 }
 
@@ -118,7 +121,10 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return { type: BRIDGE_MSG.ready };
     case BRIDGE_MSG.selection:
       if (typeof d.text === "string" && d.text.trim() !== "" && isRect(d.rect)) {
-        return { type: BRIDGE_MSG.selection, text: d.text, rect: d.rect };
+        // occ is optional for resilience against older frames — default to the
+        // first occurrence, which is the pre-occurrence behavior.
+        const occ = typeof d.occ === "number" && d.occ >= 0 ? d.occ : 0;
+        return { type: BRIDGE_MSG.selection, text: d.text, occ, rect: d.rect };
       }
       return null;
     case BRIDGE_MSG.commentClick:
@@ -159,25 +165,66 @@ function escapeRegExp(s: string): string {
 export function findAnchorInSource(
   source: string,
   anchor: string,
+  occurrence = 0,
 ): { start_index: number; end_index: number } | null {
   const trimmed = anchor.trim();
   if (!trimmed) return null;
 
-  const exact = source.indexOf(trimmed);
-  if (exact !== -1) return { start_index: exact, end_index: exact + trimmed.length };
+  // Fast path: for the first occurrence, an exact substring match is the common
+  // case (rendered prose is usually verbatim in the source).
+  if (occurrence === 0) {
+    const exact = source.indexOf(trimmed);
+    if (exact !== -1) return { start_index: exact, end_index: exact + trimmed.length };
+  }
 
-  // Whitespace-tolerant fallback: rendered selection text may collapse runs of
-  // whitespace that the source spells out (newlines, indentation between tags).
+  // Whitespace-tolerant match, walking to the requested occurrence. Rendered
+  // selection text may collapse runs of whitespace that the source spells out
+  // (newlines, indentation between tags), and the same text can repeat, so the
+  // caller passes which copy (document order) was selected.
   const pattern = trimmed.split(/\s+/).map(escapeRegExp).join("\\s+");
   try {
-    const match = source.match(new RegExp(pattern));
-    if (match?.index !== undefined) {
-      return { start_index: match.index, end_index: match.index + match[0].length };
+    const re = new RegExp(pattern, "g");
+    let i = 0;
+    for (const m of source.matchAll(re)) {
+      if (m.index === undefined) break;
+      if (i === occurrence) {
+        return { start_index: m.index, end_index: m.index + m[0].length };
+      }
+      i += 1;
     }
   } catch {
     // Pathological anchor produced an invalid pattern — fall through to null.
   }
   return null;
+}
+
+/**
+ * Which occurrence of `anchor` (0-based, document order) the comment at
+ * `startIndex` refers to. Anchor text can repeat — e.g. a title and a body
+ * paragraph both containing "Aurora Sync" — and the bridge highlights by text
+ * match, so without this it would light up every copy. Counting the matches
+ * before `startIndex` disambiguates to the one the user actually selected.
+ *
+ * Uses the same whitespace-tolerant match as `findAnchorInSource` so a wrapped
+ * source occurrence still counts. Returns 0 when the anchor is empty or the
+ * pattern is pathological (the bridge then falls back to matching all copies).
+ */
+export function anchorOccurrence(source: string, anchor: string, startIndex: number): number {
+  const trimmed = anchor.trim();
+  if (!trimmed) return 0;
+  const pattern = trimmed.split(/\s+/).map(escapeRegExp).join("\\s+");
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, "g");
+  } catch {
+    return 0;
+  }
+  let count = 0;
+  for (const m of source.matchAll(re)) {
+    if (m.index === undefined || m.index >= startIndex) break;
+    count += 1;
+  }
+  return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,8 +240,9 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   var SRC = "__OMNI_SRC__";
   var T = __OMNI_TYPES__;
   var port = null;
-  var comments = [];        // [{ id, anchor_content }]
-  var activeAnchor = null;  // string | null
+  var comments = [];        // [{ id, anchor_content, occ }]
+  var active = null;        // { anchor_content, occ } | null
+  var activeRanges = [];    // ranges matching the active comment (for scroll-into-view)
   var ranges = [];          // [{ id, range }] for click hit-testing
 
   function send(msg) {
@@ -239,19 +287,51 @@ const BRIDGE_SCRIPT_BODY = `(function () {
     return last ? { node: last.node, offset: last.node.nodeValue.length } : null;
   }
 
-  // All ranges whose text equals the (whitespace-tolerant) anchor.
+  // Whitespace-normalized view of a string: runs of whitespace collapse to a
+  // single space, with a map from each normalized index back to its raw offset
+  // (plus a trailing sentinel = raw length). charAt(i) <= " " treats every code
+  // <= U+0020 (space, tab, CR/LF, FF) as whitespace without needing regex — which
+  // matters here because the script is injected as a template-literal string.
+  function normWs(text) {
+    var norm = "";
+    var map = [];
+    var prevSpace = false;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (ch <= " ") {
+        if (prevSpace) continue;
+        norm += " ";
+        map.push(i);
+        prevSpace = true;
+      } else {
+        norm += ch;
+        map.push(i);
+        prevSpace = false;
+      }
+    }
+    map.push(text.length);
+    return { norm: norm, map: map };
+  }
+
+  // All ranges matching the anchor. anchor_content is rendered-selection text
+  // (whitespace collapsed) but the haystack is raw text-node data that preserves
+  // the source's newlines/indentation, so match on the normalized view and map
+  // normalized offsets back to raw node positions — mirroring the parent's
+  // whitespace-tolerant findAnchorInSource.
   function anchorRanges(index, anchor) {
     var out = [];
-    var needle = (anchor || "").trim();
+    var raw = (anchor || "").trim();
+    if (!raw) return out;
+    var H = normWs(index.text);
+    var needle = normWs(raw).norm.trim();
     if (!needle) return out;
-    var hay = index.text;
     var from = 0;
     var guard = 0;
     while (guard++ < 1000) {
-      var at = hay.indexOf(needle, from);
+      var at = H.norm.indexOf(needle, from);
       if (at === -1) break;
-      var s = locate(index.nodes, at);
-      var e = locate(index.nodes, at + needle.length);
+      var s = locate(index.nodes, H.map[at]);
+      var e = locate(index.nodes, H.map[at + needle.length]);
       if (s && e) {
         var r = document.createRange();
         try {
@@ -265,28 +345,100 @@ const BRIDGE_SCRIPT_BODY = `(function () {
     return out;
   }
 
+  // Flat raw-text offset of a selection boundary (node, offset) within the
+  // index's concatenated text. When the boundary is a text node we map directly;
+  // when it's an element (e.g. selecting a whole <span>, the boundary is the
+  // parent with a child index) we return the flat start of the first indexed
+  // text node at or after that boundary, using a collapsed range to compare
+  // document order. Returns -1 if nothing matches.
+  function flatOffset(index, node, offset) {
+    if (node.nodeType === 3) {
+      for (var i = 0; i < index.nodes.length; i++) {
+        if (index.nodes[i].node === node) return index.nodes[i].start + offset;
+      }
+      return -1;
+    }
+    var boundary = document.createRange();
+    try {
+      boundary.setStart(node, offset);
+    } catch (e) {
+      return -1;
+    }
+    for (var k = 0; k < index.nodes.length; k++) {
+      var tn = index.nodes[k].node;
+      // First text node that starts at or after the boundary.
+      if (boundary.comparePoint(tn, 0) >= 0) return index.nodes[k].start;
+    }
+    return -1;
+  }
+
+  // Which occurrence (0-based, document order) of the selected text the current
+  // selection is, so the parent can anchor to the copy actually selected rather
+  // than the first text match. Counts normalized matches starting before the
+  // selection's start — mirrors anchorRanges/anchorOccurrence so a wrapped
+  // occurrence still counts. Returns 0 if the position can't be resolved.
+  function selectionOccurrence(range, text) {
+    var index = buildIndex();
+    var start = flatOffset(index, range.startContainer, range.startOffset);
+    if (start === -1) return 0;
+    var H = normWs(index.text);
+    var needle = normWs((text || "").trim()).norm.trim();
+    if (!needle) return 0;
+    var count = 0;
+    var from = 0;
+    var guard = 0;
+    while (guard++ < 1000) {
+      var at = H.norm.indexOf(needle, from);
+      if (at === -1) break;
+      if (H.map[at] >= start) break;
+      count++;
+      from = at + Math.max(1, needle.length);
+    }
+    return count;
+  }
+
   function repaint() {
     var supported = typeof CSS !== "undefined" && CSS.highlights && typeof Highlight !== "undefined";
     if (!supported) return; // highlights degrade gracefully; commenting still works
     var index = buildIndex();
     ranges = [];
     var base = [];
-    var active = [];
+    var activeHi = [];
     for (var i = 0; i < comments.length; i++) {
-      var rs = anchorRanges(index, comments[i].anchor_content);
-      for (var j = 0; j < rs.length; j++) {
-        ranges.push({ id: comments[i].id, range: rs[j] });
-        if (activeAnchor && comments[i].anchor_content === activeAnchor) {
-          active.push(rs[j]);
-        } else {
-          base.push(rs[j]);
-        }
+      var c = comments[i];
+      var rs = anchorRanges(index, c.anchor_content);
+      // Anchor text can repeat (e.g. a title and a body paragraph). The parent
+      // sends the occurrence index (document order) the comment belongs to, so
+      // highlight only that one. When occ is missing or out of range (stale
+      // offset), fall back to all matches so the comment is at least visible.
+      var picked = (typeof c.occ === "number" && c.occ >= 0 && c.occ < rs.length) ? [rs[c.occ]] : rs;
+      var isActive = active && c.anchor_content === active.anchor_content &&
+        (active.occ == null || active.occ === c.occ);
+      for (var j = 0; j < picked.length; j++) {
+        ranges.push({ id: c.id, range: picked[j] });
+        if (isActive) activeHi.push(picked[j]);
+        else base.push(picked[j]);
       }
     }
+    activeRanges = activeHi;
     try {
       CSS.highlights.set("omni-comment", new Highlight(...base.filter(Boolean)));
-      CSS.highlights.set("omni-comment-active", new Highlight(...active.filter(Boolean)));
+      CSS.highlights.set("omni-comment-active", new Highlight(...activeHi.filter(Boolean)));
     } catch (e) {}
+  }
+
+  // Scroll the first active-comment range into view. Uses the range's client
+  // rect (Ranges have no scrollIntoView) to center it in the viewport, but only
+  // when off-screen so an already-visible highlight doesn't jump.
+  function scrollActiveIntoView() {
+    var r = activeRanges && activeRanges[0];
+    if (!r) return;
+    var rect = r.getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) return;
+    var vh = window.innerHeight || document.documentElement.clientHeight;
+    if (rect.top >= 0 && rect.bottom <= vh) return; // already fully visible
+    var target = window.pageYOffset + rect.top - vh / 2 + rect.height / 2;
+    window.scrollTo({ top: target < 0 ? 0 : target, behavior: "smooth" });
   }
 
   function rectOf(range) {
@@ -319,13 +471,43 @@ const BRIDGE_SCRIPT_BODY = `(function () {
 
   function emitSelection() {
     var s = currentSelection();
-    if (s) send({ type: T.selection, text: s.text, rect: rectOf(s.range) });
+    if (s) {
+      send({
+        type: T.selection,
+        text: s.text,
+        occ: selectionOccurrence(s.range, s.text),
+        rect: rectOf(s.range),
+      });
+    }
+  }
+
+  // Drop the native selection once it's covered by a saved comment, so the
+  // browser's ::selection stops masking the (lower-priority) Custom Highlight.
+  // Matches on normalized text so collapsed rendered whitespace still compares
+  // equal to the comment's stored anchor_content.
+  function clearSelectionIfCommented() {
+    var s = currentSelection();
+    if (!s) return;
+    var selText = normWs(s.text).norm.trim();
+    if (!selText) return;
+    for (var i = 0; i < comments.length; i++) {
+      if (normWs(comments[i].anchor_content || "").norm.trim() === selText) {
+        var sel = window.getSelection();
+        if (sel) sel.removeAllRanges();
+        return;
+      }
+    }
   }
 
   function onMouseUp(e) {
     var s = currentSelection();
     if (s) {
-      send({ type: T.selection, text: s.text, rect: rectOf(s.range) });
+      send({
+        type: T.selection,
+        text: s.text,
+        occ: selectionOccurrence(s.range, s.text),
+        rect: rectOf(s.range),
+      });
       return;
     }
     // A plain click (collapsed selection) — did it land inside a comment range?
@@ -361,10 +543,24 @@ const BRIDGE_SCRIPT_BODY = `(function () {
         if (!m) return;
         if (m.type === T.setComments) {
           comments = Array.isArray(m.comments) ? m.comments : [];
+          // If a newly-arrived comment covers the still-active native selection
+          // (i.e. the user just saved a comment on it), drop that selection.
+          // The browser's ::selection paints over Custom Highlights, so the range
+          // would stay grey — masking the yellow highlight — until the user
+          // clicked elsewhere to collapse it. Keeping the selection during
+          // compose is intentional; we only clear once the comment exists.
+          clearSelectionIfCommented();
           repaint();
         } else if (m.type === T.setActive) {
-          activeAnchor = m.active && m.active.anchor_content ? m.active.anchor_content : null;
+          var next = m.active && m.active.anchor_content ? m.active : null;
+          var prevKey = active ? active.anchor_content + "#" + active.occ : null;
+          var nextKey = next ? next.anchor_content + "#" + next.occ : null;
+          active = next;
           repaint();
+          // Only scroll when a comment becomes newly active (e.g. clicked in the
+          // panel), so list refreshes that keep the same active comment don't
+          // yank the reader's scroll position.
+          if (nextKey && nextKey !== prevKey) scrollActiveIntoView();
         }
       };
       send({ type: T.ready });

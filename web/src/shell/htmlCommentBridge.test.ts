@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  anchorOccurrence,
   BRIDGE_MSG,
   BRIDGE_SOURCE,
   buildBridgeScript,
@@ -60,6 +61,12 @@ describe("injectCommentBridge", () => {
     expect(script).not.toContain("__OMNI_NONCE__");
     expect(script).not.toContain("__OMNI_TYPES__");
   });
+
+  it("produces a syntactically valid script (guards template-literal escaping)", () => {
+    // The script body is a template literal; regex/backslash content in it can
+    // silently break parsing. new Function throws on a syntax error.
+    expect(() => new Function(buildBridgeScript(NONCE))).not.toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -70,16 +77,36 @@ describe("parseBridgeMessage", () => {
   const NONCE = "n1";
   const base = { source: BRIDGE_SOURCE, nonce: NONCE };
 
-  it("accepts a well-formed selection message", () => {
+  it("accepts a well-formed selection message with its occurrence index", () => {
     const msg = parseBridgeMessage(
-      { ...base, type: BRIDGE_MSG.selection, text: "Design Goals", rect: { left: 1, top: 2, right: 3, bottom: 4 } },
+      {
+        ...base,
+        type: BRIDGE_MSG.selection,
+        text: "Design Goals",
+        occ: 2,
+        rect: { left: 1, top: 2, right: 3, bottom: 4 },
+      },
       NONCE,
     );
     expect(msg).toEqual({
       type: BRIDGE_MSG.selection,
       text: "Design Goals",
+      occ: 2,
       rect: { left: 1, top: 2, right: 3, bottom: 4 },
     });
+  });
+
+  it("defaults occ to 0 when a selection message omits it (older frame)", () => {
+    const msg = parseBridgeMessage(
+      {
+        ...base,
+        type: BRIDGE_MSG.selection,
+        text: "x",
+        rect: { left: 0, top: 0, right: 0, bottom: 0 },
+      },
+      NONCE,
+    );
+    expect(msg).toMatchObject({ type: BRIDGE_MSG.selection, occ: 0 });
   });
 
   it("round-trips anchor text containing quotes and newlines", () => {
@@ -92,10 +119,12 @@ describe("parseBridgeMessage", () => {
   });
 
   it("accepts commentClick, selectionCleared, and ready", () => {
-    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.commentClick, id: "c1" }, NONCE)).toEqual({
-      type: BRIDGE_MSG.commentClick,
-      id: "c1",
-    });
+    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.commentClick, id: "c1" }, NONCE)).toEqual(
+      {
+        type: BRIDGE_MSG.commentClick,
+        id: "c1",
+      },
+    );
     expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.selectionCleared }, NONCE)).toEqual({
       type: BRIDGE_MSG.selectionCleared,
     });
@@ -112,15 +141,22 @@ describe("parseBridgeMessage", () => {
 
   it("rejects a wrong source tag", () => {
     expect(
-      parseBridgeMessage({ source: "evil", nonce: NONCE, type: BRIDGE_MSG.selectionCleared }, NONCE),
+      parseBridgeMessage(
+        { source: "evil", nonce: NONCE, type: BRIDGE_MSG.selectionCleared },
+        NONCE,
+      ),
     ).toBeNull();
   });
 
   it("rejects an unknown type, a malformed selection, and non-objects", () => {
     expect(parseBridgeMessage({ ...base, type: "omni:bogus" }, NONCE)).toBeNull();
     // Empty text / missing rect must not produce a selection.
-    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.selection, text: "   " }, NONCE)).toBeNull();
-    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.selection, text: "x" }, NONCE)).toBeNull();
+    expect(
+      parseBridgeMessage({ ...base, type: BRIDGE_MSG.selection, text: "   " }, NONCE),
+    ).toBeNull();
+    expect(
+      parseBridgeMessage({ ...base, type: BRIDGE_MSG.selection, text: "x" }, NONCE),
+    ).toBeNull();
     expect(parseBridgeMessage("not-an-object", NONCE)).toBeNull();
     expect(parseBridgeMessage(null, NONCE)).toBeNull();
   });
@@ -157,9 +193,68 @@ describe("findAnchorInSource", () => {
     expect(findAnchorInSource("<p>hi</p>", "not present anywhere")).toBeNull();
   });
 
-  it("picks the first occurrence for repeated text", () => {
+  it("picks the first occurrence for repeated text by default", () => {
     const src = "alpha beta alpha";
     const res = findAnchorInSource(src, "alpha");
     expect(res).toEqual({ start_index: 0, end_index: 5 });
+  });
+
+  it("resolves the requested occurrence for repeated text", () => {
+    // "Aurora Sync" as a title, then again in body prose — selecting the body
+    // copy (occurrence 1) must anchor to the SECOND match, not the first.
+    const src = "<h1>Aurora Sync</h1><p>Aurora Sync keeps state.</p>";
+    const first = src.indexOf("Aurora Sync");
+    const second = src.indexOf("Aurora Sync", first + 1);
+    expect(findAnchorInSource(src, "Aurora Sync", 0)).toEqual({
+      start_index: first,
+      end_index: first + "Aurora Sync".length,
+    });
+    expect(findAnchorInSource(src, "Aurora Sync", 1)).toEqual({
+      start_index: second,
+      end_index: second + "Aurora Sync".length,
+    });
+  });
+
+  it("resolves a later occurrence even when an earlier one is whitespace-wrapped", () => {
+    const src = "<p>then\n   latency</p><p>then latency again</p>";
+    const second = src.indexOf("then latency again");
+    expect(findAnchorInSource(src, "then latency", 1)).toEqual({
+      start_index: second,
+      end_index: second + "then latency".length,
+    });
+  });
+
+  it("returns null when the requested occurrence doesn't exist", () => {
+    expect(findAnchorInSource("only once here", "once", 3)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// anchorOccurrence — which copy of repeated anchor text a comment refers to
+// ---------------------------------------------------------------------------
+
+describe("anchorOccurrence", () => {
+  // A title reused verbatim in the body — the exact case that highlighted both.
+  const src = "<h1>Aurora Sync</h1><p>Aurora Sync keeps state.</p>";
+  const first = src.indexOf("Aurora Sync");
+  const second = src.indexOf("Aurora Sync", first + 1);
+
+  it("returns 0 for the first occurrence (the title)", () => {
+    expect(anchorOccurrence(src, "Aurora Sync", first)).toBe(0);
+  });
+
+  it("returns 1 for the second occurrence (the body)", () => {
+    expect(anchorOccurrence(src, "Aurora Sync", second)).toBe(1);
+  });
+
+  it("counts whitespace-tolerantly so wrapped source occurrences still count", () => {
+    // First occurrence wraps across lines; the second is the target.
+    const wrapped = "<p>then\n   latency</p><p>then latency again</p>";
+    const target = wrapped.indexOf("then latency again");
+    expect(anchorOccurrence(wrapped, "then latency", target)).toBe(1);
+  });
+
+  it("returns 0 for empty anchor text", () => {
+    expect(anchorOccurrence(src, "   ", 0)).toBe(0);
   });
 });
