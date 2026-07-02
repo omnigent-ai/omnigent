@@ -3,7 +3,7 @@
   "displayName": "Omnigent",
   "description": "Open your running local Omnigent server inside VS Code, in an editor-beside iframe.",
   "version": "0.1.0",
-  "publisher": "omnigent-ai",
+  "publisher": "databricks",
   "license": "Apache-2.0",
   "icon": "media/omnigent-icon.png",
   "repository": {
