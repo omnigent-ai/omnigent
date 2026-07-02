@@ -68,9 +68,9 @@ vi.mock("@/hooks/useConversations", () => ({
     const rows = !enabled
       ? []
       : (override ??
-          conversationsRef.current.filter(
-            (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
-          ));
+        conversationsRef.current.filter(
+          (c) => (c.labels?.omni_project ?? null) === project && (c as any).archived !== true,
+        ));
     return {
       data: enabled
         ? {
