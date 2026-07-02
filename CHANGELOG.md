@@ -5,6 +5,11 @@ generated at release time from each PR's `## Changelog` section, tagged by the
 PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
 website under `/releases`.
 
+## [Unreleased]
+
+- [Runtime] Add `claude-sonnet-5` to the static Claude subscription catalog used
+  by `sys_list_models`.
+
 ## [v0.3.0] — 2026-06-26
 
 Highlights and full notes: <https://github.com/omnigent-ai/omnigent/releases/tag/v0.3.0>
