@@ -96,6 +96,91 @@ async def test_fire_omits_header_for_reserved_identity() -> None:
     assert "x-forwarded-email" not in captured["headers"]
 
 
+async def test_fire_sends_service_identity_when_configured() -> None:
+    # With the per-boot secret wired, a fire carries BOTH attribution forms:
+    # the identity header (header-auth) and the service identity (every mode).
+    app, captured = _capture_app(200)
+    fire = build_inprocess_fire(
+        app, identity_header="X-Forwarded-Email", service_secret="boot-secret"
+    )
+
+    await fire(_loop())
+
+    assert captured["headers"]["x-forwarded-email"] == "alice@example.com"
+    assert captured["headers"]["x-omnigent-service-token"] == "boot-secret"
+    assert captured["headers"]["x-omnigent-acting-user"] == "alice@example.com"
+
+
+async def test_fire_omits_service_identity_for_reserved_identity() -> None:
+    # The reserved "local" sentinel resolves via the absent-header fallback —
+    # neither the identity header nor the service identity is sent for it.
+    app, captured = _capture_app(200)
+    fire = build_inprocess_fire(
+        app,
+        identity_header="X-Forwarded-Email",
+        reserved_identities=frozenset({"local"}),
+        service_secret="boot-secret",
+    )
+
+    await fire(_loop(created_by_user_id="local"))
+
+    assert "x-omnigent-service-token" not in captured["headers"]
+    assert "x-omnigent-acting-user" not in captured["headers"]
+
+
+def _auth_enforcing_app() -> tuple[FastAPI, dict[str, Any]]:
+    """A capture app that REQUIRES authentication via the real ``get_user_id``
+    with a cookie/OIDC-style provider (identity headers ignored, no session →
+    None). Mirrors why fires used to 401 on such deployments."""
+    from omnigent.server.routes._auth_helpers import get_user_id
+
+    class _CookieModeProvider:
+        def get_user_id(self, request: Request) -> str | None:
+            del request
+            return None
+
+    app = FastAPI()
+    captured: dict[str, Any] = {}
+    provider = _CookieModeProvider()
+
+    @app.post("/v1/sessions/{session_id}/events")
+    async def events(session_id: str, request: Request) -> JSONResponse:
+        user = get_user_id(request, provider)  # type: ignore[arg-type]
+        if user is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        captured["session_id"] = session_id
+        captured["user"] = user
+        return JSONResponse({"queued": True}, status_code=200)
+
+    return app, captured
+
+
+async def test_fire_authenticates_on_cookie_mode_via_service_identity() -> None:
+    # End-to-end S1 proof: a cookie/OIDC-style app (ignores identity headers)
+    # accepts the fire as the loop's creator when the service secret is wired…
+    app, captured = _auth_enforcing_app()
+    app.state.service_identity_secret = "boot-secret"
+    fire = build_inprocess_fire(
+        app, identity_header="X-Forwarded-Email", service_secret="boot-secret"
+    )
+
+    fired = await fire(_loop())
+
+    assert fired == "conv_1"  # dispatched → last_fired_at/last_run_id stamp
+    assert captured["user"] == "alice@example.com"
+
+
+async def test_fire_without_service_secret_still_401s_on_cookie_mode() -> None:
+    # …and without it the fire is rejected (logged, returns None → no stamp).
+    app, captured = _auth_enforcing_app()
+    fire = build_inprocess_fire(app, identity_header="X-Forwarded-Email")
+
+    fired = await fire(_loop())
+
+    assert fired is None
+    assert captured == {}
+
+
 async def test_fire_is_a_noop_for_monitors_and_empty_prompts() -> None:
     app, captured = _capture_app(200)
     fire = build_inprocess_fire(app, identity_header="X-Forwarded-Email")

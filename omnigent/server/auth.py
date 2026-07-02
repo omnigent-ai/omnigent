@@ -47,6 +47,18 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
+# In-process service identity (#6): a same-process service — today the
+# scheduler's fire callback — authenticates a request it makes back into the
+# app by presenting the per-boot secret in ``SERVICE_TOKEN_HEADER`` plus the
+# user to act as in ``SERVICE_ACTING_USER_HEADER``. Verified centrally in
+# :func:`omnigent.server.routes._auth_helpers.get_user_id`, so it works on
+# every auth mode — cookie/OIDC deployments rightly ignore proxy identity
+# headers and would otherwise 401 a scheduled fire. The secret exists only in
+# process memory (``app.state.service_identity_secret``), is minted fresh each
+# boot, and is never persisted or logged.
+SERVICE_TOKEN_HEADER = "X-Omnigent-Service-Token"
+SERVICE_ACTING_USER_HEADER = "X-Omnigent-Acting-User"
+
 # Explicit single-user marker. Set by the managed local-server spawn
 # paths (`omnigent run` in chat.py, the daemon's
 # host/local_server.py) and by the canonical bare loopback

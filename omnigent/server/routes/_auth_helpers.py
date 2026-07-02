@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hmac
 
 from fastapi import Request
 
@@ -28,6 +29,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
+    SERVICE_ACTING_USER_HEADER,
+    SERVICE_TOKEN_HEADER,
     AuthProvider,
 )
 from omnigent.server.permissions import (
@@ -47,10 +50,26 @@ def get_user_id(
 ) -> str | None:
     """Extract user identity from the request.
 
+    Checked first: the in-process **service identity** (#6) — a same-process
+    caller (the scheduler's fire callback) presents the per-boot secret from
+    ``app.state.service_identity_secret`` plus the user it acts as. This is
+    how a scheduled fire authenticates on cookie/OIDC deployments, which
+    rightly ignore proxy identity headers and would otherwise 401 it. A
+    missing or wrong token simply falls through to the auth provider.
+
     :param request: The incoming FastAPI request.
     :param auth_provider: The auth provider, or ``None`` to skip auth.
     :returns: User ID string, or ``None`` if no auth provider.
     """
+    scope_app = request.scope.get("app")
+    secret = getattr(scope_app.state, "service_identity_secret", None) if scope_app else None
+    if secret:
+        token = request.headers.get(SERVICE_TOKEN_HEADER)
+        acting = request.headers.get(SERVICE_ACTING_USER_HEADER)
+        # Compare as bytes: comparing two str raises TypeError on a non-ASCII
+        # (malformed/hostile) header, which would 500 instead of falling through.
+        if token and acting and hmac.compare_digest(token.encode(), secret.encode()):
+            return acting
     if auth_provider is None:
         return None
     return auth_provider.get_user_id(request)

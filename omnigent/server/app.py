@@ -1238,6 +1238,15 @@ def create_app(
         scheduler_service: SchedulerService | None = None
         _schedule_store = get_schedule_store()
         if _schedule_store is not None:
+            import secrets as _secrets
+
+            # Per-boot in-process service identity: fires authenticate as the
+            # loop's creator on EVERY auth mode (cookie/OIDC ignore identity
+            # headers) by presenting this secret + an acting-user header,
+            # verified centrally in get_user_id. Memory-only — scheduler and
+            # server share this process, so nothing is persisted or logged.
+            service_secret = _secrets.token_urlsafe(32)
+            app_inst.state.service_identity_secret = service_secret
             scheduler_service = SchedulerService(
                 _schedule_store,
                 build_inprocess_fire(
@@ -1251,6 +1260,7 @@ def create_app(
                     agent_store=get_agent_store(),
                     tunnel_registry=tunnel_registry,
                     permission_store=permission_store,
+                    service_secret=service_secret,
                 ),
             )
             await scheduler_service.start()

@@ -13,13 +13,15 @@ evaluation, runner-relay readiness, file resolution, and the runner forward.
 Zero duplication of that fragile preamble (``post_event`` is ~1k lines), and
 the scheduler stays correct as that path evolves.
 
-A fired turn is attributed to the schedule's creator by setting the trusted
-identity header (header-auth deployments; the default for a loopback server).
-On cookie/OIDC deployments the header is ignored and an authenticated service
-identity would be needed — see :func:`build_inprocess_fire` for the documented
-limitation. When no runner is bound to the session the endpoint returns
-``RUNNER_UNAVAILABLE``; that is expected (the user closed the session / the host
-went offline) and is logged, not raised, so the cron loop endures.
+A fired turn is attributed to the schedule's creator two ways at once: the
+trusted identity header (honored by header-auth deployments; the default for a
+loopback server) and the in-process **service identity** — the per-boot secret
+minted at server startup plus an acting-user header, verified centrally in
+``get_user_id``. The latter is what makes fires work on cookie/OIDC
+deployments, which rightly ignore proxy identity headers. When no runner is
+bound to the session the endpoint returns ``RUNNER_UNAVAILABLE``; that is
+expected (the user closed the session / the host went offline) and is logged,
+not raised, so the cron loop endures.
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ def build_inprocess_fire(
     agent_store: Any = None,
     tunnel_registry: Any = None,
     permission_store: Any = None,
+    service_secret: str | None = None,
 ) -> Callable[[Schedule], Awaitable[str | None]]:
     """Build a scheduler ``fire`` callback that injects the loop's prompt.
 
@@ -60,10 +63,11 @@ def build_inprocess_fire(
     path as a human message.
 
     Attribution: when ``schedule.created_by_user_id`` is set, the request
-    carries it in ``identity_header`` so header-auth deployments run the turn
-    as that user. Cookie/OIDC deployments ignore the header — a scheduled turn
-    there would need a minted service token (a documented follow-up); until
-    then such a fire surfaces as an auth failure and is logged, not raised.
+    carries it in ``identity_header`` (honored by header-auth deployments) and
+    — when ``service_secret`` is wired — as the in-process service identity
+    (secret + acting-user headers, accepted by ``get_user_id`` on every auth
+    mode). The latter is what lets a fire authenticate on cookie/OIDC
+    deployments, which ignore proxy identity headers.
 
     :param app: The ASGI application to dispatch into (the FastAPI server
         instance). Captured once; the transport is reused across fires.
@@ -71,16 +75,22 @@ def build_inprocess_fire(
         turn with, e.g. ``"X-Forwarded-Email"`` (see
         :func:`omnigent.server.auth.resolve_auth_header`).
     :param reserved_identities: Creator ids that must NOT be sent as an
-        explicit identity header — chiefly the reserved single-user ``"local"``
+        explicit identity — chiefly the reserved single-user ``"local"``
         sentinel, which header-auth accepts only as the *absent-header*
-        fallback and 401s when presented explicitly. For such a creator the
-        header is omitted, so identity resolves via that same local fallback.
+        fallback and 401s when presented explicitly. For such a creator both
+        attribution headers are omitted, so identity resolves via that same
+        local fallback.
     :param timeout_s: Per-fire request timeout. A turn may take a while to
         accept (host relaunch); kept generous but bounded so a wedged dispatch
         can't pin the loop forever.
+    :param service_secret: The per-boot in-process service secret (also set on
+        ``app.state.service_identity_secret``), or ``None`` to send only the
+        identity header. Memory-only; never persisted or logged.
     :returns: An awaitable ``fire(schedule)`` suitable for
         :class:`~omnigent.runtime.scheduler.SchedulerService`.
     """
+    # Lazy import (like LEVEL_OWNER below) to keep runtime← →server imports acyclic.
+    from omnigent.server.auth import SERVICE_ACTING_USER_HEADER, SERVICE_TOKEN_HEADER
 
     async def _spawn_conversation(schedule: Schedule) -> str | None:
         """Create a fresh conversation for a GLOBAL loop's agent + bind a runner.
@@ -175,7 +185,13 @@ def build_inprocess_fire(
         headers: dict[str, str] = {}
         creator = schedule.created_by_user_id
         if creator and creator not in reserved_identities:
+            # Header-auth deployments honor the trusted identity header…
             headers[identity_header] = creator
+            # …and every auth mode (cookie/OIDC included) honors the in-process
+            # service identity: per-boot secret + the user this fire acts as.
+            if service_secret is not None:
+                headers[SERVICE_TOKEN_HEADER] = service_secret
+                headers[SERVICE_ACTING_USER_HEADER] = creator
         body = {
             "type": "message",
             "data": {
