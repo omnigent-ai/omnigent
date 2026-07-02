@@ -4225,6 +4225,18 @@
       "SessionResponse": {
         "description": "API representation of a session.\n\nReturned by `POST /v1/sessions`, `GET /v1/sessions/{id}`,\nand `PATCH /v1/sessions/{id}`.",
         "properties": {
+          "active_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Response id of the turn currently in flight, or `None` when the session is idle. Sourced from the server's `_session_active_response_cache` at snapshot build time so a client connecting mid-turn can reopen a streaming `activeResponse` \u2014 the SSE stream is snapshot + live tail with no replay, so the turn-start `running` edge that carried this id is not re-sent on reconnect. Today only native-terminal forwarders (claude-native) stamp a turn id on their status edges; other harnesses leave this `None`.",
+            "title": "Active Response Id"
+          },
           "agent_id": {
             "description": "Durable identifier of the bound agent, e.g. `\"ag_abc123\"`. Stable across renames of the agent.",
             "title": "Agent Id",
