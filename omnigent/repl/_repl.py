@@ -3924,6 +3924,11 @@ async def run_repl(
         # contain more path separators — don't treat those as commands.
         first_token = text.split()[0] if text.split() else ""
         if first_token.startswith("/") and "/" not in first_token[1:]:
+            # Starting a new conversation orphans any buffered "!" output — it
+            # belonged to the prior conversation. Drop it so it can't leak into
+            # the fresh conversation's first turn.
+            if first_token in ("/clear", "/new"):
+                _pending_bang_blocks.clear()
             await handle_slash_command(text, session, client, host, fmt)
             return
 
@@ -8397,21 +8402,30 @@ def _clip_text(text: str, limit: int) -> str:
 
 
 def _write_bang_overflow(cmd: str, stdout: str, stderr: str) -> str | None:
-    """When combined output exceeds the model cap, spill the FULL (ANSI-stripped)
+    """
+    When combined output exceeds the model cap, spill the FULL (ANSI-stripped)
     capture to a temp file and return its path; else ``None``. Lets the agent
-    read everything instead of losing the truncated remainder."""
+    read everything instead of losing the truncated remainder.
+
+    The overflow is measured on the ANSI-stripped text — the same form the
+    context builder caps — so heavily-styled output doesn't trip the spill when
+    the text the model sees would fit. The file is intentionally left in place
+    for the agent to read on a later turn; the OS temp dir reclaims it.
+    """
     from rich.text import Text as _RText
 
-    if len(stdout) + len(stderr) <= _BANG_CONTEXT_MAX:
+    plain_out = _RText.from_ansi(stdout).plain if stdout else ""
+    plain_err = _RText.from_ansi(stderr).plain if stderr else ""
+    if len(plain_out) + len(plain_err) <= _BANG_CONTEXT_MAX:
         return None
     fd, path = tempfile.mkstemp(prefix="omnigent-bang-", suffix=".log")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(f"$ {cmd}\n\n")
-        if stdout:
-            fh.write(_RText.from_ansi(stdout).plain)
-        if stderr:
+        if plain_out:
+            fh.write(plain_out)
+        if plain_err:
             fh.write("\n--- stderr ---\n")
-            fh.write(_RText.from_ansi(stderr).plain)
+            fh.write(plain_err)
     return path
 
 

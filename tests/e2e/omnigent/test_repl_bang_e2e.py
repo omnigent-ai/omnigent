@@ -185,3 +185,64 @@ def test_repl_bang_bare_shows_hint_and_double_bang_escapes(
     assert "exit 0" not in turn.stripped, (
         "'!!' prompt rendered a shell exit footer — it was executed, not escaped"
     )
+
+
+def test_repl_bang_buffer_dropped_on_new_conversation(
+    omnigent_python: Path,
+    omnigent_repo_root: Path,
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """
+    Buffered ``!`` output is discarded when a new conversation starts (``/clear``)
+    — it belonged to the prior conversation and must not leak into the fresh
+    conversation's first turn.
+    """
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": "Ok."}])
+    yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
+
+    child = spawn_omnigent_run(
+        omnigent_python=omnigent_python,
+        yaml_path=yaml_path,
+        model=_MODEL,
+        harness=_HARNESS,
+        env=mock_credentials_env,
+        cwd=omnigent_repo_root,
+        timeout=_SPAWN_TIMEOUT,
+    )
+    try:
+        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
+
+        submit_prompt(child, "!echo LEAK_SENTINEL_QQQ")
+        child.expect(r"exit 0", timeout=_BANG_TIMEOUT)
+
+        # /clear starts a new conversation — it must drop the buffered output.
+        # Re-sync on the freshly re-rendered prompt before sending the next
+        # line, otherwise it races the /clear redraw and never submits.
+        submit_prompt(child, "/clear")
+        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
+        drain_for(child, 1.5)
+
+        submit_prompt(child, "hello fresh conversation")
+        await_turn_complete(
+            child,
+            running_timeout=_RUNNING_TIMEOUT,
+            completion_timeout=_COMPLETION_TIMEOUT,
+            running_marker=_RUNNING_MARKER,
+            completion_pattern=_COMPLETION_MARKER,
+        )
+        clean_exit(child, timeout=_EXIT_TIMEOUT)
+    finally:
+        if not child.closed:
+            child.close(force=True)
+
+    requests = _captured_requests(mock_llm_server_url)
+    assert requests, "the post-/clear prompt never reached the model"
+    blob = json.dumps(requests)
+    assert "LEAK_SENTINEL_QQQ" not in blob, (
+        "buffered bang output leaked into the new conversation after /clear:\n" + blob[-2000:]
+    )
+    assert "hello fresh conversation" in blob, (
+        "the post-/clear prompt is missing from the model request"
+    )
