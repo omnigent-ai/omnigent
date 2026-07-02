@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import secrets
 import sys
@@ -100,13 +101,20 @@ def _env_float(name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
+        value = math.nan
+    # Reject non-finite too: ``float("inf"/"nan")`` parses without ValueError,
+    # but an ``inf`` floor would classify every sever as a held poll (disabling
+    # flap detection) and ``nan`` makes every ``held_s < floor`` comparison
+    # False — both silent footguns, so treat them as malformed.
+    if not math.isfinite(value):
         print(
-            f"omnigent hook: ignoring non-numeric {name}={raw!r}; using {default}",
+            f"omnigent hook: ignoring non-finite {name}={raw!r}; using {default}",
             file=sys.stderr,
         )
         return default
+    return value
 
 
 # Cap on CONSECUTIVE HARD failures before the reattach loop gives up and lets

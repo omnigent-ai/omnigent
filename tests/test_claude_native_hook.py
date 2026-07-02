@@ -2304,14 +2304,19 @@ def test_held_poll_floor_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> 
         monkeypatch.delenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", raising=False)
         importlib.reload(claude_native_hook)
 
-    # A malformed override must not crash the hook — falls back to the default.
-    monkeypatch.setenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", "not-a-number")
-    reloaded = importlib.reload(claude_native_hook)
-    try:
-        assert reloaded._PERMISSION_HELD_POLL_FLOOR_S == 10.0
-    finally:
-        monkeypatch.delenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", raising=False)
-        importlib.reload(claude_native_hook)
+    # Malformed / non-finite overrides must not crash the hook or silently
+    # disable flap detection — each falls back to the 10s default. "inf" would
+    # make every sever a held poll; "nan" makes held_s < floor always False.
+    for bad in ("not-a-number", "inf", "nan", "-inf"):
+        monkeypatch.setenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", bad)
+        reloaded = importlib.reload(claude_native_hook)
+        try:
+            assert reloaded._PERMISSION_HELD_POLL_FLOOR_S == 10.0, (
+                f"bad floor {bad!r} not rejected"
+            )
+        finally:
+            monkeypatch.delenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", raising=False)
+            importlib.reload(claude_native_hook)
 
 
 def test_reattach_never_resolving_severs_are_bounded_by_deadline(
