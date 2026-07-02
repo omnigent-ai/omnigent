@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +50,9 @@ _DISCOVER_SKEW_MS = 10_000
 #: Supervisor backoff bounds.
 _BACKOFF_INITIAL_S = 1.0
 _BACKOFF_MAX_S = 30.0
+#: A run at least this long is "healthy": the next crash restarts the backoff
+#: ladder instead of continuing it (matches qwen/goose supervisors).
+_SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 
 
 @dataclass
@@ -221,7 +225,9 @@ def _read_new_items(wire_path: Path, last_line: int) -> list[_MirrorItem]:
     """
     try:
         lines = wire_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # A poll can race kimi's buffered write mid multi-byte character;
+        # the torn tail is complete by the next poll, so retry then.
         return []
     items: list[_MirrorItem] = []
     for idx in range(last_line, len(lines)):
@@ -320,6 +326,16 @@ async def forward_kimi_wire_to_session(
             await asyncio.sleep(_POLL_INTERVAL_S)
 
 
+def _supervisor_monotonic() -> float:
+    """Indirection so tests can stub the supervisor's clock."""
+    return time.monotonic()
+
+
+async def _supervisor_sleep(seconds: float) -> None:
+    """Indirection so tests can stub the supervisor's backoff sleep."""
+    await asyncio.sleep(seconds)
+
+
 async def supervise_kimi_forwarder(
     *,
     base_url: str,
@@ -339,6 +355,7 @@ async def supervise_kimi_forwarder(
     """
     backoff = _BACKOFF_INITIAL_S
     while True:
+        run_started_at = _supervisor_monotonic()
         try:
             await forward_kimi_wire_to_session(
                 base_url=base_url,
@@ -354,7 +371,11 @@ async def supervise_kimi_forwarder(
             raise
         except Exception:
             _logger.exception("kimi forwarder crashed for session %s; restarting", session_id)
-            await asyncio.sleep(backoff)
+            if _supervisor_monotonic() - run_started_at >= _SUPERVISOR_HEALTHY_UPTIME_S:
+                # A crash after a healthy run is a fresh incident, not part
+                # of a crash loop — start the backoff ladder over.
+                backoff = _BACKOFF_INITIAL_S
+            await _supervisor_sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX_S)
         else:
             return

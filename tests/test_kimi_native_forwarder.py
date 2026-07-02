@@ -8,9 +8,13 @@ by the e2e gate, not here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
+from omnigent import kimi_native_forwarder as knf
 from omnigent.kimi_native_forwarder import (
     _discover_wire,
     _ForwardState,
@@ -114,6 +118,76 @@ class TestReadNewItems:
 
     def test_missing_file_is_empty(self, tmp_path: Path) -> None:
         assert _read_new_items(tmp_path / "nope.jsonl", 0) == []
+
+    def test_torn_utf8_tail_is_tolerated(self, tmp_path: Path) -> None:
+        wire = tmp_path / "wire.jsonl"
+        # A complete line plus the first two bytes of U+4E2D "中" — what a
+        # poll that races kimi's buffered write mid-character observes.
+        wire.write_bytes(b'{"type":"metadata"}\n\xe4\xb8')
+        assert _read_new_items(wire, 0) == []
+
+    def test_torn_tail_is_delivered_once_completed(self, tmp_path: Path) -> None:
+        wire = tmp_path / "wire.jsonl"
+        row = json.dumps(
+            {
+                "type": "context.append_loop_event",
+                "event": {
+                    "type": "content.part",
+                    "uuid": "u9",
+                    "part": {"type": "text", "text": "中文"},
+                },
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        torn_at = row.index("文".encode()) + 2  # two of 文's three bytes
+        wire.write_bytes(row[:torn_at])
+        assert _read_new_items(wire, 0) == []
+        wire.write_bytes(row + b"\n")
+        items = _read_new_items(wire, 0)
+        assert [(i.role, i.text) for i in items] == [("assistant", "中文")]
+
+
+class TestSuperviseBackoff:
+    async def test_backoff_resets_after_healthy_uptime(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        crashes = iter(
+            [
+                RuntimeError("boom"),
+                RuntimeError("boom"),
+                RuntimeError("boom"),
+                asyncio.CancelledError(),
+            ]
+        )
+        # The supervisor reads the clock twice per run (start, at crash):
+        # runs 1-2 crash after 1s of uptime, run 3 after a healthy 100s.
+        clock = iter([0.0, 1.0, 10.0, 11.0, 100.0, 200.0, 300.0])
+        sleeps: list[float] = []
+
+        async def _fake_forward(**_kw: object) -> None:
+            raise next(crashes)
+
+        async def _fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(knf, "forward_kimi_wire_to_session", _fake_forward)
+        monkeypatch.setattr(knf, "_supervisor_sleep", _fake_sleep)
+        monkeypatch.setattr(knf, "_supervisor_monotonic", lambda: next(clock))
+
+        with pytest.raises(asyncio.CancelledError):
+            await knf.supervise_kimi_forwarder(
+                base_url="http://test",
+                headers={},
+                session_id="conv",
+                bridge_dir=tmp_path,
+                kimi_home=tmp_path,
+                workspace=str(tmp_path),
+                launch_epoch_ms=0,
+            )
+
+        # Two quick crashes climb the ladder (1s, 2s); the crash after a
+        # healthy run restarts it at 1s instead of continuing to 4s.
+        assert sleeps == [1.0, 2.0, 1.0]
 
 
 class TestState:
