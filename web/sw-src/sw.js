@@ -50,3 +50,56 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
   }
 });
+
+// ── Web Push (#8) ────────────────────────────────────────────────────────────
+// The push handler renders the notification the server encrypted for this
+// client; notificationclick focuses an existing tab (or opens one) and routes
+// to the conversation the notification points at. Display + routing only — no
+// caching and no lifecycle calls, so the update-prompt semantics above (wait
+// for the user's Reload, no skipWaiting/claim on install) are untouched.
+self.addEventListener("push", (event) => {
+  let data = {};
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch {
+    data = { body: event.data ? event.data.text() : "" };
+  }
+  const title = data.title || "Omnigent";
+  const options = {
+    body: data.body || "",
+    tag: data.tag,
+    data: { navigatePath: data.navigatePath || "/" },
+    icon: "/favicon.svg",
+    badge: "/favicon.svg",
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const path = (event.notification.data && event.notification.data.navigatePath) || "/";
+  event.waitUntil(
+    (async () => {
+      const clientList = await self.clients.matchAll({
+        type: "window",
+        includeUncontrolled: true,
+      });
+      for (const client of clientList) {
+        if ("focus" in client) {
+          await client.focus();
+          if ("navigate" in client) {
+            try {
+              await client.navigate(path);
+            } catch {
+              // Cross-origin / detached client — focusing is enough.
+            }
+          }
+          return;
+        }
+      }
+      if (self.clients.openWindow) {
+        await self.clients.openWindow(path);
+      }
+    })(),
+  );
+});
