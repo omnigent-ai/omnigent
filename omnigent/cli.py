@@ -3007,6 +3007,7 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.work_item_store.sqlalchemy_store import SqlAlchemyWorkItemStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
@@ -3014,6 +3015,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    work_item_store = SqlAlchemyWorkItemStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3066,6 +3068,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        work_item_store=work_item_store,
         caps=caps,
     )
 
@@ -3150,6 +3153,8 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.routes.work_items import create_work_items_router
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3167,6 +3172,15 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        # Tasks/Work-Items REST API (#3). Mounted via the generic
+        # extra_routers seam so create_app's signature stays untouched.
+        extra_routers=[
+            (
+                create_work_items_router(work_item_store, auth_provider, permission_store),
+                "/v1",
+                ["work-items"],
+            ),
+        ],
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")

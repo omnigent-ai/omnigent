@@ -304,6 +304,17 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
+# Work-item (#3), schedule/loop (#6), and canvas (#2) builtins (#12). Like the
+# comment tools, the runner has no in-process store for these, so they proxy to
+# the server's REST API over server_client (see _execute_work_management_tool).
+_WORK_MANAGEMENT_TOOLS = frozenset(
+    {
+        "create_work_item",
+        "list_work_items",
+        "update_work_item",
+    }
+)
+
 # Builtin tools the claude-native / codex-native relay advertises to the
 # real CLI, beyond the always-relayed ``sys_os_*`` family. Native harnesses
 # ignore the harness ``tools`` list, so the relay is their ONLY tool
@@ -331,6 +342,11 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    # Work-item (#3) builtins (#12): native harnesses ignore the harness
+    # ``tools`` list, so they must be advertised through the relay too, or a
+    # native Claude/Codex agent can't create or track work. They dispatch via
+    # the same runner→server REST proxy as the non-native path.
+    | _WORK_MANAGEMENT_TOOLS
 )
 
 
@@ -467,6 +483,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _WORK_MANAGEMENT_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -2559,6 +2576,92 @@ async def _execute_comment_tool(
         return json.dumps({"error": f"update_comment failed: {exc}"})
 
 
+async def _execute_work_management_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Runner-local handler for the work-item builtins (#3, #12).
+
+    The runner has no in-process WorkItem store, so — like the comment tools —
+    these proxy to the Omnigent server's REST API over ``server_client``:
+    ``/v1/work-items`` (POST/GET/PATCH).
+
+    :param tool_name: One of :data:`_WORK_MANAGEMENT_TOOLS`.
+    :param arguments: JSON-encoded args from the LLM.
+    :param conversation_id: Current session id, used as the default scope.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: A JSON result/error string for the agent.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    def _result(resp: httpx.Response) -> str:
+        if resp.status_code >= 400:
+            return json.dumps(
+                {"error": f"{tool_name} returned HTTP {resp.status_code}: {resp.text[:300]}"}
+            )
+        return json.dumps(resp.json())
+
+    try:
+        if tool_name == "create_work_item":
+            body = {
+                k: args[k]
+                for k in (
+                    "title",
+                    "source",
+                    "body",
+                    "dedup_key",
+                    "external_id",
+                    "status",
+                    "plan",
+                    "conversation_id",
+                )
+                if args.get(k) is not None
+            }
+            # Default the item to the current session so an agent-created work
+            # item links back to where it came from (overridable via args).
+            if conversation_id and body.get("conversation_id") is None:
+                body["conversation_id"] = conversation_id
+            return _result(await server_client.post("/v1/work-items", json=body, timeout=30.0))
+
+        if tool_name == "list_work_items":
+            params: dict[str, Any] = {
+                k: args[k]
+                for k in ("status", "conversation_id", "limit")
+                if args.get(k) is not None
+            }
+            return _result(await server_client.get("/v1/work-items", params=params, timeout=30.0))
+
+        if tool_name == "update_work_item":
+            work_item_id = args.get("work_item_id")
+            if not work_item_id:
+                return json.dumps({"error": "missing required argument: work_item_id"})
+            body = {
+                k: args[k]
+                for k in ("title", "body", "status", "pr_url", "conversation_id", "plan")
+                if args.get(k) is not None
+            }
+            if args.get("needs_review") is True:
+                body["status"] = "needs_review"
+            return _result(
+                await server_client.patch(
+                    f"/v1/work-items/{work_item_id}", json=body, timeout=30.0
+                )
+            )
+
+        return json.dumps({"error": f"unknown work-management tool: {tool_name}"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -4157,6 +4260,13 @@ async def execute_tool(
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
+                tool_name,
+                arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+            )
+        elif tool_name in _WORK_MANAGEMENT_TOOLS:
+            output = await _execute_work_management_tool(
                 tool_name,
                 arguments,
                 conversation_id=conversation_id,

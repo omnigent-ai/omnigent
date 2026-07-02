@@ -70,6 +70,12 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Work-item (#3) builtins are always auto-registered (#12) so agents +
+        # the Omnigent MCP can create and track work items without the spec
+        # opting in.
+        "create_work_item",
+        "list_work_items",
+        "update_work_item",
     }
 )
 
