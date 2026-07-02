@@ -29,7 +29,6 @@ from omnigent.spec.parser import (
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     FunctionPolicySpec,
-    PolicyAction,
 )
 
 
@@ -293,41 +292,6 @@ policies:
       arguments: [1, 2]
 """)
         )
-
-
-def test_parse_function_policy_optional_action_list() -> None:
-    """`action: [allow, deny]` declares the whitelist."""
-    spec = _parse_guardrails(
-        _yaml("""
-policies:
-  p:
-    type: function
-    on: [tool_call]
-    function: myorg.p.check
-    action: [allow, deny]
-""")
-    )
-    assert spec is not None and spec.policies is not None
-    p = spec.policies[0]
-    assert isinstance(p, FunctionPolicySpec)
-    assert p.action == [PolicyAction.ALLOW, PolicyAction.DENY]
-
-
-def test_parse_function_policy_action_omitted_is_none() -> None:
-    """No `action:` → `None` (accept any action)."""
-    spec = _parse_guardrails(
-        _yaml("""
-policies:
-  p:
-    type: function
-    on: [request]
-    function: myorg.p.check
-""")
-    )
-    assert spec is not None and spec.policies is not None
-    p = spec.policies[0]
-    assert isinstance(p, FunctionPolicySpec)
-    assert p.action is None
 
 
 def test_parse_policies_preserve_yaml_order() -> None:

@@ -1319,11 +1319,6 @@ class FunctionPolicySpec(PolicySpec):
 
     :param function: Where the callable lives + optional
         factory kwargs.
-    :param action: Allowed actions the callable may return.
-        Returns outside this list → fail-closed DENY (or
-        substituted ALLOW when the list contains no DENY, per
-        the classifier-only carve-out in §13). ``None`` means
-        accept any action.
     :param set_labels: Whitelist of label keys the callable
         may write. Keys outside dropped silently. ``None``
         means no writes declared (any key the callable emits
@@ -1339,7 +1334,6 @@ class FunctionPolicySpec(PolicySpec):
     """
 
     function: FunctionRef | None = None
-    action: list[PolicyAction] | None = None
     set_labels: list[str] | None = None
     config: dict[str, str] | None = None
 
