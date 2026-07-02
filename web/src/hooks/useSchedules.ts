@@ -1,8 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   deleteSchedule,
+  listAllSchedules,
+  listOnlineRunners,
   listSchedules,
   updateSchedule,
+  type OnlineRunner,
   type Schedule,
   type UpdateSchedulePatch,
 } from "@/lib/schedulesApi";
@@ -15,6 +18,26 @@ export function useSchedules(conversationId: string | undefined) {
     queryKey: [...KEY, conversationId ?? null],
     queryFn: () => listSchedules(conversationId as string),
     enabled: !!conversationId,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
+  });
+}
+
+/** List ALL schedules across the workspace (the global Schedules page). */
+export function useAllSchedules() {
+  return useQuery<Schedule[]>({
+    queryKey: [...KEY, "all"],
+    queryFn: () => listAllSchedules(),
+    staleTime: 5_000,
+    refetchInterval: 15_000,
+  });
+}
+
+/** Poll currently-online runners — drives the "no runner → loops paused" hint. */
+export function useOnlineRunners() {
+  return useQuery<OnlineRunner[]>({
+    queryKey: ["online-runners"],
+    queryFn: () => listOnlineRunners(),
     staleTime: 5_000,
     refetchInterval: 15_000,
   });

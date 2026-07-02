@@ -55,13 +55,18 @@ class _FakeStore:
         self.updated.set()
 
 
-def _fire_recorder() -> tuple[Callable[[Schedule], Awaitable[None]], list[str], asyncio.Event]:
+def _fire_recorder() -> tuple[
+    Callable[[Schedule], Awaitable[str | None]], list[str], asyncio.Event
+]:
     fired = asyncio.Event()
     calls: list[str] = []
 
-    async def fire(s: Schedule) -> None:
+    async def fire(s: Schedule) -> str | None:
         calls.append(s.id)
         fired.set()
+        # Return the dispatched conversation id — the scheduler stamps
+        # last_fired_at / last_run_id only when a fire actually dispatched.
+        return f"run_{s.id}"
 
     return fire, calls, fired
 
@@ -100,6 +105,31 @@ async def test_fires_loop_and_records_last_fired() -> None:
     assert calls == ["s1"]
     assert store.updates[0][0] == "s1"
     assert store.updates[0][1]["last_fired_at"] == int(_FIXED.timestamp())
+    # The dispatched conversation is recorded so the UI can link the run.
+    assert store.updates[0][1]["last_run_id"] == "run_s1"
+
+
+async def test_soft_skip_does_not_stamp_last_fired() -> None:
+    # A fire that dispatched nothing (no runner / auth failure / no-op) returns
+    # None — the scheduler must NOT stamp last_fired_at, so a broken deployment
+    # never looks like it "fired".
+    store = _FakeStore([_schedule("s1", cron="* * * * *")])
+    fired = asyncio.Event()
+
+    async def fire(s: Schedule) -> str | None:
+        fired.set()
+        return None
+
+    svc = SchedulerService(store, fire, now=lambda: _FIXED, sleep=_fire_once_then_park())
+    await svc.start()
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=2)
+        # Give the loop a beat to (not) write, then assert nothing was stamped.
+        await asyncio.sleep(0.02)
+    finally:
+        await svc.stop()
+
+    assert store.updates == []
 
 
 async def test_skips_monitors_and_cronless_loops() -> None:

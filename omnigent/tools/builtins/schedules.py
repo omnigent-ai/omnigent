@@ -39,6 +39,7 @@ def _schedule_dict(s: Schedule) -> dict[str, Any]:
     return {
         "id": s.id,
         "conversation_id": s.conversation_id,
+        "agent_name": s.agent_name,
         "name": s.name,
         "kind": s.kind,
         "prompt": s.prompt,
@@ -99,9 +100,10 @@ class CreateLoopTool(Tool):
             "or reports — each time it fires, the prompt runs as a fresh turn in "
             "the conversation and the agent sees the full output. Prefer this "
             "over ad-hoc shell loops (e.g. 'while true; do …; sleep'), which "
-            "block the session and leave no tracked run. Fires in this "
-            "conversation unless conversation_id is given; names are unique per "
-            "conversation."
+            "block the session and leave no tracked run. By default it fires in "
+            "this conversation; pass 'agent' (a registered agent name) to make "
+            "it a GLOBAL loop that spawns a FRESH run with that agent each fire "
+            "instead. Names are unique per conversation."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -125,7 +127,14 @@ class CreateLoopTool(Tool):
                         },
                         "conversation_id": {
                             "type": "string",
-                            "description": "Target conversation (defaults to the current one).",
+                            "description": "Target conversation (defaults to the current one). "
+                            "Omit and set 'agent' for a global loop.",
+                        },
+                        "agent": {
+                            "type": "string",
+                            "description": "Registered agent name. When set, the loop is GLOBAL: "
+                            "each fire spawns a fresh run with this agent, not tied to a "
+                            "conversation.",
                         },
                     },
                     "required": ["name", "prompt", "cron"],
@@ -147,13 +156,37 @@ class CreateLoopTool(Tool):
         if not all(isinstance(v, str) and v.strip() for v in (name, prompt, cron)):
             return json.dumps({"error": "name, prompt, and cron are required"})
 
+        store, err = _store_or_error()
+        if err is not None:
+            return err
+
+        # This in-process path has no acting-user identity (ToolContext carries
+        # none), so it can't OWN a spawned run — and a global loop's run must be
+        # owned to be visible. Global loops are therefore created via the
+        # authenticated API/relay path (the runner proxies create_loop with an
+        # 'agent' to POST /v1/schedules, which captures the user). Here we
+        # support conversation-scoped loops only.
+        agent = args.get("agent")
+        if isinstance(agent, str) and agent.strip():
+            return json.dumps(
+                {
+                    "error": "global loops (with 'agent') must be created via the API; "
+                    "this path supports conversation-scoped loops only"
+                }
+            )
         conversation_id = _resolve_conversation_id(args, ctx)
         if not conversation_id:
             return json.dumps({"error": "create_loop requires a conversation context"})
 
-        store, err = _store_or_error()
-        if err is not None:
-            return err
+        # Validate the cron up front so a typo doesn't silently disarm at fire time.
+        from datetime import datetime, timezone
+
+        from omnigent.runtime.cron import next_cron_time
+
+        try:
+            next_cron_time(cron, datetime.now(timezone.utc))
+        except ValueError as exc:
+            return json.dumps({"error": f"invalid cron expression: {exc}"})
 
         from omnigent.db.utils import generate_schedule_id
 

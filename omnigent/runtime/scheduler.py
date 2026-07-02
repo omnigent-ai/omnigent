@@ -134,12 +134,18 @@ class SchedulerService:
         while True:
             await self._sleep(delay)
             try:
-                await self._fire(schedule)
-                await asyncio.to_thread(
-                    self._store.update,
-                    schedule.id,
-                    last_fired_at=int(self._now().timestamp()),
-                )
+                fired_conv = await self._fire(schedule)
+                # Stamp last_fired_at ONLY when a run actually dispatched (fire
+                # returns the conversation id); a soft-skip / auth failure / no
+                # runner returns None, so a broken deployment doesn't look
+                # "fired". Record the run's conversation so the UI can link it.
+                if fired_conv is not None:
+                    await asyncio.to_thread(
+                        self._store.update,
+                        schedule.id,
+                        last_fired_at=int(self._now().timestamp()),
+                        last_run_id=fired_conv,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:

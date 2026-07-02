@@ -1219,7 +1219,11 @@ def create_app(
         # event loop so it dispatches into the very request path it shares.
         # Held on app.state so the schedules router can refresh() it after CRUD
         # and the finally block can stop it cleanly.
-        from omnigent.runtime import get_schedule_store
+        from omnigent.runtime import (
+            get_agent_store,
+            get_conversation_store,
+            get_schedule_store,
+        )
         from omnigent.runtime.schedule_dispatch import build_inprocess_fire
         from omnigent.runtime.scheduler import SchedulerService
         from omnigent.server.auth import RESERVED_USER_LOCAL, resolve_auth_header
@@ -1233,6 +1237,13 @@ def create_app(
                     app_inst,
                     identity_header=resolve_auth_header(),
                     reserved_identities=frozenset({RESERVED_USER_LOCAL}),
+                    # Global loops spawn a fresh session for a registered agent
+                    # on each fire (bind an online runner from the tunnel
+                    # registry) and grant the creator ownership so the run shows.
+                    conversation_store=get_conversation_store(),
+                    agent_store=get_agent_store(),
+                    tunnel_registry=tunnel_registry,
+                    permission_store=permission_store,
                 ),
             )
             await scheduler_service.start()

@@ -2608,15 +2608,19 @@ async def _execute_schedule_tool(
 
     try:
         if tool_name == "create_loop":
-            if not scoped_conv:
-                return json.dumps({"error": "create_loop requires a session id"})
             body = {
-                "conversation_id": scoped_conv,
                 "name": args.get("name"),
                 "kind": "loop",
                 "prompt": args.get("prompt"),
                 "cron": args.get("cron"),
             }
+            agent = args.get("agent")
+            if isinstance(agent, str) and agent.strip():
+                body["agent_name"] = agent.strip()  # global loop → fresh run per fire
+            elif scoped_conv:
+                body["conversation_id"] = scoped_conv
+            else:
+                return json.dumps({"error": "create_loop requires a session id or an 'agent'"})
             return _result(await server_client.post("/v1/schedules", json=body, timeout=30.0))
 
         if tool_name == "list_schedules":

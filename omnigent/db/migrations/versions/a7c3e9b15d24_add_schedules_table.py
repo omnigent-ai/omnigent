@@ -5,8 +5,11 @@ Revises: n1a2b3c4d5e6
 Create Date: 2026-06-28 00:30:00.000000
 
 Adds the ``schedules`` table: loops (cron-driven prompts) and monitors
-(stream-driven prompts) scoped to a conversation. Replaces the unimplemented
-``sys_timer_set`` stub path with a persisted, scheduler-armed definition.
+(stream-driven prompts). A loop is either conversation-scoped (fires into
+``conversation_id``) or global (``agent_name`` set, ``conversation_id`` NULL →
+each fire spawns a fresh session with that registered agent). Replaces the
+unimplemented ``sys_timer_set`` stub path with a persisted, scheduler-armed
+definition.
 """
 
 from __future__ import annotations
@@ -27,8 +30,13 @@ def upgrade() -> None:
     op.create_table(
         "schedules",
         sa.Column("id", sa.String(length=64), nullable=False),
-        sa.Column("conversation_id", sa.String(length=64), nullable=False),
+        # Nullable: NULL for a GLOBAL loop (fires into a fresh session created
+        # for ``agent_name``); set for a conversation-scoped loop/monitor.
+        sa.Column("conversation_id", sa.String(length=64), nullable=True),
         sa.Column("created_by_user_id", sa.String(length=128), nullable=True),
+        # Registered agent to spawn a fresh run for on each fire (GLOBAL loops).
+        # Mutually exclusive with conversation_id (enforced above the DB).
+        sa.Column("agent_name", sa.String(length=256), nullable=True),
         sa.Column("name", sa.String(length=256), nullable=False),
         sa.Column("kind", sa.String(length=16), nullable=False),
         sa.Column("prompt", sa.Text(), nullable=False),

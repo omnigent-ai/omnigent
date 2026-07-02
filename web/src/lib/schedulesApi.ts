@@ -9,7 +9,10 @@ import { authenticatedFetch } from "./identity";
 export interface Schedule {
   id: string;
   object: "schedule";
-  conversation_id: string;
+  /** Conversation this fires into, or null for a global loop. */
+  conversation_id: string | null;
+  /** Registered agent a global loop spawns a fresh run for, or null. */
+  agent_name: string | null;
   name: string;
   kind: "loop" | "monitor";
   prompt: string;
@@ -29,6 +32,32 @@ export async function listSchedules(conversationId: string): Promise<Schedule[]>
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { object: string; data: Schedule[] };
+  return body.data;
+}
+
+/** List every schedule across the workspace (global + conversation-scoped). */
+export async function listAllSchedules(): Promise<Schedule[]> {
+  const res = await authenticatedFetch(`/v1/schedules`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { object: string; data: Schedule[] };
+  return body.data;
+}
+
+/** A runner (host) currently connected to the server and able to run turns. */
+export interface OnlineRunner {
+  runner_id: string;
+  online: boolean;
+  harnesses: string[];
+}
+
+/**
+ * List runners currently connected (scoped to the caller). An empty list means
+ * no host is online — global loops can't spawn a fresh run until one connects.
+ */
+export async function listOnlineRunners(): Promise<OnlineRunner[]> {
+  const res = await authenticatedFetch(`/v1/runners`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { data: OnlineRunner[] };
   return body.data;
 }
 
