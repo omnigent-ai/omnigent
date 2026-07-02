@@ -260,6 +260,17 @@ def harness_is_configured(harness: str) -> bool:
     install_key = _install_key(canonical)
     if not harness_cli_installed(install_key):
         return False
+    if canonical in {"codex", "codex-native", "native-codex"}:
+        # The codex binary is present, but the provider the runner will route
+        # through can still be unreachable — most commonly a ``base_url`` that
+        # points at a local proxy (e.g. ucode's loopback AI-gateway) not running
+        # in a headless daemon. Gate on that too (a reliably-local determination)
+        # so the launch fails fast with a clear "not configured" error instead of
+        # the codex app-server timing out ~15s in while never starting a thread.
+        from omnigent.codex_native import _codex_provider_unreachable_reason
+
+        if _codex_provider_unreachable_reason() is not None:
+            return False
     # Families that authenticate via file-based credentials (not a CLI login
     # command) require both the binary AND a stored credential. The ``agy`` CLI
     # falls into this category: it has no ``agy login`` subcommand and writes
@@ -276,9 +287,18 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         canonical in {"codex", "codex-native", "native-codex"}
         and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
     ):
-        from omnigent.codex_native import _codex_auth_unavailable_reason
+        from omnigent.codex_native import (
+            _codex_auth_unavailable_reason,
+            _codex_provider_unreachable_reason,
+        )
 
-        return _codex_auth_unavailable_reason() or True
+        # ``_codex_auth_unavailable_reason`` confirms the binary + a local
+        # credential; ``_codex_provider_unreachable_reason`` confirms the
+        # provider the runner will actually route through is reachable (it
+        # catches a resolved provider whose ``base_url`` is a loopback proxy
+        # that is not running — the picker would otherwise report "available"
+        # for a codex that cannot start).
+        return _codex_auth_unavailable_reason() or _codex_provider_unreachable_reason() or True
     return harness_is_configured(canonical)
 
 
@@ -290,7 +310,9 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
     ``True`` (never gated); CLI-wrapping harnesses map to whether their
     binary is on ``PATH``. Codex entries use a structured string reason when
-    unavailable: ``"binary-missing"`` or ``"needs-auth"``.
+    unavailable: ``"binary-missing"``, ``"needs-auth"``, or
+    ``"provider-unreachable"`` (the resolved provider's ``base_url`` is a
+    loopback proxy that is not running).
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",

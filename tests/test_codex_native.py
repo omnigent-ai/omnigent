@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
-from collections.abc import Callable
+import socket
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,6 +138,167 @@ def test_codex_auth_unavailable_reason_malformed_auth_needs_auth(
     auth_path.write_text("{not json", encoding="utf-8")
 
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+@contextlib.contextmanager
+def _listening_loopback_port() -> Iterator[int]:
+    """Yield the port of a loopback socket that is actively listening."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    try:
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def _closed_loopback_port() -> int:
+    """Return a loopback port that was bound then released (nothing listening)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _set_resolved_codex_launch(
+    monkeypatch: pytest.MonkeyPatch, *, config_overrides: list[str], profile: str | None = None
+) -> None:
+    """Pin the launch that ``_codex_provider_unreachable_reason`` resolves."""
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=list(config_overrides), model=None, profile=profile
+    )
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", lambda *, model=None: launch)
+
+
+def _point_codex_config_toml_at(monkeypatch: pytest.MonkeyPatch, source_dir: Path) -> None:
+    """Redirect the config.toml source resolver used for provider base_url lookup."""
+    import omnigent.inner.codex_executor as codex_executor
+
+    monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: source_dir)
+
+
+def _write_codex_config_toml(source_dir: Path, provider: str, base_url: str) -> None:
+    """Write a config.toml with one ``[model_providers.<provider>]`` base_url."""
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "config.toml").write_text(
+        f'[model_providers.{provider}]\nbase_url = "{base_url}"\n', encoding="utf-8"
+    )
+
+
+def test_codex_provider_unreachable_cli_config_loopback_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config provider whose loopback proxy is not listening is unreachable.
+
+    This is the ucode local-gateway case: the launch pins
+    ``model_provider="ucode-databricks"`` and that table's ``base_url`` is a
+    ``127.0.0.1:PORT`` proxy that only runs during an interactive session, so in
+    a headless daemon nothing is listening and codex could never start.
+    """
+    port = _closed_loopback_port()
+    _set_resolved_codex_launch(monkeypatch, config_overrides=['model_provider="ucode-databricks"'])
+    _point_codex_config_toml_at(monkeypatch, tmp_path)
+    _write_codex_config_toml(
+        tmp_path, "ucode-databricks", f"http://127.0.0.1:{port}/ai-gateway/codex/v1"
+    )
+
+    assert codex_native._codex_provider_unreachable_reason() == "provider-unreachable"
+
+
+def test_codex_provider_reachable_cli_config_loopback_listening(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config provider whose loopback proxy is listening is reachable."""
+    _set_resolved_codex_launch(monkeypatch, config_overrides=['model_provider="ucode-databricks"'])
+    _point_codex_config_toml_at(monkeypatch, tmp_path)
+    with _listening_loopback_port() as port:
+        _write_codex_config_toml(
+            tmp_path, "ucode-databricks", f"http://127.0.0.1:{port}/ai-gateway/codex/v1"
+        )
+
+        assert codex_native._codex_provider_unreachable_reason() is None
+
+
+def test_codex_provider_remote_base_url_never_probed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remote gateway base_url is never probed (no false negatives on net state)."""
+    _set_resolved_codex_launch(monkeypatch, config_overrides=['model_provider="Databricks"'])
+    _point_codex_config_toml_at(monkeypatch, tmp_path)
+    _write_codex_config_toml(
+        tmp_path, "Databricks", "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
+    )
+    # Guard: a remote host must short-circuit before any socket connect.
+    monkeypatch.setattr(
+        codex_native.socket,
+        "create_connection",
+        lambda *a, **k: pytest.fail("remote base_url must not be probed"),
+    )
+
+    assert codex_native._codex_provider_unreachable_reason() is None
+
+
+def test_codex_provider_loopback_base_url_from_launch_override_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key/gateway/local provider bakes base_url into the launch override.
+
+    The generated ``model_providers.omnigent_provider={...base_url=...}`` inline
+    table is read straight from the launch overrides (no config.toml), and a
+    down loopback endpoint there is flagged too (e.g. a local model server).
+    """
+    port = _closed_loopback_port()
+    override = (
+        'model_providers.omnigent_provider={name="Omnigent Provider",'
+        f'base_url="http://127.0.0.1:{port}/v1",'
+        'auth={command="sh",args=["-c","true"]},wire_api="responses"}'
+    )
+    _set_resolved_codex_launch(
+        monkeypatch, config_overrides=['model_provider="omnigent_provider"', override]
+    )
+
+    assert codex_native._codex_provider_unreachable_reason() == "provider-unreachable"
+
+
+def test_codex_provider_openai_login_default_is_reachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The built-in openai login default has no local table to probe → reachable."""
+    _set_resolved_codex_launch(monkeypatch, config_overrides=[])
+
+    assert codex_native._codex_provider_unreachable_reason() is None
+
+
+def test_codex_provider_databricks_profile_is_reachable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Databricks-profile launch resolves to a remote, runtime-generated table."""
+    _set_resolved_codex_launch(monkeypatch, config_overrides=[], profile="DEFAULT")
+    _point_codex_config_toml_at(monkeypatch, tmp_path)  # no omnigent_databricks table present
+
+    assert codex_native._codex_provider_unreachable_reason() is None
+
+
+def test_codex_provider_missing_config_toml_fails_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config provider with no readable config.toml fails open (no reason)."""
+    _set_resolved_codex_launch(monkeypatch, config_overrides=['model_provider="ucode-databricks"'])
+    _point_codex_config_toml_at(monkeypatch, tmp_path)  # directory exists, config.toml absent
+
+    assert codex_native._codex_provider_unreachable_reason() is None
+
+
+def test_codex_provider_resolution_error_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A launch-resolution failure fails open — the check never blocks a launch."""
+
+    def _boom(*, model: str | None = None) -> None:
+        raise RuntimeError("resolution exploded")
+
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _boom)
+
+    assert codex_native._codex_provider_unreachable_reason() is None
 
 
 class _FakeTerminalClient:

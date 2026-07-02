@@ -436,9 +436,26 @@ describe("harnessUnconfiguredOnHost", () => {
     );
   });
 
-  it("ignores unknown future reason strings", () => {
-    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future-reason" }))).toBe(
-      null,
+  it("surfaces the provider-unreachable codex reason", () => {
+    const testHost = hostWith({ codex: "provider-unreachable" });
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessUnavailableReasonOnHost("codex", testHost)).toBe("provider-unreachable");
+    expect(harnessWarningBadgeText("provider-unreachable")).toBe("provider unreachable");
+    expect(harnessWarningMessageText("Codex", "laptop", "provider-unreachable")).toBe(
+      "Codex can't reach its Codex model provider on laptop — it's routed through a local gateway proxy that isn't running. Re-run omnigent setup on that machine and pick the direct Databricks AI Gateway.",
+    );
+  });
+
+  it("fails safe on unknown future codex reason strings", () => {
+    // A string value always means "unavailable" from the daemon (a bare `true`
+    // means available), so an unrecognized reason must still surface a warning —
+    // with generic copy — rather than silently read as available.
+    const testHost = hostWith({ codex: "future-reason" });
+    expect(harnessUnavailableReasonOnHost("codex", testHost)).toBe("future-reason");
+    expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
+    expect(harnessWarningBadgeText("future-reason")).toBe("needs setup");
+    expect(harnessWarningMessageText("Codex", "laptop", "future-reason")).toBe(
+      "Codex isn't configured on laptop — run omnigent setup on that machine.",
     );
   });
 

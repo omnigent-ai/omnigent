@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -18,9 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from urllib.parse import urlparse
 
 import click
 import httpx
+import tomllib
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
@@ -107,6 +110,15 @@ _UNBOUND_RUNNER_MESSAGE_FRAGMENT = "not bound to a runner"
 _CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
 _CODEX_AUTH_UNAVAILABLE_BINARY_MISSING = "binary-missing"
 _CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH = "needs-auth"
+# Reason returned when the provider the runner would actually route through has
+# a loopback ``base_url`` (a local proxy / model server, e.g. ucode's
+# ``127.0.0.1:PORT`` AI-gateway proxy) whose port is not listening. Distinct
+# from ``needs-auth`` (a credential exists; the endpoint just can't be reached).
+_CODEX_PROVIDER_UNREACHABLE = "provider-unreachable"
+# Loopback endpoints answer (or refuse) effectively instantly, so a short
+# timeout is enough to tell "listening" from "not listening" without the check
+# ever stalling the hello frame / launch gate.
+_CODEX_LOOPBACK_PROBE_TIMEOUT_SECONDS = 0.25
 
 
 @dataclass(frozen=True)
@@ -203,6 +215,169 @@ def _codex_auth_unavailable_reason() -> str | None:
     if not _codex_auth_json_has_available_credential(source.auth_path):
         return _CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH
     return None
+
+
+# ``base_url=`` inside a generated provider ``-c`` override (key / gateway /
+# local providers bake the whole ``[model_providers.X]`` inline table into one
+# override string — see ``_provider_codex_config_overrides``). The value is a
+# TOML basic string, which is also valid JSON, so it is safe to ``json.loads``.
+_CODEX_OVERRIDE_BASE_URL_RE = re.compile(r'base_url\s*=\s*("(?:[^"\\]|\\.)*")')
+
+
+def _codex_provider_base_url(launch: Any, provider: str) -> str | None:
+    """Return the ``base_url`` the resolved codex launch routes through.
+
+    The base URL lives in one of two places depending on the provider kind:
+
+    * ``key`` / ``gateway`` / ``local`` providers bake a generated
+      ``model_providers.omnigent_provider={...base_url=...}`` inline table
+      straight into the launch's ``-c`` overrides, so it is read from there;
+    * a ``cli-config`` provider only pins ``model_provider="X"`` and leaves the
+      ``[model_providers.X]`` table (with its ``base_url``) in the user's
+      ``config.toml`` — the file :func:`_populate_codex_home_config` copies into
+      the session ``CODEX_HOME`` — so it is read from that source config.toml.
+
+    The built-in ``openai`` login and the Databricks-profile
+    ``omnigent_databricks`` provider have no locally-inspectable table (the
+    latter is generated at app-server start against a remote host), so they
+    resolve to ``None`` and are treated as "nothing local to check".
+
+    :param launch: A resolved :class:`NativeCodexLaunch`.
+    :param provider: The provider id the launch routes through, as returned by
+        :func:`codex_session_meta_model_provider`.
+    :returns: The resolved ``base_url``, or ``None`` when it cannot be
+        determined locally.
+    """
+    for override in launch.config_overrides:
+        match = _CODEX_OVERRIDE_BASE_URL_RE.search(override)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                return None
+    if provider in ("openai", "omnigent_databricks"):
+        return None
+    return _codex_config_toml_provider_base_url(provider)
+
+
+def _codex_config_toml_provider_base_url(provider: str) -> str | None:
+    """Return ``[model_providers.<provider>].base_url`` from the source config.toml.
+
+    Reads the same ``config.toml`` that :func:`_populate_codex_home_config`
+    copies into a session ``CODEX_HOME`` (resolved via
+    :func:`_codex_home_config_source_from_env`), so it observes exactly the
+    provider table the launched Codex process will use.
+
+    :param provider: The ``[model_providers.X]`` key to look up.
+    :returns: The table's ``base_url`` string, or ``None`` when the file is
+        missing/unparseable or the table/key is absent.
+    """
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+    config_path = _codex_home_config_source_from_env() / "config.toml"
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    providers = data.get("model_providers")
+    if not isinstance(providers, dict):
+        return None
+    table = providers.get(provider)
+    if not isinstance(table, dict):
+        return None
+    base_url = table.get("base_url")
+    return base_url if isinstance(base_url, str) else None
+
+
+def _loopback_endpoint(base_url: str) -> tuple[str, int] | None:
+    """Return ``(host, port)`` when *base_url* is a loopback endpoint, else ``None``.
+
+    Only loopback hosts (``localhost`` / an IP whose :attr:`is_loopback` is set,
+    e.g. ``127.0.0.1`` or ``::1``) are returned — a remote host resolves to
+    ``None`` so callers never probe it (a remote reachability probe is out of
+    scope and would risk false negatives on transient network state).
+
+    :param base_url: A provider base URL, e.g.
+        ``"http://127.0.0.1:34659/ai-gateway/codex/v1"``.
+    :returns: ``(host, port)`` for a loopback endpoint (port defaulted from the
+        scheme when absent), or ``None`` when the URL is remote or unparseable.
+    """
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    if host == "localhost":
+        is_loopback = True
+    else:
+        try:
+            is_loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = False
+    if not is_loopback:
+        return None
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    return host, port
+
+
+def _loopback_port_listening(host: str, port: int) -> bool:
+    """Return whether a TCP connection to a loopback ``host:port`` succeeds.
+
+    :param host: A loopback host, e.g. ``"127.0.0.1"``.
+    :param port: TCP port to probe.
+    :returns: ``True`` when the port accepts a connection, ``False`` on any
+        connection error (refused / unreachable / times out).
+    """
+    try:
+        with socket.create_connection((host, port), timeout=_CODEX_LOOPBACK_PROBE_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
+def _codex_provider_unreachable_reason() -> str | None:
+    """Return a reason when the codex provider the runner will use is unreachable.
+
+    Complements :func:`_codex_auth_unavailable_reason`: that confirms a local
+    credential *exists*; this confirms the provider the launch actually routes
+    through can be *reached*. It resolves the same launch the runner will use
+    (:func:`resolve_native_codex_launch`), reads that provider's ``base_url``,
+    and — only when the ``base_url`` is a **loopback** endpoint (a local proxy /
+    model server, e.g. ucode's ``127.0.0.1:PORT`` gateway proxy that only runs
+    during an interactive session) — checks that its port is listening.
+
+    This stays within the daemon's "gate only on what can be determined
+    reliably and locally" contract: a dead loopback port is a definite local
+    fact, so flagging it is a true negative, not the false negative the readiness
+    module warns against. Remote gateways are never probed, and any resolution
+    failure fails open (returns ``None``) so the check can never block a launch
+    that might work.
+
+    :returns: :data:`_CODEX_PROVIDER_UNREACHABLE` when the resolved provider is a
+        loopback endpoint whose port is not listening; otherwise ``None``.
+    """
+    try:
+        launch = resolve_native_codex_launch(model=None)
+        provider = codex_session_meta_model_provider(launch)
+        base_url = _codex_provider_base_url(launch, provider)
+    except Exception:  # noqa: BLE001 - readiness must never raise; fail open.
+        _logger.debug("codex provider reachability check could not resolve launch", exc_info=True)
+        return None
+    if base_url is None:
+        return None
+    endpoint = _loopback_endpoint(base_url)
+    if endpoint is None:
+        return None
+    if _loopback_port_listening(*endpoint):
+        return None
+    _logger.debug(
+        "codex provider %r base_url %r is a loopback endpoint that is not listening",
+        provider,
+        base_url,
+    )
+    return _CODEX_PROVIDER_UNREACHABLE
 
 
 def _update_startup_progress(

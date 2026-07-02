@@ -515,19 +515,21 @@ export function harnessUnavailableReasonOnHost(
   if (!harness || !host?.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
   if (availability === false) return isCodexHarness(harness) ? "binary-missing" : "unconfigured";
-  if (
-    isCodexHarness(harness) &&
-    (availability === "binary-missing" || availability === "needs-auth")
-  ) {
+  // For codex, any string value is a structured "unavailable" reason from the
+  // daemon (a bare `true` means available). Surface it even when this build has
+  // no specific copy for it yet — the badge/message helpers fall back to a
+  // generic "needs setup" — so a newer daemon reason (e.g. one added after this
+  // web build shipped) never silently reads as available.
+  if (isCodexHarness(harness) && typeof availability === "string") {
     return availability;
   }
-  // Unknown future reason strings fall through to no warning until the UI knows their copy.
   return null;
 }
 
 export function harnessWarningBadgeText(reason: string | null): string {
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
+  if (reason === "provider-unreachable") return "provider unreachable";
   return "needs setup";
 }
 
@@ -541,6 +543,9 @@ export function harnessWarningMessageText(
   }
   if (reason === "binary-missing") {
     return `${agentName} is missing the Codex binary on ${hostName} — run omnigent setup on that machine.`;
+  }
+  if (reason === "provider-unreachable") {
+    return `${agentName} can't reach its Codex model provider on ${hostName} — it's routed through a local gateway proxy that isn't running. Re-run omnigent setup on that machine and pick the direct Databricks AI Gateway.`;
   }
   return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
 }
@@ -563,6 +568,15 @@ function harnessWarningMessage(
       <>
         {agentName} is missing the Codex binary on {hostName} — run <code>omnigent setup</code> on
         that machine.
+      </>
+    );
+  }
+  if (reason === "provider-unreachable") {
+    return (
+      <>
+        {agentName} can&apos;t reach its Codex model provider on {hostName} — it&apos;s routed
+        through a local gateway proxy that isn&apos;t running. Re-run <code>omnigent setup</code> on
+        that machine and pick the direct Databricks AI Gateway.
       </>
     );
   }
