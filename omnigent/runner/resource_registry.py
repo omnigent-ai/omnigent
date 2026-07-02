@@ -534,6 +534,8 @@ class SessionResourceRegistry:
         session_id: str,
         environment_id: str,
         agent_spec: Any | None = None,
+        *,
+        session_workspace: str | None = None,
     ) -> OSEnvironment:
         """Resolve an environment id to a live OSEnvironment.
 
@@ -545,11 +547,16 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param agent_spec: Agent spec for primary env creation.
+        :param session_workspace: Optional per-session workspace (the
+            working directory chosen for this session). When set, the
+            primary environment uses it in preference to the runner-level
+            workspace, so the filesystem view matches the session's
+            selected directory.
         :returns: The live :class:`OSEnvironment`.
         :raises ValueError: If the environment id cannot be resolved.
         """
         if environment_id == DEFAULT_ENVIRONMENT_ID:
-            return self._resolve_primary(session_id, agent_spec)
+            return self._resolve_primary(session_id, agent_spec, session_workspace)
 
         if self._terminal_registry is not None:
             for entry in self._terminal_registry.list_for_conversation(
@@ -570,11 +577,16 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         agent_spec: Any | None,
+        session_workspace: str | None = None,
     ) -> OSEnvironment:
         """Get or create the primary OSEnvironment for a session.
 
         :param session_id: Session/conversation identifier.
         :param agent_spec: Agent spec for env creation.
+        :param session_workspace: Optional per-session workspace (the
+            working directory chosen for this session, projected from the
+            session snapshot). When set, it takes precedence over the
+            runner-level workspace — see :meth:`_create_primary_env`.
         :returns: The primary :class:`OSEnvironment`.
         """
         with self._lock:
@@ -582,7 +594,7 @@ class SessionResourceRegistry:
             if cached is not None:
                 return cached
 
-            os_env = self._create_primary_env(session_id, agent_spec)
+            os_env = self._create_primary_env(session_id, agent_spec, session_workspace)
             self._primary_envs[session_id] = os_env
             return os_env
 
@@ -590,6 +602,7 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         agent_spec: Any | None,
+        session_workspace: str | None = None,
     ) -> OSEnvironment:
         """Create a new primary OSEnvironment.
 
@@ -615,11 +628,27 @@ class SessionResourceRegistry:
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
         from omnigent.inner.os_env import create_os_environment
 
+        # A per-session workspace (the working directory chosen for this
+        # session, projected from the session snapshot) takes precedence over
+        # the runner-level workspace. This mirrors the
+        # ``session_workspace or OMNIGENT_RUNNER_WORKSPACE`` precedence already
+        # used for runner-owned native terminals, so the Files panel and the
+        # ``/resources/environments/default`` filesystem view honor the same
+        # directory the terminal harness runs in. It is used directly (no
+        # per-session isolation subdir) because the caller chose that exact
+        # folder, and its permissions are left untouched.
+        explicit_cwd: str | None = None
+        if isinstance(session_workspace, str) and session_workspace.strip():
+            explicit_cwd = str(Path(session_workspace.strip()).expanduser().resolve())
+            os.makedirs(explicit_cwd, exist_ok=True)
+
         # Prefer the CLI launch workspace so that the OS environment
         # cwd matches the filesystem-registry watch path.  Fall back
         # to the per-session temp dir for remote/cloud runners that
         # have no workspace affinity.
-        if self._runner_workspace is not None:
+        if explicit_cwd is not None:
+            default_cwd = explicit_cwd
+        elif self._runner_workspace is not None:
             if self._per_session_workspace:
                 # Isolate sessions under the shared workspace.
                 default_cwd = str(self._runner_workspace / _sanitize_session_id(session_id))
@@ -639,12 +668,14 @@ class SessionResourceRegistry:
                 raise ValueError(
                     "Agent spec has no os_env; cannot create a primary filesystem environment."
                 )
-            # Precedence per designs/SESSION_WORKSPACE_SELECTION.md:
-            # runner_workspace (env-var-driven) ALWAYS wins when set.
-            # Otherwise the spec's absolute cwd wins; otherwise we
-            # fall back to the per-session tmpdir (default_cwd).
+            # Precedence: an explicit per-session workspace wins first, then
+            # runner_workspace (env-var-driven) when set. Otherwise the spec's
+            # absolute cwd wins; otherwise we fall back to the per-session
+            # tmpdir (default_cwd). When explicit_cwd or runner_workspace is in
+            # play, default_cwd already holds the resolved directory.
             if (
-                self._runner_workspace is not None
+                explicit_cwd is not None
+                or self._runner_workspace is not None
                 or spec_os_env.cwd is None
                 or spec_os_env.cwd in (".", "./")
             ):

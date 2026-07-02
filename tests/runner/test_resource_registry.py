@@ -1082,3 +1082,69 @@ def test_resolve_environment_runner_workspace_overrides_absolute_spec_cwd(
     # Compare via realpath because tmp_path on macOS goes through
     # /var → /private/var symlinks.
     assert os.path.realpath(env.cwd) == os.path.realpath(workspace)
+
+
+def test_resolve_environment_session_workspace_overrides_runner_workspace(
+    tmp_path: Path,
+) -> None:
+    """
+    A per-session workspace (the working directory chosen for the session,
+    projected from the session snapshot) takes precedence over both
+    runner_workspace and the spec cwd, and is used directly without a
+    per-session isolation subdirectory.
+
+    This is what makes a new session's selected working directory become the
+    primary filesystem environment / Files-panel root, instead of the
+    runner-level workspace.
+    """
+    runner_ws = tmp_path / "runner-workspace"
+    runner_ws.mkdir()
+    selected = tmp_path / "session-picked-dir"
+    selected.mkdir()
+    reg = SessionResourceRegistry(
+        runner_workspace=runner_ws,
+        per_session_workspace=True,
+    )
+    spec = SimpleNamespace(
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+
+    env = reg.resolve_environment(
+        "conv_selected",
+        DEFAULT_ENVIRONMENT_ID,
+        spec,
+        session_workspace=str(selected),
+    )
+
+    assert env is not None
+    # Used directly — not runner_ws, and not selected/<session_id>.
+    assert os.path.realpath(env.cwd) == os.path.realpath(selected)
+
+
+def test_resolve_environment_without_session_workspace_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Omitting session_workspace preserves the prior behavior: the primary
+    environment falls back to the (per-session-isolated) runner workspace."""
+    runner_ws = tmp_path / "runner-workspace"
+    runner_ws.mkdir()
+    reg = SessionResourceRegistry(
+        runner_workspace=runner_ws,
+        per_session_workspace=False,
+    )
+    spec = SimpleNamespace(
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+
+    env = reg.resolve_environment("conv_none", DEFAULT_ENVIRONMENT_ID, spec)
+
+    assert env is not None
+    assert os.path.realpath(env.cwd) == os.path.realpath(runner_ws)
