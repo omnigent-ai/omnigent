@@ -73,6 +73,21 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
         return yaml.safe_load(f) or {}
 
 
+def _resolve_canvas_enabled(cfg: dict[str, Any]) -> bool:  # type: ignore[explicit-any]
+    """Resolve the ``canvas.enabled`` server flag (#2). Default on.
+
+    Config scalars arrive as strings from the YAML loader (``false`` / ``no``
+    stay ``str``), and ``bool("false")`` is ``True`` — so a naive ``bool()``
+    cast silently ignores ``enabled: false`` and Canvas can never be turned
+    off. Use the shared falsey-aware coercion instead: a genuine bool ``False``
+    and the quoted false-y spellings both disable Canvas; an absent
+    ``canvas`` block or ``enabled`` key keeps it on.
+    """
+    from omnigent.spec.parser import _falsey_flag
+
+    return not _falsey_flag((cfg.get("canvas") or {}).get("enabled"))
+
+
 def _server_uvicorn_log_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     """
     Return Uvicorn logging config with request-duration access logs.
@@ -3006,6 +3021,7 @@ def server(
     # with "unable to open database file".
     _ensure_sqlite_parent_dir(db_uri)
 
+    from omnigent.stores.canvas_store.sqlalchemy_store import SqlAlchemyCanvasStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -3014,6 +3030,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    canvas_store = SqlAlchemyCanvasStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3052,11 +3069,17 @@ def server(
 
             routing_client = LLMRoutingClient(_policy_client)
 
+    # Canvas feature flag (#2): ``canvas.enabled`` in the server config, default
+    # on. When false, the /v1/canvas routes 404, set_canvas isn't registered,
+    # and the web client hides the Canvas tab. Falsey-aware (see helper).
+    canvas_enabled = _resolve_canvas_enabled(cfg)
+
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
+        canvas_enabled=canvas_enabled,
     )
     init_runtime(
         conversation_store=conversation_store,
@@ -3066,6 +3089,7 @@ def server(
         artifact_store=artifact_store,
         comment_store=comment_store,
         policy_store=policy_store,
+        canvas_store=canvas_store,
         caps=caps,
     )
 
@@ -3150,6 +3174,8 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.server.routes.canvas import create_canvas_router
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3167,6 +3193,17 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        # Canvas REST API (#2). Mounted via the generic extra_routers
+        # seam so create_app's signature stays untouched.
+        extra_routers=[
+            (
+                create_canvas_router(
+                    canvas_store, auth_provider, permission_store, conversation_store
+                ),
+                "/v1",
+                ["canvas"],
+            ),
+        ],
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")

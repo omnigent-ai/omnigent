@@ -1757,8 +1757,11 @@ def create_app(
             smart_routing_enabled = _caps is not None and (
                 _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
             )
+            # Canvas (#2) is on unless the operator disabled it via config.
+            canvas_enabled = _caps is None or _caps.canvas_enabled
         except ImportError:
             smart_routing_enabled = False
+            canvas_enabled = True
         return {
             "accounts_enabled": accounts_enabled,
             "login_url": login_url,
@@ -1768,6 +1771,7 @@ def create_app(
             "sandbox_provider": sandbox_provider,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "canvas_enabled": canvas_enabled,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)

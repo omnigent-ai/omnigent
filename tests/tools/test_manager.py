@@ -70,6 +70,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Canvas builtin (#2, #12) is always auto-registered so an agent +
+        # the Omnigent MCP can render an artifact without the spec opting in.
+        "set_canvas",
     }
 )
 
@@ -1165,3 +1168,39 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+# ── Canvas tool gate (#2) ─────────────────────────────
+
+
+def test_manager_skips_set_canvas_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When ``canvas.enabled`` is off (#2), ToolManager doesn't register
+    ``set_canvas`` — non-native agents don't even see it. The ``/v1/canvas``
+    route is the hard gate; skipping registration just avoids advertising a
+    tool that would 404.
+    """
+    from omnigent.runtime.caps import RuntimeCaps
+
+    monkeypatch.setattr(
+        "omnigent.runtime.get_caps",
+        lambda: RuntimeCaps(canvas_enabled=False),
+    )
+    mgr = ToolManager(_make_spec([]))
+    assert mgr.get_tool("set_canvas") is None
+
+
+def test_manager_registers_set_canvas_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canvas on (the default) → ``set_canvas`` is registered and callable."""
+    from omnigent.runtime.caps import RuntimeCaps
+
+    monkeypatch.setattr(
+        "omnigent.runtime.get_caps",
+        lambda: RuntimeCaps(canvas_enabled=True),
+    )
+    mgr = ToolManager(_make_spec([]))
+    assert mgr.get_tool("set_canvas") is not None
