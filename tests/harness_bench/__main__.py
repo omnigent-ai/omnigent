@@ -28,6 +28,7 @@ from tests.harness_bench.bench import run_bench
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
 from tests.harness_bench.profile import BenchProfile, resolve_profile
 from tests.harness_bench.report import render_json, render_markdown, render_table
+from tests.harness_bench.transport import driver_registry
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -63,6 +64,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_false",
         help="Force the offline (declared-only) render.",
     )
+    parser.add_argument(
+        "--transport",
+        metavar="NAME",
+        default=None,
+        help="Transport driver override (e.g. 'sdk-inproc', 'full-server'). "
+        "Wins over each profile's declared transport. Defaults to the "
+        "profile's transport.",
+    )
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument(
         "--markdown",
@@ -97,6 +106,15 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
+    # Validate the transport override up front so a typo is a clean CLI error
+    # (exit 2) rather than a KeyError traceback out of the async run.
+    if args.transport is not None and args.transport not in driver_registry():
+        known = ", ".join(sorted(driver_registry()))
+        print(
+            f"unknown --transport {args.transport!r}; known transports: {known}", file=sys.stderr
+        )
+        return 2
+
     # Live if explicitly forced, or implied by a supplied profile.
     live = args.live if args.live is not None else bool(args.profile)
     if live and not args.profile:
@@ -114,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             profiles,
             databricks_profile=args.profile,
             live=live,
+            transport=args.transport,
             progress=_progress if live else None,
         )
     )

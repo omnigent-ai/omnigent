@@ -28,6 +28,7 @@ bench's probes run through this driver, not just its gated tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -195,6 +196,31 @@ class FullServerDriver:
         import shutil
 
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ── async driver protocol ────────────────────────────────
+    # This driver's provisioning and turns are synchronous (subprocess spawn,
+    # blocking snapshot polls, a threaded SSE reader). Bridge to the bench's
+    # async Driver protocol by running the blocking work in a worker thread so
+    # the event loop is never blocked.
+
+    async def __aenter__(self) -> FullServerDriver:
+        return await asyncio.to_thread(self.__enter__)
+
+    async def __aexit__(self, *exc: object) -> None:
+        await asyncio.to_thread(self.__exit__, *exc)
+
+    async def run_basic_turn(self, marker: str) -> TurnResult:
+        prompt = f"Reply with exactly the literal string {marker} and nothing else."
+        return await asyncio.to_thread(self.run_turn, prompt)
+
+    async def run_streaming_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self.streaming_probe_turn)
+
+    async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+        return await asyncio.to_thread(lambda: self.tool_probe_turn(deny=deny))
+
+    async def run_interrupt_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self.interrupt_probe_turn)
 
     # ── spawn ────────────────────────────────────────────────
 
