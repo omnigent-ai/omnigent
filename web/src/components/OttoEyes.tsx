@@ -98,43 +98,51 @@ function textFieldCaretPoint(el: TextField): ScreenPoint | null {
   mirror.style.overflowWrap = "break-word";
   mirror.textContent = el.value;
 
-  doc.body.appendChild(mirror);
-  const node = mirror.firstChild;
-  // Clamp against the mirrored text length: selectionStart can momentarily lead
-  // el.value (controlled inputs, IME composition), and an out-of-range index
-  // would make Range.setStart throw.
-  const textLength = node?.textContent?.length ?? 0;
-  const caretIndex = Math.min(el.selectionStart ?? el.value.length, textLength);
-  const mirrorRect = mirror.getBoundingClientRect();
-
   // Default to the content box's top-left (caret at the very start, empty
   // field, or a layout-less environment like jsdom where Range rects are
   // unavailable). A real character rect overrides it below.
   let localLeft = 0;
   let localTop = 0;
   let caretHeight = parseFloat(cs.lineHeight) || 0;
-  if (node && caretIndex > 0) {
-    // The character before the caret; its trailing edge is where the caret
-    // rides, so the caret only drops to the next line once that glyph wraps.
-    // getClientRects() splits at a line wrap \u2014 the last rect is on the caret's
-    // line.
-    const range = doc.createRange();
-    range.setStart(node, caretIndex - 1);
-    range.setEnd(node, caretIndex);
-    const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
-    const r =
-      rects && rects.length > 0
-        ? rects[rects.length - 1]
-        : typeof range.getBoundingClientRect === "function"
-          ? range.getBoundingClientRect()
-          : null;
-    if (r && (r.width > 0 || r.height > 0 || r.right > 0 || r.top > 0)) {
-      localLeft = r.right - mirrorRect.left;
-      localTop = r.top - mirrorRect.top;
-      caretHeight = r.height;
+
+  // Always remove the mirror, even if a measurement throws (a browser Range
+  // quirk, or the field detaching mid-frame): this runs on every tracked
+  // event via rAF, so a leaked node would accumulate one hidden <div> per
+  // frame and the uncaught throw would kill all subsequent tracking.
+  doc.body.appendChild(mirror);
+  try {
+    const node = mirror.firstChild;
+    // Clamp against the mirrored text length: selectionStart can momentarily
+    // lead el.value (controlled inputs, IME composition), and an out-of-range
+    // index would make Range.setStart throw.
+    const textLength = node?.textContent?.length ?? 0;
+    const caretIndex = Math.min(el.selectionStart ?? el.value.length, textLength);
+    const mirrorRect = mirror.getBoundingClientRect();
+
+    if (node && caretIndex > 0) {
+      // The character before the caret; its trailing edge is where the caret
+      // rides, so the caret only drops to the next line once that glyph wraps.
+      // getClientRects() splits at a line wrap \u2014 the last rect is on the caret's
+      // line.
+      const range = doc.createRange();
+      range.setStart(node, caretIndex - 1);
+      range.setEnd(node, caretIndex);
+      const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
+      const r =
+        rects && rects.length > 0
+          ? rects[rects.length - 1]
+          : typeof range.getBoundingClientRect === "function"
+            ? range.getBoundingClientRect()
+            : null;
+      if (r && (r.width > 0 || r.height > 0 || r.right > 0 || r.top > 0)) {
+        localLeft = r.right - mirrorRect.left;
+        localTop = r.top - mirrorRect.top;
+        caretHeight = r.height;
+      }
     }
+  } finally {
+    doc.body.removeChild(mirror);
   }
-  doc.body.removeChild(mirror);
 
   const rect = el.getBoundingClientRect();
   // The mirror's zero-padding/zero-border content box starts at its own
@@ -227,6 +235,15 @@ export function OttoEyes({ className }: { className?: string }) {
 
     const apply = () => {
       frame = 0;
+      // React can unmount the focused field (route change, conditional render)
+      // without always delivering a matching focusout, leaving activeField
+      // pointing at a detached node whose rect measures as (0,0) — Otto would
+      // aim at the top-left corner. Drop a disconnected field back to the
+      // pointer so he rests centered instead.
+      if (activeField && !activeField.isConnected) {
+        activeField = null;
+        if (source === "caret") source = "pointer";
+      }
       // Follow the last-moved source; if the caret can't be resolved, fall
       // back to the pointer. Neither source yet → leave the pupils centered.
       const target =
