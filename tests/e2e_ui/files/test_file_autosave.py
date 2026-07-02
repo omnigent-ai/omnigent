@@ -25,6 +25,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import switch_markdown_view_mode
+
 # Files land in ``<repo-root>/<session_id>/`` (the agent spec uses
 # ``os_env.cwd: .``), so clean that per-session dir up in teardown.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -113,6 +115,10 @@ def test_markdown_edit_autosaves(page: Page, seeded_markdown: tuple[str, str]) -
 
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible()
+
+    # Markdown opens in the rendered Preview; switch to the rich-text editor to
+    # drive an edit that auto-saves.
+    switch_markdown_view_mode(page, file_viewer, "Edit")
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
     expect(editor).to_contain_text("A paragraph that will be edited")

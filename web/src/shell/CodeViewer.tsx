@@ -36,6 +36,8 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkEmoji from "remark-emoji";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize from "rehype-sanitize";
 import { type Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -77,13 +79,25 @@ const GUTTER_WIDTH = 48;
 
 // GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
 // renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
-// the same here as on GitHub (issue #970).
+// the same here as on GitHub.
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+// Markdown files routinely embed raw HTML that GitHub renders — <details>,
+// <sub>/<sup>, <kbd>, <br>, <div align>, inline <img> — which react-markdown
+// drops by default, showing the escaped tags as literal text. rehype-raw parses
+// that HTML; rehype-sanitize then strips anything unsafe (<script>, event
+// handlers, javascript: URLs) so this stays safe to render inline without an
+// iframe. Order matters: sanitize must run last, after raw parsing and GFM.
+const MARKDOWN_REHYPE_PLUGINS = [rehypeRaw, rehypeSanitize];
 
 function MarkdownPreview({ content }: { content: string }) {
   return (
     <div className="px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
-      <ReactMarkdown remarkPlugins={MARKDOWN_REMARK_PLUGINS}>{content}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   );
 }

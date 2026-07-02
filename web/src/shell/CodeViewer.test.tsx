@@ -282,6 +282,45 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(container.textContent).toContain("🎉");
     expect(container.textContent).toContain("🚀");
   });
+
+  it("renders embedded raw HTML that GitHub supports", () => {
+    // Markdown routinely embeds raw HTML (collapsible sections, sub/superscript,
+    // keyboard keys, line breaks). Without rehype-raw these render as escaped
+    // literal tags; the preview must render them as real elements like GitHub.
+    const { container } = renderMd(
+      [
+        "<details><summary>More</summary>Hidden body</details>",
+        "",
+        "H<sub>2</sub>O and E=mc<sup>2</sup>",
+        "",
+        "press <kbd>Enter</kbd>",
+        "",
+        "line one<br>line two",
+      ].join("\n"),
+    );
+    expect(container.querySelector("details summary")?.textContent).toBe("More");
+    expect(container.querySelector("sub")?.textContent).toBe("2");
+    expect(container.querySelector("sup")?.textContent).toBe("2");
+    expect(container.querySelector("kbd")?.textContent).toBe("Enter");
+    expect(container.querySelector("br")).not.toBeNull();
+    // The literal, un-rendered tag must not leak through as visible text.
+    expect(container.textContent).not.toContain("<details>");
+  });
+
+  it("sanitizes dangerous raw HTML (no scripts, event handlers, or js: URLs)", () => {
+    // Markdown content is untrusted (agent/user-authored). rehype-raw parses raw
+    // HTML, so rehype-sanitize must strip anything executable before it renders
+    // inline in the host document (unlike the iframe-isolated HTML preview).
+    const { container } = renderMd(
+      "<script>window.__pwned = true</script>\n\n" +
+        '<img src="x" onerror="window.__pwned = true" alt="x">\n\n' +
+        '<a href="javascript:window.__pwned = true">click</a>',
+    );
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("img")?.hasAttribute("onerror")).toBe(false);
+    // A javascript: href is dropped entirely rather than left clickable.
+    expect(container.querySelector("a")?.getAttribute("href")).toBeNull();
+  });
 });
 
 describe("CodeViewer HTML preview sandbox", () => {

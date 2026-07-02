@@ -921,6 +921,16 @@ describe("FileViewer markdown preview/edit/source modes", () => {
 
   const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
 
+  // Markdown's three modes live behind a single "View mode" dropdown (the
+  // toolbar was too full for three side-by-side buttons). Open it, then click
+  // the wanted option. Radix menus open on pointerdown, not click.
+  const openModeMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+  const selectMode = (mode: "Preview" | "Edit" | "Source") => {
+    openModeMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: mode }));
+  };
+
   it("opens a markdown file in the rendered preview by default", () => {
     // notes.md is not a changed file, so no diff view competes — the default
     // previewable mode ("preview") must reach CodeViewer for markdown, not be
@@ -929,38 +939,39 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(viewModeOf()).toBe("preview");
   });
 
-  it("offers Preview, Edit, and Source toggles for a markdown file", () => {
+  it("offers Preview, Edit, and Source options in the view-mode menu", () => {
     renderViewer({ open: true, path: "notes.md" });
-    expect(screen.getByRole("button", { name: "Preview" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Source" })).toBeInTheDocument();
+    openModeMenu();
+    expect(screen.getByRole("menuitem", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Source" })).toBeInTheDocument();
   });
 
-  it("switches markdown to the rich-text editor when Edit is clicked", () => {
+  it("switches markdown to the rich-text editor when Edit is chosen", () => {
     renderViewer({ open: true, path: "notes.md" });
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    selectMode("Edit");
     expect(viewModeOf()).toBe("editor");
   });
 
-  it("switches markdown to raw source when Source is clicked", () => {
+  it("switches markdown to raw source when Source is chosen", () => {
     renderViewer({ open: true, path: "notes.md" });
-    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    selectMode("Source");
     expect(viewModeOf()).toBe("source");
   });
 
   it("returns markdown to the preview from another mode", () => {
     renderViewer({ open: true, path: "notes.md" });
-    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    selectMode("Source");
     expect(viewModeOf()).toBe("source");
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    selectMode("Preview");
     expect(viewModeOf()).toBe("preview");
   });
 
-  it("does not offer the rich-text Edit toggle for HTML files", () => {
-    // HTML has no rich-text editor — only preview ↔ source. The markdown-only
-    // Edit button must not leak onto HTML's toolbar.
+  it("does not offer the markdown view-mode menu for HTML files", () => {
+    // HTML has no rich-text editor — only a single preview ↔ source toggle, not
+    // the markdown tri-state picker. The "View mode" dropdown must not appear.
     renderViewer({ open: true, path: "page.html" });
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
   });
 
   it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
@@ -973,13 +984,13 @@ describe("FileViewer markdown preview/edit/source modes", () => {
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
     renderViewer({ open: true, path: "notes.md" });
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    selectMode("Edit");
     expect(viewModeOf()).toBe("editor");
     // Mark the editor dirty (the mock forwards onDirtyChange).
     fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
     // Leaving the editor with unsaved edits must NOT switch immediately — it
     // pops the discard confirmation and stays in the editor.
-    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    selectMode("Source");
     expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
     expect(viewModeOf()).toBe("editor");
     // Confirming the discard performs the deferred switch.
@@ -989,21 +1000,21 @@ describe("FileViewer markdown preview/edit/source modes", () => {
 
   it("switches out of a clean markdown editor immediately, with no discard dialog", () => {
     renderViewer({ open: true, path: "notes.md" });
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    selectMode("Edit");
     expect(viewModeOf()).toBe("editor");
     // No dirty signal — switching is immediate and raises no dialog.
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    selectMode("Preview");
     expect(screen.queryByText("Unsaved changes")).toBeNull();
     expect(viewModeOf()).toBe("preview");
   });
 
-  it("does not pop a discard dialog when re-selecting the active markdown tab while dirty", () => {
+  it("does not pop a discard dialog when re-selecting the active markdown mode while dirty", () => {
     renderViewer({ open: true, path: "notes.md" });
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    selectMode("Edit");
     fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
-    // Clicking the tab you are already on is a no-op — it must not run the
+    // Choosing the mode you are already on is a no-op — it must not run the
     // dirty guard (which would otherwise confusingly offer to discard edits).
-    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    selectMode("Edit");
     expect(screen.queryByText("Unsaved changes")).toBeNull();
     expect(viewModeOf()).toBe("editor");
   });
@@ -1017,6 +1028,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       diffActive: false,
       diffLayout: "unified",
       previewableViewMode: "editor",
+      hideWhitespace: false,
     });
     renderViewer({ open: true, path: "page.html" });
     expect(viewModeOf()).toBe("preview");
@@ -1031,6 +1043,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       diffActive: false,
       diffLayout: "unified",
       previewableViewMode: "editor",
+      hideWhitespace: false,
     });
     renderViewer({ open: true, path: "page.html" });
     expect(viewModeOf()).toBe("preview");
@@ -1042,7 +1055,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     // pick Source, tear the tree down, remount with no URL params, and confirm
     // the seed-on-mount read restores Source rather than the preview default.
     const first = render(viewerTree({ open: true, path: "notes.md" }));
-    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    selectMode("Source");
     expect(viewModeOf()).toBe("source");
     first.unmount();
     render(viewerTree({ open: true, path: "notes.md" }));
@@ -1057,7 +1070,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("editor");
     // Once the user explicitly picks Preview, the deep-link bias is dropped.
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    selectMode("Preview");
     expect(viewModeOf()).toBe("preview");
   });
 
@@ -1069,7 +1082,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("editor");
     fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    selectMode("Preview");
     fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
     expect(viewModeOf()).toBe("editor");
   });

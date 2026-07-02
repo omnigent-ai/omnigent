@@ -33,6 +33,7 @@ describe("fileViewPreferences", () => {
       diffActive: false,
       diffLayout: "unified",
       previewableViewMode: "editor",
+      hideWhitespace: false,
     });
     expect(readFileViewPreferences().previewableViewMode).toBe("editor");
   });
@@ -103,6 +104,7 @@ describe("fileViewPreferences", () => {
       diffActive: true,
       diffLayout: "split",
       previewableViewMode: "preview",
+      hideWhitespace: false,
     });
   });
 
@@ -114,6 +116,7 @@ describe("fileViewPreferences", () => {
       diffActive: false,
       diffLayout: "unified",
       previewableViewMode: "editor",
+      hideWhitespace: false,
     });
     expect(readFileViewPreferences().previewableViewMode).toBe("editor");
   });

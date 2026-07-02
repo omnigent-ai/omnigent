@@ -57,6 +57,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -640,6 +644,14 @@ function FileViewerBody({
   // editor/source choice is already highlightable, so we respect it). Preview
   // stays the default for normal opens; the bias is dropped the moment the user
   // picks a mode and never applies to any other file.
+  //
+  // This is a separate override rather than a seeded `previewableViewMode`
+  // because that state is persisted globally: seeding it to "editor" would write
+  // "editor" back to localStorage, making *every* later markdown file open in
+  // the editor. It must also be reactive — when the user clicks Preview the
+  // stored mode is already "preview", so only flipping this override re-renders
+  // to the preview surface. It's the deep-linked path (not a boolean) so a
+  // navigate-away-and-back doesn't re-trigger the bias on the wrong file.
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
@@ -722,6 +734,19 @@ function FileViewerBody({
   // `active` drives the inline button's filled variant; it's omitted from the
   // dropdown rows (menu items aren't toggles). The save-status chip is NOT in
   // this list — it stays inline regardless of width.
+  //
+  // An action can instead carry `options`: a set of mutually-exclusive choices
+  // rendered as a single dropdown (a "picker" button inline, a submenu when
+  // collapsed) rather than one button per choice. Markdown's view-mode picker
+  // (Preview / Edit / Source) uses this so it occupies one toolbar slot.
+  type ToolbarOption = {
+    key: string;
+    label: string;
+    tooltip?: string;
+    icon: ReactNode;
+    onSelect: () => void;
+    active: boolean;
+  };
   type ToolbarAction = {
     key: string;
     /** Accessible name for the inline icon button. */
@@ -729,8 +754,11 @@ function FileViewerBody({
     /** Tooltip + dropdown row text; falls back to `label` when omitted. */
     tooltip?: string;
     icon: ReactNode;
-    onSelect: () => void;
+    onSelect?: () => void;
     active?: boolean;
+    /** When set, render a picker (dropdown/submenu) over these choices instead
+     * of a single button. `onSelect` is ignored. */
+    options?: ToolbarOption[];
   };
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
@@ -755,7 +783,11 @@ function FileViewerBody({
         apply();
       }
     };
-    toolbarActions.push(
+    // One toolbar slot: a "view mode" picker rather than three side-by-side
+    // buttons (the toolbar is tight once nav/diff/comment actions are present).
+    // The trigger shows the current surface's icon so the active mode reads at
+    // a glance; the menu lets the user pick another.
+    const modeOptions: ToolbarOption[] = [
       {
         key: "md-preview",
         label: "Preview",
@@ -780,7 +812,15 @@ function FileViewerBody({
         active: viewMode === "source",
         onSelect: () => switchTo("source"),
       },
-    );
+    ];
+    const activeMode = modeOptions.find((o) => o.active) ?? modeOptions[0];
+    toolbarActions.push({
+      key: "md-view-mode",
+      label: `View mode: ${activeMode.label}`,
+      tooltip: "View mode",
+      icon: activeMode.icon,
+      options: modeOptions,
+    });
   } else if (lang === "html" && viewMode !== "diff") {
     // HTML has no rich-text editor — a single toggle flips preview ↔ source.
     toolbarActions.push({
@@ -906,25 +946,63 @@ function FileViewerBody({
   // when it fits, as the visible toolbar. `interactive` is false for the
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
-    toolbarActions.map((action) => (
-      <TooltipProvider key={action.key}>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant={action.active ? "default" : "ghost"}
-              size="icon-sm"
-              aria-label={action.label}
-              tabIndex={interactive ? undefined : -1}
-              onClick={interactive ? action.onSelect : undefined}
-            >
-              {action.icon}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    ));
+    toolbarActions.map((action) =>
+      action.options ? (
+        // A picker: one trigger opening a menu of mutually-exclusive choices.
+        <DropdownMenu key={action.key}>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={action.label}
+                    tabIndex={interactive ? undefined : -1}
+                  >
+                    {action.icon}
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <DropdownMenuContent align="end" className="w-auto min-w-40">
+            <DropdownMenuLabel>{action.tooltip ?? action.label}</DropdownMenuLabel>
+            {action.options.map((option) => (
+              <DropdownMenuItem
+                key={option.key}
+                className={cn("whitespace-nowrap", option.active && "bg-accent")}
+                onSelect={interactive ? option.onSelect : undefined}
+              >
+                {option.icon}
+                {option.label}
+                {option.active && <CheckIcon className="ml-auto size-4" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : (
+        <TooltipProvider key={action.key}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant={action.active ? "default" : "ghost"}
+                size="icon-sm"
+                aria-label={action.label}
+                tabIndex={interactive ? undefined : -1}
+                onClick={interactive ? action.onSelect : undefined}
+              >
+                {action.icon}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      ),
+    );
 
   const innerContent = (
     <>
@@ -1053,16 +1131,39 @@ function FileViewerBody({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
-                  {toolbarActions.map((action) => (
-                    <DropdownMenuItem
-                      key={action.key}
-                      className="whitespace-nowrap"
-                      onSelect={action.onSelect}
-                    >
-                      {action.icon}
-                      {action.tooltip ?? action.label}
-                    </DropdownMenuItem>
-                  ))}
+                  {toolbarActions.map((action) =>
+                    action.options ? (
+                      // A picker collapses to a nested submenu of its choices.
+                      <DropdownMenuSub key={action.key}>
+                        <DropdownMenuSubTrigger className="whitespace-nowrap">
+                          {action.icon}
+                          {action.tooltip ?? action.label}
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent>
+                          {action.options.map((option) => (
+                            <DropdownMenuItem
+                              key={option.key}
+                              className={cn("whitespace-nowrap", option.active && "bg-accent")}
+                              onSelect={option.onSelect}
+                            >
+                              {option.icon}
+                              {option.label}
+                              {option.active && <CheckIcon className="ml-auto size-4" />}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                    ) : (
+                      <DropdownMenuItem
+                        key={action.key}
+                        className="whitespace-nowrap"
+                        onSelect={action.onSelect}
+                      >
+                        {action.icon}
+                        {action.tooltip ?? action.label}
+                      </DropdownMenuItem>
+                    ),
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (

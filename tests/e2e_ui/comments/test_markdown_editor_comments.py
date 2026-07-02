@@ -5,7 +5,8 @@ editor and adding a comment:
 
   1. A markdown file is seeded directly via the artifacts API (no agent run
      needed), so the test is fast and deterministic.
-  2. The FileViewer opens in rich-text editor mode (the default for .md files).
+  2. Markdown opens in the rendered Preview; the test switches to the rich-text
+     editor via the toolbar "View mode" menu.
   3. The user selects plain text in the editor; the floating "Add comment"
      button appears above the selection.
   4. Clicking "Add comment" marks the selection as a pending comment (a TipTap
@@ -26,7 +27,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import open_right_rail, switch_markdown_view_mode
 
 # ---------------------------------------------------------------------------
 # Test constants
@@ -145,9 +146,10 @@ def test_markdown_rich_text_editor_add_comment(
         page.get_by_role("button", name=f"Close {_MARKDOWN_FILE_PATH}", exact=True).first
     ).to_be_visible()
 
-    # Markdown files default to rich-text editor mode. The editor renders the
-    # heading and paragraph into styled HTML via TipTap; the raw markdown
-    # syntax characters (# , **) are NOT visible in the editor surface.
+    # Markdown opens in the rendered Preview; switch to the rich-text editor.
+    # The editor renders the heading and paragraph into styled HTML via TipTap;
+    # the raw markdown syntax characters (# , **) are NOT visible in it.
+    switch_markdown_view_mode(page, file_viewer, "Edit")
     editor_content = file_viewer.locator("[contenteditable='true']")
     expect(editor_content).to_be_visible(timeout=10_000)
 
@@ -271,6 +273,8 @@ def test_heading_text_anchor_content_excludes_prefix(
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible()
 
+    # Markdown opens in the rendered Preview; switch to the rich-text editor.
+    switch_markdown_view_mode(page, file_viewer, "Edit")
     editor_content = file_viewer.locator("[contenteditable='true']")
     expect(editor_content).to_be_visible(timeout=10_000)
 
