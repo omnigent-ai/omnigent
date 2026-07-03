@@ -175,10 +175,11 @@ two workflows have already done the prep for you:
 - `draft-release-notes.yml` (fires right after) then:
   1. opened a **`CHANGELOG.md` PR to `main`** — the granular, feature-level log,
      harvested mechanically from each merged PR's `## Changelog` section; and
-  2. **filled the draft's body** with concise, curated two-section notes (Major new
-     features / Bug fixes & hardening), synthesized by an agent from the merged
-     PRs, with the original auto-notes tucked into a collapsed `<details>` for
-     reference.
+  2. **filled the draft's body** with concise, curated notes (Major new features /
+     Breaking changes / Bug fixes — user-facing only), synthesized by an agent from
+     the merged PRs, with the original auto-notes tucked into a collapsed
+     `<details>` for reference. Security and CI/internal fixes are deliberately left
+     out of the highlights.
 
 Now:
 
