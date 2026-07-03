@@ -8,7 +8,7 @@ renderer, and update flow as the empty-landing snapshot -- see ``README.md``.
 Determinism strategy -- the chat page is a pure function of the committed bundle
 plus ``page.route`` stubs for every call the bind path makes (the exact load
 order is: open the per-session SSE stream, then fetch the slim session + the
-items page; see ``ap-web/src/store/chatStore.ts``):
+items page; see ``web/src/store/chatStore.ts``):
 
 * ``GET /v1/sessions/{id}/stream`` is answered with the server's ``[DONE]``
   sentinel -- a *clean* close the store does NOT reconnect on -- so no live event

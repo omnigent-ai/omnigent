@@ -6,7 +6,7 @@ drag-drop. Each attached file renders as a chip below the textarea with a
 per-file remove button; on send the files are embedded inline in the message
 (there is no separate upload endpoint), and ``removeFile`` drops a chip.
 
-This flow has no coverage below the browser: no ap-web vitest test exercises
+This flow has no coverage below the browser: no web vitest test exercises
 the ChatPage composer's ``addFiles`` / ``removeFile`` path, and the attach
 mechanism (a real hidden file input populated by the OS file picker) is exactly
 what a unit test can't drive. Playwright's ``set_input_files`` populates the

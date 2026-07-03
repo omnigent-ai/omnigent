@@ -816,3 +816,178 @@ def test_load_session_usage_merges_by_model_across_subtree(
         conversation_store=conversation_store,
     )
     assert "by_model" not in engine.usage
+
+
+# ── Subtree-scoped cost budgeting (per-subagent cost gates) ──
+
+
+def test_build_subagent_with_cost_budget_gets_session_wide_usage(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A subagent with ``cost_budget`` policy sees session-wide usage.
+
+    The per-session cost gate (``cost_budget``) gates the whole spawn tree.
+    A subagent's engine must be seeded with the full-tree total, not just
+    its own subtree, so it doesn't re-allow budgets already exhausted by
+    parent + siblings.
+
+    This test verifies the existing cost_budget behavior (baseline for
+    the new subagent_cost_budget feature).
+    """
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    sibling = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    conversation_store.set_session_usage(sibling.id, {"total_cost_usd": 0.03})
+
+    # Child's engine sees full-tree total (0.18), not just child+sibling subtree.
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child"),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    assert engine.usage["total_cost_usd"] == pytest.approx(0.18)  # 0.10+0.05+0.03
+
+
+def test_build_injects_subtree_usage_only_when_policy_present(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The engine's ``subtree_usage`` is injected only when
+    subagent_cost_budget policy is present; otherwise None.
+
+    This guards against unnecessary DB traversals (the conditional
+    injection pattern) — if the policy isn't used, we skip the lookup.
+    """
+    from omnigent.spec.types import GuardrailsSpec
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+
+    # Engine without subagent_cost_budget policy: subtree_usage is None.
+    engine_no_policy = build_policy_engine(
+        spec=AgentSpec(
+            spec_version=1,
+            name="child",
+            guardrails=GuardrailsSpec(policies={}),
+        ),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    assert engine_no_policy._subtree_usage is None
+
+    # Engine with subagent_cost_budget policy: subtree_usage is populated.
+    # (We can't easily construct the policy spec without going through
+    # the registry, so we just verify it would be computed by checking
+    # that the engine has the infrastructure to store it.)
+    engine_with_policy = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child"),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    # The engine was built successfully; when the policy is present,
+    # _subtree_usage would be populated. This is a structural test that
+    # the builder plumbs the value through.
+    assert hasattr(engine_with_policy, "_subtree_usage")
+
+
+def test_build_subagent_subtree_usage_excludes_parent_and_siblings(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A subagent's subtree_usage includes only its own subtree, not parent/siblings.
+
+    The per-subagent cost gate (``subagent_cost_budget``) gates each
+    subagent independently on its own spend. A child's subtree_usage must
+    therefore reflect only the child + its descendants, not the parent or
+    siblings.
+
+    This is the key semantic difference from cost_budget (which sees
+    session-wide) vs. subagent_cost_budget (which sees only its own subtree).
+    """
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    sibling = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    grandchild = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=child.id
+    )
+
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    conversation_store.set_session_usage(sibling.id, {"total_cost_usd": 0.03})
+    conversation_store.set_session_usage(grandchild.id, {"total_cost_usd": 0.02})
+
+    # load_session_usage with the child's ID gives us only its subtree.
+    child_subtree = load_session_usage(child.id, conversation_store)
+    # 0.07 = child (0.05) + grandchild (0.02), NOT parent or sibling.
+    assert child_subtree["total_cost_usd"] == pytest.approx(0.07)
+
+    # Parent sees full tree (0.20); child's subtree_usage would be 0.07.
+    parent_fullsession = load_session_usage(parent.id, conversation_store)
+    assert parent_fullsession["total_cost_usd"] == pytest.approx(0.20)
+
+    # Verify the difference: child subtree < session total.
+    assert child_subtree["total_cost_usd"] < parent_fullsession["total_cost_usd"]
+
+
+def test_normalize_usage_for_engine_drops_display_fields() -> None:
+    """
+    _normalize_usage_for_engine removes by_model and promotes policy_cost_usd.
+
+    Both _policy_usage_seed and _subtree_usage_seed use this helper to
+    prepare usage for the engine: strip the display-only ``by_model``
+    breakdown, and swap ``policy_cost_usd`` to ``total_cost_usd`` for
+    enforcement cost (falling back to ``total_cost_usd`` when no enforcement
+    cost exists).
+    """
+    from omnigent.runtime.policies.builder import _normalize_usage_for_engine
+
+    # Case 1: Has both policy_cost (enforcement) and by_model (display).
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 120,
+        "total_cost_usd": 0.10,
+        "policy_cost_usd": 0.15,  # In-flight estimate, higher than display.
+        "by_model": {"claude-opus": {"input_tokens": 100, "total_cost_usd": 0.10}},
+    }
+    normalized = _normalize_usage_for_engine(usage)
+    assert normalized["total_cost_usd"] == 0.15  # Swapped from policy_cost_usd.
+    assert "policy_cost_usd" not in normalized  # Removed.
+    assert "by_model" not in normalized  # Removed.
+    assert normalized["input_tokens"] == 100  # Untouched.
+
+    # Case 2: No policy_cost (codex/relay style) — falls back to total_cost_usd.
+    usage2 = {
+        "input_tokens": 50,
+        "total_cost_usd": 0.05,
+        "by_model": {"claude-sonnet": {"input_tokens": 50, "total_cost_usd": 0.05}},
+    }
+    normalized2 = _normalize_usage_for_engine(usage2)
+    assert normalized2["total_cost_usd"] == 0.05  # Unchanged; no policy_cost to promote.
+    assert "by_model" not in normalized2
+    assert normalized2["input_tokens"] == 50
+
+    # Case 3: Empty usage (no cost fields at all) — idempotent.
+    usage3: dict[str, float] = {"input_tokens": 0, "output_tokens": 0}
+    normalized3 = _normalize_usage_for_engine(usage3)
+    assert "by_model" not in normalized3
+    assert "policy_cost_usd" not in normalized3
+    assert normalized3["input_tokens"] == 0

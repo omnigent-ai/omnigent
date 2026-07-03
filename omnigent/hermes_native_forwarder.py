@@ -23,9 +23,17 @@ launched in the same cwd never mirror the same row into two conversations. We th
 poll ``messages`` past a high-water ``id`` and POST new user/assistant rows as
 ``external_conversation_item`` events (which also seeds the session title).
 
-Status (``running``/``idle``) is intentionally NOT posted here: the runner's
-PTY-activity watcher owns those edges for hermes-native (see
-:mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+The web-facing ``running``/``idle`` *spinner* edges are intentionally NOT posted
+here: the runner's PTY-activity watcher owns those ``session.status`` edges for
+hermes-native (see :mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
+That watcher drives only the web "Working…" spinner, though — it never wakes a
+parent orchestrator. So this forwarder additionally derives turn completion from
+the message log (an ``assistant`` row with no ``tool_calls`` is the agentic loop's
+terminal step) and POSTs an ``external_session_status: idle`` event once per
+completed turn — the SAME server contract claude-/codex-/opencode-/cursor-native
+use to mark a sub-agent turn terminal and wake its parent's inbox. The post is
+deduped against a persisted posted-count (:mod:`omnigent.hermes_native_status`) so
+a supervisor restart never re-wakes the parent for a turn it already reported.
 """
 
 from __future__ import annotations
@@ -42,6 +50,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+
+from omnigent import hermes_native_status
 
 _logger = logging.getLogger(__name__)
 
@@ -386,6 +396,34 @@ def _discover_session_id(
     return None
 
 
+def _discover_child_session(db_path: Path, parent_session_id: str) -> str | None:
+    """Return the newest Hermes session whose parent is *parent_session_id*.
+
+    Hermes auto-compresses by ending the current session and forking a CHILD
+    (``sessions.parent_session_id`` points at the old id; present in hermes
+    v0.17.0 state.db). The forwarder pins one id for life, so after compaction it
+    keeps polling the dead parent and the chat goes silent. Re-discover the
+    newest child so the mirror re-pins. Mirrors :func:`_discover_session_id`'s
+    read-only connect + swallow-and-warn handling; returns ``None`` on any error.
+    """
+    con = _connect_ro(db_path)
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT id FROM sessions WHERE parent_session_id = ? ORDER BY started_at DESC LIMIT 1",
+            (parent_session_id,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("child discovery", exc)
+        return None
+    finally:
+        con.close()
+    if row and isinstance(row[0], str) and row[0]:
+        return row[0]
+    return None
+
+
 def _same_path(a: str, b: str) -> bool:
     """Return whether two filesystem paths resolve to the same realpath."""
     try:
@@ -539,6 +577,72 @@ def _read_new_items(
         else:
             items.append(_MirrorItem(msg_id=msg_id, item_type="", item_data={}, response_id=""))
     return items
+
+
+def _assistant_row_has_tool_calls(tool_calls: object) -> bool:
+    """Whether an assistant ``messages`` row carries a non-empty ``tool_calls`` list.
+
+    Hermes writes one ``messages`` row per agentic step (complete, append-only —
+    rows are never updated in place, which is why message mirroring keys off
+    ``id > last_id``). An assistant row with one or more tool calls means the loop
+    continues (a tool result + further assistant step follow); a row with no tool
+    calls is the loop's terminal step — the model returning its final answer.
+    Mirrors the ``tool_calls`` parsing in :func:`_message_to_items`.
+    """
+    if not isinstance(tool_calls, str) or not tool_calls.strip():
+        return False
+    try:
+        calls = json.loads(tool_calls)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(calls, list) and len(calls) > 0
+
+
+def _count_completed_turns(db_path: Path, hermes_session_id: str) -> int:
+    """Count completed turns for *hermes_session_id* (0 on unreadable/empty).
+
+    A completed turn is an ``assistant`` row with no ``tool_calls`` — the agentic
+    loop's terminal step (see :func:`_assistant_row_has_tool_calls`). Rows are
+    counted regardless of the ``active`` flag: Hermes soft-deletes on compaction
+    (sets ``active = 0``) rather than deleting rows, so ignoring it keeps the
+    count monotonic and append-only — the dedup baseline can then only grow, never
+    drop below the posted-count and falsely re-arm an idle post for an old turn.
+    """
+    con = _connect_ro(db_path)
+    if con is None:
+        return 0
+    try:
+        rows = con.execute(
+            "SELECT tool_calls FROM messages "
+            "WHERE session_id = ? AND role = 'assistant' ORDER BY id",
+            (hermes_session_id,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("turn-end count", exc)
+        return 0
+    finally:
+        con.close()
+    return sum(1 for (tool_calls,) in rows if not _assistant_row_has_tool_calls(tool_calls))
+
+
+async def _post_external_session_status(
+    client: httpx.AsyncClient, *, session_id: str, status: str
+) -> None:
+    """POST one ``external_session_status`` event to the Sessions API.
+
+    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
+    completion that wakes the parent orchestrator's inbox — the SAME contract
+    claude-/codex-/opencode-/cursor-native use. The runner's PTY-activity watcher
+    emits only a web-spinner ``session.status`` edge for hermes-native and never
+    wakes a parent, which is why this explicit post is required.
+
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": {"status": status}},
+    )
+    resp.raise_for_status()
 
 
 async def _post_conversation_item(
@@ -768,6 +872,56 @@ async def forward_hermes_store_to_session(
                                     session_id,
                                     exc_info=True,
                                 )
+                            # Compaction ends this Hermes session and forks a
+                            # child (parent_session_id chain). Re-pin to the
+                            # newest child so the mirror follows the live session
+                            # instead of polling the dead parent forever. Done at
+                            # most once per compaction (compaction_persisted resets
+                            # to False for the child, which carries no compacted
+                            # rows yet); if no child exists we stay on the parent.
+                            try:
+                                child = await asyncio.to_thread(
+                                    _discover_child_session, db, hermes_session_id
+                                )
+                                if child is not None and not await asyncio.to_thread(
+                                    _session_claimed_by_other, bridge_dir, child, launch_epoch_s
+                                ):
+                                    hermes_session_id = child
+                                    last_id = 0
+                                    compaction_persisted = False
+                                    _external_id_synced = False
+                                    # The idle dedup baseline is per-terminal but
+                                    # the completed-turn count is per
+                                    # hermes_session_id; the child restarts its
+                                    # count near 0, so rebase the baseline to the
+                                    # child's current count. Without this the guard
+                                    # `completed_turns > posted_count` stays False
+                                    # until the child exceeds the parent's total,
+                                    # suppressing idle posts for the child's first
+                                    # turns — a worker that compacts then finishes
+                                    # would never wake its parent.
+                                    await asyncio.to_thread(
+                                        hermes_native_status.write_posted_count,
+                                        bridge_dir,
+                                        await asyncio.to_thread(_count_completed_turns, db, child),
+                                    )
+                                    _write_state(
+                                        bridge_dir,
+                                        _ForwardState(
+                                            hermes_session_id=child,
+                                            last_id=0,
+                                            launch_epoch_s=launch_epoch_s,
+                                        ),
+                                    )
+                                    continue
+                            except Exception:  # noqa: BLE001
+                                _logger.warning(
+                                    "hermes forwarder failed to re-pin to child session "
+                                    "after compaction; staying on %s; session=%s",
+                                    hermes_session_id,
+                                    session_id,
+                                    exc_info=True,
+                                )
                         # Post model/usage data after mirroring messages.
                         await usage_tracker.flush()
                         # Refresh the claim heartbeat every poll (even with no new
@@ -780,6 +934,31 @@ async def forward_hermes_store_to_session(
                                 launch_epoch_s=launch_epoch_s,
                             ),
                         )
+                        # Turn each newly-completed turn into an
+                        # ``external_session_status: idle`` edge — the signal that
+                        # wakes a parent orchestrator (the PTY watcher's spinner
+                        # status never does). A completed turn is an assistant row
+                        # with no tool_calls (the agentic loop's terminal step);
+                        # posted only AFTER its messages are mirrored above so the
+                        # parent sees the content before the completion. Deduped
+                        # against a persisted posted-count so a supervisor restart
+                        # never re-wakes the parent for a turn it already reported.
+                        # Best-effort: a failed post raises into the outer handler
+                        # and leaves the count unadvanced, so the next poll retries.
+                        completed_turns = await asyncio.to_thread(
+                            _count_completed_turns, db, hermes_session_id
+                        )
+                        if completed_turns > await asyncio.to_thread(
+                            hermes_native_status.read_posted_count, bridge_dir
+                        ):
+                            await _post_external_session_status(
+                                client, session_id=session_id, status="idle"
+                            )
+                            await asyncio.to_thread(
+                                hermes_native_status.write_posted_count,
+                                bridge_dir,
+                                completed_turns,
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -477,6 +477,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        # Immediate session: used for read-modify-write operations that must be
+        # atomic. On SQLite, ``BEGIN IMMEDIATE`` acquires the write lock before
+        # the first read, preventing ``SQLITE_BUSY_SNAPSHOT`` under concurrent
+        # writers. On other dialects ``immediate=True`` is a no-op — those paths
+        # use ``SELECT … FOR UPDATE`` via ``_supports_for_update`` instead.
+        self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
         self._supports_for_update = self._engine.dialect.name != "sqlite"
         # SQLite rowid is monotonically increasing absent deletions; it serves
         # as an insertion-ordered tiebreaker for timestamp ties. Note: without
@@ -931,6 +937,53 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(SqlConversation.id == conversation_id)
                 .values(session_usage=json.dumps(usage))
             )
+
+    def increment_session_usage(
+        self,
+        conversation_id: str,
+        delta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Atomically increment the session usage for one conversation.
+
+        Runs the read-modify-write in a single database transaction, serialising
+        concurrent writers via two complementary mechanisms:
+
+        - **PostgreSQL / MySQL / MariaDB**: ``SELECT … FOR UPDATE`` acquires an
+          exclusive row lock for the duration of the transaction; a concurrent
+          second writer blocks until this one commits.
+        - **SQLite**: the session is opened with ``BEGIN IMMEDIATE``
+          (``self._session_immediate``), which acquires SQLite's write lock
+          *before* the first read. A plain ``SELECT``-then-``UPDATE`` in a
+          deferred transaction would expose concurrent writers to
+          ``SQLITE_BUSY_SNAPSHOT`` because each writer takes a read snapshot
+          first; ``BEGIN IMMEDIATE`` prevents that by serialising at lock
+          acquisition time.
+
+        :param conversation_id: The conversation to update.
+        :param delta: Usage increments (see
+            :meth:`ConversationStore.increment_session_usage`).
+        :returns: The updated ``session_usage`` dict.
+        """
+        import json
+
+        from omnigent.stores.conversation_store import apply_session_usage_delta
+
+        with self._session_immediate() as session:
+            q = select(SqlConversation).where(SqlConversation.id == conversation_id)
+            if self._supports_for_update:
+                q = q.with_for_update()
+            row = session.scalars(q).first()
+            current: dict[str, Any] = (
+                dict(json.loads(row.session_usage)) if row and row.session_usage else {}
+            )
+            apply_session_usage_delta(current, delta)
+            session.execute(
+                update(SqlConversation)
+                .where(SqlConversation.id == conversation_id)
+                .values(session_usage=json.dumps(current))
+            )
+            return current
 
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """

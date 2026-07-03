@@ -1,0 +1,89 @@
+{
+  "name": "omnigent-vscode",
+  "displayName": "Omnigent",
+  "description": "Open your running local Omnigent server inside VS Code, in an editor-beside iframe.",
+  "version": "0.1.0",
+  "publisher": "databricks",
+  "license": "Apache-2.0",
+  "icon": "media/omnigent-icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omnigent-ai/omnigent.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "configuration": {
+      "title": "Omnigent",
+      "properties": {
+        "omnigent.serverUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Manual Omnigent server URL override for a **localhost** server (e.g. `http://127.0.0.1:6767`). Leave empty to auto-discover a locally running Omnigent server. Non-localhost URLs are not supported in this build."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "omnigent-container",
+          "title": "Omnigent",
+          "icon": "media/omnigent-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "omnigent-container": [
+        {
+          "type": "tree",
+          "id": "omnigent.home",
+          "name": "Omnigent"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "omnigent.home",
+        "contents": "Open the running Omnigent server UI in an editor tab.\n[Open Omnigent](command:omnigent.open)\nStart a local server with `omnigent server`, or set `omnigent.serverUrl` to a localhost URL."
+      }
+    ],
+    "commands": [
+      {
+        "command": "omnigent.open",
+        "title": "Omnigent: Open",
+        "icon": "media/omnigent-icon.svg"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "omnigent.open",
+          "group": "navigation@99"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "omnigent.open"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.74.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}

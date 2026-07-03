@@ -47,6 +47,7 @@ from omnigent.model_override import (
     normalize_model_for_provider,
     validate_model_override,
 )
+from omnigent.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -261,6 +262,10 @@ _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 # (RUNNER_TIMER_DISPATCH.md).
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 
+# Priority 5f.3: sys_advise_models — server-side via MCP intercept;
+# included in the tool surface only when smart routing is enabled.
+_ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
+
 # Priority 5h: Task lifecycle tools — runner-local sys_cancel_task.
 # The only cancellable task ids visible to the LLM are async dispatches
 # and sub-agent handles; observation happens through sys_read_inbox.
@@ -320,6 +325,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -450,6 +456,7 @@ _ALL_LOCAL_TOOLS = (
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
+    | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
@@ -979,6 +986,64 @@ def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
     return raw_harness
 
 
+def _subagent_cost_budget_from_args(
+    args: dict[str, Any],
+) -> dict[str, Any] | None:
+    """
+    Extract and validate the per-dispatch cost budget from ``sys_session_send`` args.
+
+    The optional ``cost_budget`` field is an object with max_cost_usd
+    (hard limit) and/or ask_thresholds_usd (soft checkpoints). At least
+    one must be present.
+
+    :param args: Parsed ``sys_session_send`` arguments.
+    :returns: A dict with max_cost_usd and/or ask_thresholds_usd, or
+        ``None`` when absent.
+    :raises ValueError: If cost_budget is malformed or values are invalid.
+    """
+    raw_args = args.get("args")
+    if isinstance(raw_args, dict):
+        budget = raw_args.get("cost_budget")
+        if budget is None:
+            return None
+
+        if not isinstance(budget, dict):
+            raise ValueError("cost_budget must be an object")
+
+        result: dict[str, Any] = {}
+
+        # Extract and validate max_cost_usd if present.
+        if "max_cost_usd" in budget:
+            max_cost = budget["max_cost_usd"]
+            if max_cost is not None:
+                max_cost = float(max_cost)
+                if max_cost <= 0:
+                    raise ValueError("cost_budget.max_cost_usd must be > 0")
+                result["max_cost_usd"] = max_cost
+
+        # Extract and validate ask_thresholds_usd if present.
+        if "ask_thresholds_usd" in budget:
+            thresholds = budget["ask_thresholds_usd"]
+            if thresholds is not None:
+                if not isinstance(thresholds, list):
+                    raise ValueError("cost_budget.ask_thresholds_usd must be an array")
+                thresholds = [float(t) for t in thresholds]
+                if not all(t > 0 for t in thresholds):
+                    raise ValueError("cost_budget.ask_thresholds_usd values must be > 0")
+                # Check that thresholds are less than max if both are set.
+                if "max_cost_usd" in result and result["max_cost_usd"] is not None:
+                    if any(t >= result["max_cost_usd"] for t in thresholds):
+                        raise ValueError("ask_thresholds_usd values must be < max_cost_usd")
+                result["ask_thresholds_usd"] = thresholds
+
+        # At least one must be present.
+        if not result:
+            raise ValueError("cost_budget must include max_cost_usd and/or ask_thresholds_usd")
+        return result
+
+    return None
+
+
 def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> frozenset[str]:
     """
     Resolve the canonical harness allowlist a sub-agent opts into.
@@ -1138,6 +1203,11 @@ async def _execute_subagent_tool(
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'harness': {exc}"
 
+    try:
+        cost_budget = _subagent_cost_budget_from_args(args)
+    except (ValueError, TypeError) as exc:
+        return f"Error: sys_session_send invalid 'cost_budget': {exc}"
+
     # By-session-id mode: post to an existing direct child instead of
     # spawning/continuing a named (agent, title) sub-agent.
     target_session_id = args.get("session_id")
@@ -1162,6 +1232,13 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'harness' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'harness' to continue "
+                f"session {target_session_id!r}."
+            )
+        if cost_budget is not None:
+            return (
+                "Error: sys_session_send 'cost_budget' applies only when a "
+                "sub-agent session is first created; it cannot change an "
+                "existing session. Re-send without 'cost_budget' to continue "
                 f"session {target_session_id!r}."
             )
         return await _send_to_existing_session(
@@ -1227,6 +1304,15 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'model' to continue "
                 "it, or sys_session_close it first to spawn a fresh "
                 "session on the requested model."
+            )
+        if cost_budget is not None:
+            return (
+                f"Error: sys_session_send 'cost_budget' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} "
+                f"title {session_name!r} already exists as "
+                f"{child_session_id}. Re-send without 'cost_budget' to "
+                "continue it, or sys_session_close it first to spawn a "
+                "fresh session with the requested budget."
             )
         child_wrapper_label = _session_wrapper_label(existing)
         existing_work = _runner_app.get_subagent_work(child_session_id)
@@ -1355,6 +1441,36 @@ async def _execute_subagent_tool(
             return "Error: server did not return child session_id"
         child_wrapper_label = _session_wrapper_label(child_data)
         created_child = True
+
+        # Attach a subagent_cost_budget policy to the child when requested.
+        # Non-fatal: the child session is still usable without the budget.
+        if cost_budget is not None:
+            policy_body = {
+                "name": "__subagent_cost_budget",
+                "type": "python",
+                "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+                "factory_params": cost_budget,  # Dict with max_cost_usd and/or ask_thresholds_usd
+                "enabled": True,
+            }
+            try:
+                pol_resp = await server_client.post(
+                    f"/v1/sessions/{child_session_id}/policies",
+                    json=policy_body,
+                    timeout=10.0,
+                )
+                if pol_resp.status_code >= 400:
+                    _logger.warning(
+                        "failed to set subagent_cost_budget policy on child %s: %s %s",
+                        child_session_id,
+                        pol_resp.status_code,
+                        pol_resp.text[:200],
+                    )
+            except httpx.HTTPError:
+                _logger.warning(
+                    "failed to set subagent_cost_budget policy on child %s",
+                    child_session_id,
+                    exc_info=True,
+                )
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
@@ -2824,7 +2940,12 @@ async def _session_get_info_via_rest(
             "status": snap.get("status"),
             "title": snap.get("title"),
             "agent_id": snap.get("agent_id"),
-            "agent_name": snap.get("agent_name"),
+            # Present the public agent name: a native-UI wrapper session
+            # (e.g. ``pi-native-ui``) reports its clean display name (``Pi``)
+            # so the internal ``-native-ui`` wrapper name never leaks to the
+            # model answering "what agent are you?". Non-wrapper names are
+            # unchanged.
+            "agent_name": public_agent_name(snap.get("agent_name")),
             "runner_id": snap.get("runner_id"),
             "runner_online": await _runner_online_or_none(snap.get("runner_id"), server_client),
             "host_id": snap.get("host_id"),
@@ -3508,7 +3629,11 @@ async def _collect_global_sessions(
     return [
         {
             "session_id": r.get("id"),
-            "agent_name": r.get("agent_name"),
+            # Hide the internal ``-native-ui`` wrapper name (e.g.
+            # ``pi-native-ui`` -> ``Pi``) in the global listing too, matching
+            # ``sys_session_get_info``. The server-side ``agent_name`` filter
+            # above still receives the caller's raw argument unchanged.
+            "agent_name": public_agent_name(r.get("agent_name")),
             "title": r.get("title"),
             "status": r.get("status"),
             "runner_id": r.get("runner_id"),

@@ -43,6 +43,47 @@ from omnigent.native_terminal import url_component
 _DEFAULT_KIRO_COMMAND = "kiro-cli"
 _KIRO_PATH_ENV = "OMNIGENT_KIRO_PATH"
 _AGENT_NAME = "kiro-native-ui"
+
+# Curated kiro-cli base models for the Web UI picker. Static (like cursor-native,
+# the other launch-only-model vendor) rather than runner-discovered: the list is
+# global and fixed, not account-scoped. ids match what ``kiro-cli --model`` accepts
+# (and ``--list-models`` reports); ``auto`` is kiro's default and a real literal id.
+# Refresh by hand from ``kiro-cli chat --list-models --format json`` if Kiro
+# ships/renames a model.
+_KIRO_BASE_MODELS: list[dict[str, Any]] = [
+    {"id": "auto", "displayName": "Auto", "isDefault": True},
+    {"id": "claude-sonnet-4.5", "displayName": "Claude Sonnet 4.5"},
+    {"id": "claude-sonnet-4", "displayName": "Claude Sonnet 4"},
+    {"id": "claude-haiku-4.5", "displayName": "Claude Haiku 4.5"},
+    {"id": "deepseek-3.2", "displayName": "DeepSeek V3.2"},
+    {"id": "minimax-m2.5", "displayName": "MiniMax M2.5"},
+    {"id": "minimax-m2.1", "displayName": "MiniMax M2.1"},
+    {"id": "glm-5", "displayName": "GLM-5"},
+    {"id": "qwen3-coder-next", "displayName": "Qwen3 Coder Next"},
+]
+
+
+def kiro_base_model_options() -> list[dict[str, Any]]:
+    """Return the curated kiro base-model options for the Web UI picker.
+
+    Mirrors :func:`omnigent.cursor_native.cursor_base_model_options`: each option
+    carries ``id`` (the value ``kiro-cli --model`` accepts), ``displayName``, and
+    ``isDefault``/``isCurrent`` flags. kiro applies the model only at launch, so
+    the picked id is persisted as ``model_override`` and consumed by the runner.
+
+    :returns: Fresh option dicts (callers may mutate); base order preserved.
+    """
+    return [
+        {
+            "id": m["id"],
+            "displayName": m["displayName"],
+            "isDefault": bool(m.get("isDefault", False)),
+            "isCurrent": False,
+        }
+        for m in _KIRO_BASE_MODELS
+    ]
+
+
 _TERMINAL_NAME = "kiro"
 _TERMINAL_SESSION_KEY = "main"
 _TMUX_ATTACH_ENV_ALLOWLIST = (

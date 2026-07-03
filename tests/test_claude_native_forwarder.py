@@ -182,6 +182,30 @@ async def _get_recorded_request(
             return request
 
 
+async def _get_recorded_item_request(
+    server: _RecordingHTTPServer,
+    *,
+    timeout_s: float = 5.0,
+) -> dict[str, Any]:
+    """
+    Await the next ``external_conversation_item`` POST, skipping status edges.
+
+    The forwarder now emits a turn-start ``external_session_status: running``
+    (carrying the turn's response id, which drives the live tool-card spinner
+    in ap-web) BEFORE a turn's items each poll. Tests that only care about the
+    forwarded conversation items use this to skip that leading status edge (and
+    any trailing idle) without asserting on it.
+
+    :param server: Recording HTTP server.
+    :param timeout_s: Per-``get`` timeout while skipping non-item POSTs.
+    :returns: The next recorded ``external_conversation_item`` POST.
+    """
+    while True:
+        request = await _get_recorded_request(server, timeout_s=timeout_s)
+        if request["body"].get("type") == "external_conversation_item":
+            return request
+
+
 async def _wait_for_json_file(path: Path, *, timeout_s: float = 5.0) -> dict[str, Any]:
     """
     Wait until a JSON object file exists and can be parsed.
@@ -1142,10 +1166,11 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         )
     )
     try:
-        # Seven transcript items, then the ``Stop`` → idle status. Items are
-        # forwarded before status each poll, so the first 7 collected are the
-        # items; the trailing idle is not asserted here.
-        requests = [await _get_recorded_request(server) for _index in range(7)]
+        # The turn-start ``running`` status (carrying the turn's response id)
+        # posts first, then the seven transcript items, then the ``Stop`` →
+        # idle status. Collect the running edge + 7 items; the trailing idle is
+        # not asserted here.
+        requests = [await _get_recorded_request(server) for _index in range(8)]
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1154,8 +1179,9 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert [request["path"] for request in requests] == ["/v1/sessions/conv_abc/events"] * 7
+    assert [request["path"] for request in requests] == ["/v1/sessions/conv_abc/events"] * 8
     assert [request["body"]["type"] for request in requests] == [
+        "external_session_status",
         "external_conversation_item",
         "external_conversation_item",
         "external_conversation_item",
@@ -1164,6 +1190,10 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         "external_conversation_item",
         "external_conversation_item",
     ]
+    # The leading status is the turn-start ``running`` edge carrying the turn's
+    # response id (what drives the live tool-card spinner on the client).
+    assert requests[0]["body"]["data"]["status"] == "running"
+    assert isinstance(requests[0]["body"]["data"].get("response_id"), str)
     posted = [
         request["body"]["data"]
         for request in requests
@@ -1206,6 +1236,11 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
     assert posted[5]["response_id"] == posted[6]["response_id"]
     assert posted[5]["response_id"] != posted[4]["response_id"]
     assert posted[1]["response_id"].startswith("resp_claude_")
+    # The turn-start running edge carries an assistant turn's response id (here
+    # the whole multi-turn transcript flushes in one poll, so it's the last
+    # turn's id). The single-turn id↔function_call match is asserted directly in
+    # test_forwarder_emits_turn_start_running_with_response_id.
+    assert requests[0]["body"]["data"]["response_id"].startswith("resp_claude_")
 
 
 @pytest.mark.asyncio
@@ -1355,6 +1390,9 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         )
     )
     try:
+        # The turn-start ``running`` status posts first (the transcript has an
+        # assistant turn), then the assistant message item.
+        running = await _get_recorded_request(server)
         request = await _get_recorded_request(server)
     finally:
         task.cancel()
@@ -1364,6 +1402,8 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         server.server_close()
         thread.join(timeout=5.0)
 
+    assert running["body"]["type"] == "external_session_status"
+    assert running["body"]["data"]["status"] == "running"
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_type"] == "message"
@@ -1432,9 +1472,11 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # The first (and only) status POST is the Stop → idle. A ``running``
     # arriving first would mean UserPromptSubmit is still wrongly mapped.
     assert request["path"] == "/v1/sessions/conv_abc/events"
+    # The Stop hook carries its authoritative background-shell count (0 here,
+    # no background tasks) so a finished shell clears the indicator.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 
@@ -1600,7 +1642,7 @@ async def test_forwarder_ignores_subagent_stop_hook(
 
     assert first["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle"},
+        "data": {"status": "idle", "background_task_count": 0},
     }
 
 
@@ -2090,7 +2132,7 @@ async def test_forwarder_start_at_end_uses_byte_offset_for_new_lines(
         assert state["byte_offset"] == len(old_prefix.encode("utf-8"))
         with transcript_path.open("a", encoding="utf-8") as handle:
             handle.write("}\n")
-        request = await _get_recorded_request(server)
+        request = await _get_recorded_item_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2175,7 +2217,7 @@ async def test_forwarder_migrates_line_cursor_state_to_byte_offset(tmp_path: Pat
         )
     )
     try:
-        request = await _get_recorded_request(server)
+        request = await _get_recorded_item_request(server)
         state = await _wait_for_json_state(
             bridge_dir / "transcript_forwarder.json",
             lambda payload: payload.get("line_cursor") == 2 and "byte_offset" in payload,
@@ -2260,7 +2302,7 @@ async def test_forwarder_waits_for_missing_fresh_transcript_without_warning(
             encoding="utf-8",
         )
 
-        request = await _get_recorded_request(server)
+        request = await _get_recorded_item_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2376,7 +2418,7 @@ async def test_forwarder_skips_to_end_on_stale_byte_cursor_state(tmp_path: Path)
         with transcript_path.open("a", encoding="utf-8") as f:
             f.write(new_record)
         # The new record should be forwarded.
-        request = await _get_recorded_request(server)
+        request = await _get_recorded_item_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2485,7 +2527,7 @@ async def test_forwarder_skips_to_end_on_out_of_range_byte_cursor_without_finger
         )
         with transcript_path.open("a", encoding="utf-8") as f:
             f.write(new_record)
-        request = await _get_recorded_request(server)
+        request = await _get_recorded_item_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2638,8 +2680,9 @@ async def test_forwarder_does_not_replay_after_compaction(tmp_path: Path) -> Non
         with transcript_path.open("a", encoding="utf-8") as f:
             f.write(new_record)
 
-        # The new record should be the only thing forwarded.
-        request = await _get_recorded_request(server)
+        # The new record should be the only item forwarded (the turn also
+        # emits a leading running status edge, which this helper skips).
+        request = await _get_recorded_item_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2797,7 +2840,7 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         )
     )
     try:
-        request = await _get_recorded_request(server)
+        request = await _get_recorded_item_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2825,7 +2868,8 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     A malformed transcript item that Omnigent rejects with a permanent 4xx
     should not be reposted forever at the poll interval. After the
     retry budget is exhausted, the forwarder emits a failed status,
-    marks the source id handled, and persists the new byte cursor.
+    marks the source id handled, persists the new byte cursor, and
+    dead-letters the dropped item to disk so it is recoverable (#1120).
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -2890,18 +2934,39 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         )
 
     persisted = json.loads((bridge_dir / "transcript_forwarder.json").read_text("utf-8"))
+    # The turn-start ``running`` status (carrying the turn's response id) leads,
+    # then the poison item is attempted twice, then the forwarder-failed status.
     assert [request["type"] for request in requests] == [
+        "external_session_status",
         "external_conversation_item",
         "external_conversation_item",
         "external_session_status",
     ]
-    assert requests[-1]["data"] == {"status": "failed"}
+    # The turn-start ``running`` edge carries the turn's response id, and the
+    # failed edge carries BOTH the drop reason as ``output`` (#1113 — the
+    # server surfaces it as the failure detail) and that same response id so
+    # it closes the streaming turn instead of leaving its tool cards spinning.
+    assert requests[0]["data"]["status"] == "running"
+    assert requests[-1]["data"] == {
+        "status": "failed",
+        "output": "transcript item poison-item:0:message rejected",
+        "response_id": requests[0]["data"]["response_id"],
+    }
     assert first.byte_offset == 0
     assert second.byte_offset == transcript_path.stat().st_size
     assert second.line_cursor == 1
     assert second.seen_source_ids == ("poison-item:0:message",)
     assert persisted["byte_offset"] == transcript_path.stat().st_size
     assert persisted["seen_source_ids"] == ["poison-item:0:message"]
+    # The dropped item is dead-lettered to disk so it is recoverable
+    # instead of silently lost (#1120).
+    dead_letter = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    assert len(dead_letter) == 1
+    record = json.loads(dead_letter[0])
+    assert record["session_id"] == "conv_abc"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["reason"] == "permanent HTTP failure after retries"
+    assert record["payload"]["item_type"] == "message"
 
 
 @pytest.mark.asyncio
@@ -5334,8 +5399,12 @@ async def test_assistant_item_held_until_its_deltas_forward(tmp_path: Path) -> N
             ordering=ordering,
         )
         # Held: the item was NOT posted and the durable cursor did not
-        # advance past it, so the next poll re-reads it.
-        assert [c.body["type"] for c in captured] == ["external_output_text_delta"]
+        # advance past it, so the next poll re-reads it. (The turn-start
+        # ``external_session_status: running`` edge is filtered out here — this
+        # test is about delta-vs-item ordering, not the status edge.)
+        assert [
+            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
+        ] == ["external_output_text_delta"]
         assert item_state.byte_offset == 0
         assert item_state.seen_source_ids == ()
 
@@ -5370,7 +5439,9 @@ async def test_assistant_item_held_until_its_deltas_forward(tmp_path: Path) -> N
     assert item_posts[0]["data"]["item_data"]["content"] == [
         {"type": "output_text", "text": "Hello world"}
     ]
-    assert [c.body["type"] for c in captured][:2] == [
+    assert [c.body["type"] for c in captured if c.body["type"] != "external_session_status"][
+        :2
+    ] == [
         "external_output_text_delta",
         "external_output_text_delta",
     ]
@@ -5405,6 +5476,9 @@ async def test_assistant_item_posts_after_hold_timeout(
 
     ordering = forwarder._DeltaOrderingState()
     captured: list[_CapturedDeltaPost] = []
+    # Share one dedupe across polls (as the real loop does) so the turn-start
+    # ``running`` status fires once, not per call.
+    dedupe = forwarder._ForwardDedupeState()
     async with _delta_capture_client(captured) as client:
         await forwarder._forward_available_deltas(
             client=client,
@@ -5421,10 +5495,14 @@ async def test_assistant_item_posts_after_hold_timeout(
             agent_name="claude-native-ui",
             state=_transcript_state_for(transcript_path),
             retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
+            dedupe=dedupe,
             ordering=ordering,
         )
-        assert [c.body["type"] for c in captured] == ["external_output_text_delta"]
+        # Status edges (the turn-start ``running``) filtered out — this test
+        # is about the delta-then-held-item ordering.
+        assert [
+            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
+        ] == ["external_output_text_delta"]
         assert state.byte_offset == 0  # held
 
         clock["now"] = 100.0 + forwarder._ASSISTANT_ITEM_DELTA_HOLD_S
@@ -5435,7 +5513,7 @@ async def test_assistant_item_posts_after_hold_timeout(
             agent_name="claude-native-ui",
             state=state,
             retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
+            dedupe=dedupe,
             ordering=ordering,
         )
 
@@ -5496,6 +5574,9 @@ async def test_assistant_item_stays_held_until_true_final_chunk(tmp_path: Path) 
     delta_state = forwarder.DeltaForwardState()
     item_state = _transcript_state_for(transcript_path)
     captured: list[_CapturedDeltaPost] = []
+    # Share one dedupe across polls (as the real loop does) so the turn-start
+    # ``running`` status fires once, not per poll.
+    dedupe = forwarder._ForwardDedupeState()
 
     async def _poll(client: httpx.AsyncClient) -> None:
         nonlocal delta_state, item_state
@@ -5514,7 +5595,7 @@ async def test_assistant_item_stays_held_until_true_final_chunk(tmp_path: Path) 
             agent_name="claude-native-ui",
             state=item_state,
             retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
+            dedupe=dedupe,
             ordering=ordering,
         )
 
@@ -5541,7 +5622,9 @@ async def test_assistant_item_stays_held_until_true_final_chunk(tmp_path: Path) 
         await _poll(client)
 
     # Commit posts only AFTER all three deltas — the order downstream assumes.
-    assert [c.body["type"] for c in captured] == [
+    # The turn-start ``running`` status edge is filtered out (it fires once,
+    # before the deltas); this test is about delta-then-commit ordering.
+    assert [c.body["type"] for c in captured if c.body["type"] != "external_session_status"] == [
         "external_output_text_delta",
         "external_output_text_delta",
         "external_output_text_delta",
@@ -5695,8 +5778,11 @@ async def test_without_hold_commit_posts_before_final_delta(tmp_path: Path) -> N
             dedupe=forwarder._ForwardDedupeState(),
             ordering=None,
         )
-        # Bug: with no hold the commit posts immediately, before the final chunk.
-        assert [c.body["type"] for c in captured] == [
+        # Bug: with no hold the commit posts immediately, before the final
+        # chunk. The turn-start ``running`` status edge is filtered out.
+        assert [
+            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
+        ] == [
             "external_output_text_delta",
             "external_conversation_item",
         ]
@@ -5713,7 +5799,7 @@ async def test_without_hold_commit_posts_before_final_delta(tmp_path: Path) -> N
         )
 
     # The final delta lands AFTER the commit — the inverted order that dupes.
-    types = [c.body["type"] for c in captured]
+    types = [c.body["type"] for c in captured if c.body["type"] != "external_session_status"]
     commit_idx = types.index("external_conversation_item")
     final_delta_idx = max(i for i, t in enumerate(types) if t == "external_output_text_delta")
     assert commit_idx < final_delta_idx
@@ -6371,3 +6457,459 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    forwarder._reset_forward_health()
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
+        forwarder._note_forward_failure("item:source-1")
+    # Below threshold: not yet degraded.
+    assert forwarder._forward_health.degraded_logged is False
+
+    forwarder._note_forward_failure("item:source-1")  # crosses threshold
+    assert forwarder._forward_health.degraded_logged is True
+    assert forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    forwarder._note_forward_failure("item:source-1")
+    assert forwarder._forward_health.degraded_logged is True
+    assert (
+        forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD + 1
+    )
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    forwarder._reset_forward_health()
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        forwarder._note_forward_failure("status:idle")
+    assert forwarder._forward_health.degraded_logged is True
+
+    forwarder._note_forward_success()
+
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False
+
+
+def test_retry_tracker_transient_failures_escalate_degraded() -> None:
+    """
+    Transient failures escalate via the retry tracker boundary (#1120).
+
+    The claude forwarder retries transient errors (connect timeouts, 503s)
+    forever, so they never reach the permanent-drop ``exhausted`` path. This
+    proves the degraded indicator still fires for that case — the exact
+    503/connect-timeout outage #1120 is about — because every
+    ``record_failure`` counts, not just exhausted give-ups. A later
+    ``clear`` (a post that got through) re-arms the indicator.
+    """
+    forwarder._reset_forward_health()
+    tracker = forwarder._PostRetryTracker()
+    transient = httpx.ConnectError("connect timeout")
+
+    for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
+        decision = tracker.record_failure("item:source-1", transient)
+        # Transient failures are retried, never dropped.
+        assert decision.exhausted is False
+        assert decision.permanent is False
+
+    assert forwarder._forward_health.degraded_logged is True
+
+    tracker.clear("item:source-1")
+    assert forwarder._forward_health.consecutive_failures == 0
+    assert forwarder._forward_health.degraded_logged is False
+
+
+@pytest.mark.asyncio
+async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
+    """
+    A permanently-rejected sub-agent transcript item is dead-lettered (#1120).
+
+    Drives the real ``_forward_available_subagents`` drop path: the
+    ``external_subagent_start`` POST succeeds, the child item POST is rejected
+    with a permanent 400 (and the item tracker exhausts on the first failure),
+    so the dropped item is appended to ``{bridge_dir}/dead_letter.jsonl`` instead
+    of being silently lost.
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    forwarder._reset_forward_health()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="dl1",
+        agent_type="Explore",
+        description="dead-letter item flow",
+        tool_use_id="toolu_dl",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-assistant-dl",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "lost"}],
+                },
+            },
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Accept the start POST; permanently reject the child item POST.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_subagent_start":
+            return httpx.Response(200, json={"child_session_id": "conv_child_dl"})
+        if body.get("type") == "external_conversation_item":
+            return httpx.Response(400, json={"error": "nope"})
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0, max_permanent_attempts=1
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    forwarder._reset_forward_health()
+    dl_path = bridge_dir / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_child_dl"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["payload"]["item_data"]["content"][0]["text"] == "lost"
+
+
+@pytest.mark.asyncio
+async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
+    """
+    A permanently-rejected sub-agent START is dead-lettered (#1120).
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    forwarder._reset_forward_health()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="dlstart1",
+        agent_type="Explore",
+        description="dead-letter start flow",
+        tool_use_id="toolu_dlstart",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Permanently reject the sub-agent start POST.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        return httpx.Response(400, json={"error": "nope"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0, max_permanent_attempts=1
+            ),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    forwarder._reset_forward_health()
+    dl_path = bridge_dir / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["session_id"] == "conv_parent"
+    assert record["event_type"] == "external_subagent_start"
+    assert record["payload"]["subagent_id"] == "dlstart1"
+    assert record["payload"]["agent_type"] == "Explore"
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
+    tmp_path: Path,
+) -> None:
+    """
+    ``Stop`` with ``background_tasks`` → ``waiting`` instead of ``idle``.
+
+    When Claude Code's Stop hook carries a non-empty ``background_tasks``
+    array (shells still running), the forwarder must publish ``waiting``
+    so the web UI keeps showing the spinner. Without this, the chat
+    interface shows "idle" while the terminal shows "1 shell running".
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [
+                {
+                    "id": "abc123",
+                    "type": "shell",
+                    "status": "running",
+                    "description": "Wait for CI",
+                    "command": "sleep 120",
+                },
+            ],
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert request["path"] == "/v1/sessions/conv_abc/events"
+    assert request["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "waiting", "background_task_count": 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_external_session_status_includes_and_omits_response_id() -> None:
+    """
+    ``post_external_session_status`` attaches ``response_id`` only when given.
+
+    The turn-bearing edges (native Claude's turn start/end) carry the response
+    id so ap-web can drive the bubble's streaming lifecycle; the bare,
+    turn-agnostic edges (e.g. the sub-agent quiescence badge) must keep posting
+    a ``data`` object with no ``response_id`` key so nothing spuriously matches.
+    """
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder.post_external_session_status(
+            client, session_id="conv_abc", status="running", response_id="resp_1"
+        )
+        await forwarder.post_external_session_status(client, session_id="conv_abc", status="idle")
+
+    assert bodies[0] == {
+        "type": "external_session_status",
+        "data": {"status": "running", "response_id": "resp_1"},
+    }
+    # Bare edge: no response_id key (not a null) so the server's optional
+    # validation passes and the client never opens a streaming response.
+    assert bodies[1] == {
+        "type": "external_session_status",
+        "data": {"status": "idle"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) -> None:
+    """
+    A ``Stop`` → idle edge carries the turn's ``response_id`` when one is known.
+
+    This is what closes the streaming ``activeResponse`` ap-web opened from the
+    turn-start ``running`` edge, so the trailing tool card stops spinning.
+    """
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "Stop", "session_id": "claude-session"},
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_abc"
+        )
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_turn_1",
+        )
+
+    assert bodies == [
+        {
+            "type": "external_session_status",
+            # The Stop→idle edge carries the turn's response id AND the
+            # background-shell tally (0 here — no shells); the live-tool-card
+            # and background-task features share this one status edge.
+            "data": {
+                "status": "idle",
+                "background_task_count": 0,
+                "response_id": "resp_turn_1",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Path) -> None:
+    """
+    The first assistant output of a turn publishes ``running`` + its response id.
+
+    Native Claude's running/idle BADGE stays PTY-derived; this id-bearing
+    ``running`` edge is the additional signal that lets ap-web open a streaming
+    ``activeResponse`` for the turn, so the forwarded tool cards (which share
+    the same response id) render LIVE rather than as static completed cards.
+    The running edge's response id must equal the forwarded items' response id.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "user-1",
+                        "message": {"role": "user", "content": "read TODO"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-tool-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_read_1",
+                                    "name": "Read",
+                                    "input": {"file_path": "TODO.md"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # First POST of the poll is the turn-start running status (it runs
+        # before the items in _forward_available_items); the two items follow.
+        running = await _get_recorded_request(server)
+        item_a = await _get_recorded_request(server)
+        item_b = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert running["body"]["type"] == "external_session_status"
+    assert running["body"]["data"]["status"] == "running"
+    running_rid = running["body"]["data"]["response_id"]
+    assert isinstance(running_rid, str) and running_rid
+    # The running edge's response id matches the ASSISTANT turn's forwarded
+    # item (the function_call), so that bubble enters the streaming lifecycle
+    # on the client. The user message carries its own distinct response id.
+    function_call = next(
+        body
+        for body in (item_a, item_b)
+        if body["body"]["type"] == "external_conversation_item"
+        and body["body"]["data"]["item_type"] == "function_call"
+    )
+    assert function_call["body"]["data"]["response_id"] == running_rid

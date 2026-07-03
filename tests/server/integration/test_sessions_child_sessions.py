@@ -1662,6 +1662,52 @@ async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale
     assert recovered_for == [child["id"]]
 
 
+async def test_subagent_background_task_waiting_delivers_to_parent_as_idle(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sub-agent's background-task ``waiting`` still delivers terminal status.
+
+    Regression for the parent-orchestrator hang: a claude-native sub-agent
+    relabels its ``Stop`` turn-end ``idle`` to ``waiting`` when a background
+    shell lingers. The terminal-delivery branch only fires for
+    ``idle``/``failed``, so an un-collapsed ``waiting`` would skip delivery and
+    the parent would wait forever. The server must collapse the sub-agent's
+    background-task ``waiting`` to ``idle`` so delivery (here, the recovery
+    path) still runs for the child.
+    """
+    child = await _create_native_child(client, name="orch-bg-waiting")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Force the direct forward to miss so delivery takes the recovery path."""
+        return
+
+    recovered_for: list[str] = []
+
+    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        recovered_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "waiting", "background_task_count": 1},
+        },
+    )
+
+    # Delivery fired despite the incoming `waiting`: the collapse to `idle`
+    # let the terminal-status branch run for THIS child (recovery invoked,
+    # 202 Accepted) instead of silently skipping and stranding the parent.
+    assert resp.status_code == 202, resp.text
+    assert recovered_for == [child["id"]]
+
+
 async def test_subagent_idle_forward_503s_when_recovery_also_fails(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

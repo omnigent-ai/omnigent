@@ -1767,7 +1767,7 @@ def test_get_openai_client_missing_databricks_sdk_raises_actionable_error(monkey
     available, the function must raise ``ImportError`` with install
     instructions — not crash with an opaque traceback.
 
-    Regression test for https://github.com/omnigent-ai/omnigent/issues/123.
+    Regression test: the SDK-missing path must fail loudly, not silently.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
@@ -1795,7 +1795,8 @@ def test_get_openai_client_missing_databricks_sdk_with_env_falls_through(monkeyp
     the function should log a warning and return a client configured from the
     env vars — not crash.
 
-    Regression test for https://github.com/omnigent-ai/omnigent/issues/123.
+    Regression test: a missing ``databricks-sdk`` must degrade to the
+    env-var client with a warning, not crash.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log capture fixture.

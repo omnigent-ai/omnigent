@@ -2022,7 +2022,7 @@ async def _attach_direct_tmux(
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _tmux_session_alive
+    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive, _tmux_session_alive
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     env = dict(os.environ)
@@ -2040,11 +2040,46 @@ async def _attach_direct_tmux(
         env=env,
     )
     startup_profiler.mark("tmux attach subprocess started")
-    await process.wait()
+
+    # Poll for a dead pane in the background. With ``remain-on-exit on``,
+    # the tmux session outlives the inner CLI, so ``tmux attach`` never exits
+    # on its own — the user sees "Pane is dead" and Ctrl-C is silently
+    # dropped because there is no process to receive the signal. Killing the
+    # attach subprocess forces it to exit so the CLI can tear down cleanly.
+    async def _kill_when_pane_dead() -> None:
+        _POLL_INTERVAL_S = 0.5
+        while True:
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            if process.returncode is not None:
+                return  # already exited naturally
+            is_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+            if is_dead is True:
+                _logger.debug("direct-tmux: pane is dead; killing tmux attach child")
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                return
+
+    watcher = asyncio.create_task(_kill_when_pane_dead(), name="direct-tmux-pane-watcher")
+    try:
+        await process.wait()
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
     startup_profiler.mark("tmux attach subprocess exited")
-    if await _tmux_session_alive(str(socket_path), tmux_target):
-        return _AttachOutcome.DETACHED
-    return _AttachOutcome.EXITED
+    # Use the tri-state probe so a dead pane (session alive, pane_dead=1) is
+    # treated as EXITED rather than DETACHED. With remain-on-exit the session
+    # outlives the inner CLI, so _tmux_session_alive alone would wrongly signal
+    # a user detach and the reconnect loop would re-attach to the dead pane.
+    pane_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+    if pane_dead is True:
+        return _AttachOutcome.EXITED
+    if pane_dead is None:
+        # Inconclusive probe — fall back to session-existence check.
+        if not await _tmux_session_alive(str(socket_path), tmux_target):
+            return _AttachOutcome.EXITED
+    return _AttachOutcome.DETACHED
 
 
 async def _attach_with_transcript_forwarder(
@@ -3462,6 +3497,55 @@ def _claude_transcript_records_from_session_items(
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
     for index, item in enumerate(items):
+        # Compaction items carry the post-compaction context. Replace
+        # all prior records with the compacted messages so the
+        # reconstructed transcript reflects the compacted state.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                records.clear()
+                parent_uuid = None
+                tool_parent_by_call_id.clear()
+                # Emit a compact_boundary system record so Claude
+                # Code recognizes the compaction on resume.
+                boundary_uuid = _synthetic_claude_transcript_uuid(
+                    session_id=session_id,
+                    external_session_id=external_session_id,
+                    item=item,
+                    index=index,
+                )
+                records.append(
+                    {
+                        "parentUuid": None,
+                        "isSidechain": False,
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "content": "Conversation compacted",
+                        "isMeta": False,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "uuid": boundary_uuid,
+                        "level": "info",
+                    }
+                )
+                parent_uuid = boundary_uuid
+                for ci, cm in enumerate(compacted_msgs):
+                    cm_uuid = _synthetic_claude_transcript_uuid(
+                        session_id=session_id,
+                        external_session_id=external_session_id,
+                        item=cm,
+                        index=ci,
+                    )
+                    cm_record = _claude_transcript_record_from_session_item(
+                        cm,
+                        session_id=external_session_id,
+                        record_uuid=cm_uuid,
+                        parent_uuid=parent_uuid,
+                        cwd=cwd,
+                    )
+                    if cm_record is not None:
+                        records.append(cm_record)
+                        parent_uuid = cm_uuid
+            continue
         record_uuid = _synthetic_claude_transcript_uuid(
             session_id=session_id,
             external_session_id=external_session_id,

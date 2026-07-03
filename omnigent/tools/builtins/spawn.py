@@ -280,17 +280,19 @@ def _build_sys_session_send_schema(
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model, harness} when a spec-level policy "
-            "requires explicit dispatch metadata, a per-dispatch model "
-            "override, or an allowlisted harness override."
+            "{input, purpose, model, harness, cost_budget} when a spec-level "
+            "policy requires explicit dispatch metadata, a per-dispatch model "
+            "override, an allowlisted harness override, or a per-subagent "
+            "cost budget."
         )
         if harness_opt_in
         else (
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model} when a spec-level policy requires "
-            "explicit dispatch metadata or a per-dispatch model override."
+            "{input, purpose, model, cost_budget} when a spec-level policy "
+            "requires explicit dispatch metadata, a per-dispatch model "
+            "override, or a per-subagent cost budget."
         )
     )
     return {
@@ -348,6 +350,37 @@ def _build_sys_session_send_schema(
                                         ),
                                     },
                                     **harness_property,
+                                    "cost_budget": {
+                                        "type": "object",
+                                        "properties": {
+                                            "max_cost_usd": {
+                                                "type": "number",
+                                                "description": (
+                                                    "Optional hard limit in USD. "
+                                                    "Blocks tool calls once exceeded "
+                                                    "on expensive models."
+                                                ),
+                                            },
+                                            "ask_thresholds_usd": {
+                                                "type": "array",
+                                                "items": {"type": "number"},
+                                                "description": (
+                                                    "Optional soft warning checkpoints "
+                                                    "in USD. The subagent asks for "
+                                                    "approval the first time spend "
+                                                    "crosses each threshold (each must "
+                                                    "be < max_cost_usd if both are set)."
+                                                ),
+                                            },
+                                        },
+                                        "description": (
+                                            "Optional per-subagent cost budget configuration "
+                                            "with max_cost_usd (hard limit) and/or "
+                                            "ask_thresholds_usd (soft checkpoints). At least "
+                                            "one must be set. Applies only when this send "
+                                            "creates the session; ignored on continuation sends."
+                                        ),
+                                    },
                                 },
                                 "required": ["input"],
                                 "additionalProperties": False,

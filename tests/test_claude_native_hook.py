@@ -1736,6 +1736,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client(mode))
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1755,37 +1756,63 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "ls"},
-            "tool_output": "ok",
-        },
-        {"hook_event_name": "UserPromptSubmit", "prompt": "hello"},
-    ],
-)
-def test_evaluate_policy_non_tool_call_phases_fail_open_on_error(
+def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    payload: dict[str, object],
 ) -> None:
     """
-    Off the tool-call gate, an unobtainable verdict stays fail-open.
+    A governed UserPromptSubmit blocks when no usable verdict is returned.
 
-    PostToolUse runs after the tool executed and the request gate is
-    advisory, so neither denies on a transport error — mirroring the
-    runner-side ``FAIL_CLOSED_PHASES`` (PR #163).
+    The request gate is the sole pre-turn enforcement point for native
+    sessions — a server outage must not let an over-budget or otherwise-
+    blocked request proceed. The output must be ``decision: "block"``.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": "hello"})),
+    )
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert result["reason"]
+
+
+def test_evaluate_policy_post_tool_use_fails_open_on_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    PostToolUse fails OPEN on a transport error — the tool already ran.
+
+    Mirroring the runner-side ``FAIL_CLOSED_PHASES``.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "tool_output": "ok",
+    }
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
 
     exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
@@ -1875,47 +1902,6 @@ def test_evaluate_policy_retries_5xx_and_succeeds(
     assert captured.out == ""
     # Two 503s then one 200 = 3 total attempts.
     assert call_count == 3
-
-
-def test_build_reauth_remints_and_preserves_routing_header(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    ``_build_reauth`` re-mints the bearer and keeps the routing header.
-
-    The fresh token must be merged OVER the existing headers so the
-    ``X-Databricks-Org-Id`` workspace-routing header (which the Apps server
-    needs to avoid a 403 reroute to the account) is preserved, not dropped.
-    """
-    monkeypatch.setattr(
-        "omnigent.runner._entry._make_auth_token_factory",
-        lambda server_url=None: lambda: "fresh-token",
-    )
-    reauth = claude_native_hook._build_reauth(
-        "https://ap.example.com",
-        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
-    )
-    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
-
-
-def test_build_reauth_returns_none_without_factory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    ``_build_reauth`` returns ``None`` when no refresh mechanism is available.
-
-    Local unauthenticated servers (no token factory) must not synthesize an
-    auth header; returning ``None`` lets the caller fall through to its normal
-    handling (which fails closed for a tool-call gate).
-    """
-    monkeypatch.setattr(
-        "omnigent.runner._entry._make_auth_token_factory",
-        lambda server_url=None: None,
-    )
-    reauth = claude_native_hook._build_reauth(
-        "https://ap.example.com", {"Authorization": "Bearer stale"}
-    )
-    assert reauth() is None
 
 
 def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
@@ -2056,3 +2042,361 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
         result["hookSpecificOutput"]["permissionDecisionReason"]
         == native_policy_hook._EVAL_UNAVAILABLE_REASON
     )
+
+
+# ── #1782: bound the reattach spin-loop ────────────────────────────────────
+#
+# Before the fix, ``_post_hook_with_reattach`` re-POSTed on every 5xx/transport
+# failure until a one-day wall-clock deadline. Against a persistently down
+# server that meant re-driving the turn (and respawning harness/tool
+# subprocesses) every <=30s for 24h — the spin half of the zombie pileup. The
+# fix bounds CONSECUTIVE HARD failures (server down/sick), classified by
+# EXCEPTION KIND + held time, while leaving a proxy-severed HELD poll (a slow
+# human waiting) untouched. The Polly review flagged that a pure wall-clock
+# threshold couldn't tell a 60s proxy-severed parked poll from a 60s connect
+# failure — hence the kind-based classification exercised below.
+
+
+def _scripted_client(
+    *,
+    script: list[tuple[str, float]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> type:
+    """Build an httpx.Client stub whose POSTs fail per a scripted plan.
+
+    Each entry is ``(kind, held_s)``: ``kind`` selects the failure raised and
+    ``held_s`` is how long that attempt "took" (advanced on a fake clock, so
+    tests run instantly). Past the end, the last entry repeats.
+
+    ``kind`` values:
+      * ``"connect"`` — :class:`httpx.ConnectError` (server never reached: hard)
+      * ``"severed"`` — :class:`httpx.RemoteProtocolError` (established then
+        dropped: a held-poll sever iff ``held_s`` >= the floor)
+      * ``"5xx"``     — a 503 response (server sick: hard)
+
+    :param script: Per-attempt ``(kind, held_s)`` plan.
+    :param monkeypatch: Installs the fake clock + no-op sleep.
+    :returns: A drop-in ``httpx.Client`` class; ``.calls`` counts POSTs.
+    """
+    clock = {"t": 0.0}
+    calls: list[str] = []
+
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _ScriptedClient:
+        calls: list[str] = []
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _ScriptedClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            i = len(calls)
+            calls.append(url)
+            kind, held_s = script[i] if i < len(script) else script[-1]
+            clock["t"] += held_s  # this attempt "took" held_s before failing
+            req = httpx.Request("POST", url)
+            if kind == "connect":
+                raise httpx.ConnectError("AP unreachable", request=req)
+            if kind == "severed":
+                raise httpx.RemoteProtocolError("server dropped the poll", request=req)
+            if kind == "5xx":
+                return httpx.Response(503, text="upstream down", request=req)
+            raise AssertionError(f"unknown scripted kind {kind!r}")
+
+    _ScriptedClient.calls = calls
+    return _ScriptedClient
+
+
+def test_reattach_bounds_consecutive_hard_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A down server no longer re-POSTs for a day (#1782 spin-loop).
+
+    Every attempt is an unreachable-server ``ConnectError``, so the loop must
+    give up after ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` attempts and return
+    ``None`` (caller fails-ask) — not spin until the day-long budget.
+    """
+    client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is None
+    assert len(client.calls) == claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES, (
+        "reattach must stop after the consecutive-hard-failure cap, not spin"
+    )
+
+
+def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server stuck returning 5xx is a hard failure and is bounded (#1782).
+
+    A sick server that keeps 500-ing is the spin just as much as an
+    unreachable one, so it must hit the same cap.
+    """
+    client = _scripted_client(script=[("5xx", 0.0)], monkeypatch=monkeypatch)
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is None
+    assert len(client.calls) == claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+
+
+def test_reattach_cap_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_HOOK_MAX_RETRIES`` tunes the hard-failure cap.
+
+    Operators fronting a flaky proxy can widen the budget. Re-import the
+    module under the env override so the module-level constant is recomputed.
+    """
+    import importlib
+
+    monkeypatch.setenv("OMNIGENT_HOOK_MAX_RETRIES", "3")
+    reloaded = importlib.reload(claude_native_hook)
+    try:
+        client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
+        monkeypatch.setattr(reloaded.httpx, "Client", client)
+
+        resp = reloaded._post_hook_with_reattach(
+            url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+            headers={},
+            payload={"hook_event_name": "PreToolUse"},
+            hook_label="permission",
+        )
+        assert resp is None
+        assert reloaded._PERMISSION_MAX_CONSECUTIVE_FAILURES == 3
+        assert len(client.calls) == 3
+    finally:
+        # Restore the module for other tests (monkeypatch unsets the env var,
+        # but the reloaded constant would persist without this).
+        monkeypatch.delenv("OMNIGENT_HOOK_MAX_RETRIES", raising=False)
+        importlib.reload(claude_native_hook)
+
+
+def test_reattach_bad_env_max_retries_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-integer ``OMNIGENT_HOOK_MAX_RETRIES`` must not crash the hook.
+
+    ``int("banana")`` at import time would raise and defeat the terminal
+    fallback; the guarded parse keeps the default instead (#1782 review note).
+    """
+    import importlib
+
+    monkeypatch.setenv("OMNIGENT_HOOK_MAX_RETRIES", "banana")
+    reloaded = importlib.reload(claude_native_hook)
+    try:
+        assert reloaded._PERMISSION_MAX_CONSECUTIVE_FAILURES == 8  # default preserved
+    finally:
+        monkeypatch.delenv("OMNIGENT_HOOK_MAX_RETRIES", raising=False)
+        importlib.reload(claude_native_hook)
+
+
+def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A proxy severing a HELD poll must never cap a slow human (#1782 review).
+
+    This is the exact scenario Polly flagged: a legitimately-parked approval
+    behind a proxy that severs the idle long-poll every ~60s. Each sever is an
+    established-then-dropped ``RemoteProtocolError`` held past the floor — a
+    held-poll sever, NOT a hard failure — so the counter resets every time and
+    the human is never fail-asked. We script far more severs than the cap and
+    assert the loop keeps retrying, then a real 2xx (the human answers) returns.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 50.0  # ~60s proxy idle
+    # 3x the cap in held-poll severs, then a success — if severs counted, it
+    # would have fail-asked long before reaching the success.
+    n_severs = cap * 3
+    clock = {"t": 0.0}
+    calls: list[str] = []
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _SeverThenAnswerClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _SeverThenAnswerClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            i = len(calls)
+            calls.append(url)
+            req = httpx.Request("POST", url)
+            if i < n_severs:
+                clock["t"] += held  # poll was held for the proxy idle interval
+                raise httpx.RemoteProtocolError("proxy severed idle poll", request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _SeverThenAnswerClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200, (
+        "a slow human behind a severing proxy was capped — the #1782 regression"
+    )
+    assert len(calls) == n_severs + 1  # retried through every sever, then answered
+
+
+def test_reattach_fast_flapping_connection_is_hard_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An established connection that drops instantly is a flap, not a poll.
+
+    A crash-looping server that accepts then immediately resets the connection
+    raises the same ``RemoteProtocolError`` as a real held-poll sever — but
+    held for ~0s. The held-time floor classifies it as a hard failure so this
+    tight loop is still bounded (it must not masquerade as a parked poll).
+    """
+    client = _scripted_client(script=[("severed", 0.0)], monkeypatch=monkeypatch)
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is None
+    assert len(client.calls) == claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES, (
+        "an instant establish-drop flap must be bounded like any hard failure"
+    )
+
+
+def test_held_poll_floor_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_HOOK_HELD_POLL_FLOOR_S`` tunes the flap-vs-held boundary.
+
+    Operators behind an aggressive proxy whose idle timeout is under the 10s
+    default can lower the floor so their legitimate slow-human severs stay
+    classified as held polls (reset), not flaps (counted) — closing the one
+    narrow human-capping edge. A malformed value falls back to the default.
+    """
+    import importlib
+
+    monkeypatch.setenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", "3.5")
+    reloaded = importlib.reload(claude_native_hook)
+    try:
+        assert reloaded._PERMISSION_HELD_POLL_FLOOR_S == 3.5
+    finally:
+        monkeypatch.delenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", raising=False)
+        importlib.reload(claude_native_hook)
+
+    # Malformed / non-finite overrides must not crash the hook or silently
+    # disable flap detection — each falls back to the 10s default. "inf" would
+    # make every sever a held poll; "nan" makes held_s < floor always False.
+    for bad in ("not-a-number", "inf", "nan", "-inf"):
+        monkeypatch.setenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", bad)
+        reloaded = importlib.reload(claude_native_hook)
+        try:
+            assert reloaded._PERMISSION_HELD_POLL_FLOOR_S == 10.0, (
+                f"bad floor {bad!r} not rejected"
+            )
+        finally:
+            monkeypatch.delenv("OMNIGENT_HOOK_HELD_POLL_FLOOR_S", raising=False)
+            importlib.reload(claude_native_hook)
+
+
+def test_reattach_never_resolving_severs_are_bounded_by_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sick backend behind a holding proxy still terminates (#1782 review).
+
+    The known residual: a dead backend behind a proxy that accepts then
+    silently severs a held connection (>= the floor) is transport-
+    indistinguishable from a proxy severing a genuinely-parked human poll, so
+    every sever RESETS the consecutive-hard-failure counter and the cap is
+    never reached. This must NOT be an infinite loop — the absolute
+    ``_PERMISSION_TIMEOUT_S`` deadline has to bound it. Here every attempt is a
+    ~15s held sever that never resolves; the loop must eventually return
+    ``None`` (fail-ask) once the day-long budget elapses, not spin forever.
+    """
+    # Each attempt: an established connection held ~15s (> floor) then severed,
+    # never a success. The counter resets every time, so only the deadline can
+    # stop it. Fake clock advances 15s per attempt + 30s backoff.
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 5.0  # 15s: a held sever
+    client = _scripted_client(script=[("severed", held)], monkeypatch=monkeypatch)
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is None, "a never-resolving held-sever spin must fail-ask, not loop forever"
+    # It resets the counter every time (never hits the cap of 8), so it ran far
+    # more than the cap and stopped only when the ~1-day deadline elapsed.
+    assert len(client.calls) > claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES, (
+        "held severs must reset the cap; the deadline (not the cap) bounds this path"
+    )
+    # And it is genuinely bounded by the deadline. In this harness only post()
+    # advances the fake clock (by ``held``); the backoff sleep is a no-op, so
+    # the loop runs ~deadline/held times. (In production the real backoff sleep
+    # also elapses, so the real-world count is strictly lower.) Assert the
+    # count matches that ceiling — proving the deadline, not an accident, stops
+    # it — and stays comfortably below a runaway.
+    max_expected = claude_native_hook._PERMISSION_TIMEOUT_S / held + 2
+    assert len(client.calls) <= max_expected, "deadline did not bound the reset-forever path"
+
+
+def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 2xx on the first try returns immediately (no regression).
+
+    The spin-loop bound must not perturb the happy path: one successful POST
+    returns its response without retry.
+    """
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+
+    class _OkClient:
+        calls = 0
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _OkClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            type(self).calls += 1
+            return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(claude_native_hook.httpx, "Client", _OkClient)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None
+    assert resp.status_code == 200
+    assert _OkClient.calls == 1

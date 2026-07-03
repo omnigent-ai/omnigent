@@ -35,6 +35,24 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
+
+class GitStatusUnavailable(RuntimeError):
+    """A ``git`` invocation backing the changed-files view could not complete.
+
+    Raised on timeout, non-zero exit, or spawn error.  This deliberately
+    distinguishes "could not read the working-tree state" from "there are no
+    changes": the former must surface as an error so the UI shows a failure
+    state, instead of being swallowed to an empty list that looks identical to
+    a clean tree.  When raised, the failure is also logged at WARNING with the
+    git argv, the directory it ran in, the exit code, stderr, and the
+    wall-clock duration so the next occurrence diagnoses itself.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 # Filename patterns for ephemeral process artifacts that should never appear in
 # the Files panel regardless of .gitignore rules.  These are write-temp files
 # produced by editors, package managers, and system tools (not real source
@@ -681,26 +699,54 @@ class GitFilesystemRegistry(FilesystemRegistry):
         :param limit: Maximum number of records to return.
         :returns: List of file-record dicts, newest first.
         """
+        # ``--untracked-files=all`` forces git to expand entirely-untracked
+        # directories into their individual files.  Without it, a new file
+        # inside a brand-new directory tree collapses to a single ``?? dir/``
+        # line, so the UI would show the directory (stat'd as ~96 B) instead
+        # of the added file.
+        argv = ["git", "status", "--porcelain", "--untracked-files=all"]
+        started = time.monotonic()
         try:
-            # ``--untracked-files=all`` forces git to expand entirely-untracked
-            # directories into their individual files.  Without it, a new file
-            # inside a brand-new directory tree collapses to a single ``?? dir/``
-            # line, so the UI would show the directory (stat'd as ~96 B) instead
-            # of the added file.
             result = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=all"],
+                argv,
                 cwd=str(self._git_root),
                 capture_output=True,
                 timeout=5,
             )
-        except Exception:
-            _logger.debug(
-                "GitFilesystemRegistry.list_changed_files: git status failed", exc_info=True
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: %r in %s timed out after %.2fs",
+                argv,
+                self._git_root,
+                elapsed,
             )
-            return []
+            raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
+        except OSError as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: %r in %s could not run after %.2fs: %s",
+                argv,
+                self._git_root,
+                elapsed,
+                exc,
+            )
+            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
+        elapsed = time.monotonic() - started
         if result.returncode != 0:
-            return []
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: %r in %s exited %d after %.2fs: %s",
+                argv,
+                self._git_root,
+                result.returncode,
+                elapsed,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
 
         records: list[dict[str, Any]] = []
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
@@ -745,21 +791,53 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
+        # Mirror list_changed_files: a read that *could not run* (timeout /
+        # spawn error / non-zero exit) raises so the diff endpoint surfaces it,
+        # instead of being swallowed to ``None`` — which the endpoint turns
+        # into a 404 indistinguishable from "this path has no changes".
+        argv = ["git", "status", "--porcelain", "--", git_path]
+        started = time.monotonic()
         try:
             result = subprocess.run(
-                ["git", "status", "--porcelain", "--", git_path],
+                argv,
                 cwd=str(self._git_root),
                 capture_output=True,
                 timeout=5,
             )
-        except Exception:
-            _logger.debug(
-                "GitFilesystemRegistry.get_changed_file: git status failed", exc_info=True
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s timed out after %.2fs",
+                argv,
+                self._git_root,
+                elapsed,
             )
-            return None
+            raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
+        except OSError as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s could not run after %.2fs: %s",
+                argv,
+                self._git_root,
+                elapsed,
+                exc,
+            )
+            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
+        elapsed = time.monotonic() - started
         if result.returncode != 0:
-            return None
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s exited %d after %.2fs: %s",
+                argv,
+                self._git_root,
+                result.returncode,
+                elapsed,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
 
         output = result.stdout.decode("utf-8", errors="replace")
         for line in output.splitlines():

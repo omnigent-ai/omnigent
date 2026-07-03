@@ -1,7 +1,7 @@
 """E2E: starting a new session from the home composer ("/").
 
 The landing composer (``NewChatLandingScreen`` in
-``ap-web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
+``web/src/shell/NewChatDialog.tsx``) owns session creation end to end:
 the textarea is the new session's first message and the footer chips —
 host, working directory, git worktree — plus the unified agent/harness
 picker supply every create parameter. The picker is a single dropdown
@@ -574,11 +574,12 @@ def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) 
     """Picking a model + reasoning effort rides along to the create call.
 
     For the Claude-native agent the config submenu shows a model/effort
-    picker that defaults to Claude Code's own "Sonnet / Medium". Selecting
-    "Opus" and "High" must (a) check those radios as immediate feedback and
-    (b) reach ``POST /v1/sessions`` as ``model_override: "opus"`` +
-    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
-    ``--effort`` at terminal launch).
+    picker that starts with NOTHING selected — no model/effort default is
+    forced, so an untouched picker omits the override and Claude Code keeps its
+    own configured model. Explicitly selecting "Opus" and "High" must (a) check
+    those radios as immediate feedback and (b) reach ``POST /v1/sessions`` as
+    ``model_override: "opus"`` + ``reasoning_effort: "high"`` (the runner reads
+    them as ``--model`` / ``--effort`` at terminal launch).
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
@@ -621,14 +622,16 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Claude Code auto-selects; open its config submenu, which carries the
-            # model + effort radio groups defaulting to Claude Code's effective
-            # defaults (Sonnet / Medium).
+            # model + effort radio groups. No default is forced, so both groups
+            # start with NOTHING checked — an untouched picker omits the override
+            # and Claude Code uses its own configured model. Verify the unselected
+            # default, then make an explicit pick.
             await _open_entry_config(page, "ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-model-sonnet")).to_have_attribute(
-                "aria-checked", "true"
+            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
+                "aria-checked", "false"
             )
             await expect(page.get_by_test_id("new-chat-landing-effort-medium")).to_have_attribute(
-                "aria-checked", "true"
+                "aria-checked", "false"
             )
 
             # Pick model and effort in SEPARATE submenu visits. Picking a knob
@@ -934,9 +937,9 @@ def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
 
     Unlike Claude Code — whose submenu shows permission/model knobs — Polly and
     Debby declare a brain harness, so their config submenu renders an "Agent
-    Harness" radio group. Selecting a non-default harness ("Pi") must (a) show
-    all four harness options and (b) reach ``POST /v1/sessions`` as
-    ``harness_override: "pi"``.
+    Harness" radio group. Selecting a dynamically registered community harness
+    must (a) show the label from ``/v1/harnesses`` and (b) reach
+    ``POST /v1/sessions`` as ``harness_override: "community-brain"``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_harness(base_url, session_id))
@@ -954,6 +957,17 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 create_bodies=create_bodies,
                 agents_body=_bundle_agents_body(),
             )
+
+            async def handle_harness_catalog(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {"data": [{"id": "community-brain", "label": "Community Brain"}]}
+                    ),
+                )
+
+            await page.route("**/v1/harnesses", handle_harness_catalog)
 
             # Neutralize agent discovery so only the stubbed bundle agents
             # (Polly/Debby) feed the picker. The landing picker merges
@@ -993,9 +1007,14 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
                 ).to_be_visible()
+            # Dynamic harness labels from `/v1/harnesses` extend the built-in
+            # fallback catalog in the user-visible picker.
+            community_harness = page.get_by_test_id("new-chat-landing-harness-community-brain")
+            await expect(community_harness).to_be_visible()
+            await expect(community_harness).to_contain_text("Community Brain")
             # Picking a harness commits and closes the menu (the agent chip keeps
             # the bare agent label "Polly"); the override rides along on create.
-            await page.get_by_test_id("new-chat-landing-harness-pi").click()
+            await community_harness.click()
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -1005,7 +1024,7 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_polly_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("harness_override") == "pi", body
+            assert body.get("harness_override") == "community-brain", body
         finally:
             await browser.close()
 

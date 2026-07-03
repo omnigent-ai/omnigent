@@ -187,18 +187,48 @@ def _codex_auth_unavailable_reason() -> str | None:
     """
     Return why local Codex is unavailable, or ``None`` when available.
 
-    The check is synchronous, side-effect free, and local-only: it only checks
-    the ``codex`` binary and the resolved local auth source. It never runs
-    ``codex login``, shells out to a status command, or performs a network probe.
+    Readiness must ask the same question the launch resolver answers, not read a
+    credential file the launch ignores. :func:`resolve_native_codex_launch`
+    routes a Databricks-gateway / provider-configured setup through a Databricks
+    profile or a ``model_provider`` override and mints its bearer at run time
+    (``databricks auth token`` / a provider auth command) — it never reads
+    ``auth.json``. So on such a host ``auth.json`` is legitimately empty, and
+    gating on it is a false negative (the launch works). Only when the launch
+    defers to Codex's *own* login is ``auth.json`` the credential that decides
+    availability, so that is the only case gated on it. This mirrors the
+    fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
+    rely on: their gateway token is a runtime mint the daemon can't observe.
+
+    The check stays synchronous, side-effect free, and local: it resolves the
+    launch (local config reads) and, only on the defer-to-login path, inspects
+    the local auth source. It never runs ``codex login``, a status command, or a
+    network probe; any resolver failure fails safe onto the ``auth.json`` check.
 
     :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
-        when the CLI exists but ``auth.json`` is missing, malformed, or carries
-        no credential, and ``None`` when a credential is configured. Token
-        *validity* (revoked/expired refresh) is not judged locally — see
-        :func:`_codex_auth_json_has_available_credential`.
+        when the launch would defer to Codex's own login but ``auth.json`` is
+        missing, malformed, or carries no credential, and ``None`` when a
+        provider will route the launch or a login credential is configured.
+        Token *validity* (revoked/expired refresh, an unreachable gateway) is
+        not judged locally — it surfaces at the first turn via the executor.
     """
     if shutil.which(_DEFAULT_CODEX_COMMAND) is None:
         return _CODEX_AUTH_UNAVAILABLE_BINARY_MISSING
+    # ponytail: resolve_native_codex_launch runs once per codex spelling
+    # (codex / codex-native / native-codex → 3×) per hello frame; on a host with
+    # NO configured provider it also runs ambient detection (a localhost ollama
+    # probe + a `claude auth status` subprocess). It's off the event loop and
+    # only bites unconfigured hosts — memoize the launch across the map build in
+    # configured_harness_map if that cost ever shows up.
+    try:
+        launch = resolve_native_codex_launch(model=None)
+        routes_through_provider = (
+            launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+        )
+    except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
+        _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
+        routes_through_provider = False
+    if routes_through_provider:
+        return None
     source = _resolve_codex_auth_source()
     if not _codex_auth_json_has_available_credential(source.auth_path):
         return _CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH
@@ -1909,6 +1939,30 @@ def _codex_rollout_records_from_session_items(
     interrupted_response_ids = _interrupted_response_ids_from_session_items(items)
     for index, item in enumerate(items):
         if _session_item_response_id(item) in interrupted_response_ids:
+            continue
+        # Compaction items carry the post-compaction context. Emit a
+        # Compacted rollout record and discard all prior records — the
+        # replacement_history replaces them.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                compacted_record: dict[str, Any] = {
+                    "timestamp": timestamp,
+                    "type": "compacted",
+                    "payload": {
+                        "message": item.get("summary", ""),
+                        "replacement_history": compacted_msgs,
+                    },
+                }
+                w_id = item.get("window_id")
+                if w_id is not None:
+                    compacted_record["payload"]["window_id"] = w_id
+                # Replace all prior response_item records — the
+                # replacement_history is the new context baseline.
+                # Keep only session_meta and turn_context records.
+                records = [r for r in records if r.get("type") in ("session_meta",)]
+                records.append(compacted_record)
+                seen_turn_ids.clear()
             continue
         payload = _codex_response_item_from_session_item(item)
         if payload is None:

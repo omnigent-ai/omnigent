@@ -40,7 +40,7 @@ const _TRANSIENT_RETRY_MAX_BACKOFF_MS = 10_000;
 // our own _PARK_ATTEMPT_TIMEOUT_MS timer fires (the server held the
 // connection open the whole time). We use the attempt's elapsed wall-time
 // to disambiguate the two even when controller.signal.aborted has already
-// flipped true (the abort-timer-race in finding #3): only an attempt that
+// flipped true (the abort-timer race): only an attempt that
 // survived to ~the per-attempt timeout is treated as a re-attachable park;
 // anything that failed materially sooner is a genuine transport error and
 // is charged against the transient budget (→ eventually fail CLOSED).
@@ -83,6 +83,20 @@ function readConfig() {
   } catch (_err) {
     return null;
   }
+}
+
+// Re-read authHeaders from config.json on each outbound request. The bearer
+// baked at launch dies with the ~1h Databricks OAuth lifetime; the runner
+// re-mints it into config.json each turn (PiNativeExecutor), so re-reading
+// here keeps the policy/MCP/event POSTs authenticated instead of failing
+// closed mid-session. Falls back to the closed-over headers when the re-read
+// fails (a torn config) so a transient read can't drop auth.
+function freshAuthHeaders(fallback) {
+  const latest = readConfig();
+  if (latest && latest.authHeaders && typeof latest.authHeaders === "object") {
+    return latest.authHeaders;
+  }
+  return fallback || {};
 }
 
 /**
@@ -156,7 +170,7 @@ async function evalNativePolicyHttp(config, toolName, args) {
   });
   const reqHeaders = {
     "content-type": "application/json",
-    ...(config.authHeaders || {}),
+    ...freshAuthHeaders(config.authHeaders),
   };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
@@ -164,7 +178,7 @@ async function evalNativePolicyHttp(config, toolName, args) {
   // resolves quickly (fail CLOSED) instead of riding the long park ceiling.
   let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
   let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
-  // Bound on consecutive raw ASK rounds (see _MAX_RAW_ASK_ROUNDS / finding #2).
+  // Bound on consecutive raw ASK rounds (see _MAX_RAW_ASK_ROUNDS).
   let rawAskRounds = 0;
 
   while (true) {
@@ -197,7 +211,7 @@ async function evalNativePolicyHttp(config, toolName, args) {
       // Distinguish a LEGITIMATE long-poll re-attach from a GENUINE transport
       // error. controller.signal.aborted alone is unreliable: once our
       // per-attempt timer has fired it reads true even if a real connect
-      // reset raced the timer (finding #3). A genuine connect error throws
+      // reset raced the timer. A genuine connect error throws
       // fast — well under _PARK_ATTEMPT_TIMEOUT_MS — whereas a real long-poll
       // only aborts once the timer fires after holding the connection open
       // the whole attempt. So require BOTH aborted AND that the attempt
@@ -398,7 +412,7 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(config.authHeaders || {}),
+        ...freshAuthHeaders(config.authHeaders),
       },
       body,
     });
@@ -661,7 +675,7 @@ function extractPiUsage(message) {
 function headers(config) {
   return {
     "content-type": "application/json",
-    ...(config.authHeaders || {}),
+    ...freshAuthHeaders(config.authHeaders),
   };
 }
 

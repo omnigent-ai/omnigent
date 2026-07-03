@@ -1007,6 +1007,50 @@ def test_normalize_cursor_usage_includes_cache_fields() -> None:
     result = _normalize_cursor_usage(raw, "auto")
     assert result["cache_read_input_tokens"] == 300
     assert result["cache_creation_input_tokens"] == 50
+    # cursor's inputTokens (500) is inclusive of cache read (300) + write (50);
+    # input_tokens must be the non-cached remainder (150) so compute_llm_cost,
+    # which prices the cache buckets additively, does not double-bill them.
+    assert result["input_tokens"] == 150
+
+
+def test_normalize_cursor_usage_subtracts_cache_to_avoid_double_billing() -> None:
+    """``input_tokens`` excludes cached tokens so cache reads/writes aren't billed twice.
+
+    cursor reports ``inputTokens`` inclusive of cache read + write, but
+    ``compute_llm_cost`` requires ``input_tokens`` to be the non-cached portion
+    and prices ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+    additively. Passing the full inclusive count while also reporting the cache
+    buckets bills the cached tokens twice.
+
+    Regression guard: pre-fix ``input_tokens`` was the full 1000 here.
+    """
+    raw = {
+        "inputTokens": 1000,
+        "outputTokens": 200,
+        "totalTokens": 1200,
+        "cacheReadTokens": 700,
+        "cacheWriteTokens": 50,
+    }
+    result = _normalize_cursor_usage(raw, "auto")
+    # 1000 inclusive - 700 read - 50 write = 250 non-cached input.
+    assert result["input_tokens"] == 250, (
+        f"input_tokens {result['input_tokens']} != 250 — the cache read/write must be "
+        "subtracted from cursor's inclusive inputTokens so compute_llm_cost does not "
+        "double-bill them against the additive cache buckets."
+    )
+    assert result["cache_read_input_tokens"] == 700
+    assert result["cache_creation_input_tokens"] == 50
+    # total_tokens keeps the reported inclusive total; input + read + write
+    # reconstructs it against output, proving cached tokens are counted once.
+    assert result["input_tokens"] + 700 + 50 == 1000
+
+
+def test_normalize_cursor_usage_clamps_when_cache_exceeds_input() -> None:
+    """Malformed cache > input clamps ``input_tokens`` to 0, not negative."""
+    raw = {"inputTokens": 100, "outputTokens": 20, "cacheReadTokens": 999}
+    result = _normalize_cursor_usage(raw, "auto")
+    assert result["input_tokens"] == 0
+    assert result["cache_read_input_tokens"] == 999
 
 
 async def test_run_turn_captures_usage_from_turn_ended_update(
@@ -1511,9 +1555,14 @@ async def test_ensure_session_writes_hooks_json(
     wrapper = tmp_path / ".cursor" / "omnigent-hook.sh"
     assert wrapper.exists()
     wrapper_text = wrapper.read_text()
-    assert "_OMNIGENT_SERVER_URL='http://127.0.0.1:6767'" in wrapper_text
-    assert "_OMNIGENT_SESSION_ID='conv_test123'" in wrapper_text
+    # Values are shlex-quoted (shell-safe URLs/ids need no quotes).
+    assert "_OMNIGENT_SERVER_URL=http://127.0.0.1:6767" in wrapper_text
+    assert "_OMNIGENT_SESSION_ID=conv_test123" in wrapper_text
     assert "cursor_policy_hook.py" in wrapper_text
+    # The wrapper bakes a one-shot auth + workspace-routing header...
+    assert "_OMNIGENT_AUTH_HEADERS=" in wrapper_text
+    # ...so it must be owner-only (the baked token is never world-readable).
+    assert wrapper.stat().st_mode & 0o777 == 0o700
 
     # auto_review=True must be passed so cursor's own TUI approval prompts
     # are bypassed in favour of the executor's native elicitation card.

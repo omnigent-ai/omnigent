@@ -48,6 +48,11 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from omnigent.env_credentials import (
+    expand_envvars_with_omnigent_prefix,
+    getenv_with_omnigent_prefix,
+    omnigent_prefixed_env_name,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.spec.parser import check_unresolved_env_vars
@@ -166,8 +171,11 @@ _HARNESS_FAMILY: dict[str, str] = {
     # per-spawn provider override flag, so Omnigent cannot thread a generic
     # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
     # and is managed out-of-band via ``kimi provider add``.
-    # Qwen Code uses an OpenAI-compatible provider.
+    # Qwen Code is OpenAI-compatible; the native TUI keys both spellings (mirroring
+    # codex-native) so a same-agent qwen→qwen fork/switch reads as same-family.
     "qwen": OPENAI_FAMILY,
+    "qwen-native": OPENAI_FAMILY,
+    "native-qwen": OPENAI_FAMILY,
     # The native agy TUI bridge authenticates via the Gemini OAuth credential
     # (file-based, checked in :mod:`omnigent.onboarding.gemini_auth`) and the
     # detected GEMINI_API_KEY is adopted as a ``gemini``-family key, so the
@@ -450,19 +458,22 @@ def resolve_secret(ref: str) -> str:
         return value
     if ref.startswith("env:"):
         var = ref[len("env:") :]
-        value = os.environ.get(var)
-        if value is None:
+        resolved = getenv_with_omnigent_prefix(var)
+        if resolved is None:
+            prefixed = omnigent_prefixed_env_name(var)
+            fallback = f" or ${prefixed}" if prefixed != var else ""
             raise OmnigentError(
                 f"Unresolved environment variable '${var}' referenced by "
-                f"'env:{var}'. Set the variable in the environment.",
+                f"'env:{var}'. Set ${var}{fallback} in the environment.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        _actual_var, value = resolved
         # Strip surrounding whitespace: a key exported with a stray trailing
         # newline (e.g. ``export KEY=$(cat file)``) must not be forwarded
         # verbatim to a harness/SDK, where the padding fails auth.
         return value.strip()
     # Bare inline reference, e.g. "$ANTHROPIC_API_KEY" or a literal value.
-    expanded = os.path.expandvars(ref)
+    expanded = expand_envvars_with_omnigent_prefix(ref)
     check_unresolved_env_vars(ref, expanded)
     return expanded
 
@@ -511,7 +522,7 @@ def _expand(key: str, value: str) -> str:
     :returns: The expanded value, e.g. ``"sk-or-..."``.
     :raises OmnigentError: If a referenced variable is unset.
     """
-    expanded = os.path.expandvars(value)
+    expanded = expand_envvars_with_omnigent_prefix(value)
     check_unresolved_env_vars(key, expanded)
     return expanded
 

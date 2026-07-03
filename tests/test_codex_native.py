@@ -35,9 +35,25 @@ def _write_codex_auth(path: Path, payload: object) -> None:
 
 
 def _point_codex_auth_check_at(
-    monkeypatch: pytest.MonkeyPatch, auth_path: Path, *, binary_present: bool
+    monkeypatch: pytest.MonkeyPatch,
+    auth_path: Path,
+    *,
+    binary_present: bool,
+    launch: Any | None = None,
 ) -> None:
-    """Redirect Codex availability checks away from the real machine state."""
+    """Redirect Codex availability checks away from the real machine state.
+
+    ``launch`` pins what :func:`resolve_native_codex_launch` returns; the default
+    is the defer-to-Codex-login shape (``profile=None``, ``model_provider`` not
+    set → resolves to ``"openai"``), which is exactly the case where
+    ``auth.json`` is the credential that decides availability. Provider-routed
+    tests pass an explicit launch.
+    """
+    if launch is None:
+        launch = codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[], model=None, profile=None
+        )
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", lambda model=None: launch)
     monkeypatch.setattr(
         codex_native,
         "_resolve_codex_auth_source",
@@ -135,6 +151,53 @@ def test_codex_auth_unavailable_reason_malformed_auth_needs_auth(
     auth_path.parent.mkdir(parents=True, exist_ok=True)
     auth_path.write_text("{not json", encoding="utf-8")
 
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_databricks_profile_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Databricks-profile launch is available even with an EMPTY auth.json.
+
+    The reported bug: the launch mints its bearer via ``databricks auth token``
+    and never reads ``auth.json``, so gating on it is a false negative. auth.json
+    is deliberately absent here — availability must come from the launch.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=[], model=None, profile="my-profile"
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_provider_override_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch pinning a non-openai model_provider is available sans auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="omnigent_databricks"'], model=None, profile=None
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resolver blow-up fails safe onto the auth.json check (never raises)."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+
+    def _boom(model: object = None) -> object:
+        raise RuntimeError("corrupt config")
+
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _boom)
+
+    # No auth.json → falls through to needs-auth rather than propagating.
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
@@ -5509,6 +5572,350 @@ def test_forwarder_drops_codex_tool_item_missing_required_field(
     assert "Codex commandExecution missing command" in caplog.text
 
 
+def test_forwarder_posts_codex_image_view_tool_call() -> None:
+    """
+    A completed Codex ``imageView`` becomes a view_image tool card.
+
+    Codex emits an ``imageView`` item when the model opens a local image
+    to look at it. Before this was handled the item was silently dropped,
+    so the web transcript skipped a step the native TUI shows. The only
+    datum is the path, so it is both the argument and the output (the web
+    UI cannot fetch a runner-local path).
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageView",
+                "id": "img_view_1",
+                "path": "/repo/screenshot.png",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "codex-native-ui",
+                    "name": "view_image",
+                    "arguments": '{"path": "/repo/screenshot.png"}',
+                    "call_id": "img_view_1",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {
+                    "call_id": "img_view_1",
+                    "output": "/repo/screenshot.png",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+    ]
+
+
+def test_forwarder_posts_codex_image_generation_tool_call() -> None:
+    """
+    A completed Codex ``imageGeneration`` becomes a generate_image tool card.
+
+    The raw ``result`` (base64 image bytes) is deliberately NOT mirrored —
+    the web UI has no assistant-side image rendering and the base64 blob
+    would only bloat the transcript. The card carries the revised prompt as
+    the argument and the status plus on-disk save path as the output.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageGeneration",
+                "id": "img_gen_1",
+                "status": "completed",
+                "revisedPrompt": "a red bicycle on a beach",
+                "result": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+                "savedPath": "/repo/out.png",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert [p["data"]["item_type"] for p in posted] == [
+        "function_call",
+        "function_call_output",
+    ]
+    call = posted[0]["data"]["item_data"]
+    assert call["name"] == "generate_image"
+    assert call["call_id"] == "img_gen_1"
+    # The revised prompt is surfaced; the base64 result is never echoed.
+    assert json.loads(call["arguments"]) == {"revised_prompt": "a red bicycle on a beach"}
+    assert "iVBORw0KGgo" not in call["arguments"]
+    output = posted[1]["data"]["item_data"]["output"]
+    assert output == "status: completed\nsaved to /repo/out.png"
+    assert "iVBORw0KGgo" not in output
+
+
+def test_forwarder_drops_codex_image_generation_missing_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An ``imageGeneration`` with no status is dropped, not mirrored blank.
+
+    ``status`` is a required protocol field; its absence means a malformed
+    item, which is logged and skipped rather than mirrored as an empty card.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageGeneration",
+                "id": "img_gen_bad",
+                "revisedPrompt": "x",
+                "result": "y",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == []
+    assert "Codex imageGeneration missing status" in caplog.text
+
+
+def test_forwarder_posts_codex_entered_review_mode_marker() -> None:
+    """
+    Codex ``enteredReviewMode`` surfaces a visible review-mode marker.
+
+    Codex ``/review`` brackets a turn with enter/exit thread items. The web
+    UI has no review affordance, so the transition is mirrored as a short
+    assistant-message marker (the same rail used for plan updates), carrying
+    the review subject so the web user sees what is under review.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "enteredReviewMode",
+                "id": "review_1",
+                "review": "review the auth changes",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Entered review mode: review the auth changes",
+                        }
+                    ],
+                },
+                "response_id": "codex_turn_123",
+            },
+        }
+    ]
+
+
+def test_forwarder_posts_codex_exited_review_mode_marker() -> None:
+    """
+    Codex ``exitedReviewMode`` surfaces a visible exit marker.
+
+    With no review subject the marker is just the header — a terse divider
+    that tells the web user the session left review mode.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "exitedReviewMode",
+                "id": "review_2",
+                "review": "",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [{"type": "output_text", "text": "Exited review mode"}],
+                },
+                "response_id": "codex_turn_123",
+            },
+        }
+    ]
+
+
+def _turn_diff_event(turn_id: str, diff: str, *, thread_id: str = "thread_123") -> dict[str, Any]:
+    """
+    Build a Codex ``turn/diff/updated`` notification.
+
+    :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+    :param diff: Aggregated unified diff for the turn so far.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :returns: App-server event payload.
+    """
+    return {
+        "method": "turn/diff/updated",
+        "params": {"threadId": thread_id, "turnId": turn_id, "diff": diff},
+    }
+
+
+def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
+    """
+    ``turn/diff/updated`` is coalesced and flushed once at turn end.
+
+    Codex streams the aggregated working-tree diff repeatedly as edits land.
+    Posting each update would spam the transcript with a growing diff, so the
+    forwarder stores only the newest diff and mirrors it once, at the
+    terminal boundary, as a single ``turn_diff`` function-call pair — after
+    the turn's other items and before the idle status edge.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    latest_diff = "--- a/x.py\n+++ b/x.py\n@@\n-old\n+new\n"
+
+    async def run() -> None:
+        """
+        Replay two diff updates followed by the terminal boundary.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            for event in [
+                _turn_diff_event("turn_123", "--- a/x.py\n+++ b/x.py\n@@\n-old\n"),
+                _turn_diff_event("turn_123", latest_diff),
+                _completed_event("turn_123", thread_id="thread_123"),
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    # The two diff updates post nothing; only the terminal boundary flushes a
+    # single turn_diff pair (carrying the LATEST diff), then the idle edge.
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "codex-native-ui",
+                    "name": "turn_diff",
+                    "arguments": "{}",
+                    "call_id": "codex_turn_diff_turn_123",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {
+                    "call_id": "codex_turn_diff_turn_123",
+                    "output": latest_diff,
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_session_status",
+            "data": _expected_status_data("idle", "turn_123"),
+        },
+    ]
+    # The stored diff is consumed on flush — no leak into the next turn.
+    assert forwarder_state.turn_diff_by_turn == {}
+
+
+def test_forwarder_skips_turn_diff_when_none_captured(tmp_path: Path) -> None:
+    """
+    A turn with no ``turn/diff/updated`` posts no turn_diff card.
+
+    Read-only turns never receive a diff notification, so the terminal
+    boundary must emit only the idle status edge — no empty diff artifact.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+
+    async def run() -> None:
+        """
+        Replay a terminal boundary with no preceding diff update.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                event=_completed_event("turn_123", thread_id="thread_123"),
+                forwarder_state=forwarder_state,
+            )
+
+    asyncio.run(run())
+
+    assert posted == [
+        {
+            "type": "external_session_status",
+            "data": _expected_status_data("idle", "turn_123"),
+        },
+    ]
+
+
 def test_forwarder_skips_item_retry_on_ambiguous_transport_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9173,3 +9580,106 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
         {"type": "external_compaction_status", "data": {"status": "in_progress"}},
         {"type": "external_compaction_status", "data": {"status": "completed"}},
     ]
+
+
+def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
+    """Compaction items emit a Compacted rollout record and discard prior items."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi there"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "compaction summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": "gAAAA_encrypted",
+                },
+            ],
+            "window_id": 2,
+            "response_id": "compact_1",
+        },
+        {
+            "id": "msg_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    # Should have: session_meta, compacted, turn_context, response_item (msg_3), event_msg
+    types = [r["type"] for r in records]
+    assert "session_meta" in types
+    assert "compacted" in types
+    # Pre-compaction response_items should be gone
+    pre_compaction_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "hello"}]
+    ]
+    assert len(pre_compaction_items) == 0, "Pre-compaction items should be discarded"
+    # The compacted record should have replacement_history and window_id
+    compacted_records = [r for r in records if r["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    cp = compacted_records[0]["payload"]
+    assert cp["window_id"] == 2
+    assert len(cp["replacement_history"]) == 2
+    assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
+    # Post-compaction message should still be present
+    post_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
+    ]
+    assert len(post_items) == 1
+
+
+def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> None:
+    """Sessions without compaction produce no Compacted rollout record."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    types = [r["type"] for r in records]
+    assert "compacted" not in types

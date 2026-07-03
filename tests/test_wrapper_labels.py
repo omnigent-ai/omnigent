@@ -109,7 +109,7 @@ def test_codex_native_wrapper_constants_match_picker_module() -> None:
 
     The picker uses it to render the ``[codex]`` Runtime badge.
     """
-    from omnigent.native_coding_agents import CODEX_NATIVE_CODING_AGENT
+    from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 
     assert CODEX_NATIVE_CODING_AGENT.wrapper_label == CODEX_NATIVE_WRAPPER_VALUE
 
@@ -135,7 +135,7 @@ def test_pi_native_wrapper_constants_match_pi_native_module() -> None:
 
 def test_pi_native_wrapper_constants_match_registry() -> None:
     """The native coding-agent registry owns the Pi wrapper metadata."""
-    from omnigent.native_coding_agents import PI_NATIVE_CODING_AGENT
+    from omnigent.harness_plugins import PI_NATIVE_CODING_AGENT
 
     assert PI_NATIVE_CODING_AGENT.agent_name == "pi-native-ui"
     assert PI_NATIVE_CODING_AGENT.harness == "pi-native"
@@ -145,7 +145,7 @@ def test_pi_native_wrapper_constants_match_registry() -> None:
 
 def test_kiro_native_wrapper_constants_match_registry() -> None:
     """The native coding-agent registry owns the Kiro wrapper metadata."""
-    from omnigent.native_coding_agents import KIRO_NATIVE_CODING_AGENT
+    from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT
 
     assert KIRO_NATIVE_CODING_AGENT.agent_name == "kiro-native-ui"
     assert KIRO_NATIVE_CODING_AGENT.harness == "kiro-native"

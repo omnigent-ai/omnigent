@@ -1442,8 +1442,9 @@ class ClaudeSDKExecutor(Executor):
         same_loop = state.loop is None or current_loop is state.loop
         same_task = state.task is None or current_task is state.task
         if not (same_loop and same_task):
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different event loop/task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different event loop/task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -1453,8 +1454,9 @@ class ClaudeSDKExecutor(Executor):
         except RuntimeError as exc:
             if "different task" not in str(exc):
                 raise
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -2515,6 +2517,30 @@ class ClaudeSDKExecutor(Executor):
         if terminal_error:
             yield ExecutorError(message=terminal_error)
             return
+
+        # A turn can finish the stream without ever yielding a
+        # ``ResultMessage`` — the CLI can close the stream early, or the
+        # turn can be cut short before its final usage is reported. In
+        # that case ``turn_usage`` is None and the context-occupancy
+        # meter freezes at the previous successful turn's value, hiding
+        # real window fill exactly when a session is in trouble (#1533).
+        # We already observed the latest prompt size from ``message_start``
+        # (``last_call_usage``), so synthesize a usage dict from it and let
+        # ``TurnComplete`` carry it. ``context_tokens`` (window fill) is the
+        # meaningful field here; ``output_tokens`` is unknown on an
+        # incomplete turn, so report 0 rather than guess. The full
+        # ``ResultMessage`` path above still wins whenever it runs.
+        if turn_usage is None and last_call_usage is not None:
+            ctx_in = last_call_usage.get("input_tokens") or 0
+            ctx_cc = last_call_usage.get("cache_creation_input_tokens") or 0
+            ctx_cr = last_call_usage.get("cache_read_input_tokens") or 0
+            turn_usage = {
+                "input_tokens": ctx_in,
+                "output_tokens": 0,
+                "total_tokens": ctx_in,
+                "context_tokens": ctx_in + ctx_cc + ctx_cr,
+                "model": observed_model or model,
+            }
 
         # ── LLM_RESPONSE policy evaluation ───────────────────────
         # Evaluate after the stream completes but before TurnComplete

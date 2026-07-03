@@ -129,7 +129,7 @@ comments; this is the *what*, not the *how*.)
 - [ ] **Composer status line: real model + context ring (Web UI).** For
   native-qwen the composer's model/effort chip is currently **hidden** (web UI
   flag `nativeVendorOwnsModel` in `chatStore.sessionBindingPatch` →
-  `ComposerStatusLine` in `ap-web/src/pages/ChatPage.tsx`). It was showing the
+  `ComposerStatusLine` in `web/src/pages/ChatPage.tsx`). It was showing the
   bound spec's *default* model (`claude-sonnet-4-6`) because the qwen-native-ui
   spec sets no model and qwen picks its model inside the vendor TUI (OpenAI-compat
   env / qwen's own `/model`), so Omnigent's `llmModel` was a misleading default.
@@ -182,6 +182,32 @@ comments; this is the *what*, not the *how*.)
   its own checkpoint and emits *only new* events to `--json-file`, so the
   transcript is never re-mirrored — qwen sidesteps the double-mirror problem that
   forced goose-native to start fresh.
+
+- [x] **Carry history into qwen on fork / switch-agent (incl. cross-harness).**
+  Forking a session — or switching its agent — into qwen-native now seeds the new
+  qwen session with the prior conversation, the same way claude-/codex-/pi-native
+  do. qwen-native is registered in `_FORK_HISTORY_NATIVE_HARNESSES`
+  (`server/routes/sessions.py`), so both the fork and switch-agent routes stamp
+  `omnigent.fork.carry_history` and clear `external_session_id` on the clone. On
+  the clone's first launch, `_auto_create_qwen_terminal` calls
+  `_build_qwen_fork_recording`, which fetches the clone's copied Omnigent items
+  (`fetch_all_session_items_for_pi_resume` — harness-neutral) and rebuilds qwen's
+  on-disk recording via `qwen_session_records_from_session_items` +
+  `write_qwen_session_recording`, then forces `--resume`. Because it rebuilds from
+  Omnigent items (not the source's vendor transcript), it works **cross-harness**
+  (claude/pi/codex → qwen). **Key on-disk-format finding:** qwen resolves
+  `--resume <id>` from *three* files, not the `.jsonl` alone — it also needs
+  `chats/<id>.runtime.json` (session index entry) and the project `meta.json`; a
+  bare recording yields the blocking "No saved session found" screen (verified on
+  v0.18.2). The synthesized recording emits only `user`/`assistant` message
+  records (the `system` snapshot records qwen writes live are optional for
+  resume); tool calls are dropped (text turns carry the context). The rebuild is
+  gated on a NULL `external_session_id` so it runs only on the first launch — once
+  the minted id is persisted, later relaunches take the normal resume path and
+  never clobber qwen's live recording (which by then holds post-fork turns). The
+  minted id is the clone's own deterministic `qwen_session_id_for_conversation`,
+  so the resume path recomputes it. Mirrors pi-native's fork rebuild
+  (`_resolve_pi_external_session_id` case 2).
 
 ### Medium
 
@@ -245,9 +271,20 @@ comments; this is the *what*, not the *how*.)
   - *Full route:* spec with `executor.profile: <db-profile>` (or a
     `databricks-*` model), then `omni run`; confirm the runner log's
     `qwen gateway routing:` line shows the Databricks base URL + profile.
-- [ ] **Omnigent tools.** Qwen can only call its own built-in tools; tools
-  defined by Omnigent aren't exposed to it (so they can't be invoked or
-  recorded). Permission gating on qwen's *own* tool calls already works.
+- [x] **Omnigent tools.** Qwen-native now exposes the shared Omnigent MCP relay
+  (`omnigent.claude_native_bridge serve-mcp`, `mcpServers.omnigent`,
+  `trust: true`) to qwen via the `--mcp-config <path>` launch flag (the
+  claude-native model). qwen connects to it on boot, `/mcp` lists it, and the
+  model can call Omnigent's builtin tools (`sys_*`, `load_skill`, `web_fetch`, …).
+  The config lives in the per-session bridge dir, **not** the workspace, so we
+  drop no file in the user's repo, concurrent same-workspace sessions can't
+  collide, and CLI-provided servers are ungated (no "Untrusted MCP server"
+  prompt → no pre-approval step). The token + config are written by
+  `qwen_native_bridge.write_mcp_config`; the live tool surface is advertised by
+  the `tool_relay.json` that `ensure_comment_relay` writes. The `bridge.json`
+  bearer token is written through `_ensure_secure_bridge_dir` (the same
+  owner-only ancestor validation the shared relay applies to token-bearing
+  trees). Permission gating on qwen's *own* tool calls already works.
 - [ ] **File I/O recording / content policy.** Omnigent now *executes* delegated
   file reads/writes through the `OSEnvironment` (see "File I/O delegation" in
   What works today), so the bytes flow through Omnigent and the sandbox roots are
