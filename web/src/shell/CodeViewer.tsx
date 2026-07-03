@@ -33,8 +33,12 @@ import { useChatStore } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkEmoji from "remark-emoji";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import { rehypeGithubAlerts } from "rehype-github-alerts";
 import { type Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -74,10 +78,76 @@ const MonacoCodeEditor = lazy(() =>
 // Width of the line-number gutter — must match the `w-12` Tailwind class on the gutter div.
 const GUTTER_WIDTH = 48;
 
+// GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
+// renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
+// the same here as on GitHub.
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+
+// rehype-github-alerts turns `> [!NOTE]` blockquotes into GitHub's
+// `<div class="markdown-alert markdown-alert-note">…` callout markup (GFM
+// itself leaves them as plain blockquotes). We keep only the alert's div/p
+// classes and drop its inline <svg> octicon in sanitize below; the icon is
+// redrawn from CSS (see `.markdown-alert` in index.css) so the sanitized
+// output stays a tiny, fixed class surface rather than arbitrary SVG.
+const ALERT_CLASS = /^markdown-alert(-\w+)?$/;
+const ALERT_TITLE_CLASS = /^markdown-alert-title$/;
+// Extend the default (GitHub-derived) sanitize schema minimally: allow `class`
+// on the alert wrapper div (markdown-alert*) and its title p (markdown-alert-
+// title) only for those exact tokens. Everything else — <script>, event
+// handlers, javascript: URLs, arbitrary classes — is still stripped, so raw
+// HTML in a .md file stays safe to render inline.
+const MARKDOWN_SANITIZE_SCHEMA = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    div: [...(defaultSchema.attributes?.div ?? []), ["className", ALERT_CLASS]],
+    p: [...(defaultSchema.attributes?.p ?? []), ["className", ALERT_TITLE_CLASS]],
+  },
+};
+
+// Markdown files routinely embed raw HTML that GitHub renders — <details>,
+// <sub>/<sup>, <kbd>, <br>, <div align>, inline <img> — which react-markdown
+// drops by default, showing the escaped tags as literal text. rehype-raw parses
+// that HTML; rehype-sanitize then strips anything unsafe (<script>, event
+// handlers, javascript: URLs) so this stays safe to render inline without an
+// iframe. Order matters: alerts transform before sanitize, and sanitize runs
+// last, after raw parsing and GFM.
+const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+  rehypeRaw,
+  rehypeGithubAlerts,
+  [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
+];
+
+// Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
+// `width`/`height` *attributes* (presentational hints lose to any author CSS).
+// GitHub honors explicit dimensions, so mirror them onto an inline style —
+// which does win the cascade — for the one image being rendered. This runs
+// after sanitize (React components render the already-sanitized tree), so it
+// adds no attack surface. Only literal integer pixel values are forwarded.
+const MARKDOWN_COMPONENTS: Components = {
+  img({ node: _node, width, height, style, ...props }) {
+    const px = (v: string | number | undefined) =>
+      typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ? `${v}px` : undefined;
+    const sized = {
+      ...style,
+      width: px(width) ?? style?.width,
+      height: px(height) ?? style?.height,
+    };
+    // eslint-disable-next-line jsx-a11y/alt-text -- alt is forwarded via props
+    return <img {...props} style={sized} />;
+  },
+};
+
 function MarkdownPreview({ content }: { content: string }) {
   return (
-    <div className="px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    <div className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
+      <ReactMarkdown
+        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        components={MARKDOWN_COMPONENTS}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   );
 }
