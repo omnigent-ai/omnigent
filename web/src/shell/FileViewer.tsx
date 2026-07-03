@@ -57,6 +57,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -596,7 +600,8 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [open, onCloseTab, searchOpen, guardDirty]);
 
-  // View mode toggle — preview is the default for md/html, source for everything else.
+  // View mode toggle — markdown defaults to the rich-text editor, HTML to its
+  // rendered preview, and everything else to source.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html";
   // Images render through CodeViewer's <ImageViewer> regardless of view mode;
@@ -632,6 +637,24 @@ function FileViewerBody({
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
+  // A ?comment= deep link to a markdown file must open on the rich-text editor
+  // so the comment's anchor highlight is visible in context — the whole point
+  // of following the link. The editor is forced regardless of the user's sticky
+  // preference: the read-only Preview can't render the highlight at all, so a
+  // Preview-preferring user would otherwise land on a surface where the comment
+  // they came to see isn't shown. The bias is dropped the moment the user picks
+  // a mode themselves, and never applies to any other file.
+  //
+  // This is a separate override rather than a seeded `previewableViewMode`
+  // because that state is persisted globally: seeding it to "editor" would write
+  // "editor" back to localStorage, clobbering the user's own preference for
+  // every later markdown file. It must also be reactive — flipping this override
+  // is what re-renders to the chosen surface once the user picks a mode. It's
+  // the deep-linked path (not a boolean) so a navigate-away-and-back doesn't
+  // re-trigger the bias on the wrong file.
+  const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
+    initialCommentIdRef.current ? path : null,
+  );
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -639,13 +662,18 @@ function FileViewerBody({
   useEffect(() => {
     writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
   }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
-  // Non-markdown previewable (HTML): "editor" falls back to "preview" — no rich-text mode.
-  // Markdown: "preview" is removed; treat as "source" if somehow set (e.g. shared state from an HTML file).
+  // Markdown supports all three previewable modes (preview / editor / source).
+  // HTML has no rich-text editor, so its "editor" preference falls back to the
+  // rendered preview; "preview" / "source" pass through for both. The shared
+  // preference still carries across file types — opening markdown in source
+  // then switching to an HTML file keeps you in source, etc.
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? lang !== "markdown" && previewableViewMode === "editor"
-      ? "preview"
-      : lang === "markdown" && previewableViewMode === "preview"
-        ? "source"
+    ? lang === "markdown"
+      ? deepLinkBiasPath === path
+        ? "editor"
+        : previewableViewMode
+      : previewableViewMode === "editor"
+        ? "preview"
         : previewableViewMode
     : "source";
   // Derived effective view mode — diff takes priority when active and available.
@@ -706,6 +734,19 @@ function FileViewerBody({
   // `active` drives the inline button's filled variant; it's omitted from the
   // dropdown rows (menu items aren't toggles). The save-status chip is NOT in
   // this list — it stays inline regardless of width.
+  //
+  // An action can instead carry `options`: a set of mutually-exclusive choices
+  // rendered as a single dropdown (a "picker" button inline, a submenu when
+  // collapsed) rather than one button per choice. Markdown's view-mode picker
+  // (Preview / Edit / Source) uses this so it occupies one toolbar slot.
+  type ToolbarOption = {
+    key: string;
+    label: string;
+    tooltip?: string;
+    icon: ReactNode;
+    onSelect: () => void;
+    active: boolean;
+  };
   type ToolbarAction = {
     key: string;
     /** Accessible name for the inline icon button. */
@@ -713,42 +754,87 @@ function FileViewerBody({
     /** Tooltip + dropdown row text; falls back to `label` when omitted. */
     tooltip?: string;
     icon: ReactNode;
-    onSelect: () => void;
+    onSelect?: () => void;
     active?: boolean;
+    /** When set, render a picker (dropdown/submenu) over these choices instead
+     * of a single button. `onSelect` is ignored. */
+    options?: ToolbarOption[];
   };
   const toolbarActions: ToolbarAction[] = [];
-  if (isPreviewable && viewMode !== "diff") {
-    const previewLabel =
-      lang === "markdown"
-        ? viewMode === "editor"
-          ? "Source view"
-          : "Rich text editor"
-        : viewMode === "preview"
-          ? "View source"
-          : "View preview";
+  if (lang === "markdown" && viewMode !== "diff") {
+    // Markdown is a segmented control over three reachable modes: the rich-text
+    // Editor (default), the rendered Preview, and raw Source. Switching away
+    // from the editor must guard unsaved edits; the read-only preview/source
+    // surfaces carry no edits, so they switch freely.
+    const switchTo = (mode: "preview" | "editor" | "source") => {
+      // No-op when already on this surface — re-selecting the active tab must
+      // not run the dirty guard (which would pop a discard dialog for nothing).
+      if (mode === viewMode) return;
+      // Clear the deep-link bias and set the absolute mode together, and only
+      // when the switch actually proceeds — so a guarded (dirty) switch the user
+      // cancels leaves both the bias and the editor intact.
+      const apply = () => {
+        setDeepLinkBiasPath(null);
+        setPreviewableViewMode(mode);
+      };
+      if (viewMode === "editor") {
+        guardDirty(apply);
+      } else {
+        apply();
+      }
+    };
+    // One toolbar slot: a "view mode" picker rather than three side-by-side
+    // buttons (the toolbar is tight once nav/diff/comment actions are present).
+    // The trigger shows the current surface's icon so the active mode reads at
+    // a glance; the menu lets the user pick another.
+    const modeOptions: ToolbarOption[] = [
+      {
+        key: "md-preview",
+        label: "Preview",
+        tooltip: "Rendered preview",
+        icon: <EyeIcon className="size-4" />,
+        active: viewMode === "preview",
+        onSelect: () => switchTo("preview"),
+      },
+      {
+        key: "md-edit",
+        label: "Edit",
+        tooltip: "Rich text editor",
+        icon: <PencilLineIcon className="size-4" />,
+        active: viewMode === "editor",
+        onSelect: () => switchTo("editor"),
+      },
+      {
+        key: "md-source",
+        label: "Source",
+        tooltip: "Raw Markdown source",
+        icon: <CodeIcon className="size-4" />,
+        active: viewMode === "source",
+        onSelect: () => switchTo("source"),
+      },
+    ];
+    const activeMode = modeOptions.find((o) => o.active) ?? modeOptions[0];
+    toolbarActions.push({
+      key: "md-view-mode",
+      label: `View mode: ${activeMode.label}`,
+      tooltip: "View mode",
+      icon: activeMode.icon,
+      options: modeOptions,
+    });
+  } else if (lang === "html" && viewMode !== "diff") {
+    // HTML has no rich-text editor — a single toggle flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
-      label: previewLabel,
+      label: viewMode === "preview" ? "View source" : "View preview",
       icon:
-        lang === "markdown" ? (
-          viewMode === "editor" ? (
-            <CodeIcon className="size-4" />
-          ) : (
-            <PencilLineIcon className="size-4" />
-          )
-        ) : viewMode === "preview" ? (
-          <CodeIcon className="size-4" />
-        ) : (
-          <EyeIcon className="size-4" />
-        ),
+        viewMode === "preview" ? <CodeIcon className="size-4" /> : <EyeIcon className="size-4" />,
+      // Write the absolute target keyed off the RESOLVED viewMode, not the raw
+      // stored value: a shared "editor" preference (carried over from a markdown
+      // file) resolves to "preview" for HTML, so a functional updater keyed on
+      // "editor" would no-op the first click. Keying on viewMode makes one click
+      // always reach the other surface.
       onSelect: () => {
-        if (lang === "markdown") {
-          guardDirty(() =>
-            setPreviewableViewMode((mode) => (mode === "editor" ? "source" : "editor")),
-          );
-        } else {
-          setPreviewableViewMode((mode) => (mode === "preview" ? "source" : "preview"));
-        }
+        setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
       },
     });
   }
@@ -860,25 +946,63 @@ function FileViewerBody({
   // when it fits, as the visible toolbar. `interactive` is false for the
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
-    toolbarActions.map((action) => (
-      <TooltipProvider key={action.key}>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant={action.active ? "default" : "ghost"}
-              size="icon-sm"
-              aria-label={action.label}
-              tabIndex={interactive ? undefined : -1}
-              onClick={interactive ? action.onSelect : undefined}
-            >
-              {action.icon}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    ));
+    toolbarActions.map((action) =>
+      action.options ? (
+        // A picker: one trigger opening a menu of mutually-exclusive choices.
+        <DropdownMenu key={action.key}>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={action.label}
+                    tabIndex={interactive ? undefined : -1}
+                  >
+                    {action.icon}
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <DropdownMenuContent align="end" className="w-auto min-w-40">
+            <DropdownMenuLabel>{action.tooltip ?? action.label}</DropdownMenuLabel>
+            {action.options.map((option) => (
+              <DropdownMenuItem
+                key={option.key}
+                className={cn("whitespace-nowrap", option.active && "bg-accent")}
+                onSelect={interactive ? option.onSelect : undefined}
+              >
+                {option.icon}
+                {option.label}
+                {option.active && <CheckIcon className="ml-auto size-4" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : (
+        <TooltipProvider key={action.key}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant={action.active ? "default" : "ghost"}
+                size="icon-sm"
+                aria-label={action.label}
+                tabIndex={interactive ? undefined : -1}
+                onClick={interactive ? action.onSelect : undefined}
+              >
+                {action.icon}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      ),
+    );
 
   const innerContent = (
     <>
@@ -1007,16 +1131,39 @@ function FileViewerBody({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
-                  {toolbarActions.map((action) => (
-                    <DropdownMenuItem
-                      key={action.key}
-                      className="whitespace-nowrap"
-                      onSelect={action.onSelect}
-                    >
-                      {action.icon}
-                      {action.tooltip ?? action.label}
-                    </DropdownMenuItem>
-                  ))}
+                  {toolbarActions.map((action) =>
+                    action.options ? (
+                      // A picker collapses to a nested submenu of its choices.
+                      <DropdownMenuSub key={action.key}>
+                        <DropdownMenuSubTrigger className="whitespace-nowrap">
+                          {action.icon}
+                          {action.tooltip ?? action.label}
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent>
+                          {action.options.map((option) => (
+                            <DropdownMenuItem
+                              key={option.key}
+                              className={cn("whitespace-nowrap", option.active && "bg-accent")}
+                              onSelect={option.onSelect}
+                            >
+                              {option.icon}
+                              {option.label}
+                              {option.active && <CheckIcon className="ml-auto size-4" />}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                    ) : (
+                      <DropdownMenuItem
+                        key={action.key}
+                        className="whitespace-nowrap"
+                        onSelect={action.onSelect}
+                      >
+                        {action.icon}
+                        {action.tooltip ?? action.label}
+                      </DropdownMenuItem>
+                    ),
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (
