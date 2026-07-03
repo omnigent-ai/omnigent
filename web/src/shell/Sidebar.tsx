@@ -1407,7 +1407,7 @@ function ConversationList({
                 active={activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)}
               >
                 <ConversationSection
-                  title="Chats"
+                  title="Sessions"
                   conversations={sections.sessions}
                   pinnedConversationIds={pinnedConversationIds}
                   collapsed={effectiveCollapsedSections.includes("Chats")}

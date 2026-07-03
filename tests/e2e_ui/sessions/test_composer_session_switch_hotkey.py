@@ -17,7 +17,7 @@ ate the chord and the route never changed.
 No LLM turn is needed — this exercises pure client-side keyboard + routing —
 so it skips the nightly/real-agent markers the approval suites carry. Two
 runner-bound sessions come from the ``seeded_session_pair`` fixture; both
-render under the sidebar's "Chats" group, so both are in the hotkey's ordered
+render under the sidebar's "Sessions" group, so both are in the hotkey's ordered
 list.
 """
 
