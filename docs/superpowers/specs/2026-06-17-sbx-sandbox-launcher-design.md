@@ -246,11 +246,14 @@ Implementation follows TDD (red → green → refactor) per the project's skills
 Resolved against a real, logged-in `sbx` during the implementation discovery
 spike. Each item updates the corresponding design assumption.
 
-1. **Default `shell` image contents** — _pending live confirmation_ (the
-   discovery sandbox create is blocked by a host erofs/containerd issue, see
-   item 6). The setup step stays defensive/idempotent regardless: it installs
-   only the missing tools, so whatever the base image already ships simply
-   no-ops.
+1. **Default `shell` image contents — RESOLVED (2026-07-02, live).** The image
+   is Ubuntu 26.04 LTS with `python3`/`pip3`/`git`/`node`/`npm` already
+   present; `tmux` and the Claude Code CLI are **not** present, so the setup
+   step's installs of those two are the only ones that actually fire (the
+   rest no-op, confirming the defensive/idempotent design). Its system
+   `python3` is 3.14 — initially suspected as the cause of item 8's install
+   failure, but reproduced identically under a clean Python 3.12 (installed
+   via the image's bundled `uv`), proving the Python version is irrelevant.
 2. **Kit reference forms.** `sbx create --kit` takes `strings` (repeatable);
    accepted forms are a **local directory, ZIP, or OCI** reference. A GitHub
    `…/tree/<branch>/<subdir>` URL is **rejected** (`sbx kit validate` →
@@ -286,22 +289,70 @@ spike. Each item updates the corresponding design assumption.
    has since been migrated to plain ext4 (no ecryptfs mounts remain), and
    `sbx create` now pulls and extracts `docker/sandbox-templates:shell-docker`
    cleanly. A default network policy (item 5) is also configured on the host.
-7. **Host blocker — KVM vcpu entry failure (environment, not design;
-   recorded 2026-07-01).** With the filesystem blocker gone, `sbx create …
-   shell <dir>` now fails at microVM boot:
-   `failed to create shim task: VM exited before connecting`. The daemon log
-   shows the hypervisor ("sailor") starting all vcpus, then
-   `kvm fail entry, exit_reason=0` on one vcpu ~270ms in, after which the VM
-   shuts down. Reproducible across runs (not a flake); `/dev/kvm` exists and
-   the user is in the `kvm` group. Suspected sbx v0.32.0 hypervisor
-   incompatibility with this host's kernel (7.0.0-27-generic). sbx cleans up
-   the failed sandbox itself, so no stale state is left. This blocks the live
-   image-contents probe (item 1) and the Task 11 end-to-end verification on
-   this machine until an sbx/kernel update fixes VM boot — or the E2E runs on
-   another host. It does **not** affect the launcher code, which is fully
-   unit-tested against a mocked `sbx` (28 tests) and whose `create` argv,
-   policy preflight, and login probe were exercised for real up to the VM
-   boot failure.
+7. **Host blocker — KVM vcpu entry failure: RESOLVED (2026-07-02).** The
+   `kvm fail entry, exit_reason=0` boot failure (recorded 2026-07-01) turned
+   out to be caused by VirtualBox running concurrently on the same host —
+   VirtualBox's own hypervisor holds `/dev/kvm` in a way that's incompatible
+   with sbx's "sailor" microVM hypervisor. Once VirtualBox was shut down,
+   `sbx create` booted cleanly and consistently. Not an sbx/kernel bug; a
+   local-machine conflict between two hypervisors sharing `/dev/kvm`.
+8. **Bug — full `pip install` fails on `opentelemetry-instrumentation-fastapi`
+   (found + fixed live, 2026-07-02).** Once sandboxes could boot, the first
+   real `wheel_install_command` run failed:
+   `ERROR: Could not find a version that satisfies the requirement
+   opentelemetry-instrumentation-fastapi<1,>=0`. Root cause: that package has
+   never cut a non-beta release (every published version is tagged
+   `0.NNbN`), and plain `pip install` excludes pre-releases by default. This
+   is independent of Python version (reproduced identically under a fresh
+   Python 3.12) and independent of sbx — it's the **first real exercise**
+   of a full, with-deps wheel install anywhere in the codebase, since every
+   other launcher installs `--no-deps` into a prebaked image and never
+   resolves this dependency at all. Fixed by adding `--pre` to
+   `wheel_install_command`; verified live (full install of all 3 wheels +
+   deps succeeds).
+9. **Flake — first `sbx cp` after a fresh `provision()` (found + fixed live,
+   2026-07-02).** The wheel tarball's *first* `sbx cp` into a just-created
+   sandbox failed twice in a row with `tar: Unexpected EOF in archive`
+   (truncated transfer); an immediate manual retry succeeded both times.
+   Looks like sbx's copy transport isn't fully warmed up immediately after
+   `provision`'s setup step (apt + npm install) finishes. `put()` now
+   retries up to 3 times with a 2s backoff — `sbx cp` is idempotent
+   (overwrites the destination), so retrying is safe. Covered by two new
+   unit tests (`test_put_retries_transient_failure_then_succeeds`,
+   `test_put_gives_up_after_retries_exhausted`).
+10. **`localhost`/`127.0.0.1` in `--server` is unreachable from inside a
+    sandbox — operational note, not a code change.** A sandbox's egress proxy
+    (`gateway.docker.internal:3128`) rewrites `host.docker.internal` back to
+    `localhost` for its own policy matching, then denies it under the
+    default-deny policy (`Blocked by network policy: domain localhost:6767`).
+    To point `--server` at a locally-running Omnigent server: use
+    `http://host.docker.internal:<port>` (not `127.0.0.1`/`localhost`) and run
+    `sbx policy allow network "localhost:<port>,host.docker.internal:<port>"`
+    once. Not a launcher bug — the same constraint applies to any locally
+    bound service a sandbox needs to reach.
+
+### End-to-end verification — PASSED (2026-07-02)
+
+With VirtualBox stopped and the two fixes above applied, the full flow ran
+against a real sbx sandbox and a real local Omnigent server:
+
+- `omnigent sandbox create --provider sbx --server http://host.docker.internal:<port>`
+  — sandbox created, wheels built + shipped + installed (full dependency
+  install, ~100 packages), "Sandbox ready" banner printed.
+- `omnigent host --server …` run inside the sandbox — connected and
+  registered; `GET /v1/hosts` on the server shows it `"status":"online"`
+  with `claude-native: true` and the other harnesses available.
+- `docker run --rm hello-world` inside the sandbox — nested Docker confirmed
+  working (each sandbox's own Docker daemon, per the design goal).
+- `sbx rm -f` cleanup left no stray sandboxes.
+
+Not exercised: the interactive Ctrl-C-to-detach path for
+`exec_foreground`/`connect`, and a full claude-native session round-trip
+through the web UI. Both require a real attached TTY / browser session that
+this non-interactive verification pass couldn't drive; `sbx exec -it` under
+a non-tty subprocess call returned no error but also no visible output,
+which is a testing-harness limitation, not a launcher bug (`run` and
+non-`-it` `exec` calls all behaved correctly throughout).
 
 ### Confirmed CLI surface (matches the plan's argv assumptions)
 
@@ -311,3 +362,6 @@ spike. Each item updates the corresponding design assumption.
   mirror `docker exec`; auto-starts a stopped sandbox.
 - `sbx cp SRC DST` with one side as `SANDBOX:PATH`.
 - `sbx ls [--json] [-q]`, `sbx rm [-f] SANDBOX…`, `sbx stop SANDBOX…`.
+- `sbx policy allow network RESOURCES [--sandbox NAME]` — adds a global (or
+  per-sandbox) egress allow rule; resources are comma-separated
+  `host[:port]` entries.

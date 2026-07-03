@@ -28,13 +28,13 @@ This is a discovery task (no production code). Its deliverable is **recorded fin
 **Files:**
 - Modify: `docs/superpowers/specs/2026-06-17-sbx-sandbox-launcher-design.md` (fill in the "Open verification items" section with results)
 
-- [ ] **Step 1: Confirm not-logged-in detection (already verified once)**
+- [x] **Step 1: Confirm not-logged-in detection (already verified once)**
 
 Run: `sbx ls; echo "exit=$?"`
 Expected when logged out: `exit=1` and stderr contains `Not authenticated to Docker` / `Sign in with: sbx login`.
 Record: the exact exit code + message `prepare()` keys on. (Pre-verified: exit 1, message as above.)
 
-- [ ] **Step 2: Inspect the default `shell` sandbox image contents**
+- [x] **Step 2: Inspect the default `shell` sandbox image contents**
 
 ```bash
 sbx create --name oa-probe shell .
@@ -47,12 +47,12 @@ sbx exec oa-probe bash -lc 'test -f "$(python3 -c "import sys,sysconfig,os;print
 
 Record in the spec: which of `python3/pip3/git/tmux/node/npm/docker/claude` are present, the base distro (apt vs not), and whether PEP 668 is in force.
 
-- [ ] **Step 3: Confirm whether local sandboxes idle-stop**
+- [x] **Step 3: Confirm whether local sandboxes idle-stop**
 
 Run: `sbx ls --json` and inspect for any idle/auto-stop fields; check `sbx create --help` / docs.
 Record: whether `keep_alive` needs to do anything (default assumption: no idle-stop ⇒ informational no-op).
 
-- [ ] **Step 4: Confirm the kit reference forms accepted at create**
+- [x] **Step 4: Confirm the kit reference forms accepted at create**
 
 ```bash
 git clone https://github.com/landreville/sbxkit /tmp/sbxkit
@@ -62,11 +62,11 @@ sbx create --name oa-probe-kit --kit /tmp/sbxkit/claude shell .; echo "exit=$?"
 
 Record: that local-directory kit refs work (pre-verified: the GitHub `/tree/...` URL is rejected as an OCI ref by `sbx kit validate`). Confirm passthrough of a local dir / OCI ref; document the recommended way to consume a repo-subdir kit (clone locally, then pass the directory).
 
-- [ ] **Step 5: Clean up probes**
+- [x] **Step 5: Clean up probes**
 
 Run: `sbx rm -f oa-probe oa-probe-kit`
 
-- [ ] **Step 6: Update the spec's "Open verification items" with the four results, then commit**
+- [x] **Step 6: Update the spec's "Open verification items" with the four results, then commit**
 
 ```bash
 git add docs/superpowers/specs/2026-06-17-sbx-sandbox-launcher-design.md
@@ -90,7 +90,7 @@ git commit -m "docs: record sbx launcher discovery findings"
   - Module constants `TEMPLATE_ENV_VAR="OMNIGENT_SBX_TEMPLATE"`, `SANDBOX_ENV_PASSTHROUGH_ENV_VAR="OMNIGENT_SBX_SANDBOX_ENV"`, `KITS_ENV_VAR="OMNIGENT_SBX_KITS"`
   - Internal helpers: `_sbx_binary() -> str`, `_run_sbx(args, *, capture=True, check=False) -> subprocess.CompletedProcess`, `_resolve_template() -> str | None`, `_resolve_kits() -> list[str]`, `_resolve_env() -> dict[str, str]`
 
-- [ ] **Step 1: Write the failing test (config resolution + class vars)**
+- [x] **Step 1: Write the failing test (config resolution + class vars)**
 
 Create `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -217,12 +217,12 @@ def test_resolve_env_resolves_values(fake_sbx: _FakeSbx, monkeypatch: pytest.Mon
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -v`
 Expected: FAIL — `ModuleNotFoundError: omnigent.onboarding.sandboxes.sbx`.
 
-- [ ] **Step 3: Write the module scaffold**
+- [x] **Step 3: Write the module scaffold**
 
 Create `omnigent/onboarding/sandboxes/sbx.py`:
 
@@ -395,12 +395,12 @@ class SbxSandboxLauncher(SandboxLauncher):
         return resolved
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -v`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/sbx.py tests/onboarding/sandboxes/test_sbx.py
@@ -419,7 +419,7 @@ git commit -m "feat(sbx): scaffold launcher with config resolution"
 - Consumes: `_sbx_binary`, `_run_sbx` (Task 2)
 - Produces: `prepare(self) -> None`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -449,12 +449,12 @@ def test_prepare_passes_when_logged_in(fake_sbx: _FakeSbx) -> None:
     assert [c.args[1] for c in fake_sbx.calls] == ["ls"]
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k prepare -v`
 Expected: FAIL — `prepare` not implemented (raises base capability error / AttributeError).
 
-- [ ] **Step 3: Implement `prepare`**
+- [x] **Step 3: Implement `prepare`**
 
 Add to `SbxSandboxLauncher`:
 
@@ -476,12 +476,12 @@ Add to `SbxSandboxLauncher`:
             )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k prepare -v`
 Expected: PASS (3 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/sbx.py tests/onboarding/sandboxes/test_sbx.py
@@ -500,7 +500,7 @@ git commit -m "feat(sbx): add prepare preflight (binary + login)"
 - Consumes: `_run_sbx`, `_resolve_kits`, `_resolve_template`, `_SETUP_COMMAND` (Tasks 2)
 - Produces: `provision(self, name: str) -> str` (returns the sandbox name; bind-mounts cwd)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -589,12 +589,12 @@ def test_provision_missing_network_policy_gives_remediation(
         SbxSandboxLauncher().provision("box")
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k provision -v`
 Expected: FAIL — `provision` not implemented.
 
-- [ ] **Step 3: Implement `provision`**
+- [x] **Step 3: Implement `provision`**
 
 Add to `SbxSandboxLauncher`:
 
@@ -648,12 +648,12 @@ Add to `SbxSandboxLauncher`:
 
 Add `from pathlib import Path` to the module imports (top of file, with the other stdlib imports).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k provision -v`
 Expected: PASS (4 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/sbx.py tests/onboarding/sandboxes/test_sbx.py
@@ -672,7 +672,7 @@ git commit -m "feat(sbx): provision create + kits/template + setup step"
 - Consumes: `_run_sbx` (Task 2), `RemoteCommandResult` (base)
 - Produces: `run(self, sandbox_id, command, *, check=True) -> RemoteCommandResult`; `put(self, sandbox_id, local_path, remote_path) -> None`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -714,12 +714,12 @@ def test_put_wraps_failure(fake_sbx: _FakeSbx) -> None:
         SbxSandboxLauncher().put("box", Path("/tmp/x"), "/tmp/x")
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "run_ or put" -v`
 Expected: FAIL — methods not implemented.
 
-- [ ] **Step 3: Implement `run` and `put`**
+- [x] **Step 3: Implement `run` and `put`**
 
 Add to `SbxSandboxLauncher`:
 
@@ -768,12 +768,12 @@ Add to `SbxSandboxLauncher`:
             )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "run_ or put" -v`
 Expected: PASS (4 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/sbx.py tests/onboarding/sandboxes/test_sbx.py
@@ -791,7 +791,7 @@ git commit -m "feat(sbx): add run (exec) and put (cp) primitives"
 **Interfaces:**
 - Produces: `wheel_install_command(self, remote_tgz_path: str) -> str`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -813,12 +813,12 @@ def test_wheel_install_is_full_install(fake_sbx: _FakeSbx) -> None:
     assert "--force-reinstall" not in cmd
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k wheel_install -v`
 Expected: FAIL — base class raises a capability error.
 
-- [ ] **Step 3: Implement `wheel_install_command`**
+- [x] **Step 3: Implement `wheel_install_command`**
 
 Add to `SbxSandboxLauncher`:
 
@@ -846,12 +846,12 @@ Add to `SbxSandboxLauncher`:
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k wheel_install -v`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/sbx.py tests/onboarding/sandboxes/test_sbx.py
@@ -870,7 +870,7 @@ git commit -m "feat(sbx): full-install wheel_install_command for default image"
 - Consumes: `_sbx_binary`, `_resolve_env` (Task 2)
 - Produces: `exec_foreground(self, sandbox_id: str, command: str) -> int`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -906,12 +906,12 @@ def test_exec_foreground_reraises_keyboard_interrupt(fake_sbx: _FakeSbx) -> None
         SbxSandboxLauncher().exec_foreground("box", "omnigent host --server u")
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k exec_foreground -v`
 Expected: FAIL — `exec_foreground` not implemented.
 
-- [ ] **Step 3: Implement `exec_foreground`**
+- [x] **Step 3: Implement `exec_foreground`**
 
 Add to `SbxSandboxLauncher`:
 
@@ -944,12 +944,12 @@ Add to `SbxSandboxLauncher`:
         return result.returncode
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k exec_foreground -v`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/sbx.py tests/onboarding/sandboxes/test_sbx.py
@@ -968,7 +968,7 @@ git commit -m "feat(sbx): exec_foreground attach with env injection"
 - Consumes: `_run_sbx` (Task 2)
 - Produces: `_sandbox_exists(self, sandbox_id: str) -> bool`; `attach`, `keep_alive`, `terminate` (all `(self, sandbox_id: str) -> None`)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -1020,12 +1020,12 @@ def test_terminate_idempotent_when_absent(fake_sbx: _FakeSbx) -> None:
     assert [c.args[1] for c in fake_sbx.calls] == ["ls"]
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "attach or keep_alive or terminate" -v`
 Expected: FAIL — methods not implemented.
 
-- [ ] **Step 3: Implement the lifecycle methods**
+- [x] **Step 3: Implement the lifecycle methods**
 
 Add `import json` to the module imports, then add to `SbxSandboxLauncher`:
 
@@ -1098,12 +1098,12 @@ Add `import json` to the module imports, then add to `SbxSandboxLauncher`:
             )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "attach or keep_alive or terminate" -v`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/sbx.py tests/onboarding/sandboxes/test_sbx.py
@@ -1122,7 +1122,7 @@ git commit -m "feat(sbx): attach/keep_alive/terminate lifecycle"
 - Consumes: `available_providers`, `get_launcher` (`__init__.py`)
 - Produces: `"sbx"` entry in `_LAUNCHERS`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -1149,12 +1149,12 @@ def test_login_primitives_are_capability_gated(fake_sbx: _FakeSbx) -> None:
         launcher.stream_exec("box", "echo hi")
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "registered or capability_gated" -v`
 Expected: FAIL — `"sbx" not in available_providers()`.
 
-- [ ] **Step 3: Register the provider**
+- [x] **Step 3: Register the provider**
 
 In `omnigent/onboarding/sandboxes/__init__.py`, add the `sbx` entry to `_LAUNCHERS`:
 
@@ -1167,12 +1167,12 @@ _LAUNCHERS: dict[str, str] = {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "registered or capability_gated" -v`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/__init__.py tests/onboarding/sandboxes/test_sbx.py
@@ -1192,7 +1192,7 @@ git commit -m "feat(sbx): register sbx sandbox provider"
 - Consumes: `get_launcher` (Task 9 registration), `SbxSandboxLauncher(kits=…)` (Task 2)
 - Produces: `get_launcher(provider, *, workspace_host=None, kits=None)`; `--kit` repeatable option on `omnigent sandbox create`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/onboarding/sandboxes/test_sbx.py`:
 
@@ -1249,12 +1249,12 @@ def test_create_command_forwards_kit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert recorded["kits"] == ("/tmp/sbxkit/claude",)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "threads_kits or forwards_kit" -v`
 Expected: FAIL — `get_launcher` has no `kits` param / `--kit` option unknown.
 
-- [ ] **Step 3: Add the `kits` param + sbx special-case to `get_launcher`**
+- [x] **Step 3: Add the `kits` param + sbx special-case to `get_launcher`**
 
 In `omnigent/onboarding/sandboxes/__init__.py`, update `get_launcher`:
 
@@ -1278,7 +1278,7 @@ Add `from collections.abc import Sequence` under `from __future__ import annotat
 
 Update the `get_launcher` docstring with a one-line note that `kits` is consumed only by the `sbx` provider (other providers ignore it).
 
-- [ ] **Step 4: Add the `--kit` option to `sandbox create`**
+- [x] **Step 4: Add the `--kit` option to `sandbox create`**
 
 In `omnigent/cli_sandbox.py`, add an option decorator to `sandbox_create` (after `--name`):
 
@@ -1301,19 +1301,19 @@ Add `kits: tuple[str, ...]` to the `sandbox_create` signature, and pass it throu
     )
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -k "threads_kits or forwards_kit" -v`
 Expected: PASS (2 tests).
 
-- [ ] **Step 6: Run the full launcher test module + lint**
+- [x] **Step 6: Run the full launcher test module + lint**
 
 Run: `pytest tests/onboarding/sandboxes/test_sbx.py -v`
 Expected: PASS (all tests).
 Run: `srt -- ruff check omnigent/onboarding/sandboxes/sbx.py omnigent/cli_sandbox.py omnigent/onboarding/sandboxes/__init__.py` (or the repo's configured linter).
 Expected: clean.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add omnigent/onboarding/sandboxes/__init__.py omnigent/cli_sandbox.py tests/onboarding/sandboxes/test_sbx.py
@@ -1328,7 +1328,7 @@ git commit -m "feat(sbx): wire --kit option through to the sbx launcher"
 - Modify: `README.md` (the cloud-sandbox / providers section)
 - Modify: `omnigent/cli_sandbox.py` (the `sandbox` group docstring "Provider notes")
 
-- [ ] **Step 1: Document the provider in the CLI help**
+- [x] **Step 1: Document the provider in the CLI help**
 
 In `omnigent/cli_sandbox.py`, extend the `sandbox` group docstring's "Provider notes" block with:
 
@@ -1340,18 +1340,18 @@ In `omnigent/cli_sandbox.py`, extend the `sandbox` group docstring's "Provider n
                personal config with `--kit <ref>` (repeatable).
 ```
 
-- [ ] **Step 2: Document the provider in the README**
+- [x] **Step 2: Document the provider in the README**
 
 In `README.md`, in the "Run agents in cloud sandboxes" area, add a sentence noting a local option: running a session inside a local Docker Sandbox (`sbx`) microVM via `omnigent sandbox create --provider sbx`, with optional `--kit` config and nested-Docker support. Match the surrounding prose style.
 
-- [ ] **Step 3: Commit the docs**
+- [x] **Step 3: Commit the docs**
 
 ```bash
 git add README.md omnigent/cli_sandbox.py
 git commit -m "docs(sbx): document the sbx sandbox provider"
 ```
 
-- [ ] **Step 4: End-to-end manual verification (real `sbx`, logged in, server reachable)**
+- [x] **Step 4: End-to-end manual verification (real `sbx`, logged in, server reachable)**
 
 Run, from an omnigent checkout, against a running Omnigent server URL:
 
@@ -1376,7 +1376,7 @@ Expected: `omnigent host` runs in the sandbox and registers; the host appears in
 sbx rm -f omnigent-host   # cleanup
 ```
 
-- [ ] **Step 5: Record verification results**
+- [x] **Step 5: Record verification results**
 
 Note any deviations from the discovery-task assumptions (PEP 668 flag, setup deps, idle-stop). If `wheel_install_command` or `_SETUP_COMMAND` needed adjustment, the change should already be committed under the relevant task; otherwise fix and commit now.
 
