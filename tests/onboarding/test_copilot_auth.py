@@ -21,6 +21,8 @@ from omnigent.onboarding import copilot_auth, extra_install
 from omnigent.onboarding import secrets as secret_store
 from omnigent.onboarding.copilot_auth import (
     COPILOT_SECRET_NAME,
+    copilot_github_host,
+    copilot_github_host_settings,
     copilot_github_token_configured,
     copilot_github_token_ref,
     copilot_github_token_settings,
@@ -254,3 +256,39 @@ def test_install_copilot_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(extra_install.shutil, "which", lambda name: None)
     monkeypatch.setattr(copilot_auth.subprocess, "run", _boom)
     assert install_copilot_sdk() is False
+
+
+# ---------------------------------------------------------------------------
+# GitHub host helpers
+# ---------------------------------------------------------------------------
+
+
+def test_github_host_defaults_to_github_com(tmp_path: Path) -> None:
+    # No copilot block at all -> falls back to "github.com".
+    assert copilot_github_host() == "github.com"
+
+
+def test_github_host_reads_from_config(tmp_path: Path) -> None:
+    _write_config(tmp_path, {"copilot": {"github_host": "shs.ghe.com"}})
+    assert copilot_github_host() == "shs.ghe.com"
+
+
+def test_github_host_ignores_empty_string(tmp_path: Path) -> None:
+    _write_config(tmp_path, {"copilot": {"github_host": ""}})
+    assert copilot_github_host() == "github.com"
+
+
+def test_github_host_settings_shape() -> None:
+    assert copilot_github_host_settings("shs.ghe.com") == {
+        "copilot": {"github_host": "shs.ghe.com"}
+    }
+
+
+def test_github_host_coexists_with_token_ref(tmp_path: Path) -> None:
+    # Both fields can live in the copilot block simultaneously.
+    _write_config(
+        tmp_path,
+        {"copilot": {"github_token_ref": "env:GH_TOKEN", "github_host": "shs.ghe.com"}},
+    )
+    assert copilot_github_host() == "shs.ghe.com"
+    assert copilot_github_token_ref() == "env:GH_TOKEN"

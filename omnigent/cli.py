@@ -10287,6 +10287,7 @@ def _manage_copilot_harness() -> None:
     from omnigent.onboarding.copilot_auth import (
         COPILOT_CONFIG_KEY,
         COPILOT_SECRET_NAME,
+        copilot_github_host,
         copilot_github_token_configured,
         copilot_github_token_ref,
         copilot_sdk_installed,
@@ -10304,12 +10305,22 @@ def _manage_copilot_harness() -> None:
     while True:
         config = _load_global_config()
         token_set = copilot_github_token_configured(config)
+        current_host = copilot_github_host(config)
+        host_label = f" [{current_host}]" if current_host != "github.com" else ""
 
         rows: list[_HarnessMenuRow] = [
             _HarnessMenuRow(
-                "Replace GitHub token" if token_set else "Set GitHub token",
+                f"Login with GitHub CLI (gh auth login){host_label}",
+                action="gh_login",
+            ),
+            _HarnessMenuRow(
+                "Replace GitHub token" if token_set else "Paste GitHub token",
                 action="set_key",
-            )
+            ),
+            _HarnessMenuRow(
+                f"Set GitHub host (current: {current_host})",
+                action="set_host",
+            ),
         ]
         if token_set:
             rows.append(_HarnessMenuRow("Remove GitHub token", action="remove_key"))
@@ -10324,8 +10335,12 @@ def _manage_copilot_harness() -> None:
         action = rows[idx].action
         if action == "back":
             return
-        if action == "set_key":
+        if action == "gh_login":
+            status = _gh_auth_login_copilot()
+        elif action == "set_key":
             status = _set_copilot_github_token()
+        elif action == "set_host":
+            status = _set_copilot_github_host()
         elif action == "remove_key":
             ref = copilot_github_token_ref(config)
             # Only the secret we own (``keychain:copilot``) is ours to delete: a
@@ -10336,6 +10351,120 @@ def _manage_copilot_harness() -> None:
                 secret_store.delete_secret(COPILOT_SECRET_NAME)
             _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
             status = "✓ Removed Copilot GitHub token"
+
+
+def _gh_auth_login_copilot() -> str | None:
+    """Run ``gh auth login --hostname <host>`` and store the resulting token.
+
+    Checks that ``gh`` is on PATH first. Runs the interactive login using the
+    configured GitHub host (default ``github.com``, or a GHE hostname set via
+    ``Set GitHub host``), then stores the resulting OAuth token under
+    ``keychain:copilot``. The token is never echoed.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted /
+        something failed.
+    """
+    import shutil
+    import subprocess as _sp
+
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_SECRET_NAME,
+        copilot_github_host,
+        copilot_github_token_settings,
+        looks_like_github_copilot_token,
+    )
+
+    console = Console()
+    host = copilot_github_host()
+
+    if host != "github.com":
+        console.print(
+            f"  [yellow]Note:[/yellow] GitHub host is set to [bold]{host}[/bold]. "
+            "The Copilot SDK requires a [bold]github.com[/bold] token — "
+            "this will only work if your GHE instance is linked to github.com Copilot access."
+        )
+
+    if not shutil.which("gh"):
+        console.print(
+            "  [red]gh CLI not found.[/red] Install it with:"
+            "  [bold]brew install gh[/bold]  then re-run setup."
+        )
+        return None
+
+    console.print(f"  Running [bold]gh auth login --hostname {host}[/bold] …")
+    try:
+        result = _sp.run(
+            ["gh", "auth", "login", "--hostname", host],
+            check=False,
+        )
+    except OSError as exc:
+        console.print(f"  [red]Failed to launch gh:[/red] {exc}")
+        return None
+
+    if result.returncode != 0:
+        console.print("  [red]gh auth login did not complete successfully.[/red]")
+        return None
+
+    # Retrieve the token the login produced.
+    try:
+        token_result = _sp.run(
+            ["gh", "auth", "token", "--hostname", host],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        token = token_result.stdout.strip()
+    except OSError as exc:
+        console.print(f"  [red]Failed to retrieve token from gh:[/red] {exc}")
+        return None
+
+    if not token:
+        console.print(
+            "  [red]No token returned by gh.[/red] Login may have succeeded — "
+            f"try [bold]Paste GitHub token[/bold] and paste the output of "
+            f"[bold]gh auth token --hostname {host}[/bold]."
+        )
+        return None
+
+    if not looks_like_github_copilot_token(token):
+        console.print(
+            f"  [yellow]Warning:[/yellow] token shape ({token[:8]}…) is unexpected. "
+            "Storing anyway — Copilot will reject it if it lacks Copilot access."
+        )
+
+    secret_store.store_secret(COPILOT_SECRET_NAME, token)
+    _save_global_config(
+        copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"),
+        deep_merge_keys=("copilot",),
+    )
+    return "✓ Logged in via GitHub CLI and token stored"
+
+
+def _set_copilot_github_host() -> str | None:
+    """Prompt for and save the GitHub host for Copilot; return a status line.
+
+    Lets the user set a custom GitHub hostname (e.g. ``shs.ghe.com``) so that
+    ``gh auth login`` and the harness target the right instance. Stored under
+    ``copilot.github_host`` in ``~/.omnigent/config.yaml`` via a deep merge so
+    the token reference is preserved.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding.copilot_auth import (
+        copilot_github_host,
+        copilot_github_host_settings,
+    )
+    from omnigent.onboarding.interactive import prompt_text
+
+    current = copilot_github_host()
+    raw = prompt_text(f"GitHub hostname (current: {current})", default=current).strip()
+    if not raw:
+        return None
+    if raw == current:
+        return None
+    _save_global_config(copilot_github_host_settings(raw), deep_merge_keys=("copilot",))
+    return f"✓ GitHub host set to {raw}"
 
 
 def _set_copilot_github_token() -> str | None:
@@ -10370,7 +10499,9 @@ def _set_copilot_github_token() -> str | None:
             default=False,
         ):
             return None
-        _save_global_config(copilot_github_token_settings(f"env:{detected_var}"))
+        _save_global_config(
+            copilot_github_token_settings(f"env:{detected_var}"), deep_merge_keys=("copilot",)
+        )
         return f"✓ Copilot GitHub token set (from ${detected_var})"
 
     pasted = prompt_text("GitHub token with Copilot access", hide_input=True).strip()
@@ -10383,7 +10514,10 @@ def _set_copilot_github_token() -> str | None:
     ):
         return None
     secret_store.store_secret(COPILOT_SECRET_NAME, pasted)
-    _save_global_config(copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"))
+    _save_global_config(
+        copilot_github_token_settings(f"keychain:{COPILOT_SECRET_NAME}"),
+        deep_merge_keys=("copilot",),
+    )
     return "✓ Copilot GitHub token stored"
 
 

@@ -107,3 +107,21 @@ def test_no_auth_prefers_stored_block_over_ambient(
 def test_bundle_dir_threaded(tmp_path: Path) -> None:
     env = _build_copilot_spawn_env(_make_spec(), workdir=tmp_path)
     assert env["HARNESS_COPILOT_BUNDLE_DIR"] == str(tmp_path)
+
+
+def test_github_host_forwarded_when_configured(tmp_path: Path) -> None:
+    # When the user has set a non-github.com host in config, it must be
+    # forwarded as HARNESS_COPILOT_GITHUB_HOST so the harness can pass it
+    # to the executor and on to the bundled CLI binary.
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"copilot": {"github_host": "shs.ghe.com"}})
+    )
+    env = _build_copilot_spawn_env(_make_spec(auth=None))
+    assert env.get("HARNESS_COPILOT_GITHUB_HOST") == "shs.ghe.com"
+
+
+def test_github_host_absent_by_default() -> None:
+    # No host configured -> HARNESS_COPILOT_GITHUB_HOST must not be set
+    # (the executor defaults to github.com when the env var is absent).
+    env = _build_copilot_spawn_env(_make_spec(auth=None))
+    assert "HARNESS_COPILOT_GITHUB_HOST" not in env

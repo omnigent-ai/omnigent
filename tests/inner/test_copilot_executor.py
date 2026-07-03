@@ -24,6 +24,7 @@ from omnigent.inner.copilot_executor import (
     _accumulate_usage,
     _ambient_github_token,
     _build_copilot_prompt,
+    _classify_auth_error,
     _coerce_args,
     _encode_tool_result,
     _event_data,
@@ -31,6 +32,7 @@ from omnigent.inner.copilot_executor import (
     _permission_policy_input,
     _resolve_model,
     _resolve_reasoning_effort,
+    _resolve_session_idle_timeout,
 )
 from omnigent.inner.executor import (
     CompactionComplete,
@@ -342,12 +344,86 @@ def test_ambient_github_token_precedence(monkeypatch: pytest.MonkeyPatch) -> Non
     assert _ambient_github_token() == "gho_a"
 
 
+def test_resolve_session_idle_timeout_none_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("COPILOT_SDK_SESSION_IDLE_TIMEOUT", raising=False)
+    assert _resolve_session_idle_timeout() is None
+
+
+def test_resolve_session_idle_timeout_reads_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COPILOT_SDK_SESSION_IDLE_TIMEOUT", "300")
+    assert _resolve_session_idle_timeout() == 300
+
+
+def test_resolve_session_idle_timeout_ignores_non_integer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COPILOT_SDK_SESSION_IDLE_TIMEOUT", "not-a-number")
+    assert _resolve_session_idle_timeout() is None
+
+
 def test_capabilities() -> None:
     ex = CopilotExecutor()
     assert ex.supports_streaming() is True
     assert ex.supports_tool_calling() is True
     assert ex.handles_tools_internally() is True
     assert ex.supports_live_message_queue() is False
+
+
+@pytest.mark.asyncio
+async def test_use_logged_in_user_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When no explicit token is resolved, use_logged_in_user=True delegates
+    # auth to the Copilot CLI's existing login rather than failing with a 401.
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor()  # no github_token
+    _ = [e async for e in ex.run_turn([_user("hi")], [], "")]
+    assert state["client_kwargs"][0]["use_logged_in_user"] is True
+    assert state["client_kwargs"][0]["github_token"] is None
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_use_logged_in_user_false_when_token_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When an explicit token is supplied, use_logged_in_user=False — the token
+    # path is used and the CLI login is not consulted.
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_explicit")
+    _ = [e async for e in ex.run_turn([_user("hi")], [], "")]
+    assert state["client_kwargs"][0]["use_logged_in_user"] is False
+    assert state["client_kwargs"][0]["github_token"] == "gho_explicit"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_ghe_host_sets_gh_host_in_client_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non-github.com host must be forwarded as GH_HOST in the client env dict
+    # so the bundled Copilot CLI binary can route auth to the GHE instance.
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x", github_host="shs.ghe.com")
+    _ = [e async for e in ex.run_turn([_user("hi")], [], "")]
+    client_env = state["client_kwargs"][0].get("env")
+    assert isinstance(client_env, dict)
+    assert client_env["GH_HOST"] == "shs.ghe.com"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_github_com_host_no_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # github.com is the default; no env override should be injected.
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x", github_host="github.com")
+    _ = [e async for e in ex.run_turn([_user("hi")], [], "")]
+    assert state["client_kwargs"][0].get("env") is None
+    await ex.close()
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +807,47 @@ async def test_ensure_session_failure_surfaces_executor_error(
     events = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert errors and "bad token" in errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# Auth error classification (regression: #1936)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_auth_error_no_credentials_gives_setup_hint() -> None:
+    # No token + 401 → "no credentials" message pointing at omni setup.
+    exc = RuntimeError("Authentication failed: 401: Bad credentials")
+    result = _classify_auth_error(exc, github_token=None, github_host=None)
+    msg = str(result)
+    assert "No Copilot credentials" in msg
+    assert "omni setup" in msg
+    assert "Login with GitHub CLI" in msg
+
+
+def test_classify_auth_error_bad_token_github_com_gives_token_hint() -> None:
+    # Explicit token + 401 on github.com → "token rejected" message.
+    exc = RuntimeError("Authentication failed: 401: Bad credentials")
+    result = _classify_auth_error(exc, github_token="gho_bad", github_host="github.com")
+    msg = str(result)
+    assert "github.com" in msg
+    assert "401" in msg or "rejected" in msg.lower()
+    assert "omni setup" in msg
+
+
+def test_classify_auth_error_bad_token_enterprise_host_names_host() -> None:
+    # Explicit token + 401 on a GHE host → message names the enterprise host.
+    exc = RuntimeError("Authentication failed: 401: Bad credentials")
+    result = _classify_auth_error(exc, github_token="gho_ent", github_host="shs.ghe.com")
+    msg = str(result)
+    assert "shs.ghe.com" in msg
+    assert "omni setup" in msg
+
+
+def test_classify_auth_error_non_auth_error_passes_through() -> None:
+    # A non-auth error (network failure, version skew) must not be re-wrapped.
+    exc = RuntimeError("Connection refused")
+    result = _classify_auth_error(exc, github_token="gho_x", github_host=None)
+    assert result is exc  # exact same object, untouched
 
 
 @pytest.mark.asyncio

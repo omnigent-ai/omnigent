@@ -1884,6 +1884,7 @@ def _build_copilot_spawn_env(
         # keyring, which the hot spawn-env path shouldn't import eagerly.
         from omnigent.onboarding.copilot_auth import (
             COPILOT_TOKEN_ENV_VARS,
+            copilot_github_host,
             resolve_copilot_github_token,
         )
 
@@ -1895,6 +1896,12 @@ def _build_copilot_spawn_env(
                 if os.environ.get(_env_var):
                     env["HARNESS_COPILOT_GITHUB_TOKEN"] = os.environ[_env_var]
                     break
+        # Forward the configured GitHub host so the harness can target a GHE
+        # instance. Only set when the user has explicitly configured a host
+        # (non-github.com) so the default path is unchanged.
+        _host = copilot_github_host()
+        if _host != "github.com":
+            env["HARNESS_COPILOT_GITHUB_HOST"] = _host
     # Always set so the wrap doesn't fall back to ``"all"`` and override an
     # explicit ``skills: none`` from the spec (parity with the peer builders).
     env["HARNESS_COPILOT_SKILLS_FILTER"] = json.dumps(spec.skills_filter)

@@ -23,6 +23,7 @@ def _clear_harness_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HARNESS_COPILOT_MODEL",
         "HARNESS_COPILOT_CWD",
         "HARNESS_COPILOT_GITHUB_TOKEN",
+        "HARNESS_COPILOT_GITHUB_HOST",
         "HARNESS_COPILOT_OS_ENV",
         "HARNESS_COPILOT_SKILLS_FILTER",
         "HARNESS_COPILOT_BUNDLE_DIR",
@@ -98,3 +99,17 @@ def test_create_app_exposes_executor_adapter_routes() -> None:
     # endpoints exist, not merely that the object has a ``routes`` attribute.
     assert "/health" in paths
     assert any("/v1/sessions/" in p and p.endswith("/events") for p in paths)
+
+
+def test_build_executor_threads_github_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HARNESS_COPILOT_GITHUB_HOST", "shs.ghe.com")
+    monkeypatch.setenv("HARNESS_COPILOT_GITHUB_TOKEN", "gho_x")
+    executor = ch._build_copilot_executor()
+    assert isinstance(executor, CopilotExecutor)
+    assert executor._github_host == "shs.ghe.com"
+
+
+def test_build_executor_github_host_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    executor = ch._build_copilot_executor()
+    assert isinstance(executor, CopilotExecutor)
+    assert executor._github_host is None

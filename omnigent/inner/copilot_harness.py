@@ -53,6 +53,7 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_COPILOT_MODEL"
 _ENV_CWD = "HARNESS_COPILOT_CWD"
 _ENV_GITHUB_TOKEN = "HARNESS_COPILOT_GITHUB_TOKEN"
+_ENV_GITHUB_HOST = "HARNESS_COPILOT_GITHUB_HOST"
 _ENV_OS_ENV = "HARNESS_COPILOT_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_COPILOT_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_COPILOT_BUNDLE_DIR"
@@ -133,6 +134,7 @@ def _build_copilot_executor() -> Executor:
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL) or None,
         github_token=os.environ.get(_ENV_GITHUB_TOKEN) or None,
+        github_host=os.environ.get(_ENV_GITHUB_HOST) or None,
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
         skills_filter=_resolve_skills_filter(),

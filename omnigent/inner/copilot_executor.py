@@ -287,6 +287,7 @@ class CopilotExecutor(Executor):
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         github_token: str | None = None,
+        github_host: str | None = None,
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
@@ -311,6 +312,11 @@ class CopilotExecutor(Executor):
         self._os_env_spec = os_env
         self._model_override = model
         self._github_token = github_token or _ambient_github_token()
+        # GitHub host override (e.g. "shs.ghe.com"). When set and different
+        # from github.com, forwarded as GH_HOST to the bundled Copilot CLI.
+        self._github_host: str | None = github_host or None
+        # SDK-level session idle timeout read from COPILOT_SDK_SESSION_IDLE_TIMEOUT.
+        self._session_idle_timeout: int | None = _resolve_session_idle_timeout()
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
@@ -500,10 +506,24 @@ class CopilotExecutor(Executor):
         # must be absolute"), and a spec / os_env can hand us a relative cwd
         # (e.g. ``.``), so always resolve to an absolute path.
         cwd = os.path.abspath(self._cwd or os.getcwd())
+        # When no explicit token is resolved, fall back to the Copilot CLI's own
+        # logged-in user (``gh auth login`` or VS Code Copilot extension).
+        # Without this, CLI-logged-in users with no env token always get a 401.
+        use_logged_in_user = self._github_token is None
+        # When a non-github.com host is configured, forward it as GH_HOST so
+        # the bundled CLI binary can use it for auth routing. The full os.environ
+        # is included so the CLI inherits the process environment unchanged
+        # except for the host override.
+        client_env: dict[str, str] | None = None
+        if self._github_host and self._github_host != "github.com":
+            client_env = {**os.environ, "GH_HOST": self._github_host}
         client = CopilotClient(
-            github_token=self._github_token,
+            github_token=self._github_token or None,
+            use_logged_in_user=use_logged_in_user,
             working_directory=cwd,
             log_level="error",
+            session_idle_timeout_seconds=self._session_idle_timeout,
+            env=client_env,
         )
         try:
             # ``start()`` is inside the try: it spawns the bundled Copilot CLI
@@ -528,9 +548,9 @@ class CopilotExecutor(Executor):
                 working_directory=cwd,
                 reasoning_effort=reasoning_effort or None,
             )
-        except BaseException:
+        except BaseException as exc:
             await _safe_stop(client)
-            raise
+            raise _classify_auth_error(exc, self._github_token, self._github_host) from exc
         state.client = client
         state.session = session
 
@@ -835,6 +855,23 @@ def _ambient_github_token() -> str | None:
     return None
 
 
+# Env var for the SDK-level session idle timeout (seconds). Surfaces a timeout
+# error instead of hanging when a session goes idle mid-turn.
+_ENV_SESSION_IDLE_TIMEOUT = "COPILOT_SDK_SESSION_IDLE_TIMEOUT"
+
+
+def _resolve_session_idle_timeout() -> int | None:
+    """Return session idle timeout in seconds from env, or None for SDK default."""
+    raw = os.environ.get(_ENV_SESSION_IDLE_TIMEOUT, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-integer %s=%r", _ENV_SESSION_IDLE_TIMEOUT, raw)
+        return None
+
+
 def _coerce_args(raw: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
     """Coerce a tool-call ``arguments`` payload to a dict.
 
@@ -977,6 +1014,61 @@ def _finalize_usage(acc: dict[str, int]) -> dict[str, Any] | None:  # type: igno
         # 1 AIC = 1e9 nano-AIU = $0.01, so nano-AIU / 1e11 = USD.
         usage["cost_usd"] = nano_aiu / 1e11
     return usage
+
+
+def _classify_auth_error(
+    exc: BaseException,
+    github_token: str | None,
+    github_host: str | None,
+) -> BaseException:
+    """Re-wrap an auth-related startup exception with a diagnostic message.
+
+    Distinguishes three cases so the error message points directly at the
+    missing or wrong setting rather than surfacing the raw SDK error:
+
+    - **No credentials configured**: no explicit token and ``use_logged_in_user``
+      path also failed — the user has neither exported a token nor logged in
+      via ``gh auth login``.
+    - **Token rejected by host**: an explicit token was supplied but the host
+      (``github.com`` or a GHE hostname) returned ``Bad credentials`` / 401 —
+      the token is wrong, expired, or scoped to a different host.
+    - **Other errors**: version skew, network failure, etc. — returned as-is.
+
+    The original exception is always chained (``raise ... from exc``) so the
+    full SDK traceback is preserved for debugging.
+    """
+    msg = str(exc)
+    is_auth_failure = "401" in msg or "Bad credentials" in msg or "Authentication failed" in msg
+
+    if not is_auth_failure:
+        return exc  # not an auth error; let the original propagate unchanged
+
+    host = github_host or "github.com"
+    setup_cmd = "omni setup"
+
+    if github_token is None:
+        # use_logged_in_user=True path also failed — no credentials at all.
+        return RuntimeError(
+            f"No Copilot credentials found for {host!r}. "
+            f"Either export COPILOT_GITHUB_TOKEN / GH_TOKEN, or run "
+            f"`{setup_cmd}` → Copilot → Login with GitHub CLI to authenticate."
+        )
+
+    # A token was supplied but the host rejected it.
+    if host != "github.com":
+        return RuntimeError(
+            f"Copilot token rejected by {host!r} (401 Bad credentials). "
+            f"The token may be scoped to a different host or have expired. "
+            f"Run `{setup_cmd}` → Copilot → Login with GitHub CLI "
+            f"[{host}] to re-authenticate against {host!r}."
+        )
+
+    return RuntimeError(
+        f"Copilot token rejected by github.com (401 Bad credentials). "
+        f"The token may have expired or lack the 'Copilot Requests' permission. "
+        f"Run `{setup_cmd}` → Copilot → Login with GitHub CLI to get a fresh token, "
+        f"or use a fine-grained PAT (github_pat_...) with Copilot access."
+    )
 
 
 async def _safe_stop(obj: Any) -> None:  # type: ignore[explicit-any]

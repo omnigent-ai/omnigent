@@ -45,6 +45,7 @@ COPILOT_SECRET_NAME = "copilot"
 COPILOT_CONFIG_KEY = "copilot"
 _TOKEN_REF_FIELD = "github_token_ref"
 _TOKEN_FIELD = "github_token"
+_GITHUB_HOST_FIELD = "github_host"
 
 # Ambient GitHub-token env vars, in the precedence the Copilot CLI/SDK honors.
 COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
@@ -200,3 +201,35 @@ def copilot_github_token_settings(ref: str) -> dict[str, object]:
     :returns: ``{"copilot": {"github_token_ref": ref}}``.
     """
     return {COPILOT_CONFIG_KEY: {_TOKEN_REF_FIELD: ref}}
+
+
+def copilot_github_host(config: dict[str, object] | None = None) -> str:
+    """Return the configured GitHub host for Copilot, defaulting to ``github.com``.
+
+    Reads ``copilot.github_host`` from the global config. Use this when the user
+    has a GitHub Enterprise Server instance (e.g. ``shs.ghe.com``) and wants
+    ``gh auth login`` and the harness to target that host instead.
+
+    :param config: A pre-loaded config mapping; ``None`` loads the global config.
+    :returns: The hostname string, e.g. ``"shs.ghe.com"`` or ``"github.com"``.
+    """
+    cfg = load_config() if config is None else config
+    block = cfg.get(COPILOT_CONFIG_KEY)
+    if isinstance(block, dict):
+        host = block.get(_GITHUB_HOST_FIELD)
+        if isinstance(host, str) and host.strip():
+            return host.strip()
+    return "github.com"
+
+
+def copilot_github_host_settings(host: str) -> dict[str, object]:
+    """Build the settings dict that records a GitHub host override.
+
+    Intended for use with ``_save_global_config(..., deep_merge_keys=("copilot",))``
+    so the host is merged into the existing ``copilot:`` block without wiping
+    the token reference.
+
+    :param host: The GitHub hostname, e.g. ``"shs.ghe.com"``.
+    :returns: ``{"copilot": {"github_host": host}}``.
+    """
+    return {COPILOT_CONFIG_KEY: {_GITHUB_HOST_FIELD: host}}
