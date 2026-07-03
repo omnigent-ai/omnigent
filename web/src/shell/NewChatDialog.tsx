@@ -1877,7 +1877,9 @@ export function NewChatLandingScreen() {
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
-    () => landingDraft?.pickedHarness ?? readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
+    () =>
+      landingDraft?.pickedHarness ??
+      readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
   );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
