@@ -1098,10 +1098,15 @@ class _OutputTextDeltaCoalescer:
                 buffer_message_id = None
                 buffered_chars = 0
                 flush_deadline = None
-                item.done.set_result(None)
+                # A cancelled flush() leaves its barrier queued with an
+                # already-cancelled future; set_result on it would raise
+                # InvalidStateError, kill this worker, and wedge close().
+                if not item.done.done():
+                    item.done.set_result(None)
                 continue
             await self._flush_buffer(buffer, message_id=buffer_message_id)
-            item.done.set_result(None)
+            if not item.done.done():
+                item.done.set_result(None)
             return
 
     async def _flush_buffer(self, buffer: list[str], *, message_id: str | None) -> None:

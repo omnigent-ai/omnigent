@@ -15,6 +15,7 @@ only an already-mirrored value is not re-posted.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -423,6 +424,60 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert client.posts == []
+
+
+# ── delta coalescer: a cancelled flush() must not kill the worker ──────
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_survives_cancelled_flush_and_still_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled ``flush()`` must not kill the delta worker.
+
+    Stopping or deleting a session cancels the forwarder task, which can be
+    awaiting ``delta_coalescer.flush()`` at that moment; the cancellation
+    leaves the queued barrier holding an already-cancelled future. The worker
+    used to die calling ``set_result`` on it (``InvalidStateError``), after
+    which ``close()`` enqueued a stop marker nobody consumed — teardown hung
+    forever and the codex app-server subprocess leaked. The worker now skips
+    completed futures: it survives the poisoned barrier and ``close()``
+    completes.
+    """
+    in_flush = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_post(
+        client: object,
+        session_id: str,
+        delta: str,
+        *,
+        message_id: str | None = None,
+        index: int | None = None,
+        final: bool | None = None,
+    ) -> None:
+        in_flush.set()
+        await release.wait()
+
+    monkeypatch.setattr(fwd, "_post_output_text_delta", fake_post)
+    coalescer = fwd._OutputTextDeltaCoalescer(None, "conv_test")  # type: ignore[arg-type]
+
+    # "\n" forces an immediate flush; the worker blocks inside the stubbed
+    # HTTP post, so the barrier below queues behind a busy worker.
+    await coalescer.append("hello\n")
+    await asyncio.wait_for(in_flush.wait(), 2.0)
+
+    flush_task = asyncio.create_task(coalescer.flush())
+    await asyncio.sleep(0)  # let flush_task block on its barrier future
+    flush_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flush_task
+
+    # The worker resumes and dequeues the poisoned barrier: it must survive
+    # and keep serving; close() must complete instead of hanging forever.
+    release.set()
+    await asyncio.wait_for(coalescer.close(), 2.0)
+    assert coalescer._worker_task is None
 
 
 # ── sub-agent usage pricing: seed the child coalescer's model ──────────
