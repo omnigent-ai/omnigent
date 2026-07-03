@@ -4940,7 +4940,9 @@ export function modelPickerKindForConv(
 export function shouldShowModelPicker(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return modelPickerKindForConv(conv) !== null || conv?.labels?.["omnigent.wrapper"] === "opencode-sdk";
+  return (
+    modelPickerKindForConv(conv) !== null || conv?.labels?.["omnigent.wrapper"] === "opencode-sdk"
+  );
 }
 
 /**
@@ -5042,7 +5044,6 @@ function AgentPicker({
   onSelect,
   effortLevels,
   showEffort,
-  showModels,
   isOpencode = false,
   modelPickerKind,
   codexModelOptions,
@@ -5145,7 +5146,8 @@ function AgentPicker({
           return mdl?.name ?? effectiveModel;
         })()
       : null;
-  const modelLabel = opencodeModelLabel ?? formatStatusModelLabel(effectiveModel, codexModelOptions);
+  const modelLabel =
+    opencodeModelLabel ?? formatStatusModelLabel(effectiveModel, codexModelOptions);
   const effortTriggerLabel =
     showEffort && selectedEffort
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
@@ -5246,9 +5248,7 @@ function AgentPicker({
             <PickerSectionHeader>Models</PickerSectionHeader>
             {isOpencode ? (
               harnessModels.length === 0 ? (
-                <div className="px-2 py-1.5 text-xs text-muted-foreground/70">
-                  Loading models…
-                </div>
+                <div className="px-2 py-1.5 text-xs text-muted-foreground/70">Loading models…</div>
               ) : (
                 harnessModels.map((provider) => (
                   <div key={provider.id}>

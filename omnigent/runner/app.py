@@ -17625,7 +17625,7 @@ def create_runner_app(
         providers: list[dict[str, Any]] = []
         try:
             harness_client = await process_manager.get_client(session_id, "any")
-        except Exception:
+        except Exception:  # noqa: BLE001 - no harness subprocess is a normal, best-effort case.
             harness_client = None
         if harness_client is not None:
             try:
@@ -17635,7 +17635,7 @@ def create_runner_app(
                 )
                 if resp.status_code == 200:
                     providers = resp.json().get("providers", [])
-            except Exception:
+            except Exception:  # noqa: BLE001 - provider query is best effort.
                 _logger.debug("Harness providers query failed for %s", session_id)
 
         return JSONResponse(status_code=200, content={"workers": workers, "providers": providers})

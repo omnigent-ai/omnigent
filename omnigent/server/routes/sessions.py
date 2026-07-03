@@ -208,7 +208,6 @@ from omnigent.server.schemas import (
     ErrorEvent,
     GrantPermissionRequest,
     HarnessProvider,
-    HarnessProviderModel,
     MCPServerSummary,
     ModelUsage,
     OutputItemDoneEvent,
@@ -20416,8 +20415,7 @@ async def _load_runner_models(
         providers: list[dict[str, object]] = []
         for p in raw_providers:
             models = [
-                {"id": m["id"], "name": m.get("name", m["id"])}
-                for m in (p.get("models") or [])
+                {"id": m["id"], "name": m.get("name", m["id"])} for m in (p.get("models") or [])
             ]
             providers.append(
                 {

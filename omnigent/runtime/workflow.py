@@ -1073,6 +1073,8 @@ def _materialise_one_shot_token(auth_command: str) -> str:
             code=ErrorCode.INVALID_INPUT,
         )
     return token
+
+
 def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     """Apply a cli-config Databricks AI Gateway to the pi (gateway-harness) path.
 

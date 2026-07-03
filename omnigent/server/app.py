@@ -152,7 +152,9 @@ _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
-_OPENCODE_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "opencode")
+_OPENCODE_BUNDLE_SOURCE = resolve_repo_symlink(
+    Path(_examples_resources.__file__).parent / "opencode"
+)
 
 
 class _FastAPICallNext(Protocol):

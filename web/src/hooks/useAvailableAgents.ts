@@ -46,6 +46,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
+  opencode: "OpenCode",
 };
 
 function displayNameForAgent(name: string, harness?: string | null): string {

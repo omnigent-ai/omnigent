@@ -3935,8 +3935,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       return;
     case "session_models":
       // Same nudge for harness-owned models (opencode providers).
-      // refetchSkills also applies harnessModels from the snapshot.
-      void refetchSkills(event.conversationId);
+      // refetchRunnerBackedSessionState also applies harnessModels from
+      // the snapshot.
+      void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "tool_result":
       // Tool results are not a reliable correlation signal for
