@@ -152,23 +152,11 @@ OFFICIAL_PROFILES: dict[str, BenchProfile] = {
 # ── native-tui harnesses ─────────────────────────────────────────
 #
 # Native harnesses are not in HARNESS_PROBES (that matrix is the SDK-wrap
-# e2e set), so their profiles are built directly here.
-#
-# Only claude-native ships as official today. It is an OMNIGENT_CREDENTIAL
-# vendor (the bench can mint its gateway credential) AND its turns surface on
-# the shared session HTTP stream the driver reads (tmux-paste delivery), so
-# the native-tui driver can actually observe it — live-verified end to end.
-#
-# codex-native is deliberately NOT shipped yet: it is also OMNIGENT_CREDENTIAL,
-# but it delivers output via app-server RPC rather than tmux paste, so a turn
-# runs (in_progress → completed) without ever emitting text deltas or
-# persisting an assistant item on the session stream — the shared driver
-# cannot observe it. Its vendor entry stays in the driver's _VENDORS so a
-# `--harness codex-native --transport native-tui` opt-in resolves and
-# skip-gates cleanly, but wiring RPC-delivery observation is a follow-up
-# before it earns an official profile. OWN_AUTH natives (cursor-native,
-# kiro-native, ...) need a vendor login the bench cannot provision, and are
-# likewise left to a --harness <ref> opt-in.
+# e2e set), so their profiles are built directly here. Both shipped natives
+# are OMNIGENT_CREDENTIAL vendors the native-tui driver can run and observe
+# (see native_tui_driver for the per-vendor provisioning). OWN_AUTH natives
+# (cursor-native, kiro-native, ...) need a vendor login the bench cannot
+# provision, so they are left to a --harness <ref> opt-in.
 #
 # model: native harnesses take the model as a launch --model, not a
 # HARNESS_<H>_MODEL env var, so they are absent from model_env_keys() and
@@ -177,6 +165,7 @@ OFFICIAL_PROFILES: dict[str, BenchProfile] = {
 _NATIVE_PROFILES: dict[str, tuple[str, str]] = {
     # harness: (model, marker)
     "claude-native": ("databricks-claude-sonnet-4-6", "CLAUDE_NATIVE_OK"),
+    "codex-native": ("databricks-gpt-5-4-mini", "CODEX_NATIVE_OK"),
 }
 
 

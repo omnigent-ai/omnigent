@@ -33,12 +33,13 @@ records, so adding a harness is a config entry, not a new driver — until a
 vendor diverges in kind (codex-native is RPC-delivered; opencode-native is
 ``native-server`` not ``native-tui``), which will want its own handling.
 
-Scope: this driver ships **claude-native**, live-verified end to end (basic
-turn, delta streaming, model override, interrupt — no drift) on a host with
-the ``claude`` CLI logged in. codex-native is wired as a vendor entry for
-opt-in but not shipped as an official profile: its app-server RPC delivery
-is not observable on the shared session stream (see ``_VENDORS``), so its
-turns run without surfacing text — RPC-delivery observation is a follow-up.
+Scope: this driver ships **claude-native** and **codex-native**, both
+live-verified end to end (basic turn, delta streaming, model override,
+interrupt) on a host with the vendor CLI logged in. They reach the same shared
+observe path by different means: claude-native tails a transcript (forwarder
+auto-starts on bind), codex-native rides an app-server-RPC forwarder that the
+driver wires up via an explicit runner launch/bind + native terminal ensure +
+provider config (``needs_terminal_ensure``; see ``_provision``).
 """
 
 from __future__ import annotations
@@ -56,6 +57,12 @@ from typing import Any
 
 import httpx
 
+from omnigent.host.daemon_launch import (
+    launch_or_reuse_daemon_runner,
+    wait_for_host_online,
+    wait_for_runner_online,
+)
+from omnigent.native_terminal import bind_session_runner
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import lookup_databricks_host
@@ -71,6 +78,9 @@ _HEALTH_TIMEOUT_S = 90.0
 _HOST_ONLINE_TIMEOUT_S = 45.0
 _POLL_INTERVAL_S = 0.3
 _TURN_TIMEOUT_S = 180.0
+# How long to wait for the forwarder to come live (external_session_id stamped)
+# after the terminal ensure returns.
+_FORWARDER_READY_TIMEOUT_S = 90.0
 
 # Native turns take longer (terminal boot + a real interactive vendor turn),
 # so the prompts stay short and the timeouts generous.
@@ -109,27 +119,27 @@ class NativeVendor:
         ``"claude-native-ui"``.
     :param own_auth: ``True`` when the vendor uses its own login (cannot take
         a minted bearer); such a harness is only runnable pre-logged-in.
+    :param needs_terminal_ensure: ``True`` when a turn's output only reaches
+        the shared session stream after the vendor's runner-side forwarder is
+        wired up, which requires an explicit runner launch/bind + native
+        terminal ensure during provisioning (codex-native). claude-native's
+        forwarder auto-starts on session bind, so it needs none of this.
     """
 
     harness: str
     agent_name: str
     own_auth: bool = False
+    needs_terminal_ensure: bool = False
 
 
-# Vendor registry. Both entries are OMNIGENT_CREDENTIAL vendors, but only
-# claude-native is observable by this driver today: its output surfaces on the
-# shared session HTTP stream (POST events / SSE / item polling) because its
-# delivery is tmux-paste. codex-native delivers via app-server RPC, so a turn
-# runs (in_progress → completed) without emitting text deltas or persisting an
-# assistant item on that stream — the shared observe path sees nothing. Its
-# entry stays here so `--harness codex-native --transport native-tui` resolves
-# and skip-gates cleanly rather than crashing, but it is intentionally left out
-# of the shipped OFFICIAL_PROFILES (see manifest) until RPC-delivery
-# observation is wired. OWN_AUTH natives are absent (login the bench cannot
-# provision).
+# Both shipped vendors surface output on the shared session stream; codex-native
+# needs extra provisioning first (see ``needs_terminal_ensure``). OWN_AUTH
+# natives are absent (login the bench cannot provision).
 _VENDORS: dict[str, NativeVendor] = {
     "claude-native": NativeVendor("claude-native", "claude-native-ui", own_auth=False),
-    "codex-native": NativeVendor("codex-native", "codex-native-ui", own_auth=False),
+    "codex-native": NativeVendor(
+        "codex-native", "codex-native-ui", own_auth=False, needs_terminal_ensure=True
+    ),
 }
 
 
@@ -229,6 +239,11 @@ class NativeTuiDriver:
             "DATABRICKS_CONFIG_PROFILE": self._db_profile,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         }
+        # codex reads its provider from omnigent's global config, not from
+        # DATABRICKS_CONFIG_PROFILE; without it the TUI hits the vendor login
+        # screen and never starts a thread.
+        if self._vendor.needs_terminal_ensure:
+            base_env["OMNIGENT_CONFIG_HOME"] = str(self._write_provider_config())
         self._proc = spawn_omnigent_server(self._tmp, port, base_env, binding_token)
         self._wait_health()
         self._daemon = self._spawn_host_daemon(base_env)
@@ -248,6 +263,76 @@ class NativeTuiDriver:
         )
         created.raise_for_status()
         self._session_id = str(created.json()["id"])
+        if self._vendor.needs_terminal_ensure:
+            self._wire_native_forwarder(host_id, workspace)
+
+    def _write_provider_config(self) -> Path:
+        """Write the ``OMNIGENT_CONFIG_HOME`` config that routes the vendor's
+        LLM provider through this run's Databricks profile; return its dir."""
+        config_home = self._tmp / "omnigent-config"
+        config_home.mkdir(exist_ok=True)
+        (config_home / "config.yaml").write_text(
+            f"auth:\n  type: databricks\n  profile: {self._db_profile}\n",
+            encoding="utf-8",
+        )
+        return config_home
+
+    def _wire_native_forwarder(self, host_id: str, workspace: Path) -> None:
+        """Launch/bind a runner, ensure the native terminal, and wait for the
+        forwarder to come live, so turns can drive on the shared observe path.
+
+        Readiness is the session's ``external_session_id`` being stamped (the
+        vendor thread id), which the forwarder sets once its thread starts.
+        """
+        assert self._client is not None and self._session_id is not None
+        session_id = self._session_id
+        self._launch_and_bind_runner(host_id, workspace)
+        ensure = self._client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+            timeout=90.0,
+        )
+        ensure.raise_for_status()
+        # Gate on the forwarder wiring up: it stamps external_session_id (the
+        # codex thread id) on the session once the TUI creates its thread.
+        # Posting a turn before this races ahead of the forwarder subscription.
+        deadline = time.monotonic() + _FORWARDER_READY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            snap = self._client.get(f"/v1/sessions/{session_id}")
+            if snap.status_code == 200 and snap.json().get("external_session_id"):
+                return
+            time.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"native forwarder did not wire up within {_FORWARDER_READY_TIMEOUT_S}s "
+            f"(no external_session_id); logs in {self._tmp}"
+        )
+
+    def _launch_and_bind_runner(self, host_id: str, workspace: Path) -> str:
+        """Launch (or reuse) a daemon runner for the session and bind it.
+
+        The daemon auto-spawns a runner, but the native terminal ensure needs
+        the session explicitly bound to an online runner first (an unbound
+        session 503s ``runner_unavailable``). Bridges the async daemon-launch
+        helpers into this sync provisioning path.
+        """
+        assert self._client is not None and self._session_id is not None
+        session_id = self._session_id
+
+        async def _run() -> str:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=httpx.Timeout(30.0, read=120.0),
+                headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+            ) as ac:
+                await wait_for_host_online(ac, host_id, timeout_s=_HOST_ONLINE_TIMEOUT_S)
+                runner_id = await launch_or_reuse_daemon_runner(
+                    ac, host_id=host_id, session_id=session_id, workspace=str(workspace)
+                )
+                await wait_for_runner_online(ac, runner_id, timeout_s=_HOST_ONLINE_TIMEOUT_S)
+                await bind_session_runner(ac, session_id, runner_id)
+                return runner_id
+
+        return asyncio.run(_run())
 
     def _spawn_host_daemon(self, base_env: dict[str, str]) -> subprocess.Popen[bytes]:
         # Under the real $HOME so the vendor's interactive login is inherited
