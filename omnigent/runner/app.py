@@ -51,6 +51,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -2075,6 +2076,7 @@ async def _auto_create_cursor_terminal(
         write_mcp_config,
     )
     from omnigent.cursor_native_forwarder import clear_cursor_bridge_state, preseed_resume_state
+    from omnigent.cursor_native_status import clear_cursor_status_state
     from omnigent.cursor_native_usage import clear_cursor_usage_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
@@ -2124,6 +2126,10 @@ async def _auto_create_cursor_terminal(
         # the cumulative count clean. Preserved across a preseeded resume (the
         # accumulator's generation-id dedup makes re-reading the log safe).
         clear_cursor_usage_state(bridge_dir)
+        # Likewise drop the turn-end marker + idle poster state so a stale count
+        # from a prior terminal can't make the new forwarder skip (or re-fire)
+        # the ``external_session_status: idle`` parent-wake edge.
+        clear_cursor_status_state(bridge_dir)
         if resume_chat_id is not None:
             _logger.warning(
                 "cursor-native: could not pre-seed prior chat store for %r; "
@@ -2503,9 +2509,14 @@ async def _auto_create_hermes_terminal(
         write_tmux_target,
     )
     from omnigent.hermes_native_forwarder import clear_hermes_bridge_state
+    from omnigent.hermes_native_status import clear_hermes_status_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
     clear_hermes_bridge_state(bridge_dir)
+    # Likewise drop the idle poster state so a stale posted-count from a prior
+    # terminal can't make the new forwarder skip (or re-fire) the
+    # ``external_session_status: idle`` parent-wake edge.
+    clear_hermes_status_state(bridge_dir)
 
     # Write a per-session HERMES_HOME with the Omnigent policy hook so the
     # native TUI evaluates tool calls against Omnigent policies.
@@ -15577,9 +15588,24 @@ def create_runner_app(
         # Resolve pending policy approval Futures.
         if body_type == "approval":
             _data = body.get("data") or body
-            pending_approvals.resolve(
-                _data.get("elicitation_id", ""), _data.get("action") == "accept"
-            )
+            _elicit_action = _data.get("action", "")
+            pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
+            if _elicit_action == "decline":
+                # Explicit user decline: send an interrupt to the harness
+                # so the turn aborts cleanly instead of continuing after
+                # the DENY tool result reaches the LLM. This fires before
+                # the ProxyMcpManager task resumes (asyncio cooperative
+                # scheduling), so interrupt_session is called before the
+                # deny propagates to the SDK.
+                try:
+                    _int_client = await process_manager.get_client(conversation_id, "any")
+                    await _int_client.post(
+                        f"/v1/sessions/{conversation_id}/events",
+                        json={"type": "interrupt"},
+                        timeout=5.0,
+                    )
+                except Exception:  # noqa: BLE001 — best-effort; deny path continues
+                    pass
             # The server wraps the verdict as ``{"type": "approval", "data": {…}}``,
             # but the harness scaffold's ``ApprovalEvent`` wants the fields at the
             # top level — forwarding the envelope verbatim 422s and hangs the turn.
@@ -19050,6 +19076,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
 }
+_HARNESS_MODEL_ENV_KEY = model_env_keys()
 
 
 def _build_spawn_env_from_spec(
@@ -19111,15 +19138,20 @@ def _build_spawn_env_from_spec(
         elif harness == "copilot":
             env = _build_copilot_spawn_env(spec, workdir=workdir)
         else:
-            # Native terminal harnesses and unknown harnesses build env elsewhere.
-            return None
+            builder_path = spawn_env_builders().get(harness)
+            if builder_path is not None:
+                builder = load_object(builder_path)
+                env = builder(spec, cwd=cwd, workdir=workdir)
+            else:
+                # Native terminal harnesses and unknown harnesses build env elsewhere.
+                return None
     except ImportError:
         return None
 
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the
     # readout but the turn still uses the provider/catalog default.
-    if model_override:
+    if model_override and env is not None:
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
             env[model_key] = model_override

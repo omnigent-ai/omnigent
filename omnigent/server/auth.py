@@ -246,6 +246,27 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
+        """
+        Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
+
+        A managed runner runs in a sandbox with no logged-in user
+        credential of its own, so the server mints one for its HTTP
+        callbacks when auth is enabled (see the
+        ``POST /v1/runners/{id}/token`` endpoint). Default: ``None`` — no
+        minting (single-user / no-auth, or a provider whose identity is
+        asserted externally and can't be minted server-side, e.g.
+        header/proxy auth). The runner then authenticates with its tunnel
+        binding token alone.
+
+        :param user_id: The session owner the runner acts as, e.g.
+            ``"alice@example.com"``.
+        :param ttl_seconds: Token lifetime in seconds.
+        :returns: A bearer token string, or ``None`` when this provider
+            cannot mint one.
+        """
+        return None
+
 
 class UnifiedAuthProvider(AuthProvider):
     """Unified authentication provider that supports header-based,
@@ -347,6 +368,38 @@ class UnifiedAuthProvider(AuthProvider):
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
+
+    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
+        """
+        Mint a short-lived owner JWT for a managed-sandbox runner.
+
+        Accounts / OIDC modes sign a session JWT in the same HS256 format
+        :meth:`_check_cookie` validates, so the runner can present it as
+        ``Authorization: Bearer <jwt>`` on its HTTP callbacks and resolve
+        to *user_id*. Header/proxy mode returns ``None`` — identity there
+        is asserted by the upstream proxy and can't be minted server-side.
+
+        :param user_id: The session owner the runner acts as, e.g.
+            ``"alice@example.com"``.
+        :param ttl_seconds: Token lifetime in seconds.
+        :returns: An HS256-signed JWT, or ``None`` for header mode, an
+            empty/reserved user, or a missing cookie config.
+        """
+        if not user_id or user_id in _RESERVED_USERS:
+            return None
+        if self._source not in ("oidc", "accounts"):
+            return None
+        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if cookie_config is None:
+            return None
+        from omnigent.server.oidc import mint_session_token
+
+        return mint_session_token(
+            user_id,
+            cookie_config.cookie_secret,
+            ttl_seconds,
+            self._source,
+        )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the

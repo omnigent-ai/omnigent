@@ -1,5 +1,5 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { BubbleView } from "./ChatPage";
@@ -112,6 +112,32 @@ describe("AssistantBubble lifecycle rendering", () => {
     renderBubble(assistantBubble("completed"));
 
     expect(screen.queryByTestId("assistant-interrupted-indicator")).toBeNull();
+  });
+});
+
+describe("UserBubble copy button", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("copies the message text to the clipboard when clicked", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+
+    renderBubble(userBubble("copy me please"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("copy me please"));
+  });
+
+  it("does not render a copy button for an attachments-only message (no text)", () => {
+    renderBubble(
+      userBubble("", {
+        content: [{ type: "input_image", file_id: "f1", filename: "a.png" }],
+      }),
+    );
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
   });
 });
 

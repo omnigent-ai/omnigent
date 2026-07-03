@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parents[2] / ".github" / "scripts" / "changelog" / "generate.py"
 spec = importlib.util.spec_from_file_location("changelog_generate", SCRIPT)
@@ -32,6 +35,55 @@ def test_previous_final_tag_ignores_prereleases() -> None:
 
 def test_previous_final_tag_first_release() -> None:
     assert gen.previous_final_tag("v0.1.0", ["v0.1.0", "v0.1.0rc4"]) is None
+
+
+def test_previous_final_tag_skips_rc_between_finals() -> None:
+    # v0.2.0, v0.3.0rc0, v0.3.0 present → previous of v0.3.0 is v0.2.0 (rc ignored).
+    assert gen.previous_final_tag("v0.3.0", ["v0.2.0", "v0.3.0rc0", "v0.3.0"]) == "v0.2.0"
+
+
+# --- collect() base override -------------------------------------------------
+
+
+def _stub_io(monkeypatch, *, subjects: list[str], all_tags: list[str], date: str = "2026-07-02"):
+    """Stub the git/gh IO so collect() runs offline; records the range args seen."""
+    seen: list[tuple[str | None, str]] = []
+
+    def fake_range_subjects(prev, tag):
+        seen.append((prev, tag))
+        return subjects
+
+    monkeypatch.setattr(gen, "_all_tags", lambda: all_tags)
+    monkeypatch.setattr(gen, "_range_subjects", fake_range_subjects)
+    monkeypatch.setattr(gen, "_tag_date", lambda tag: date)
+    monkeypatch.setattr(gen, "_gh_pr_body", lambda repo, pr: None)
+    _stub_io.seen = seen
+
+
+def test_collect_uses_base_override_as_range_start(monkeypatch) -> None:
+    _stub_io(monkeypatch, subjects=[], all_tags=["v0.3.0"])
+    gen.collect("HEAD", "o/o", base="v0.3.0")
+    # Range start is the explicit base, NOT previous_final_tag (which would raise
+    # on the non-version "HEAD").
+    assert _stub_io.seen == [("v0.3.0", "HEAD")]
+
+
+def test_collect_without_base_uses_previous_final_tag(monkeypatch) -> None:
+    _stub_io(monkeypatch, subjects=[], all_tags=["v0.2.0", "v0.3.0rc0", "v0.3.0"])
+    gen.collect("v0.3.0", "o/o")
+    assert _stub_io.seen == [("v0.2.0", "v0.3.0")]
+
+
+# --- CLI guard rail ----------------------------------------------------------
+
+
+def test_cli_non_version_ref_without_base_errors(monkeypatch, capsys) -> None:
+    # A non-version ref (branch/sha) can't be ordered and has no default range.
+    monkeypatch.setattr(sys, "argv", ["generate.py", "--tag", "ci-test", "--repo", "o/o"])
+    with pytest.raises(SystemExit) as exc:
+        gen.main()
+    assert exc.value.code != 0
+    assert "not a PEP 440 version" in capsys.readouterr().err
 
 
 # --- pr_numbers_from_subjects ------------------------------------------------
@@ -100,6 +152,14 @@ def test_harvest_placeholder_is_omitted() -> None:
 def test_harvest_deleted_section_is_omitted() -> None:
     result = gen.harvest_pr(123, _body(None))
     assert result.status == "omitted"
+
+
+@pytest.mark.parametrize("marker", ["skip", "n/a", "N/A", "none", "-"])
+def test_harvest_omit_markers_are_omitted(marker: str) -> None:
+    # Leftover `skip`/`n/a` (old template sentinel) must not leak in as an entry.
+    result = gen.harvest_pr(123, _body(marker))
+    assert result.status == "omitted"
+    assert result.description == ""
 
 
 def test_harvest_missing_body() -> None:
@@ -185,6 +245,33 @@ def test_insert_is_idempotent_and_replaces() -> None:
     doc = gen.insert_section(_SEED, "v0.3.0", _section("v0.3.0", "2026-06-27", "old"))
     doc = gen.insert_section(doc, "v0.3.0", _section("v0.3.0", "2026-06-27", "new"))
     assert doc.count("[v0.3.0]") == 1
+    assert "new (#1)" in doc and "old (#1)" not in doc
+
+
+def test_insert_prerelease_orders_by_pep440_and_coexists() -> None:
+    # A dev tag lands above the previous final; the eventual final sorts above the
+    # dev; an rc sits between them. All three (final/rc/dev) coexist as blocks.
+    doc = gen.insert_section(_SEED, "v0.3.0", _section("v0.3.0", "2026-06-26", "three"))
+    doc = gen.insert_section(doc, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "dev"))
+    doc = gen.insert_section(doc, "v0.4.0", _section("v0.4.0", "2026-07-10", "final"))
+    doc = gen.insert_section(doc, "v0.4.0rc1", _section("v0.4.0rc1", "2026-07-08", "rc"))
+    headers = re.findall(r"(?m)^## \[([^\]]+)\]", doc)
+    assert headers == ["v0.4.0", "v0.4.0rc1", "v0.4.0dev0", "v0.3.0"]
+
+
+def test_insert_final_and_dev_are_distinct_blocks() -> None:
+    # v0.4.0 must NOT overwrite v0.4.0dev0 (no collapse of dev → final).
+    doc = gen.insert_section(_SEED, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "dev"))
+    doc = gen.insert_section(doc, "v0.4.0", _section("v0.4.0", "2026-07-10", "final"))
+    assert doc.count("[v0.4.0dev0]") == 1
+    assert re.search(r"(?m)^## \[v0\.4\.0\]", doc) is not None
+    assert "dev (#1)" in doc and "final (#1)" in doc
+
+
+def test_insert_dev_tag_idempotent() -> None:
+    doc = gen.insert_section(_SEED, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "old"))
+    doc = gen.insert_section(doc, "v0.4.0dev0", _section("v0.4.0dev0", "2026-07-02", "new"))
+    assert doc.count("[v0.4.0dev0]") == 1
     assert "new (#1)" in doc and "old (#1)" not in doc
 
 

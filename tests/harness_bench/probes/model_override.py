@@ -18,9 +18,10 @@ gateway to reject unknown ids promptly.
 from __future__ import annotations
 
 from omnigent.model_override import model_family_mismatch, validate_model_override
-from tests.harness_bench.driver import SdkInprocDriver, infra_failure_reason
+from tests.harness_bench.driver import infra_failure_reason
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict
 
 
@@ -30,7 +31,7 @@ class ModelOverrideProbe(CapabilityProbe):
     priority = Priority.P0
     applies_to = Applicability.BOTH
 
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
         # Offline half: the override mechanism itself must accept this
         # harness+model pair. A rejection here is a hard UNSUPPORTED — the
         # caller could never set this model in the first place.
@@ -44,9 +45,7 @@ class ModelOverrideProbe(CapabilityProbe):
 
         # Live half: the harness was spawned with {env_prefix}MODEL set to
         # profile.model; a completing turn proves the override routed.
-        result = await driver.run_turn(
-            f"Reply with exactly the literal string {profile.marker} and nothing else.",
-        )
+        result = await driver.run_basic_turn(profile.marker)
         detail = {"model": profile.model, "completed": result.completed}
         if result.completed and result.text:
             return ProbeResult(

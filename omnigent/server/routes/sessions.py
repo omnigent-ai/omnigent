@@ -84,17 +84,19 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import (
-    HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
-)
-from omnigent.model_override import model_family_mismatch, validate_model_override
-from omnigent.native_coding_agents import (
+from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     NativeCodingAgent,
+)
+from omnigent.host.frames import (
+    HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+)
+from omnigent.model_override import model_family_mismatch, validate_model_override
+from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
@@ -838,6 +840,14 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 # Used by _get_session_snapshot.
 _session_status_cache: dict[str, str] = {}
 
+# Per-session in-flight response id, tracked alongside _session_status_cache.
+# Set when a running/waiting status edge carries a response_id (native Claude's
+# turn-start edge does); popped on idle/failed. Projected onto the session
+# snapshot as ``active_response_id`` so a client reconnecting mid-turn can
+# reopen the streaming ``activeResponse`` and keep forwarded tool cards
+# rendering LIVE — the SSE stream is "snapshot + live tail, no replay", so the
+# turn-start ``running`` event is never re-sent on reconnect.
+_session_active_response_cache: dict[str, str] = {}
 # Per-session background-shell tally (claude-native), kept in lockstep with
 # ``_session_status_cache`` so a snapshot/reload re-shows "N background tasks
 # still running" after the live SSE edge is gone. The authoritative source is
@@ -2533,6 +2543,11 @@ def _build_session_response(
         # once the launch succeeds; a failed launch is retained with
         # its reason. Populated by _publish_sandbox_status.
         sandbox_status=_session_sandbox_status_cache.get(conv.id),
+        # In-flight turn id so a mid-turn reconnect can reopen a streaming
+        # ``activeResponse`` (the turn-start ``running`` edge that carried it
+        # is not replayed on the SSE stream). Populated for native-terminal
+        # sessions whose forwarder stamps a turn id; ``None`` otherwise.
+        active_response_id=_session_active_response_cache.get(conv.id),
     )
 
 
@@ -4177,8 +4192,11 @@ async def _hold_native_ask_gate(
         used by ``POST /policies/evaluate`` retries so a hook retry after
         a transient 5xx / connect-drop does not prompt the human twice.
         ``None`` mints a fresh id (the default for non-retry callers).
-    :returns: ``True`` iff a human accepted; ``False`` on decline /
-        cancel / timeout / disconnect (fail closed).
+    :returns: ``True`` iff a human accepted; ``False`` on cancel /
+        timeout / disconnect (fail closed).
+    :raises ElicitationDeclinedError: when the human explicitly
+        declines (``action == "decline"``). Callers should abort the
+        turn rather than continuing with a DENY.
     """
     tool_name = data.get("name")
     tool_input = data.get("arguments")
@@ -4210,6 +4228,13 @@ async def _hold_native_ask_gate(
         tool_name=tool_name if isinstance(tool_name, str) else None,
         tool_input=tool_input if isinstance(tool_input, dict) else None,
     )
+    # Explicit user decline → raise so callers can abort the turn rather
+    # than feeding a DENY message to the LLM and letting it continue.
+    if verdict is not None and verdict.action == "decline":
+        raise ElicitationDeclinedError(
+            result.reason or "",
+            policy_name=result.deciding_policy,
+        )
     approved = verdict is not None and verdict.action == "accept"
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
@@ -5389,8 +5414,20 @@ def _publish_status(
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
+        # Session stays ``failed`` (terminal); the turn is over, so drop any
+        # tracked in-flight response id rather than leaving it for the
+        # snapshot to reopen a streaming bubble.
+        _session_active_response_cache.pop(session_id, None)
         return
     _session_status_cache[session_id] = status
+    # Track the in-flight response id for snapshot-based reconnect (see
+    # _session_active_response_cache). A running/waiting edge that names a
+    # turn opens it; any idle/failed edge closes it.
+    if status in ("running", "waiting"):
+        if response_id is not None:
+            _session_active_response_cache[session_id] = response_id
+    else:
+        _session_active_response_cache.pop(session_id, None)
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and
@@ -11026,15 +11063,21 @@ async def _evaluate_input_policy(
     # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
     # ALLOW (fall through to forward the message); decline / timeout ->
     # DENY (fail-closed).
-    approved = await _hold_native_ask_gate(
-        request,
-        session_id=session_id,
-        phase=Phase.REQUEST,
-        data=body.data,
-        engine=engine,
-        result=result,
-        conversation_store=conversation_store,
-    )
+    try:
+        approved = await _hold_native_ask_gate(
+            request,
+            session_id=session_id,
+            phase=Phase.REQUEST,
+            data=body.data,
+            engine=engine,
+            result=result,
+            conversation_store=conversation_store,
+        )
+    except ElicitationDeclinedError as exc:
+        return {
+            "verdict": "deny",
+            "reason": exc.args[0] or "Denied by policy",
+        }
     if approved:
         return None
     return {
@@ -16324,16 +16367,37 @@ def create_sessions_router(
                         Phase.LLM_REQUEST,
                         Phase.REQUEST,
                     ):
-                        approved = await _hold_native_ask_gate(
-                            request,
-                            session_id=session_id,
-                            phase=phase,
-                            data=data,
-                            engine=engine,
-                            result=result,
-                            conversation_store=conversation_store,
-                            elicitation_id=hook_elicitation_id,
-                        )
+                        try:
+                            approved = await _hold_native_ask_gate(
+                                request,
+                                session_id=session_id,
+                                phase=phase,
+                                data=data,
+                                engine=engine,
+                                result=result,
+                                conversation_store=conversation_store,
+                                elicitation_id=hook_elicitation_id,
+                            )
+                        except ElicitationDeclinedError as exc:
+                            # Explicit user decline: interrupt the native
+                            # harness BEFORE returning the hook deny so the
+                            # Escape key reaches Claude Code's tmux pane first.
+                            # By the time the DENY response reaches the hook
+                            # subprocess, the abort signal is already queued.
+                            # Best-effort: forwarding failures are swallowed.
+                            await _forward_session_change_to_runner(
+                                session_id,
+                                _server_runner_router,
+                                {"type": "interrupt"},
+                            )
+                            verdict_body = {
+                                "result": "POLICY_ACTION_DENY",
+                                "reason": exc.args[0] or "Approval was declined.",
+                            }
+                            return Response(
+                                content=json.dumps(verdict_body),
+                                media_type="application/json",
+                            )
                         verdict_body: dict[str, Any] = (
                             {"result": "POLICY_ACTION_ALLOW"}
                             if approved
@@ -16441,6 +16505,16 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt Codex before returning the
+            # deny response, same as the Claude-native path. The await
+            # ensures the abort signal reaches Codex before it processes
+            # the decline result and lets the LLM continue.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         body = codex_request.build_response(result)
         return Response(
             content=json.dumps(body),
@@ -16535,6 +16609,14 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt the native harness before
+            # returning the decline so the abort signal arrives first.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         return Response(
             content=result.model_dump_json(),
             media_type="application/json",
@@ -16642,6 +16724,14 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt the native harness before
+            # returning the decline so the abort signal arrives first.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
             media_type="application/json",
@@ -16742,6 +16832,14 @@ def create_sessions_router(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
+        if result.action == "decline":
+            # Explicit user decline: interrupt the native harness before
+            # returning the decline so the abort signal arrives first.
+            await _forward_session_change_to_runner(
+                session_id,
+                _server_runner_router,
+                {"type": "interrupt"},
+            )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
             media_type="application/json",

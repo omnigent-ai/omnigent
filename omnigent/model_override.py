@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_plugins import model_env_keys
 
 # Generous-but-safe upper bound; real ids ("databricks-claude-opus-4-8",
 # "us.anthropic.claude-sonnet-4-6") stay well under it.
@@ -39,6 +40,7 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "copilot",
     }
 )
+_SDK_MODEL_OVERRIDE_HARNESSES = frozenset(model_env_keys())
 
 
 def validate_model_override(value: str) -> str:

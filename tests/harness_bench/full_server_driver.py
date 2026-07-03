@@ -10,24 +10,30 @@ It reuses the exact spawn recipe of the e2e ``live_server`` fixture
 (``tests/e2e/conftest.py``) via the shared compat helpers, but packaged as
 a plain async context manager so the bench CLI can drive it without pytest.
 
-Status: foundation — server+runner lifecycle and a basic turn (send
-message, poll the session snapshot to terminal, extract assistant text),
-live-verified. Follow-ups (stacked PRs) layer on the dimensions the wrap
-path cannot prove and the bench wiring to select this transport:
+Status (live-verified): server+runner lifecycle, a basic turn, and the
+payoff this transport exists for — a real **server-dispatched tool call**
+(a read-only builtin) and **tool-call policy enforcement** (a spec-baked
+``tool_call`` deny policy blocks the call the way production does). Ad-hoc
+request-level function tools are NOT used here: the SDK harnesses handle
+tools internally, so they never round-trip as a server-dispatched, policy-
+gated call — a builtin does.
 
-- server-dispatched tools (request-level function-tool round-trip);
-- tool-call policy enforcement via a pre-attached ``tool_call`` deny policy;
-- delta-level streaming via the ``/v1/sessions/{id}/stream`` SSE subscribe;
-- interrupt/cancel;
-- a ``--transport`` selector + driver registry so the probes run through it.
+Interrupt/cancel is verified (a long turn is interrupted mid-flight and the
+server's cancellation marker confirms it stopped), and delta-level
+streaming is measured via the ``/v1/sessions/{id}/stream`` SSE subscribe.
+
+Follow-up (stacked PR): a ``--transport`` selector + driver registry so the
+bench's probes run through this driver, not just its gated tests.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -51,6 +57,26 @@ from tests.harness_bench.profile import BenchProfile
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 _HEALTH_TIMEOUT_S = 90.0
 _POLL_INTERVAL_S = 0.2
+
+# The builtin the tool/policy probes drive: read-only, zero setup, server-
+# dispatched, and gated at the tool_call phase. Its denial output carries
+# _DENY_REASON so a blocked call is unambiguous.
+_TOOL_NAME = "list_files"
+_DENY_REASON = "bench-policy-deny"
+_TOOL_PROMPT = f"List the files using the {_TOOL_NAME} tool, then tell me how many there are."
+
+# The server persists an interrupted turn as a synthetic user message whose
+# text contains this marker (see tests/e2e/test_cancel_history.py).
+_CANCELLATION_MARKER = "interrupted"
+_LONG_PROMPT = (
+    "Write a very detailed 600-word essay about the history of computing, in full paragraphs."
+)
+
+# Prompt long enough that a streaming harness emits clearly many deltas.
+_STREAM_PROMPT = (
+    "Count from 1 to 30 in words, one number per line, and add a short note after each."
+)
+_TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response.cancelled"})
 
 
 def _find_free_port() -> int:
@@ -101,6 +127,12 @@ class FullServerDriver:
         self._logs: list[Path] = []
         self._client: httpx.Client | None = None
         self._session_id: str | None = None
+        # A second agent+session whose spec bakes a tool_call deny policy,
+        # created lazily for the policy probe (the REST policy endpoint's
+        # handler allowlist excludes make_fixed_action_callable, so the deny
+        # must ride in the agent spec instead).
+        self._deny_session_id: str | None = None
+        self._runner_id = ""
         self._base_url = ""
         self._tmp = Path("/tmp") / f"omni-bench-fs-{uuid.uuid4().hex[:8]}"
 
@@ -146,7 +178,8 @@ class FullServerDriver:
             timeout=300.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         )
-        agent_name = self._register_agent()
+        self._runner_id = runner_id
+        agent_name = self._register_agent(deny=False)
         self._session_id = self._create_session(agent_name, runner_id)
         return self
 
@@ -163,6 +196,31 @@ class FullServerDriver:
         import shutil
 
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ── async driver protocol ────────────────────────────────
+    # This driver's provisioning and turns are synchronous (subprocess spawn,
+    # blocking snapshot polls, a threaded SSE reader). Bridge to the bench's
+    # async Driver protocol by running the blocking work in a worker thread so
+    # the event loop is never blocked.
+
+    async def __aenter__(self) -> FullServerDriver:
+        return await asyncio.to_thread(self.__enter__)
+
+    async def __aexit__(self, *exc: object) -> None:
+        await asyncio.to_thread(self.__exit__, *exc)
+
+    async def run_basic_turn(self, marker: str) -> TurnResult:
+        prompt = f"Reply with exactly the literal string {marker} and nothing else."
+        return await asyncio.to_thread(self.run_turn, prompt)
+
+    async def run_streaming_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self.streaming_probe_turn)
+
+    async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+        return await asyncio.to_thread(lambda: self.tool_probe_turn(deny=deny))
+
+    async def run_interrupt_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self.interrupt_probe_turn)
 
     # ── spawn ────────────────────────────────────────────────
 
@@ -240,27 +298,54 @@ class FullServerDriver:
 
     # ── agent + session ──────────────────────────────────────
 
-    def _register_agent(self) -> str:
+    def _register_agent(self, *, deny: bool) -> str:
         import io
         import tarfile
 
         import yaml
 
         assert self._client is not None
-        name = f"bench-{self._profile.harness}"
-        config = {
+        name = f"bench-{self._profile.harness}" + ("-deny" if deny else "")
+        config: dict[str, Any] = {
+            "spec_version": 1,
             "name": name,
             "prompt": "You are a helpful assistant used for capability testing.",
             "executor": {
-                "harness": self._profile.harness,
+                "type": "omnigent",
                 "model": self._profile.model,
                 "profile": self._db_profile,
+                "config": {"harness": self._profile.harness},
             },
+            # A read-only builtin the server dispatches (and gates at the
+            # tool_call phase). The tool/policy probes drive a call to it;
+            # it is harmless for basic turns (the model just won't call it).
+            "tools": {"builtins": [_TOOL_NAME]},
         }
+        if deny:
+            # Bake a tool_call-phase deny on the builtin so the server blocks
+            # the call the way production policy enforcement does.
+            config["guardrails"] = {
+                "policies": {
+                    "deny_tool": {
+                        "type": "function",
+                        "function": {
+                            "path": "omnigent.policies.function.make_fixed_action_callable",
+                            "arguments": {
+                                "action": "deny",
+                                "reason": _DENY_REASON,
+                                "on_phases": ["tool_call"],
+                                "on_tools": [_TOOL_NAME],
+                            },
+                        },
+                    }
+                }
+            }
+        # spec_version bundles load via the directory spec loader, which
+        # recognizes tools.builtins and expects the member named config.yaml.
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             payload = yaml.safe_dump(config).encode()
-            info = tarfile.TarInfo(f"{name}.yaml")
+            info = tarfile.TarInfo("config.yaml")
             info.size = len(payload)
             tar.addfile(info, io.BytesIO(payload))
         resp = self._client.post(
@@ -283,6 +368,156 @@ class FullServerDriver:
         bound = self._client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
         bound.raise_for_status()
         return session_id
+
+    def _ensure_deny_session(self) -> str:
+        """Lazily register the deny agent and its session; return the session id."""
+        if self._deny_session_id is None:
+            name = self._register_agent(deny=True)
+            self._deny_session_id = self._create_session(name, self._runner_id)
+        return self._deny_session_id
+
+    # ── tool / policy probe ──────────────────────────────────
+
+    def tool_probe_turn(self, *, deny: bool, timeout: float = 180.0) -> TurnResult:
+        """Drive a turn that calls the builtin tool; return a :class:`TurnResult`.
+
+        On the full-server transport a tool call is real and server-
+        dispatched. With *deny* the turn runs against a session whose agent
+        bakes a ``tool_call`` deny policy, so the server blocks the call and
+        the tool output carries the deny reason.
+
+        Fills :attr:`TurnResult.tool_calls` (the builtin call) and
+        :attr:`TurnResult.tool_call_denied` (whether the server blocked it),
+        plus ``completed`` / ``failed`` / ``text``.
+        """
+        assert self._client is not None
+        sid = self._ensure_deny_session() if deny else self._session_id
+        assert sid is not None
+        result = TurnResult()
+        body = {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": _TOOL_PROMPT}]},
+        }
+        self._client.post(f"/v1/sessions/{sid}/events", json=body).raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        seen_running = False
+        while time.monotonic() < deadline:
+            snap = self._client.get(f"/v1/sessions/{sid}").json()
+            status = snap.get("status")
+            items = snap.get("items", [])
+            if status in ("running", "waiting"):
+                seen_running = True
+            if status == "failed":
+                result.failed = True
+                result.error = snap.get("last_task_error") or snap.get("error")
+                break
+            if status == "idle" and seen_running:
+                result.completed = True
+                _scan_tool_items(items, result)
+                result.text = _assistant_text(items)
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        else:
+            result.timed_out = True
+        return result
+
+    # ── streaming probe ──────────────────────────────────────
+
+    def streaming_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
+        """Measure token-level streaming via the session SSE subscribe stream.
+
+        The full-server stream (``GET /v1/sessions/{id}/stream``) is separate
+        from the message POST, so a background thread subscribes and counts
+        ``response.output_text.delta`` events while the main thread posts the
+        turn. More than one delta means the harness streams incrementally.
+        """
+        assert self._client is not None and self._session_id is not None
+        sid = self._session_id
+        result = TurnResult()
+        done = threading.Event()
+
+        def _read_stream() -> None:
+            try:
+                with self._client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{sid}/stream", timeout=timeout
+                ) as resp:
+                    for line in resp.iter_lines():
+                        if not line.startswith("event:"):
+                            continue
+                        etype = line[len("event:") :].strip()
+                        if etype == "response.output_text.delta":
+                            result.text_delta_count += 1
+                        elif etype in _TERMINAL_EVENTS:
+                            result.completed = etype == "response.completed"
+                            result.cancelled = etype == "response.cancelled"
+                            result.failed = etype == "response.failed"
+                            return
+            except httpx.HTTPError as exc:
+                result.error = repr(exc)
+            finally:
+                done.set()
+
+        reader = threading.Thread(target=_read_stream, daemon=True)
+        reader.start()
+        time.sleep(1.0)  # let the subscription register before the turn starts
+        self._client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": _STREAM_PROMPT}],
+                },
+            },
+        ).raise_for_status()
+        if not done.wait(timeout):
+            result.timed_out = True
+        return result
+
+    # ── interrupt probe ──────────────────────────────────────
+
+    def interrupt_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
+        """Start a long turn, interrupt it mid-flight, and report the outcome.
+
+        Posts an ``interrupt`` event once the turn is running (after a short
+        hold so some text streams first), then waits for the server's
+        cancellation marker. Sets :attr:`TurnResult.cancelled` when the
+        marker appears — the honored-interrupt signal.
+        """
+        assert self._client is not None and self._session_id is not None
+        sid = self._session_id
+        result = TurnResult()
+        body = {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": _LONG_PROMPT}]},
+        }
+        self._client.post(f"/v1/sessions/{sid}/events", json=body).raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        interrupted = False
+        while time.monotonic() < deadline:
+            snap = self._client.get(f"/v1/sessions/{sid}").json()
+            status = snap.get("status")
+            items = snap.get("items", [])
+            if status in ("running", "waiting") and not interrupted:
+                # Let a little text stream so the interrupt lands mid-turn.
+                time.sleep(1.5)
+                self._client.post(f"/v1/sessions/{sid}/events", json={"type": "interrupt"})
+                interrupted = True
+            if _has_cancellation_marker(items):
+                result.cancelled = True
+                result.text = _assistant_text(items)
+                break
+            if status == "idle" and interrupted:
+                # Settled after the interrupt; the marker lands just after.
+                result.cancelled = _has_cancellation_marker(items)
+                result.text = _assistant_text(items)
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        else:
+            result.timed_out = True
+        return result
 
     # ── turn ─────────────────────────────────────────────────
 
@@ -333,6 +568,38 @@ class FullServerDriver:
         else:
             result.timed_out = True
         return result
+
+
+def _scan_tool_items(items: list[dict], result: TurnResult) -> None:
+    """Populate tool_calls and tool_call_denied from session items."""
+    for raw in items:
+        data = raw.get("data", raw)
+        itype = raw.get("type") or data.get("type")
+        if itype == "function_call":
+            result.tool_calls.append(
+                {
+                    "call_id": data.get("call_id"),
+                    "name": data.get("name"),
+                    "arguments": data.get("arguments"),
+                }
+            )
+        elif itype == "function_call_output":
+            out = str(data.get("output", ""))
+            if data.get("status") == "blocked" or _DENY_REASON in out:
+                result.tool_call_denied = True
+
+
+def _has_cancellation_marker(items: list[dict]) -> bool:
+    """Whether items include the synthetic 'interrupted' user message."""
+    for raw in items:
+        data = raw.get("data", raw)
+        if (raw.get("type") == "message") and (data.get("role") == "user"):
+            if any(
+                _CANCELLATION_MARKER in (b.get("text", "") or "")
+                for b in data.get("content", []) or []
+            ):
+                return True
+    return False
 
 
 def _assistant_text(items: list[dict]) -> str:

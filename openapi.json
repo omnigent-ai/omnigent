@@ -4225,6 +4225,18 @@
       "SessionResponse": {
         "description": "API representation of a session.\n\nReturned by `POST /v1/sessions`, `GET /v1/sessions/{id}`,\nand `PATCH /v1/sessions/{id}`.",
         "properties": {
+          "active_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Response id of the turn currently in flight, or `None` when the session is idle. Sourced from the server's `_session_active_response_cache` at snapshot build time so a client connecting mid-turn can reopen a streaming `activeResponse` \u2014 the SSE stream is snapshot + live tail with no replay, so the turn-start `running` edge that carried this id is not re-sent on reconnect. Today only native-terminal forwarders (claude-native) stamp a turn id on their status edges; other harnesses leave this `None`.",
+            "title": "Active Response Id"
+          },
           "agent_id": {
             "description": "Durable identifier of the bound agent, e.g. `\"ag_abc123\"`. Stable across renames of the agent.",
             "title": "Agent Id",
@@ -6119,6 +6131,35 @@
         ]
       }
     },
+    "/v1/harnesses": {
+      "get": {
+        "operationId": "list_harnesses_v1_harnesses_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Harnesses V1 Harnesses Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Harnesses",
+        "tags": [
+          "harnesses"
+        ]
+      }
+    },
     "/v1/hosts": {
       "get": {
         "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
@@ -6541,7 +6582,7 @@
     },
     "/v1/me": {
       "get": {
-        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\"}`, `{\"user_id\": null}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
+        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nAlso returns `is_admin` \u2014 the mode-agnostic admin signal\n(the shared `users.is_admin` column, set by the admin-list\npromotion at login). The SPA gates admin chrome on it in\nEVERY mode, including OIDC/SSO where the accounts-only\n`/auth/me` endpoint does not exist.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\", \"is_admin\": true}`, `{\"user_id\": null, \"is_admin\": false}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
         "operationId": "me_v1_me_get",
         "responses": {
           "200": {
@@ -6873,6 +6914,61 @@
           }
         },
         "summary": "Runner Status",
+        "tags": [
+          "runners"
+        ]
+      }
+    },
+    "/v1/runners/{runner_id}/token": {
+      "post": {
+        "description": "Mint a short-lived owner bearer for a managed-sandbox runner.\n\nA managed sandbox runner has no user credential of its own; it\npresents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and managed sandboxes always run\ntoken-bound (no allow-list).\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
+        "operationId": "mint_runner_owner_token_v1_runners__runner_id__token_post",
+        "parameters": [
+          {
+            "description": "Token-bound runner id from the path.",
+            "in": "path",
+            "name": "runner_id",
+            "required": true,
+            "schema": {
+              "title": "Runner Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "title": "Response Mint Runner Owner Token V1 Runners  Runner Id  Token Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Runner Owner Token",
         "tags": [
           "runners"
         ]

@@ -83,10 +83,17 @@ export interface CommentInboxSource {
  *
  * - Addressed comments are excluded — they were resolved before the
  *   viewer got to them, so there's nothing left to look at.
- * - The viewer's own comments are excluded when authorship is known
- *   (`viewerId` non-null and matching `created_by`); you don't need
- *   an inbox prompt for a comment you just wrote. In single-user
- *   mode both sides are null/anonymous and nothing is excluded.
+ * - Only comments an identifiable *other* person left qualify: the inbox
+ *   surfaces "comments other people left you", so a comment must have a
+ *   `created_by` that isn't the viewer. This means a private / unshared
+ *   session — where every comment is your own — contributes nothing, and
+ *   single-user deployments (all comments unauthored) show an empty inbox
+ *   rather than echoing your own comments back at you. A comment can only
+ *   carry another user's `created_by` if that user had access, so this
+ *   doubles as the "session is shared with someone" check without needing
+ *   the grant list. Unauthored comments (single-user, or legacy
+ *   pre-attribution) are dropped for the same reason — they can't be shown
+ *   as someone else's.
  */
 export function collectCommentInboxItems(
   sources: CommentInboxSource[],
@@ -98,7 +105,8 @@ export function collectCommentInboxItems(
     for (const comment of comments) {
       if (comment.status !== "draft") continue;
       if (seenIds.has(comment.id)) continue;
-      if (viewerId !== null && comment.created_by === viewerId) continue;
+      if (comment.created_by === null) continue;
+      if (comment.created_by === viewerId) continue;
       items.push({ row, comment });
     }
   }

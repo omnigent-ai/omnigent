@@ -1,9 +1,11 @@
 // Tests for the admin MembersPage (invite, password reset, delete user).
 //
 // Browser e2e is impractical (admin/accounts-gated — would need a second
-// authenticated server), so the surface is pinned here by mocking accountsApi
-// (getMe gates admin; listUsers/createInvite/resetUserPassword/deleteUser drive
-// the table + actions) and useNavigate (to observe the unauth → /login bounce).
+// authenticated server), so the surface is pinned here by mocking the
+// mode-agnostic identity probe (resolveIdentity/getCurrentIsAdmin gate admin),
+// accountsApi (listUsers/createInvite/resetUserPassword/deleteUser drive the
+// table + actions), and useServerInfo (accounts_enabled toggles the
+// manage-vs-read-only surface — the latter is the OIDC case).
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -11,15 +13,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MembersPage } from "./MembersPage";
 import type { AccountListEntry } from "@/lib/accountsApi";
 import * as accountsApi from "@/lib/accountsApi";
+import * as identity from "@/lib/identity";
 
-const navigateMock = vi.fn();
+const mocks = vi.hoisted(() => ({ accountsEnabled: true }));
 
-vi.mock("@/lib/routing", async (importActual) => ({
-  ...(await importActual<typeof import("@/lib/routing")>()),
-  useNavigate: () => navigateMock,
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ accounts_enabled: mocks.accountsEnabled }),
+}));
+vi.mock("@/lib/identity", () => ({
+  resolveIdentity: vi.fn(),
+  getCurrentIsAdmin: vi.fn(),
 }));
 vi.mock("@/lib/accountsApi", () => ({
-  getMe: vi.fn(),
   listUsers: vi.fn(),
   createInvite: vi.fn(),
   resetUserPassword: vi.fn(),
@@ -46,12 +51,9 @@ function renderPage() {
 }
 
 beforeEach(() => {
-  vi.mocked(accountsApi.getMe).mockResolvedValue({
-    id: "admin",
-    is_admin: true,
-    created_at: null,
-    last_login_at: null,
-  });
+  mocks.accountsEnabled = true;
+  vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
+  vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   vi.mocked(accountsApi.listUsers).mockResolvedValue([]);
   vi.mocked(accountsApi.createInvite).mockResolvedValue({
     ok: true,
@@ -75,18 +77,14 @@ afterEach(() => {
 
 describe("MembersPage gating", () => {
   it("shows a loading state until the identity probe resolves", () => {
-    vi.mocked(accountsApi.getMe).mockReturnValue(new Promise(() => {})); // never resolves
+    vi.mocked(identity.resolveIdentity).mockReturnValue(new Promise(() => {})); // never resolves
     renderPage();
     expect(screen.getByText("Loading…")).toBeInTheDocument();
   });
 
   it("blocks non-admins with a permission message and never lists users", async () => {
-    vi.mocked(accountsApi.getMe).mockResolvedValue({
-      id: "alice",
-      is_admin: false,
-      created_at: null,
-      last_login_at: null,
-    });
+    vi.mocked(identity.resolveIdentity).mockResolvedValue("alice");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
     renderPage();
     expect(
       await screen.findByText("You don't have permission to manage members."),
@@ -94,10 +92,14 @@ describe("MembersPage gating", () => {
     expect(accountsApi.listUsers).not.toHaveBeenCalled();
   });
 
-  it("bounces an unauthenticated visitor to /login", async () => {
-    vi.mocked(accountsApi.getMe).mockResolvedValue(null);
+  it("stays in the loading state for an unauthenticated visitor (resolveIdentity redirects)", async () => {
+    // resolveIdentity returns null AND owns the login redirect, so the page
+    // just never leaves its loading state — it must NOT list users.
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
     renderPage();
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/login", { replace: true }));
+    await waitFor(() => expect(identity.getCurrentIsAdmin).not.toHaveBeenCalled());
+    expect(accountsApi.listUsers).not.toHaveBeenCalled();
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
   });
 });
 
@@ -178,5 +180,32 @@ describe("MembersPage actions", () => {
     await waitFor(() => expect(accountsApi.createInvite).toHaveBeenCalledWith(false));
     // The single-use invite URL renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue(/register\?invite=tok/)).toBeInTheDocument();
+  });
+});
+
+describe("MembersPage under OIDC (read-only)", () => {
+  beforeEach(() => {
+    // OIDC: accounts disabled → no password-based management. The list still
+    // renders (admins can see who's provisioned), but every management
+    // affordance is gone.
+    mocks.accountsEnabled = false;
+  });
+
+  it("lists users but offers no management actions", async () => {
+    vi.mocked(accountsApi.listUsers).mockResolvedValue([
+      user({ id: "admin", is_admin: true }),
+      user({ id: "bob" }),
+    ]);
+    renderPage();
+
+    // The list renders with role badges.
+    const bobRow = (await screen.findByText("bob")).closest("tr")!;
+    expect(within(bobRow).getByText("Member")).toBeInTheDocument();
+
+    // No invite button, no per-row Reset/Remove, and a read-only notice.
+    expect(screen.queryByRole("button", { name: /Invite member/ })).toBeNull();
+    expect(within(bobRow).queryByRole("button", { name: /Reset/ })).toBeNull();
+    expect(within(bobRow).queryByRole("button", { name: /Remove/ })).toBeNull();
+    expect(screen.getByText(/provisioned automatically on first sign-in/)).toBeInTheDocument();
   });
 });

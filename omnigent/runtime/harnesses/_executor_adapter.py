@@ -44,6 +44,7 @@ from typing import Any
 
 from fastapi import Response
 
+from omnigent.errors import ElicitationDeclinedError
 from omnigent.inner.executor import (
     CompactionComplete,
     Executor,
@@ -457,6 +458,28 @@ class ExecutorAdapter(HarnessApp):
                             )
                             agent_span = None
                         raise RuntimeError(f"inner executor error: {event.message}")
+        except ElicitationDeclinedError:
+            # Fallback for executors that propagate the exception directly
+            # (non-SDK / non-spawned-task paths). SDK-based executors use
+            # ctx.cancelled.set() from _stable_elicitation_handler instead,
+            # because the SDK wraps its control-request callbacks in their
+            # own tasks and would swallow a raised exception before it
+            # reached this handler. Either way the turn ends as cancelled.
+            _logger.info(
+                "elicitation explicitly declined for response %s — aborting turn",
+                ctx.response_id,
+            )
+            if tctx is not None and agent_span is not None:
+                from omnigent.runtime.telemetry import record_cancellation
+
+                record_cancellation(agent_span)
+                tctx.end_agent_span(agent_span, response=None)
+            ctx.cancelled.set()
+            # Interrupt the inner executor session so the in-flight
+            # generation stops immediately, same as the normal
+            # cancellation path.
+            if self._executor is not None:
+                await self._executor.interrupt_session(self._session_key)
         except BaseException:
             # End agent span on unhandled exceptions so it's not
             # left open (which would leak on the OTel provider).
@@ -734,6 +757,13 @@ class ExecutorAdapter(HarnessApp):
             content_preview=f"{tool_name}({preview})",
         )
         result = await ctx.elicit(elicitation_id, params)
+        if result.action == "decline":
+            # The SDK invokes this callback from a spawned control-request
+            # task whose try/except would swallow a raised exception before
+            # it could reach run_turn's except block. Signal the cancellation
+            # via ctx.cancelled instead — the run_turn event loop checks this
+            # flag between events and takes the existing interrupt path.
+            ctx.cancelled.set()
         return result.action == "accept"
 
     async def _stable_policy_evaluator(
