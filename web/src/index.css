@@ -1346,10 +1346,12 @@
   font-weight: 500;
   margin: 0.75em 0 0.25em;
 }
-/* GitHub-style images: never overflow the editor column. No `height: auto` —
-   it would override explicit height="" attributes from HTML <img> tags.
-   inline-block overrides Tailwind preflight's `img { display: block }` so
-   images flow within headings/paragraphs (logos, badges) like on GitHub. */
+/* GitHub-style images: never overflow the editor column. Explicit <img
+   width/height> are applied as inline styles by the node view (see
+   TipTapWorkspaceImage), which beat Preflight's `img { height: auto }` — an
+   attribute-based size would not. inline-block overrides Preflight's
+   `img { display: block }` so images flow within headings/paragraphs (logos,
+   badges) like on GitHub. */
 .tiptap-md-content .ProseMirror img {
   max-width: 100%;
   display: inline-block;
