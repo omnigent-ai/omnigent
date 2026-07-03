@@ -131,3 +131,16 @@ def test_catalog_rows_include_capabilities() -> None:
             # JSON-serializable: values are str/bool, not enums.
             for value in row["capabilities"].values():
                 assert isinstance(value, (str, bool))
+
+
+def test_catalog_includes_hermes() -> None:
+    """Hermes must appear in the web picker catalog (regression: it was a
+    valid harness with capabilities but had no ``harness_labels`` entry, so
+    ``harness_catalog`` — which iterates labels — dropped it)."""
+    rows = harness_catalog()
+    hermes = next((row for row in rows if row["id"] == "hermes"), None)
+    assert hermes is not None, "hermes missing from harness_catalog()"
+    assert hermes["label"] == "Hermes"
+    # The catalog only lists valid harnesses and hermes declares capabilities,
+    # so the row must carry the feature matrix like its subprocess peers.
+    assert "capabilities" in hermes

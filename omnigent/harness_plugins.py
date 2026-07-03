@@ -609,6 +609,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        "hermes": "Hermes",
         "openai-agents": "OpenAI Agents SDK",
         "pi": "Pi",
     },
