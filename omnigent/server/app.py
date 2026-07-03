@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -132,6 +132,11 @@ _register_web_mimetypes()
 _WEB_UI_DIST = Path(
     os.environ.get("OMNIGENT_WEB_UI_DIST") or (Path(__file__).parent / "static" / "web-ui")
 )
+# Static explainer served at "/" when no web UI bundle is present (an API-only
+# build, or an install that skipped the web UI). Kept as a file rather than an
+# inline string so it doesn't clutter the app definition; it's pure static
+# markup with no interpolation. Shipped via package-data in pyproject.toml.
+_API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.html"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
@@ -2239,7 +2244,8 @@ def create_app(
             app.include_router(router, prefix=prefix, tags=tags)
 
     web_ui_dist = _WEB_UI_DIST
-    if web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file():
+    web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
+    if web_ui_present:
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
@@ -2249,26 +2255,16 @@ def create_app(
             name="web-ui",
         )
     else:
+        # No SPA bundle (API-only build, or an install that skipped the web
+        # UI). The "/" route isn't used for anything else, so just always serve
+        # a short HTML explainer there with a 200 — no content negotiation. A
+        # normal install bundles the UI and the static mount above owns "/", so
+        # this only applies to API-only servers.
 
         @app.get("/", include_in_schema=False)
-        async def root() -> dict[str, str]:
-            """
-            Return API server metadata when no web UI build is bundled.
-
-            Databricks Apps opens the app URL at ``/`` in a browser.
-            API-only wheels intentionally omit the SPA assets, so serve
-            a small JSON landing response instead of FastAPI's generic
-            404. When a web UI build is present, the static mount above
-            owns ``/`` and this fallback is not registered.
-
-            :returns: Service metadata with health and docs paths.
-            """
-            return {
-                "service": "omnigent",
-                "status": "ok",
-                "health": "/health",
-                "docs": "/docs",
-            }
+        async def root() -> FileResponse:
+            """Serve the API-only landing page (no web UI bundle present)."""
+            return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     return app
 
