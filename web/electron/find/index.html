@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Find</title>
+    <style>
+      /* Same design tokens as setup/index.html so the bar matches the app. */
+      :root {
+        color-scheme: light dark;
+        --background: #fff;
+        --foreground: #11171c;
+        --muted-foreground: #6f6f6f;
+        --border: #e8ecf0;
+        --radius-lg: 0.5rem;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --background: #1e1927;
+          --foreground: oklch(0.965 0.003 240);
+          --muted-foreground: #92a4b3;
+          --border: oklch(0.28 0.005 240);
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 8px;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        font-size: 13px;
+        background: var(--background);
+        color: var(--foreground);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+      }
+      input {
+        flex: 1;
+        min-width: 0;
+        border: none;
+        outline: none;
+        background: transparent;
+        color: var(--foreground);
+        font: inherit;
+      }
+      input::placeholder {
+        color: var(--muted-foreground);
+      }
+      #count {
+        color: var(--muted-foreground);
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+      button {
+        border: none;
+        background: transparent;
+        color: var(--foreground);
+        font: inherit;
+        cursor: pointer;
+        padding: 2px 6px;
+        border-radius: 4px;
+      }
+      button:hover {
+        background: color-mix(in srgb, var(--foreground) 8%, transparent);
+      }
+    </style>
+  </head>
+  <body>
+    <input id="q" type="text" placeholder="Find in page" autocomplete="off" spellcheck="false" />
+    <span id="count"></span>
+    <button id="prev" title="Previous (Shift+Enter)">&#8593;</button>
+    <button id="next" title="Next (Enter)">&#8595;</button>
+    <button id="close" title="Close (Esc)">&#10005;</button>
+    <script>
+      // Uses the find-bar preload bridge (electron/src/find_preload.js); the
+      // actual searching runs in the main process against the parent window.
+      const find = window.omnigentFind;
+      const q = document.getElementById("q");
+      const count = document.getElementById("count");
+
+      // New text starts a fresh search; Enter / arrows step through matches.
+      q.addEventListener("input", () => {
+        count.textContent = "";
+        find.query(q.value, { forward: true, findNext: false });
+      });
+      function step(forward) {
+        find.query(q.value, { forward, findNext: true });
+      }
+      q.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") step(!e.shiftKey);
+        if (e.key === "Escape") find.close();
+      });
+      document.getElementById("next").addEventListener("click", () => step(true));
+      document.getElementById("prev").addEventListener("click", () => step(false));
+      document.getElementById("close").addEventListener("click", () => find.close());
+
+      find.onResult(({ active, matches }) => {
+        count.textContent = q.value === "" ? "" : `${active}/${matches}`;
+      });
+      // Re-opening an already-open bar (Cmd+F again) re-selects the query.
+      find.onActivate(() => {
+        q.focus();
+        q.select();
+      });
+      q.focus();
+    </script>
+  </body>
+</html>

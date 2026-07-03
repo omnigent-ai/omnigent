@@ -509,6 +509,66 @@ def test_native_output_item_done_retires_by_content_not_position() -> None:
     )
 
 
+def test_pi_native_empty_final_marker_retires_message_on_commit() -> None:
+    """
+    A pi-native turn is retired even though its ``final`` chunk is empty.
+
+    pi-native (and any harness using the web UI's ``finalizeStreamingMessage``
+    contract) signals end-of-message with an EMPTY marker — ``delta=""`` with
+    ``final=true`` — after the text chunks. The completion flag, not the
+    (absent) text, is what flips ``final_seen`` and makes the message eligible
+    for the byte-equal retire on ``output_item.done``.
+
+    Regression: the old ``not delta`` guard dropped that empty marker before
+    ``final_seen`` could be set, so the message was never retired. ``snapshot_for``
+    then replayed the fully-committed message on every reconnect / cold-load,
+    double-rendering it beside the snapshot's persisted copy (the reported bug).
+    """
+    cid = "conv_pi_empty_final"
+    text = "I'm Claude, made by Anthropic."
+    # Text chunk(s), then the separate empty finalize marker.
+    inflight_text.record_publish(cid, _native_delta("pi:msg:0", 0, text, final=False))
+    marker = _native_delta("pi:msg:0", 1, "", final=True)
+    suppress_marker = inflight_text.record_publish(cid, marker)
+    # The empty marker is broadcast (not suppressed) while the message is still
+    # uncommitted — its live preview must finalize on the web client.
+    assert suppress_marker is False
+
+    # The empty marker recorded text only via its earlier chunk; the join key
+    # is the full message text, so the commit retires it by content.
+    suppress_done = inflight_text.record_publish(cid, _message_done("ci_pi", text=text))
+    assert suppress_done is False, "a committed item is broadcast, never suppressed from live"
+
+    # No replay: a reconnect / cold-load shows ONLY the snapshot's copy.
+    assert inflight_text.snapshot_for(cid) == [], (
+        "a committed pi-native message must not replay (it would double-render)"
+    )
+
+
+def test_pi_native_empty_final_marker_suppresses_when_commit_races_ahead() -> None:
+    """
+    The empty finalize marker also retires when the commit raced ahead.
+
+    The committed ``output_item.done`` can arrive BEFORE the deltas (the
+    single-chunk race): no in-flight message matches yet, so its fingerprint
+    is buffered. When the text chunk then the empty ``final`` marker land, the
+    marker — now honored rather than dropped — completes the message, matches
+    the buffered fingerprint, retires it, and is suppressed from the live tail
+    so the duplicate trailing chunk never reaches the client.
+    """
+    cid = "conv_pi_empty_final_race"
+    text = "PONG"
+    # Commit lands first (deltas raced behind): fingerprint buffered.
+    inflight_text.record_publish(cid, _message_done("ci_pong", text=text))
+    # Text chunk, then the empty finalize marker completes + matches it.
+    inflight_text.record_publish(cid, _native_delta("pi:msg:0", 0, text, final=False))
+    marker = _native_delta("pi:msg:0", 1, "", final=True)
+    suppress_marker = inflight_text.record_publish(cid, marker)
+    assert suppress_marker is True, "the duplicate trailing chunk must be suppressed from live"
+
+    assert inflight_text.snapshot_for(cid) == [], "the committed message must not replay"
+
+
 def test_codex_output_item_done_retires_matching_preview_without_final_delta() -> None:
     """
     Codex-native retires previews on commit even without ``final: true``.

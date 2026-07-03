@@ -135,7 +135,7 @@ def test_resolve_provider_databricks_default(
     :param tmp_path: Per-test temp dir.
     """
     _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
-    for harness in ("claude-native", "codex-native", "pi"):
+    for harness in ("claude-native", "codex-native", "pi", "pi-native", "native-pi"):
         provider = resolve_model_provider(_worker_spec(harness), harness)
         assert provider.kind == "databricks", f"harness {harness}: {provider}"
         assert provider.profile == "prof-a"
@@ -275,9 +275,7 @@ def test_resolve_provider_databricks_model_prefix_uses_env_profile(
         # No providers, no auth, no ambient → nothing resolves.
         pytest.param(_worker_spec("claude-native"), "claude-native", id="nothing-configured"),
         # A harness outside the provider-resolution map.
-        pytest.param(
-            _worker_spec("databricks_supervisor"), "databricks_supervisor", id="unknown-harness"
-        ),
+        pytest.param(_worker_spec("unknown-harness"), "unknown-harness", id="unknown-harness"),
         # A structural stub without spec attributes must degrade, not raise.
         pytest.param(
             SimpleNamespace(executor=SimpleNamespace(type="omnigent", config={})),

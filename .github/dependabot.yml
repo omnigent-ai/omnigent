@@ -1,0 +1,102 @@
+# Dependabot configuration — security-only.
+#
+# Fix PRs come from the repo-level "Dependabot security updates" toggle
+# (enabled out of band): Dependabot opens a PR whenever a dependency has an
+# open advisory. The `updates` blocks below exist to (a) GROUP those security
+# PRs per ecosystem so a burst of advisories becomes one PR, and (b) declare
+# every manifest directory.
+#
+# Scheduled VERSION updates are DISABLED (`open-pull-requests-limit: 0`): the
+# proactive bump PRs — especially majors (react 19, react-router 8, …) — were
+# pure churn for this repo. Security updates are NOT subject to that limit, so
+# they keep flowing. To re-enable hygiene bumps later, raise the limit and add
+# a `version-updates` group (e.g. `update-types: [minor, patch]`) per ecosystem.
+#
+# No cooldown: security fixes should land promptly. The supply-chain delay a
+# cooldown provided only mattered for version updates, which are now off.
+version: 2
+
+updates:
+  # ── Python (server + runner; root uv workspace) ──────────────────────────
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      pip-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ── web (React frontend) ──────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      web-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ── web Electron shell ────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/web/electron"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      electron-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ── CI helper deps (.github/ci-deps) ─────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/.github/ci-deps"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      ci-deps-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ── Rust sidecar used by the codex-parity test fixture ───────────────────
+  - package-ecosystem: cargo
+    directory: "/tests/codex_parity/sidecar"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      sidecar-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ── iOS app (CocoaPods/Bundler Gemfile) ──────────────────────────────────
+  - package-ecosystem: bundler
+    directory: "/web/ios"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      ios-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ── GitHub Actions (workflow `uses:` pins) ───────────────────────────────
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]

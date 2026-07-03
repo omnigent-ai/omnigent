@@ -914,3 +914,144 @@ def test_reassign_user_grants_dedups_when_target_already_has_grant(
     assert moved == 0  # already present → dropped, not moved
     assert [p.conversation_id for p in store.list_for_user("alice")] == [conv]
     assert store.list_for_user("local") == []
+
+
+# ── check_access ──────────────────────────────────────────────────────────────
+
+
+def test_check_access_direct_grant(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """check_access returns True when user has a direct grant at or above required level."""
+    _ensure_user(store, "alice")
+    conv = _create_conversation(db_uri)
+    store.grant("alice", conv, level=2)
+
+    assert store.check_access("alice", conv, required_level=1) is True
+    assert store.check_access("alice", conv, required_level=2) is True
+    assert store.check_access("alice", conv, required_level=3) is False
+
+
+def test_check_access_public_grant_fallback(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """check_access falls back to __public__ grant when user has no direct grant."""
+    from omnigent.server.auth import RESERVED_USER_PUBLIC
+
+    _ensure_user(store, "alice")
+    _ensure_user(store, RESERVED_USER_PUBLIC)
+    conv = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_PUBLIC, conv, level=1)
+
+    assert store.check_access("alice", conv, required_level=1) is True
+    assert store.check_access("alice", conv, required_level=2) is False
+
+
+def test_check_access_none_user(store: SqlAlchemyPermissionStore) -> None:
+    """check_access returns False when user_id is None."""
+    assert store.check_access(None, "conv_any", required_level=1) is False
+
+
+def test_check_access_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """check_access returns False when user has no grants and no public access."""
+    _ensure_user(store, "alice")
+    conv = _create_conversation(db_uri)
+    assert store.check_access("alice", conv, required_level=1) is False
+
+
+# ── get_permission_level ──────────────────────────────────────────────────────
+
+
+def test_get_permission_level_direct_grant(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """get_permission_level returns the user's direct grant level."""
+    _ensure_user(store, "alice")
+    conv = _create_conversation(db_uri)
+    store.grant("alice", conv, level=3)
+
+    assert store.get_permission_level("alice", conv) == 3
+
+
+def test_get_permission_level_admin_gets_owner(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """get_permission_level returns LEVEL_OWNER for admin users."""
+    from omnigent.server.auth import LEVEL_OWNER
+
+    store.ensure_user("admin_user", is_admin=True)
+    conv = _create_conversation(db_uri)
+
+    assert store.get_permission_level("admin_user", conv) == LEVEL_OWNER
+
+
+def test_get_permission_level_public_fallback(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """get_permission_level falls back to public grant when no direct grant."""
+    from omnigent.server.auth import RESERVED_USER_PUBLIC
+
+    _ensure_user(store, "alice")
+    _ensure_user(store, RESERVED_USER_PUBLIC)
+    conv = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_PUBLIC, conv, level=1)
+
+    assert store.get_permission_level("alice", conv) == 1
+
+
+def test_get_permission_level_none_user(store: SqlAlchemyPermissionStore) -> None:
+    """get_permission_level returns None for None user_id."""
+    assert store.get_permission_level(None, "conv_any") is None
+
+
+def test_get_permission_level_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """get_permission_level returns None when no grants exist."""
+    _ensure_user(store, "alice")
+    conv = _create_conversation(db_uri)
+    assert store.get_permission_level("alice", conv) is None
+
+
+# ── set_admin ─────────────────────────────────────────────────────────────────
+
+
+def test_set_admin_promotes_user(store: SqlAlchemyPermissionStore) -> None:
+    """set_admin(user, True) makes the user an admin."""
+    store.ensure_user("bob")
+    assert store.is_admin("bob") is False
+    store.set_admin("bob", True)
+    assert store.is_admin("bob") is True
+
+
+def test_set_admin_demotes_user(store: SqlAlchemyPermissionStore) -> None:
+    """set_admin(user, False) removes admin status."""
+    store.ensure_user("carol", is_admin=True)
+    assert store.is_admin("carol") is True
+    store.set_admin("carol", False)
+    assert store.is_admin("carol") is False
+
+
+# ── list_for_sessions (bulk) ──────────────────────────────────────────────────
+
+
+def test_list_for_sessions_returns_grouped_grants(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """list_for_sessions returns grants grouped by conversation_id."""
+    _ensure_user(store, "alice")
+    _ensure_user(store, "bob")
+    conv_a = _create_conversation(db_uri)
+    conv_b = _create_conversation(db_uri)
+    store.grant("alice", conv_a, level=2)
+    store.grant("bob", conv_a, level=1)
+    store.grant("alice", conv_b, level=3)
+
+    result = store.list_for_sessions([conv_a, conv_b])
+    assert len(result[conv_a]) == 2
+    assert len(result[conv_b]) == 1
+    assert result[conv_b][0].user_id == "alice"
+
+
+def test_list_for_sessions_empty_input(store: SqlAlchemyPermissionStore) -> None:
+    """list_for_sessions with empty list returns empty dict."""
+    assert store.list_for_sessions([]) == {}
+
+
+def test_list_for_sessions_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """list_for_sessions returns empty lists for conversations with no grants."""
+    conv = _create_conversation(db_uri)
+    result = store.list_for_sessions([conv])
+    assert result == {conv: []}

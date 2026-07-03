@@ -1,0 +1,71 @@
+{
+  "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+  "status": "CORTEX_STEP_STATUS_WAITING",
+  "metadata": {
+    "stepGenerationVersion": 1,
+    "createdAt": "2026-06-22T23:59:07.500052Z",
+    "viewableAt": "2026-06-22T23:59:07.630843Z",
+    "finishedGeneratingAt": "2026-06-22T23:59:07.630842Z",
+    "lastCompletedChunkAt": "2026-06-22T23:59:07.630830Z",
+    "startedAt": "2026-06-22T23:59:07.632002Z",
+    "source": "CORTEX_STEP_SOURCE_MODEL",
+    "toolCall": {
+      "id": "cbawg2v8",
+      "name": "run_command",
+      "argumentsJson": "{\"CommandLine\":\"pwd\",\"Cwd\":\"/Users/bryanli/.gemini/antigravity-cli/scratch\",\"WaitMsBeforeAsync\":2000,\"toolAction\":\"Running pwd command\",\"toolSummary\":\"Run pwd command\"}",
+      "thinkingSignature": "EqEMCp4MAQw51scOR5pX5ckyi32QBuyRRNp57QWydUR6USZHWZODePbHVCToCfmP7z41a7j/6v2ygF4Ek6IKcQ/Bh2YqCbXyvd52Gjfvxm0XFnaitnfRKbPNbaEC17fGOMPvIatFRPfDP//1U2TYDgQB+u6Zv879ptNTizxfsRmFtnDKqMoaxXarjVY59eQmJ4NSKM74DGssyx74NESS7RqXCQOagHWbsomRPRfQUIYC9xX33Op9Er5NkwUDS+1gWmnfoc28rcUM/2tIaRxPj2gf+TExp85v3HZ6LJ3BgefBoMLYbhWxVdhkfc572aNpB9A1KOd9fL8IqGzP7owUGqSFs4KyWd/tRIKurirkcO8O11/E5YYe57H6IDCz51EQ3UbiUvcReuOOjRIyftVzSFKg5mHw4JqIsC7b5fsb7dgRcldOGqKAlpu2dZ2k0iUgf+GtdChE+FW1+cBrPVwrIIEpSTIxLluHB3NKe27HXXkpj9gw4QNBjwBhRGh22D5B7i5NCNF+qQd8LIu1lwPpWYQbArUukl6TLWG2CeDQXmyvg1BK6FJtkUI/lRsiE2eY1DtISQjT/vQg27wd0lW62Yf0R+aGiaGbmsSvWOkZ54banqPM+FG9JutlTviUmgEMK8d590CdBK3RMjsKIrF9z6r5XIsuRZRLMhCot6zeIeDf6wERW2pkG116z1TdRmwOSPaAVD5UUUnzMkwOEVdTRp2c6bpUWXOD4xI8bVR9xQuSU6lBgJSEgmBhoX8tOLP6G0Fm5mGPfOzUsQrEP79OZ3BS+d9HkDzwLEv0+I9wQ7R1YV+0337MeNITa1660OJfC6Yzp7zLKfUP5bvAPXfxnT8ZBTuWzu+KP/WfyloU8Ex3MSVt2Au7WE7iJsk0dGbu/SiNoJAEjxG47CsUtfuEcJadFkrXvnxCrj++eQKOgt7T06WirPgqjPg1ZjBqA2AdeKGOAaGaAsHKu+4VFzGMLAATNrhQiK/MKNxkDnosV4cK4E6eN8BPvwvphTgx2zIJYlzO+JBGjiyQM/u2hs6/QaSrJ5tV1/liC+NOeJ9t9ScBmj5sPpMVyTCmTh+Hn1wpfozOhcAtUCnBMuls6vD+y99yru4nKrEDpBU1pUdjLvmUtAOdzGk/vUwzRs+kkzt3s3/+U5uGyUOE+17wjfYnjIoOCQq8xQ6wVYSdj8qID6wsJH8Hjv/r8DUGMbe/J28/bFEzbDzKYirmmdmJtx5XOFNjCfojavtwuIa3QL2CtZU1MdVn4d/NVAM4ouUtjC5VX+1bUkIttjsnUzJk2c6YvHOwfeA9XoXAXmM3YBhtmD5N9aPWzdxCo3lKvBFP7cqJQ6vO/s4o6M+Z7jm84uvQqmSUjSpLcOeHvBJbs4otCU5cKzKhuOFaiqWG9SQXh2hjLBQ3QwKynjfvwHg7G4YEZaXceKICtvi2iVXLqh75y3Jf3rKX8oWrGM39rYLp9uwA0FXaNTEAnVGeQSIivKEpYbUYiiBgCtgJb8psmFhJRBftmtaJ0w1FM1zcmyGi87bPvJjTG/UWZmu15K3Eg42PRNWuvi/LFV0jMfJomgHITNxKLaiZwHmL6c2L8ISzcQpM8UII07egRttJ1Wu/YMiWDOMb4vZb+UpjZWfjafO7PhqsWj4ZJUndG5U3gH09Yroph7RyfaDGUsBWo8/P0nEENrAMSk3wQL5N3kEcek9/DMP/PuWzeuvqPA6uDD25lRKtjbZgp01tFTYg2nj86Y2HMCIym84CZqcHgOQpZbHuG+b0EXk765LnslQEfEEuHnuvRmv1hVfWAKIVyaWb1e/39wPNEsDN/3tXGS8FGH6zkRO3Xs60gOAhW79sqzN6brXAgW89s16fcLzcp6KcMAZDm5I4kIJD7KHw/X6073zLxGoJTv8wZKqwRs7RnVW5+13ON21z9wqv/HxMJmQW1r+nNJGxxSqPKZLpNxXnqcVlTsmfvkA0agjJm0JwHO/+tZrDlHDuvECXB/oTXFsl8gY94m3oKnM1rzVIH7qSfD8o/vPMTbqK/hujuTG4k752WvMS7teD+iIPJL2GB9J+UYZy2PN8fheztEhJLHDgg6EcRe4SQ0E8",
+      "originalName": "run_command"
+    },
+    "argumentsOrder": [
+      "CommandLine",
+      "Cwd",
+      "WaitMsBeforeAsync",
+      "toolAction",
+      "toolSummary"
+    ],
+    "generatorModel": "MODEL_PLACEHOLDER_M20",
+    "requestedModel": {
+      "model": "MODEL_PLACEHOLDER_M20"
+    },
+    "executionId": "552a8ac6-69d6-4423-883e-4ff4f463c1db",
+    "toolCallOutputTokens": 42,
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "stepIndex": 6,
+      "metadataIndex": 1,
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    },
+    "internalMetadata": {
+      "statusTransitions": [
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_PENDING",
+          "timestamp": "2026-06-22T23:59:07.631100Z"
+        },
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_WAITING",
+          "timestamp": "2026-06-22T23:59:07.635873Z"
+        }
+      ]
+    },
+    "toolSummary": "Run pwd command",
+    "toolAction": "Running pwd command"
+  },
+  "runCommand": {
+    "commandLine": "pwd",
+    "proposedCommandLine": "pwd",
+    "cwd": "/Users/bryanli/.gemini/antigravity-cli/scratch",
+    "waitMsBeforeAsync": "2000",
+    "blocking": true
+  },
+  "requestedInteraction": {
+    "permission": {
+      "resource": {
+        "action": "command",
+        "target": "pwd"
+      },
+      "persistSuggestionType": "PERSIST_SUGGESTION_TYPE_SUGGESTED",
+      "suggestedPersistPattern": "pwd",
+      "actionDescription": "Running pwd command"
+    }
+  }
+}

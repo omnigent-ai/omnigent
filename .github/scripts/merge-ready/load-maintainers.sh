@@ -2,7 +2,8 @@
 # Loads the maintainer set from .github/MAINTAINER at main's tip.
 #
 # Always main, never the PR head SHA: otherwise a PR could edit
-# MAINTAINER to grant itself force-merge bypass without being merged.
+# MAINTAINER to grant itself a maintainer-gated waiver (e.g.
+# skip-security-scan, skip-e2e-ui-test) without being merged.
 # Defense-in-depth: a PR could still edit *this* workflow to drop
 # `?ref=main`, so the remaining defense is `required_pull_request_reviews`
 # in branch protection.
@@ -23,7 +24,7 @@ set -e
 
 if [[ $RC -ne 0 || -z "$CONTENT_B64" ]]; then
   echo "list=" >> "$GITHUB_OUTPUT"
-  echo "::warning::.github/MAINTAINER not found on main; force-merge label cannot be effective until the file is merged."
+  echo "::warning::.github/MAINTAINER not found on main; maintainer-gated waivers cannot be effective until the file is merged."
   exit 0
 fi
 
@@ -36,7 +37,7 @@ USERS="${USERS% }"
 
 if [[ -z "${USERS// /}" ]]; then
   echo "list=" >> "$GITHUB_OUTPUT"
-  echo "::warning::.github/MAINTAINER on main has no entries; force-merge label cannot be effective."
+  echo "::warning::.github/MAINTAINER on main has no entries; maintainer-gated waivers cannot be effective."
   exit 0
 fi
 

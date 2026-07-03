@@ -222,3 +222,118 @@ def test_describe_verdict_is_model_and_tier() -> None:
     """The one-line summary names the model and its tier."""
     text = describe_verdict(_verdict(tier="expensive", model="databricks-claude-opus-4-8"))
     assert text == "databricks-claude-opus-4-8 (expensive)"
+
+
+def test_label_value_caps_long_rationale_at_column_limit() -> None:
+    """An oversized judge rationale must trim to fit the varchar(256)
+    labels column (Postgres rejects the whole write otherwise, the
+    haiku-shows/opus-doesn't bug)."""
+    verdict = AdvisorVerdict(
+        tier="expensive",
+        model="databricks-claude-opus-4-8",
+        applied=True,
+        rationale="x" * 600,
+        turn_anchor="2026-06-11T05:30:45.670436+00:00",
+    )
+    value = verdict_to_label_value(verdict)
+    assert len(value) <= 256
+    parsed = parse_verdict({COST_CONTROL_PLAN_LABEL: value})
+    assert parsed is not None
+    assert parsed.model == verdict.model
+    assert parsed.rationale is not None and parsed.rationale.endswith("...")
+
+
+def test_label_value_preserves_non_ascii_rationale_within_budget() -> None:
+    """A long non-ASCII rationale trims to a real prefix, not to null.
+
+    Regression guard for the encoding bug: ``json.dumps`` defaults to
+    ``ensure_ascii=True``, so each CJK char serializes to ``\\uXXXX``
+    (6 chars). The old trim counted raw chars against an overflow measured
+    on the escaped string, so a short non-ASCII rationale computed a
+    ``keep`` of zero and the serializer dropped it wholesale to
+    ``null`` (even with column budget to spare). The reader then raised on
+    that null. The trim must keep as much rationale as actually fits.
+    """
+    verdict = AdvisorVerdict(
+        tier="expensive",
+        model="databricks-claude-opus-4-8",
+        applied=True,
+        rationale="复杂重构任务" * 12,  # ~72 CJK chars, overflows the column
+        turn_anchor="2026-06-11T05:30:45.670436+00:00",
+    )
+    value = verdict_to_label_value(verdict)
+    assert len(value) <= 256
+    parsed = parse_verdict({COST_CONTROL_PLAN_LABEL: value})
+    assert parsed is not None
+    # The rationale survives as a trimmed prefix, not destroyed to null.
+    assert parsed.rationale is not None
+    assert parsed.rationale.endswith("...")
+    assert parsed.rationale.startswith("复杂重构")
+
+
+def test_label_value_keeps_short_non_ascii_rationale_verbatim() -> None:
+    """A non-ASCII rationale that fits is stored untouched (no trim)."""
+    verdict = AdvisorVerdict(
+        tier="cheap",
+        model="databricks-claude-haiku-4-5",
+        applied=False,
+        rationale="简单任务",
+        turn_anchor=_ANCHOR,
+    )
+    parsed = parse_verdict({COST_CONTROL_PLAN_LABEL: verdict_to_label_value(verdict)})
+    assert parsed is not None
+    assert parsed.rationale == "简单任务"
+
+
+def test_label_value_caps_escape_heavy_rationale() -> None:
+    """An all-quotes rationale (each char escapes to two) still fits 256."""
+    verdict = AdvisorVerdict(
+        tier="medium",
+        model="databricks-claude-sonnet-4-6",
+        applied=True,
+        rationale='"' * 600,
+        turn_anchor=_ANCHOR,
+    )
+    value = verdict_to_label_value(verdict)
+    assert len(value) <= 256
+    parsed = parse_verdict({COST_CONTROL_PLAN_LABEL: value})
+    assert parsed is not None
+    assert parsed.rationale is not None and parsed.rationale.endswith("...")
+
+
+def test_parse_verdict_tolerates_null_rationale() -> None:
+    """A serialized verdict carrying ``rationale: null`` parses, not raises.
+
+    ``verdict_to_label_value`` emits a null rationale in the degenerate
+    case where nothing fits, so the reader must accept it for the
+    serialize/parse round-trip to be total.
+    """
+    raw = json.dumps(
+        {
+            "version": 3,
+            "tier": "cheap",
+            "model": "databricks-claude-haiku-4-5",
+            "applied": True,
+            "rationale": None,
+            "turn_anchor": _ANCHOR,
+        }
+    )
+    parsed = parse_verdict({COST_CONTROL_PLAN_LABEL: raw})
+    assert parsed is not None
+    assert parsed.rationale is None
+
+
+def test_parse_verdict_non_string_non_null_rationale_raises() -> None:
+    """A numeric rationale is still corrupt and fails loud."""
+    raw = json.dumps(
+        {
+            "version": 3,
+            "tier": "cheap",
+            "model": "databricks-claude-haiku-4-5",
+            "applied": True,
+            "rationale": 123,
+            "turn_anchor": _ANCHOR,
+        }
+    )
+    with pytest.raises(ValueError, match="string or null rationale"):
+        parse_verdict({COST_CONTROL_PLAN_LABEL: raw})

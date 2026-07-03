@@ -698,6 +698,7 @@ from omnigent.inner.databricks_executor import (  # noqa: E402
     _DatabricksBearerAuth,
     _read_databrickscfg,
     _read_databrickscfg_file_fallback,
+    _read_databrickscfg_host,
 )
 
 _AUTH_ENV_VARS: tuple[str, ...] = (
@@ -816,6 +817,97 @@ def test_read_databrickscfg_empty_config_file_returns_none(
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
 
     assert _read_databrickscfg("missing-profile") is None
+
+
+def test_read_databrickscfg_host_reads_oauth_profile_without_token(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """
+    Host-only resolution supports Databricks CLI OAuth profile sections.
+
+    Native Codex does not need a static token at startup: it only needs the
+    workspace host to build the Codex provider base URL, then Codex's
+    ``auth.command`` calls ``databricks auth token --profile`` for live bearer
+    refresh. A default install without ``databricks-sdk`` must therefore still
+    accept a present ``auth_type=databricks-cli`` section with no ``token``.
+    """
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+        [oauth-profile]
+        host = https://oauth-host.example.com
+        auth_type = databricks-cli
+        """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    assert _read_databrickscfg_host("oauth-profile") == "https://oauth-host.example.com"
+
+
+def test_read_databrickscfg_host_missing_named_profile_does_not_fallback(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """An explicit missing profile must not borrow a different profile's host."""
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+        [other-profile]
+        host = https://other.example.com
+        auth_type = databricks-cli
+        """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    assert _read_databrickscfg_host("missing-profile") is None
+
+
+def test_codex_executor_gateway_uses_host_only_oauth_profile(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """
+    Wrapped Codex shares the native Codex host-only Databricks profile path.
+
+    This covers default installs where the runner can read a
+    ``databricks-cli`` profile's host but cannot mint a bearer snapshot at
+    construction time.
+    """
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+        [oauth-profile]
+        host = https://oauth-host.example.com
+        auth_type = databricks-cli
+        """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._read_databrickscfg",
+        lambda _profile: None,
+    )
+
+    from omnigent.inner.codex_executor import CodexExecutor
+
+    executor = CodexExecutor(
+        codex_path=sys.executable,
+        gateway=True,
+        databricks_profile="oauth-profile",
+    )
+
+    overrides = "\n".join(executor._codex_config_overrides)
+    assert "https://oauth-host.example.com/ai-gateway/codex/v1" in overrides
+    assert 'databricks auth token --profile \\"oauth-profile\\"' in overrides
 
 
 def test_read_databrickscfg_no_config_file_returns_none(

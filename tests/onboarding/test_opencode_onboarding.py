@@ -6,7 +6,6 @@ from omnigent.onboarding.harness_install import (
     required_cli_for_harness,
 )
 from omnigent.onboarding.harness_readiness import (
-    OPENCODE_SURFACE,
     configured_harness_map,
     harness_is_configured,
 )
@@ -15,7 +14,7 @@ from omnigent.onboarding.harness_readiness import (
 def test_install_spec_present():
     spec = harness_install_spec(OPENCODE_KEY)
     assert spec is not None
-    assert spec.package == "opencode-ai"
+    assert spec.package == "opencode-ai@~1.17.7"
     assert spec.binary == "opencode"
 
 
@@ -25,7 +24,7 @@ def test_required_cli_for_opencode():
 
 
 def test_configured_map_includes_opencode():
-    assert OPENCODE_SURFACE in configured_harness_map()
+    assert OPENCODE_KEY in configured_harness_map()
 
 
 def test_harness_is_configured_resolvable():

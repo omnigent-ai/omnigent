@@ -23,6 +23,12 @@ _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os
 # inside the CLI subprocess.
 _NATIVE_OS_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
 
+# Cursor SDK native tool names surfaced via the preToolUse hook
+# (see ``omnigent.inner.cursor_policy_hook``). Cursor uses ``Shell``
+# for its terminal tool (not ``Bash``). ``Read`` / ``Write`` / ``Edit``
+# are already in ``_NATIVE_OS_TOOLS`` above.
+_CURSOR_NATIVE_OS_TOOLS = frozenset({"Shell"})
+
 # Pi native tool names (lowercase), surfaced via the pi ``tool_call``
 # extension hook (see ``omnigent.inner.pi_executor._gate_native_tool``).
 # Pi runs these in-process and routes them through the same TOOL_CALL
@@ -31,6 +37,38 @@ _NATIVE_OS_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
 # as the Omnigent ``sys_os_*`` tools (``path`` / ``command``), so the
 # previews below resolve without a Pi-specific arg branch.
 _PI_NATIVE_OS_TOOLS = frozenset({"read", "bash", "write", "edit"})
+
+# Hermes Agent tool names surfaced via the ``pre_tool_call`` shell hook
+# (see ``omnigent.inner.hermes_policy_hook``). Hermes uses its own naming
+# convention for file/shell operations.
+_HERMES_OS_TOOLS = frozenset(
+    {"terminal", "execute_code", "read_file", "write_file", "search_files"}
+)
+
+# Goose native tool names. Goose namespaces its built-in "developer" extension
+# tools as ``developer__<tool>``; ``shell`` is the terminal tool and
+# ``write`` / ``edit`` / ``text_editor`` / ``read_image`` / ``tree`` are the file
+# tools (names vary slightly by Goose version, so cover both the split write/edit
+# and the unified text_editor spellings).
+_GOOSE_NATIVE_OS_TOOLS = frozenset(
+    {
+        "developer__shell",
+        "developer__write",
+        "developer__edit",
+        "developer__text_editor",
+        "developer__read_image",
+        "developer__tree",
+    }
+)
+
+# opencode-native permission CATEGORIES (the ``permission`` field of a
+# ``permission.asked`` event, mapped to the policy-event tool name by the SSE
+# forwarder — live-verified against 1.17.7). opencode collapses write/edit/patch
+# into ``edit``; ``bash`` is its shell tool (``ShellID.ToolID``). ``bash`` /
+# ``read`` / ``edit`` overlap the lowercase pi set above, but list them
+# explicitly so opencode coverage does not silently depend on that set, and add
+# the file-search categories (``grep`` / ``glob``) pi lacks.
+_OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
 
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
@@ -79,7 +117,7 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
 def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before any file or shell tool call.
 
-    Covers four tool-name families:
+    Covers six tool-name families:
 
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
@@ -88,9 +126,19 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
       ``PreToolUse`` hook contract.
     - **Codex native tools** — uses the same ``PreToolUse`` hook
       contract with the same tool names (e.g. ``Bash``).
+    - **Cursor SDK native tools** (``Shell``) — surfaced via the
+      ``preToolUse`` hook (see ``cursor_policy_hook.py``). Cursor
+      uses ``Shell`` instead of ``Bash`` for its terminal tool.
     - **Pi native tools** (``read``, ``bash``, ``write``, ``edit``)
       — surfaced via the pi ``tool_call`` extension hook. Lowercase
       and distinct from the Claude/Codex casing.
+    - **Hermes Agent tools** (``terminal``, ``execute_code``,
+      ``read_file``, ``write_file``, ``search_files``) — surfaced
+      via the ``pre_tool_call`` shell hook.
+    - **opencode native tools** (``bash``, ``edit``, ``read``,
+      ``grep``, ``glob``) — opencode's permission CATEGORIES, surfaced
+      via the SSE forwarder's ``permission.asked`` → policy-evaluate
+      path. opencode collapses write/edit/patch into ``edit``.
 
     Returns ASK so the user sees an approval prompt before the tool
     executes.
@@ -105,13 +153,24 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     if not isinstance(data, dict):
         return _ALLOW
     tool = data.get("name", "")
-    if tool in _SYS_OS_TOOLS or tool in _NATIVE_OS_TOOLS or tool in _PI_NATIVE_OS_TOOLS:
+    _all_os_tools = (
+        _SYS_OS_TOOLS
+        | _NATIVE_OS_TOOLS
+        | _CURSOR_NATIVE_OS_TOOLS
+        | _PI_NATIVE_OS_TOOLS
+        | _HERMES_OS_TOOLS
+        | _GOOSE_NATIVE_OS_TOOLS
+        | _OPENCODE_NATIVE_OS_TOOLS
+    )
+    if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash"):
+        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
             preview = args.get("command", "") if isinstance(args, dict) else ""
-        elif tool in ("Grep", "Glob"):
+        elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
+        elif tool == "execute_code":
+            preview = args.get("code", "")[:80] if isinstance(args, dict) else ""
         else:
             # Omnigent tools use ``path``; Claude native tools use ``file_path``.
             preview = (
@@ -246,8 +305,12 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             data = event.get("data")
             text = data if isinstance(data, str) else ""
             if text.startswith("/"):
-                # Extract the command name: first token after "/"
-                command = text[1:].split(None, 1)[0] if len(text) > 1 else ""
+                # Extract the command name: first token after "/".
+                # ``split(None, ...)`` drops empty tokens, so a bare "/"
+                # or a slash followed only by whitespace ("/   ") yields
+                # an empty list — guard against IndexError.
+                tokens = text[1:].split(None, 1)
+                command = tokens[0] if tokens else ""
                 if command.lower() in blocked_lower:
                     return {
                         "result": "DENY",
@@ -515,7 +578,9 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
         "covers Omnigent sys_os_* tools, Claude Code native tools "
-        "(Bash, Read, Write, Edit, Glob, Grep), and Codex native tools",
+        "(Bash, Read, Write, Edit, Glob, Grep), Codex native tools, "
+        "opencode native tools (bash, edit, read, grep, glob), "
+        "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,
     },
     {

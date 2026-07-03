@@ -26,6 +26,31 @@ from omnigent.claude_native_bridge import url_component
 DAEMON_POLL_INTERVAL_S = 0.5
 
 
+def _json_body(resp: httpx.Response) -> dict[str, object]:
+    """Decode a host/runner status response body, tolerating non-JSON.
+
+    The host + runner status endpoints (``GET /v1/hosts/{id}``,
+    ``GET /v1/runners/{id}/status``) are expected to answer JSON. But a
+    server reached over ``--server`` that does not mount the host router
+    (e.g. an API-only deployment, or a misconfigured server) lets these
+    paths fall through to the SPA HTML5-history fallback, which answers
+    ``200 text/html`` with ``index.html``. Calling ``resp.json()`` on that
+    raised an opaque ``json.JSONDecodeError`` that crashed the REPL before
+    it ever became ready. Treat any non-dict / non-JSON 200 body as "no
+    status yet" so the caller keeps polling and ultimately fails with the
+    actionable timeout message instead.
+
+    :param resp: A ``200`` host/runner status response.
+    :returns: The decoded JSON object, or an empty dict when the body is
+        not a JSON object (e.g. the SPA HTML fallback).
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
 async def wait_for_host_online(
     client: httpx.AsyncClient,
     host_id: str,
@@ -58,7 +83,7 @@ async def wait_for_host_online(
         except httpx.TransportError as exc:
             last_error = exc
         else:
-            if resp.status_code == 200 and resp.json().get("status") == "online":
+            if resp.status_code == 200 and _json_body(resp).get("status") == "online":
                 return
         await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
     message = (
@@ -79,7 +104,7 @@ async def runner_is_online(client: httpx.AsyncClient, runner_id: str) -> bool:
     :returns: ``True`` when the status endpoint reports ``online``.
     """
     resp = await client.get(f"/v1/runners/{url_component(runner_id)}/status")
-    return resp.status_code == 200 and bool(resp.json().get("online"))
+    return resp.status_code == 200 and bool(_json_body(resp).get("online"))
 
 
 async def wait_for_runner_online(
@@ -119,7 +144,7 @@ async def wait_for_runner_online(
             last_error = exc
         else:
             if resp.status_code == 200:
-                body = resp.json()
+                body = _json_body(resp)
                 if body.get("online"):
                     return
                 exit_error = body.get("error")
@@ -162,7 +187,7 @@ async def launch_or_reuse_daemon_runner(
     :raises click.ClickException: If the launch request fails.
     """
     snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
-    existing = snap.json().get("runner_id") if snap.status_code == 200 else None
+    existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
     if isinstance(existing, str) and existing:
         if await runner_is_online(client, existing):
             return existing

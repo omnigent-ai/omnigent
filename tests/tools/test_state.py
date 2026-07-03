@@ -273,7 +273,8 @@ def test_transaction_serializes_across_processes(state_root: Path) -> None:
     cores, so this exposes any missing lock.
     """
     num_procs = 8
-    ctx = multiprocessing.get_context("fork")
+    start_method = "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    ctx = multiprocessing.get_context(start_method)
     procs = [
         ctx.Process(target=_bump_in_subprocess, args=(str(state_root), "q"))
         for _ in range(num_procs)

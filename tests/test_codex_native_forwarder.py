@@ -16,12 +16,19 @@ only an already-mirrored value is not re-posted.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
 from omnigent import codex_native_forwarder as fwd
-from omnigent.codex_native_bridge import codex_home_for_bridge_dir
+from omnigent.codex_native_bridge import (
+    CodexNativeBridgeState,
+    codex_home_for_bridge_dir,
+    read_bridge_state,
+    write_bridge_state,
+)
+from omnigent.codex_native_forwarder import _persist_codex_compaction_item
 
 
 class _RecordingClient:
@@ -192,6 +199,148 @@ async def test_sync_after_resume_posts_spawn_model() -> None:
         )
     ]
     assert state.posted_model == "gpt-5.4-mini"
+
+
+def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None:
+    """
+    ``thread/settings/updated`` records Codex's live thinking settings.
+
+    App-server sends the public ``ThreadSettings`` shape with ``effort`` and
+    ``collaborationMode``. If this parser regresses, the later sync helpers have
+    no state to mirror, so Omnigent would keep stale ``reasoning_effort`` and
+    mode metadata even though Codex changed them.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "model": "gpt-5.4-codex",
+                "effort": "medium",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4-codex",
+                        "reasoning_effort": "medium",
+                        "developer_instructions": None,
+                    },
+                },
+            }
+        }
+    )
+
+    assert state.model == "gpt-5.4-codex"
+    assert state.effort == "medium"
+    assert state.collaboration_mode == "plan"
+
+
+@pytest.mark.asyncio
+async def test_sync_reasoning_effort_change_posts_and_dedupes() -> None:
+    """
+    Codex effort changes mirror to Omnigent exactly once per observed value.
+
+    The first sync must POST ``external_reasoning_effort_change`` so the server
+    persists ``conversation.reasoning_effort``. The second sync with the same
+    value must not re-post; otherwise every repeated settings notification would
+    churn the session stream.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(effort="medium")
+
+    await fwd._sync_reasoning_effort_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+    await fwd._sync_reasoning_effort_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    # One post proves the new effort reached AP; no second post proves the
+    # dedupe baseline advanced after a successful mirror.
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": "medium"},
+            },
+        )
+    ]
+    assert state.posted_effort == "medium"
+    assert state.posted_effort_known is True
+
+
+@pytest.mark.asyncio
+async def test_sync_reasoning_effort_change_posts_clear() -> None:
+    """
+    Codex clearing effort mirrors JSON null to Omnigent.
+
+    ``None`` is a meaningful observed value (model/default effort), so the
+    forwarder must still post it after a prior explicit effort. If this returned
+    early on falsey ``None``, Omnigent would keep a stale explicit effort.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(
+        effort=None,
+        posted_effort="high",
+        posted_effort_known=True,
+    )
+
+    await fwd._sync_reasoning_effort_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": None},
+            },
+        )
+    ]
+    assert state.posted_effort is None
+    assert state.posted_effort_known is True
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_collaboration_mode_change_posts_and_dedupes() -> None:
+    """
+    Codex collaboration mode changes mirror to Omnigent labels once.
+
+    The ``mode`` value is the durable "Plan vs Default" signal we can get from
+    app-server. Missing this POST would leave the session snapshot without the
+    current Codex mode.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(collaboration_mode="plan")
+
+    await fwd._sync_codex_collaboration_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+    await fwd._sync_codex_collaboration_mode_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_collaboration_mode_change",
+                "data": {"mode": "plan"},
+            },
+        )
+    ]
+    assert state.posted_collaboration_mode == "plan"
 
 
 @pytest.mark.parametrize(
@@ -525,3 +674,1169 @@ async def test_elicitation_post_returns_none_when_budget_exhausted(
     # 1 = the deadline check stopped the loop before a second attempt
     # (backoff 1.0s > 0.5s budget); more means the budget is ignored.
     assert len(client.posts) == 1
+
+
+class _StatusClient:
+    """httpx client stub whose ``post`` returns a fixed status code."""
+
+    def __init__(self, status_code: int) -> None:
+        """:param status_code: Status to return from every post, e.g. ``400``."""
+        self.status_code = status_code
+        self.posts = 0
+
+    async def post(self, url: str, *, json: dict) -> httpx.Response:
+        """Return the configured status; never raises."""
+        del json
+        self.posts += 1
+        return httpx.Response(self.status_code, request=httpx.Request("POST", url))
+
+
+def test_forward_failures_escalate_to_degraded_once() -> None:
+    """
+    Sustained forward failures flip the degraded latch exactly once (#1120).
+
+    Network drops previously surfaced only as scattered per-item warnings;
+    the latch turns a real outage into a single loud signal and does not
+    re-fire per dropped item.
+    """
+    fwd._reset_forward_health()
+
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD - 1):
+        fwd._note_forward_failure("external_output_text_delta")
+    # Below threshold: not yet degraded.
+    assert fwd._forward_health.degraded_logged is False
+
+    fwd._note_forward_failure("external_output_text_delta")  # crosses threshold
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD
+
+    # The latch holds — further failures keep counting but don't re-escalate.
+    fwd._note_forward_failure("external_output_text_delta")
+    assert fwd._forward_health.degraded_logged is True
+    assert fwd._forward_health.consecutive_failures == fwd._FORWARD_DEGRADED_THRESHOLD + 1
+
+
+def test_forward_success_resets_degraded_state() -> None:
+    """
+    A successful forward clears the failure count and degraded latch.
+
+    Recovery must re-arm the indicator so a later outage escalates again.
+    """
+    fwd._reset_forward_health()
+    for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD):
+        fwd._note_forward_failure("external_session_usage")
+    assert fwd._forward_health.degraded_logged is True
+
+    fwd._note_forward_success()
+
+    assert fwd._forward_health.consecutive_failures == 0
+    assert fwd._forward_health.degraded_logged is False
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_tracks_success_and_failure() -> None:
+    """
+    _post_session_event classifies each outcome into forward health (#1120).
+
+    A 2xx clears the failure run; a permanent 4xx counts as a failure so a
+    sustained outage can escalate.
+    """
+    fwd._reset_forward_health()
+
+    # A permanent 4xx is a failure.
+    await fwd._post_session_event(
+        _StatusClient(400), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 1
+
+    # A 2xx resets the run.
+    await fwd._post_session_event(
+        _RecordingClient(), "conv_x", event_type="external_session_status", data={"status": "idle"}
+    )
+    assert fwd._forward_health.consecutive_failures == 0
+
+
+# ── #1108: turn-error "silent success" → surfaced failed ──────────────
+#
+# A failed Codex turn arrives as ``turn/completed`` (a clean success boundary)
+# with ``turn.status == "failed"`` and a ``turn.error`` object. These tests pin
+# the surface-only fix: such turns are forced to ``failed``, the reason is
+# surfaced as the status output, auth errors (codexErrorInfo / 401-403) carry a
+# re-auth hint, the resume path reaches the same verdict, an empty turn is idle
+# (+ WARN), and a genuinely clean turn still reports success.
+
+
+def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
+    """
+    Seed bridge state so a terminal turn edge clears the active turn.
+
+    ``_terminal_turn_status_edge`` only produces an edge when the terminal
+    event clears the recorded active turn id; without this seed it returns
+    ``None`` as "stale".
+
+    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
+    :param turn_id: Active Codex turn id to record, e.g. ``"turn_123"``.
+    :returns: None.
+    """
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(bridge_dir / "codex-home"),
+            active_turn_id=turn_id,
+        ),
+    )
+
+
+def test_classify_codex_error_auth_vs_generic() -> None:
+    """The shared classifier flags auth errors and leaves the rest generic.
+
+    This is the single classifier reused by both the live and resume paths;
+    if it regresses, an expired-login failure would surface without the
+    re-auth hint (or a disk-full error would wrongly demand re-auth). It
+    prefers ``codexErrorInfo`` (variant / httpStatusCode) and falls back to
+    the message text.
+    """
+    auth = fwd._CODEX_ERROR_KIND_AUTH
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Structured codexErrorInfo: string variant, tagged object, http status.
+    assert fwd._classify_codex_error({"codexErrorInfo": "Unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "Unauthorized"}}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 401}}, "nope") == auth
+    # The real app-server enum serializes lowercase snake_case; it must match
+    # via the structured path (message "nope" has no auth substring to fall
+    # back on), case-insensitively.
+    assert fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "nope") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": {"type": "unauthorized"}}, "nope") == auth
+    # Message-text fallback when codexErrorInfo is absent.
+    assert fwd._classify_codex_error({}, "Please run codex login") == auth
+    assert fwd._classify_codex_error({}, "ChatGPT session expired") == auth
+    assert fwd._classify_codex_error({"codexErrorInfo": "Other"}, "disk full") == generic
+
+
+def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
+    """``_terminal_error_from_turn`` returns the classified ``turn.error``.
+
+    The helper is the single source of truth for "did this turn fail"; both
+    edge builders depend on it, so it must read ``turn.error`` and classify it.
+    """
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {
+                "message": "401 Unauthorized: login expired",
+                "codexErrorInfo": "Unauthorized",
+            },
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "401 Unauthorized: login expired"
+    assert error.kind == fwd._CODEX_ERROR_KIND_AUTH
+    assert error.is_auth is True
+
+
+def test_terminal_error_from_turn_falls_back_to_error_item() -> None:
+    """With no ``turn.error``, an ``error`` ThreadItem in ``turn.items`` is used.
+
+    Both shapes exist in the app-server type system; the fallback keeps the fix
+    correct on the version/path that emits the error as an item rather than as a
+    ``turn.error`` object.
+    """
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [
+                {"type": "agentMessage", "id": "a", "text": "working"},
+                {"type": "error", "message": "please run codex login"},
+            ],
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "please run codex login"
+    assert error.is_auth is True
+
+
+def test_terminal_error_from_turn_prefers_turn_error_over_item() -> None:
+    """``turn.error`` wins when both it and an ``error`` item are present."""
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": "from turn.error"},
+            "items": [{"type": "error", "message": "from item"}],
+        }
+    }
+
+    error = fwd._terminal_error_from_turn(params)
+
+    assert error is not None
+    assert error.message == "from turn.error"
+
+
+def test_terminal_error_from_turn_none_for_clean_turn() -> None:
+    """A turn with no ``error`` object or item yields ``None`` (no false positives)."""
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "agentMessage", "id": "a", "text": "done"}],
+        }
+    }
+
+    assert fwd._terminal_error_from_turn(params) is None
+
+
+def test_terminal_turn_status_edge_error_item_forces_failed(tmp_path: Path) -> None:
+    """A ``turn/completed`` carrying an ``error`` item (no ``turn.error``) fails.
+
+    The item-fallback path must flip the live edge to ``failed`` just like the
+    ``turn.error`` path does.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "error", "message": "model stream broke"}],
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is not None
+    assert edge.error.message == "model stream broke"
+    assert edge.source == "turn/completed:turn-error"
+
+
+def test_terminal_turn_status_edge_turn_error_forces_failed(tmp_path: Path) -> None:
+    """A ``turn/completed`` carrying ``turn.error`` is forced to ``failed``.
+
+    This is the core of #1108: Codex reported a *completed* boundary, but the
+    turn actually failed. The edge must be ``failed`` (not the silent ``idle``
+    the method alone implies) and carry the classified error.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": "model stream broke"},
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.turn_id == "turn_123"
+    assert edge.error is not None
+    assert edge.error.message == "model stream broke"
+    assert edge.error.kind == fwd._CODEX_ERROR_KIND_GENERIC
+    assert edge.source == "turn/completed:turn-error"
+
+
+def test_terminal_turn_status_edge_auth_turn_error_classified(tmp_path: Path) -> None:
+    """An auth-classified ``turn.error`` rides the failed edge as ``auth``."""
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {
+                "message": "Forbidden",
+                "codexErrorInfo": {"type": "Unauthorized", "httpStatusCode": 403},
+            },
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is not None
+    assert edge.error.is_auth is True
+
+
+def test_terminal_turn_status_edge_failed_status_without_error(tmp_path: Path) -> None:
+    """A ``turn.status == "failed"`` with no ``error`` object still fails.
+
+    Defends against an app-server version that records the failed status but
+    omits the populated ``turn.error`` — the edge must not fall back to ``idle``.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {"turn": {"id": "turn_123", "status": "failed"}}
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is None
+    assert edge.source == "turn/completed:turn-failed"
+
+
+def test_terminal_turn_status_edge_clean_turn_still_idle(tmp_path: Path) -> None:
+    """A genuinely clean ``turn/completed`` still maps to ``idle`` (regression).
+
+    The turn-error check must not break the happy path: no error → the edge
+    stays ``idle`` with no attached error.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "agentMessage", "id": "a", "text": "all good"}],
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "idle"
+    assert edge.error is None
+    assert edge.source == "turn/completed"
+
+
+def test_terminal_turn_status_edge_empty_turn_idle_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A zero-item ``turn/completed`` maps to ``idle`` and emits a WARN.
+
+    An empty turn is not an error, but it is unusual enough to log: it maps to
+    ``idle`` (so the session closes) while a WARN records the anomaly.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    params = {"turn": {"id": "turn_123", "status": "completed", "items": []}}
+
+    with caplog.at_level("WARNING", logger="omnigent.codex_native_forwarder"):
+        edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "idle"
+    assert edge.error is None
+    assert any(
+        "empty turn" in record.getMessage() and record.levelname == "WARNING"
+        for record in caplog.records
+    ), "expected a WARN log for the empty (zero-item) turn"
+
+
+def test_omnigent_status_from_resume_turn_error_parity() -> None:
+    """Resume parity: a completed resume turn carrying ``turn.error`` → ``failed``.
+
+    Without this, a reconnect that backfills from ``thread/resume`` would close
+    the session as ``idle`` even though the turn had errored — the resume-path
+    half of the silent-success bug.
+    """
+    turn_with_error = {
+        "id": "turn_123",
+        "status": "completed",
+        "error": {"message": "rate limited"},
+    }
+    turn_clean = {
+        "id": "turn_123",
+        "status": "completed",
+        "items": [{"type": "agentMessage", "id": "a", "text": "hi"}],
+    }
+
+    assert fwd._omnigent_status_from_resume_turn(turn_with_error) == "failed"
+    # Parity check: the clean turn still resolves to idle.
+    assert fwd._omnigent_status_from_resume_turn(turn_clean) == "idle"
+
+
+def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
+    """The resume edge carries the classified error like the live edge does."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    turns = [
+        {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": "please sign in again"},
+        }
+    ]
+
+    edge = fwd._resume_terminal_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
+
+    assert edge is not None
+    assert edge.status == "failed"
+    assert edge.error is not None
+    assert edge.error.is_auth is True
+    assert edge.source == "thread/resume:turn-error"
+    # The active turn id is cleared once the terminal edge is derived.
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
+    """A failed edge with a generic error surfaces the message as output.
+
+    The reason must reach the server (as ``output``) rather than being dropped;
+    a generic error carries no re-auth flag.
+    """
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(
+        status="failed",
+        turn_id="turn_123",
+        source="turn/completed:turn-error",
+        error=fwd._CodexTerminalError(
+            message="model stream broke",
+            kind=fwd._CODEX_ERROR_KIND_GENERIC,
+        ),
+    )
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    assert body["type"] == "external_session_status"
+    data = body["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == "model stream broke"
+    # Generic errors do not demand re-auth.
+    assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_auth_error_includes_reauth_hint() -> None:
+    """A failed edge with an auth error flags re-auth and appends the hint."""
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(
+        status="failed",
+        turn_id="turn_123",
+        source="turn/completed:turn-error",
+        error=fwd._CodexTerminalError(
+            message="401 Unauthorized",
+            kind=fwd._CODEX_ERROR_KIND_AUTH,
+        ),
+    )
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    data = body["data"]
+    assert data["status"] == "failed"
+    assert data["reauth_required"] is True
+    assert "401 Unauthorized" in data["output"]
+    assert fwd._CODEX_REAUTH_HINT in data["output"]
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
+    """A normal idle edge (no error) posts status only — the success path."""
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(status="idle", turn_id="turn_123", source="turn/completed")
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    data = body["data"]
+    assert data["status"] == "idle"
+    assert "output" not in data
+    assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
+async def test_compaction_status_posts_and_dedupes_consecutive() -> None:
+    """
+    Compaction status mirrors as external_compaction_status, deduped (#1255).
+
+    Codex may signal completion via both a ``contextCompaction`` item and a
+    ``thread/compacted`` notification; consecutive identical statuses must
+    not double-post (the spinner would flicker).
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._post_compaction_status(client, "conv_x", "in_progress", forwarder_state=state)
+    await fwd._post_compaction_status(client, "conv_x", "completed", forwarder_state=state)
+    # Duplicate completion (e.g. item then notification) is suppressed.
+    await fwd._post_compaction_status(client, "conv_x", "completed", forwarder_state=state)
+
+    assert [post[1] for post in client.posts] == [
+        {"type": "external_compaction_status", "data": {"status": "in_progress"}},
+        {"type": "external_compaction_status", "data": {"status": "completed"}},
+    ]
+    assert state.compaction_status_posted == "completed"
+
+
+@pytest.mark.asyncio
+async def test_completed_context_compaction_item_clears_spinner() -> None:
+    """
+    A completed ``contextCompaction`` item posts compaction-completed.
+
+    It is a status edge, not transcript history, so it must clear the
+    spinner without being appended as a conversation item.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    state.compaction_status_posted = "in_progress"
+
+    await fwd._handle_completed_item(
+        client,
+        "conv_x",
+        {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"type": "contextCompaction", "id": "item_c"},
+        },
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {"type": "external_compaction_status", "data": {"status": "completed"}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_opens_block_then_continues() -> None:
+    """
+    Codex reasoning deltas mirror as external_output_reasoning_delta (#1254).
+
+    The first delta of a reasoning item opens the block (``started=True``
+    → ``response.reasoning.started``); subsequent deltas for the same item
+    continue it (``started=False``). Reasoning was previously dropped — only
+    the effort *level* synced, never the thinking text.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._handle_reasoning_delta(
+        client,
+        "conv_x",
+        {"turnId": "turn_1", "itemId": "item_r", "delta": "Let me "},
+        state,
+    )
+    await fwd._handle_reasoning_delta(
+        client,
+        "conv_x",
+        {"turnId": "turn_1", "itemId": "item_r", "delta": "think."},
+        state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_reasoning_delta",
+                "data": {"delta": "Let me ", "started": True},
+            },
+        ),
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_output_reasoning_delta",
+                "data": {"delta": "think.", "started": False},
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_new_item_reopens_block() -> None:
+    """
+    A reasoning delta for a new item id opens a fresh block.
+
+    Multi-step turns (reason → tool → reason) emit a second reasoning item;
+    its first delta must re-open the block so the web UI starts a new
+    "thinking" section rather than appending to the prior one.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._handle_reasoning_delta(
+        client, "conv_x", {"itemId": "item_a", "delta": "first"}, state
+    )
+    await fwd._handle_reasoning_delta(
+        client, "conv_x", {"itemId": "item_b", "delta": "second"}, state
+    )
+
+    started_flags = [post[1]["data"]["started"] for post in client.posts]
+    assert started_flags == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
+    """
+    An empty delta that does not open a block is dropped (no noise post).
+
+    The block-opening delta is always posted (even empty, to emit
+    ``response.reasoning.started``); a later empty continuation carries
+    nothing to render and must not POST.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    # Opening delta (empty) still posts to open the block.
+    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+    # Empty continuation for the same item is dropped.
+    await fwd._handle_reasoning_delta(client, "conv_x", {"itemId": "item_r", "delta": ""}, state)
+
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"] == {"delta": "", "started": True}
+
+
+# ---------------------------------------------------------------------------
+# _persist_codex_compaction_item
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_posts_event() -> None:
+    """Compaction event is posted with last_item_id and Codex summary."""
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
+    get_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["type"] == "compaction"
+    assert body["data"]["last_item_id"] == "item_codex"
+    assert "Codex" in body["data"]["summary"]
+    # Codex can't read post-compaction state, so no compacted_messages
+    assert "compacted_messages" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
+    """When no items exist, last_item_id falls back to compact_boundary_ prefix."""
+    empty_resp = MagicMock()
+    empty_resp.json.return_value = {"data": []}
+    empty_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=empty_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    client.post.assert_called_once()
+    _url, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["data"]["last_item_id"].startswith("compact_boundary_")
+    assert "compacted_messages" not in body["data"]
+
+
+def test_read_compacted_history_extracts_replacement_history_and_window_id(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns replacement_history and window_id."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    lines = [
+        _json.dumps({"type": "session_meta", "payload": {"id": "abc"}}),
+        _json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user"}}),
+        _json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "summary",
+                    "replacement_history": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        },
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "gAAAA_test_token",
+                        },
+                    ],
+                    "window_id": 2,
+                },
+            }
+        ),
+    ]
+    rollout.write_text("\n".join(lines) + "\n")
+
+    result = fwd._read_compacted_history(rollout)
+
+    assert result is not None
+    assert result["window_id"] == 2
+    assert len(result["replacement_history"]) == 2
+    assert result["replacement_history"][0]["type"] == "message"
+    assert result["replacement_history"][0]["role"] == "user"
+    assert result["replacement_history"][1]["type"] == "compaction"
+    assert result["replacement_history"][1]["encrypted_content"] == "gAAAA_test_token"
+
+
+def test_read_compacted_history_returns_none_for_no_compacted_entry(
+    tmp_path: Path,
+) -> None:
+    """_read_compacted_history returns None when no Compacted entry exists."""
+    import json as _json
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(_json.dumps({"type": "session_meta", "payload": {"id": "abc"}}) + "\n")
+
+    assert fwd._read_compacted_history(rollout) is None
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_durable_event_on_permanent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A permanently-failed durable event is dead-lettered to disk (#1120).
+
+    Drives ``_post_session_event`` (the health-tracking wrapper) with a stubbed
+    inner that returns an HTTP 500, and asserts the dropped
+    ``external_conversation_item`` payload is appended to
+    ``{bridge_dir}/dead_letter.jsonl``.
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        data = {"item_type": "message", "item_data": {"role": "assistant"}}
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data=data,
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    dl_path = tmp_path / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = _json.loads(lines[0])
+    assert record["session_id"] == "conv_codex1"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["payload"] == data
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_does_not_dead_letter_ephemeral_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ephemeral (non-durable) event is NOT dead-lettered on failure (#1120).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_output_text_delta",
+            data={"delta": "hi"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_usage_on_permanent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A permanently-failed ``external_session_usage`` event is dead-lettered (#1120).
+
+    Usage is the other durable type alongside conversation items, so its
+    transcript/usage data must also be recoverable on a sustained outage.
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        data = {"context_tokens": 1234, "model": "databricks-claude-opus-4-7"}
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex_usage",
+            event_type="external_session_usage",
+            data=data,
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    dl_path = tmp_path / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = _json.loads(lines[0])
+    assert record["session_id"] == "conv_codex_usage"
+    assert record["event_type"] == "external_session_usage"
+    assert record["payload"] == data
+
+
+class _RaisingPostClient:
+    """Async client stub whose ``post`` always raises a fixed transport error."""
+
+    def __init__(self, exc: httpx.HTTPError) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    async def post(self, url: str, json: object) -> httpx.Response:
+        self.calls += 1
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_classifies_ambiguous_skip() -> None:
+    """
+    An ambiguous conversation-item transport failure surfaces as ambiguous (#1579).
+
+    The inner used to conflate this with a proven-undelivered failure (both
+    returned ``None``); replay must be able to tell them apart.
+    """
+    client = _RaisingPostClient(
+        httpx.ReadTimeout("response lost", request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+    )
+    assert result.response is None
+    assert result.delivered_ambiguous is True
+    assert result.transport_error == "ReadTimeout"
+    # Ambiguous items are abandoned immediately — no retries.
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_classifies_proven_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A connect failure exhausted after retries is proven-undelivered, not ambiguous.
+    """
+    monkeypatch.setattr(fwd, "_sleep", AsyncMock())
+    client = _RaisingPostClient(
+        httpx.ConnectError("refused", request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+    )
+    assert result.response is None
+    assert result.delivered_ambiguous is False
+    assert result.transport_error == "ConnectError"
+    # Connect failures are safe to retry, so all attempts are spent.
+    assert client.calls == fwd._POST_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_ambiguous_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ambiguous-skip drop is dead-lettered with ``delivered_ambiguous=True`` (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _ambiguous_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=None, delivered_ambiguous=True, transport_error="ReadTimeout"
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _ambiguous_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data={"item_type": "message"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert record["delivered_ambiguous"] is True
+    assert record["http_status"] is None
+    assert record["transport_error"] == "ReadTimeout"
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_records_http_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A status-bearing failure records ``http_status`` and is not ambiguous (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(503, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data={"item_type": "message"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert record["http_status"] == 503
+    assert record["delivered_ambiguous"] is False
+    assert record["transport_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    On startup, a proven-undelivered record is re-POSTed and removed (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="proven-undelivered transport failure after retries",
+        delivered_ambiguous=False,
+        http_status=None,
+        transport_error="ConnectError",
+    )
+
+    posted: list[dict] = []
+
+    async def _ok_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+        posted.append(
+            {
+                "session_id": session_id,
+                "event_type": event_type,
+                "data": data,
+                "max_attempts": max_attempts,
+                "timeout": timeout,
+            }
+        )
+        return fwd._PostResult(
+            response=httpx.Response(200, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _ok_inner)
+    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+
+    assert len(posted) == 1
+    assert posted[0]["session_id"] == "conv_codex1"
+    assert posted[0]["event_type"] == "external_conversation_item"
+    assert posted[0]["data"] == {"item_type": "message"}
+    # Replay re-POSTs with a single attempt and a short timeout so a large file
+    # or a hung server cannot stall startup.
+    assert posted[0]["max_attempts"] == 1
+    assert posted[0]["timeout"] == fwd._REPLAY_POST_TIMEOUT_SECONDS
+    # Delivered → record removed.
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_skips_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    On startup, an ambiguous record is never re-POSTed and is retained (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="ambiguous transport failure (may already be committed)",
+        delivered_ambiguous=True,
+    )
+
+    called = False
+
+    async def _inner(client, session_id, *, event_type, data, **_kwargs):
+        nonlocal called
+        called = True
+        return fwd._PostResult(
+            response=httpx.Response(200, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _inner)
+    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+
+    assert called is False
+    # Ambiguous record retained as a forensic record.
+    assert (tmp_path / "dead_letter.jsonl").exists()
+
+
+class _RecordingPostClient:
+    """Async client stub that records each ``post`` call's kwargs."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+        self.calls: list[dict] = []
+
+    async def post(self, url: str, **kwargs: object) -> httpx.Response:
+        self.calls.append(kwargs)
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_single_attempt_and_timeout() -> None:
+    """
+    ``max_attempts=1`` makes one POST (no retry) and ``timeout`` is threaded through.
+
+    Replay relies on both so a hung server fails fast and startup is bounded (#1579).
+    """
+    client = _RecordingPostClient(
+        httpx.Response(503, request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+        max_attempts=1,
+        timeout=5.0,
+    )
+    # A single attempt even though 503 is normally retryable.
+    assert len(client.calls) == 1
+    assert client.calls[0]["timeout"] == 5.0
+    assert result.response is not None
+    assert result.response.status_code == 503
+
+
+async def test_post_session_event_records_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex's exhausted-retry POST failure is recorded for the idle watchdog.
+
+    Writer half of issue #1119 for the codex forwarder: when every attempt to
+    POST a session event raises a connect error, ``_post_session_event`` must
+    record the failure in ``_native_forwarder_health`` (via
+    ``_log_post_transport_failure``) so the harness idle-turn watchdog can name
+    the connectivity cause instead of a generic "wedged LLM" reason.
+    """
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        """Stub client whose every POST fails to connect."""
+
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            """Raise a connect error mimicking an unreachable server."""
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def _no_sleep(_seconds: float) -> None:
+        """No-op sleep so the retry loop doesn't add real delay."""
+
+    monkeypatch.setattr(fwd, "_sleep", _no_sleep)
+
+    health.clear()
+    try:
+        result = await fwd._post_session_event(
+            _AlwaysConnectError(),  # type: ignore[arg-type]
+            "conv_x",
+            event_type="external_session_status",
+            data={},
+        )
+        assert result is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "external_session_status" in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()

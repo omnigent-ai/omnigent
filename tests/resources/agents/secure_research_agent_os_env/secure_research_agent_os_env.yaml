@@ -54,7 +54,11 @@ executor:
   model: databricks-claude-sonnet-4-6
 
 tools:
-  web_search:
+  # NB: the tool is named ``search_web`` (not ``web_search``) because
+  # ``web_search`` is a reserved builtin tool name — declaring a local
+  # tool with that name fails spec validation. The sibling
+  # ``secure_research_agent.yaml`` uses ``search_web`` for the same reason.
+  search_web:
     type: function
     description: Search the web for public information.
     callable: tests.resources.examples._shared.tool_functions.web_search
@@ -67,14 +71,14 @@ tools:
 policies:
   taint_web_search:
     type: function
-    on: [tool_call:web_search]
+    on: [tool_call:search_web]
     function:
       path: omnigent.policies.function.make_fixed_action_callable
       arguments:
         action: allow
         set_labels: {integrity: "0"}
         on_phases: [tool_call]
-        on_tools: [web_search]
+        on_tools: [search_web]
     set_labels: [integrity]
 
   taint_confidential_read:

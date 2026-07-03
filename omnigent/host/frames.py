@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+HarnessAvailability = bool | str
+
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
 # configured on that machine (CLI missing or no default credential). Shared
@@ -49,6 +51,8 @@ class HostFrameKind(str, Enum):
     CREATE_WORKTREE_RESULT = "host.create_worktree_result"
     REMOVE_WORKTREE = "host.remove_worktree"
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
+    CREATE_DIR = "host.create_dir"
+    CREATE_DIR_RESULT = "host.create_dir_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -79,7 +83,7 @@ class HostHelloFrame:
     frame_protocol_version: int
     name: str
     runners: list[str] = field(default_factory=list)
-    configured_harnesses: dict[str, bool] | None = None
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
 
 
 @dataclass
@@ -426,6 +430,50 @@ class HostRemoveWorktreeResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostCreateDirFrame:
+    """Server → host: create a new directory on the host.
+
+    Backs ``POST /v1/hosts/{id}/directories``, used by the Web UI's
+    workspace picker so a user can make a fresh folder to start a
+    session in without dropping to a terminal. The host owns ``~``
+    resolution, same rules as ``host.list_dir`` / ``host.stat``.
+
+    :param request_id: Correlates the result, e.g. ``"req_mkdir_1"``.
+    :param path: Absolute or tilde-prefixed directory path to create,
+        e.g. ``"/Users/corey/projects/new-app"`` or ``"~/scratch"``.
+        Missing parent directories are created (``os.makedirs``).
+    """
+
+    request_id: str
+    path: str
+
+
+@dataclass
+class HostCreateDirResultFrame:
+    """Host → server: outcome of a create-dir request.
+
+    :param request_id: Correlates to the
+        :class:`HostCreateDirFrame`, e.g. ``"req_mkdir_1"``.
+    :param status: ``"ok"`` or ``"failed"``. ``"failed"`` is reserved
+        for unexpected I/O errors; an expected filesystem error (the
+        directory already exists, permission denied, a parent path
+        component is a file) collapses to ``"ok"`` with a descriptive
+        ``error`` so the route layer can map it to a 409 rather than a
+        500 — same posture as ``host.list_dir`` for a missing path.
+    :param path: Absolute path of the created directory, e.g.
+        ``"/Users/corey/projects/new-app"``. ``None`` when the
+        directory was not created.
+    :param error: Filesystem error, e.g. ``"directory already
+        exists"`` or ``"permission denied"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    path: str | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostLaunchRunnerFrame
@@ -441,10 +489,36 @@ HostFrame = (
     | HostCreateWorktreeResultFrame
     | HostRemoveWorktreeFrame
     | HostRemoveWorktreeResultFrame
+    | HostCreateDirFrame
+    | HostCreateDirResultFrame
 )
 
 
 # ── Encode / decode ──────────────────────────────────────
+
+
+def _encode_payload(payload: dict[str, Any]) -> str:
+    """Serialize a frame payload, injecting the active trace context.
+
+    Centralized so every host frame carries a W3C ``traceparent`` (and
+    ``tracestate`` when set) whenever it is encoded inside an active
+    span — the host tunnel is a JSON-frame transport no OTel
+    auto-instrumentor can see, so this is how the Host Daemon ↔ Server
+    boundary joins the distributed trace. When no span is active the
+    payload is unchanged. Decoders ignore the extra envelope keys, so
+    this stays wire-compatible with peers that do not read them.
+
+    :param payload: The frame fields about to be serialized.
+    :returns: The JSON wire string.
+    """
+    from omnigent.runtime import telemetry
+
+    # Record the outbound body on the active span (redacted, gated by
+    # content capture) before injecting propagation keys, so the span
+    # shows exactly what this side sent.
+    telemetry.record_message_payload(payload)
+    telemetry.inject_trace_context(payload)
+    return json.dumps(payload)
 
 
 def encode_host_frame(frame: HostFrame) -> str:
@@ -455,7 +529,7 @@ def encode_host_frame(frame: HostFrame) -> str:
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
     if isinstance(frame, HostHelloFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.HELLO.value,
                 "version": frame.version,
@@ -466,7 +540,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LAUNCH_RUNNER.value,
                 "request_id": frame.request_id,
@@ -476,7 +550,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LAUNCH_RUNNER_RESULT.value,
                 "request_id": frame.request_id,
@@ -487,7 +561,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STOP_RUNNER.value,
                 "request_id": frame.request_id,
@@ -495,7 +569,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStopRunnerResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STOP_RUNNER_RESULT.value,
                 "request_id": frame.request_id,
@@ -504,7 +578,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostRunnerExitedFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
@@ -512,7 +586,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStatFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STAT.value,
                 "request_id": frame.request_id,
@@ -520,7 +594,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostStatResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.STAT_RESULT.value,
                 "request_id": frame.request_id,
@@ -532,7 +606,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostListDirFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LIST_DIR.value,
                 "request_id": frame.request_id,
@@ -543,7 +617,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostListDirResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.LIST_DIR_RESULT.value,
                 "request_id": frame.request_id,
@@ -563,7 +637,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostCreateWorktreeFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.CREATE_WORKTREE.value,
                 "request_id": frame.request_id,
@@ -573,7 +647,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.CREATE_WORKTREE_RESULT.value,
                 "request_id": frame.request_id,
@@ -584,7 +658,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostRemoveWorktreeFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.REMOVE_WORKTREE.value,
                 "request_id": frame.request_id,
@@ -594,11 +668,29 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostRemoveWorktreeResultFrame):
-        return json.dumps(
+        return _encode_payload(
             {
                 "kind": HostFrameKind.REMOVE_WORKTREE_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostCreateDirFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CREATE_DIR.value,
+                "request_id": frame.request_id,
+                "path": frame.path,
+            }
+        )
+    if isinstance(frame, HostCreateDirResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CREATE_DIR_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "path": frame.path,
                 "error": frame.error,
             }
         )
@@ -690,6 +782,10 @@ def _decode_known_host_frame(
             return _decode_remove_worktree(msg)
         case HostFrameKind.REMOVE_WORKTREE_RESULT:
             return _decode_remove_worktree_result(msg)
+        case HostFrameKind.CREATE_DIR:
+            return _decode_create_dir(msg)
+        case HostFrameKind.CREATE_DIR_RESULT:
+            return _decode_create_dir_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -704,7 +800,7 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
-        configured_harnesses=_optional_str_bool_map(msg, "configured_harnesses"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
     )
 
 
@@ -936,6 +1032,32 @@ def _decode_remove_worktree_result(
     )
 
 
+def _decode_create_dir(msg: dict[str, Any]) -> HostCreateDirFrame:
+    """Decode a host.create_dir request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.create_dir frame.
+    """
+    return HostCreateDirFrame(
+        request_id=_required_str(msg, "request_id"),
+        path=_required_str(msg, "path"),
+    )
+
+
+def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
+    """Decode a host.create_dir_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.create_dir_result frame.
+    """
+    return HostCreateDirResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        path=_optional_nullable_str(msg, "path"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
 # ── Field validators ─────────────────────────────────────
 
 
@@ -995,23 +1117,25 @@ def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
     return list(val)
 
 
-def _optional_str_bool_map(msg: dict[str, Any], key: str) -> dict[str, bool] | None:
-    """Return an optional string→bool mapping field.
+def _optional_str_availability_map(
+    msg: dict[str, Any], key: str
+) -> dict[str, HarnessAvailability] | None:
+    """Return an optional string→availability mapping field.
 
     Tolerant by design: absent, null, or non-mapping values all decode
     to ``None`` ("unknown") rather than raising, so an older or newer
     peer's hello never breaks the tunnel handshake. Entries with a
-    non-string key or non-bool value are dropped for the same reason.
+    non-string key or non-bool/string value are dropped for the same reason.
 
     :param msg: Decoded frame object.
     :param key: Field name, e.g. ``"configured_harnesses"``.
-    :returns: The mapping, e.g. ``{"claude-sdk": True}``, or ``None``
+    :returns: The mapping, e.g. ``{"claude-sdk": True, "codex": "needs-auth"}``, or ``None``
         when absent / null / not a JSON object.
     """
     val = msg.get(key)
     if not isinstance(val, dict):
         return None
-    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, bool)}
+    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, (bool, str))}
 
 
 def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:

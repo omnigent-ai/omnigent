@@ -38,20 +38,21 @@ def _ansi_truecolor_fg(hex_rgb: str) -> str:
 
 
 def _display_width(text: str) -> int:
-    """Terminal display width of *text*, counting VS16 emoji as 2 cells.
+    """Terminal display width of *text*.
 
-    :func:`rich.cells.cell_len` under-counts an emoji forced to its wide
-    presentation by a trailing VARIATION SELECTOR-16 (U+FE0F) — e.g. the
-    cli-config ``⚙️`` glyph — as a single cell, while modern terminals
-    render it as two. Adding one cell per VS16 makes the banner box border
-    line up under such a glyph instead of drifting one column right.
+    :func:`rich.cells.cell_len` (rich >= 14, which omnigent requires) counts
+    an emoji forced to its wide presentation by a trailing VARIATION
+    SELECTOR-16 (U+FE0F) — e.g. the cli-config ``⚙️`` glyph — as the two
+    cells modern terminals render, so it already aligns the banner box.
+    (rich < 14 under-counted such glyphs as one cell and needed a ``+1 per
+    VS16`` correction; under rich 14 that correction became a double-count.)
 
     :param text: The string to measure, e.g. ``"⚙️ my-gateway"``.
     :returns: The estimated terminal column width, e.g. ``13``.
     """
     from rich.cells import cell_len
 
-    return cell_len(text) + text.count("\N{VARIATION SELECTOR-16}")
+    return cell_len(text)
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,38 @@
+/* Comment decorations for the Monaco code editor. Colors mirror the Shiki
+   CodeViewer overlays (yellow), with dark-mode variants under `.dark`. Class
+   names are applied by Monaco to its own DOM, so they must be real CSS rules
+   (not Tailwind utilities). */
+
+/* Saved comment range — dim highlight. */
+.oa-comment {
+  background-color: rgba(250, 204, 21, 0.2);
+}
+/* The active comment, or a not-yet-saved selection — stronger highlight. */
+.oa-comment-active {
+  background-color: rgba(250, 204, 21, 0.38);
+}
+/* The dim highlight reads the same in dark mode, so only the active color
+   needs a dark override (softer so it doesn't overpower the dark canvas). */
+.dark .oa-comment-active {
+  background-color: rgba(250, 204, 21, 0.3);
+}
+
+/* In dark mode, paint the editor surface with the app's --card tone instead of
+   github-dark's default, so the code editor / diff viewer blend into the card
+   they sit in. Monaco fills .monaco-editor(-background) from its own
+   --vscode-editor-background variable (set per-theme to a single concrete
+   color); rebinding that variable to var(--card) keeps the background tied to
+   the token so it tracks any change to --card with no JS. The .dark prefix
+   outranks Monaco's own single-class rule, and light mode keeps github-light.
+
+   The line-number gutter (.margin) paints from a separate variable,
+   --vscode-editorGutter-background. github-dark doesn't set editorGutter.background
+   explicitly, so Monaco resolves it from editor.background to a concrete hex at
+   theme-registration time — meaning it ignores our editor-background override
+   unless we rebind it too. */
+.dark .monaco-editor,
+.dark .monaco-diff-editor,
+.dark .monaco-component {
+  --vscode-editor-background: var(--card);
+  --vscode-editorGutter-background: var(--card);
+}

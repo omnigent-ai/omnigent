@@ -9,11 +9,14 @@ import pytest
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     clear_active_turn_id_if_matches,
+    clear_bridge_state,
     codex_home_for_bridge_dir,
     prepare_bridge_dir,
+    read_bridge_startup_error,
     read_bridge_state,
     read_codex_config_model,
     read_policy_hook_config,
+    write_bridge_startup_error,
     write_bridge_state,
     write_policy_hook_config,
 )
@@ -199,3 +202,17 @@ def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path)
     """
     # bridge_dir exists (fixture) but no state.json was written.
     assert clear_active_turn_id_if_matches(bridge_dir, "turn_1") is True
+
+
+def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> None:
+    """
+    The startup-error breadcrumb round-trips, and ``clear_bridge_state``
+    drops it before each launch so stale failures don't linger (issue #59).
+    """
+    assert read_bridge_startup_error(bridge_dir) is None
+
+    write_bridge_startup_error(bridge_dir, "thread never started (TimeoutError)")
+    assert read_bridge_startup_error(bridge_dir) == "thread never started (TimeoutError)"
+
+    clear_bridge_state(bridge_dir)
+    assert read_bridge_startup_error(bridge_dir) is None

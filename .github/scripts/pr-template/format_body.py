@@ -42,6 +42,18 @@ def format_body(body: str) -> str:
 
     body = _append_section(
         body,
+        "Test Plan",
+        "How was this change tested? Describe the steps, commands, or scenarios "
+        "used to verify it (autoformat added this section — please replace it).",
+    )
+    body = _append_section(
+        body,
+        "Demo",
+        "<!-- Video or images demonstrating the change. Mandatory for UI / "
+        "frontend changes; use 'N/A' otherwise. -->",
+    )
+    body = _append_section(
+        body,
         "ELI5",
         "<!-- Optional: explain the change in plain language. -->",
     )
@@ -54,9 +66,16 @@ def format_body(body: str) -> str:
     body = _append_section(body, "Test coverage", _checkbox_block(TEST_LABELS))
     body = _append_section(
         body,
-        "Coverage rationale",
-        "Autoformat added this section; please add commands run or explain why "
-        "coverage is sufficient.",
+        "Coverage notes",
+        "<!-- Optional; required if you checked 'Manual verification completed' "
+        "or 'Not applicable' above. -->",
+    )
+    body = _append_section(
+        body,
+        "Changelog",
+        "<!-- One or more '<Category>: description' lines (Added | Changed | "
+        "Fixed | Deprecated | Removed | Security) for user-facing changes, or "
+        "'skip'. A Breaking change must always be announced. -->\n\nskip",
     )
     return body.rstrip() + "\n"
 

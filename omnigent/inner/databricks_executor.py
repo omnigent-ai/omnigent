@@ -227,6 +227,57 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
     return None
 
 
+def _read_databrickscfg_host(profile: str | None = None) -> str | None:
+    """
+    Read only the workspace host from the Databricks config file.
+
+    Codex gateway launches use the cfg profile as a host selector and delegate
+    bearer refresh to ``databricks auth token --profile ...`` via Codex's
+    ``auth.command``. That startup path must work even when ``databricks-sdk``
+    is unavailable in the runner environment, because raw
+    ``auth_type=databricks-cli`` sections often have a host but no static
+    token.
+
+    Profile resolution order is intentionally narrower than
+    :func:`_read_databrickscfg_file_fallback`: an explicit missing profile
+    returns ``None`` instead of falling through to another profile, because
+    the generated auth command will still be pinned to the explicit profile.
+
+    :param profile: Databricks config profile name, or ``None`` to use
+        ``DATABRICKS_CONFIG_PROFILE``, ``[DEFAULT]``, then the first section
+        with a host.
+    :returns: Workspace host URL, or ``None`` when no host can be resolved.
+    """
+    import configparser
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return None
+
+    config = configparser.ConfigParser()
+    config.read(cfg_path)
+
+    resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
+    if resolved_profile:
+        if resolved_profile in config:
+            host = config[resolved_profile].get("host")
+            return host or None
+        return None
+
+    default_host = config.defaults().get("host")
+    if default_host:
+        return default_host
+
+    for section in config.sections():
+        host = config[section].get("host")
+        if host:
+            logger.info("Using Databricks host from profile [%s] in ~/.databrickscfg", section)
+            return host
+
+    return None
+
+
 class DatabricksAuthError(OSError):
     """Raised when Databricks credential resolution or token refresh fails.
 

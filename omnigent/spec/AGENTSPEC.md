@@ -133,6 +133,10 @@ tools:
     - name: web_search                     # dict — explicit Perplexity
       search_provider: perplexity
       api_key: ${PERPLEXITY_API_KEY}
+    - name: web_search                     # dict — explicit Nimble
+      search_provider: nimble
+      api_key: ${NIMBLE_API_KEY}
+      # optional: max_results (1-100, default 5); search_depth (lite | deep)
 ```
 
 Keys can be hardcoded or use `${ENV_VAR}` references (resolved at deploy time
@@ -143,9 +147,13 @@ by the client, not at runtime by the server — the spec is self-contained).
 - **OpenAI models:** `web_search` works automatically with no config —
   it uses OpenAI's native `web_search_preview` (server-side). Just add
   `- web_search` to builtins.
-- **Other models:** `search_provider` must be set to `"google"` or
-  `"perplexity"` with credentials. All config comes from the spec (no
-  environment variable fallbacks).
+- **Other models:** `search_provider` must be set to `"google"`,
+  `"perplexity"`, or `"nimble"` with credentials. All config comes from the
+  spec (no environment variable fallbacks).
+- **Nimble** (`search_provider: nimble`): returns a ranked list of titles,
+  URLs, and snippets from Nimble's AI search API. Requires `api_key`; optional
+  `max_results` (1-100, default 5) and `search_depth` (`lite` default, or
+  `deep`). Works with any non-OpenAI model.
 
 **`web_fetch` — zero-config web research:** Spawns an internal sub-agent with
 `terminal_run` to search the web and fetch pages using plain HTTP. No API keys

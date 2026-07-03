@@ -33,6 +33,7 @@ from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, 
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
+HarnessAvailability = bool | str
 
 
 @dataclass
@@ -73,7 +74,7 @@ class Host:
     updated_at: int
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
-    configured_harnesses: dict[str, bool] | None = None
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -100,14 +101,14 @@ def host_is_live(host: Host, now: int | None = None) -> bool:
 _logger = logging.getLogger(__name__)
 
 
-def _parse_configured_harnesses(raw: str | None) -> dict[str, bool] | None:
+def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailability] | None:
     """
     Parse the JSON-encoded ``hosts.configured_harnesses`` column.
 
     Tolerant: ``NULL``, malformed JSON, or a non-object payload all
     map to ``None`` ("unknown") — a corrupt column value must degrade
     to no-warning in the UI, never break host listing. Entries with a
-    non-bool value are dropped for the same reason.
+    non-bool/string value are dropped for the same reason.
 
     :param raw: The raw column value, e.g.
         ``'{"claude-sdk": true, "codex": false}'`` or ``None``.
@@ -122,7 +123,7 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, bool] | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    return {k: v for k, v in parsed.items() if isinstance(v, bool)}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, (bool, str))}
 
 
 def _row_to_host(row: SqlHost) -> Host:
@@ -186,7 +187,7 @@ class HostStore:
         owner: str,
         *,
         allow_host_id_reown: bool = False,
-        configured_harnesses: dict[str, bool] | None = None,
+        configured_harnesses: dict[str, HarnessAvailability] | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.

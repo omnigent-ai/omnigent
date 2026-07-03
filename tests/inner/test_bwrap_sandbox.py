@@ -717,6 +717,113 @@ def test_wrap_launcher_argv_binds_intermediate_symlink_at_literal_path(
     )
 
 
+def test_wrap_launcher_argv_target_binds_non_default_path(
+    tmp_path: Path,
+) -> None:
+    """
+    When ``target`` names a binary outside the default mounts
+    (e.g. an npm-managed CLI under ``node_modules/.bin/``),
+    ``wrap_launcher_argv`` must emit ``--ro-bind-try`` args that
+    bind the target's directory chain into the sandbox.
+
+    This is the bwrap-PATH bug that caused the 5 claude-sdk sandbox
+    e2e failures: the launcher re-execs into the bwrap namespace and
+    then runs ``subprocess.run([target_path, ...])``.  Without binding
+    the target's directory, that exec fails with FileNotFoundError
+    because the directory (e.g. ``node_modules/.bin/``) is never
+    visible inside the namespace.
+
+    **What breaks if wrong:** every harness-CLI sandbox test that
+    installs its CLI outside ``/usr``, ``/bin``, or ``/sbin`` would
+    fail with ``FileNotFoundError`` when the launcher re-execs under
+    bwrap.
+    """
+    # Simulate node_modules/.bin/claude outside the default mounts.
+    cli_install = tmp_path / "node_modules" / ".bin"
+    cli_install.mkdir(parents=True)
+    fake_claude = cli_install / "claude"
+    fake_claude.write_text("#!/bin/sh\necho ok\n")
+    fake_claude.chmod(0o755)
+    cli_path = str(fake_claude)
+
+    # Use a separate cwd so the target is not covered by the cwd bind.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(workspace)
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"],
+        policy,
+        workspace,
+        target=cli_path,
+    )
+
+    # The target's parent directory must be bind-mounted (as --ro-bind-try
+    # <real-src> <literal-dst>).  The src and dst are the same for a real
+    # (non-symlink) file.
+    parent_dir = str(cli_install.resolve(strict=False))
+    bind_pairs = [
+        (argv[i + 1], argv[i + 2]) for i in range(len(argv) - 2) if argv[i] == "--ro-bind-try"
+    ]
+    assert any(dst == parent_dir for _, dst in bind_pairs), (
+        f"Expected a --ro-bind-try entry with destination {parent_dir!r} "
+        f"so the target binary at {cli_path!r} is reachable inside the "
+        f"bwrap namespace.  Got bind pairs: {bind_pairs}"
+    )
+
+
+def test_wrap_launcher_argv_target_none_no_extra_binds(
+    tmp_path: Path,
+) -> None:
+    """
+    When ``target=None`` (the default), the argv must be identical to
+    the ``target``-free call — no spurious extra ``--ro-bind-try``
+    args are emitted.
+
+    Regression guard: the target-visibility feature must be strictly
+    opt-in so callers that never pass a target (e.g. the
+    parent-side ``_HelperProcessClient`` spawn path) keep their argv
+    unchanged.
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    without_target = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    with_none = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], policy, tmp_path, target=None
+    )
+    assert without_target == with_none, (
+        "Passing target=None must produce identical argv to omitting the parameter."
+    )
+
+
+def test_wrap_launcher_argv_target_already_in_default_mounts(
+    tmp_path: Path,
+) -> None:
+    """
+    When the target binary lives under a default RO mount (``/usr``,
+    ``/bin``, ``/sbin``, etc.) no extra bind args are emitted for it
+    — ``_ensure_executable_visible`` already skips paths covered by
+    :data:`_DEFAULT_RO_DIRS`.
+
+    Ensures the target-visibility feature doesn't add redundant mounts
+    for system binaries that are already visible in the sandbox.
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    # /usr/bin/env is a regular binary directly under /usr, which is in
+    # _DEFAULT_RO_DIRS — no extra binds should land for it.
+    env_path = "/usr/bin/env"
+    argv_no_target = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    argv_with_target = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], policy, tmp_path, target=env_path
+    )
+    assert argv_no_target == argv_with_target, (
+        "Passing a target already covered by the default mounts must not "
+        "add any extra --ro-bind-try entries to the argv."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dotfile masking + symlink defense
 # ---------------------------------------------------------------------------
@@ -767,6 +874,47 @@ def test_dotfile_masking_hides_disallowed_dotfiles(tmp_path: Path) -> None:
     # Non-dotfile is untouched.
     assert not _argv_mentions(argv, regular_path, after_token="--tmpfs")
     assert not _argv_mentions(argv, regular_path, after_token="--bind-try")
+
+
+def test_dotfile_masking_skips_target_that_vanished_after_scan(
+    tmp_path: Path,
+) -> None:
+    """
+    A dotfile the scan saw but that vanished before the argv is built
+    produces NO mask triple — otherwise bwrap would try to create the
+    mountpoint inside the ro-bound cwd and abort (the flaky CI failure,
+    where coverage.py's transient ``.coverage.*`` files raced the scan).
+    A persistent dotfile alongside it is still masked.
+    """
+    from omnigent.inner import bwrap_sandbox
+    from omnigent.inner._cwd_scan import MaskedEntry
+
+    cwd = tmp_path.resolve(strict=False)
+    (tmp_path / ".env").write_text("SECRET=42")
+    present_path = cwd / ".env"
+    # Never created on disk: simulates a file renamed away after the scan.
+    vanished_path = cwd / ".coverage.inner-rest.host.pid2942.XbRGYxCx"
+
+    real_scan = bwrap_sandbox.scan_cwd_mask_entries
+
+    def _scan_with_phantom(*args: object, **kwargs: object) -> list[MaskedEntry]:
+        entries = list(real_scan(*args, **kwargs))  # type: ignore[arg-type]
+        entries.append(MaskedEntry(path=vanished_path, kind="file"))
+        return entries
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    with patch.object(bwrap_sandbox, "scan_cwd_mask_entries", _scan_with_phantom):
+        argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _has_pair(argv, "--bind-try", "/dev/null", str(present_path)), (
+        ".env (present) should still be masked with --bind-try /dev/null."
+    )
+    assert _index_of_triple(argv, "--bind-try", "/dev/null", str(vanished_path)) is None, (
+        "A vanished dotfile must NOT be masked — bwrap would have to "
+        "create the mountpoint inside the read-only cwd bind and abort. "
+        f"argv slice: {[t for t in argv if 'coverage' in t]}"
+    )
 
 
 # NOTE: walker-decision tests (escape symlink defense, recursion,

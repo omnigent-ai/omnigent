@@ -16,7 +16,11 @@ import httpx
 import pytest
 
 from omnigent.host import daemon_launch
-from omnigent.host.daemon_launch import wait_for_host_online, wait_for_runner_online
+from omnigent.host.daemon_launch import (
+    runner_is_online,
+    wait_for_host_online,
+    wait_for_runner_online,
+)
 
 
 class _FlakyThenOnline:
@@ -60,6 +64,66 @@ class _AlwaysRefuses:
         :raises httpx.ConnectError: Always.
         """
         raise httpx.ConnectError("connection refused", request=request)
+
+
+class _HtmlThenOnline:
+    """MockTransport handler that answers the SPA HTML fallback N times, then JSON-online.
+
+    Reproduces a ``--server`` deployment whose host router is not mounted:
+    ``GET /v1/hosts/{id}`` / ``GET /v1/runners/{id}/status`` fall through
+    to the SPA HTML5-history fallback and answer ``200 text/html`` with
+    ``index.html`` until (in this mock) the real status endpoint finally
+    reports online. Before the non-JSON tolerance fix the first HTML body
+    raised ``json.JSONDecodeError`` out of the wait, crashing the REPL
+    before it became ready.
+
+    :param html_polls: Number of initial 200-text/html responses to serve
+        before answering with the JSON ``body``.
+    :param body: JSON body returned once "online".
+    """
+
+    def __init__(self, html_polls: int, body: dict[str, object]) -> None:
+        self.html_polls = html_polls
+        self.body = body
+        self.requests_seen = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Handle one mock-transport request.
+
+        :param request: The outgoing request the client built.
+        :returns: A ``200 text/html`` SPA-fallback response until the
+            HTML budget is exhausted, then a ``200`` JSON ``body``.
+        """
+        self.requests_seen += 1
+        if self.requests_seen <= self.html_polls:
+            return httpx.Response(
+                200,
+                text="<!doctype html><title>omnigent</title>",
+                headers={"content-type": "text/html"},
+            )
+        return httpx.Response(200, json=self.body)
+
+
+class _AlwaysHtml:
+    """MockTransport handler that always answers the SPA HTML fallback (200 text/html)."""
+
+    def __init__(self) -> None:
+        self.requests_seen = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Answer with the SPA HTML5-history fallback body.
+
+        :param request: The outgoing request the client built.
+        :returns: A ``200 text/html`` response carrying ``index.html``.
+        """
+        self.requests_seen += 1
+        return httpx.Response(
+            200,
+            text="<!doctype html><title>omnigent</title>",
+            headers={"content-type": "text/html"},
+        )
 
 
 @pytest.fixture
@@ -210,3 +274,73 @@ async def test_wait_for_host_online_deadline_reports_last_connect_error(
     assert "host_abc123" in message
     assert "Last connection error" in message
     assert "connection refused" in message
+
+
+async def test_wait_for_runner_online_tolerates_html_fallback_then_online(
+    fast_poll: None,
+) -> None:
+    """A 200-text/html status body must not crash the runner wait.
+
+    Reproduces the ``--server`` deployment where the status path falls
+    through to the SPA HTML5-history fallback for the first polls, then
+    the runner registers and the endpoint answers JSON ``online: true``.
+    Before the non-JSON tolerance fix the first HTML body raised
+    ``json.JSONDecodeError`` out of the wait; this test failing with a
+    raised ``ValueError`` means that regressed.
+    """
+    handler = _HtmlThenOnline(html_polls=2, body={"online": True})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        await wait_for_runner_online(client, "runner_abc123", timeout_s=5.0)
+    # 3 = 2 HTML-fallback polls + the one that observed JSON "online".
+    assert handler.requests_seen == 3
+
+
+async def test_wait_for_runner_online_html_fallback_fails_with_timeout_not_jsonerror(
+    fast_poll: None,
+) -> None:
+    """A status path stuck on the HTML fallback fails with the friendly timeout.
+
+    When the host router is never mounted the status path answers
+    ``200 text/html`` forever. The wait must keep polling and end in
+    ``click.ClickException`` (the actionable timeout) rather than
+    propagating ``json.JSONDecodeError`` on the first poll.
+    """
+    handler = _AlwaysHtml()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        with pytest.raises(click.ClickException) as excinfo:
+            await wait_for_runner_online(client, "runner_abc123", timeout_s=0.05)
+    assert "runner_abc123" in str(excinfo.value)
+    # >1 proves the HTML body was tolerated as "no status yet" and polling
+    # continued; a raised JSONDecodeError would never reach the asserts.
+    assert handler.requests_seen > 1
+
+
+async def test_runner_is_online_false_on_html_fallback_body() -> None:
+    """``runner_is_online`` reports False (not a crash) on a 200 HTML body.
+
+    The single-shot reuse check must treat a non-JSON 200 as "not online"
+    so ``launch_or_reuse_daemon_runner`` falls back to launching a fresh
+    runner instead of dying on ``resp.json()``.
+    """
+    handler = _AlwaysHtml()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        assert await runner_is_online(client, "runner_abc123") is False
+
+
+async def test_wait_for_host_online_tolerates_html_fallback_then_online(
+    fast_poll: None,
+) -> None:
+    """Same non-JSON tolerance for the host status endpoint's online wait."""
+    handler = _HtmlThenOnline(html_polls=2, body={"status": "online"})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        await wait_for_host_online(client, "host_abc123", timeout_s=5.0)
+    # 3 = 2 HTML-fallback polls + the one that observed JSON "online".
+    assert handler.requests_seen == 3

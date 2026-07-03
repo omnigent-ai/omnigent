@@ -9,6 +9,7 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -20,8 +21,12 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
+from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
+    HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
     HostHelloFrame,
@@ -46,6 +51,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -63,6 +69,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -267,19 +274,71 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # …" for a key the CLI just saved to the file. Not a secret (a boolean
         # flag); safe to propagate.
         "OMNIGENT_DISABLE_KEYRING",
+        # claude-sdk sandbox bypass flag. A diagnostic knob (not a
+        # secret — a plain boolean) read inside the harness to decide
+        # whether to wrap the brain CLI in sandbox-exec. Without it in
+        # the allowlist the daemon→runner env strip drops it, so a bare
+        # ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX=1 omnigent run …`` had no
+        # effect (the operator also had to set
+        # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
+        # Safe to propagate: not a secret.
+        "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
+        # Native-Claude launcher plugin selector: the entry-point NAME of a
+        # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
+        # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
+        # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
+        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # The daemon→runner env strip would otherwise drop it, leaving the
+        # runner on the default launch. Safe to propagate: not a secret, just a
+        # plugin name.
+        "OMNIGENT_CLAUDE_LAUNCHER",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
+        # Claude Code's Bedrock-mode switch: a non-secret boolean flag that
+        # turns on AWS Bedrock / Bedrock-compatible gateway mode. The matching
+        # credential (AWS_BEARER_TOKEN_BEDROCK) and endpoint
+        # (ANTHROPIC_BEDROCK_BASE_URL) are NOT here: they are credentials and
+        # live in HARNESS_CREDENTIAL_ENV_VARS, mirroring ANTHROPIC_API_KEY /
+        # ANTHROPIC_BASE_URL. Safe to propagate: not a secret.
+        "CLAUDE_CODE_USE_BEDROCK",
+        # Claude Code's Bedrock-auth-skip switch: a non-secret boolean flag
+        # that disables AWS SigV4 auth so Claude Code can talk to a LiteLLM
+        # proxy fronting Bedrock. Without it the runner attempts native AWS
+        # auth, which fails for non-AWS proxies. Same rationale as
+        # CLAUDE_CODE_USE_BEDROCK above. Safe to propagate: not a secret.
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        # Kubernetes config path. A filesystem path (typically
+        # ``~/.kube/config``), not a bearer secret — the file *contains*
+        # cluster certs/tokens but the env var is just a path string,
+        # analogous to ``HOME``. Without it, ``kubectl`` / helm / k9s
+        # inside the agent's shell fall back to the default path which may
+        # not match what the host owner configured (e.g. a non-standard
+        # kubeconfig location or a colon-separated multi-file list).
+        "KUBECONFIG",
+        # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
+        # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
+        # telemetry.init() no-ops there and omni-runner / omni-harness export
+        # nothing — inheriting OTEL_* alone is no longer enough now that
+        # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
+        # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
+        "OMNIGENT_TELEMETRY_ENABLED",
     }
+    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
+    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
+    | set(WINDOWS_ENV_PASSTHROUGH)
 )
-# Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_",)
+# Allowed by prefix: locale family (``LC_*``), MLflow, and OpenTelemetry config —
+# both the standard ``OTEL_*`` vars and Omnigent's ``OMNIGENT_OTEL_*`` knobs
+# (capture-content, FastAPI toggle) so they reach the runner/harness too.
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "OMNIGENT_OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
 # ANTHROPIC_* for claude-sdk / pi (claude-code also honors
-# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways, and
-# CLAUDE_CODE_OAUTH_TOKEN for `claude setup-token` subscription auth),
+# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways,
+# AWS_BEARER_TOKEN_BEDROCK + ANTHROPIC_BEDROCK_BASE_URL for Bedrock mode,
+# and CLAUDE_CODE_OAUTH_TOKEN for `claude setup-token` subscription auth),
 # OPENAI_* for codex / openai-agents (CODEX_ACCESS_TOKEN is the codex
 # CLI's headless ChatGPT-workspace credential, minted in the ChatGPT
 # admin console — Business/Enterprise plans), GEMINI_API_KEY for the
@@ -292,11 +351,13 @@ _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_",)
 # on a server-managed sandbox: the deployment's injected provider
 # secrets) — forwarding them is the intent, not a leak. Vars absent
 # from the host env are simply not set.
-HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
+_BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
     {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
@@ -305,6 +366,11 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GIT_TOKEN",
         "GIT_USERNAME",
     }
+)
+HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
+    name
+    for canonical in _BASE_HARNESS_CREDENTIAL_ENV_VARS
+    for name in env_names_with_omnigent_prefix(canonical)
 )
 
 # Comma-separated EXTRA env var names to forward host→runner, beyond
@@ -665,6 +731,17 @@ class HostProcess:
                 "(the /v1/hosts tunnel route). Confirm you have access and that "
                 "the server is up to date, then retry. " + self._login_fix_hint()
             )
+        if status == 409:
+            return HostConnectError(
+                "Connection refused (HTTP 409): this machine is already "
+                "registered to a different account on this server, so the "
+                "account you authenticated as cannot claim it. This usually "
+                "means the host was first registered under another identity "
+                "(e.g. the single-user 'local' owner before the server "
+                "switched to accounts auth). Ask an administrator to remove "
+                "the existing host registration, or reset this machine's host "
+                "id, then retry. " + self._login_fix_hint()
+            )
         return HostConnectError(
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
@@ -699,8 +776,7 @@ class HostProcess:
                 status="failed",
                 error=(
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — run `omnigent setup` on that "
-                    "machine to install the CLI and set a default credential"
+                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
@@ -1050,6 +1126,78 @@ class HostProcess:
             before=frame.before,
         )
 
+    def _handle_create_dir(self, frame: HostCreateDirFrame) -> HostCreateDirResultFrame:
+        """Handle a ``host.create_dir`` request from the server.
+
+        Creates the directory (and any missing parents) with
+        ``os.makedirs``. ``~`` expands against the host process
+        owner's home, same rules as ``host.list_dir``. Expected
+        filesystem errors (the directory already exists, permission
+        denied, a parent component is a file) return ``status: "ok"``
+        with a descriptive ``error`` so the route layer can map them
+        to a 409 rather than a 500 — mirroring how ``_handle_list_dir``
+        reports a missing path. Only unexpected I/O errors surface as
+        ``status: "failed"``.
+
+        :param frame: The create-dir request frame. ``frame.path`` may
+            be absolute or tilde-prefixed.
+        :returns: Result frame carrying the created absolute path on
+            success, or an ``error`` describing why it was not created.
+        """
+        try:
+            expanded = os.path.expanduser(frame.path)
+        except (TypeError, ValueError) as exc:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"path expansion failed: {exc}",
+            )
+        try:
+            # exist_ok=False so creating an existing folder is a clear
+            # "already exists" rather than a silent no-op — the picker
+            # should tell the user the name is taken.
+            os.makedirs(expanded, exist_ok=False)
+        except FileExistsError:
+            # makedirs raises FileExistsError whether the leaf is an
+            # existing directory or a regular file. Distinguish the two
+            # so "name is taken by a file" isn't mislabelled as an
+            # existing directory.
+            error = (
+                "directory already exists"
+                if os.path.isdir(expanded)
+                else "a file already exists at that path"
+            )
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                error=error,
+            )
+        except NotADirectoryError:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                error="a parent path component is not a directory",
+            )
+        except PermissionError:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                error="permission denied",
+            )
+        except OSError as exc:
+            return HostCreateDirResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"mkdir failed: {exc.strerror or str(exc)}",
+            )
+        created = os.path.abspath(expanded)
+        _logger.info("Created directory %s", created)
+        return HostCreateDirResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            path=created,
+        )
+
     async def _handle_create_worktree(
         self,
         frame: HostCreateWorktreeFrame,
@@ -1283,8 +1431,20 @@ class HostProcess:
             managed-host token header or — only when a token could be
             minted — ``{"Authorization": "Bearer <token>"}``.
         """
-        headers: dict[str, str] = {}
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+        from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+        # Identify as a first-party client so the server's WebSocket origin
+        # guard (CSWSH protection) allows the handshake — the host process
+        # is not a browser. Seeded before either auth branch so it is sent
+        # on both the managed-token and Bearer paths.
+        headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        # Workspace routing: the tunnel handshake must name the workspace or
+        # it routes to the account. Empty for single-workspace and managed
+        # hosts (no recorded selector), so neither is affected.
+        from omnigent.cli_auth import databricks_request_headers
+
+        headers.update(databricks_request_headers(self._server_url))
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
@@ -1320,7 +1480,7 @@ class HostProcess:
             to the reconnect loop in :meth:`run`.
         """
         hello = HostHelloFrame(
-            version="0.1.0",
+            version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
@@ -1383,7 +1543,22 @@ class HostProcess:
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
             return
-        await self._dispatch_host_frame(ws, frame)
+        # Handle the frame inside a CONSUMER span parented on the trace
+        # context the server stamped into the frame envelope, so the
+        # host's work (and the result frame it sends back) nests under
+        # the server request that triggered it.
+        from omnigent.runtime import telemetry
+
+        try:
+            carrier = json.loads(raw)
+        except ValueError:
+            carrier = {}
+        if not isinstance(carrier, dict):
+            carrier = {}
+        raw_kind = carrier.get("kind")
+        kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
+        with telemetry.consume_frame_span(kind, carrier):
+            await self._dispatch_host_frame(ws, frame)
 
     async def _dispatch_host_frame(
         self,
@@ -1406,6 +1581,8 @@ class HostProcess:
             await ws.send(encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
             await ws.send(encode_host_frame(self._handle_list_dir(frame)))
+        elif isinstance(frame, HostCreateDirFrame):
+            await ws.send(encode_host_frame(self._handle_create_dir(frame)))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
@@ -1429,6 +1606,14 @@ def run_host_process(
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
+    # Initialize tracing so the host daemon exports its own spans
+    # (e.g. handling launch_runner / stat / list_dir frames) into the
+    # same distributed trace as the server that requested them. The
+    # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
+    from omnigent.runtime import telemetry
+
+    telemetry.init("omni-host")
+
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH

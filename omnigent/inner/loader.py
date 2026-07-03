@@ -252,6 +252,7 @@ def _parse_agent_def(
     agent.runtime = data.get("runtime", False)
     agent.timers = data.get("timers", False)
     agent.spawn = data.get("spawn", False)
+    agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
 
     # Executor
@@ -623,10 +624,23 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
         # missing keys map to ``None`` directly. ``data.get`` happens to
         # already return ``None`` for missing keys, so the assignment
         # flows through unchanged.
+        #
+        # Parse ``executor.auth`` into a typed auth dataclass so that
+        # inline AgentTool sub-agents can declare auth (e.g. api_key +
+        # base_url for mock LLM routing) and have it flow through to the
+        # child spec's executor. Without this, auth blocks on inline
+        # sub-agent executors are silently dropped.
+        auth = None
+        raw_auth = data.get("auth")
+        if isinstance(raw_auth, dict):
+            from omnigent.spec.parser import _parse_executor_auth
+
+            auth = _parse_executor_auth(data, expand_env=True)
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
+            auth=auth,
         )
     return None
 
@@ -762,6 +776,37 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
             "os_env.sandbox.egress_allow_private_destinations must be a "
             f"boolean, got {type(allow_private).__name__}"
         )
+    # Secretless credential proxy. Reuse the single canonical parser
+    # (``omnigent.spec.parser._parse_credential_proxy``) rather than a
+    # second copy so the single-file omnigent-YAML path and the
+    # bundle/config.yaml path can never drift — a duplicated parser here
+    # is exactly what silently dropped ``credential_proxy`` on this path
+    # before. Lazy-imported to avoid an import-time cycle with the spec
+    # layer (which imports inner.datamodel). The two cross-field guards
+    # below mirror the spec parser so an inert credential_proxy (no
+    # hardened backend / no egress rules) is rejected on both paths.
+    from omnigent.spec.parser import (
+        _credential_proxy_macos_unsupported_reason,
+        _parse_credential_proxy,
+    )
+
+    credential_proxy = _parse_credential_proxy(data.get("credential_proxy"))
+    if credential_proxy is not None and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise ValueError(
+            "os_env.sandbox.credential_proxy requires sandbox.type=linux_bwrap "
+            "(Linux) or sandbox.type=darwin_seatbelt (macOS) so credentials are "
+            "bound to a hardened helper boundary. "
+            f"Got sandbox.type={sandbox_type!r}."
+        )
+    if credential_proxy is not None and not egress_rules:
+        raise ValueError(
+            "os_env.sandbox.credential_proxy requires os_env.sandbox.egress_rules: "
+            "the MITM egress proxy is what swaps the synthetic placeholder for the "
+            "real credential and rejects placeholder leaks, so it must be active."
+        )
+    macos_reason = _credential_proxy_macos_unsupported_reason(credential_proxy, sandbox_type)
+    if macos_reason is not None:
+        raise ValueError(macos_reason)
     # Defer the absent-field defaults to the dataclass so there is a single
     # source of truth: re-stating literals here (e.g. ``"warn"``, ``50000``)
     # silently drifts the moment the OSEnvSandboxSpec defaults change. An
@@ -797,6 +842,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         env_passthrough=data.get("env_passthrough"),
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
+        credential_proxy=credential_proxy,
     )
 
 

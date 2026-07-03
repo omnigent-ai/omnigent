@@ -1,9 +1,0 @@
-{
-    "agent_info_status": {"kind": "exact", "value": 200},
-    "agent_info_name": {"kind": "exact", "value": "hello_world"},
-    "agent_info_has_mascot": {"kind": "exact", "value": true},
-    "chat_status": {"kind": "exact", "value": 200},
-    "chat_has_response": {"kind": "exact", "value": true},
-    "chat_has_session_id": {"kind": "exact", "value": true},
-    "chat_response_text": {"kind": "min_length", "value": 4}
-}

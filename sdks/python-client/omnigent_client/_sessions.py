@@ -32,7 +32,13 @@ from pydantic import TypeAdapter
 
 from omnigent.server.schemas import ServerStreamEvent
 
+from ._child_status import child_summary_busy
 from ._errors import raise_for_status, require_json_object, response_body
+
+# Default recursion cap for the sub-agent tree helpers. Mirrors web's
+# ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
+# rollup, the CLI ``↓`` tree, and the web Agents rail all walk the same depth.
+_DEFAULT_SUBTREE_DEPTH = 3
 
 # Adapter that validates a single SSE ``data:`` payload against the
 # typed discriminated union. Built once at module load — TypeAdapter
@@ -147,7 +153,7 @@ class Session:
     :param model_override: Per-session LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` when no override is active
         and the agent's ``llm_model`` applies. Set via the REPL's
-        ``/model`` command or the ap-web model picker; both write
+        ``/model`` command or the web model picker; both write
         the same column so the surfaces stay in sync.
     :param context_window: Context window size in tokens looked up
         server-side from litellm, e.g. ``200_000``. ``None`` when
@@ -675,6 +681,115 @@ class SessionsNamespace:
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
         return body.get("data", [])
 
+    async def child_sessions(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        List sub-agent (child) sessions under a parent session.
+
+        Calls ``GET /v1/sessions/{session_id}/child_sessions`` and
+        returns a page of ``ChildSessionSummary`` dicts (``id``,
+        ``title``, ``tool``, ``agent_name``, ``busy``,
+        ``current_task_status``, ``last_message_preview``,
+        ``pending_elicitations_count``, …). The REPL recurses this per
+        node to assemble the sub-agent tree shown on the main interface.
+
+        :param session_id: Parent session/conversation identifier,
+            e.g. ``"conv_parent123"``.
+        :param limit: Maximum number of children to return
+            (1-1000, default 100).
+        :returns: List of child-session summary dicts (empty when the
+            session has no sub-agents).
+        :raises OmnigentError: On non-2xx status (404 when the
+            session does not exist).
+        """
+        resp = await self._http.get(
+            f"{self._base}/v1/sessions/{session_id}/child_sessions",
+            params={"limit": limit},
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
+        return body.get("data", [])
+
+    async def child_sessions_tree(
+        self,
+        session_id: str,
+        *,
+        max_depth: int = _DEFAULT_SUBTREE_DEPTH,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List the whole sub-agent subtree under *session_id*, flattened.
+
+        :meth:`child_sessions` is one level deep; this recurses it breadth-first
+        to *max_depth*, mirroring web's ``useChildSessions`` per-node fetch.
+        Each returned row is the raw ``ChildSessionSummary`` dict with an added
+        ``parent_id`` recording the session it was queried under, so callers can
+        reconstruct the hierarchy. *session_id* itself is not included.
+
+        This is the shared recursion behind both the CLI ``↓`` sub-agent tree
+        (the REPL seeds its registry from this) and :meth:`subtree_busy`.
+
+        :param session_id: Root parent session identifier.
+        :param max_depth: Levels to descend (1 = direct children only). Capped
+            to match the CLI tree and the web Agents rail.
+        :param limit: Per-level page size passed to :meth:`child_sessions`.
+        :returns: Flattened list of child-session summary dicts, each carrying a
+            ``parent_id`` key (empty when the session has no sub-agents).
+        :raises OmnigentError: On non-2xx status (404 when the session does not
+            exist).
+        """
+        nodes: list[dict[str, Any]] = []
+        seen: set[str] = {session_id}
+        frontier: list[str] = [session_id]
+        depth = 0
+        while frontier and depth < max_depth:
+            next_frontier: list[str] = []
+            for parent_id in frontier:
+                rows = await self.child_sessions(parent_id, limit=limit)
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    sid = row.get("id")
+                    if not isinstance(sid, str) or sid in seen:  # cycle / dupe guard
+                        continue
+                    seen.add(sid)
+                    nodes.append({**row, "parent_id": parent_id})
+                    next_frontier.append(sid)
+            frontier = next_frontier
+            depth += 1
+        return nodes
+
+    async def subtree_busy(
+        self,
+        session_id: str,
+        *,
+        max_depth: int = _DEFAULT_SUBTREE_DEPTH,
+        limit: int = 100,
+    ) -> bool:
+        """Whether any sub-agent anywhere under *session_id* is still working.
+
+        The queryable rollup an SDK driver needs: a parent's own ``status`` is
+        per-session and reads ``idle`` once it delegates and returns to its own
+        prompt, even while its sub-agents run. This recurses the subtree
+        (:meth:`child_sessions_tree`) and applies the canonical
+        :func:`omnigent_client.child_summary_busy` predicate — the same "busy"
+        definition the CLI badge and the web ``SubagentsPanel`` use — so an
+        eval loop can gate "your turn" on real subtree activity.
+
+        Point-in-time (no subscription); re-call for a fresh value.
+
+        :param session_id: Root parent session identifier.
+        :param max_depth: Levels to descend (see :meth:`child_sessions_tree`).
+        :param limit: Per-level page size.
+        :returns: ``True`` while any descendant is busy, else ``False``.
+        :raises OmnigentError: On non-2xx status.
+        """
+        nodes = await self.child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
+        return any(child_summary_busy(node) for node in nodes)
+
     async def get(self, session_id: str) -> Session:
         """
         Fetch the current snapshot of a session.
@@ -775,6 +890,7 @@ class SessionsNamespace:
         *,
         title: str | None = None,
         up_to_response_id: str | None = None,
+        model_override: str | None = None,
     ) -> dict[str, Any]:
         """
         Fork an existing session into a new session.
@@ -791,19 +907,27 @@ class SessionsNamespace:
             ``"resp_abc123"``. When set, the fork copies history only
             up to and including that response; ``None`` copies the
             full history.
+        :param model_override: Optional model id to launch the fork on
+            ("restart with model"), e.g. ``"databricks-gpt-5-4-mini"``.
+            Overrides the model the fork inherits from the source; the
+            server validates and family-checks it. ``None`` keeps the
+            source's model.
         :returns: Raw response dict matching the ``SessionResponse``
             shape: ``id``, ``agent_id``, ``status``, ``created_at``,
             ``title``, ``labels``, ``reasoning_effort``, and
             ``items``.
         :raises OmnigentError: 404 if *source_session_id* does
-            not exist; 400 if the source has no agent binding or
-            *up_to_response_id* names no response in the source.
+            not exist; 400 if the source has no agent binding,
+            *up_to_response_id* names no response in the source, or
+            *model_override* is invalid / cross-family for the fork.
         """
         body: dict[str, Any] = {}
         if title is not None:
             body["title"] = title
         if up_to_response_id is not None:
             body["up_to_response_id"] = up_to_response_id
+        if model_override is not None:
+            body["model_override"] = model_override
         resp = await self._http.post(
             f"{self._base}/v1/sessions/{source_session_id}/fork",
             json=body,

@@ -19,6 +19,8 @@ from __future__ import annotations
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
+    KIRO_NATIVE_WRAPPER_VALUE,
+    PI_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
 
@@ -107,10 +109,9 @@ def test_codex_native_wrapper_constants_match_picker_module() -> None:
 
     The picker uses it to render the ``[codex]`` Runtime badge.
     """
-    from omnigent.repl import _resume_picker
+    from omnigent.native_coding_agents import CODEX_NATIVE_CODING_AGENT
 
-    assert _resume_picker._CLAUDE_NATIVE_WRAPPER_LABEL_KEY == WRAPPER_LABEL_KEY
-    assert _resume_picker._CODEX_NATIVE_WRAPPER_LABEL_VALUE == CODEX_NATIVE_WRAPPER_VALUE
+    assert CODEX_NATIVE_CODING_AGENT.wrapper_label == CODEX_NATIVE_WRAPPER_VALUE
 
 
 def test_codex_native_wrapper_constants_match_server_routes() -> None:
@@ -122,3 +123,31 @@ def test_codex_native_wrapper_constants_match_server_routes() -> None:
 
     assert sessions_routes._CLAUDE_NATIVE_WRAPPER_LABEL_KEY == WRAPPER_LABEL_KEY
     assert sessions_routes._CODEX_NATIVE_WRAPPER_LABEL_VALUE == CODEX_NATIVE_WRAPPER_VALUE
+
+
+def test_pi_native_wrapper_constants_match_pi_native_module() -> None:
+    """``omnigent.pi_native`` imports the same key/value pair."""
+    from omnigent import pi_native
+
+    assert pi_native._WRAPPER_LABEL_KEY == WRAPPER_LABEL_KEY
+    assert pi_native._WRAPPER_LABEL_VALUE == PI_NATIVE_WRAPPER_VALUE
+
+
+def test_pi_native_wrapper_constants_match_registry() -> None:
+    """The native coding-agent registry owns the Pi wrapper metadata."""
+    from omnigent.native_coding_agents import PI_NATIVE_CODING_AGENT
+
+    assert PI_NATIVE_CODING_AGENT.agent_name == "pi-native-ui"
+    assert PI_NATIVE_CODING_AGENT.harness == "pi-native"
+    assert PI_NATIVE_CODING_AGENT.wrapper_label == PI_NATIVE_WRAPPER_VALUE
+    assert PI_NATIVE_CODING_AGENT.terminal_name == "pi"
+
+
+def test_kiro_native_wrapper_constants_match_registry() -> None:
+    """The native coding-agent registry owns the Kiro wrapper metadata."""
+    from omnigent.native_coding_agents import KIRO_NATIVE_CODING_AGENT
+
+    assert KIRO_NATIVE_CODING_AGENT.agent_name == "kiro-native-ui"
+    assert KIRO_NATIVE_CODING_AGENT.harness == "kiro-native"
+    assert KIRO_NATIVE_CODING_AGENT.wrapper_label == KIRO_NATIVE_WRAPPER_VALUE
+    assert KIRO_NATIVE_CODING_AGENT.terminal_name == "kiro"

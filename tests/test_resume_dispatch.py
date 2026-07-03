@@ -198,6 +198,110 @@ def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
     assert captured["codex_args"] == ()
 
 
+def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote kiro-native conv routes to ``run_kiro_native``."""
+    monkeypatch.setattr(
+        resume_dispatch,
+        "_read_wrapper_label_remote",
+        lambda *, server, conv_id: "kiro-native-ui",
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="conv_kiro",
+        server="https://example.com/",
+    )
+
+    assert captured["session_id"] == "conv_kiro"
+    assert captured["server"] == "https://example.com"
+    assert captured["kiro_args"] == ()
+
+
+def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Remote antigravity-native conv ⇒ ``run_antigravity_native(server=..., session_id=...)``.
+
+    The Omnigent conv id must be preserved exactly like the codex/claude
+    paths, but the runtime-specific passthrough kwarg is
+    ``antigravity_args``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        resume_dispatch,
+        "_read_wrapper_label_remote",
+        lambda *, server, conv_id: "antigravity-native-ui",
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """
+        Record the kwargs ``run_antigravity_native`` was called with.
+
+        :param kwargs: Wrapper kwargs.
+        :returns: None.
+        """
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.antigravity_native.run_antigravity_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="conv_agy",
+        server="https://example.com/",
+    )
+
+    assert captured["session_id"] == "conv_agy"
+    assert captured["server"] == "https://example.com"
+    assert captured["antigravity_args"] == ()
+
+
+def test_dispatch_by_runtime_antigravity_native_local_routes_to_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Local antigravity-native conv routes to ``run_antigravity_native``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        resume_dispatch,
+        "_read_wrapper_label_local",
+        lambda *, conv_id: "antigravity-native-ui",
+    )
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """
+        Record the kwargs ``run_antigravity_native`` was called with.
+
+        :param kwargs: Wrapper kwargs.
+        :returns: None.
+        """
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.antigravity_native.run_antigravity_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="conv_agy_local",
+        server=None,
+    )
+
+    assert captured["session_id"] == "conv_agy_local"
+    assert captured["server"] is None
+    assert captured["antigravity_args"] == ()
+
+
 def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

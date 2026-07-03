@@ -1,33 +1,20 @@
 name: Maintainer Approval
 
-# Gates merge on a maintainer's approval. The job *is* the required
-# check: it exits non-zero until a maintainer has approved, and GitHub
-# reports that pass/fail as the `Maintainer Approval` status check
-# automatically. We do NOT post a commit status, so no `statuses: write`
-# token is needed.
+# Gates merge on a maintainer's approval. The job *is* the required check: it
+# exits non-zero until a maintainer approves, and GitHub reports that pass/fail
+# as the `Maintainer Approval` status. No commit status is posted (a fork's token
+# is read-only, so a `gh api .../statuses` POST would 403), so the check is the
+# job result instead.
 #
-# Why this matters for fork PRs: a fork's `pull_request` /
-# `pull_request_review` token is forced read-only regardless of the
-# `permissions:` block, so the old `gh api .../statuses` POST always
-# 403'd on contributor PRs. Making the check the job result sidesteps
-# the API write entirely.
+# Trigger is `pull_request_target`, so it runs from main with the base token
+# even for fork PRs: it isn't held behind the fork-PR-workflow approval gate
+# (reports immediately on open), and the PR-head copy never runs (a malicious PR
+# can't weaken the check). Safe because the job checks out nothing and runs no PR
+# code — it reads .github/MAINTAINER from main's tip (so a PR can't self-grant by
+# adding its author) and queries the API.
 #
-# Trigger is `pull_request_target`, so the workflow always runs from the
-# base branch (main) with the base repo's token, even for fork PRs:
-#   - it is not held behind the "approve fork-PR workflows" gate, so it
-#     reports immediately on open instead of sitting in action_required;
-#   - the PR-head copy of this file never runs, so a malicious PR cannot
-#     edit the check to weaken it.
-# This is safe because the job checks out nothing and runs no PR code --
-# it only reads .github/MAINTAINER from main and queries the API.
-#
-# `pull_request_target` does not fire on reviews, so an approval does
-# not re-run this check by itself. maintainer-approval-rerun.yml +
-# maintainer-approval-rerun-run.yml re-run this workflow when a
-# maintainer submits an approving review, flipping the check green.
-#
-# Why read .github/MAINTAINER from main's tip (not the PR head): a PR
-# that adds its own author to MAINTAINER must not be able to self-grant.
+# `pull_request_target` doesn't fire on reviews, so maintainer-approval-rerun.yml
+# + -rerun-run.yml re-run this workflow on an approving review to flip it green.
 
 on:
   pull_request_target:
@@ -37,8 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  # Do not cancel in-progress runs: a superseded run cancelled mid-flight
-  # leaves the check red, and queued re-evaluation is cheap.
+  # Don't cancel in-progress: a run cancelled mid-flight leaves the check red.
   group: maintainer-approval-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
@@ -68,9 +54,8 @@ jobs:
           fi
 
           CONTENT=$(echo "$CONTENT_B64" | base64 -d)
-          # Strip comments and blanks; flatten to a space-separated list.
-          # `grep -v` exits 1 with no matches; wrap so the pipeline stays
-          # 0 under pipefail and we reach the empty-list branch.
+          # Strip comments/blanks to a space-separated list. `grep -v` exits 1
+          # on no matches; wrap with `|| true` so pipefail reaches the empty branch.
           MAINTAINERS=$(echo "$CONTENT" | sed -E 's/#.*$//' | tr -s '[:space:]' '\n' | { grep -v '^$' || true; } | tr '\n' ' ')
           MAINTAINERS_LC=$(echo "$MAINTAINERS" | tr '[:upper:]' '[:lower:]')
           if [[ -z "${MAINTAINERS_LC// /}" ]]; then

@@ -1,0 +1,75 @@
+# Create a GitHub Release entry (the `…/releases` page) when a version tag is
+# pushed. This is METADATA ONLY — it does NOT build or publish any installable
+# artifact. PyPI publishing lives in the central secure-release repo
+# (databricks/secure-public-registry-releases-eng → `omnigent` workflow), on
+# hardened runners with OIDC Trusted Publishing and a mandatory dependency
+# scan. Keeping those concerns separate is deliberate (see RELEASING.md):
+#
+#   * This job runs NO project or third-party code — no build, no `pip
+#     install`/`npm ci`, no tests. Its only action is SHA-pinned
+#     `actions/checkout` plus `gh release create`. A malicious tagged commit
+#     therefore cannot execute anything here.
+#   * It uses the ephemeral `GITHUB_TOKEN` (no stored secret / PAT). The single
+#     elevated scope, `contents: write`, is the minimum GitHub requires to
+#     create a release and nothing else in the job uses it.
+#   * It attaches NO wheels. The release carries only generated notes and the
+#     source tarball GitHub auto-attaches, so PyPI (the scanned, securely
+#     published channel) stays the single source of installable artifacts.
+#   * The release is created as a DRAFT: a human verifies/edits the generated
+#     notes and publishes it (ideally after the prod PyPI publish lands), so a
+#     bot never makes a public release on its own.
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      # Version tags only (v0.2.0, v0.2.0rc1, …) — `v[0-9]*` avoids triggering
+      # on non-release tags like `v-infra-*`.
+      - "v[0-9]*"
+
+# Least privilege: creating a release requires `contents: write`; nothing here
+# needs anything more.
+permissions:
+  contents: write
+
+jobs:
+  draft-release:
+    # Inert in forks / mirrors — only the canonical repo should cut releases.
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Full history so `--generate-notes` can diff against the previous tag.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Draft release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Rerun-safe: if a release for this tag already exists (a rerun, a
+          # deleted-and-re-pushed tag, or a manual release), skip instead of
+          # failing the job. An `if` so this can't trip `set -e`.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # rc / dev / alpha / beta tags are flagged as pre-releases.
+          pre=""
+          case "$TAG" in
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) pre="--prerelease" ;;
+          esac
+          # $pre is intentionally UNQUOTED: it word-splits to nothing when empty,
+          # and is only ever "" or "--prerelease" (set just above, never from
+          # external input). Quoting it would pass an empty positional arg.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --generate-notes \
+            --title "$TAG" \
+            $pre
+          echo "Drafted release $TAG — review/edit the notes and publish from the Releases page." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

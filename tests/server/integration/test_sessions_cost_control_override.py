@@ -46,7 +46,7 @@ async def test_patch_cost_control_override_round_trips_through_snapshot(
 ) -> None:
     """PATCH writes the column and ``GET`` returns the same value.
 
-    This is the contract the ap-web "Cost Optimized" toggle depends
+    This is the contract the web "Cost Optimized" toggle depends
     on: the PATCH response hydrates the optimistic store state, and
     the next snapshot (reload, another client) must agree with it.
 

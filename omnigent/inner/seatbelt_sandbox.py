@@ -438,6 +438,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
                 if sandbox_spec.env_passthrough is not None
                 else None
             ),
+            credential_proxy=sandbox_spec.credential_proxy,
         )
 
     def wrap_launcher_argv(
@@ -446,6 +447,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
         policy: SandboxPolicy,
         cwd: Path,
         chdir: Path | None = None,
+        target: str | None = None,
     ) -> list[str]:
         """
         Build the ``sandbox-exec`` argv that wraps *argv* under an
@@ -511,6 +513,9 @@ class SeatbeltSandboxBackend(SandboxBackend):
             unsafe ancestor (see :func:`_ensure_executable_visible`).
         """
         del chdir  # See docstring — Seatbelt has no --chdir analog.
+        del target  # SBPL profile grants read access by subpath rules; the
+        # run_launcher target binary is typically covered by the cwd or default
+        # subpath allows.  A targeted seatbelt fix is tracked separately.
         cwd_resolved = cwd.resolve(strict=False)
         extra_read_paths = _ensure_executable_visible(
             argv, cwd_resolved, policy_read_roots=policy.read_roots or []

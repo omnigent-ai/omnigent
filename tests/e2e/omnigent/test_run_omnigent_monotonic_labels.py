@@ -58,78 +58,24 @@ Uses the same fixture pattern as
 
 from __future__ import annotations
 
-import configparser
-import os
 import sqlite3
 import subprocess
 from pathlib import Path
 
-import pytest
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
-from tests._model_pools import resolve_model
-
-# Same harness/model as the other run_omnigent e2e tests — the
+# Same harness as the other run_omnigent e2e tests — the
 # invariant under test is on the policy + label-store path,
 # not on harness specifics, and openai-agents has the most
 # reliable ``-p`` one-shot dispatch.
 _HARNESS = "openai-agents"
-_MODEL = resolve_model("databricks-gpt-5-4-mini", key=__name__)
+# Mock model name — the mock LLM server uses the "default" queue
+# for any model string.
+_MODEL = "mock-model"
 
 # 180 s matches the resumption suite's headroom for DBOS
 # sqlite migrations + cold imports + one openai-agents turn.
 _RUN_TIMEOUT_SEC = 180
-
-# CLAUDE.md says to prefer the ``test-profile`` profile for integration
-# tests. The shared ``omnigent_credentials_env`` fixture
-# may resolve a different workspace; we read the test-profile host +
-# token directly here.
-_DATABRICKSCFG_PATH = Path.home() / ".databrickscfg"
-_DF1_PROFILE = "test-profile"
-
-
-@pytest.fixture(scope="module")
-def df1_credentials_env() -> dict[str, str]:
-    """
-    Build a subprocess env wired to the ``test-profile`` Databricks
-    workspace's serving endpoints.
-
-    Reads ``~/.databrickscfg`` directly (skip the test if the
-    profile is missing) and constructs the same env shape as
-    the ``omnigent_credentials_env`` fixture, but pointed at
-    test-profile explicitly.
-
-    :returns: A dict suitable for ``subprocess.Popen(env=...)``.
-    """
-    if not _DATABRICKSCFG_PATH.is_file():
-        pytest.skip(f"requires {_DATABRICKSCFG_PATH} with [test-profile] profile")
-    cfg = configparser.ConfigParser()
-    cfg.read(_DATABRICKSCFG_PATH)
-    if _DF1_PROFILE not in cfg:
-        pytest.skip(f"requires [test-profile] profile in {_DATABRICKSCFG_PATH}")
-    section = cfg[_DF1_PROFILE]
-    host = section.get("host", "").rstrip("/")
-    token = section.get("token", "")
-    if not host or not token:
-        pytest.skip("[test-profile] profile missing 'host' or 'token'")
-    env = dict(os.environ)
-    env["OPENAI_BASE_URL"] = f"{host}/serving-endpoints"
-    env["OPENAI_API_KEY"] = token
-    env["DATABRICKS_CONFIG_PROFILE"] = _DF1_PROFILE
-    # Strip stale token / nested-Claude-Code env vars that
-    # would shadow our PAT or refuse to launch the harness —
-    # same set the omnigent conftest strips, per CLAUDE.md
-    # baseline.
-    for stale in (
-        "ANTHROPIC_API_KEY",
-        "DATABRICKS_TOKEN",
-        "CLAUDE_CODE",
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_CODE_EXECPATH",
-        "CODEX",
-    ):
-        env.pop(stale, None)
-    return env
 
 
 def _isolated_home_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
@@ -154,7 +100,8 @@ def _isolated_home_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
 def test_monotonic_decreasing_constraint_enforced_end_to_end(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    df1_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """
@@ -179,9 +126,10 @@ def test_monotonic_decreasing_constraint_enforced_end_to_end(
         sees ``current=None`` and the rogue write is allowed
         (also "1" persisted).
     """
+    configure_mock_llm(mock_llm_server_url, [{"text": "ok"}])
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_home_env(df1_credentials_env, fake_home)
+    env = _isolated_home_env(mock_credentials_env, fake_home)
 
     # The agent YAML. Omnigent-flavored format (no
     # ``spec_version``); the omnigent-compat adapter
@@ -310,7 +258,8 @@ policies:
 def test_monotonic_increasing_picks_most_restrictive_in_one_evaluation(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    df1_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """
@@ -349,9 +298,10 @@ def test_monotonic_increasing_picks_most_restrictive_in_one_evaluation(
         data race in YAML order — one silently nullifies the
         other depending on file ordering.
     """
+    configure_mock_llm(mock_llm_server_url, [{"text": "ok"}])
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_home_env(df1_credentials_env, fake_home)
+    env = _isolated_home_env(mock_credentials_env, fake_home)
 
     agent_dir = tmp_path / "monotonic_increasing_agent"
     agent_dir.mkdir()

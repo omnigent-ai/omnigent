@@ -13,7 +13,49 @@ from collections.abc import Callable
 # server (API) base onto the UI mount so browser links land on the SPA
 # instead of the JSON API.
 WORKSPACE_API_PATH = "/api/2.0/omnigent"
-WORKSPACE_UI_PATH = "/ml/omnigent"
+WORKSPACE_UI_PATH = "/omnigent"
+
+
+def is_workspace_hosted_url(base_url: str) -> bool:
+    """
+    Whether *base_url* is a Databricks workspace-hosted Omnigent mount.
+
+    True for the API proxy mount (``https://<ws>/api/2.0/omnigent``) the
+    CLI connects to on a workspace. Used to suppress UI a workspace
+    deployment shouldn't surface (e.g. the startup banner's server-version
+    row, since a workspace build reports no meaningful version string).
+
+    :param base_url: Omnigent server base URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :returns: ``True`` when the URL path is the workspace API mount.
+    """
+    return urllib.parse.urlsplit(base_url.rstrip("/")).path == WORKSPACE_API_PATH
+
+
+def display_server_url(base_url: str) -> str:
+    """
+    Map an Omnigent server base URL to the user-facing form to show.
+
+    Databricks workspace-hosted servers are connected to on the API proxy
+    mount (``https://<ws>/api/2.0/omnigent``), but the URL a user
+    recognizes — and that the web UI lives on — is the workspace SPA mount
+    (``https://<ws>/omnigent``). Rewrites the API path to the UI path for
+    those (dropping any ``?o=<org>`` query), so the startup banner shows
+    the clean ``/omnigent`` URL instead of the internal API path. Every
+    other URL (local ``http://127.0.0.1:<port>``, a custom remote) is
+    returned unchanged apart from a trailing-slash trim.
+
+    :param base_url: Omnigent server base URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"`` or
+        ``"http://127.0.0.1:6767"``.
+    :returns: The display URL, e.g.
+        ``"https://example.databricks.com/omnigent"`` or
+        ``"http://127.0.0.1:6767"``.
+    """
+    parsed = urllib.parse.urlsplit(base_url.rstrip("/"))
+    if parsed.path == WORKSPACE_API_PATH:
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, WORKSPACE_UI_PATH, "", ""))
+    return base_url.rstrip("/")
 
 
 def conversation_url(base_url: str, conversation_id: str) -> str:
@@ -23,7 +65,7 @@ def conversation_url(base_url: str, conversation_id: str) -> str:
     For Databricks workspace-hosted servers
     (``https://<ws>/api/2.0/omnigent``) the web UI lives on the
     workspace SPA mount, so the link becomes
-    ``https://<ws>/ml/omnigent/c/<id>`` — with the ``?o=<org>``
+    ``https://<ws>/omnigent/c/<id>`` — with the ``?o=<org>``
     workspace selector appended when ``omnigent login`` recorded the
     org id.
 

@@ -11,9 +11,12 @@ import pytest
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
+    _LABEL_VALUE_MAX_LEN,
     SessionLiveness,
     _get_session_snapshot,
+    _persist_session_status_error_labels,
     _publish_subtree_cost_to_ancestors,
+    _truncate_label,
 )
 
 
@@ -25,6 +28,32 @@ async def _drain_runner_skills(session_id: str) -> None:
     """
     for _ in range(100):
         if session_id in _sessions_mod._runner_skills_cache:
+            return
+        await asyncio.sleep(0)
+
+
+async def _drain_model_options(session_id: str) -> None:
+    """Pump the loop until the background Codex model-options fetch lands.
+
+    Codex model options are eventual-consistent like skills: the first
+    snapshot returns ``[]`` and starts the runner query; a later snapshot
+    serves the cache.
+    """
+    for _ in range(100):
+        if session_id in _sessions_mod._model_options_cache:
+            return
+        await asyncio.sleep(0)
+
+
+async def _drain_runner_models(session_id: str) -> None:
+    """Pump the loop until the snapshot's background harness-models fetch lands.
+
+    Harness-owned models (opencode) are eventual-consistent like skills:
+    the first snapshot returns ``[]`` and kicks off the runner query; a
+    later snapshot serves the cache.
+    """
+    for _ in range(100):
+        if session_id in _sessions_mod._runner_models_cache:
             return
         await asyncio.sleep(0)
 
@@ -240,6 +269,43 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error() -> None:
+    """
+    A terminal/runtime failure captured from ``session.status`` survives reload.
+
+    Required terminal boot failures can happen before any assistant transcript
+    or runner-crash report exists. The live SSE carries ``error``, and the
+    relay persists it as labels so a later snapshot can still render a useful
+    failure banner instead of ``last_task_error=None``.
+    """
+    conv = Conversation(
+        id="conv_failed_terminal",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_failed_terminal",
+        agent_id="ag_test",
+        labels={
+            "omnigent.last_task_error_code": "required_terminal_exited",
+            "omnigent.last_task_error_message": "Required terminal exited unexpectedly",
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_failed_terminal": conv},
+    )
+
+    snapshot = await _get_session_snapshot(  # type: ignore[arg-type]
+        conv_store,
+        "conv_failed_terminal",
+    )
+
+    assert snapshot.last_task_error == {
+        "code": "required_terminal_exited",
+        "message": "Required terminal exited unexpectedly",
+    }
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 
@@ -323,10 +389,13 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
     # Still "running" from the cached value.
     assert snapshot2.status == "running"
     # Status is server-cached, so only the FIRST snapshot queries the
-    # runner for status; the second hits the cache. (Skills are
-    # runner-owned and fetched every snapshot via ``/skills`` — the
-    # runner caches them per session — so filter those out here.)
-    status_calls = [u for u in fake_client.get_calls if not u.endswith("/skills")]
+    # runner for status; the second hits the cache. (Skills and harness
+    # models are runner-owned and fetched every snapshot via ``/skills``
+    # and ``/models`` — the runner caches them per session — so filter
+    # those out here.)
+    status_calls = [
+        u for u in fake_client.get_calls if not u.endswith("/skills") and not u.endswith("/models")
+    ]
     assert len(status_calls) == 1, (
         f"Expected 1 runner status GET (cache hit on second call), "
         f"got {len(status_calls)}. If 2, the cache "
@@ -381,6 +450,8 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _FakeResponse:
         status_code = 200
@@ -432,12 +503,17 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         "instead of synthesizing a default status"
     )
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
+    # Status is synchronous; the skills and harness-models GETs are now
+    # background fetches.
     await _drain_runner_skills("conv_router_only")
-    assert fake_client.get_calls == [
-        "/v1/sessions/conv_router_only",
-        "/v1/sessions/conv_router_only/skills",
-    ]
+    await _drain_runner_models("conv_router_only")
+    assert sorted(fake_client.get_calls) == sorted(
+        [
+            "/v1/sessions/conv_router_only",
+            "/v1/sessions/conv_router_only/skills",
+            "/v1/sessions/conv_router_only/models",
+        ]
+    )
 
 
 @pytest.mark.asyncio
@@ -455,6 +531,8 @@ async def test_session_snapshot_includes_skills_from_runner(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -504,6 +582,505 @@ async def test_session_snapshot_includes_skills_from_runner(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_includes_model_options_from_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Codex-native model and effort controls use Codex's live ``model/list``.
+
+    The session snapshot first returns no options and kicks a background
+    runner fetch. Once the fetch lands, the next snapshot exposes Codex's
+    returned model ids, display names, and model-specific efforts. If this
+    regresses to a hardcoded frontend list, this runner path would not be
+    called and the snapshot would stay empty.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "gpt-5.5",
+                                "model": "databricks-gpt-5-5",
+                                "displayName": "GPT-5.5",
+                                "defaultReasoningEffort": "high",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": "low", "description": "Low"},
+                                    {"reasoningEffort": "medium", "description": "Medium"},
+                                    {"reasoningEffort": "high", "description": "High"},
+                                    {"reasoningEffort": "xhigh", "description": "Extra high"},
+                                ],
+                                "isDefault": True,
+                            }
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_options",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_options",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_options": conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_options",
+    )
+    assert first.model_options == []
+    await _drain_model_options("conv_codex_options")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_options",
+    )
+
+    assert "/v1/sessions/conv_codex_options/codex-model-options" in fake_client.get_calls
+    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0]["displayName"] == "GPT-5.5"
+    assert snapshot.model_options[0]["supportedReasoningEfforts"] == [
+        {"reasoningEffort": "low", "description": "Low"},
+        {"reasoningEffort": "medium", "description": "Medium"},
+        {"reasoningEffort": "high", "description": "High"},
+        {"reasoningEffort": "xhigh", "description": "Extra high"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_serves_static_cursor_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Cursor-native model options are a curated *static* catalog, served directly.
+
+    Unlike codex (live runner ``model/list``), cursor's catalog never changes
+    per session, so the snapshot returns it on the FIRST read with no runner
+    round-trip and no background fetch. Serving it directly (not through the
+    runner-backed cache) is what keeps the picker from blanking on a
+    ``refresh_state`` snapshot — the regression behind the effort-change bug.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_cursor_options",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_cursor_options",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_cursor_options": conv},
+    )
+
+    # First snapshot already carries the full catalog — no kick-and-empty.
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_cursor_options",
+    )
+
+    # No runner round-trip for cursor model options (served statically).
+    assert not any("model-options" in url for url in fake_client.get_calls)
+    ids = [m["id"] for m in snapshot.model_options]
+    assert "claude-opus-4-6" in ids and "gpt-5.2" in ids and "composer-2.5" in ids
+    # base-id namespace only — no flattened effort variants leak through.
+    assert not any("-high" in i or "-xhigh" in i for i in ids)
+    # The cache must stay untouched — that's what makes it refresh_state-proof.
+    assert "conv_cursor_options" not in _mod._model_options_cache
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_refresh_state_reloads_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``refresh_state=True`` pierces stale runner-backed Codex catalogs.
+
+    Browser reloads pass this flag so an AP-process cache warmed by an older
+    bug or older Codex response does not keep driving the model picker after
+    refresh. The first refreshed snapshot must not serve the stale cached row;
+    once the background runner read lands, a later snapshot serves the live
+    catalog.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_cache["conv_codex_refresh"] = [
+        {
+            "id": "stale-model",
+            "model": "stale-provider-model",
+            "displayName": "Stale Model",
+            "defaultReasoningEffort": "low",
+            "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": "Low"}],
+            "isDefault": False,
+        }
+    ]
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "fresh-model",
+                                "model": "fresh-provider-model",
+                                "displayName": "Fresh Model",
+                                "defaultReasoningEffort": "high",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": "high", "description": "High"}
+                                ],
+                                "isDefault": True,
+                            }
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_refresh",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_refresh",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_refresh": conv},
+    )
+
+    refreshed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_refresh",
+        refresh_state=True,
+    )
+    # Refresh must not echo the stale cached row. If this is "stale-model",
+    # browser reloads would not recover after the server-side cache shape is fixed.
+    assert [m["id"] for m in refreshed.model_options] == []
+    await _drain_model_options("conv_codex_refresh")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_refresh",
+    )
+
+    assert "/v1/sessions/conv_codex_refresh/codex-model-options" in fake_client.get_calls
+    assert [m["id"] for m in snapshot.model_options] == ["fresh-model"]
+    assert snapshot.model_options[0]["displayName"] == "Fresh Model"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_retries_empty_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An early empty Codex catalog is treated as not-ready, not cached.
+
+    This covers the startup race where the AP snapshot asks the runner for
+    model options before the codex-native forwarder has recorded bridge state.
+    Older runners returned ``200 {"models": []}`` for that window; caching
+    that response permanently hid the picker until AP restart.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+            self._codex_payloads: list[dict[str, object]] = [
+                {"models": []},
+                {
+                    "models": [
+                        {
+                            "id": "gpt-5.5",
+                            "model": "databricks-gpt-5-5",
+                            "displayName": "GPT-5.5",
+                            "defaultReasoningEffort": "xhigh",
+                            "supportedReasoningEfforts": [
+                                {"reasoningEffort": "high", "description": "High"},
+                                {"reasoningEffort": "xhigh", "description": "Extra high"},
+                            ],
+                            "isDefault": True,
+                        }
+                    ]
+                },
+            ]
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return _FakeResponse(self._codex_payloads.pop(0))
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_empty_then_ready",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_empty_then_ready",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_empty_then_ready": conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_empty_then_ready",
+    )
+    assert first.model_options == []
+    await _drain_model_options("conv_codex_empty_then_ready")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_empty_then_ready",
+    )
+
+    # Two codex-model-options calls means the empty catalog was not cached;
+    # one call would recreate the missing-picker regression.
+    assert (
+        fake_client.get_calls.count("/v1/sessions/conv_codex_empty_then_ready/codex-model-options")
+        == 2
+    )
+    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0]["defaultReasoningEffort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_retries_503_model_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner ``503`` during Codex bridge startup is retried in the background.
+
+    The codex-native runner reports model options as unavailable until the
+    TUI-created thread is recorded in bridge state. The AP background fetch
+    should stay alive across that transient 503 and publish/cache the catalog
+    once the next retry succeeds.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+
+    class _FakeResponse:
+        def __init__(
+            self,
+            payload: dict[str, object],
+            *,
+            status_code: int = 200,
+        ) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+            self._codex_responses: list[_FakeResponse] = [
+                _FakeResponse(
+                    {
+                        "error": "codex_native_model_options_failed",
+                        "detail": "Codex-native model options are not ready yet.",
+                    },
+                    status_code=503,
+                ),
+                _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "gpt-5.4",
+                                "model": "databricks-gpt-5-4",
+                                "displayName": "GPT-5.4",
+                                "defaultReasoningEffort": "medium",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": "medium", "description": "Medium"},
+                                    {"reasoningEffort": "high", "description": "High"},
+                                ],
+                                "isDefault": False,
+                            }
+                        ]
+                    }
+                ),
+            ]
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/codex-model-options"):
+                return self._codex_responses.pop(0)
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id="conv_codex_503_then_ready",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_codex_503_then_ready",
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={"conv_codex_503_then_ready": conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_503_then_ready",
+    )
+    assert first.model_options == []
+    await _drain_model_options("conv_codex_503_then_ready")
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_codex_503_then_ready",
+    )
+
+    # Two calls proves the transient 503 did not terminate discovery; one
+    # call would leave the cache cold forever until another snapshot request.
+    assert (
+        fake_client.get_calls.count("/v1/sessions/conv_codex_503_then_ready/codex-model-options")
+        == 2
+    )
+    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.4"]
+    assert snapshot.model_options[0]["defaultReasoningEffort"] == "medium"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -519,6 +1096,8 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -658,6 +1237,8 @@ async def test_session_snapshot_prefers_router_over_singleton(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _Response:
         def __init__(self, status: str) -> None:
@@ -699,12 +1280,17 @@ async def test_session_snapshot_prefers_router_over_singleton(
     )
 
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
+    # Status is synchronous; the skills and harness-models GETs are now
+    # background fetches.
     await _drain_runner_skills("conv_prefer_router")
-    assert router_client.get_calls == [
-        "/v1/sessions/conv_prefer_router",
-        "/v1/sessions/conv_prefer_router/skills",
-    ]
+    await _drain_runner_models("conv_prefer_router")
+    assert sorted(router_client.get_calls) == sorted(
+        [
+            "/v1/sessions/conv_prefer_router",
+            "/v1/sessions/conv_prefer_router/skills",
+            "/v1/sessions/conv_prefer_router/models",
+        ]
+    )
     assert singleton_client.get_calls == [], (
         "singleton should not have been queried when the router resolved a client"
     )
@@ -978,3 +1564,80 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     assert by_conv["conv_g"]["usage_by_model"]["model-a"]["input_tokens"] == 70
     # The payload is a session.usage broadcast the web client renders as the badge.
     assert by_conv["conv_p"]["type"] == "session.usage"
+
+
+# ── _truncate_label ──────────────────────────────────────────────────────────
+
+
+def test_truncate_label_short_value_unchanged() -> None:
+    """Values at or below the column limit pass through unmodified."""
+    value = "x" * _LABEL_VALUE_MAX_LEN
+    assert _truncate_label(value) == value
+
+
+def test_truncate_label_long_value_fits_column() -> None:
+    """Truncated output fits the column, keeps the head, and flags the cut."""
+    long_value = "a" * (_LABEL_VALUE_MAX_LEN + 100)
+    result = _truncate_label(long_value)
+    assert len(result) == _LABEL_VALUE_MAX_LEN
+    # The informative head is preserved and a marker signals the truncation.
+    assert result.endswith("…")
+    assert result[:-1] == long_value[: _LABEL_VALUE_MAX_LEN - 1]
+
+
+def test_truncate_label_at_limit_no_marker() -> None:
+    """A value exactly at the limit is kept verbatim — no spurious ellipsis."""
+    value = "b" * _LABEL_VALUE_MAX_LEN
+    result = _truncate_label(value)
+    assert result == value
+    assert not result.endswith("…")
+
+
+def test_truncate_label_empty_string() -> None:
+    """Empty string is returned unchanged (no off-by-one crash)."""
+    assert _truncate_label("") == ""
+
+
+# ── _persist_session_status_error_labels ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_truncates_long_message() -> None:
+    """A failure message longer than 256 chars is truncated before the store
+    write, preventing the ``DataError`` that silently dropped the reason."""
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    long_message = "Runner MCP execute failed: " + "x" * 300
+    error = ErrorDetail(code="mcp_error", message=long_message)
+
+    await _persist_session_status_error_labels("conv_123", error, _MockStore())  # type: ignore[arg-type]
+
+    stored = captured["conv_123"]["omnigent.last_task_error_message"]
+    assert len(stored) <= _LABEL_VALUE_MAX_LEN
+    # The diagnostic prefix survives so the reload-visible reason is still useful.
+    assert stored.startswith("Runner MCP execute failed: ")
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_short_message_stored_verbatim() -> None:
+    """A short failure message is stored without modification."""
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_error", message="Process exited with code 1")
+
+    await _persist_session_status_error_labels("conv_456", error, _MockStore())  # type: ignore[arg-type]
+
+    assert captured["conv_456"]["omnigent.last_task_error_message"] == "Process exited with code 1"
+    assert captured["conv_456"]["omnigent.last_task_error_code"] == "runner_error"

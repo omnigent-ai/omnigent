@@ -42,7 +42,14 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.credential_proxy import SYNTHETIC_CREDENTIAL_PREFIX
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+)
 from omnigent.inner.os_env import create_os_environment
 from tests.inner.sandbox.conftest import run_async
 
@@ -893,6 +900,258 @@ def test_s4_two_sandboxes_cannot_borrow_each_others_proxy(
     finally:
         env_a.close()
         env_b.close()
+
+
+# ---------------------------------------------------------------------------
+# Secretless credential_proxy end-to-end (local upstream, no internet)
+# ---------------------------------------------------------------------------
+
+
+class _CapturingUpstream:
+    """A loopback HTTP server that records each ``Authorization`` header.
+
+    The sandbox makes requests through the egress proxy to this local
+    upstream, so the captured value is exactly what the proxy forwarded
+    after rewriting — proving the real secret reached the service while
+    the sandbox only ever held the synthetic placeholder.
+
+    :param captured: Authorization header values seen, in arrival order.
+    :param port: The bound loopback port.
+    """
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        captured: list[str | None] = []
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                captured.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args: object) -> None:
+                # Silence the default stderr access log.
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.captured = captured
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        """Stop the server and join its thread."""
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+def _proxied_http_probe(target_url: str, *, auth_expr: str) -> str:
+    """
+    Build a Python probe that GETs *target_url* through ``HTTP_PROXY``.
+
+    The probe constructs ``Proxy-Authorization`` from the proxy URL's
+    embedded token (the helper rewrote ``HTTP_PROXY`` in-process to carry
+    it) and sends ``Authorization`` built from *auth_expr*, then prints
+    ``STATUS <code>``.
+
+    :param target_url: Absolute http URL of the local upstream, e.g.
+        ``"http://127.0.0.1:54321/probe"``.
+    :param auth_expr: A Python expression (evaluated in the probe) that
+        yields the ``Authorization`` header value, e.g.
+        ``"'Bearer ' + os.environ['JIRA_TOKEN']"``.
+    :returns: Python source for use with :func:`_python_probe_argv`.
+    """
+    return "\n".join(
+        [
+            "import os, base64, http.client",
+            "from urllib.parse import urlparse",
+            "p = urlparse(os.environ['HTTP_PROXY'])",
+            "headers = {'Connection': 'close'}",
+            f"headers['Authorization'] = {auth_expr}",
+            "if p.username and p.password:",
+            "    creds = f'{p.username}:{p.password}'.encode()",
+            "    headers['Proxy-Authorization'] = 'Basic ' + base64.b64encode(creds).decode()",
+            "conn = http.client.HTTPConnection(p.hostname, p.port, timeout=30)",
+            f"conn.request('GET', '{target_url}', headers=headers)",
+            "resp = conn.getresponse()",
+            "print('STATUS', resp.status)",
+            "conn.close()",
+        ]
+    )
+
+
+def _proxied_http_probe_no_auth(target_url: str) -> str:
+    """
+    Build a Python probe that GETs *target_url* through ``HTTP_PROXY`` with
+    no ``Authorization`` header.
+
+    This is the swap-on-access client: it sends the request bare and
+    relies on the egress proxy to attach the real credential for the
+    bound host. Only ``Proxy-Authorization`` (built from the proxy URL's
+    embedded token) is set, never ``Authorization``.
+
+    :param target_url: Absolute http URL of the local upstream, e.g.
+        ``"http://127.0.0.1:54321/probe"``.
+    :returns: Python source for use with :func:`_python_probe_argv`.
+    """
+    return "\n".join(
+        [
+            "import os, base64, http.client",
+            "from urllib.parse import urlparse",
+            "p = urlparse(os.environ['HTTP_PROXY'])",
+            "headers = {'Connection': 'close'}",
+            "if p.username and p.password:",
+            "    creds = f'{p.username}:{p.password}'.encode()",
+            "    headers['Proxy-Authorization'] = 'Basic ' + base64.b64encode(creds).decode()",
+            "conn = http.client.HTTPConnection(p.hostname, p.port, timeout=30)",
+            f"conn.request('GET', '{target_url}', headers=headers)",
+            "resp = conn.getresponse()",
+            "print('STATUS', resp.status)",
+            "conn.close()",
+        ]
+    )
+
+
+def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Swap-on-access (the default): the proxy injects Basic auth on a bare request.
+
+    This is the git_https / no-``env`` path. The binding has NO
+    ``inject_env``, so nothing credential-shaped is placed in the sandbox.
+    The probe sends a request with no ``Authorization`` header at all; the
+    egress proxy attaches ``Basic b64(x-access-token:<real>)`` for the
+    bound host on the way out. We assert both halves: the upstream
+    received the real Basic credential AND the sandbox env never held the
+    real secret or any ``oa_cred_*`` placeholder.
+    """
+    import base64
+
+    real_secret = "gho_real_git_token_5k1"
+    monkeypatch.setenv("OA_TEST_GIT_SECRET", real_secret)
+    upstream = _CapturingUpstream()
+    spec = active_sandbox_spec_factory(
+        egress_rules=["* 127.0.0.1/**"],
+        egress_allow_private_destinations=True,
+        credential_proxy=CredentialProxySpec(
+            entries=[
+                CredentialProxyEntry(
+                    host="127.0.0.1",
+                    scheme="basic",
+                    source=CredentialSourceSpec(kind="env", env="OA_TEST_GIT_SECRET"),
+                    username="x-access-token",
+                )
+            ]
+        ),
+    )
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
+    )
+    probe = _proxied_http_probe_no_auth(f"http://127.0.0.1:{upstream.port}/probe")
+    try:
+        result = run_async(os_env.shell(_python_probe_argv(probe)))
+        # Dump every credential-shaped env var the sandbox can see.
+        sandbox_env = run_async(
+            os_env.shell('env | grep -E "OA_TEST_GIT_SECRET|oa_cred_" || true')
+        )
+    finally:
+        os_env.close()
+        upstream.close()
+
+    assert result["exit_code"] == 0, (
+        f"Probe failed. stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
+    )
+    assert "STATUS 200" in result["stdout"], f"Did not reach upstream: {result['stdout']!r}"
+    expected = "Basic " + base64.b64encode(f"x-access-token:{real_secret}".encode()).decode()
+    # The proxy synthesized the Authorization header from nothing the
+    # client sent — if injection regressed, captured would be [None]
+    # (the bare request) instead of the real Basic credential.
+    assert upstream.captured == [expected], (
+        "Upstream MUST receive the proxy-injected Basic credential on a bare "
+        f"request. Captured: {upstream.captured!r}."
+    )
+    # The sandbox never held the real secret nor a placeholder — pure
+    # swap-on-access puts nothing credential-shaped in the env.
+    assert real_secret not in sandbox_env["stdout"], (
+        f"real secret leaked into the sandbox env: {sandbox_env['stdout']!r}"
+    )
+    assert SYNTHETIC_CREDENTIAL_PREFIX not in sandbox_env["stdout"], (
+        f"a synthetic placeholder was injected for a swap-on-access entry: "
+        f"{sandbox_env['stdout']!r}"
+    )
+
+
+def test_credential_proxy_https_bearer_swaps_injected_env_token(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    https_bearer: the synthetic env token is swapped for the real secret.
+
+    Full path: parser-shaped spec -> parent resolves ``env:OA_TEST_SECRET``
+    -> mints ``oa_cred_*`` -> injects it as ``JIRA_TOKEN`` in the sandbox
+    -> probe sends ``Bearer <synthetic>`` -> egress proxy swaps it -> local
+    upstream sees the REAL secret. We assert both halves: the upstream got
+    the real token AND the sandbox env held only the synthetic.
+    """
+    real_secret = "real-bearer-secret-9f3a"
+    monkeypatch.setenv("OA_TEST_SECRET", real_secret)
+    upstream = _CapturingUpstream()
+    spec = active_sandbox_spec_factory(
+        egress_rules=["* 127.0.0.1/**"],
+        egress_allow_private_destinations=True,
+        credential_proxy=CredentialProxySpec(
+            entries=[
+                CredentialProxyEntry(
+                    host="127.0.0.1",
+                    scheme="bearer",
+                    source=CredentialSourceSpec(kind="env", env="OA_TEST_SECRET"),
+                    inject_env=["JIRA_TOKEN"],
+                )
+            ]
+        ),
+    )
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
+    )
+    probe = _proxied_http_probe(
+        f"http://127.0.0.1:{upstream.port}/probe",
+        auth_expr="'Bearer ' + os.environ['JIRA_TOKEN']",
+    )
+    try:
+        result = run_async(os_env.shell(_python_probe_argv(probe)))
+        sandbox_token = run_async(os_env.shell('printf "%s" "$JIRA_TOKEN"'))
+    finally:
+        os_env.close()
+        upstream.close()
+
+    assert result["exit_code"] == 0, (
+        f"Probe failed. stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
+    )
+    assert "STATUS 200" in result["stdout"], f"Did not reach upstream: {result['stdout']!r}"
+    assert upstream.captured == [f"Bearer {real_secret}"], (
+        "Upstream MUST receive the real bearer secret after the proxy swap. "
+        f"Captured: {upstream.captured!r}. If it shows oa_cred_*, the rewrite "
+        "did not fire; if empty, the request never reached upstream."
+    )
+    # The sandbox itself only ever held the synthetic placeholder — the
+    # real secret must never have been injected into the sandbox env.
+    injected = sandbox_token["stdout"]
+    assert injected.startswith(SYNTHETIC_CREDENTIAL_PREFIX), (
+        f"Sandbox JIRA_TOKEN should be a synthetic placeholder, got {injected!r}"
+    )
+    assert real_secret not in injected
 
 
 # Module guard so the helpers don't trigger lint warnings about

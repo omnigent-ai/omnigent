@@ -23,6 +23,7 @@ from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     OMNIGENT_REPL_TERMINAL_ROLE,
+    QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
@@ -305,8 +306,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     _seed_registry(registry, "conv_abc", stale)
 
     resource_registry = SessionResourceRegistry(terminal_registry=registry)
-    # Role stamped at auto-create time in production (launch_terminal's
-    # resource_role); seeded directly here to avoid spawning real tmux.
+    # Role stamped at auto-create time in production (resource_role);
+    # seeded directly here to avoid spawning real tmux.
     resource_registry._terminal_roles[("conv_abc", "terminal_tui_main")] = (
         OMNIGENT_REPL_TERMINAL_ROLE
     )
@@ -331,6 +332,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         publish_event: object,
         *,
         server_client: object,
+        agent_spec: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_repl_terminal`` that registers a
@@ -340,6 +342,9 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         :param rr: The runner's resource registry (unused by the stub).
         :param publish_event: Per-session SSE emitter (unused).
         :param server_client: Omnigent server client (unused).
+        :param agent_spec: Resolved session agent spec threaded by the
+            recreate path so the REPL terminal inherits the agent sandbox
+            (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
         auto_create_sessions.append(session_id)
@@ -413,6 +418,125 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
 
     assert auto_create_sessions == ["conv_abc"]
     assert str(fresh_dir / "tui-main.sock") in attach_argvs[1]
+
+
+def test_runner_resource_attach_recreates_dead_qwen_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dead qwen-native terminal is recreated on attach, not rejected.
+
+    Pins the same crash-recovery gap the REPL already covered:
+    qwen's TUI can die while the registry still holds a stale running
+    entry, and before the fix the attach route would close 4404 and
+    leave the embedded qwen pane blank for the rest of the session.
+    The route should tear down the dead terminal, rerun qwen auto-
+    create, and bridge the fresh pane on the same attach that noticed
+    the crash.
+
+    :param tmp_path: Pytest tmp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    registry = TerminalRegistry()
+    stale = _make_running_instance("qwen", "main", tmp_path)
+
+    async def dead_tmux() -> bool:
+        """
+        Simulate ``tmux has-session`` reporting the qwen pane gone.
+
+        :returns: ``False`` after flipping the optimistic running flag.
+        """
+        stale.running = False
+        return False
+
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
+    _seed_registry(registry, "conv_abc", stale)
+
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    resource_registry._terminal_roles[("conv_abc", "terminal_qwen_main")] = (
+        QWEN_NATIVE_TERMINAL_ROLE
+    )
+
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    fresh_dir = tmp_path / "fresh"
+    fresh_dir.mkdir()
+    fresh = _make_running_instance("qwen", "main", fresh_dir)
+    auto_create_sessions: list[str] = []
+
+    async def fake_auto_create(
+        session_id: str,
+        rr: SessionResourceRegistry,
+        publish_event: object,
+        *,
+        server_client: object,
+        ensure_comment_relay: object = None,
+    ) -> SessionResourceView:
+        """
+        Stand-in for ``_auto_create_qwen_terminal`` that registers a
+        live pane without spawning real tmux.
+
+        :param session_id: Session being recreated, e.g. ``"conv_abc"``.
+        :param rr: The runner's resource registry (unused by the stub).
+        :param publish_event: Per-session SSE emitter (unused).
+        :param server_client: Omnigent server client (unused).
+        :param ensure_comment_relay: Comment relay hook threaded by the
+            recreate path (unused by the stub).
+        :returns: Terminal resource view for the fresh pane.
+        """
+        auto_create_sessions.append(session_id)
+        _seed_registry(registry, session_id, fresh)
+        return SessionResourceView(
+            id="terminal_qwen_main",
+            type="terminal",
+            session_id=session_id,
+            name="qwen",
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_qwen_terminal", fake_auto_create)
+
+    attach_argvs: list[list[str]] = []
+
+    def fake_fork() -> tuple[int, int]:
+        """Drive the child branch of ``pty.fork`` in-process."""
+        return 0, 0
+
+    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        """Capture the tmux attach argv instead of exec'ing."""
+        attach_argvs.append(argv)
+        raise OSError("stop child path")
+
+    exit_exc = RuntimeError("child exited")
+    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
+    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
+    monkeypatch.setattr(
+        "omnigent.terminals.ws_bridge.os._exit",
+        lambda code: (_ for _ in ()).throw(exit_exc),
+    )
+
+    with pytest.raises(RuntimeError, match="child exited"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
+        ):
+            pass
+
+    assert auto_create_sessions == ["conv_abc"]
+    assert str(fresh_dir / "qwen-main.sock") in attach_argvs[0]
+    assert registry.get("conv_abc", "qwen", "main") is fresh
+
+    with pytest.raises(RuntimeError, match="child exited"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
+        ):
+            pass
+
+    assert auto_create_sessions == ["conv_abc"]
+    assert str(fresh_dir / "qwen-main.sock") in attach_argvs[1]
 
 
 def test_runner_resource_attach_dead_non_repl_terminal_keeps_4404(

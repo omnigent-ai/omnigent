@@ -1,20 +1,47 @@
 <!--
 For AI-written descriptions:
-- Follow this template (Summary, Type of change, Test coverage, Coverage rationale).
+- Follow this template (Related issue, Summary, Test Plan, Demo, Type of change, Test coverage, Coverage notes).
 - Keep it concise; reviewers skim long descriptions.
 - For non-trivial changes, include an ELI5 and a diagram (ASCII or mermaid).
-- Leave every checkbox in place. The PR Template check fails if required sections
-  or checkbox rows are removed.
+- Keep every section and checkbox row in place so reviewers can skim them.
+- For UI changes (the "UI / frontend change" box below), fill in the Demo
+  section: attach a screenshot or screen recording of the new behaviour.
 -->
+
+## Related issue
+
+<!--
+Link the issue this PR addresses with a closing keyword so GitHub auto-links it
+(and closes it on merge): e.g. `Closes #123`. One issue per PR. If an older,
+still-open community PR already closes the same issue, the newer one may be
+auto-closed as a duplicate (maintainer PRs are exempt). Use `N/A` for
+chores/docs with no associated issue.
+-->
+
+Closes #
 
 ## Summary
 
 <!-- What changed and why, in 1-3 bullets or a short paragraph. -->
 
+## Test Plan
+
+<!-- How was this change tested? Describe the steps, commands, or scenarios used to verify it. Include a screenshot or recording where helpful. -->
+
+## Demo
+
+<!--
+Video or images demonstrating the change. Drag-and-drop a screenshot or screen
+recording, or paste a link. Expected for UI / frontend changes (check the
+"UI / frontend change" box below) — show the new behaviour. Optional otherwise;
+use `N/A` for non-visual changes.
+-->
+
 ## Type of change
 
 - [ ] Bug fix
 - [ ] Feature
+- [ ] UI / frontend change
 - [ ] Refactor / chore
 - [ ] Docs
 - [ ] Test / CI
@@ -31,11 +58,30 @@ For AI-written descriptions:
 - [ ] Existing tests cover this change
 - [ ] Not applicable
 
-## Coverage rationale
+## Coverage notes
 
 <!--
-Describe the exact commands run and the coverage added/updated. If you did not
-add or run tests, explain why the existing coverage is enough or why tests are
-not applicable. For E2E-relevant changes, call out the E2E scenario exercised or
-why no E2E coverage was added.
+Optional — but required if you checked "Manual verification completed" or
+"Not applicable" above. Describe what you verified manually, or why automated
+test coverage is not needed for this change.
 -->
+
+## Changelog
+
+<!--
+If this PR has a user-facing change worth announcing, write one or more lines
+below in the user's voice, each prefixed with a category. Otherwise leave it
+as `skip`.
+
+Lower the bar than docs: DO include small features and UX changes (moved/renamed
+buttons, new flags, copy tweaks). DO skip pure-internal churn (CI, refactors,
+test-only changes, dependency bumps with no user impact).
+
+Categories: Added | Changed | Fixed | Deprecated | Removed | Security
+Format:     <Category>: <one-line description>   (the PR link is added for you)
+Example:    Added: `omnigent run --watch` reruns an agent when files change
+
+A `skip` here is fine for chores — but a Breaking change must always be announced.
+-->
+
+skip
