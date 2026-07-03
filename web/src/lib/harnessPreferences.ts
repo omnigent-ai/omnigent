@@ -4,9 +4,8 @@
 // Bundle agents (e.g. Polly, Debby) let the user pick a brain harness
 // (claude-sdk, openai-agents, …) that overrides the agent spec's default.
 // This store remembers the last pick per agent so returning users start on
-// the harness they used last. The consumer validates the stored value
-// against the agent's current harness vocabulary and falls back to the
-// spec default when it no longer exists.
+// the harness they used last. A stale value (harness removed server-side)
+// is sent as `harness_override` and rejected by the server at create time.
 
 const STORAGE_KEY = "omnigent:last-harness-by-agent";
 

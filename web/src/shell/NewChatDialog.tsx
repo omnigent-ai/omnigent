@@ -1271,7 +1271,7 @@ function AgentHarnessPicker({
   setBypassSandbox: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
-  setPickedHarness: (harness: string | null) => void;
+  setPickedHarness: (harness: string | null, agentId?: string) => void;
 }) {
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
@@ -1460,7 +1460,7 @@ function AgentHarnessPicker({
             onSelectAgent(agent);
             // Picking the spec default clears the override so the session
             // tracks the spec.
-            setPickedHarness(h === defaultHarness ? null : h);
+            setPickedHarness(h === defaultHarness ? null : h, agent.id);
           }}
           host={host}
           labels={brainHarnessLabels}
@@ -1874,8 +1874,8 @@ export function NewChatLandingScreen() {
     () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
   // Per-session brain-harness override for bundle agents (polly / debby).
-  // null = the agent spec's declared harness (no override sent); cleared on
-  // every agent switch so a pick never leaks across agents.
+  // null = the agent spec's declared harness (no override sent). On agent
+  // switch, seeded from the user's last stored pick for that agent.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
     () =>
       landingDraft?.pickedHarness ??
@@ -2348,11 +2348,14 @@ export function NewChatLandingScreen() {
   const agentLabel = selectedAgent ? selectedAgent.display_name : "Select agent";
 
   // Wrap the harness setter so every explicit pick is persisted to
-  // localStorage, keyed by the current agent id.
+  // localStorage. The caller can pass an explicit `agentId` for the
+  // switch-via-submenu path where `effectiveAgentId` still reflects the
+  // previously selected agent (the state update from `onSelectAgent` hasn't
+  // applied yet).
   const handleSetPickedHarness = useCallback(
-    (harness: string | null) => {
+    (harness: string | null, agentId?: string) => {
       setPickedHarness(harness);
-      writeLastHarness(effectiveAgentId, harness);
+      writeLastHarness(agentId ?? effectiveAgentId, harness);
     },
     [effectiveAgentId],
   );
