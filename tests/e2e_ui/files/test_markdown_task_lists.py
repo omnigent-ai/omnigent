@@ -72,9 +72,8 @@ def test_task_lists_render_as_checkboxes(
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible()
 
-    # Markdown opens in the rendered Preview; switch to the rich-text editor,
-    # where task lists render as the dedicated TaskList node view.
-    switch_markdown_view_mode(page, file_viewer, "Edit")
+    # Markdown opens in the rich-text editor by default, where task lists
+    # render as the dedicated TaskList node view.
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
 

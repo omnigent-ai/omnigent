@@ -600,7 +600,8 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [open, onCloseTab, searchOpen, guardDirty]);
 
-  // View mode toggle — preview is the default for md/html, source for everything else.
+  // View mode toggle — markdown defaults to the rich-text editor, HTML to its
+  // rendered preview, and everything else to source.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html";
   // Images render through CodeViewer's <ImageViewer> regardless of view mode;
@@ -637,21 +638,20 @@ function FileViewerBody({
     () => persistedPrefsRef.current.previewableViewMode,
   );
   // A ?comment= deep link to a markdown file should open where the comment's
-  // anchor is highlighted in context. The read-only Preview can't render that
-  // highlight (only the rich-text editor and raw source can), so for that one
-  // deep-linked markdown file we bias the initial view to the editor — but only
-  // when the user's preference would otherwise land on Preview (a stored
-  // editor/source choice is already highlightable, so we respect it). Preview
-  // stays the default for normal opens; the bias is dropped the moment the user
-  // picks a mode and never applies to any other file.
+  // anchor is highlighted in context. Markdown defaults to the rich-text editor
+  // (highlightable), so this only matters when the user has made Preview their
+  // sticky preference: the read-only Preview can't render the highlight, so for
+  // that one deep-linked file we bias the initial view to the editor. A stored
+  // editor/source choice is already highlightable, so we respect it. The bias is
+  // dropped the moment the user picks a mode and never applies to another file.
   //
   // This is a separate override rather than a seeded `previewableViewMode`
   // because that state is persisted globally: seeding it to "editor" would write
-  // "editor" back to localStorage, making *every* later markdown file open in
-  // the editor. It must also be reactive — when the user clicks Preview the
-  // stored mode is already "preview", so only flipping this override re-renders
-  // to the preview surface. It's the deep-linked path (not a boolean) so a
-  // navigate-away-and-back doesn't re-trigger the bias on the wrong file.
+  // "editor" back to localStorage, clobbering the user's Preview preference for
+  // every later markdown file. It must also be reactive — when the user clicks
+  // Preview the stored mode is already "preview", so only flipping this override
+  // re-renders to the preview surface. It's the deep-linked path (not a boolean)
+  // so a navigate-away-and-back doesn't re-trigger the bias on the wrong file.
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
@@ -762,10 +762,10 @@ function FileViewerBody({
   };
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
-    // Markdown is a segmented control over three reachable modes: the rendered
-    // Preview (default, issue #970), the rich-text Editor, and raw Source.
-    // Switching away from the editor must guard unsaved edits; the read-only
-    // preview/source surfaces carry no edits, so they switch freely.
+    // Markdown is a segmented control over three reachable modes: the rich-text
+    // Editor (default), the rendered Preview, and raw Source. Switching away
+    // from the editor must guard unsaved edits; the read-only preview/source
+    // surfaces carry no edits, so they switch freely.
     const switchTo = (mode: "preview" | "editor" | "source") => {
       // No-op when already on this surface — re-selecting the active tab must
       // not run the dirty guard (which would pop a discard dialog for nothing).

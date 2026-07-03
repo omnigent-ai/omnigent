@@ -25,25 +25,10 @@ export interface FileViewPreferences {
 
 const STORAGE_KEY = "omnigent:file-view-preferences";
 
-// Bump when a DEFAULT changes such that a value auto-persisted under the old
-// default must NOT keep pinning returning users to it. The file viewer writes
-// its seeded state back on mount (idempotent persist), so every user who ever
-// opened a file already has a `previewableViewMode` in storage even if they
-// never touched a toggle.
-//
-// v2 (issue #970): the previewable default flipped "editor" → "preview". A
-// record without `v === 2` therefore can't distinguish a deliberate "editor"
-// choice from the old auto-written default, so we ignore its previewableViewMode
-// and fall back to the new "preview" default (diff prefs are still honored).
-const SCHEMA_VERSION = 2;
-
 export const DEFAULT_FILE_VIEW_PREFERENCES: FileViewPreferences = {
   diffActive: false,
   diffLayout: "unified",
-  // Previewable files (markdown/html) open in the rendered preview pane by
-  // default. Markdown's editable rich-text view and raw source are one toolbar
-  // tap away; HTML toggles preview ↔ source.
-  previewableViewMode: "preview",
+  previewableViewMode: "editor",
   hideWhitespace: false,
 };
 
@@ -64,20 +49,14 @@ export function readFileViewPreferences(): FileViewPreferences {
       return DEFAULT_FILE_VIEW_PREFERENCES;
     }
     const p = parsed as Record<string, unknown>;
-    // Only trust a stored previewableViewMode written by the CURRENT schema —
-    // a pre-v2 record's value was the old hardcoded default, not a real choice.
-    const isCurrentSchema = p.v === SCHEMA_VERSION;
     return {
       diffActive:
         typeof p.diffActive === "boolean" ? p.diffActive : DEFAULT_FILE_VIEW_PREFERENCES.diffActive,
       diffLayout: p.diffLayout === "split" ? "split" : "unified",
       previewableViewMode:
-        isCurrentSchema &&
-        (p.previewableViewMode === "preview" ||
-          p.previewableViewMode === "editor" ||
-          p.previewableViewMode === "source")
+        p.previewableViewMode === "preview" || p.previewableViewMode === "source"
           ? p.previewableViewMode
-          : "preview",
+          : "editor",
       hideWhitespace:
         typeof p.hideWhitespace === "boolean"
           ? p.hideWhitespace
@@ -95,9 +74,7 @@ export function readFileViewPreferences(): FileViewPreferences {
 export function writeFileViewPreferences(prefs: FileViewPreferences): void {
   if (typeof window === "undefined") return;
   try {
-    // Stamp the schema version so a future read can tell a deliberately-chosen
-    // mode from a value auto-written under an older default (see SCHEMA_VERSION).
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...prefs, v: SCHEMA_VERSION }));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
   } catch {
     // localStorage quota or access errors shouldn't break the app.
   }

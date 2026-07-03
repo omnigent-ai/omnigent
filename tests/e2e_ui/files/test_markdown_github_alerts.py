@@ -81,9 +81,8 @@ def test_github_alerts_render_as_typed_callouts(
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible()
 
-    # Markdown opens in the rendered Preview; switch to the rich-text editor,
-    # where GitHub alerts render as typed callout blockquotes.
-    switch_markdown_view_mode(page, file_viewer, "Edit")
+    # Markdown opens in the rich-text editor by default, where GitHub alerts
+    # render as typed callout blockquotes.
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
 

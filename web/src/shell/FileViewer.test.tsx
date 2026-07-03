@@ -908,11 +908,12 @@ describe("FileViewer view-preference persistence across refresh", () => {
   });
 });
 
-// ── Markdown preview / edit / source modes (issue #970) ─────────────────────
+// ── Markdown preview / edit / source modes ──────────────────────────────────
 //
-// HTML has always had a rendered "preview" pane; markdown only had editor ↔
-// source. Issue #970 adds a read-only rendered preview for markdown and makes
-// it the default, with the rich-text editor and raw source one tap away.
+// HTML has always had a rendered "preview" pane; markdown had editor ↔ source.
+// A read-only rendered preview was added for markdown as a third mode: markdown
+// opens in the rich-text editor by default, with the preview and raw source one
+// tap away in the "View mode" dropdown.
 
 describe("FileViewer markdown preview/edit/source modes", () => {
   beforeEach(() => {
@@ -931,12 +932,12 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: mode }));
   };
 
-  it("opens a markdown file in the rendered preview by default", () => {
+  it("opens a markdown file in the rich-text editor by default", () => {
     // notes.md is not a changed file, so no diff view competes — the default
-    // previewable mode ("preview") must reach CodeViewer for markdown, not be
-    // remapped to source the way it used to be.
+    // previewable mode ("editor") must reach CodeViewer for markdown. Preview
+    // and source are reachable from the toolbar dropdown, not the default.
     renderViewer({ open: true, path: "notes.md" });
-    expect(viewModeOf()).toBe("preview");
+    expect(viewModeOf()).toBe("editor");
   });
 
   it("offers Preview, Edit, and Source options in the view-mode menu", () => {
@@ -1062,10 +1063,19 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(viewModeOf()).toBe("source");
   });
 
-  it("opens a markdown file in the editor when arrived at via a ?comment= deep link", () => {
-    // The read-only preview can't render a comment's anchor highlight, so a
-    // deep-linked markdown comment must land in the editor (a highlightable
-    // surface) instead of the default preview.
+  it("biases a Preview-preferring user into the editor on a ?comment= deep link", () => {
+    // A user whose sticky preference is Preview would normally open markdown in
+    // the read-only preview, which can't render a comment's anchor highlight. A
+    // deep-linked comment must therefore land in the editor (a highlightable
+    // surface). Seed the preference to Preview so the bias is what's under test
+    // (with the default editor preference the file would open in the editor
+    // regardless, exercising nothing).
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+    });
     useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
     renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("editor");
@@ -1077,7 +1087,14 @@ describe("FileViewer markdown preview/edit/source modes", () => {
   it("keeps a dirty deep-linked editor when the discard dialog is cancelled", () => {
     // The bias must only drop when the switch actually proceeds: cancelling the
     // discard prompt has to leave the editor (and its unsaved edits) intact, not
-    // fall through to preview.
+    // fall through to preview. Seed Preview so the bias (not the default) is
+    // what puts us in the editor.
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+    });
     useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
     renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("editor");

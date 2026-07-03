@@ -125,9 +125,8 @@ def test_markdown_renders_rich_constructs_and_source_toggle(
         page.get_by_role("button", name=f"Close {_MARKDOWN_FILE_PATH}", exact=True).first
     ).to_be_visible()
 
-    # Markdown opens in the rendered Preview; switch to the rich-text editor,
-    # where each construct renders as its semantic HTML element.
-    switch_markdown_view_mode(page, file_viewer, "Edit")
+    # Markdown opens in the rich-text editor by default, where each construct
+    # renders as its semantic HTML element.
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
     expect(editor.locator("h1")).to_contain_text("Rich Design Document")
