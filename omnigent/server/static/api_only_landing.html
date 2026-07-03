@@ -1,14 +1,4 @@
-"""Static landing page served at ``/`` when the server has no web UI bundle.
-
-Kept out of :mod:`omnigent.server.app` so the large HTML string doesn't clutter
-the app definition. ``create_app`` serves this at ``/`` with a 200 — only when
-no SPA bundle is mounted (an API-only build, or an install that skipped the web
-UI). A normal install always bundles the UI, so users never see this.
-"""
-
-from __future__ import annotations
-
-API_ONLY_LANDING_HTML = """<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -66,4 +56,3 @@ npm run build</pre>
   </p>
 </body>
 </html>
-"""

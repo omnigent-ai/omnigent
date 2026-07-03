@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -43,7 +43,6 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server._api_only_landing import API_ONLY_LANDING_HTML
 from omnigent.server.auth import AuthProvider
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -133,6 +132,11 @@ _register_web_mimetypes()
 _WEB_UI_DIST = Path(
     os.environ.get("OMNIGENT_WEB_UI_DIST") or (Path(__file__).parent / "static" / "web-ui")
 )
+# Static explainer served at "/" when no web UI bundle is present (an API-only
+# build, or an install that skipped the web UI). Kept as a file rather than an
+# inline string so it doesn't clutter the app definition; it's pure static
+# markup with no interpolation. Shipped via package-data in pyproject.toml.
+_API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.html"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
@@ -2258,9 +2262,9 @@ def create_app(
         # this only applies to API-only servers.
 
         @app.get("/", include_in_schema=False)
-        async def root() -> HTMLResponse:
+        async def root() -> FileResponse:
             """Serve the API-only landing page (no web UI bundle present)."""
-            return HTMLResponse(API_ONLY_LANDING_HTML)
+            return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     return app
 
