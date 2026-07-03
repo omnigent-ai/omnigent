@@ -61,6 +61,7 @@ import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1876,7 +1877,7 @@ export function NewChatLandingScreen() {
   // null = the agent spec's declared harness (no override sent); cleared on
   // every agent switch so a pick never leaks across agents.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
-    () => landingDraft?.pickedHarness ?? null,
+    () => landingDraft?.pickedHarness ?? readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
   );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
@@ -2344,11 +2345,22 @@ export function NewChatLandingScreen() {
   // redundant.
   const agentLabel = selectedAgent ? selectedAgent.display_name : "Select agent";
 
-  // Select an agent/harness from the picker. Switching agents drops the
-  // harness override so a pick never leaks across agents; explicit picks
-  // persist (auto-defaults never do).
+  // Wrap the harness setter so every explicit pick is persisted to
+  // localStorage, keyed by the current agent id.
+  const handleSetPickedHarness = useCallback(
+    (harness: string | null) => {
+      setPickedHarness(harness);
+      writeLastHarness(effectiveAgentId, harness);
+    },
+    [effectiveAgentId],
+  );
+
+  // Select an agent/harness from the picker. Switching agents seeds the
+  // harness override from the user's last pick for that agent (so a
+  // returning user lands on the harness they used last); explicit picks
+  // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
-    if (agent.id !== effectiveAgentId) setPickedHarness(null);
+    if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
@@ -2904,7 +2916,7 @@ export function NewChatLandingScreen() {
                   setBypassSandbox={setBypassSandbox}
                   setPickedModel={setPickedModel}
                   setPickedEffort={setPickedEffort}
-                  setPickedHarness={setPickedHarness}
+                  setPickedHarness={handleSetPickedHarness}
                 />
                 {smartRoutingEnabled &&
                   selectedAgent &&
