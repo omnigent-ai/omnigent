@@ -1063,26 +1063,29 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(viewModeOf()).toBe("source");
   });
 
-  it("biases a Preview-preferring user into the editor on a ?comment= deep link", () => {
-    // A user whose sticky preference is Preview would normally open markdown in
-    // the read-only preview, which can't render a comment's anchor highlight. A
-    // deep-linked comment must therefore land in the editor (a highlightable
-    // surface). Seed the preference to Preview so the bias is what's under test
-    // (with the default editor preference the file would open in the editor
-    // regardless, exercising nothing).
-    writeFileViewPreferences({
-      diffActive: false,
-      diffLayout: "unified",
-      previewableViewMode: "preview",
-      hideWhitespace: false,
-    });
-    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
-    renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
-    expect(viewModeOf()).toBe("editor");
-    // Once the user explicitly picks Preview, the deep-link bias is dropped.
-    selectMode("Preview");
-    expect(viewModeOf()).toBe("preview");
-  });
+  it.each(["preview", "source"] as const)(
+    "forces the editor on a ?comment= deep link even when the preference is %s",
+    (pref) => {
+      // Following a comment link must land on the rich-text editor so the
+      // comment's anchor highlight is visible — that's the whole point of the
+      // link. This holds regardless of the user's sticky preference: Preview
+      // can't render the highlight at all, and even Source is overridden so the
+      // deep link is consistent. Seed a non-editor preference so the bias (not
+      // the default) is what's under test.
+      writeFileViewPreferences({
+        diffActive: false,
+        diffLayout: "unified",
+        previewableViewMode: pref,
+        hideWhitespace: false,
+      });
+      useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+      renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+      expect(viewModeOf()).toBe("editor");
+      // Once the user explicitly picks a mode, the deep-link bias is dropped.
+      selectMode("Preview");
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
 
   it("keeps a dirty deep-linked editor when the discard dialog is cancelled", () => {
     // The bias must only drop when the switch actually proceeds: cancelling the

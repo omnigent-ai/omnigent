@@ -637,21 +637,21 @@ function FileViewerBody({
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
-  // A ?comment= deep link to a markdown file should open where the comment's
-  // anchor is highlighted in context. Markdown defaults to the rich-text editor
-  // (highlightable), so this only matters when the user has made Preview their
-  // sticky preference: the read-only Preview can't render the highlight, so for
-  // that one deep-linked file we bias the initial view to the editor. A stored
-  // editor/source choice is already highlightable, so we respect it. The bias is
-  // dropped the moment the user picks a mode and never applies to another file.
+  // A ?comment= deep link to a markdown file must open on the rich-text editor
+  // so the comment's anchor highlight is visible in context — the whole point
+  // of following the link. The editor is forced regardless of the user's sticky
+  // preference: the read-only Preview can't render the highlight at all, so a
+  // Preview-preferring user would otherwise land on a surface where the comment
+  // they came to see isn't shown. The bias is dropped the moment the user picks
+  // a mode themselves, and never applies to any other file.
   //
   // This is a separate override rather than a seeded `previewableViewMode`
   // because that state is persisted globally: seeding it to "editor" would write
-  // "editor" back to localStorage, clobbering the user's Preview preference for
-  // every later markdown file. It must also be reactive — when the user clicks
-  // Preview the stored mode is already "preview", so only flipping this override
-  // re-renders to the preview surface. It's the deep-linked path (not a boolean)
-  // so a navigate-away-and-back doesn't re-trigger the bias on the wrong file.
+  // "editor" back to localStorage, clobbering the user's own preference for
+  // every later markdown file. It must also be reactive — flipping this override
+  // is what re-renders to the chosen surface once the user picks a mode. It's
+  // the deep-linked path (not a boolean) so a navigate-away-and-back doesn't
+  // re-trigger the bias on the wrong file.
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
@@ -669,7 +669,7 @@ function FileViewerBody({
   // then switching to an HTML file keeps you in source, etc.
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
     ? lang === "markdown"
-      ? deepLinkBiasPath === path && previewableViewMode === "preview"
+      ? deepLinkBiasPath === path
         ? "editor"
         : previewableViewMode
       : previewableViewMode === "editor"
