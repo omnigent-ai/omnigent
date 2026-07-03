@@ -202,3 +202,31 @@ async def test_full_server_async_shims_delegate_to_sync(monkeypatch: pytest.Monk
 
     assert calls[0] == "enter" and calls[-1] == "exit"
     assert any(c.startswith("tool:") and "True" in c for c in calls)
+
+
+# ── native-tui transport (offline) ──────────────────────────────
+
+
+def test_native_tui_registered_and_gates() -> None:
+    """native-tui is in the registry and gates unwired vendors cleanly."""
+    from tests.harness_bench.native_tui_driver import NativeTuiDriver
+    from tests.harness_bench.transport import driver_registry, resolve_driver_class
+
+    assert driver_registry()["native-tui"] is NativeTuiDriver
+
+    # A --transport override routes any profile to the native driver.
+    claude_native = BenchProfile(
+        harness="claude-native", model="m", env_prefix="HARNESS_CLAUDE_NATIVE_", marker="X"
+    )
+    assert resolve_driver_class(claude_native, override="native-tui") is NativeTuiDriver
+
+    # A native harness with no vendor entry (not yet wired) is a clean skip,
+    # never a crash — the walking skeleton only wires claude-native.
+    cursor_native = BenchProfile(
+        harness="cursor-native", model="m", env_prefix="HARNESS_CURSOR_NATIVE_", marker="X"
+    )
+    reason = NativeTuiDriver.unavailable(cursor_native, databricks_profile="oss")
+    assert reason is not None and "cursor-native" in reason
+
+    # No profile → the same capability-neutral skip contract as other drivers.
+    assert NativeTuiDriver.unavailable(claude_native, databricks_profile=None) is not None

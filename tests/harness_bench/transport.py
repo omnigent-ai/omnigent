@@ -86,10 +86,12 @@ def driver_registry() -> dict[str, type]:
     """
     from tests.harness_bench.driver import SdkInprocDriver
     from tests.harness_bench.full_server_driver import FullServerDriver
+    from tests.harness_bench.native_tui_driver import NativeTuiDriver
 
     return {
         SdkInprocDriver.transport: SdkInprocDriver,
         FullServerDriver.transport: FullServerDriver,
+        NativeTuiDriver.transport: NativeTuiDriver,
     }
 
 

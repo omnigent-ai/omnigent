@@ -34,6 +34,7 @@ or correct them as transport coverage lands.
 
 from __future__ import annotations
 
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_capabilities import AuthModel, HarnessCapabilities, IntegrationMode
 from omnigent.harness_plugins import harness_capabilities, model_env_keys
 from tests.e2e._harness_probes import HARNESS_PROBES, HarnessProbe
@@ -104,10 +105,12 @@ def _declared_from_capabilities(harness: str) -> dict[str, Verdict]:
         # interrupt: True → SUPPORTED; False → UNSUPPORTED.
         declared["interrupt"] = Verdict.SUPPORTED if caps.interrupt else Verdict.UNSUPPORTED
 
-    # model_override is backed by the model-env-key registry (the SDK
-    # model-override set), not a capability field: a harness with a
-    # HARNESS_<H>_MODEL env key accepts a caller-specified model.
-    if harness in model_env_keys():
+    # model_override is backed by the registry, not a capability field. An
+    # SDK harness takes it via a HARNESS_<H>_MODEL env key (model_env_keys);
+    # a native harness takes it as a launch --model argv element (see
+    # omnigent/model_override.py). Either path means the harness accepts a
+    # caller-specified model.
+    if harness in model_env_keys() or is_native_harness(harness):
         declared["model_override"] = Verdict.SUPPORTED
 
     return declared
@@ -144,6 +147,61 @@ OFFICIAL_PROFILES: dict[str, BenchProfile] = {
     for probe in HARNESS_PROBES
     if probe.harness in _OFFICIAL_HARNESSES
 }
+
+
+# ── native-tui harnesses ─────────────────────────────────────────
+#
+# Native harnesses are not in HARNESS_PROBES (that matrix is the SDK-wrap
+# e2e set), so their profiles are built directly here.
+#
+# Only claude-native ships as official today. It is an OMNIGENT_CREDENTIAL
+# vendor (the bench can mint its gateway credential) AND its turns surface on
+# the shared session HTTP stream the driver reads (tmux-paste delivery), so
+# the native-tui driver can actually observe it — live-verified end to end.
+#
+# codex-native is deliberately NOT shipped yet: it is also OMNIGENT_CREDENTIAL,
+# but it delivers output via app-server RPC rather than tmux paste, so a turn
+# runs (in_progress → completed) without ever emitting text deltas or
+# persisting an assistant item on the session stream — the shared driver
+# cannot observe it. Its vendor entry stays in the driver's _VENDORS so a
+# `--harness codex-native --transport native-tui` opt-in resolves and
+# skip-gates cleanly, but wiring RPC-delivery observation is a follow-up
+# before it earns an official profile. OWN_AUTH natives (cursor-native,
+# kiro-native, ...) need a vendor login the bench cannot provision, and are
+# likewise left to a --harness <ref> opt-in.
+#
+# model: native harnesses take the model as a launch --model, not a
+# HARNESS_<H>_MODEL env var, so they are absent from model_env_keys() and
+# their model_override declares UNKNOWN (honest — the probe confirms it live
+# once native model-override observation is wired).
+_NATIVE_PROFILES: dict[str, tuple[str, str]] = {
+    # harness: (model, marker)
+    "claude-native": ("databricks-claude-sonnet-4-6", "CLAUDE_NATIVE_OK"),
+}
+
+
+def _native_profile(harness: str, model: str, marker: str) -> BenchProfile:
+    """Build a native-tui :class:`BenchProfile`, columns/verdicts from capabilities."""
+    caps = harness_capabilities().get(harness)
+    # The vendor CLI the driver skip-gates on (claude-native -> "claude").
+    cli_binary = harness.removesuffix("-native")
+    env_prefix = "HARNESS_" + harness.upper().replace("-", "_") + "_"
+    return BenchProfile(
+        harness=harness,
+        model=model,
+        env_prefix=env_prefix,
+        marker=marker,
+        cli_binary=cli_binary,
+        transport="native-tui",
+        owner="",
+        auth=_auth_prose(caps),
+        implementation=_implementation_prose(caps),
+        declared=_declared_from_capabilities(harness),
+    )
+
+
+for _h, (_model, _marker) in _NATIVE_PROFILES.items():
+    OFFICIAL_PROFILES[_h] = _native_profile(_h, _model, _marker)
 
 
 __all__ = ["OFFICIAL_PROFILES"]

@@ -108,6 +108,40 @@ def _mint_bearer(profile: str) -> str:
     return str(json.loads(proc.stdout)["access_token"])
 
 
+def spawn_omnigent_server(
+    tmp: Path, port: int, base_env: dict[str, str], binding_token: str
+) -> subprocess.Popen[bytes]:
+    """Spawn an ``omnigent server`` subprocess writing state under *tmp*.
+
+    Shared by the full-server and native-tui drivers (both need the same
+    server; only what connects to it differs — a bare runner vs a host
+    daemon). Writes ``server.log`` / ``bench.db`` / ``artifacts`` under *tmp*.
+    """
+    db_path = tmp / "bench.db"
+    artifact_dir = tmp / "artifacts"
+    artifact_dir.mkdir(exist_ok=True)
+    log = tmp / "server.log"
+    args = [
+        server_executable(),
+        "-m",
+        "omnigent.cli",
+        "server",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+    ]
+    return subprocess.Popen(
+        args,
+        env={**base_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
+        cwd=compat_server_cwd(),
+        stdout=log.open("wb"),
+        stderr=subprocess.STDOUT,
+    )
+
+
 class FullServerDriver:
     """Drive turns through a live Omnigent server + runner.
 
@@ -227,30 +261,9 @@ class FullServerDriver:
     def _spawn_server(
         self, port: int, base_env: dict[str, str], binding_token: str
     ) -> subprocess.Popen[bytes]:
-        db_path = self._tmp / "bench.db"
-        artifact_dir = self._tmp / "artifacts"
-        artifact_dir.mkdir(exist_ok=True)
-        log = self._tmp / "server.log"
-        self._logs.append(log)
-        args = [
-            server_executable(),
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-        ]
-        return subprocess.Popen(
-            args,
-            env={**base_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-            cwd=compat_server_cwd(),
-            stdout=log.open("wb"),
-            stderr=subprocess.STDOUT,
-        )
+        proc = spawn_omnigent_server(self._tmp, port, base_env, binding_token)
+        self._logs.append(self._tmp / "server.log")
+        return proc
 
     def _spawn_runner(
         self, base_env: dict[str, str], runner_id: str, binding_token: str
