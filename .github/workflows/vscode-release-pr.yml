@@ -201,7 +201,7 @@ jobs:
 
           url = os.environ["GATEWAY_BASE_URL"].rstrip("/") + "/chat/completions"
           payload = json.dumps({
-              "model": "databricks-claude-opus-4-8",
+              "model": "databricks-claude-sonnet-4-6",
               "max_tokens": 1024,
               "temperature": 0,
               "messages": [
