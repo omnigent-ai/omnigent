@@ -266,6 +266,46 @@ def test_put_wraps_failure(fake_sbx: _FakeSbx) -> None:
         SbxSandboxLauncher().put("box", Path("/tmp/x"), "/tmp/x")
 
 
+def test_put_retries_transient_failure_then_succeeds(
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A fresh sandbox's `sbx cp` transport can flake once right after
+    `provision` (confirmed live: the first copy fails with a truncated
+    tar extract, an immediate manual retry always succeeds). put()
+    retries transiently-failed copies instead of giving up outright.
+    """
+    monkeypatch.setattr(sbxmod.time, "sleep", lambda seconds: None)
+    attempts: list[int] = []
+
+    def flaky_run(argv: list[str], **kwargs: object) -> _FakeCompleted:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return _FakeCompleted(
+                args=argv,
+                returncode=1,
+                stderr="ERROR: tar extract failed: tar: Unexpected EOF in archive",
+            )
+        return _FakeCompleted(args=argv, returncode=0)
+
+    monkeypatch.setattr(sbxmod.subprocess, "run", flaky_run)
+    SbxSandboxLauncher().put("box", Path("/tmp/oa-wheels.tgz"), "/tmp/oa-wheels.tgz")
+    assert len(attempts) == 2
+
+
+def test_put_gives_up_after_retries_exhausted(
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy that keeps failing still raises, naming the last error."""
+    monkeypatch.setattr(sbxmod.time, "sleep", lambda seconds: None)
+    fake_sbx.responses["cp"] = _FakeCompleted(
+        args=[], returncode=1, stderr="tar: Unexpected EOF in archive"
+    )
+    with pytest.raises(click.ClickException, match="Unexpected EOF"):
+        SbxSandboxLauncher().put("box", Path("/tmp/x"), "/tmp/x")
+    assert len(fake_sbx.calls) == 3
+
+
 # ── wheel_install_command ───────────────────────────────────
 
 
@@ -279,6 +319,12 @@ def test_wheel_install_is_full_install(fake_sbx: _FakeSbx) -> None:
     assert "tar xzf /tmp/oa-wheels.tgz" in cmd
     assert "pip install" in cmd
     assert "--user" in cmd
+    # Required: opentelemetry-instrumentation-fastapi has never cut a
+    # non-beta release, so a plain install excludes every version
+    # matching the pin and fails outright (confirmed against a real
+    # sandbox — the prebaked-image launchers' --no-deps install never
+    # exercises this dependency).
+    assert "--pre" in cmd
     assert "--no-deps" not in cmd
     assert "--force-reinstall" not in cmd
 

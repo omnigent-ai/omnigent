@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
@@ -227,17 +228,32 @@ class SbxSandboxLauncher(SandboxLauncher):
         """
         Copy a local file into the sandbox via ``sbx cp``.
 
+        A sandbox's copy transport can flake on the very first transfer
+        right after :meth:`provision` — confirmed live: the first ``sbx
+        cp`` after a fresh create fails with a truncated tar extract,
+        and an immediate manual retry always succeeds. ``cp`` is
+        idempotent (it overwrites the destination), so a few quick
+        retries are safe and turn that transient race into a no-op for
+        callers.
+
         :param sandbox_id: Target sandbox name.
         :param local_path: Local file to read.
         :param remote_path: Absolute destination path inside the sandbox.
-        :raises click.ClickException: When the transfer fails.
+        :raises click.ClickException: When every attempt fails.
         """
-        result = self._run_sbx(["cp", str(local_path), f"{sandbox_id}:{remote_path}"])
-        if result.returncode != 0:
-            raise click.ClickException(
-                f"File copy to sandbox '{sandbox_id}' failed: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
+        attempts = 3
+        result = None
+        for attempt in range(1, attempts + 1):
+            result = self._run_sbx(["cp", str(local_path), f"{sandbox_id}:{remote_path}"])
+            if result.returncode == 0:
+                return
+            if attempt < attempts:
+                time.sleep(2)
+        assert result is not None
+        raise click.ClickException(
+            f"File copy to sandbox '{sandbox_id}' failed after {attempts} attempts: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """
@@ -248,8 +264,13 @@ class SbxSandboxLauncher(SandboxLauncher):
         ``--no-deps`` / ``--force-reinstall``). ``--user`` lands the
         install where the bootstrap's PATH-persistence step adds to PATH
         (``$HOME/.local/bin``). ``--break-system-packages`` tolerates a
-        PEP-668 externally-managed base python (drop it if the discovery
-        task showed PEP 668 is not in force).
+        PEP-668 externally-managed base python. ``--pre`` is required:
+        omnigent depends on ``opentelemetry-instrumentation-fastapi``,
+        which has never cut a non-beta release, so a plain ``pip
+        install`` excludes every version that satisfies the pin and
+        fails outright — confirmed live against a real sbx sandbox,
+        where the prebaked-image launchers' ``--no-deps`` install never
+        exercises this dependency at all.
 
         :param remote_tgz_path: Sandbox path of the shipped tarball.
         :returns: Shell command string for :meth:`run`.
@@ -257,7 +278,7 @@ class SbxSandboxLauncher(SandboxLauncher):
         return (
             "cd /tmp && rm -rf oa-wheels && mkdir oa-wheels && "
             f"tar xzf {remote_tgz_path} -C oa-wheels --warning=no-unknown-keyword && "
-            "pip install --user --break-system-packages "
+            "pip install --user --break-system-packages --pre "
             "--no-warn-script-location oa-wheels/*.whl"
         )
 
