@@ -17,8 +17,8 @@ The goal is:
 ## Package Contract
 
 An optional harness package declares an entry point in the
-`omnigent.community.harnesses` group. Community harness implementation modules
-must also live under the `omnigent.community.harnesses.*` namespace; core rejects
+`omnigent.community.harness` group. Community harness implementation modules
+must also live under the `omnigent.community.harness.*` namespace; core rejects
 plugins that try to register flat packages or override builtin harness names.
 
 ```toml
@@ -28,8 +28,8 @@ dependencies = [
   "omnigent==0.3.0.dev0",
 ]
 
-[project.entry-points."omnigent.community.harnesses"]
-foo = "omnigent.community.harnesses.foo.plugin:get_contribution"
+[project.entry-points."omnigent.community.harness"]
+foo = "omnigent.community.harness.foo.plugin:get_contribution"
 ```
 
 For local sibling checkouts, keep the package dependency normal and point uv at
@@ -68,7 +68,7 @@ def get_contribution() -> HarnessContribution:
         name="omnigent-foo",
         valid_harnesses=frozenset({"foo"}),
         harness_modules={
-            "foo": "omnigent.community.harnesses.foo.inner.foo_harness",
+            "foo": "omnigent.community.harness.foo.inner.foo_harness",
         },
         aliases={
             "foo-code": "foo",
@@ -136,7 +136,7 @@ and merged into web picker surfaces.
 
 ## Runtime Flow
 
-1. Python loads installed entry points in `omnigent.community.harnesses`.
+1. Python loads installed entry points in `omnigent.community.harness`.
 2. `omnigent.harness_plugins.plugin_state()` merges the built-in contribution
    with each plugin contribution.
 3. Spec validation checks `accepted_harnesses()` and uses
@@ -154,7 +154,7 @@ and merged into web picker surfaces.
 For a non-native harness:
 
 - Create a separate package, for example `omnigent-foo`.
-- Add the `omnigent.community.harnesses` entry point.
+- Add the `omnigent.community.harness` entry point.
 - Implement `get_contribution()`.
 - Fill `valid_harnesses`, `harness_modules`, and `aliases`.
 - Add `install_specs` and `harness_install_keys` if the harness needs a CLI.

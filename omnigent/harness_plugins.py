@@ -2,7 +2,7 @@
 
 Core Omnigent contributes the built-in harnesses directly. Optional community
 packages contribute additional harnesses through the
-``omnigent.community.harnesses`` entry point group.
+``omnigent.community.harness`` entry point group.
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ from omnigent.harness_install_spec import HarnessInstallSpec
 
 _logger = logging.getLogger(__name__)
 
-COMMUNITY_ENTRY_POINT_GROUP = "omnigent.community.harnesses"
-COMMUNITY_MODULE_PREFIX = "omnigent.community.harnesses."
+COMMUNITY_ENTRY_POINT_GROUP = "omnigent.community.harness"
+COMMUNITY_MODULE_PREFIX = "omnigent.community.harness."
 
 
 @dataclass(frozen=True)
