@@ -1,7 +1,6 @@
 import {
   ArrowDownAZIcon,
   ArrowDownWideNarrowIcon,
-  ChevronDownIcon,
   EyeIcon,
   EyeOffIcon,
   FileClockIcon,
@@ -22,7 +21,6 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
-import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -52,22 +50,16 @@ interface FilesPanelProps {
   sort: ChangedSort;
   onSortChange: (sort: ChangedSort) => void;
   /**
-   * When provided, the panel renders an X close button in the header
-   * (replacing the expand toggle) and fills its parent's height —
-   * dropping the rounded card chrome so it can serve as the entire
-   * content of a full-screen drawer. The collapse chevron and the
-   * expand toggle are hidden too: a full-screen drawer already owns
-   * the viewport, so those affordances would be a no-op or actively
-   * confusing.
+   * When provided, the panel renders an X close button in the header and
+   * fills its parent's height — dropping the rounded card chrome so it can
+   * serve as the entire content of a full-screen drawer.
    */
   onClose?: () => void;
   /**
    * Frameless mode: drops the rounded card chrome and fills the parent
    * container's height (like the `onClose` drawer) — but without a close
    * button. Used by the inline right panel where the panel is embedded in a
-   * split layout rather than a drawer. Unlike the drawer, it keeps the
-   * collapsible "Working folder" button header (with its chevron and
-   * `aria-expanded`), so the header stays a focusable, toggleable control.
+   * split layout rather than a drawer.
    */
   frameless?: boolean;
 }
@@ -260,8 +252,7 @@ function SearchFilterInput({
 // ---------------------------------------------------------------------------
 
 /**
- * Right-side Files card. Always visible on desktop; collapses its content via
- * the chevron in the header.
+ * Right-side Files card. Always visible on desktop.
  *
  * - Flat view: changed files only (registry-backed, any depth).
  * - Tree view: all on-disk files in the workspace root, expandable folders.
@@ -293,7 +284,6 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
-  const [collapsed, setCollapsed] = useState(() => readFilesPanelPreferences().collapsed);
   const [changedSearch, setChangedSearch] = useState("");
   const [treeSearch, setTreeSearch] = useState("");
   const [debouncedTreeSearch, setDebouncedTreeSearch] = useState("");
@@ -304,25 +294,19 @@ export function FilesPanel({
   const [treeExclude, setTreeExclude] = useState("");
   const [debouncedTreeExclude, setDebouncedTreeExclude] = useState("");
   const [showSearchFilters, setShowSearchFilters] = useState(false);
-  // The drawer (onClose) owns the full viewport, so it gets a static,
-  // always-open header with its own X close button — a collapse chevron there
-  // would be a no-op. The inline rail (frameless) and the standalone card keep
-  // the collapsible "Working folder" *button* header (accessible name +
-  // aria-expanded), which is what lets it be focused/toggled and asserted on.
-  const isDrawer = onClose !== undefined;
-  // Both the drawer and the inline rail fill their parent's height and drop the
+  // The drawer (onClose) adds an X close button to the header. Both the drawer
+  // and the inline rail (frameless) fill their parent's height and drop the
   // rounded card chrome; only the standalone card caps content at max-h.
+  const isDrawer = onClose !== undefined;
   const fillHeight = isDrawer || frameless === true;
-  // The drawer is always open; everywhere else the header chevron toggles it.
-  const contentVisible = isDrawer || !collapsed;
   const changedQuery = useWorkspaceChangedFiles(conversationId, {
-    enabled: contentVisible,
+    enabled: true,
   });
   const allFilesQuery = useWorkspaceAllFiles(conversationId, {
-    enabled: contentVisible && !flatView,
+    enabled: !flatView,
   });
   const envQuery = useWorkspaceEnvironment(conversationId, {
-    enabled: contentVisible,
+    enabled: true,
   });
   const workingDir = envQuery.data?.root ?? null;
   const changedCount = changedQuery.data?.data.length ?? 0;
@@ -359,7 +343,7 @@ export function FilesPanel({
     debouncedTreeInclude,
     debouncedTreeExclude,
     {
-      enabled: contentVisible && !flatView && debouncedTreeSearch.trim().length > 0,
+      enabled: !flatView && debouncedTreeSearch.trim().length > 0,
     },
   );
   // Highlight the filters toggle when include/exclude carry a value.
@@ -372,204 +356,154 @@ export function FilesPanel({
         fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
       )}
     >
-      {/* Header — single row: [title · workingDir] [eye] [chevron / close] */}
+      {/* Header — single row: [title · workingDir] [eye] [close?] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        {isDrawer ? (
-          <>
-            <span className="shrink-0 font-medium text-sm">Working folder</span>
-            {workingDir && <WorkingDirLabel dir={workingDir} />}
-            <div className="ml-auto flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-              <HiddenFilesToggle
-                showHidden={showHidden}
-                onToggle={() => onShowHiddenChange(!showHidden)}
-                size="4"
-                hiddenCount={hiddenFilesCount}
-              />
-              {onClose && (
-                <button
-                  type="button"
-                  aria-label="Close files"
-                  className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  onClick={onClose}
-                >
-                  <XIcon className="size-4" />
-                </button>
-              )}
-            </div>
-          </>
-        ) : (
-          <>
+        <span className="shrink-0 font-medium text-sm">Working folder</span>
+        {workingDir && <WorkingDirLabel dir={workingDir} />}
+        <div className="ml-auto flex items-center gap-1">
+          <HiddenFilesToggle
+            showHidden={showHidden}
+            onToggle={() => onShowHiddenChange(!showHidden)}
+            size={isDrawer ? "4" : "3.5"}
+            hiddenCount={hiddenFilesCount}
+          />
+          {onClose && (
             <button
               type="button"
-              className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-              onClick={() =>
-                setCollapsed((v) => {
-                  const next = !v;
-                  writeFilesPanelPreferences({ ...readFilesPanelPreferences(), collapsed: next });
-                  return next;
-                })
-              }
-              aria-expanded={!collapsed}
+              aria-label="Close files"
+              className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+              onClick={onClose}
             >
-              <span className="shrink-0 font-medium text-sm">Working folder</span>
-              {workingDir && <WorkingDirLabel dir={workingDir} />}
-              <ChevronDownIcon
-                className={cn(
-                  "ml-auto size-4 shrink-0 text-muted-foreground transition-transform duration-150",
-                  collapsed && "-rotate-90",
-                )}
-              />
+              <XIcon className="size-4" />
             </button>
-            {!collapsed && (
-              <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                <HiddenFilesToggle
-                  showHidden={showHidden}
-                  onToggle={() => onShowHiddenChange(!showHidden)}
-                  size="3.5"
-                  hiddenCount={hiddenFilesCount}
-                />
-              </div>
-            )}
-          </>
-        )}
+          )}
+        </div>
       </div>
       {/* Content */}
-      {contentVisible && (
-        <>
-          <div className="shrink-0 border-t border-border" />
-          {/* Search toolbar — the Changed | All scope switch leads, then the
+      <div className="shrink-0 border-t border-border" />
+      {/* Search toolbar — the Changed | All scope switch leads, then the
               search field, then the per-view trailing control (Sort for the
               changed list, glob filters for the tree). Lives outside the
               scroll container so negative margins aren't clipped. */}
-          {flatView && (
-            <div
-              className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <FileScopeSwitch
-                flatView={flatView}
-                onChange={onFlatViewChange}
-                count={changedCount}
+      {flatView && (
+        <div
+          className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
+              <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
+              <input
+                aria-label="Search changed files"
+                className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                onChange={(event) => setChangedSearch(event.target.value)}
+                placeholder="Search"
+                type="search"
+                value={changedSearch}
               />
-              <div className="flex min-w-0 flex-1 items-center gap-2">
-                <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
-                  <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
-                  <input
-                    aria-label="Search changed files"
-                    className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
-                    onChange={(event) => setChangedSearch(event.target.value)}
-                    placeholder="Search"
-                    type="search"
-                    value={changedSearch}
-                  />
-                </div>
-                <SortSelector sort={changedSort} onChange={onSortChange} />
-              </div>
             </div>
-          )}
-          {!flatView && (
-            <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
-              <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-                <FileScopeSwitch
-                  flatView={flatView}
-                  onChange={onFlatViewChange}
-                  count={changedCount}
-                />
-                <div className="flex min-w-0 flex-1 items-center gap-2">
-                  <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
-                    <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
-                    <input
-                      aria-label="Search all files"
-                      className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
-                      onChange={(event) => setTreeSearch(event.target.value)}
-                      placeholder="Search"
-                      type="search"
-                      value={treeSearch}
-                    />
-                  </div>
-                  <button
-                    type="button"
-                    aria-label={showSearchFilters ? "Hide search filters" : "Show search filters"}
-                    aria-expanded={showSearchFilters}
-                    title="Files to include / exclude"
-                    className={cn(
-                      "flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] hover:bg-muted",
-                      showSearchFilters || treeFiltersActive
-                        ? "text-foreground"
-                        : "text-muted-foreground hover:text-foreground",
-                    )}
-                    onClick={() => setShowSearchFilters((v) => !v)}
-                  >
-                    <SlidersHorizontalIcon className="size-3.5" />
-                    {treeFiltersActive && !showSearchFilters && (
-                      <span className="size-1.5 rounded-full bg-primary" aria-hidden />
-                    )}
-                  </button>
-                  <SortSelector sort={changedSort} onChange={onSortChange} />
-                </div>
-              </div>
-              {showSearchFilters && (
-                <div className="flex flex-col gap-1.5 border-border border-t px-3 py-2">
-                  <SearchFilterInput
-                    label="files to include"
-                    placeholder="e.g. *.ts, src/**"
-                    value={treeInclude}
-                    onChange={setTreeInclude}
-                  />
-                  <SearchFilterInput
-                    label="files to exclude"
-                    placeholder="e.g. **/node_modules, *.test.ts"
-                    value={treeExclude}
-                    onChange={setTreeExclude}
-                  />
-                </div>
-              )}
-            </div>
-          )}
-          <section
-            className={cn(
-              "overflow-y-auto px-2 pb-2",
-              flatView ? "pt-1" : "pt-2",
-              fillHeight ? "min-h-0 flex-1" : "max-h-72",
-            )}
-          >
-            {flatView ? (
-              <FlatFileList
-                files={changedQuery.data?.data}
-                isLoading={changedQuery.isLoading}
-                isError={changedQuery.isError}
-                error={changedQuery.error}
-                onFileSelect={onFileSelect}
-                showHidden={showHidden}
-                onShowHidden={() => onShowHiddenChange(true)}
-                searchQuery={changedSearch}
-                sort={changedSort}
-                conversationId={conversationId}
-                runnerWentOffline={runnerWentOffline}
-              />
-            ) : (
-              <FolderTree
-                files={allFilesQuery.data?.data}
-                isLoading={allFilesQuery.isLoading}
-                isError={allFilesQuery.isError}
-                error={allFilesQuery.error}
-                onFileSelect={onFileSelect}
-                conversationId={conversationId}
-                showHidden={showHidden}
-                onShowHidden={() => onShowHiddenChange(true)}
-                changedFiles={changedQuery.data?.data}
-                sort={changedSort}
-                runnerWentOffline={runnerWentOffline}
-                searchQuery={debouncedTreeSearch}
-                searchResults={treeSearchQuery.data}
-                isSearching={treeSearchQuery.isFetching}
-                isSearchError={treeSearchQuery.isError}
-                searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
-              />
-            )}
-          </section>
-        </>
+            <SortSelector sort={changedSort} onChange={onSortChange} />
+          </div>
+        </div>
       )}
+      {!flatView && (
+        <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
+            <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
+                <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
+                <input
+                  aria-label="Search all files"
+                  className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                  onChange={(event) => setTreeSearch(event.target.value)}
+                  placeholder="Search"
+                  type="search"
+                  value={treeSearch}
+                />
+              </div>
+              <button
+                type="button"
+                aria-label={showSearchFilters ? "Hide search filters" : "Show search filters"}
+                aria-expanded={showSearchFilters}
+                title="Files to include / exclude"
+                className={cn(
+                  "flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] hover:bg-muted",
+                  showSearchFilters || treeFiltersActive
+                    ? "text-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+                onClick={() => setShowSearchFilters((v) => !v)}
+              >
+                <SlidersHorizontalIcon className="size-3.5" />
+                {treeFiltersActive && !showSearchFilters && (
+                  <span className="size-1.5 rounded-full bg-primary" aria-hidden />
+                )}
+              </button>
+              <SortSelector sort={changedSort} onChange={onSortChange} />
+            </div>
+          </div>
+          {showSearchFilters && (
+            <div className="flex flex-col gap-1.5 border-border border-t px-3 py-2">
+              <SearchFilterInput
+                label="files to include"
+                placeholder="e.g. *.ts, src/**"
+                value={treeInclude}
+                onChange={setTreeInclude}
+              />
+              <SearchFilterInput
+                label="files to exclude"
+                placeholder="e.g. **/node_modules, *.test.ts"
+                value={treeExclude}
+                onChange={setTreeExclude}
+              />
+            </div>
+          )}
+        </div>
+      )}
+      <section
+        className={cn(
+          "overflow-y-auto px-2 pb-2",
+          flatView ? "pt-1" : "pt-2",
+          fillHeight ? "min-h-0 flex-1" : "max-h-72",
+        )}
+      >
+        {flatView ? (
+          <FlatFileList
+            files={changedQuery.data?.data}
+            isLoading={changedQuery.isLoading}
+            isError={changedQuery.isError}
+            error={changedQuery.error}
+            onFileSelect={onFileSelect}
+            showHidden={showHidden}
+            onShowHidden={() => onShowHiddenChange(true)}
+            searchQuery={changedSearch}
+            sort={changedSort}
+            conversationId={conversationId}
+            runnerWentOffline={runnerWentOffline}
+          />
+        ) : (
+          <FolderTree
+            files={allFilesQuery.data?.data}
+            isLoading={allFilesQuery.isLoading}
+            isError={allFilesQuery.isError}
+            error={allFilesQuery.error}
+            onFileSelect={onFileSelect}
+            conversationId={conversationId}
+            showHidden={showHidden}
+            onShowHidden={() => onShowHiddenChange(true)}
+            changedFiles={changedQuery.data?.data}
+            sort={changedSort}
+            runnerWentOffline={runnerWentOffline}
+            searchQuery={debouncedTreeSearch}
+            searchResults={treeSearchQuery.data}
+            isSearching={treeSearchQuery.isFetching}
+            isSearchError={treeSearchQuery.isError}
+            searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
+          />
+        )}
+      </section>
     </div>
   );
 }
