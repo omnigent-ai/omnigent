@@ -863,3 +863,223 @@ def test_init_forces_unified_provider_mode(
     monkeypatch.setattr(telemetry, "_metrics_initialized", False)
     telemetry.init()
     assert os.environ.get("MLFLOW_USE_DEFAULT_TRACER_PROVIDER") == "false"
+
+
+# ── GenAI OTel metric instruments (#1053) ─────────────────
+
+
+@pytest.fixture
+def metric_reader() -> Iterator[Any]:
+    """
+    Install a fresh in-memory metric reader so tests can assert on
+    emitted histogram data points without network I/O.
+
+    Resets the module-level histogram vars before and after each
+    test so instrument state does not leak between tests.
+    """
+    from opentelemetry import metrics as otel_metrics
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics.set_meter_provider(provider)
+
+    meter = otel_metrics.get_meter("omnigent-test")
+    token_hist = meter.create_histogram("gen_ai.client.token.usage", unit="{token}")
+    op_hist = meter.create_histogram("gen_ai.client.operation.duration", unit="s")
+    tool_hist = meter.create_histogram("agent.tool.duration", unit="s")
+
+    telemetry._token_usage_histogram = token_hist  # type: ignore[attr-defined]
+    telemetry._operation_duration_histogram = op_hist  # type: ignore[attr-defined]
+    telemetry._tool_duration_histogram = tool_hist  # type: ignore[attr-defined]
+
+    yield reader
+
+    telemetry._token_usage_histogram = None  # type: ignore[attr-defined]
+    telemetry._operation_duration_histogram = None  # type: ignore[attr-defined]
+    telemetry._tool_duration_histogram = None  # type: ignore[attr-defined]
+
+
+def _collect_metrics(reader: Any) -> dict[str, Any]:
+    """
+    Flush the reader and return a flat dict keyed by metric name.
+
+    :param reader: ``InMemoryMetricReader`` fixture value.
+    :returns: Dict mapping metric name to its ``Metric`` object.
+    """
+    metrics = reader.get_metrics_data()
+    result: dict[str, Any] = {}
+    for rm in metrics.resource_metrics:
+        for sm in rm.scope_metrics:
+            for m in sm.metrics:
+                result[m.name] = m
+    return result
+
+
+def test_record_llm_usage_emits_token_usage_histogram(
+    in_memory_exporter: InMemorySpanExporter,
+    metric_reader: Any,
+) -> None:
+    """
+    ``record_llm_usage`` with a model string emits input and output
+    token counts to ``gen_ai.client.token.usage`` with the correct
+    attributes (``gen_ai.provider.name``, ``gen_ai.request.model``,
+    ``gen_ai.token.type``).
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL) as span:
+            telemetry.record_llm_usage(
+                span,
+                {"input_tokens": 200, "output_tokens": 80},
+                model="anthropic/claude-sonnet-4-6",
+            )
+
+    metrics = _collect_metrics(metric_reader)
+    assert "gen_ai.client.token.usage" in metrics, (
+        "expected gen_ai.client.token.usage metric, got: " + str(list(metrics.keys()))
+    )
+
+    data_points = metrics["gen_ai.client.token.usage"].data.data_points
+    by_type = {dp.attributes.get("gen_ai.token.type"): dp for dp in data_points}
+
+    assert by_type["input"].sum == 200, f"expected input sum=200, got {by_type['input'].sum}"
+    assert by_type["output"].sum == 80, f"expected output sum=80, got {by_type['output'].sum}"
+    assert by_type["input"].attributes["gen_ai.provider.name"] == "anthropic"
+    assert by_type["input"].attributes["gen_ai.request.model"] == "claude-sonnet-4-6"
+
+
+def test_record_llm_usage_emits_operation_duration_histogram(
+    in_memory_exporter: InMemorySpanExporter,
+    metric_reader: Any,
+) -> None:
+    """
+    ``record_llm_usage`` with ``duration_s`` emits to
+    ``gen_ai.client.operation.duration`` keyed by provider and model.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL) as span:
+            telemetry.record_llm_usage(
+                span,
+                {"input_tokens": 10, "output_tokens": 5},
+                model="openai/gpt-5.4",
+                duration_s=1.5,
+            )
+
+    metrics = _collect_metrics(metric_reader)
+    assert "gen_ai.client.operation.duration" in metrics, (
+        "expected gen_ai.client.operation.duration metric"
+    )
+
+    data_points = metrics["gen_ai.client.operation.duration"].data.data_points
+    assert len(data_points) == 1
+    dp = data_points[0]
+    assert dp.sum == pytest.approx(1.5, rel=1e-6)
+    assert dp.attributes["gen_ai.provider.name"] == "openai"
+    assert dp.attributes["gen_ai.request.model"] == "gpt-5.4"
+    assert dp.attributes["gen_ai.operation.name"] == "chat"
+
+
+def test_record_llm_usage_no_metrics_when_histograms_uninitialized(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``record_llm_usage`` is backward-compatible: when the OTel meter
+    provider is not configured (histogram vars are None), calling it
+    with or without ``model`` raises no error and only records the
+    MLflow span attribute.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+    from mlflow.tracing.constant import SpanAttributeKey
+
+    monkeypatch.setattr(telemetry, "_token_usage_histogram", None)
+    monkeypatch.setattr(telemetry, "_operation_duration_histogram", None)
+
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL) as span:
+            telemetry.record_llm_usage(
+                span,
+                {"input_tokens": 5, "output_tokens": 3},
+                model="anthropic/claude-haiku-4-5",
+                duration_s=0.8,
+            )
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert len(spans) == 1
+    payload = _read_attr(spans[0], SpanAttributeKey.CHAT_USAGE)
+    assert payload["input_tokens"] == 5
+    assert payload["output_tokens"] == 3
+
+
+def test_record_tool_metric_emits_tool_duration_histogram(
+    metric_reader: Any,
+) -> None:
+    """
+    ``record_tool_metric`` emits the ``agent.tool.duration`` histogram
+    in seconds (converted from milliseconds) with an
+    ``agent.tool.name`` attribute.
+    """
+    telemetry.record_tool_metric("web_search", 350.0)
+
+    metrics = _collect_metrics(metric_reader)
+    assert "agent.tool.duration" in metrics, (
+        "expected agent.tool.duration metric, got: " + str(list(metrics.keys()))
+    )
+
+    data_points = metrics["agent.tool.duration"].data.data_points
+    assert len(data_points) == 1
+    dp = data_points[0]
+    assert dp.sum == pytest.approx(0.35, rel=1e-6), (
+        f"expected 0.35s (350ms / 1000), got {dp.sum}"
+    )
+    assert dp.attributes["agent.tool.name"] == "web_search"
+
+
+def test_record_tool_metric_noop_when_histogram_uninitialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``record_tool_metric`` is a no-op when no OTel meter provider is
+    configured -- no exception, no side effects.
+    """
+    monkeypatch.setattr(telemetry, "_tool_duration_histogram", None)
+    telemetry.record_tool_metric("web_fetch", 100.0)  # must not raise
+
+
+def test_record_llm_usage_no_histogram_when_model_is_none(
+    in_memory_exporter: InMemorySpanExporter,
+    metric_reader: Any,
+) -> None:
+    """
+    ``record_llm_usage`` with no ``model`` argument emits no metric
+    data points even when the OTel histograms are initialized.
+    The MLflow span attribute is still set.
+    """
+    import mlflow
+    from mlflow.entities import SpanType
+    from mlflow.tracing.constant import SpanAttributeKey
+
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL) as span:
+            telemetry.record_llm_usage(span, {"input_tokens": 7, "output_tokens": 3})
+
+    # Span attribute must still be set.
+    spans = in_memory_exporter.get_finished_spans()
+    payload = _read_attr(spans[0], SpanAttributeKey.CHAT_USAGE)
+    assert payload["input_tokens"] == 7
+
+    # No metric data points should have been emitted.
+    metrics = _collect_metrics(metric_reader)
+    token_metric = metrics.get("gen_ai.client.token.usage")
+    if token_metric is not None:
+        assert len(token_metric.data.data_points) == 0, (
+            "expected no data points when model is None"
+        )

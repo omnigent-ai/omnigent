@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import secrets
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -409,6 +410,7 @@ class ExecutorAdapter(HarnessApp):
                     )
 
                 response_text: str | None = None
+                _turn_start_s = time.monotonic()
                 async for event in executor.run_turn(
                     messages=messages,
                     tools=tools,
@@ -446,12 +448,26 @@ class ExecutorAdapter(HarnessApp):
                                 _active_tool_parent = None
                         elif isinstance(event, TurnComplete):
                             response_text = event.response
-                            if event.usage is not None:
+                            if event.usage is not None and agent_span is not None:
                                 from omnigent.runtime.telemetry import record_llm_usage
 
                                 # Record usage on the agent span for
                                 # aggregate visibility.
-                                record_llm_usage(agent_span, event.usage)
+                                record_llm_usage(
+                                    agent_span,
+                                    event.usage,
+                                    model=request.model_override or request.model,
+                                    duration_s=time.monotonic() - _turn_start_s,
+                                )
+                    # Emit tool duration metric outside the tracing guard so
+                    # metrics fire even when MLflow tracing is not configured.
+                    if isinstance(event, ToolCallComplete) and event.duration_ms >= 0:
+                        from omnigent.runtime.telemetry import record_tool_metric
+
+                        record_tool_metric(
+                            _strip_mcp_tool_prefix(event.name),
+                            event.duration_ms,
+                        )
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):

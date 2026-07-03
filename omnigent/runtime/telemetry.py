@@ -61,6 +61,12 @@ _initialized: bool = False
 _metrics_initialized: bool = False
 _logs_initialized: bool = False
 
+# GenAI OTel semantic convention histogram instruments.
+# Populated by _init_otel_metrics(); None when no meter provider is configured.
+_token_usage_histogram: Any | None = None
+_operation_duration_histogram: Any | None = None
+_tool_duration_histogram: Any | None = None
+
 
 class _RemoteParentTraceState:
     """
@@ -342,15 +348,29 @@ def trace_context_for_response(
         yield
 
 
-def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
+def record_llm_usage(
+    span: LiveSpan,
+    usage: dict[str, Any],
+    *,
+    model: str | None = None,
+    duration_s: float | None = None,
+) -> None:
     """
-    Record token usage on an LLM span.
+    Record token usage on an LLM span and emit OTel metric instruments.
 
     MLflow stores usage as a single JSON dict under
     ``mlflow.chat.tokenUsage`` and translates each field to the
-    corresponding ``gen_ai.usage.*`` attribute on OTLP export —
+    corresponding ``gen_ai.usage.*`` attribute on OTLP export --
     ``input_tokens``, ``output_tokens``, ``total_tokens``, plus
     optional cache fields.
+
+    When ``model`` is provided and the OTel meter provider is
+    configured, also emits:
+
+    * ``gen_ai.client.token.usage`` histogram -- one data point per
+      token type (``gen_ai.token.type=input`` / ``output``).
+    * ``gen_ai.client.operation.duration`` histogram -- when
+      ``duration_s`` is also provided.
 
     Cache breakdown attributes are recorded only when present.
     Their absence is meaningful (the provider did not report
@@ -361,6 +381,14 @@ def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
         keys: ``"input_tokens"``, ``"output_tokens"``,
         ``"total_tokens"``, ``"cache_read_input_tokens"``,
         ``"cache_creation_input_tokens"``.
+    :param model: Provider-prefixed model string, e.g.
+        ``"anthropic/claude-sonnet-4-6"``. When set, metric
+        attributes ``gen_ai.provider.name`` and
+        ``gen_ai.request.model`` are derived via
+        :func:`parse_provider_name`.
+    :param duration_s: Wall time of the LLM turn in seconds.
+        Emitted to ``gen_ai.client.operation.duration`` when
+        ``model`` is also set.
     """
     from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
 
@@ -379,6 +407,45 @@ def record_llm_usage(span: LiveSpan, usage: dict[str, Any]) -> None:
             usage["cache_creation_input_tokens"]
         )
     span.set_attribute(SpanAttributeKey.CHAT_USAGE, payload)
+
+    if model and (_token_usage_histogram is not None or _operation_duration_histogram is not None):
+        provider_name, model_name = parse_provider_name(model)
+        metric_attrs: dict[str, str] = {
+            "gen_ai.provider.name": provider_name,
+            "gen_ai.request.model": model_name,
+        }
+        if _token_usage_histogram is not None:
+            input_tokens = int(usage.get("input_tokens", 0))
+            output_tokens = int(usage.get("output_tokens", 0))
+            if input_tokens:
+                _token_usage_histogram.record(
+                    input_tokens, {**metric_attrs, "gen_ai.token.type": "input"}
+                )
+            if output_tokens:
+                _token_usage_histogram.record(
+                    output_tokens, {**metric_attrs, "gen_ai.token.type": "output"}
+                )
+        if _operation_duration_histogram is not None and duration_s is not None:
+            _operation_duration_histogram.record(
+                duration_s,
+                {**metric_attrs, "gen_ai.operation.name": "chat"},
+            )
+
+
+def record_tool_metric(tool_name: str, duration_ms: float) -> None:
+    """
+    Emit the ``agent.tool.duration`` histogram for a completed tool call.
+
+    No-op when the OTel meter provider is not configured.
+
+    :param tool_name: Tool name without MCP prefix, e.g. ``"web_search"``.
+    :param duration_ms: Tool execution wall time in milliseconds.
+    """
+    if _tool_duration_histogram is not None and duration_ms >= 0:
+        _tool_duration_histogram.record(
+            duration_ms / 1000.0,
+            {"agent.tool.name": tool_name},
+        )
 
 
 def record_error(span: LiveSpan, exc: BaseException) -> None:
@@ -552,6 +619,24 @@ def _init_otel_metrics() -> None:
             resource=Resource.create({SERVICE_NAME: service_name}),
         )
         otel_metrics.set_meter_provider(provider)
+
+        global _token_usage_histogram, _operation_duration_histogram, _tool_duration_histogram
+        meter = otel_metrics.get_meter("omnigent")
+        _token_usage_histogram = meter.create_histogram(
+            name="gen_ai.client.token.usage",
+            unit="{token}",
+            description="Measures number of input and output tokens used.",
+        )
+        _operation_duration_histogram = meter.create_histogram(
+            name="gen_ai.client.operation.duration",
+            unit="s",
+            description="Duration of a GenAI LLM operation.",
+        )
+        _tool_duration_histogram = meter.create_histogram(
+            name="agent.tool.duration",
+            unit="s",
+            description="Duration of a tool call.",
+        )
         _metrics_initialized = True
     except Exception:
         _logger.exception("failed to initialize OpenTelemetry metrics")
