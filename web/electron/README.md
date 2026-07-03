@@ -326,14 +326,20 @@ You can see and change which binary is used in two places:
 
 A configured path is saved to `settings.json` (`omnigent_path`) only once it
 validates as a runnable CLI; clearing it reverts to auto-detection. Connecting
-to a **remote** server never needs the CLI — only "Start locally" and hosting do.
+to a **remote** server never needs the CLI — only starting a local server and
+hosting this machine do (and "Start locally" now does both).
 
 ### Start locally
 
-**"Start a server on this machine"** runs `omnigent server start` (idempotent —
-reuses a healthy one) and then connects this window to its
-`http://127.0.0.1:<port>` URL through the normal connect flow. It does not
-connect this machine as a runner — that stays an explicit step in the app.
+The setup page's **"Start locally"** button runs `omnigent server start`
+(idempotent — reuses a healthy one), attaches a host on this machine to that
+server, and connects this window to its `http://127.0.0.1:<port>` URL through
+the normal connect flow — a server **and** a runner in one click, so a
+first-run user is chatting without touching a terminal. Because this is the
+bundled, trusted setup page (not server-served code), it needs no separate
+hosting-consent dialog. On an older shell whose preload lacks the combined
+bridge it falls back to server-only, and the runner is connected later from the
+host menu.
 
 ### Connecting this machine as a runner
 
@@ -351,6 +357,16 @@ adopt a daemon already serving that server (one you started by hand) or spawn
 next time; **Always Allow** records the origin in `settings.json`
 (`allowed_hosting_origins`) so later connects skip the prompt. `stop` is
 fail-safe and needs no confirmation. The same bridge exposes `stop` / `restart`.
+
+A one-click **"Run on this Mac"** button offers the same thing from two more
+spots: the connect-a-host dialog's zero-host escape hatch and the host-selection
+dropdown. It goes through `startLocalHost` (not `controlHost`) — a detached
+daemon keyed by target in the same `~/.omnigent` registry the CLI uses, so it is
+visible to `omnigent host status` and never double-spawns — but it is gated by
+the identical native confirmation, since enrolling a runner still executes agent
+code. It renders **only** in the desktop shell: in a plain browser it hides
+itself and the surfaces fall back to their `omnigent host --server <url>` CLI
+instructions. Its status is read via `getLocalHostStatus`.
 
 Status is read live (host connected = a live daemon process **and** an online
 host tunnel; the shell never caches it). The host surface goes through the JS

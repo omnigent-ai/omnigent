@@ -80,6 +80,7 @@ import {
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
+import { RunOnThisMacButton } from "./RunOnThisMacButton";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -300,9 +301,12 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
 export function ConnectHostInstructions({
   serverUrl,
   label,
+  onHostOnline,
 }: {
   serverUrl: string;
   label?: string;
+  /** Called once a one-click "Run on this Mac" host comes online (desktop only). */
+  onHostOnline?: () => void;
 }) {
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
@@ -314,6 +318,9 @@ export function ConnectHostInstructions({
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-xs text-muted-foreground">{label}</p>}
+      {/* Desktop-only one-click host spawn. Self-hides in a browser (and when
+          the CLI is missing), leaving the manual command below as the path. */}
+      <RunOnThisMacButton serverUrl={serverUrl} onHostOnline={onHostOnline} />
       {databricksFeatures ? (
         <Tabs defaultValue="local">
           <TabsList className="w-full">
@@ -3084,22 +3091,25 @@ export function NewChatLandingScreen() {
                       </DropdownMenuItem>
                     );
                   })}
-                  {/* Desktop shell, machine not in the list yet: offer to connect
-                    it in one click. */}
+                  {/* Desktop shell, machine not in the list yet: one-click spawn
+                    a host on this Mac. Its internal click/polling state machine
+                    needs to survive the menu staying open, so it's a plain row
+                    (not a DropdownMenuItem, which would close on select). It
+                    self-hides outside Electron / when the CLI is missing. */}
                   {showConnectThisMachine && (
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        pendingConnectRef.current = true;
-                      }}
-                      disabled={connectingThisMachine}
-                      data-testid="new-chat-landing-run-on-this-machine"
-                      className="gap-2 text-xs"
-                    >
-                      <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <span className="text-xs">
-                        {connectingThisMachine ? "Connecting this machine…" : "Run on this machine"}
-                      </span>
-                    </DropdownMenuItem>
+                    <div className="px-2 py-1" data-testid="new-chat-landing-run-on-this-machine">
+                      <RunOnThisMacButton
+                        serverUrl={serverUrl}
+                        onHostOnline={() => {
+                          void (async () => {
+                            const identity = await getHostIdentity();
+                            setDesktopHost(identity);
+                            await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+                            if (identity?.hostId) selectHost(identity.hostId);
+                          })();
+                        }}
+                      />
+                    </div>
                   )}
                   {(allHosts.length > 0 || showConnectThisMachine) && <DropdownMenuSeparator />}
                   {/* Persistent escape hatch: open the connect-a-host
@@ -3357,6 +3367,10 @@ export function NewChatLandingScreen() {
           <ConnectHostInstructions
             serverUrl={serverUrl}
             label="Run this on the machine you want to use, then pick it from the host menu:"
+            onHostOnline={() => {
+              void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+              setConnectOpen(false);
+            }}
           />
         </DialogContent>
       </Dialog>

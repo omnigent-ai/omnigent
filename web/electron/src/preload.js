@@ -104,6 +104,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * setup page, so a connected server can't repoint the CLI at an arbitrary one.
    */
   resetCliPath: () => ipcRenderer.invoke("omnigent:cli-reset-path"),
+  /**
+   * One-click: spawn a host on this machine for the window's server. On a local
+   * server this ensures a local server AND attaches a host. Resolves
+   * `{ ok, error?, logPath? }`. The serverUrl arg is a convenience; the main
+   * process authoritatively uses the window's own pinned server.
+   * @param {string} serverUrl
+   */
+  startLocalHost: (serverUrl) => ipcRenderer.invoke("omnigent:start-local-host", serverUrl),
+  /**
+   * Read the local-host daemon status for the window's server (no subprocess —
+   * reads the same registry the CLI uses). Resolves a LocalHostStatus or null.
+   * @param {string} serverUrl
+   */
+  getLocalHostStatus: (serverUrl) =>
+    ipcRenderer.invoke("omnigent:get-local-host-status", serverUrl),
 });
 
 // Setup-page bridge: persist + navigate to a server URL, and read the saved
@@ -136,4 +151,10 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * caller then connects to `url` via setServerUrl.
    */
   startLocalServer: () => ipcRenderer.invoke("omnigent:start-local-server"),
+  /**
+   * Start (or reuse) the local server AND attach a host on this machine to it,
+   * so the app is usable end-to-end in one click. Resolves `{ok, url?, error?}`;
+   * the caller connects to `url` via setServerUrl.
+   */
+  startLocalAndHost: () => ipcRenderer.invoke("omnigent:start-local-server-and-host"),
 });

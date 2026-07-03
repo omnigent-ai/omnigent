@@ -35,6 +35,7 @@ const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+const localHost = require("./localHost");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -1848,6 +1849,27 @@ function registerIpc() {
     return serverManager.startLocalServer(cliPath);
   });
 
+  // Setup page → start (or reuse) the local server AND attach a host on this
+  // machine to it, so a fresh install is usable end-to-end in one click. Returns
+  // the server URL so the setup page hands off to the normal navigation flow.
+  // The setup page is the trusted, bundled origin that also chooses the CLI
+  // path, so no separate host-enrollment consent is needed here.
+  ipcMain.handle("omnigent:start-local-server-and-host", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("start-local-server-and-host is only available to the setup page");
+    }
+    const cliPath = resolvedCliPath();
+    if (!cliPath) {
+      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+    }
+    const server = await serverManager.startLocalServer(cliPath);
+    if (!server.ok || !server.url) return server;
+    // Best-effort host attach: if it fails, the server is still up and usable,
+    // so surface the URL and let the user connect a host from the host menu.
+    await localHost.startLocalHost({ serverUrl: server.url });
+    return server;
+  });
+
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
   // come from local config (no `omnigent host status` subprocess), so this is
   // instant — it lets the new-session picker tag/connect "this machine" without
@@ -1920,6 +1942,51 @@ function registerIpc() {
     } else {
       result = { ok: false, error: `unknown host action '${action}'` };
     }
+    broadcastHostStatus();
+    return result;
+  });
+
+  // SPA → read this machine's local-host daemon status for the window's own
+  // server (running? runtime present? needs login?). Read-only — no subprocess,
+  // no consent — so pinned-origin gating alone is enough. The renderer passes a
+  // serverUrl for convenience, but we use the window's authoritative server so a
+  // foreign page can't probe an arbitrary target.
+  ipcMain.handle("omnigent:get-local-host-status", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] get-local-host-status from untrusted sender dropped");
+      return null;
+    }
+    const serverUrl = senderServerUrl(event);
+    return localHost.getLocalHostStatus({ serverUrl });
+  });
+
+  // SPA → one-click: spawn a host on this machine for the window's own server.
+  // On a local server this ensures a local server AND attaches a host in a
+  // single `omni host ""`. Enrolling the machine as a runner executes agent code
+  // locally, so — exactly like host-control start — gate on the native consent
+  // dialog: isPinnedOriginSender proves the call came FROM the pinned page, not
+  // that the USER asked. The serverUrl decision uses the window's own server,
+  // never the renderer-supplied arg.
+  ipcMain.handle("omnigent:start-local-host", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("start-local-host is only available to a connected server page");
+    }
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!(await confirmHostEnrollment(win))) {
+      return { ok: false, error: "Hosting wasn't approved for this server." };
+    }
+    // Ensure the CLI is authenticated for a remote server first (local needs
+    // none) — otherwise the daemon would just fail on a 401. This mirrors the
+    // host-control start path, so the detached daemon works for remote servers
+    // too, not only loopback.
+    const cliPath = resolvedCliPath();
+    if (cliPath) {
+      const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
+      if (!auth.ok) return { ok: false, error: auth.error };
+    }
+    const result = await localHost.startLocalHost({ serverUrl });
     broadcastHostStatus();
     return result;
   });

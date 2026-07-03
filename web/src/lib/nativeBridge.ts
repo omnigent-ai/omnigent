@@ -130,6 +130,10 @@ interface ElectronDesktopApi extends NativeShellApi {
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
   resetCliPath?: () => Promise<CliStatus | null>;
+  /** One-click: spawn a host on this machine for the window's server. */
+  startLocalHost?: (serverUrl: string) => Promise<StartLocalHostResult>;
+  /** Read the local-host daemon status for the window's server (no subprocess). */
+  getLocalHostStatus?: (serverUrl: string) => Promise<LocalHostStatus | null>;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -163,6 +167,30 @@ export interface HostIdentity {
 export interface HostActionResult {
   ok: boolean;
   error?: string;
+}
+
+/** Result of a one-click local-host spawn from the desktop shell. */
+export interface StartLocalHostResult {
+  ok: boolean;
+  error?: string;
+  /** Path to the daemon's log file, when one was opened. */
+  logPath?: string | null;
+}
+
+/** The local-host daemon's status for a given server, from the desktop shell. */
+export interface LocalHostStatus {
+  /** Whether a host daemon for this server is currently running. */
+  running: boolean;
+  /** Whether the `omnigent` CLI was found on this machine. */
+  runtimeAvailable: boolean;
+  /** Whether the daemon would target a local server (`omni host ""`) or remote. */
+  mode: "local" | "remote";
+  /** Whether the user likely needs to sign in to this (remote) server first. */
+  needsLogin: boolean;
+  /** The server URL this status is for, or null. */
+  serverUrl: string | null;
+  /** Path to the daemon's log file, or null when not running. */
+  logPath: string | null;
 }
 
 /** Data backing the title-bar server picker, from the Electron shell. */
@@ -550,6 +578,39 @@ export async function resetCliPath(): Promise<CliStatus | null> {
     return await electron.resetCliPath();
   } catch (err) {
     console.warn("[nativeBridge] electron resetCliPath failed:", err);
+    return null;
+  }
+}
+
+/**
+ * One-click: spawn a host on this machine for the given server, via the desktop
+ * shell. On a local server this ensures a local server AND attaches a host in a
+ * single step. Resolves `{ ok, error? }`; a no-op `{ ok: false }` outside the
+ * shell (or under a shell too old to expose the bridge).
+ */
+export async function startLocalHost(serverUrl: string): Promise<StartLocalHostResult> {
+  const electron = electronApi();
+  if (!electron?.startLocalHost) return { ok: false, error: "not running under the desktop shell" };
+  try {
+    return await electron.startLocalHost(serverUrl);
+  } catch (err) {
+    console.warn("[nativeBridge] electron startLocalHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Read the local-host daemon status for the given server from the desktop shell
+ * (reads the same daemon registry the CLI uses — no subprocess). Resolves `null`
+ * outside the Electron shell or under a shell too old to expose the bridge.
+ */
+export async function getLocalHostStatus(serverUrl: string): Promise<LocalHostStatus | null> {
+  const electron = electronApi();
+  if (!electron?.getLocalHostStatus) return null;
+  try {
+    return await electron.getLocalHostStatus(serverUrl);
+  } catch (err) {
+    console.warn("[nativeBridge] electron getLocalHostStatus failed:", err);
     return null;
   }
 }

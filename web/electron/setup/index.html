@@ -639,11 +639,15 @@
           startLocalBtn.disabled = true;
           startLocalBtn.textContent = "Starting…";
           try {
-            const result = await setup.startLocalServer();
+            // Start the local server AND attach a host on this machine in one
+            // click, so the app is usable end-to-end without a terminal. Fall
+            // back to server-only on an older shell that lacks the newer bridge.
+            const result = setup.startLocalAndHost
+              ? await setup.startLocalAndHost()
+              : await setup.startLocalServer();
             if (result && result.ok && result.url) {
               // Hand off to the normal connect/navigate flow; on success the
-              // window loads the server and this page goes away. Connecting this
-              // machine as a runner is done later from the host menu.
+              // window loads the server and this page goes away.
               input.value = result.url;
               await setup.setServerUrl(result.url);
               return;
