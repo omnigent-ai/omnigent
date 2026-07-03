@@ -1,9 +1,12 @@
-# Build the VS Code extension and attach a SHA256-verified `.vsix` to a DRAFT
-# GitHub release. Triggered manually (workflow_dispatch), typically after a
-# "Release (vscode): vX.Y.Z" PR (from vscode-release-pr.yml) has merged. The
-# release version comes from `editors/vscode/package.json` — never typed by
-# hand here — so the tag and the packaged version can't diverge. A human
-# reviews the draft and clicks publish.
+# Build the VS Code extension from a FROZEN release branch and attach a
+# SHA256-verified `.vsix` to a DRAFT GitHub release. Triggered manually
+# (workflow_dispatch) with the target version; it checks out the
+# `release/vscode-v<version>` branch (created by vscode-release-pr.yml) rather
+# than main, so the built artifact is frozen to that branch — commits that land
+# on main after the release branch was cut cannot leak into the release. The
+# `vscode-v<version>` tag is created on the branch commit when the draft is
+# published. The version comes from the branch's `package.json` (verified to
+# match the input), so the tag and the packaged version can't diverge.
 #
 # This produces the ARTIFACT ONLY — it does NOT publish to the VS Code
 # Marketplace or Open VSX. That runs from the central secure-release repo
@@ -21,10 +24,15 @@ name: VS Code Extension Release
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Branch/tag/SHA to build from (default: the merged release commit on the default branch)."
-        required: false
+      version:
+        description: "Version to release, e.g. 0.2.0. Builds from the release/vscode-v<version> branch."
+        required: true
         type: string
+      dry_run:
+        description: "Build + package + checksum, but do NOT create the draft GitHub release."
+        required: false
+        type: boolean
+        default: true
 
 # Least privilege: creating a release + tag requires `contents: write`.
 permissions:
@@ -41,9 +49,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Validate version
+        # Runs before checkout, so the default editors/vscode workdir does not
+        # exist yet — run from the workspace root.
+        working-directory: ${{ github.workspace }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Strict X.Y.Z (matches vscode-release-pr.yml; vsce rejects suffixes).
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' is not a valid X.Y.Z."
+            exit 1
+          fi
+
+      # Build from the FROZEN release branch, not main. Later main commits can't
+      # leak into the release.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: release/vscode-v${{ inputs.version }}
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -55,16 +78,22 @@ jobs:
           npm run build
           npm run package
 
-      - name: Resolve version and tag from package.json
+      - name: Resolve tag and verify package.json version
         id: meta
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          version=$(node -p "require('./package.json').version")
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=vscode-v$version" >> "$GITHUB_OUTPUT"
-          # Target the commit we actually built (inputs.ref may differ from the
-          # dispatch ref, so $GITHUB_SHA is not necessarily the built commit).
+          # The branch's package.json must already carry this version (the PR
+          # workflow bumped it). Guards against building the wrong branch/commit.
+          pkg_version=$(node -p "require('./package.json').version")
+          if [[ "$pkg_version" != "$VERSION" ]]; then
+            echo "::error::package.json version ($pkg_version) != requested version ($VERSION). Is release/vscode-v$VERSION the branch created by vscode-release-pr.yml?"
+            exit 1
+          fi
+          echo "tag=vscode-v$VERSION" >> "$GITHUB_OUTPUT"
+          # Tag/target the exact branch commit we built.
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "Building vscode-v$version" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Building vscode-v$VERSION from $(git rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Compute SHA256 checksum
         run: |
@@ -77,9 +106,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.meta.outputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run — built and checksummed $TAG but skipping the draft release." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # Rerun-safe: upload assets to an existing release, else create a draft
-          # one (which creates the vscode-v<version> tag on the built commit).
+          # one (which creates the vscode-v<version> tag on the frozen branch
+          # commit when the draft is published).
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
               --repo "$GITHUB_REPOSITORY" --clobber

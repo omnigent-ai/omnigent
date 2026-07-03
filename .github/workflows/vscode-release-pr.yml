@@ -25,6 +25,11 @@ on:
         description: "Extension release version, e.g. 0.2.0 (no leading v)."
         required: true
         type: string
+      dry_run:
+        description: "Bump + draft the CHANGELOG and show the diff, but do NOT push the branch or open the PR."
+        required: false
+        type: boolean
+        default: true
 
 # Opening a PR needs contents + pull-requests write.
 permissions:
@@ -251,6 +256,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
         working-directory: editors/vscode
         run: |
           git config user.name "github-actions[bot]"
@@ -266,6 +272,12 @@ jobs:
             echo "::error::Release PR staged files outside editors/vscode:"
             git diff --cached --name-only | grep -v '^editors/vscode/'
             exit 1
+          fi
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run — staged bump + CHANGELOG for v$VERSION but not pushing a branch or opening a PR." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            { echo '### Dry-run diff'; echo '```diff'; git diff --cached; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           git commit -m "Release (vscode): v$VERSION"
           git push --force-with-lease origin "$BRANCH"
