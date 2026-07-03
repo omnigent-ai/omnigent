@@ -321,6 +321,37 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     // A javascript: href is dropped entirely rather than left clickable.
     expect(container.querySelector("a")?.getAttribute("href")).toBeNull();
   });
+
+  it("renders GitHub alerts as typed callouts, not literal blockquote text", () => {
+    // `> [!NOTE]` etc. are GitHub alerts. GFM alone leaves them as plain
+    // blockquotes with a literal "[!NOTE]" first line; rehype-github-alerts
+    // turns them into typed callouts (a .markdown-alert wrapper + a titled
+    // header) that CSS then styles per type, matching GitHub and the editor.
+    const { container } = renderMd(
+      ["> [!NOTE]\n> Useful information.", "", "> [!WARNING]\n> Careful here."].join("\n"),
+    );
+    const note = container.querySelector(".markdown-alert.markdown-alert-note");
+    const warning = container.querySelector(".markdown-alert.markdown-alert-warning");
+    expect(note).not.toBeNull();
+    expect(warning).not.toBeNull();
+    expect(note?.querySelector(".markdown-alert-title")?.textContent).toBe("Note");
+    expect(note?.textContent).toContain("Useful information.");
+    // The raw marker must be consumed, not shown verbatim.
+    expect(container.textContent).not.toContain("[!NOTE]");
+  });
+
+  it("keeps explicit width/height on an embedded <img>", () => {
+    // GitHub honors <img width/height>. Tailwind Preflight's `img { height:
+    // auto }` overrides the HTML attributes, so the preview forwards them to an
+    // inline style (which wins the cascade) — the sized image is not left square.
+    const { container } = renderMd(
+      '<img src="https://example.com/logo.png" alt="logo" width="200" height="100">',
+    );
+    const img = container.querySelector<HTMLImageElement>('img[alt="logo"]');
+    expect(img).not.toBeNull();
+    expect(img?.style.width).toBe("200px");
+    expect(img?.style.height).toBe("100px");
+  });
 });
 
 describe("CodeViewer HTML preview sandbox", () => {
