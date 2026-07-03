@@ -2826,6 +2826,21 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
+  const [isCopied, setIsCopied] = useState(false);
+  const copyTimeoutRef = useRef<number>(0);
+
+  const handleCopy = async () => {
+    if (!text || !navigator?.clipboard?.writeText) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setIsCopied(true);
+      window.clearTimeout(copyTimeoutRef.current);
+      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
+
   return (
     <Message
       from="user"
@@ -2945,6 +2960,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
+      {text && (
+        <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <MessageAction tooltip="Copy" onClick={handleCopy}>
+            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+          </MessageAction>
+        </MessageActions>
+      )}
     </Message>
   );
 }
