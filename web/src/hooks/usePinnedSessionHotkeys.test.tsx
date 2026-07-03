@@ -1,6 +1,7 @@
-// Cmd/Ctrl+digit jumps to the Nth pinned session: 1–9 → indices 0–8, 0 → 10th.
-// Requires Cmd/Ctrl, no Alt/Shift; fires inside text fields; out-of-range and
-// already-active are no-ops; only out-of-range leaves the native event alone.
+// Numeric pinned-session jump to the Nth pinned session: 1–9 → indices 0–8,
+// 0 → 10th. Platform-aware chord — plain Cmd/Ctrl+digit in the Electron shell,
+// Cmd/Ctrl+Alt+digit in the browser (matched on e.code there, since Alt rewrites
+// e.key). Fires inside text fields; out-of-range and already-active are no-ops.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,9 +12,9 @@ vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
 }));
 
-// The shortcut is desktop-only (Cmd+digit collides with browser tab-switching),
-// so the hook is gated on the Electron shell. Default the mock to "native" and
-// flip it per-test for the browser case.
+// The chord is platform-aware: plain Cmd+digit in the Electron shell, but
+// Cmd+Alt+digit in the browser (where plain Cmd+digit is the native tab-switch).
+// Default the mock to "native" and flip it per-test for the browser case.
 const isNativeShell = vi.fn(() => true);
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
@@ -27,8 +28,9 @@ function press(
     metaKey: true,
   },
   target: HTMLElement = document.body,
+  code = "",
 ): KeyboardEvent {
-  const e = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...mods });
+  const e = new KeyboardEvent("keydown", { key, code, bubbles: true, cancelable: true, ...mods });
   target.dispatchEvent(e);
   return e;
 }
@@ -141,12 +143,50 @@ describe("usePinnedSessionHotkeys", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("is inert in a plain browser (not the Electron shell)", () => {
+  it("browser: leaves plain Cmd+digit to the native tab-switch", () => {
     isNativeShell.mockReturnValue(false);
     renderHook(() => usePinnedSessionHotkeys(ids, undefined));
-    const e = press("1");
+    const e = press("1", { metaKey: true }, document.body, "Digit1");
     expect(navigate).not.toHaveBeenCalled();
-    // Leave the browser's own Cmd+1 tab-switch alone.
+    // Plain Cmd+1 is the browser's own tab-switch — left alone.
     expect(e.defaultPrevented).toBe(false);
+  });
+
+  it("browser: Cmd+Alt+Digit1 opens the first pinned session", () => {
+    isNativeShell.mockReturnValue(false);
+    renderHook(() => usePinnedSessionHotkeys(ids, undefined));
+    // Alt rewrites e.key on macOS (⌥1 → "¡"), so the hook matches e.code.
+    const e = press("¡", { metaKey: true, altKey: true }, document.body, "Digit1");
+    expect(navigate).toHaveBeenCalledWith("/c/a");
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("browser: Ctrl+Alt+Digit3 opens the third (Windows/Linux)", () => {
+    isNativeShell.mockReturnValue(false);
+    renderHook(() => usePinnedSessionHotkeys(ids, undefined));
+    press("3", { ctrlKey: true, altKey: true }, document.body, "Digit3");
+    expect(navigate).toHaveBeenCalledWith("/c/c");
+  });
+
+  it("browser: ignores AltGr chords (AltGr+digit composes characters on intl layouts)", () => {
+    // AltGr reports as Ctrl+Alt on Windows/Linux — typing AltGr+2 must
+    // compose the character (event untouched), not navigate to a session.
+    isNativeShell.mockReturnValue(false);
+    renderHook(() => usePinnedSessionHotkeys(ids, undefined));
+    const altGraph = vi
+      .spyOn(KeyboardEvent.prototype, "getModifierState")
+      .mockImplementation((keyArg) => keyArg === "AltGraph");
+    const e = press("\u00b2", { ctrlKey: true, altKey: true }, document.body, "Digit2");
+    expect(navigate).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
+    altGraph.mockRestore();
+  });
+
+  it("browser: Cmd+Alt+Digit0 opens the tenth pinned session", () => {
+    isNativeShell.mockReturnValue(false);
+    const ten = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+    renderHook(() => usePinnedSessionHotkeys(ten, undefined));
+    press("º", { metaKey: true, altKey: true }, document.body, "Digit0");
+    expect(navigate).toHaveBeenCalledWith("/c/j");
   });
 });
