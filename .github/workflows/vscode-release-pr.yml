@@ -201,7 +201,11 @@ jobs:
 
           url = os.environ["GATEWAY_BASE_URL"].rstrip("/") + "/chat/completions"
           payload = json.dumps({
-              "model": "databricks-claude-opus-4-8",
+              # This model id is served on the gateway's OpenAI-compatible
+              # /chat/completions surface (same id auto-assign-reviewer.yml uses).
+              # NOTE: databricks-claude-opus-4-8 is only served on /anthropic, so
+              # it 400s here — keep an OpenAI-surface id.
+              "model": "databricks-claude-sonnet-4-6",
               "max_tokens": 1024,
               "temperature": 0,
               "messages": [
