@@ -96,6 +96,12 @@ def test_unknown_provider_raises() -> None:
         ("databricks-gpt-5-4", "openai-agents"),
         ("openai/gpt-5.4", "openai-agents"),
         ("gpt-5.4", "openai-agents"),
+        # xAI / Grok models → openai-agents (OpenAI-compatible endpoint,
+        # classified OPENAI_FAMILY in configure_models.py).
+        ("xai/grok-4.3", "openai-agents"),
+        ("xai/grok-4", "openai-agents"),
+        ("grok-4.3", "openai-agents"),
+        ("grok-4", "openai-agents"),
         # Unknown model — no prefix match — returns empty string so the
         # downstream validator can surface a "harness required" error.
         ("llama3-groq", ""),
