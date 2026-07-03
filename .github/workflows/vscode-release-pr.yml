@@ -279,6 +279,21 @@ jobs:
             { echo '### Dry-run diff'; echo '```diff'; git diff --cached; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+
+          # If nothing is staged, `main` is already at this version (e.g. a first
+          # release where package.json + CHANGELOG were prepared by hand). There
+          # is no diff to open a PR for, but the release branch must still exist
+          # so vscode-extension-release.yml can build the frozen `.vsix` from it.
+          # Push the branch at the current commit and skip the PR.
+          if git diff --cached --quiet; then
+            git push --force-with-lease origin "$BRANCH"
+            echo "No changes to release for v$VERSION — main is already at this version." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Pushed branch \`$BRANCH\` at the current commit (no PR). Build from it with the **VS Code Extension Release** workflow." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           git commit -m "Release (vscode): v$VERSION"
           git push --force-with-lease origin "$BRANCH"
           gh pr create \
