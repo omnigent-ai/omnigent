@@ -1,7 +1,7 @@
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -528,7 +528,7 @@ function AddPolicyDialog({
                         }
                         className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
                       >
-                        {prop.enum.map((v) => (
+                        {prop.enum.map((v: string) => (
                           <option key={v} value={v}>
                             {v}
                           </option>
@@ -536,7 +536,7 @@ function AddPolicyDialog({
                       </select>
                     ) : prop?.type === "array" && prop.items?.enum ? (
                       <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-1">
-                        {prop.items.enum.map((v) => {
+                        {prop.items.enum.map((v: string) => {
                           const current = factoryParams[key]
                             ? factoryParams[key].split(",").filter(Boolean)
                             : Array.isArray(prop?.default)
