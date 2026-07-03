@@ -1954,6 +1954,25 @@ def create_app(
             _session_status_cache,
         )
 
+        # Newest-wins guard: a superseded tunnel's teardown fires this
+        # hook after a fresh tunnel for the same ``runner_id`` already
+        # registered (``TunnelRegistry.register`` retires the old
+        # session, whose helper tasks then error out and run this
+        # teardown). Marking the runner's sessions ``failed`` here would
+        # clobber the live tunnel's recovery: reconnect-recovery
+        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
+        # may have just cleared a stale ``runner_disconnected`` failure,
+        # and this stale disconnect would silently re-fail the session.
+        # If a live tunnel is registered for this runner, the runner is
+        # NOT offline, so skip. Mirrors the registry's own
+        # generation-guarded ``deregister``.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                runner_id,
+            )
+            return
+
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
