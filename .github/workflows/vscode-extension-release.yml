@@ -102,6 +102,41 @@ jobs:
           echo "Built $vsix" | tee -a "$GITHUB_STEP_SUMMARY"
           cat "$vsix.sha256" | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Build release notes from the CHANGELOG section
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          # Prefill the release notes with THIS version's CHANGELOG section only
+          # (the block under "## [<version>]", up to the next "## " heading).
+          python3 - "$VERSION" <<'PY'
+          import sys, re, pathlib
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          # Match "## [<version>]" ... until the next "## " heading or EOF.
+          m = re.search(
+              r"^## \[" + re.escape(version) + r"\][^\n]*\n(.*?)(?=^## |\Z)",
+              text, re.MULTILINE | re.DOTALL,
+          )
+          body = (m.group(1).strip() if m else "")
+          out = pathlib.Path("/tmp/release_notes.md")
+          if body:
+              out.write_text(f"## {version}\n\n{body}\n", encoding="utf-8")
+              print(f"Release notes from CHANGELOG [{version}] section.")
+          else:
+              # Fallback: no matching section — keep a minimal generic note.
+              out.write_text(
+                  f"Omnigent VS Code extension `{version}`.\n", encoding="utf-8"
+              )
+              print(f"::warning::No '## [{version}]' CHANGELOG section found — using a generic note.")
+          PY
+          # Footer applies to every release; append after the CHANGELOG body.
+          {
+            echo ""
+            echo "---"
+            echo "Marketplace / Open VSX publishing runs from the secure-release repo, which downloads and SHA256-verifies the attached \`.vsix\`."
+          } >> /tmp/release_notes.md
+
       - name: Publish draft GitHub release with the .vsix + checksum
         env:
           GH_TOKEN: ${{ github.token }}
@@ -117,15 +152,17 @@ jobs:
           # one (which creates the vscode-v<version> tag on the frozen branch
           # commit when the draft is published).
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Rerun: refresh assets and the notes on the existing draft.
             gh release upload "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
               --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file /tmp/release_notes.md
           else
             gh release create "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
               --repo "$GITHUB_REPOSITORY" \
               --draft \
               --target "${{ steps.meta.outputs.sha }}" \
               --title "VS Code extension $TAG" \
-              --notes "Omnigent VS Code extension \`$TAG\`. Marketplace / Open VSX publishing runs from the secure-release repo, which downloads and SHA256-verifies the attached \`.vsix\`."
+              --notes-file /tmp/release_notes.md
           fi
           echo "Drafted release $TAG with the .vsix + .sha256 — review and publish it from the Releases page." \
             | tee -a "$GITHUB_STEP_SUMMARY"
