@@ -142,7 +142,7 @@ interface ChatHeaderProps {
  * canvas shows through, and chat content dissolves before it slides
  * under the controls (the conversation viewport's ``chat-scroll-fade``
  * mask, index.css; chat reserves clearance via ``pt-20``,
- * terminal-first via ``pt-16``). Left slot: open-sidebar +
+ * terminal-first via ``pt-14``). Left slot: open-sidebar +
  * back-to-parent. Right slot: desktop action buttons (Agent info ·
  * Share · right-panel toggle), a mobile three-dot menu mirroring the
  * same actions, and a mobile FAB that opens the rail tabs as

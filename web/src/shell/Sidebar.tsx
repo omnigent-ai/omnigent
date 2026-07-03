@@ -219,6 +219,22 @@ function ArchivedToast() {
   );
 }
 
+/**
+ * Compute the set of IDs to add for a shift-click range selection.
+ * Returns null when the range can't be computed (missing anchor or id).
+ */
+export function computeShiftSelectRange(
+  visibleIds: readonly string[],
+  anchorId: string,
+  targetId: string,
+): string[] | null {
+  const anchorIdx = visibleIds.indexOf(anchorId);
+  const targetIdx = visibleIds.indexOf(targetId);
+  if (anchorIdx === -1 || targetIdx === -1) return null;
+  const [start, end] = anchorIdx < targetIdx ? [anchorIdx, targetIdx] : [targetIdx, anchorIdx];
+  return visibleIds.slice(start, end + 1);
+}
+
 /** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
 function showArchivedToast() {
   showToast(<ArchivedToast />);
@@ -231,11 +247,26 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  const toggleSelected = useCallback((id: string) => {
+  const lastSelectedIdRef = useRef<string | null>(null);
+  const getVisibleIdsRef = useRef<() => string[]>(() => []);
+
+  const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
+      if (shiftKey && lastSelectedIdRef.current != null) {
+        const range = computeShiftSelectRange(
+          getVisibleIdsRef.current(),
+          lastSelectedIdRef.current,
+          id,
+        );
+        if (range) {
+          for (const rid of range) next.add(rid);
+          return next;
+        }
+      }
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      lastSelectedIdRef.current = id;
       return next;
     });
   }, []);
@@ -251,6 +282,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   const exitSelectionMode = useCallback(() => {
     setSelectionMode(false);
     setSelectedIds(new Set());
+    lastSelectedIdRef.current = null;
   }, []);
 
   // Debounce search input so we don't fire a server request on every
@@ -550,6 +582,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
+              getVisibleIdsRef={getVisibleIdsRef}
             />
           </nav>
 
@@ -679,6 +712,7 @@ function ProjectFolder({
   selectedIds,
   onToggleSelected,
   onProjectAssigned,
+  projectRenderedIdsRef,
 }: {
   name: string;
   expanded: boolean;
@@ -691,8 +725,9 @@ function ProjectFolder({
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
+  projectRenderedIdsRef?: RefObject<Map<string, string[]>>;
 }) {
   const query = useProjectSessions(name, expanded);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
@@ -704,6 +739,16 @@ function ProjectFolder({
       activeOverride,
     );
   }, [query.data, pinnedSet, activeOverride]);
+
+  // Register this folder's rendered IDs synchronously during render so the
+  // shift-select range uses the real per-project data, not the global list.
+  const renderedIds = useMemo(
+    () => (expanded ? conversations.map((c) => c.id) : []),
+    [expanded, conversations],
+  );
+  if (projectRenderedIdsRef) {
+    projectRenderedIdsRef.current.set(name, renderedIds);
+  }
 
   // While the first page loads, show a "Loading…" footer instead of the "No
   // chats" empty state (which would otherwise flash before rows arrive).
@@ -780,7 +825,8 @@ interface ConversationListProps {
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
+  getVisibleIdsRef: RefObject<() => string[]>;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -799,6 +845,7 @@ function ConversationList({
   selectionMode,
   selectedIds,
   onToggleSelected,
+  getVisibleIdsRef,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -809,6 +856,11 @@ function ConversationList({
 
   // Project names for grouping sessions by their reserved project label.
   const { data: projectNames = [] } = useProjects();
+
+  // Each ProjectFolder registers its actually-rendered conversation IDs here
+  // (synchronously during render) so shift-select ranges use the real rendered
+  // order, not the global paginated list which can diverge.
+  const projectRenderedIdsRef = useRef<Map<string, string[]>>(new Map());
 
   // Backfill pinned sessions that aren't in the loaded set.
   const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
@@ -1135,6 +1187,24 @@ function ConversationList({
       ...visible("Shared with me", sections.shared),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
+  // Getter that builds the shift-select visible order on demand (at click
+  // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
+  // during render — guarantees the project segment is always fresh even when a
+  // ProjectFolder re-renders independently (async query resolve, session
+  // re-sort) without triggering a parent re-render.
+  getVisibleIdsRef.current = () => {
+    const vis = (title: string, list: readonly Conversation[]) =>
+      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
+    const projCollapsed = effectiveCollapsedSections.includes("Projects");
+    return [
+      ...vis("Pinned", sections.pinned),
+      ...(projCollapsed
+        ? []
+        : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
+      ...vis("Chats", sections.sessions),
+      ...vis("Shared with me", sections.shared),
+    ];
+  };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
@@ -1319,6 +1389,7 @@ function ConversationList({
                     selectedIds={selectedIds}
                     onToggleSelected={onToggleSelected}
                     onProjectAssigned={expandProject}
+                    projectRenderedIdsRef={projectRenderedIdsRef}
                   />
                 ))}
               </SectionGroup>
@@ -1673,7 +1744,7 @@ function ConversationSection({
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   /** Placeholder shown when expanded with no rows (e.g. an empty project). */
   emptyMessage?: string;
   /** Indent the rows one extra step (used to nest a project's chats). */
@@ -2081,7 +2152,7 @@ function ConversationRow({
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   isSelected: boolean;
-  onToggleSelected: (conversationId: string) => void;
+  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
 }) {
   // `useParams` reads from the active matched route. On `/`, the param is
@@ -2386,7 +2457,7 @@ function ConversationRow({
         if (selectionMode) {
           e.preventDefault();
           e.stopPropagation();
-          onToggleSelected(conversation.id);
+          onToggleSelected(conversation.id, e.shiftKey);
           return;
         }
         onClick(e);

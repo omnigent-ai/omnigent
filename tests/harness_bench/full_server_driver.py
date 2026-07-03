@@ -18,18 +18,22 @@ request-level function tools are NOT used here: the SDK harnesses handle
 tools internally, so they never round-trip as a server-dispatched, policy-
 gated call — a builtin does.
 
-Follow-ups (stacked PRs): delta-level streaming via the
-``/v1/sessions/{id}/stream`` SSE subscribe, interrupt/cancel, and a
-``--transport`` selector + driver registry so the bench's probes run
-through this driver.
+Interrupt/cancel is verified (a long turn is interrupted mid-flight and the
+server's cancellation marker confirms it stopped), and delta-level
+streaming is measured via the ``/v1/sessions/{id}/stream`` SSE subscribe.
+
+Follow-up (stacked PR): a ``--transport`` selector + driver registry so the
+bench's probes run through this driver, not just its gated tests.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -60,6 +64,19 @@ _POLL_INTERVAL_S = 0.2
 _TOOL_NAME = "list_files"
 _DENY_REASON = "bench-policy-deny"
 _TOOL_PROMPT = f"List the files using the {_TOOL_NAME} tool, then tell me how many there are."
+
+# The server persists an interrupted turn as a synthetic user message whose
+# text contains this marker (see tests/e2e/test_cancel_history.py).
+_CANCELLATION_MARKER = "interrupted"
+_LONG_PROMPT = (
+    "Write a very detailed 600-word essay about the history of computing, in full paragraphs."
+)
+
+# Prompt long enough that a streaming harness emits clearly many deltas.
+_STREAM_PROMPT = (
+    "Count from 1 to 30 in words, one number per line, and add a short note after each."
+)
+_TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response.cancelled"})
 
 
 def _find_free_port() -> int:
@@ -179,6 +196,31 @@ class FullServerDriver:
         import shutil
 
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    # ── async driver protocol ────────────────────────────────
+    # This driver's provisioning and turns are synchronous (subprocess spawn,
+    # blocking snapshot polls, a threaded SSE reader). Bridge to the bench's
+    # async Driver protocol by running the blocking work in a worker thread so
+    # the event loop is never blocked.
+
+    async def __aenter__(self) -> FullServerDriver:
+        return await asyncio.to_thread(self.__enter__)
+
+    async def __aexit__(self, *exc: object) -> None:
+        await asyncio.to_thread(self.__exit__, *exc)
+
+    async def run_basic_turn(self, marker: str) -> TurnResult:
+        prompt = f"Reply with exactly the literal string {marker} and nothing else."
+        return await asyncio.to_thread(self.run_turn, prompt)
+
+    async def run_streaming_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self.streaming_probe_turn)
+
+    async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+        return await asyncio.to_thread(lambda: self.tool_probe_turn(deny=deny))
+
+    async def run_interrupt_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self.interrupt_probe_turn)
 
     # ── spawn ────────────────────────────────────────────────
 
@@ -380,6 +422,103 @@ class FullServerDriver:
             result.timed_out = True
         return result
 
+    # ── streaming probe ──────────────────────────────────────
+
+    def streaming_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
+        """Measure token-level streaming via the session SSE subscribe stream.
+
+        The full-server stream (``GET /v1/sessions/{id}/stream``) is separate
+        from the message POST, so a background thread subscribes and counts
+        ``response.output_text.delta`` events while the main thread posts the
+        turn. More than one delta means the harness streams incrementally.
+        """
+        assert self._client is not None and self._session_id is not None
+        sid = self._session_id
+        result = TurnResult()
+        done = threading.Event()
+
+        def _read_stream() -> None:
+            try:
+                with self._client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{sid}/stream", timeout=timeout
+                ) as resp:
+                    for line in resp.iter_lines():
+                        if not line.startswith("event:"):
+                            continue
+                        etype = line[len("event:") :].strip()
+                        if etype == "response.output_text.delta":
+                            result.text_delta_count += 1
+                        elif etype in _TERMINAL_EVENTS:
+                            result.completed = etype == "response.completed"
+                            result.cancelled = etype == "response.cancelled"
+                            result.failed = etype == "response.failed"
+                            return
+            except httpx.HTTPError as exc:
+                result.error = repr(exc)
+            finally:
+                done.set()
+
+        reader = threading.Thread(target=_read_stream, daemon=True)
+        reader.start()
+        time.sleep(1.0)  # let the subscription register before the turn starts
+        self._client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": _STREAM_PROMPT}],
+                },
+            },
+        ).raise_for_status()
+        if not done.wait(timeout):
+            result.timed_out = True
+        return result
+
+    # ── interrupt probe ──────────────────────────────────────
+
+    def interrupt_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
+        """Start a long turn, interrupt it mid-flight, and report the outcome.
+
+        Posts an ``interrupt`` event once the turn is running (after a short
+        hold so some text streams first), then waits for the server's
+        cancellation marker. Sets :attr:`TurnResult.cancelled` when the
+        marker appears — the honored-interrupt signal.
+        """
+        assert self._client is not None and self._session_id is not None
+        sid = self._session_id
+        result = TurnResult()
+        body = {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": _LONG_PROMPT}]},
+        }
+        self._client.post(f"/v1/sessions/{sid}/events", json=body).raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        interrupted = False
+        while time.monotonic() < deadline:
+            snap = self._client.get(f"/v1/sessions/{sid}").json()
+            status = snap.get("status")
+            items = snap.get("items", [])
+            if status in ("running", "waiting") and not interrupted:
+                # Let a little text stream so the interrupt lands mid-turn.
+                time.sleep(1.5)
+                self._client.post(f"/v1/sessions/{sid}/events", json={"type": "interrupt"})
+                interrupted = True
+            if _has_cancellation_marker(items):
+                result.cancelled = True
+                result.text = _assistant_text(items)
+                break
+            if status == "idle" and interrupted:
+                # Settled after the interrupt; the marker lands just after.
+                result.cancelled = _has_cancellation_marker(items)
+                result.text = _assistant_text(items)
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        else:
+            result.timed_out = True
+        return result
+
     # ── turn ─────────────────────────────────────────────────
 
     def run_turn(self, prompt: str, *, timeout: float = 180.0) -> TurnResult:
@@ -448,6 +587,19 @@ def _scan_tool_items(items: list[dict], result: TurnResult) -> None:
             out = str(data.get("output", ""))
             if data.get("status") == "blocked" or _DENY_REASON in out:
                 result.tool_call_denied = True
+
+
+def _has_cancellation_marker(items: list[dict]) -> bool:
+    """Whether items include the synthetic 'interrupted' user message."""
+    for raw in items:
+        data = raw.get("data", raw)
+        if (raw.get("type") == "message") and (data.get("role") == "user"):
+            if any(
+                _CANCELLATION_MARKER in (b.get("text", "") or "")
+                for b in data.get("content", []) or []
+            ):
+                return True
+    return False
 
 
 def _assistant_text(items: list[dict]) -> str:

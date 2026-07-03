@@ -40,6 +40,10 @@ _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
+# Re-mint a managed runner's owner JWT this many seconds before it
+# expires, so a live session's HTTP callbacks never present an expired
+# token. Well under the server-side token TTL.
+_MANAGED_MINT_REFRESH_SKEW_S = 300.0
 _logger = logging.getLogger(__name__)
 
 
@@ -229,6 +233,14 @@ class _RunnerDatabricksAuth(httpx.Auth):
         if self._factory is not None:
             token = self._factory()
             if not token:
+                if getattr(self._factory, "declined", False):
+                    # The server definitively refuses to mint for this runner
+                    # (managed mint factory hit HTTP 400/404 after install —
+                    # e.g. its construction probe lost a boot race to a
+                    # no-auth server). Bare requests are correct there; do
+                    # NOT fail closed or the runner bricks every callback.
+                    yield request
+                    return
                 raise httpx.RequestError("Databricks token refresh returned no token")
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
@@ -382,13 +394,185 @@ def _make_auth_token_factory(
                 return oidc_token
         return _sdk_token()
 
-    # Probe once to check if credentials are available.
+    # Probe once to check if a user credential is available.
     try:
         if _factory() is not None:
             return _factory
     except (ValueError, OSError, ImportError):
         pass
+
+    # Managed-sandbox fallback: no user credential resolved (no stored
+    # OIDC token, no Databricks config), but a managed runner still holds
+    # its tunnel binding token. Authenticate its HTTP callbacks (and the
+    # tunnel bearer) with a short-lived owner JWT the server mints against
+    # that binding token — refreshed on demand, so there is no static
+    # credential at rest and no fixed session-length cap.
+    if resolved_server_url:
+        try:
+            binding_token = _runner_tunnel_binding_token_from_env()
+        except RuntimeError:
+            binding_token = None
+        if binding_token is not None:
+            return _make_managed_mint_factory(resolved_server_url, binding_token)
     return None
+
+
+def _make_managed_mint_factory(
+    server_url: str,
+    binding_token: str,
+) -> Callable[[], str | None] | None:
+    """Build a token factory that mints a managed runner's owner JWT.
+
+    For a server-managed sandbox runner with no user credential of its
+    own: mint a short-lived owner JWT from ``POST /v1/runners/{id}/token``,
+    authenticated by the runner's tunnel binding token, and cache it in
+    memory. The cached token is reused until it nears expiry, then
+    re-minted — so a managed session runs arbitrarily long without its
+    auth expiring (no fixed session-length cap), and no long-lived
+    credential is ever written to the sandbox environment.
+
+    The same factory feeds both the WS tunnel bearer and the httpx
+    callback client (see :func:`_make_auth_token_factory` callers), so one
+    credential authenticates every runner->server surface.
+
+    :param server_url: Omnigent server base URL, e.g.
+        ``"https://omnigent.example.com"``.
+    :param binding_token: The runner's tunnel binding token (the sandbox's
+        only credential), presented to the mint endpoint.
+    :returns: A sync callable returning a fresh owner JWT, or ``None`` only
+        when the server *definitively* will not mint for this runner (HTTP
+        400 no-auth/header mode, or 404 older server without the endpoint) —
+        the runner then sends unauthenticated requests, as it did before this
+        fallback existed. A *transient* probe failure still installs the
+        factory, which re-mints on the next callback (so a blip at boot does
+        not leave the runner unauthenticated until process restart). If such
+        a post-install mint then gets the definitive 400/404, the factory
+        latches ``declined`` and returns ``None`` thereafter, and
+        :class:`_RunnerDatabricksAuth` falls back to bare requests.
+    """
+    from omnigent.runner.identity import token_bound_runner_id
+
+    runner_id = token_bound_runner_id(binding_token)
+    mint_url = f"{server_url.rstrip('/')}/v1/runners/{runner_id}/token"
+
+    # Construction probe. Decline to install the factory ONLY when the
+    # server definitively will not mint for this runner — HTTP 400 (no auth
+    # provider / header mode) or 404 (an older server without the endpoint).
+    # There the runner falls back to bare requests, which are correct on a
+    # no-auth server. Every other outcome installs the factory: a success
+    # seeds the cache; a transient failure (network blip, 5xx, timeout)
+    # installs it anyway so the next callback re-mints, rather than leaving
+    # the runner unauthenticated until process restart.
+    factory = _ManagedMintTokenFactory(mint_url, server_url, binding_token)
+    factory()
+    if factory.declined:
+        return None
+    return factory
+
+
+class _ManagedMintTokenFactory:
+    """Callable that mints (and caches) a managed runner's owner JWT.
+
+    Each call returns the cached JWT until it nears expiry, then re-mints
+    via :func:`_mint_managed_owner_token`. When a mint gets a *definitive*
+    refusal (HTTP 400 no-auth/header mode, 404 older server), the
+    :attr:`declined` latch is set and every subsequent call returns
+    ``None`` without touching the network —
+    :meth:`_RunnerDatabricksAuth.auth_flow` reads the latch to send bare
+    requests instead of failing closed. The latch matters when the
+    construction probe loses a boot race (a connection error installs the
+    factory, then the first real mint learns the server never mints).
+    """
+
+    def __init__(self, mint_url: str, server_url: str, binding_token: str) -> None:
+        """
+        :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
+        :param server_url: Omnigent server base URL.
+        :param binding_token: The runner's tunnel binding token.
+        """
+        self._mint_url = mint_url
+        self._server_url = server_url
+        self._binding_token = binding_token
+        self._cached_token: str | None = None
+        self._cached_expires_at = 0.0
+        self.declined = False
+
+    def __call__(self) -> str | None:
+        """Return a fresh owner JWT, or ``None``.
+
+        :returns: The cached or freshly-minted JWT; ``None`` after a
+            definitive server decline (sets :attr:`declined`) or on a
+            transient mint failure with no still-valid cached token.
+        """
+        if self.declined:
+            return None
+        now = time.time()
+        if (
+            self._cached_token is not None
+            and now < self._cached_expires_at - _MANAGED_MINT_REFRESH_SKEW_S
+        ):
+            return self._cached_token
+        try:
+            token, expires_at = _mint_managed_owner_token(
+                self._mint_url, self._server_url, self._binding_token
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (400, 404):
+                self.declined = True
+                return None
+            return self._still_valid_cached_token(now)
+        except (httpx.HTTPError, ValueError, KeyError, OSError):
+            # Transient mint failure: keep serving the cached token while
+            # it is still valid; otherwise report "no token" and let the
+            # tunnel's / HTTP client's on-401 retry drive the next mint.
+            return self._still_valid_cached_token(now)
+        self._cached_token = token
+        self._cached_expires_at = expires_at
+        return token
+
+    def _still_valid_cached_token(self, now: float) -> str | None:
+        """Return the cached token if it hasn't expired outright.
+
+        :param now: Current epoch seconds.
+        :returns: The cached token while still valid, else ``None``.
+        """
+        if self._cached_token is not None and now < self._cached_expires_at:
+            return self._cached_token
+        return None
+
+
+def _mint_managed_owner_token(
+    mint_url: str,
+    server_url: str,
+    binding_token: str,
+) -> tuple[str, float]:
+    """Mint one managed-runner owner JWT from the server.
+
+    :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
+    :param server_url: Server base URL, used for the Databricks workspace
+        routing header (``X-Databricks-Org-Id``) when applicable.
+    :param binding_token: The runner's tunnel binding token, sent as the
+        ``X-Omnigent-Runner-Tunnel-Token`` header to authenticate the mint.
+    :returns: ``(jwt, expires_at_epoch_seconds)``.
+    :raises httpx.HTTPError: On network failure or a non-2xx response.
+    :raises KeyError: If the response is missing the expected fields.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    headers = {
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
+        **databricks_request_headers(server_url),
+    }
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(mint_url, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+    return payload["token"], float(payload["expires_at"])
 
 
 def _runner_tunnel_binding_token_from_env() -> str | None:

@@ -13,26 +13,10 @@ transport differs.
 
 from __future__ import annotations
 
-from tests.harness_bench.driver import SdkInprocDriver
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict
-
-_TOOL_NAME = "bench_echo"
-_TOOL_SPEC = [
-    {
-        "type": "function",
-        "function": {
-            "name": _TOOL_NAME,
-            "description": "Echo a token back. Call this to retrieve the secret token.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "what to echo"}},
-                "required": ["query"],
-            },
-        },
-    }
-]
 
 
 class ToolCallingProbe(CapabilityProbe):
@@ -41,15 +25,12 @@ class ToolCallingProbe(CapabilityProbe):
     priority = Priority.P0
     applies_to = Applicability.BOTH
 
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
-        result = await driver.run_turn(
-            f"You must call the {_TOOL_NAME} tool with query='token' to get the secret, "
-            "then reply with the tool's output verbatim.",
-            tools=_TOOL_SPEC,
-            auto_tool_output=f"the-secret-is-{profile.marker}",
-            timeout=150.0,
-        )
-        called = [tc for tc in result.tool_calls if tc.get("name") == _TOOL_NAME]
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
+        # The driver owns the tool mechanism (a request-level function tool on
+        # the wrap path, a builtin on full-server); the probe only cares that
+        # *a* tool call was dispatched and the turn closed.
+        result = await driver.run_tool_turn(deny=False)
+        called = list(result.tool_calls)
         detail = {
             "tool_calls": [tc.get("name") for tc in result.tool_calls],
             "completed": result.completed,
