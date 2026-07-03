@@ -2025,7 +2025,10 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
-        from omnigent.server.routes.sessions import _ensure_runner_relay
+        from omnigent.server.routes.sessions import (
+            _ensure_runner_relay,
+            _publish_runner_recovered_status,
+        )
 
         # Direct by-runner lookup instead of list-everything-and-filter:
         # the listing path may be backed by an eventually-consistent
@@ -2089,6 +2092,19 @@ def create_app(
                 runner_id,
                 routed.client,
                 conversation_store,
+            )
+            # A reconnect can land the runner back on an idle session with
+            # no new turn (a transient WS blip; the runner process
+            # survived). The disconnect left the session marked failed with
+            # persisted ``runner_disconnected`` labels, and without a
+            # ``running`` edge nothing clears them — the Subagents panel
+            # keeps the grey "Disconnected" dot until the next user
+            # message. Clearing on reconnect drops it as soon as the runner
+            # is reachable again. The helper self-guards: it only clears a
+            # session whose persisted failure is ``runner_disconnected``, so
+            # a genuine task failure survives the reconnect untouched.
+            await _publish_runner_recovered_status(
+                conv.id, conversation_store, require_disconnect_code=True
             )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:

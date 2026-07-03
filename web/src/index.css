@@ -55,6 +55,10 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-info: var(--info);
+  /* Dedicated blue for the sub-agent "session active / idle-alive" states
+     * (launching/idle/done) — distinct from the shared amber --warning (still
+     * used by the "Needs response" badge). */
+  --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
   /* Named status hues — success/warning/info are repointed to the
@@ -188,6 +192,10 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* Session active / idle-alive blue — a deeper, saturated azure
+     * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
+     * with strong contrast on the white card surface. */
+  --session-active: #2f7fd4;
   --border: #e8ecf0;
   /* Stronger divider/outline + a dedicated neutral button border. */
   --border-strong: #a3b1bf;
@@ -265,6 +273,10 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* Session active / idle-alive blue, lightened for the dark glass card so
+     * the small dot keeps adequate contrast against the dark canvas (the
+     * light-mode #2f7fd4 reads too dim here). */
+  --session-active: #5ca4f5;
   /* Brand pink + named status hues (same values as light — the brand
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */

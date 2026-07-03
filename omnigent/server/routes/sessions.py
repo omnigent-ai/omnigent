@@ -5539,7 +5539,12 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     return None
 
 
-def _publish_runner_recovered_status(session_id: str) -> None:
+async def _publish_runner_recovered_status(
+    session_id: str,
+    conversation_store: ConversationStore,
+    *,
+    require_disconnect_code: bool = False,
+) -> None:
     """
     Clear a stale failed session status after runner recovery.
 
@@ -5550,12 +5555,47 @@ def _publish_runner_recovered_status(session_id: str) -> None:
     stale and should not keep the conversation marked failed until the
     next user turn emits ``running``.
 
+    Recovery also clears the durable ``last_task_error`` labels the
+    disconnect relay persisted. Those labels survive reload so an
+    ongoing disconnect still projects a "Disconnected" pill, but once
+    the runner is reachable again the session is healthy and idle — the
+    pill must drop without waiting for the next ``running`` edge.
+
+    An explicit rebind/handshake (a PATCH ``/clear`` or ``/switch``, or
+    the message-forward session-init) is a user-driven proof the runner
+    is live, so it clears any stale ``failed`` state. A *passive* tunnel
+    reconnect is weaker: the process merely came back on its own, saying
+    nothing about a genuine task error. Callers on that path pass
+    ``require_disconnect_code=True`` so only a ``runner_disconnected``
+    failure is cleared — a genuine task failure (``response.failed`` / a
+    setup error with any other ``last_task_error`` code) survives the
+    reconnect, keeping the red "Failed" pill instead of silently flipping
+    it back to idle and hiding the error.
+
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
+    :param conversation_store: Store used to read the persisted error
+        code and clear the labels on genuine recovery.
+    :param require_disconnect_code: When ``True`` (passive-reconnect
+        caller), only clear if the persisted ``last_task_error.code`` is
+        ``runner_disconnected``; when ``False`` (default, explicit
+        rebind/handshake), clear any stale ``failed`` state. Labels are
+        cleared in both cases.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
         return
+    # A passive reconnect must distinguish a benign runner disconnect
+    # from a real task failure: both land the cache on "failed", but only
+    # the disconnect persists a ``runner_disconnected`` label. The
+    # reconnect proves the runner is reachable again, which invalidates a
+    # disconnect failure but says nothing about a genuine task error —
+    # leave that one alone. Explicit rebinds skip this guard.
+    if require_disconnect_code:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
+        if last_error is None or last_error.get("code") != "runner_disconnected":
+            return
     _session_status_cache[session_id] = "idle"
     event = SessionStatusEvent(
         type="session.status",
@@ -5564,6 +5604,7 @@ def _publish_runner_recovered_status(session_id: str) -> None:
         error=None,
     )
     session_stream.publish(session_id, event.model_dump())
+    await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
 def _publish_terminal_pending(session_id: str, pending: bool) -> None:
@@ -6827,6 +6868,7 @@ async def _ensure_runner_session_initialized(
     session_id: str,
     conv: Conversation,
     runner_client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -6865,6 +6907,8 @@ async def _ensure_runner_session_initialized(
         ``agent_id`` and ``sub_agent_name`` for the handshake body.
     :param runner_client: Runner client already resolved for
         *session_id* (its tunnel is up).
+    :param conversation_store: Store used to clear persisted disconnect
+        error labels once the handshake proves the runner recovered.
     :returns: None.
     """
     try:
@@ -6882,7 +6926,7 @@ async def _ensure_runner_session_initialized(
         # via the same warning path rather than silently forwarding into a
         # half-initialized runner.
         resp.raise_for_status()
-        _publish_runner_recovered_status(session_id)
+        await _publish_runner_recovered_status(session_id, conversation_store)
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
@@ -9937,13 +9981,23 @@ async def _relay_runner_stream(
         )
         # Publish a failed status so the client's SSE stream sees a
         # clean error event instead of silent truncation (#1114).
-        _publish_status(
+        disconnect_error = ErrorDetail(
+            code="runner_disconnected",
+            message="Runner disconnected unexpectedly.",
+        )
+        _publish_status(session_id, "failed", disconnect_error)
+        # Persist the disconnect cause as durable labels so the
+        # distinction survives into snapshots and child-session
+        # summaries. Without this the relay-fed cache only carries a
+        # generic ``failed`` and ``last_task_error`` is dropped, leaving
+        # the UI unable to tell a benign runner disconnect from a real
+        # task failure (Option B: render a "Disconnected" pill, not the
+        # red "Failed" pill). Cleared on the next ``running`` edge by the
+        # session.status handler, exactly like other failure labels.
+        await _persist_session_status_error_labels(
             session_id,
-            "failed",
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
+            disconnect_error,
+            conversation_store,
         )
     except asyncio.CancelledError:
         raise
@@ -15172,7 +15226,7 @@ def create_sessions_router(
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:
-                            _publish_runner_recovered_status(session_id)
+                            await _publish_runner_recovered_status(session_id, conversation_store)
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
                         # (same source as the relay's except clause).
@@ -19307,7 +19361,9 @@ def create_sessions_router(
             # forwarded into a TUI whose forwarder isn't attached, the
             # round-trip never mirrors back, and the optimistic bubble
             # sticks with no reply (host-restart bug).
-            await _ensure_runner_session_initialized(session_id, conv, runner_client)
+            await _ensure_runner_session_initialized(
+                session_id, conv, runner_client, conversation_store
+            )
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
