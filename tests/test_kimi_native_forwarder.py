@@ -8,9 +8,14 @@ by the e2e gate, not here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import httpx
+import pytest
+
+from omnigent import kimi_native_forwarder as knf
 from omnigent.kimi_native_forwarder import (
     _discover_wire,
     _ForwardState,
@@ -165,3 +170,100 @@ class TestDiscoverWire:
         self._make_session(home, "session_stale", "/ws", mtime=1000.0)
         # launch far in the future (ms) → the 1000s-mtime session is below the floor.
         assert _discover_wire(home, "/ws", launch_epoch_ms=9_000_000_000_000) is None
+
+
+class TestPostFailureHandling:
+    """The forward loop must not blindly re-post after a failed POST.
+
+    The server does not dedupe ``external_conversation_item`` POSTs, so a
+    blind retry after an ambiguous failure (request sent, response lost)
+    duplicates the web bubble; and an item the server deterministically
+    rejects used to be retried forever, wedging the mirror for the rest of
+    the session. Mirrors the cursor-native forwarder's handling.
+    """
+
+    def _wire_row(self, uuid: str, text: str) -> dict[str, object]:
+        return {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "content.part",
+                "uuid": uuid,
+                "part": {"type": "text", "text": text},
+            },
+        }
+
+    def _bind_wire(self, tmp_path: Path, uuids: list[str]) -> None:
+        wire = tmp_path / "wire.jsonl"
+        wire.write_text(
+            "\n".join(json.dumps(self._wire_row(u, f"text-{u}")) for u in uuids) + "\n",
+            encoding="utf-8",
+        )
+        knf._write_state(tmp_path, knf._ForwardState(str(wire), 0))
+
+    async def _run_until(self, tmp_path: Path, done, extra_polls: int = 10) -> None:
+        task = asyncio.create_task(
+            knf.forward_kimi_wire_to_session(
+                base_url="http://unused",
+                headers={},
+                session_id="conv_t",
+                bridge_dir=tmp_path,
+                kimi_home=tmp_path,
+                workspace=str(tmp_path),
+                launch_epoch_ms=0,
+            )
+        )
+        try:
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if done():
+                    break
+            # A few more polls so any wrongful re-post would show up.
+            await asyncio.sleep(0.01 * extra_polls)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    async def test_ambiguous_post_failure_is_not_reposted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An item whose POST response was lost is skipped, not re-posted."""
+        self._bind_wire(tmp_path, ["u1", "u2"])
+        monkeypatch.setattr(knf, "_POLL_INTERVAL_S", 0.01)
+        delivered: list[str] = []
+
+        async def fake_post(client, *, base_url, headers, session_id, item, agent_name):
+            delivered.append(item.response_id)
+            if item.response_id == "kimi:u1" and delivered.count("kimi:u1") == 1:
+                # The server committed the item but the response was lost.
+                raise httpx.ReadTimeout("response lost after delivery")
+
+        monkeypatch.setattr(knf, "_post_conversation_item", fake_post)
+        await self._run_until(tmp_path, lambda: "kimi:u2" in delivered)
+
+        assert delivered == ["kimi:u1", "kimi:u2"]
+
+    async def test_poison_item_is_skipped_after_bounded_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A deterministically rejected item stops wedging the mirror."""
+        self._bind_wire(tmp_path, ["u1", "u2"])
+        monkeypatch.setattr(knf, "_POLL_INTERVAL_S", 0.01)
+        delivered: list[str] = []
+
+        async def fake_post(client, *, base_url, headers, session_id, item, agent_name):
+            delivered.append(item.response_id)
+            if item.response_id == "kimi:u1":
+                request = httpx.Request("POST", "http://ap")
+                raise httpx.HTTPStatusError(
+                    "rejected",
+                    request=request,
+                    response=httpx.Response(400, request=request),
+                )
+
+        monkeypatch.setattr(knf, "_post_conversation_item", fake_post)
+        await self._run_until(tmp_path, lambda: "kimi:u2" in delivered)
+
+        # Bounded retries for the poison item, then the mirror moves on.
+        assert delivered.count("kimi:u1") == knf._MAX_ITEM_POST_ATTEMPTS
+        assert delivered.count("kimi:u2") == 1

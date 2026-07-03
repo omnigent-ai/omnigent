@@ -8,9 +8,13 @@ stripping, role mapping, and the idempotent high-water cursor.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
+
+import httpx
+import pytest
 
 from omnigent import goose_native_forwarder as f
 
@@ -110,3 +114,81 @@ def test_default_sessions_db_honors_override(monkeypatch) -> None:
     assert f.default_sessions_db() == Path("/custom/sessions.db")
     monkeypatch.delenv("GOOSE_SESSIONS_DB", raising=False)
     assert f.default_sessions_db().name == "sessions.db"
+
+
+async def _run_forward_until(tmp_path: Path, done, extra_s: float = 0.1) -> None:
+    task = asyncio.create_task(
+        f.forward_goose_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="goose-native-ui",
+            goose_session_name="omni-1",
+            db_path=tmp_path / "sessions.db",
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        for _ in range(600):
+            await asyncio.sleep(0.01)
+            if done():
+                break
+        # A few more polls so a wrongful re-post would show up.
+        await asyncio.sleep(extra_s)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_ambiguous_post_failure_is_not_reposted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An item whose POST response was lost is skipped, not re-posted.
+
+    The server does not dedupe ``external_conversation_item`` POSTs, so a
+    blind retry after an ambiguous failure (request sent, response lost)
+    duplicates the web bubble. Mirrors cursor-native's handling.
+    """
+    _seed_db(tmp_path / "sessions.db")
+    delivered: list[int] = []
+
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+        delivered.append(item.msg_id)  # type: ignore[attr-defined]
+        if len(delivered) == 1:
+            # The server committed the item but the response was lost.
+            raise httpx.ReadTimeout("response lost after delivery")
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fake_post)
+    await _run_forward_until(tmp_path, lambda: len(set(delivered)) >= 2)
+
+    # The first row was delivered exactly once despite the lost response.
+    assert delivered == sorted(set(delivered))
+
+
+async def test_poison_item_is_skipped_after_bounded_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deterministically rejected item stops wedging the mirror forever."""
+    _seed_db(tmp_path / "sessions.db")
+    delivered: list[int] = []
+    poison_id: list[int] = []
+
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+        delivered.append(item.msg_id)  # type: ignore[attr-defined]
+        if not poison_id:
+            poison_id.append(item.msg_id)  # type: ignore[attr-defined]
+        if item.msg_id == poison_id[0]:  # type: ignore[attr-defined]
+            request = httpx.Request("POST", "http://ap")
+            raise httpx.HTTPStatusError(
+                "rejected", request=request, response=httpx.Response(400, request=request)
+            )
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fake_post)
+    await _run_forward_until(tmp_path, lambda: len(set(delivered)) >= 2, extra_s=0.05)
+
+    # Bounded retries for the poison row, then the mirror moves on.
+    assert delivered.count(poison_id[0]) == f._MAX_ITEM_POST_ATTEMPTS
+    later = [m for m in delivered if m != poison_id[0]]
+    assert later and len(later) == len(set(later))

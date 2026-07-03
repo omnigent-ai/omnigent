@@ -586,3 +586,94 @@ async def test_supervise_restarts_then_propagates_cancel(
 
     assert calls["n"] == 2
     assert sleeps == [1.0]  # initial backoff before the one restart
+
+
+async def test_ambiguous_post_failure_is_not_reposted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An item whose POST response was lost is marked seen, not re-posted.
+
+    The server does not dedupe ``external_conversation_item`` POSTs, so a
+    blind retry after an ambiguous failure (request sent, response lost)
+    duplicates the web bubble. Mirrors cursor-native's handling.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        _ev_bytes(_user_ev("u1", "hello")) + _ev_bytes(_user_ev("u2", "world"))
+    )
+    delivered: list[str] = []
+
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+        delivered.append(item.uuid)  # type: ignore[attr-defined]
+        if item.uuid == "u1" and delivered.count("u1") == 1:  # type: ignore[attr-defined]
+            # The server committed the item but the response was lost.
+            raise httpx.ReadTimeout("response lost after delivery")
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+        )
+    )
+    for _ in range(400):
+        if "u2" in delivered:
+            break
+        await asyncio.sleep(0.01)
+    # A few more polls so a wrongful re-post would show up.
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert delivered == ["u1", "u2"]
+    state = _read_state(bridge)
+    assert "u1" in (state.seen_uuids or [])
+
+
+async def test_poison_item_is_skipped_after_bounded_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deterministically rejected item stops wedging the mirror forever."""
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        _ev_bytes(_user_ev("u1", "hello")) + _ev_bytes(_user_ev("u2", "world"))
+    )
+    delivered: list[str] = []
+
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+        delivered.append(item.uuid)  # type: ignore[attr-defined]
+        if item.uuid == "u1":  # type: ignore[attr-defined]
+            request = httpx.Request("POST", "http://ap")
+            raise httpx.HTTPStatusError(
+                "rejected", request=request, response=httpx.Response(400, request=request)
+            )
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+        )
+    )
+    for _ in range(600):
+        if "u2" in delivered:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    # Bounded retries for the poison item, then the mirror moves on.
+    assert delivered.count("u1") == fwd._MAX_ITEM_POST_ATTEMPTS
+    assert delivered.count("u2") == 1

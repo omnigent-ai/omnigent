@@ -57,6 +57,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_may_have_been_delivered
 from omnigent.qwen_native_bridge import events_file_path
 
 _logger = logging.getLogger(__name__)
@@ -65,6 +66,9 @@ _logger = logging.getLogger(__name__)
 #: sub-second cadence keeps the mirrored chat tracking the terminal step by step.
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
+#: Bounded retries for a server-rejected item before skipping it, so one
+#: poison item can't wedge the mirror forever (matches cursor_native_forwarder).
+_MAX_ITEM_POST_ATTEMPTS = 5
 
 # Supervisor backoff (mirrors goose_native_forwarder.supervise_goose_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -316,6 +320,8 @@ async def forward_qwen_events_to_session(
     persisted = _read_state(bridge_dir)
     offset = persisted.offset
     seen = _new_seen(persisted.seen_uuids)
+    failed_uuid: str | None = None
+    failed_attempts = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -325,10 +331,69 @@ async def forward_qwen_events_to_session(
                 items, new_offset = await asyncio.to_thread(
                     _read_new_events, target, offset, seen, agent_name
                 )
+                retry_later = False
                 for item in items:
-                    await _post_conversation_item(client, session_id=session_id, item=item)
+                    try:
+                        await _post_conversation_item(client, session_id=session_id, item=item)
+                    except httpx.HTTPError as exc:
+                        if post_may_have_been_delivered(exc):
+                            # Ambiguous: the request was sent but its response
+                            # was lost, so the server may have committed the
+                            # item. Items aren't deduped server-side, so
+                            # re-posting would duplicate the web bubble — mark
+                            # it seen and skip past it.
+                            _logger.warning(
+                                "qwen forwarder skipping item after an ambiguous "
+                                "POST failure (may already be committed); "
+                                "uuid=%s",
+                                item.uuid,
+                                exc_info=True,
+                            )
+                        elif isinstance(exc, httpx.HTTPStatusError):
+                            # The server received and rejected the item. Retry
+                            # a bounded number of polls, then skip so one
+                            # poison item can't wedge the mirror forever.
+                            if item.uuid != failed_uuid:
+                                failed_uuid, failed_attempts = item.uuid, 0
+                            failed_attempts += 1
+                            if failed_attempts < _MAX_ITEM_POST_ATTEMPTS:
+                                _logger.warning(
+                                    "qwen forwarder POST rejected (HTTP %s); "
+                                    "retrying; uuid=%s attempt=%s",
+                                    exc.response.status_code,
+                                    item.uuid,
+                                    failed_attempts,
+                                )
+                                retry_later = True
+                                break
+                            _logger.error(
+                                "qwen forwarder dropping item after %s rejected "
+                                "POSTs (HTTP %s); mirror would otherwise wedge; "
+                                "uuid=%s",
+                                failed_attempts,
+                                exc.response.status_code,
+                                item.uuid,
+                            )
+                        else:
+                            # Connection-level failure: the server is
+                            # unreachable, which is not this item's fault.
+                            # Retry next poll; the supervisor rides it out.
+                            _logger.warning(
+                                "qwen forwarder POST could not reach the server; "
+                                "retrying; uuid=%s",
+                                item.uuid,
+                                exc_info=True,
+                            )
+                            retry_later = True
+                            break
+                    # Reached on a successful post, an ambiguous-delivery skip,
+                    # or a poison-item drop: advance past the item.
+                    failed_uuid, failed_attempts = None, 0
                     seen[item.uuid] = None
-                if new_offset != offset or items:
+                # A retry-later break must NOT advance the offset: unposted
+                # items after the failed one would be skipped forever (``seen``
+                # only covers items that were marked above).
+                if not retry_later and (new_offset != offset or items):
                     offset = new_offset
                     _write_state(
                         bridge_dir,

@@ -38,6 +38,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_may_have_been_delivered
+
 _logger = logging.getLogger(__name__)
 
 #: Poll cadence for new wire-log lines (matches cursor_native_forwarder).
@@ -49,6 +51,9 @@ _DISCOVER_SKEW_MS = 10_000
 #: Supervisor backoff bounds.
 _BACKOFF_INITIAL_S = 1.0
 _BACKOFF_MAX_S = 30.0
+#: Bounded retries for a server-rejected item before skipping it, so one
+#: poison item can't wedge the mirror forever (matches cursor_native_forwarder).
+_MAX_ITEM_POST_ATTEMPTS = 5
 
 
 @dataclass
@@ -290,6 +295,8 @@ async def forward_kimi_wire_to_session(
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
+    failed_line = -1
+    failed_attempts = 0
     async with httpx.AsyncClient(timeout=15.0) as client:
         while True:
             if wire_path is None or not wire_path.exists():
@@ -313,8 +320,52 @@ async def forward_kimi_wire_to_session(
                             agent_name=agent_name,
                         )
                     except httpx.HTTPError as exc:
-                        _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
-                        break
+                        if post_may_have_been_delivered(exc):
+                            # Ambiguous: the request was sent but its response
+                            # was lost, so the server may have committed the
+                            # item. Conversation items aren't deduped
+                            # server-side, so re-posting would duplicate the
+                            # web bubble — skip past it.
+                            _logger.warning(
+                                "kimi forwarder skipping item after an ambiguous "
+                                "POST failure (may already be committed); "
+                                "line=%s",
+                                item.line_no,
+                                exc_info=True,
+                            )
+                        elif isinstance(exc, httpx.HTTPStatusError):
+                            # The server received and rejected the item. Retry
+                            # a bounded number of polls, then skip so one
+                            # poison item can't wedge the mirror forever.
+                            if item.line_no != failed_line:
+                                failed_line, failed_attempts = item.line_no, 0
+                            failed_attempts += 1
+                            if failed_attempts < _MAX_ITEM_POST_ATTEMPTS:
+                                _logger.warning(
+                                    "kimi forwarder POST rejected (HTTP %s); "
+                                    "retrying; line=%s attempt=%s",
+                                    exc.response.status_code,
+                                    item.line_no,
+                                    failed_attempts,
+                                )
+                                break
+                            _logger.error(
+                                "kimi forwarder dropping item after %s rejected "
+                                "POSTs (HTTP %s); mirror would otherwise wedge; "
+                                "line=%s",
+                                failed_attempts,
+                                exc.response.status_code,
+                                item.line_no,
+                            )
+                        else:
+                            # Connection-level failure: the server is
+                            # unreachable, which is not this item's fault.
+                            # Retry indefinitely; the poll cadence rides it out.
+                            _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
+                            break
+                    # Reached on a successful post, an ambiguous-delivery skip,
+                    # or a poison-item drop: advance past the item.
+                    failed_line, failed_attempts = -1, 0
                     last_line = item.line_no + 1
                     _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
             await asyncio.sleep(_POLL_INTERVAL_S)

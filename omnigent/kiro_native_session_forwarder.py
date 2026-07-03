@@ -14,18 +14,22 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_may_have_been_delivered
 from omnigent.kiro_native_bridge import write_forwarder_ready
 
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_INTERVAL_S = 0.7
 _POST_TIMEOUT_S = 30.0
+#: Bounded retries for a server-rejected message before skipping it, so one
+#: poison message can't wedge the mirror forever (matches cursor_native_forwarder).
+_MAX_ITEM_POST_ATTEMPTS = 5
 _DISCOVERY_SKEW_MS = 10_000
 _STATE_FILE = "kiro_session_forwarder.json"
 
@@ -49,6 +53,9 @@ class _KiroConversationMessage:
     message_id: str
     role: str
     text: str
+    #: File offset just past this message's JSONL line, so the forward
+    #: cursor can advance per message instead of per batch.
+    end_offset: int = 0
 
 
 def _kiro_cli_sessions_dir(home: Path | None = None) -> Path:
@@ -237,7 +244,7 @@ def _read_new_kiro_messages(
                     continue
                 message = _parse_kiro_jsonl_line(line)
                 if message is not None:
-                    messages.append(message)
+                    messages.append(replace(message, end_offset=offset))
             return messages, offset
     except OSError:
         return [], byte_offset
@@ -507,6 +514,8 @@ async def forward_kiro_session_to_omnigent(
     mirrored_external_session_id: str | None = None
     last_posted_cost: float | None = None
     last_posted_model: str | None = None
+    failed_message_id: str | None = None
+    failed_attempts = 0
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -542,11 +551,12 @@ async def forward_kiro_session_to_omnigent(
                             external_session_id=state.session_id,
                         )
                         mirrored_external_session_id = state.session_id
-                    messages, byte_offset = await asyncio.to_thread(
+                    messages, batch_end_offset = await asyncio.to_thread(
                         _read_new_kiro_messages,
                         jsonl_path,
                         state.byte_offset,
                     )
+                    retry_later = False
                     for message in messages:
                         # Mirror the transcript only. Running/idle status for
                         # kiro-native is owned by the PTY watcher's ``emit_status``
@@ -555,14 +565,79 @@ async def forward_kiro_session_to_omnigent(
                         # whose forwarders mirror the transcript, not the
                         # running/idle session status. Posting status here too
                         # double-sourced it (#1137).
-                        await _post_conversation_message(
-                            client,
-                            session_id=session_id,
-                            agent_name=agent_name,
-                            message=message,
-                        )
-                    if byte_offset != state.byte_offset:
-                        state.byte_offset = byte_offset
+                        try:
+                            await _post_conversation_message(
+                                client,
+                                session_id=session_id,
+                                agent_name=agent_name,
+                                message=message,
+                            )
+                        except httpx.HTTPError as exc:
+                            if post_may_have_been_delivered(exc):
+                                # Ambiguous: the request was sent but its
+                                # response was lost, so the server may have
+                                # committed the message. Items aren't deduped
+                                # server-side, so re-posting would duplicate
+                                # the web bubble — skip past it.
+                                _logger.warning(
+                                    "kiro forwarder skipping message after an "
+                                    "ambiguous POST failure (may already be "
+                                    "committed); message_id=%s",
+                                    message.message_id,
+                                    exc_info=True,
+                                )
+                            elif isinstance(exc, httpx.HTTPStatusError):
+                                # The server received and rejected the message.
+                                # Retry a bounded number of polls, then skip so
+                                # one poison message can't wedge the mirror.
+                                if message.message_id != failed_message_id:
+                                    failed_message_id = message.message_id
+                                    failed_attempts = 0
+                                failed_attempts += 1
+                                if failed_attempts < _MAX_ITEM_POST_ATTEMPTS:
+                                    _logger.warning(
+                                        "kiro forwarder POST rejected (HTTP %s); "
+                                        "retrying; message_id=%s attempt=%s",
+                                        exc.response.status_code,
+                                        message.message_id,
+                                        failed_attempts,
+                                    )
+                                    retry_later = True
+                                    break
+                                _logger.error(
+                                    "kiro forwarder dropping message after %s "
+                                    "rejected POSTs (HTTP %s); mirror would "
+                                    "otherwise wedge; message_id=%s",
+                                    failed_attempts,
+                                    exc.response.status_code,
+                                    message.message_id,
+                                )
+                            else:
+                                # Connection-level failure: the server is
+                                # unreachable, which is not this message's
+                                # fault. Retry next poll.
+                                _logger.warning(
+                                    "kiro forwarder POST could not reach the "
+                                    "server; retrying; message_id=%s",
+                                    message.message_id,
+                                    exc_info=True,
+                                )
+                                retry_later = True
+                                break
+                        # Advance the cursor past this message as soon as it is
+                        # posted (or skipped/dropped), so a failure later in
+                        # the batch never re-posts the messages already
+                        # delivered — the old batch-level cursor did exactly
+                        # that on any transient failure.
+                        failed_message_id, failed_attempts = None, 0
+                        # Monotonic: only ever move the cursor forward.
+                        if message.end_offset > state.byte_offset:
+                            state.byte_offset = message.end_offset
+                            _write_state(bridge_dir, state)
+                    # Only cover the batch tail (trailing non-mirrorable lines)
+                    # when nothing is pending a retry.
+                    if not retry_later and batch_end_offset > state.byte_offset:
+                        state.byte_offset = batch_end_offset
                         _write_state(bridge_dir, state)
                     write_forwarder_ready(bridge_dir)
                     # Forward kiro's credit metering as authoritative session

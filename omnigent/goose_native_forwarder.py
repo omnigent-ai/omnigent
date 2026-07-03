@@ -37,6 +37,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_may_have_been_delivered
+
 _logger = logging.getLogger(__name__)
 
 #: Seconds between store polls. Goose flushes a ``messages`` row per agentic
@@ -46,6 +48,9 @@ _logger = logging.getLogger(__name__)
 #: rather than lagging a beat behind each one. 0.4s balances liveness vs. load.
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
+#: Bounded retries for a server-rejected item before skipping it, so one
+#: poison item can't wedge the mirror forever (matches cursor_native_forwarder).
+_MAX_ITEM_POST_ATTEMPTS = 5
 
 # Supervisor backoff (mirrors cursor_native_forwarder.supervise_cursor_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -351,6 +356,8 @@ async def forward_goose_store_to_session(
     persisted = _read_state(bridge_dir)
     goose_session_id: str | None = persisted.goose_session_id
     last_id = persisted.last_id if goose_session_id is not None else 0
+    failed_msg_id = -1
+    failed_attempts = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -374,7 +381,63 @@ async def forward_goose_store_to_session(
                     )
                     for item in items:
                         if item.item_type:
-                            await _post_conversation_item(client, session_id=session_id, item=item)
+                            try:
+                                await _post_conversation_item(
+                                    client, session_id=session_id, item=item
+                                )
+                            except httpx.HTTPError as exc:
+                                if post_may_have_been_delivered(exc):
+                                    # Ambiguous: the request was sent but its
+                                    # response was lost, so the server may have
+                                    # committed the item. Items aren't deduped
+                                    # server-side, so re-posting would duplicate
+                                    # the web bubble — skip past it.
+                                    _logger.warning(
+                                        "goose forwarder skipping item after an "
+                                        "ambiguous POST failure (may already be "
+                                        "committed); msg_id=%s",
+                                        item.msg_id,
+                                        exc_info=True,
+                                    )
+                                elif isinstance(exc, httpx.HTTPStatusError):
+                                    # The server received and rejected the item.
+                                    # Retry a bounded number of polls, then skip
+                                    # so one poison item can't wedge the mirror.
+                                    if item.msg_id != failed_msg_id:
+                                        failed_msg_id, failed_attempts = item.msg_id, 0
+                                    failed_attempts += 1
+                                    if failed_attempts < _MAX_ITEM_POST_ATTEMPTS:
+                                        _logger.warning(
+                                            "goose forwarder POST rejected (HTTP "
+                                            "%s); retrying; msg_id=%s attempt=%s",
+                                            exc.response.status_code,
+                                            item.msg_id,
+                                            failed_attempts,
+                                        )
+                                        break
+                                    _logger.error(
+                                        "goose forwarder dropping item after %s "
+                                        "rejected POSTs (HTTP %s); mirror would "
+                                        "otherwise wedge; msg_id=%s",
+                                        failed_attempts,
+                                        exc.response.status_code,
+                                        item.msg_id,
+                                    )
+                                else:
+                                    # Connection-level failure: the server is
+                                    # unreachable, which is not this item's
+                                    # fault. Retry next poll.
+                                    _logger.warning(
+                                        "goose forwarder POST could not reach "
+                                        "the server; retrying; msg_id=%s",
+                                        item.msg_id,
+                                        exc_info=True,
+                                    )
+                                    break
+                        # Reached on a successful post, a non-mirrored row, an
+                        # ambiguous-delivery skip, or a poison-item drop:
+                        # advance past the item.
+                        failed_msg_id, failed_attempts = -1, 0
                         last_id = item.msg_id
                         _write_state(
                             bridge_dir,

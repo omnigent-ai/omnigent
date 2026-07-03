@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -207,12 +208,15 @@ def test_read_new_kiro_messages_returns_user_and_assistant_text(tmp_path: Path) 
 
     messages, byte_offset = forwarder._read_new_kiro_messages(jsonl_path, 0)
 
-    assert messages == [
+    assert [replace(m, end_offset=0) for m in messages] == [
         forwarder._KiroConversationMessage(message_id="user-1", role="user", text="hey"),
         forwarder._KiroConversationMessage(
             message_id="assistant-1", role="assistant", text="Hello there"
         ),
     ]
+    # Each message carries the offset just past its own line, so the forward
+    # cursor can advance per message; the last one covers the whole read.
+    assert 0 < messages[0].end_offset < messages[1].end_offset
     assert byte_offset == jsonl_path.stat().st_size
 
 
@@ -246,9 +250,10 @@ def test_read_new_kiro_messages_holds_offset_at_partial_trailing_line(tmp_path: 
 
     # Only the complete record is delivered; the offset stops at its newline,
     # not at EOF (which would skip the partial record once it's finished).
-    assert messages == [
+    assert [replace(m, end_offset=0) for m in messages] == [
         forwarder._KiroConversationMessage(message_id="user-1", role="user", text="first")
     ]
+    assert messages[0].end_offset == offset
     assert offset == len((complete + "\n").encode("utf-8"))
     assert offset < jsonl_path.stat().st_size
 
@@ -257,7 +262,7 @@ def test_read_new_kiro_messages_holds_offset_at_partial_trailing_line(tmp_path: 
         handle.write("\n")
     messages, offset = forwarder._read_new_kiro_messages(jsonl_path, offset)
 
-    assert messages == [
+    assert [replace(m, end_offset=0) for m in messages] == [
         forwarder._KiroConversationMessage(
             message_id="assistant-1", role="assistant", text="second"
         )
@@ -339,7 +344,7 @@ async def test_forward_kiro_session_posts_conversation_messages(
             launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
         )
 
-    assert posted == [
+    assert [(sid, agent, replace(msg, end_offset=0)) for sid, agent, msg in posted] == [
         (
             "conv_kiro",
             "kiro-native-ui",
@@ -589,7 +594,7 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
             expected_session_id="resumed-session",
         )
 
-    assert posted == [
+    assert [replace(m, end_offset=0) for m in posted] == [
         forwarder._KiroConversationMessage(message_id="resumed-user", role="user", text=":0"),
         forwarder._KiroConversationMessage(
             message_id="resumed-assistant", role="assistant", text="resumed reply"
@@ -831,3 +836,128 @@ async def test_forward_kiro_session_mirrors_current_model_once(
 
     # Mirrored once; the unchanged second poll does not re-post.
     assert models == [("conv_kiro", "claude-haiku-4.5")]
+
+
+def _three_message_session(tmp_path: Path) -> tuple[Path, Path]:
+    """A kiro session with three mirrorable messages, for retry tests."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "Prompt",
+                "data": {"message_id": f"m-{i}", "content": [{"kind": "text", "data": f"t{i}"}]},
+            }
+            for i in range(3)
+        ],
+    )
+    return sessions_dir, workspace
+
+
+async def _run_polls(
+    monkeypatch: pytest.MonkeyPatch, workspace: Path, tmp_path: Path, polls: int
+) -> None:
+    """Drive the forward loop for *polls* iterations, then cancel."""
+    remaining = {"n": polls}
+
+    async def _bounded_sleep(_seconds: float) -> None:
+        remaining["n"] -= 1
+        if remaining["n"] <= 0:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _bounded_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_does_not_repost_delivered_batch_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mid-batch transient failure must not re-post already-delivered messages.
+
+    The cursor used to advance per *batch*: any failure on message k re-posted
+    the k-1 messages already delivered (duplicate web bubbles — no server-side
+    dedup). The cursor now advances per message.
+    """
+    sessions_dir, workspace = _three_message_session(tmp_path)
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    delivered: list[str] = []
+    fail_once = {"armed": True}
+
+    async def _fake_post(client, *, session_id, agent_name, message) -> None:
+        del client
+        if message.message_id == "m-1" and fail_once["armed"]:
+            fail_once["armed"] = False
+            # Connection-level failure: never delivered, retried next poll.
+            raise httpx.ConnectError("server unreachable")
+        delivered.append(message.message_id)
+
+    monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
+    await _run_polls(monkeypatch, workspace, tmp_path, polls=4)
+
+    # m-0 delivered exactly once; m-1/m-2 delivered on the retry poll.
+    assert delivered == ["m-0", "m-1", "m-2"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_post_failure_is_not_reposted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A message whose POST response was lost is skipped, not re-posted."""
+    sessions_dir, workspace = _three_message_session(tmp_path)
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    attempts: list[str] = []
+
+    async def _fake_post(client, *, session_id, agent_name, message) -> None:
+        del client
+        attempts.append(message.message_id)
+        if message.message_id == "m-1" and attempts.count("m-1") == 1:
+            # The server committed the message but the response was lost.
+            raise httpx.ReadTimeout("response lost after delivery")
+
+    monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
+    await _run_polls(monkeypatch, workspace, tmp_path, polls=4)
+
+    assert attempts == ["m-0", "m-1", "m-2"]
+
+
+@pytest.mark.asyncio
+async def test_poison_message_is_skipped_after_bounded_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deterministically rejected message stops wedging the mirror forever."""
+    sessions_dir, workspace = _three_message_session(tmp_path)
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    attempts: list[str] = []
+
+    async def _fake_post(client, *, session_id, agent_name, message) -> None:
+        del client
+        attempts.append(message.message_id)
+        if message.message_id == "m-1":
+            request = httpx.Request("POST", "http://ap")
+            raise httpx.HTTPStatusError(
+                "rejected", request=request, response=httpx.Response(400, request=request)
+            )
+
+    monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
+    await _run_polls(monkeypatch, workspace, tmp_path, polls=10)
+
+    # Bounded retries for the poison message, then the mirror moves on; the
+    # already-delivered m-0 is never re-posted.
+    assert attempts.count("m-0") == 1
+    assert attempts.count("m-1") == forwarder._MAX_ITEM_POST_ATTEMPTS
+    assert attempts.count("m-2") == 1
