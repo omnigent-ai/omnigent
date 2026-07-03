@@ -128,7 +128,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import { SettingsSidebarBody, useSettingsRoute } from "./settingsNav";
+import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
   type ActiveChatOverride,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
@@ -337,6 +337,10 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   // for the settings section nav (see settingsNav.tsx) — entering settings
   // shouldn't replace the whole sidebar.
   const { inSettings } = useSettingsRoute();
+  // Remember the pre-settings location so "Back to Omnigent" returns to the
+  // conversation the user was viewing, not the home page. Tracked here since
+  // the sidebar stays mounted across the transition into settings.
+  useTrackSettingsReturn();
 
   // Sync pinned ids to localStorage whenever state changes. Keeping
   // the write here (instead of inside the state updater) preserves the
