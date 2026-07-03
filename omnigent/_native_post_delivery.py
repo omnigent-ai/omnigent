@@ -169,6 +169,7 @@ async def post_external_session_status(
     status: str,
     output: str | None = None,
     background_task_count: int | None = None,
+    response_id: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -186,6 +187,13 @@ async def post_external_session_status(
         edge, forwarded so the UI can show "N background tasks still running".
         ``None`` omits the field (server leaves its sticky tally untouched) — the
         default for edges that know nothing about background shells.
+    :param response_id: Optional id of the assistant turn this status edge
+        belongs to. When set, the server attaches it to the ``session.status``
+        SSE event so ap-web can drive the bubble's streaming lifecycle — that's
+        what makes native forwarded tool cards render LIVE (spinner + elapsed
+        timer) rather than as static completed cards. ``None`` (the default)
+        preserves the bare, turn-agnostic status edges (e.g. the sub-agent
+        quiescence badge) that don't map to a turn.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -193,6 +201,8 @@ async def post_external_session_status(
         data["output"] = output
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
+    if response_id is not None:
+        data["response_id"] = response_id
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

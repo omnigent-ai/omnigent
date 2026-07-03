@@ -1690,6 +1690,15 @@ class SessionResponse(BaseModel):
         ``_session_sandbox_status_cache`` at snapshot build time, so
         a client opening the session mid-launch sees the current
         stage.
+    :param active_response_id: Response id of the turn currently in
+        flight, or ``None`` when the session is idle. Sourced from the
+        server's ``_session_active_response_cache`` at snapshot build
+        time so a client connecting mid-turn can reopen a streaming
+        ``activeResponse`` — the SSE stream is snapshot + live tail with
+        no replay, so the turn-start ``running`` edge that carried this
+        id is not re-sent on reconnect. Today only native-terminal
+        forwarders (claude-native) stamp a turn id on their status
+        edges; other harnesses leave this ``None``.
     """
 
     id: str
@@ -1739,6 +1748,7 @@ class SessionResponse(BaseModel):
     model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    active_response_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):

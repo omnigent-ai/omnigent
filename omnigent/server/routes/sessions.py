@@ -840,6 +840,14 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 # Used by _get_session_snapshot.
 _session_status_cache: dict[str, str] = {}
 
+# Per-session in-flight response id, tracked alongside _session_status_cache.
+# Set when a running/waiting status edge carries a response_id (native Claude's
+# turn-start edge does); popped on idle/failed. Projected onto the session
+# snapshot as ``active_response_id`` so a client reconnecting mid-turn can
+# reopen the streaming ``activeResponse`` and keep forwarded tool cards
+# rendering LIVE — the SSE stream is "snapshot + live tail, no replay", so the
+# turn-start ``running`` event is never re-sent on reconnect.
+_session_active_response_cache: dict[str, str] = {}
 # Per-session background-shell tally (claude-native), kept in lockstep with
 # ``_session_status_cache`` so a snapshot/reload re-shows "N background tasks
 # still running" after the live SSE edge is gone. The authoritative source is
@@ -2535,6 +2543,11 @@ def _build_session_response(
         # once the launch succeeds; a failed launch is retained with
         # its reason. Populated by _publish_sandbox_status.
         sandbox_status=_session_sandbox_status_cache.get(conv.id),
+        # In-flight turn id so a mid-turn reconnect can reopen a streaming
+        # ``activeResponse`` (the turn-start ``running`` edge that carried it
+        # is not replayed on the SSE stream). Populated for native-terminal
+        # sessions whose forwarder stamps a turn id; ``None`` otherwise.
+        active_response_id=_session_active_response_cache.get(conv.id),
     )
 
 
@@ -5401,8 +5414,20 @@ def _publish_status(
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
+        # Session stays ``failed`` (terminal); the turn is over, so drop any
+        # tracked in-flight response id rather than leaving it for the
+        # snapshot to reopen a streaming bubble.
+        _session_active_response_cache.pop(session_id, None)
         return
     _session_status_cache[session_id] = status
+    # Track the in-flight response id for snapshot-based reconnect (see
+    # _session_active_response_cache). A running/waiting edge that names a
+    # turn opens it; any idle/failed edge closes it.
+    if status in ("running", "waiting"):
+        if response_id is not None:
+            _session_active_response_cache[session_id] = response_id
+    else:
+        _session_active_response_cache.pop(session_id, None)
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and
