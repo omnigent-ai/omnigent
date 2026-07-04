@@ -2517,6 +2517,26 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     assert options.stderr is None
 
 
+def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
+    """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
+    against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
+    — so the sandbox root matches the tmux terminal and never falls back
+    to ``$HOME``. Absolute paths are honored verbatim."""
+    from omnigent.inner.claude_sdk_executor import _resolve_sandbox_cwd
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
+    monkeypatch.chdir("/tmp")
+
+    assert str(_resolve_sandbox_cwd(".")) == "/home/bobby/code/agents"
+    assert str(_resolve_sandbox_cwd(None)) == "/home/bobby/code/agents"
+    assert str(_resolve_sandbox_cwd("src")) == "/home/bobby/code/agents/src"
+    assert str(_resolve_sandbox_cwd("/etc/foo")) == "/etc/foo"
+
+    # No workspace set → falls back to the process cwd (prior behavior).
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+    assert str(_resolve_sandbox_cwd(".")) == "/tmp"
+
+
 @pytest.mark.parametrize("env_value", ["1", "true", "yes"])
 def test_prepare_claude_cli_path_bypasses_wrapper_when_env_set(
     monkeypatch, caplog, env_value: str

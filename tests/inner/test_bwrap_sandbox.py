@@ -824,6 +824,61 @@ def test_wrap_launcher_argv_target_already_in_default_mounts(
     )
 
 
+def test_wrap_launcher_argv_reexposes_interpreter_under_masked_dotdir(
+    tmp_path: Path,
+) -> None:
+    """
+    When cwd is an ancestor of the helper interpreter and the
+    interpreter lives under a hidden dir (a ``uv tool`` install at
+    ``~/.local/share/uv/tools/omnigent/bin/python`` with cwd=``$HOME``),
+    the dotfile masker ``--tmpfs``-masks ``.local`` — and, emitted last,
+    that mask would hide the interpreter and make bwrap's ``execvp``
+    fail with ENOENT.
+
+    The argv must therefore (1) still mask ``.local`` (the sibling
+    content stays hidden), (2) emit a ``--ro-bind-try`` of the
+    interpreter's ``bin`` dir AFTER the mask so it wins, and (3) NOT
+    re-bind ``.local`` itself (which would defeat the mask).
+    """
+    interp_bin = tmp_path / ".local" / "share" / "uv" / "tools" / "omnigent" / "bin"
+    interp_bin.mkdir(parents=True)
+    interp = interp_bin / "python"
+    interp.write_text("#!/bin/sh\n")
+    interp.chmod(0o755)
+
+    backend = _make_backend()
+    # overflow="warn" so the $HOME-sized walk doesn't raise on the
+    # unrelated dotdirs a real home carries; the mask itself is unaffected.
+    policy = _make_policy(tmp_path, cwd_hidden_scan_overflow="warn")
+    argv = backend.wrap_launcher_argv(
+        [str(interp), "-c", "pass"], policy, tmp_path, target=str(interp)
+    )
+
+    cwd = tmp_path.resolve(strict=False)
+    local_dir = str(cwd / ".local")
+    bin_dir = str(interp_bin.resolve(strict=False))
+
+    def _last_index(pred: object) -> int:
+        return max((i for i, _ in enumerate(argv) if pred(i)), default=-1)  # type: ignore[operator]
+
+    mask_pos = _last_index(lambda i: argv[i] == "--tmpfs" and argv[i + 1] == local_dir)
+    assert mask_pos >= 0, f".local should still be --tmpfs-masked. argv: {argv}"
+
+    bind_pos = _last_index(
+        lambda i: argv[i] == "--ro-bind-try" and i + 2 < len(argv) and argv[i + 2] == bin_dir
+    )
+    assert bind_pos > mask_pos, (
+        "The interpreter bin dir must be re-bound with --ro-bind-try AFTER "
+        f"the .local --tmpfs mask so it wins. mask_pos={mask_pos}, "
+        f"bind_pos={bind_pos}. argv: {argv}"
+    )
+
+    # The masked dotdir itself must not be re-exposed wholesale.
+    assert not _has_pair(argv, "--ro-bind-try", local_dir, local_dir), (
+        ".local was re-bound wholesale, defeating the dotfile mask."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dotfile masking + symlink defense
 # ---------------------------------------------------------------------------
@@ -1214,6 +1269,49 @@ print(json.dumps(results))
         f"clone(CLONE_NEWNET) returned errno={parsed['clone_newnet']['errno']}"
         f" instead of EPERM; the MASKED_EQ rule for CLONE_NEWNET in"
         " _bwrap_extra_seccomp_rules() is missing or incorrect."
+    )
+
+
+@pytestmark_bwrap
+def test_interpreter_under_masked_dotdir_still_spawns(tmp_path: Path) -> None:
+    """
+    End-to-end: an interpreter reachable only via a hidden dir INSIDE
+    cwd still runs, while sibling content under that dir stays masked.
+
+    Mirrors the reported failure — a ``uv tool``-installed omnigent at
+    ``~/.local/share/uv/tools/omnigent/bin/python`` with the sandbox
+    rooted at ``$HOME`` — where the dotfile masker ``--tmpfs``-masked
+    ``.local`` and bwrap died with ``execvp ...: No such file or
+    directory``. Proves the interpreter now execs AND that the mask
+    still hides an unrelated secret alongside it.
+    """
+    real_python = os.path.realpath(sys.executable)
+    interp_bin = tmp_path / ".local" / "share" / "uv" / "tools" / "omnigent" / "bin"
+    interp_bin.mkdir(parents=True)
+    interp = interp_bin / "python"
+    interp.symlink_to(real_python)
+    # A secret elsewhere under .local, NOT on the interpreter's path.
+    secret = tmp_path / ".local" / "secret.txt"
+    secret.write_text("TOPSECRET")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, cwd_hidden_scan_overflow="warn")
+    probe = (
+        "import pathlib,sys;"
+        f"print('SECRET_LEAK' if pathlib.Path({str(secret)!r}).exists() else 'ok');"
+        "sys.stdout.write('RAN')"
+    )
+    argv = backend.wrap_launcher_argv([str(interp), "-c", probe], policy, tmp_path)
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, (
+        f"interpreter under masked .local failed to spawn (rc="
+        f"{completed.returncode}). stderr={completed.stderr[-400:]!r}"
+    )
+    assert "RAN" in completed.stdout, f"probe did not run. stdout={completed.stdout!r}"
+    assert "SECRET_LEAK" not in completed.stdout, (
+        "the re-expose bind leaked an unrelated secret under the masked "
+        ".local dir; only the interpreter subtree should be re-exposed."
     )
 
 

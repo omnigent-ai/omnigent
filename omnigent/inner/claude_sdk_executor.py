@@ -889,6 +889,31 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
+    """Resolve the sandbox root, rooting relative paths at the session
+    working folder rather than the runner daemon's process cwd.
+
+    A relative ``os_env.cwd`` — notably the default ``"."`` — resolved
+    against ``os.getcwd()`` lands on the runner daemon's ``$HOME`` when
+    no workspace is selected. That both roots the sandbox at the whole
+    home dir and disagrees with the tmux terminal, which uses
+    ``OMNIGENT_RUNNER_WORKSPACE``. Prefer that workspace as the base so
+    the two agree; fall back to the process cwd only when it is unset.
+    An absolute ``spec_cwd`` is honored verbatim.
+
+    :param spec_cwd: The spec's ``os_env.cwd``, or ``None``.
+    :returns: The resolved, absolute sandbox root.
+    """
+    base = os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or os.getcwd()
+    if spec_cwd:
+        path = pathlib.Path(spec_cwd)
+        if not path.is_absolute():
+            path = pathlib.Path(base) / path
+    else:
+        path = pathlib.Path(base)
+    return path.resolve(strict=False)
+
+
 def prepare_claude_cli_path(
     real_cli_path: str | None,
     spec: OSEnvSpec | None,
@@ -913,7 +938,7 @@ def prepare_claude_cli_path(
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
 
-    cwd = pathlib.Path(spec.cwd or os.getcwd()).resolve(strict=False)
+    cwd = _resolve_sandbox_cwd(spec.cwd)
     sandbox = resolve_sandbox(spec, cwd)
     if not sandbox.active:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
@@ -965,7 +990,7 @@ def prepare_tight_cli_process_path(
         ),
     )
     try:
-        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+        resolved_cwd = _resolve_sandbox_cwd(cwd)
         sandbox = resolve_sandbox(spec, resolved_cwd)
     except (OSError, NotImplementedError) as exc:
         logger.warning(
