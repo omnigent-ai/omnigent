@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -333,6 +334,72 @@ def _isolate_codex_native_state(
     """
     state_dir = tmp_path_factory.mktemp("codex-native-state")
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_snapshot_failures(pytestconfig: pytest.Config):
+    """
+    Race-safe override of pytest-playwright-visual-snapshot's cleanup fixture.
+
+    The plugin ships a ``scope="session", autouse=True`` fixture of this
+    name that, at session start, does ``shutil.rmtree(path, ignore_errors=
+    True)`` then ``path.mkdir(parents=True, exist_ok=True)`` on the
+    configured failures dir (``tests/e2e_ui/visual/snapshot_failures``,
+    per ``[tool.pytest.ini_options]`` in ``pyproject.toml``). Because the
+    fixture is a *global* plugin autouse fixture, it runs once per xdist
+    worker on **every** shard -- including runtime/harnesses, which never
+    touches a visual snapshot -- all pointing at the same shared relative
+    path.
+
+    ``Path.mkdir(exist_ok=True)`` is NOT race-safe against a concurrent
+    ``rmtree``: CPython calls ``os.mkdir``, catches the ``FileExistsError``,
+    then re-checks ``self.is_dir()`` and *re-raises* if the directory is
+    gone. When N workers each ``rmtree`` + ``mkdir`` the same path at
+    startup, one worker's ``rmtree`` can land in another's TOCTOU window,
+    so its ``mkdir`` re-raises ``FileExistsError`` and errors every test in
+    that worker at setup. This is latent on every shard/commit; it surfaces
+    intermittently on whichever run loses the race (the high-worker
+    ``-n 8 --dist=worksteal`` runtime-harnesses lane is the most exposed).
+
+    Defining the fixture here (same name, in the root conftest) shadows the
+    plugin's for the whole suite. We reproduce the plugin's path setup so
+    the visual suite still works, but recreate the directory with a retry
+    that tolerates a peer worker deleting it mid-flight -- each worker
+    ``rmtree``s exactly once, so the retry budget cannot be exhausted.
+
+    :param pytestconfig: session ``Config`` (ini options + rootdir).
+    """
+    from pytest_playwright_visual_snapshot.plugin import SnapshotPaths
+
+    root_dir = Path(pytestconfig.rootdir)  # type: ignore[arg-type]
+
+    SnapshotPaths.snapshots_path = Path(
+        pytestconfig.getini("playwright_visual_snapshots_path")
+        or (root_dir / "__snapshots__")
+    )
+    SnapshotPaths.failures_path = Path(
+        pytestconfig.getini("playwright_visual_snapshot_failures_path")
+        or (root_dir / "snapshot_failures")
+    )
+
+    failures_path = SnapshotPaths.failures_path
+    shutil.rmtree(failures_path, ignore_errors=True)
+
+    # Recreate race-safely: a peer xdist worker's rmtree can land in the
+    # TOCTOU window of our mkdir and defeat exist_ok=True. Each worker
+    # rmtrees exactly once, so retrying past that window always converges.
+    last_exc: FileExistsError | None = None
+    for _ in range(64):
+        try:
+            failures_path.mkdir(parents=True, exist_ok=True)
+            last_exc = None
+            break
+        except FileExistsError as exc:
+            last_exc = exc
+    if last_exc is not None and not failures_path.is_dir():
+        raise last_exc
+
+    yield
 
 
 @pytest.fixture()
