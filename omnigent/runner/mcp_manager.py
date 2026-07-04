@@ -55,6 +55,7 @@ class _SharedServerEntry:
     tools: list[McpToolDef] = field(default_factory=list)
     error: str | None = None
     ref_count: int = 0
+    connect_task: asyncio.Task[None] | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -72,7 +73,6 @@ class _SpecEntry:
     spec_hash: str
     servers: dict[str, _SpecServerRef] = field(default_factory=dict)
     server_hashes: set[str] = field(default_factory=set)
-    connect_task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True)
@@ -353,42 +353,42 @@ class RunnerMcpManager:
         async with self._lock:
             entry = self._ensure_entry(spec_hash, configs)
             self._touch(spec_hash)
-            connect_task = entry.connect_task
-            needs_connect = any(s.entry.connection is None for s in entry.servers.values())
-            if needs_connect and (connect_task is None or connect_task.done()):
-                entry.connect_task = asyncio.create_task(
-                    self._connect_all(entry),
-                    name=f"runner-mcp-on-demand:{spec_hash}",
-                )
-                connect_task = entry.connect_task
+            refs = list(entry.servers.values())
+            for ref in refs:
+                self._retain_server_ref(ref.entry)
+            connect_tasks = {
+                ref.server_hash: task
+                for ref in refs
+                if (task := self._ensure_connect_task(ref.entry, entry.spec_hash)) is not None
+            }
 
-        # Await outside the lock so concurrent connects can proceed.
-        if connect_task is not None:
-            try:
-                await connect_task
-            except Exception:
-                _logger.exception("runner mcp connect task raised; surfacing partial results")
+        try:
+            if connect_tasks:
+                try:
+                    await asyncio.gather(*connect_tasks.values())
+                except Exception:
+                    _logger.exception("runner mcp connect task raised; surfacing partial results")
 
-        schemas: list[dict[str, Any]] = []
-        tool_names: set[str] = set()
-        failures: dict[str, str] = {}
-        for ref in entry.servers.values():
-            server = ref.entry
-            if server.error is not None:
-                failures[ref.config.name] = server.error
-                continue
-            allowed = (
-                set(getattr(ref.config, "tools", None) or [])
-                if getattr(ref.config, "tools", None)
-                else None
-            )
-            for td in server.tools:
-                schema = _mcp_tool_schema(ref.config.name, td, allowed)
-                if schema is None:
+            schemas: list[dict[str, Any]] = []
+            tool_names: set[str] = set()
+            failures: dict[str, str] = {}
+            for ref in refs:
+                server = ref.entry
+                if server.error is not None:
+                    failures[ref.config.name] = server.error
                     continue
-                schemas.append(schema)
-                tool_names.add(schema["name"])
-        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
+                allowed = self._allowed_tools(ref)
+                for td in server.tools:
+                    schema = _mcp_tool_schema(ref.config.name, td, allowed)
+                    if schema is None:
+                        continue
+                    schemas.append(schema)
+                    tool_names.add(schema["name"])
+            return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures=failures)
+        finally:
+            async with self._lock:
+                for ref in refs:
+                    self._release_server_ref(ref.entry, entry.spec_hash)
 
     async def call_tool(
         self,
@@ -418,22 +418,58 @@ class RunnerMcpManager:
                 f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"
             )
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
-        async with self._lock:
-            entry = self._ensure_entry(spec_hash, configs)
-            self._touch(spec_hash)
+        server_to_release: _SharedServerEntry | None = None
+        try:
+            if "__" in tool_name:
+                async with self._lock:
+                    entry = self._ensure_entry(spec_hash, configs)
+                    self._touch(spec_hash)
+                    route_ref = self._resolve_tool_ref(entry, tool_name)
+                    if route_ref is None:
+                        raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+                    ref, bare_name = route_ref
+                    self._retain_server_ref(ref.entry)
+                    server_to_release = ref.entry
+                    connect_task = self._ensure_connect_task(ref.entry, entry.spec_hash)
 
-        route = await self._resolve_tool_route_connected(entry, spec, tool_name)
-        if route is None:
-            raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
-        owning_server, bare_name = route
-        if owning_server.connection is None:
-            raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+                if connect_task is not None:
+                    await connect_task
+                if (
+                    ref.entry.error is None
+                    and ref.entry.connection is not None
+                    and self._server_has_allowed_tool(ref, bare_name)
+                ):
+                    route = (ref.entry, bare_name)
+                else:
+                    route = None
+            else:
+                await self.schemas_for(spec)
+                async with self._lock:
+                    entry = self._specs.get(spec_hash)
+                    route = (
+                        None
+                        if entry is None
+                        else self._resolve_tool_route_from_entry(entry, tool_name)
+                    )
+                    if route is not None:
+                        self._retain_server_ref(route[0])
+                        server_to_release = route[0]
 
-        return await owning_server.connection.call_tool(
-            bare_name,
-            arguments,
-            session_id=session_id,
-        )
+            if route is None:
+                raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+            owning_server, bare_name = route
+            if owning_server.connection is None:
+                raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
+
+            return await owning_server.connection.call_tool(
+                bare_name,
+                arguments,
+                session_id=session_id,
+            )
+        finally:
+            if server_to_release is not None:
+                async with self._lock:
+                    self._release_server_ref(server_to_release, spec_hash)
 
     def _resolve_tool_route(
         self,
@@ -453,19 +489,71 @@ class RunnerMcpManager:
         entry = self._specs.get(spec_hash)
         if entry is None:
             return None
-        for ref in entry.servers.values():
+        return self._resolve_tool_route_from_entry(entry, tool_name)
+
+    def _resolve_tool_route_from_entry(
+        self,
+        entry: _SpecEntry,
+        tool_name: str,
+    ) -> tuple[_SharedServerEntry, str] | None:
+        """Find a connected, allowed MCP tool route inside *entry*."""
+        if "__" in tool_name:
+            route_ref = self._resolve_tool_ref(entry, tool_name)
+            if route_ref is None:
+                return None
+            ref, bare_tool = route_ref
+            if ref.entry.error is not None:
+                return None
+            if self._server_has_allowed_tool(ref, bare_tool):
+                return ref.entry, bare_tool
+            return None
+
+        for ref in self._ordered_server_refs(entry):
             server = ref.entry
             if server.error is not None:
                 continue
-            prefix = f"{ref.config.name}__"
-            if tool_name.startswith(prefix):
-                bare_tool = tool_name[len(prefix) :]
-                if any(td.name == bare_tool for td in server.tools):
-                    return server, bare_tool
-                return None
-            if "__" not in tool_name and any(td.name == tool_name for td in server.tools):
+            if self._server_has_allowed_tool(ref, tool_name):
                 return server, tool_name
         return None
+
+    @staticmethod
+    def _ordered_server_refs(entry: _SpecEntry) -> list[_SpecServerRef]:
+        """Prefer the longest namespace when server names overlap."""
+        return sorted(entry.servers.values(), key=lambda ref: len(ref.config.name), reverse=True)
+
+    def _resolve_tool_ref(
+        self,
+        entry: _SpecEntry,
+        tool_name: str,
+    ) -> tuple[_SpecServerRef, str] | None:
+        """Find the spec ref addressed by a namespaced tool name."""
+        if "__" not in tool_name:
+            return None
+        for ref in self._ordered_server_refs(entry):
+            prefix = f"{ref.config.name}__"
+            if not tool_name.startswith(prefix):
+                continue
+            bare_name = tool_name[len(prefix) :]
+            if not self._is_tool_allowed(ref, bare_name) or not is_valid_tool_name(bare_name):
+                return None
+            return ref, bare_name
+        return None
+
+    @staticmethod
+    def _allowed_tools(ref: _SpecServerRef) -> set[str] | None:
+        tools = getattr(ref.config, "tools", None)
+        return set(tools) if tools else None
+
+    def _is_tool_allowed(self, ref: _SpecServerRef, bare_name: str) -> bool:
+        allowed = self._allowed_tools(ref)
+        return allowed is None or bare_name in allowed
+
+    def _server_has_allowed_tool(self, ref: _SpecServerRef, bare_name: str) -> bool:
+        return (
+            self._is_tool_allowed(ref, bare_name)
+            and is_valid_tool_name(bare_name)
+            and any(td.name == bare_name for td in ref.entry.tools)
+        )
 
     def _resolve_owning_server(
         self,
@@ -489,23 +577,41 @@ class RunnerMcpManager:
 
     async def shutdown(self) -> None:
         """Best-effort close of every active MCP connection."""
-        for _spec_hash, entry in list(self._specs.items()):
-            if entry.connect_task is not None and not entry.connect_task.done():
-                entry.connect_task.cancel()
-        for server_hash, server in list(self._servers.items()):
-            if server.connection is None:
+        async with self._lock:
+            servers = list(self._servers.values())
+            connect_tasks = [
+                task
+                for server in servers
+                if (task := server.connect_task) is not None and not task.done()
+            ]
+            for server in servers:
+                server.ref_count = 0
+            self._specs.clear()
+            self._servers.clear()
+            self._lru.clear()
+            for task in connect_tasks:
+                task.cancel()
+
+        if connect_tasks:
+            await asyncio.gather(*connect_tasks, return_exceptions=True)
+
+        for server in servers:
+            conn = server.connection
+            if conn is None:
                 continue
+            server.connection = None
+            server.tools = []
             try:
-                await server.connection.close()
+                await conn.close()
             except Exception:
                 _logger.exception(
                     "error closing MCP %r (%s) during shutdown",
                     server.config.name,
-                    server_hash,
+                    server.server_hash,
                 )
-        self._specs.clear()
-        self._servers.clear()
-        self._lru.clear()
+
+        if self._evict_tasks:
+            await asyncio.gather(*list(self._evict_tasks), return_exceptions=True)
 
     def _ensure_entry(self, spec_hash: str, configs: list[MCPServerConfig]) -> _SpecEntry:
         """Return or create the pool entry for *spec_hash*. Caller holds lock."""
@@ -554,60 +660,105 @@ class RunnerMcpManager:
 
     def _release_spec_entry(self, spec_hash: str, entry: _SpecEntry) -> None:
         """Release one spec entry and close shared servers no longer referenced."""
-        if entry.connect_task is not None and not entry.connect_task.done():
-            entry.connect_task.cancel()
         for server_hash in entry.server_hashes:
             server = self._servers.get(server_hash)
-            if server is None:
-                continue
-            server.ref_count -= 1
-            if server.ref_count > 0:
-                continue
-            self._servers.pop(server_hash, None)
-            if server.connection is None:
-                continue
-            task = asyncio.create_task(
-                self._safe_close(server.connection, spec_hash, server.config.name),
-                name=f"runner-mcp-evict-close:{spec_hash}:{server.config.name}",
-            )
-            self._evict_tasks.add(task)
-            task.add_done_callback(self._evict_tasks.discard)
+            if server is not None:
+                self._release_server_ref(server, spec_hash)
 
     @staticmethod
-    async def _safe_close(conn: McpServerConnection, spec_hash: str, name: str) -> None:
+    async def _safe_close(conn: McpServerConnection, owner: str, name: str) -> None:
         try:
             await conn.close()
         except Exception:
-            _logger.exception("error closing evicted MCP %r in spec %s", name, spec_hash)
+            _logger.exception("error closing MCP %r for %s", name, owner)
 
-    async def _connect_all(self, entry: _SpecEntry) -> None:
-        """Connect every MCP in *entry* concurrently. Failures recorded per server."""
-        unique_servers: dict[str, _SharedServerEntry] = {}
-        for ref in entry.servers.values():
-            unique_servers.setdefault(ref.server_hash, ref.entry)
-        await asyncio.gather(
-            *[
-                self._connect_server(server, entry.spec_hash)
-                for server in unique_servers.values()
-                if server.connection is None
-            ]
+    def _schedule_close(self, conn: McpServerConnection, owner: str, name: str) -> None:
+        task = asyncio.create_task(
+            self._safe_close(conn, owner, name),
+            name=f"runner-mcp-close:{owner}:{name}",
         )
+        self._evict_tasks.add(task)
+        task.add_done_callback(self._evict_tasks.discard)
+
+    @staticmethod
+    def _retain_server_ref(server: _SharedServerEntry) -> None:
+        server.ref_count += 1
+
+    def _release_server_ref(self, server: _SharedServerEntry, owner: str) -> None:
+        """Release one server ref. Caller holds ``self._lock``."""
+        if server.ref_count <= 0:
+            return
+        server.ref_count -= 1
+        if server.ref_count > 0:
+            return
+        if server.connect_task is not None and not server.connect_task.done():
+            return
+
+        self._servers.pop(server.server_hash, None)
+        conn = server.connection
+        server.connection = None
+        server.tools = []
+        if conn is not None:
+            self._schedule_close(conn, owner, server.config.name)
+
+    def _ensure_connect_task(
+        self,
+        server: _SharedServerEntry,
+        spec_hash: str,
+    ) -> asyncio.Task[None] | None:
+        """Return an in-flight shared connect task, creating one if needed."""
+        if server.connection is not None:
+            return None
+        if server.connect_task is None or server.connect_task.done():
+            server.connect_task = asyncio.create_task(
+                self._connect_server(server, spec_hash),
+                name=f"runner-mcp-connect:{server.server_hash}",
+            )
+        return server.connect_task
 
     async def _connect_server(self, server: _SharedServerEntry, spec_hash: str) -> None:
         """Connect one shared MCP server if needed."""
-        async with server.lock:
-            if server.connection is not None:
-                return
-            try:
+        close_after_connect: McpServerConnection | None = None
+        current_task = asyncio.current_task()
+        try:
+            async with server.lock:
+                if server.connection is not None:
+                    return
+
                 conn = McpServerConnection(
                     config=server.config,
                     cwd=self._stdio_cwd,
                     elicitation_callback=self._build_elicitation_callback(),
                 )
-                tools = await conn.connect()
-                server.connection = conn
-                server.tools = tools
-                server.error = None
+                try:
+                    tools = await conn.connect()
+                except asyncio.CancelledError:
+                    await self._safe_close(conn, spec_hash, server.config.name)
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    async with self._lock:
+                        server.error = f"{type(exc).__name__}: {exc}"
+                        server.connection = None
+                        server.tools = []
+                    _logger.warning(
+                        "runner mcp connect failed: spec=%s server_hash=%s server=%s error=%s",
+                        spec_hash,
+                        server.server_hash,
+                        server.config.name,
+                        server.error,
+                    )
+                    return
+
+                async with self._lock:
+                    server.connection = conn
+                    server.tools = tools
+                    server.error = None
+                    if server.ref_count <= 0:
+                        self._servers.pop(server.server_hash, None)
+                        server.connection = None
+                        server.tools = []
+                        close_after_connect = conn
+
                 _logger.info(
                     "runner mcp connected: spec=%s server_hash=%s server=%s tools=%d",
                     spec_hash,
@@ -615,41 +766,23 @@ class RunnerMcpManager:
                     server.config.name,
                     len(tools),
                 )
-            except Exception as exc:  # noqa: BLE001
-                server.error = f"{type(exc).__name__}: {exc}"
-                server.connection = None
-                server.tools = []
-                _logger.warning(
-                    "runner mcp connect failed: spec=%s server_hash=%s server=%s error=%s",
-                    spec_hash,
-                    server.server_hash,
-                    server.config.name,
-                    server.error,
-                )
+        finally:
+            cleanup_conn: McpServerConnection | None = None
+            async with self._lock:
+                if server.connect_task is current_task:
+                    server.connect_task = None
+                if server.ref_count <= 0:
+                    self._servers.pop(server.server_hash, None)
+                    if server.connection is not None:
+                        cleanup_conn = server.connection
+                        server.connection = None
+                        server.tools = []
 
-    async def _resolve_tool_route_connected(
-        self,
-        entry: _SpecEntry,
-        spec: AgentSpec,
-        tool_name: str,
-    ) -> tuple[_SharedServerEntry, str] | None:
-        """Resolve a route, connecting only the named server when possible."""
-        if "__" in tool_name:
-            for ref in entry.servers.values():
-                prefix = f"{ref.config.name}__"
-                if not tool_name.startswith(prefix):
-                    continue
-                bare_name = tool_name[len(prefix) :]
-                await self._connect_server(ref.entry, entry.spec_hash)
-                if ref.entry.error is not None or ref.entry.connection is None:
-                    return None
-                if any(td.name == bare_name for td in ref.entry.tools):
-                    return ref.entry, bare_name
-                return None
-            return None
+            if cleanup_conn is not None and cleanup_conn is not close_after_connect:
+                await self._safe_close(cleanup_conn, spec_hash, server.config.name)
 
-        await self.schemas_for(spec)
-        return self._resolve_tool_route(spec, tool_name)
+        if close_after_connect is not None:
+            await self._safe_close(close_after_connect, spec_hash, server.config.name)
 
     def status_snapshot(self) -> dict[str, Any]:
         """JSON-able view of pool state for introspection."""

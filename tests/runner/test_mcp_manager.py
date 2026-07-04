@@ -631,9 +631,9 @@ async def test_shutdown_cancels_in_flight_schema_connect(
     manager = RunnerMcpManager()
     schemas_task = asyncio.create_task(manager.schemas_for(spec))
     await started.wait()
-    # Capture the on-demand connect task ref before shutdown clears it.
-    spec_hash = compute_spec_hash(spec.mcp_servers)
-    connect_task = manager._specs[spec_hash].connect_task
+    # Capture the shared-server connect task ref before shutdown clears it.
+    server_hash = compute_server_hash(spec.mcp_servers[0])
+    connect_task = manager._servers[server_hash].connect_task
     assert connect_task is not None and not connect_task.done(), (
         "connect task must be in flight before shutdown"
     )
@@ -648,6 +648,143 @@ async def test_shutdown_cancels_in_flight_schema_connect(
     schemas_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await schemas_task
+
+
+@pytest.mark.asyncio
+async def test_evicted_spec_closes_late_completed_shared_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect that finishes after spec eviction is still closed."""
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    closed: list[str] = []
+
+    class _SlowConn:
+        """Connection whose connect can be completed after LRU eviction."""
+
+        def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
+            self._config = config
+
+        async def connect(self) -> list[McpToolDef]:
+            started.set()
+            await finish.wait()
+            return [_make_tool_def("run")]
+
+        async def close(self) -> None:
+            closed.append(self._config.name)
+
+        async def call_tool(self, name: str, arguments: dict[str, Any], **_kw: Any) -> str:
+            return "ok"
+
+    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _SlowConn)
+
+    spec = _make_spec(_make_config("shared"))
+    server_hash = compute_server_hash(spec.mcp_servers[0])
+    manager = RunnerMcpManager()
+    call_task = asyncio.create_task(manager.call_tool(spec, "shared__run", {}))
+    try:
+        await started.wait()
+        for i in range(_POOL_SPEC_CAPACITY):
+            await manager.prewarm(_make_spec(_make_config(f"evict-{i}")))
+
+        assert server_hash in manager._servers, "active call must keep the shared server tracked"
+        finish.set()
+        assert await call_task == "ok"
+        await asyncio.sleep(0.05)
+
+        assert server_hash not in manager._servers
+        assert closed == ["shared"]
+    finally:
+        if not call_task.done():
+            call_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call_task
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shared_connect_survives_one_spec_eviction_while_referenced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Evicting one spec must not cancel a connect another spec still needs."""
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    connect_calls = 0
+
+    class _SlowConn:
+        """Shared connection that records connect count."""
+
+        def __init__(self, *, config: MCPServerConfig, cwd: Any = None, **_kwargs: Any) -> None:
+            self._config = config
+
+        async def connect(self) -> list[McpToolDef]:
+            nonlocal connect_calls
+            connect_calls += 1
+            started.set()
+            await finish.wait()
+            return [_make_tool_def("run"), _make_tool_def("other")]
+
+        async def close(self) -> None:
+            pass
+
+        async def call_tool(self, name: str, arguments: dict[str, Any], **_kw: Any) -> str:
+            return "ok"
+
+    monkeypatch.setattr(_mcp_manager_module, "McpServerConnection", _SlowConn)
+
+    cfg_run = _make_config("shared")
+    cfg_run.tools = ["run"]
+    cfg_other = _make_config("shared")
+    cfg_other.tools = ["other"]
+    spec_run = _make_spec(cfg_run)
+    spec_other = _make_spec(cfg_other)
+
+    manager = RunnerMcpManager()
+    call_task = asyncio.create_task(manager.call_tool(spec_run, "shared__run", {}))
+    try:
+        await started.wait()
+        await manager.prewarm(spec_other)
+        for i in range(_POOL_SPEC_CAPACITY - 1):
+            await manager.prewarm(_make_spec(_make_config(f"evict-other-{i}")))
+
+        finish.set()
+        assert await call_task == "ok"
+        schemas = await manager.schemas_for(spec_other)
+
+        assert schemas.tool_names == {"shared__other"}
+        assert connect_calls == 1
+    finally:
+        if not call_task.done():
+            call_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call_task
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tool_allowlist_blocks_dispatch(
+    patch_connection: dict[str, Any],
+) -> None:
+    """Per-spec tool filters apply to dispatch, not just schema listing."""
+    patch_connection["__tools_for__"]["jira"] = [
+        _make_tool_def("search"),
+        _make_tool_def("create"),
+    ]
+    cfg = _make_config("jira")
+    cfg.tools = ["search"]
+    spec = _make_spec(cfg)
+    manager = RunnerMcpManager()
+    try:
+        schemas = await manager.schemas_for(spec)
+        with pytest.raises(RuntimeError, match="no live MCP serving tool"):
+            await manager.call_tool(spec, "jira__create", {})
+        output = await manager.call_tool(spec, "jira__search", {"q": "one"})
+    finally:
+        await manager.shutdown()
+
+    assert schemas.tool_names == {"jira__search"}
+    assert output == "called search with {'q': 'one'}"
+    assert patch_connection["jira"].call_tool_calls == [("search", {"q": "one"})]
 
 
 @pytest.mark.asyncio
