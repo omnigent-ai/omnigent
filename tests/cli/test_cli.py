@@ -3265,6 +3265,18 @@ def test_sanitize_no_proxy_env_noop_when_unset(monkeypatch: pytest.MonkeyPatch) 
     assert "no_proxy" not in os.environ
 
 
+def test_sanitize_no_proxy_env_unwraps_ipv6_with_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bracketed IPv6 entry carrying a port unwraps without a stray `]`."""
+    monkeypatch.setenv("no_proxy", "[::1]:3128,localhost")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    _sanitize_no_proxy_env()
+
+    # A leftover `]` would re-trigger the httpx URL-parse crash this guards.
+    assert "]" not in os.environ["no_proxy"]
+    assert os.environ["no_proxy"] == "::1:3128,localhost"
+
+
 # ---------------------------------------------------------------------------
 # `omnigent config` command
 # ---------------------------------------------------------------------------

@@ -65,20 +65,15 @@ KITS_ENV_VAR: str = "OMNIGENT_SBX_KITS"
 """Environment variable naming (comma- or whitespace-separated) sbx kit
 references applied at provision time (``sbx create --kit``)."""
 
-# npm package specs sourced from harness_install.py (not hardcoded here) so
-# this setup step tracks the same version pins `omnigent setup` installs —
-# notably OpenCode's `~1.17.7` range, required by the runtime's own
-# check_opencode_version gate.
+# npm specs come from harness_install.py so this setup tracks the same version
+# pins `omnigent setup` installs (e.g. OpenCode's `~1.17.7` range).
 _claude_spec = harness_install_spec(ANTHROPIC_FAMILY)
 _opencode_spec = harness_install_spec(OPENCODE_KEY)
 assert _claude_spec is not None and _opencode_spec is not None
 
-# One-time root setup run after `sbx create` to make sbx's default image
-# a viable Omnigent host: ensure python/pip, git, tmux, node/npm, and the
-# Claude Code + OpenCode CLIs (claude-native and opencode/opencode-native
-# both gate on their respective binaries). Idempotent — already-present
-# tools no-op. (Discovery task confirms the base image's gaps; absent
-# tools are installed, present ones skipped.)
+# One-time root setup after `sbx create`: install the host runtime deps
+# (python/git/tmux/node/npm) and the Claude Code + OpenCode CLIs the harnesses
+# gate on. Idempotent — already-present tools are skipped.
 _SETUP_COMMAND: str = (
     "set -e; "
     "if command -v apt-get >/dev/null 2>&1; then "
@@ -141,15 +136,12 @@ class SbxSandboxLauncher(SandboxLauncher):
             self._binary = found
         return self._binary
 
-    def _run_sbx(
-        self, args: list[str], *, capture: bool = True, check: bool = False
-    ) -> subprocess.CompletedProcess[str]:
-        """Run ``sbx <args>``; capture text output by default."""
+    def _run_sbx(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        """Run ``sbx <args>``, capturing text output."""
         return subprocess.run(
             [self._sbx_binary(), *args],
-            capture_output=capture,
+            capture_output=True,
             text=True,
-            check=check,
         )
 
     def prepare(self) -> None:
@@ -191,10 +183,8 @@ class SbxSandboxLauncher(SandboxLauncher):
         result = self._run_sbx(args)
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
-            # Discovery finding: sbx refuses to start any sandbox until a
-            # host-global default network policy is set, with a distinctive
-            # message. Rewrite it into a single actionable remediation so the
-            # user isn't left guessing which `sbx policy` invocation to run.
+            # sbx refuses to start any sandbox until a host-global default
+            # network policy exists; rewrite that into an actionable remediation.
             if "default network policy" in detail.lower():
                 raise click.ClickException(
                     "sbx has no default network policy configured. Run "
@@ -245,32 +235,27 @@ class SbxSandboxLauncher(SandboxLauncher):
         """
         Copy a local file into the sandbox via ``sbx cp``.
 
-        A sandbox's copy transport can flake on the very first transfer
-        right after :meth:`provision` — confirmed live: the first ``sbx
-        cp`` after a fresh create fails with a truncated tar extract,
-        and an immediate manual retry always succeeds. ``cp`` is
-        idempotent (it overwrites the destination), so a few quick
-        retries are safe and turn that transient race into a no-op for
-        callers.
+        The first ``sbx cp`` into a freshly-provisioned sandbox can flake
+        with a truncated-tar extract; an immediate retry clears it, and
+        ``cp`` is idempotent. Only that transient is retried — a permanent
+        error (bad path, missing sandbox) fails fast.
 
         :param sandbox_id: Target sandbox name.
         :param local_path: Local file to read.
         :param remote_path: Absolute destination path inside the sandbox.
-        :raises click.ClickException: When every attempt fails.
+        :raises click.ClickException: When the copy fails.
         """
         attempts = 3
-        result = None
         for attempt in range(1, attempts + 1):
             result = self._run_sbx(["cp", str(local_path), f"{sandbox_id}:{remote_path}"])
             if result.returncode == 0:
                 return
-            if attempt < attempts:
-                time.sleep(2)
-        assert result is not None
-        raise click.ClickException(
-            f"File copy to sandbox '{sandbox_id}' failed after {attempts} attempts: "
-            f"{result.stderr.strip() or result.stdout.strip()}"
-        )
+            detail = result.stderr.strip() or result.stdout.strip()
+            low = detail.lower()
+            transient = "unexpected eof" in low or "tar extract failed" in low
+            if not transient or attempt == attempts:
+                raise click.ClickException(f"File copy to sandbox '{sandbox_id}' failed: {detail}")
+            time.sleep(2)
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """

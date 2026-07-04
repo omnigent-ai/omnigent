@@ -261,10 +261,12 @@ def test_put_uses_sbx_cp(fake_sbx: _FakeSbx) -> None:
 
 
 def test_put_wraps_failure(fake_sbx: _FakeSbx) -> None:
-    """A failing `sbx cp` surfaces stderr as a ClickException."""
+    """A permanent `sbx cp` failure surfaces stderr and fails fast (no retry)."""
     fake_sbx.responses["cp"] = _FakeCompleted(args=[], returncode=1, stderr="no such sandbox")
     with pytest.raises(click.ClickException, match="no such sandbox"):
         SbxSandboxLauncher().put("box", Path("/tmp/x"), "/tmp/x")
+    # A non-transient error is not retried — one attempt, no 2s sleeps.
+    assert len(fake_sbx.calls) == 1
 
 
 def test_put_retries_transient_failure_then_succeeds(
@@ -438,6 +440,16 @@ def test_get_launcher_threads_kits() -> None:
     from omnigent.onboarding.sandboxes import get_launcher
 
     launcher = get_launcher("sbx", kits=("/tmp/sbxkit/claude",))
+    assert isinstance(launcher, SbxSandboxLauncher)
+    assert launcher._resolve_kits() == ["/tmp/sbxkit/claude"]
+
+
+def test_get_launcher_empty_kits_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Click's empty-tuple default must not shadow the OMNIGENT_SBX_KITS fallback."""
+    from omnigent.onboarding.sandboxes import get_launcher
+
+    monkeypatch.setenv(KITS_ENV_VAR, "/tmp/sbxkit/claude")
+    launcher = get_launcher("sbx", kits=())
     assert isinstance(launcher, SbxSandboxLauncher)
     assert launcher._resolve_kits() == ["/tmp/sbxkit/claude"]
 

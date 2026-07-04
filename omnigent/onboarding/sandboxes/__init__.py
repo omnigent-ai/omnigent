@@ -138,7 +138,10 @@ def get_launcher(
     if provider == "sbx":
         from omnigent.onboarding.sandboxes.sbx import SbxSandboxLauncher
 
-        return SbxSandboxLauncher(kits=kits)
+        # An empty tuple (Click's `--kit` default when unspecified) means
+        # "not passed" — collapse it to None so the OMNIGENT_SBX_KITS
+        # env-var fallback is still consulted.
+        return SbxSandboxLauncher(kits=kits or None)
     module_name, _, class_name = target.partition(":")
     module = importlib.import_module(module_name)
     launcher_cls: type[SandboxLauncher] = getattr(module, class_name)

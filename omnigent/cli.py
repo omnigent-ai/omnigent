@@ -194,12 +194,21 @@ def _sanitize_no_proxy_env() -> None:
     brackets (and deduping) normalizes to the form httpx expects without
     disabling proxy support.
     """
+
+    def _unbracket(host: str) -> str:
+        # `[::1]` → `::1` (and `[::1]:3128` → `::1:3128`) without leaving a
+        # stray `]` mid-string, which would re-trigger the httpx parse crash.
+        if host.startswith("[") and "]" in host:
+            inner, _, rest = host[1:].partition("]")
+            return inner + rest
+        return host
+
     for name in ("NO_PROXY", "no_proxy"):
         value = os.environ.get(name)
         if not value:
             continue
         cleaned = ",".join(
-            dict.fromkeys(host.strip().strip("[]") for host in value.split(",") if host.strip())
+            dict.fromkeys(_unbracket(h.strip()) for h in value.split(",") if h.strip())
         )
         if cleaned != value:
             os.environ[name] = cleaned
@@ -1302,10 +1311,8 @@ def main() -> None:
     # (update-check cache, diagnostics logs, config). No-op once migrated.
     _migrate_legacy_state_dir()
 
-    # Normalize NO_PROXY/no_proxy before any httpx.Client() gets constructed
-    # (e.g. the Databricks auth pre-flight in `host`/`run`) — see
-    # _sanitize_no_proxy_env's docstring for the sbx-triggered crash this
-    # prevents.
+    # Normalize NO_PROXY/no_proxy so httpx can parse it (see
+    # _sanitize_no_proxy_env) before any httpx.Client() is built.
     _sanitize_no_proxy_env()
 
     argv = sys.argv[1:]
