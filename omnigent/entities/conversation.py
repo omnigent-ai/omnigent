@@ -685,6 +685,10 @@ class ConversationItem(BaseModel):
     A persisted item with a store-assigned ID.
 
     :param id: Store-assigned item ID, e.g. ``"msg_abc123"``.
+    :param conversation_id: Conversation that owns the item when the
+        item was loaded from a store. Excluded from generic
+        ``model_dump()`` output so existing item API payloads stay
+        stable.
     :param type: Item type, e.g. ``"message"``,
         ``"function_call"``.
     :param status: Item status, e.g. ``"completed"``.
@@ -697,6 +701,7 @@ class ConversationItem(BaseModel):
     """
 
     id: str
+    conversation_id: str | None = Field(default=None, exclude=True)
     type: str
     status: str
     response_id: str

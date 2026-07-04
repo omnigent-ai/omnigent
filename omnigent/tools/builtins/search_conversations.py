@@ -120,7 +120,7 @@ def _format_results(
     results: list[dict[str, Any]] = []
     for item in items:
         result: dict[str, Any] = {
-            "conversation_id": item.response_id,
+            "conversation_id": getattr(item, "conversation_id", None) or item.response_id,
             "item_id": item.id,
             "created_at": item.created_at,
             "type": item.type,

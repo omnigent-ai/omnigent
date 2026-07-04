@@ -301,11 +301,15 @@ def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) 
     assert len(items) == 2
     assert items[0].id.startswith("msg_")
     assert items[1].id.startswith("msg_")
+    assert items[0].conversation_id == conv.id
+    assert items[1].conversation_id == conv.id
 
     page = conversation_store.list_items(conv.id)
     assert len(page.data) == 2
     assert page.data[0].data.role == "user"
     assert page.data[1].data.role == "assistant"
+    assert page.data[0].conversation_id == conv.id
+    assert page.data[1].conversation_id == conv.id
 
 
 def test_append_records_human_author_attribution(
@@ -971,9 +975,11 @@ def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
     results = conversation_store.search("Paris")
     assert len(results) == 1
     assert results[0].type == "message"
+    assert results[0].conversation_id == conv.id
 
     results = conversation_store.search("sunny")
     assert len(results) == 1
+    assert results[0].conversation_id == conv.id
 
     assert conversation_store.search("nonexistent") == []
 
@@ -1013,8 +1019,12 @@ def test_search_scoped_to_conversation(
     assert len(conversation_store.search("hello")) == 2
 
     # Scoped: only one per conversation
-    assert len(conversation_store.search("hello", conversation_id=conv1.id)) == 1
-    assert len(conversation_store.search("hello", conversation_id=conv2.id)) == 1
+    conv1_results = conversation_store.search("hello", conversation_id=conv1.id)
+    conv2_results = conversation_store.search("hello", conversation_id=conv2.id)
+    assert len(conv1_results) == 1
+    assert len(conv2_results) == 1
+    assert conv1_results[0].conversation_id == conv1.id
+    assert conv2_results[0].conversation_id == conv2.id
 
 
 def test_search_function_call_item(
