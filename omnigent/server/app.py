@@ -51,6 +51,7 @@ from omnigent.server.performance_metrics import (
     set_request_duration_for_access_log,
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
+from omnigent.server.routes.registry import create_registry_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -71,6 +72,7 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
+from omnigent.stores.registry_store import RegistryStore
 from omnigent.stores.conversation_store import SessionConnectivity
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -972,6 +974,7 @@ def create_app(
     agent_cache: AgentCache,
     runner_tunnel_tokens: frozenset[str] | None = None,
     comment_store: CommentStore | None = None,
+    registry_store: RegistryStore | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
@@ -1004,6 +1007,8 @@ def create_app(
         token-bound runner id, which is the shared remote-server
         behavior.
     :param comment_store: Store for per-conversation review comments.
+    :param registry_store: Store for the community agent registry.
+        ``None`` disables all ``/v1/registry`` endpoints.
     :param policy_store: Store for server-persisted policies
         (session-scoped and server-wide defaults). ``None``
         disables both the session policy and default policy
@@ -1832,6 +1837,15 @@ def create_app(
             ),
             prefix="/v1",
             tags=["comments"],
+        )
+    if registry_store is not None:
+        app.include_router(
+            create_registry_router(
+                registry_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["registry"],
         )
     if policy_store is not None:
         app.include_router(

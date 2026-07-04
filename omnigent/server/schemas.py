@@ -262,6 +262,102 @@ class AgentObject(BaseModel):
     builtin: bool = False
 
 
+# ── Registry ───────────────────────────────────────────────────
+
+
+class PublishedAgentObject(BaseModel):
+    """
+    API representation of a community-published registry entry.
+
+    :param id: Unique publication identifier, e.g. ``"pa_abc123"``.
+    :param object: Fixed resource type, always ``"published_agent"``.
+    :param name: Slug-style agent name, e.g. ``"code-reviewer"``.
+    :param version: Semver string, e.g. ``"1.2.0"``.
+    :param harness: Executor harness, e.g. ``"claude-sdk"``.
+    :param description: Human-readable purpose of the agent.
+    :param author: Publisher handle or email address.
+    :param created_at: Unix epoch seconds of publication.
+    :param category: Optional category slug, e.g. ``"coding"``.
+    :param tags: Searchable tags.
+    :param prompt_excerpt: First ~200 chars of the system prompt.
+    :param network_access: Whether the agent makes outbound network calls.
+    :param write_access: Whether the agent writes to the filesystem.
+    :param guardrails: Human-readable safety restrictions, or ``None``.
+    :param source_url: Link to the agent's source or raw YAML, or ``None``.
+    :param stars_count: Cumulative star count.
+    :param bundle_location: Artifact store key for the downloadable
+        bundle, or ``None`` when no bundle was uploaded.
+    :param updated_at: Unix epoch seconds of the last metadata update,
+        or ``None`` if never updated.
+    """
+
+    id: str
+    object: str = "published_agent"
+    name: str
+    version: str
+    harness: str
+    description: str
+    author: str
+    created_at: int
+    category: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    prompt_excerpt: str | None = None
+    network_access: bool = False
+    write_access: bool = False
+    guardrails: str | None = None
+    source_url: str | None = None
+    stars_count: int = 0
+    bundle_location: str | None = None
+    updated_at: int | None = None
+
+
+class PublishAgentRequest(BaseModel):
+    """
+    Request body for ``POST /v1/registry`` (publish an agent).
+
+    :param name: Slug-style agent name, e.g. ``"code-reviewer"``.
+        Must be unique within the given version.
+    :param version: Semver string, e.g. ``"1.2.0"``.
+    :param harness: Executor harness, e.g. ``"claude-sdk"``.
+    :param description: Human-readable purpose of the agent.
+    :param author: Publisher handle or email address.
+    :param category: Optional category slug, e.g. ``"coding"``.
+    :param tags: Searchable tags.
+    :param prompt_excerpt: First ~200 chars of the system prompt,
+        surfaced on the detail page.
+    :param network_access: Whether the agent makes outbound network calls.
+    :param write_access: Whether the agent writes to the filesystem.
+    :param guardrails: Human-readable safety restrictions.
+    :param source_url: Link to the agent's source repository or raw YAML.
+    :param bundle_location: Artifact store key for the downloadable
+        bundle, when the caller has pre-uploaded a bundle.
+    """
+
+    name: str
+    version: str
+    harness: str
+    description: str
+    author: str
+    category: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    prompt_excerpt: str | None = None
+    network_access: bool = False
+    write_access: bool = False
+    guardrails: str | None = None
+    source_url: str | None = None
+    bundle_location: str | None = None
+
+
+class StarResponse(BaseModel):
+    """
+    Response body for ``POST /v1/registry/{name}/star``.
+
+    :param stars_count: The new cumulative star count after the increment.
+    """
+
+    stars_count: int
+
+
 # ── Session Policies ───────────────────────────────────────────
 
 
