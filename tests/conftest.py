@@ -374,8 +374,7 @@ def cleanup_snapshot_failures(pytestconfig: pytest.Config):
     root_dir = Path(pytestconfig.rootdir)  # type: ignore[arg-type]
 
     SnapshotPaths.snapshots_path = Path(
-        pytestconfig.getini("playwright_visual_snapshots_path")
-        or (root_dir / "__snapshots__")
+        pytestconfig.getini("playwright_visual_snapshots_path") or (root_dir / "__snapshots__")
     )
     SnapshotPaths.failures_path = Path(
         pytestconfig.getini("playwright_visual_snapshot_failures_path")
