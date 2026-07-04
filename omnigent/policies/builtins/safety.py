@@ -113,11 +113,17 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
 
 # ── OS tool approval ────────────────────────────────────────────────────────
 
+_SHELL_TOOLS = frozenset({"sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"})
 
-def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
-    """ASK for user approval before any file or shell tool call.
 
-    Covers six tool-name families:
+def ask_on_os_tools(
+    *,
+    shell_severity: bool = False,
+    gate_pushes: bool = True,
+) -> PolicyCallable:
+    """Factory: ASK for user approval before any file or shell tool call.
+
+    Covers seven tool-name families:
 
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
@@ -140,32 +146,53 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
       via the SSE forwarder's ``permission.asked`` → policy-evaluate
       path. opencode collapses write/edit/patch into ``edit``.
 
-    Returns ASK so the user sees an approval prompt before the tool
-    executes.
+    When ``shell_severity`` is ``False`` (the default), every OS tool
+    call returns ASK — identical to the original behaviour. When
+    ``True``, shell tools are classified by blast radius (safe →
+    ALLOW, risky → ASK, catastrophic → DENY) using the same
+    classifier as the ``blast_radius`` policy, while non-shell OS
+    tools still ASK. This lets admins consolidate the two policies
+    into one without double-prompting.
 
-    :param event: Policy event dict.
-    :returns: ASK if a file/shell tool is being called, ALLOW
-        otherwise.
+    :param shell_severity: When ``True``, classify shell commands by
+        blast radius instead of blanket-ASKing. Defaults to ``False``
+        (backward compatible).
+    :param gate_pushes: Only meaningful when ``shell_severity`` is
+        ``True``. When ``True`` (default), recoverable-but-outward
+        commands (``git push``, ``gh pr merge``) return ASK. When
+        ``False`` only the catastrophic DENY set is enforced.
+    :returns: A policy callable that gates OS tool calls.
     """
-    if event.get("type") != "tool_call":
-        return _ALLOW
-    data = event.get("data")
-    if not isinstance(data, dict):
-        return _ALLOW
-    tool = data.get("name", "")
-    _all_os_tools = (
-        _SYS_OS_TOOLS
-        | _NATIVE_OS_TOOLS
-        | _CURSOR_NATIVE_OS_TOOLS
-        | _PI_NATIVE_OS_TOOLS
-        | _HERMES_OS_TOOLS
-        | _GOOSE_NATIVE_OS_TOOLS
-        | _OPENCODE_NATIVE_OS_TOOLS
-    )
-    if tool in _all_os_tools:
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        if event.get("type") != "tool_call":
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+        tool = data.get("name", "")
+        _all_os_tools = (
+            _SYS_OS_TOOLS
+            | _NATIVE_OS_TOOLS
+            | _CURSOR_NATIVE_OS_TOOLS
+            | _PI_NATIVE_OS_TOOLS
+            | _HERMES_OS_TOOLS
+            | _GOOSE_NATIVE_OS_TOOLS
+            | _OPENCODE_NATIVE_OS_TOOLS
+        )
+        if tool not in _all_os_tools:
+            return _ALLOW
+
         args = data.get("arguments", {})
+
+        if shell_severity and tool in _SHELL_TOOLS:
+            from omnigent.inner.nessie.policies import classify_command_severity
+
+            command = args.get("command", "") if isinstance(args, dict) else ""
+            return classify_command_severity(command, gate_pushes=gate_pushes)
+
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
+        if tool in _SHELL_TOOLS:
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
@@ -180,7 +207,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
             "result": "ASK",
             "reason": f"Agent wants to call {tool}({preview!r}). Approve?",
         }
-    return _ALLOW
+
+    return evaluate
 
 
 # ── Policy tool approval ───────────────────────────────────────────────────
@@ -574,14 +602,36 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
     },
     {
         "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
-        "kind": "callable",
+        "kind": "factory",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
         "covers Omnigent sys_os_* tools, Claude Code native tools "
         "(Bash, Read, Write, Edit, Glob, Grep), Codex native tools, "
         "opencode native tools (bash, edit, read, grep, glob), "
-        "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
-        "params_schema": None,
+        "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files). "
+        "Enable shell_severity to classify shell commands by blast radius "
+        "(safe=ALLOW, risky=ASK, catastrophic=DENY) instead of blanket-ASKing",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "shell_severity": {
+                    "type": "boolean",
+                    "description": "When true, classify shell commands by blast radius "
+                    "(safe commands pass, risky ones ASK, catastrophic ones DENY) "
+                    "instead of prompting on every shell call. "
+                    "Non-shell OS tools (file read/write/edit/search) still ASK",
+                    "default": False,
+                },
+                "gate_pushes": {
+                    "type": "boolean",
+                    "description": "Only used when shell_severity is true. "
+                    "When true, recoverable-but-outward commands (git push, "
+                    "gh pr merge) return ASK. When false only catastrophic "
+                    "commands are denied",
+                    "default": True,
+                },
+            },
+        },
     },
     {
         "handler": "omnigent.policies.builtins.safety.block_skills",

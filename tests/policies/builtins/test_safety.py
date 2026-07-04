@@ -38,7 +38,7 @@ def test_ask_on_os_tools_asks_for_sys_os_tools(tool: str) -> None:
     built-in OS tool set.
     """
     args = {"command": "ls"} if tool == "sys_os_shell" else {"path": "/tmp/f"}
-    result = ask_on_os_tools(tc(tool, args))
+    result = ask_on_os_tools()(tc(tool, args))
     assert result["result"] == "ASK"
     # Reason must name the tool so the user knows what is being asked.
     assert tool in result["reason"]
@@ -76,7 +76,7 @@ def test_ask_on_os_tools_asks_for_native_tools(
     :param expected_preview: Substring that must appear in the reason
         preview so the user sees what the tool will do.
     """
-    result = ask_on_os_tools(tc(tool, args))
+    result = ask_on_os_tools()(tc(tool, args))
     assert result["result"] == "ASK"
     assert tool in result["reason"]
     # The preview should contain the relevant argument value so the
@@ -121,7 +121,7 @@ def test_ask_on_os_tools_asks_for_pi_native_tools(
     :param args: Tool arguments dict.
     :param expected_preview: Substring that must appear in the reason.
     """
-    result = ask_on_os_tools(tc(tool, args))
+    result = ask_on_os_tools()(tc(tool, args))
     assert result["result"] == "ASK"
     assert tool in result["reason"]
     assert expected_preview in result["reason"]
@@ -157,7 +157,7 @@ def test_ask_on_os_tools_asks_for_goose_native_tools(
     :param args: Tool arguments dict.
     :param expected_preview: Substring that must appear in the reason.
     """
-    result = ask_on_os_tools(tc(tool, args))
+    result = ask_on_os_tools()(tc(tool, args))
     assert result["result"] == "ASK"
     assert tool in result["reason"]
     assert expected_preview in result["reason"]
@@ -195,7 +195,7 @@ def test_ask_on_os_tools_asks_for_opencode_native_tools(
     :param args: Tool arguments dict.
     :param expected_preview: Substring that must appear in the reason.
     """
-    result = ask_on_os_tools(tc(tool, args))
+    result = ask_on_os_tools()(tc(tool, args))
     assert result["result"] == "ASK"
     assert tool in result["reason"]
     assert expected_preview in result["reason"]
@@ -206,8 +206,77 @@ def test_ask_on_os_tools_allows_non_os_tool() -> None:
 
     If this returns ASK, the policy is over-matching on unrelated tools.
     """
-    result = ask_on_os_tools(tc("web_search", {"query": "hello"}))
+    result = ask_on_os_tools()(tc("web_search", {"query": "hello"}))
     assert result["result"] == "ALLOW"
+
+
+# ── ask_on_os_tools: shell_severity mode ───────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"],
+    ids=["sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"],
+)
+def test_ask_on_os_tools_shell_severity_allows_safe_commands(tool: str) -> None:
+    """With ``shell_severity=True``, safe shell commands ALLOW without prompting.
+
+    If this returns ASK, the severity classifier is not being applied and
+    the user is still double-prompted on safe commands.
+    """
+    result = ask_on_os_tools(shell_severity=True)(tc(tool, {"command": "git status"}))
+    assert result["result"] == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"],
+    ids=["sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"],
+)
+def test_ask_on_os_tools_shell_severity_asks_risky_commands(tool: str) -> None:
+    """With ``shell_severity=True``, risky shell commands ASK.
+
+    A recoverable-but-outward command like ``git push`` must still prompt.
+    """
+    result = ask_on_os_tools(shell_severity=True)(tc(tool, {"command": "git push origin main"}))
+    assert result["result"] == "ASK"
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"],
+    ids=["sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"],
+)
+def test_ask_on_os_tools_shell_severity_denies_catastrophic_commands(tool: str) -> None:
+    """With ``shell_severity=True``, catastrophic commands DENY.
+
+    Force-push and ``rm -rf /`` must be blocked outright.
+    """
+    result = ask_on_os_tools(shell_severity=True)(
+        tc(tool, {"command": "git push --force origin main"})
+    )
+    assert result["result"] == "DENY"
+
+
+def test_ask_on_os_tools_shell_severity_still_asks_for_file_tools() -> None:
+    """With ``shell_severity=True``, non-shell OS tools still ASK.
+
+    The severity classifier only applies to shell tools; file read/write/edit
+    tools keep the blanket-ASK behavior.
+    """
+    result = ask_on_os_tools(shell_severity=True)(tc("Read", {"path": "/etc/passwd"}))
+    assert result["result"] == "ASK"
+    result = ask_on_os_tools(shell_severity=True)(tc("sys_os_write", {"path": "/tmp/f"}))
+    assert result["result"] == "ASK"
+
+
+def test_ask_on_os_tools_shell_severity_gate_pushes_false() -> None:
+    """With ``shell_severity=True`` and ``gate_pushes=False``, only
+    catastrophic commands DENY; recoverable pushes ALLOW.
+    """
+    policy = ask_on_os_tools(shell_severity=True, gate_pushes=False)
+    assert policy(tc("Bash", {"command": "git push origin main"}))["result"] == "ALLOW"
+    assert policy(tc("Bash", {"command": "git push --force origin main"}))["result"] == "DENY"
 
 
 def test_ask_on_os_tools_allows_non_tool_call_phase() -> None:
@@ -222,7 +291,7 @@ def test_ask_on_os_tools_allows_non_tool_call_phase() -> None:
         "context": {"actor": {}, "usage": {}},
         "session_state": {},
     }
-    result = ask_on_os_tools(event)
+    result = ask_on_os_tools()(event)
     assert result["result"] == "ALLOW"
 
 

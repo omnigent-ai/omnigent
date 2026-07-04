@@ -343,6 +343,44 @@ def _push_severity(argv: list[str]) -> str | None:
     return "ASK"
 
 
+def classify_command_severity(
+    command: str,
+    *,
+    gate_pushes: bool = True,
+    deny_reason: str = "Blocked by the blast-radius policy.",
+) -> _Json:
+    """
+    Classify a shell command string by blast radius.
+
+    Catastrophic, irreversible commands (force-push, ``rm -rf /``,
+    hard-reset to a remote ref) return DENY. Outward or destructive but
+    recoverable commands (``git push``, ``gh pr merge``, ``rm -rf`` of a
+    scoped path, infra deploy/destroy) return ASK. Everything else —
+    reads, tests, edits, and local git — returns ALLOW.
+
+    This is the shared classification core used by both
+    :func:`blast_radius` (nessie policy) and
+    :func:`~omnigent.policies.builtins.safety.ask_on_os_tools` (when
+    ``shell_severity=True``).
+
+    :param command: The shell command string to classify.
+    :param gate_pushes: When ``True`` (default), recoverable-but-outward
+        commands return ASK. When ``False`` only the catastrophic DENY
+        set is enforced.
+    :param deny_reason: Reason text surfaced on a DENY decision.
+    :returns: A V0 decision dict (ALLOW / ASK / DENY).
+    """
+    if not isinstance(command, str):
+        return _ALLOW
+    statements = _shell_statements(command)
+    severities = {sev for stmt in statements for sev in (_rm_severity(stmt), _push_severity(stmt))}
+    if "DENY" in severities or any(p.search(command) for p in _DENY_PATTERNS):
+        return _decision("DENY", f"{deny_reason} (irreversible: {command!r})")
+    if gate_pushes and ("ASK" in severities or any(p.search(command) for p in _ASK_PATTERNS)):
+        return _decision("ASK", f"High-blast-radius command needs approval: {command!r}")
+    return _ALLOW
+
+
 def blast_radius(
     *,
     gate_pushes: bool = True,
@@ -383,24 +421,11 @@ def blast_radius(
         args = _tool_call(event, {"sys_os_shell", "Bash", "bash"})
         if args is None:
             return _ALLOW
-        command = args.get("command")
-        # A Bash / sys_os_shell call always carries a string ``command`` by
-        # contract; a non-str is a malformed payload no pattern can classify, so
-        # there is nothing to gate.
-        if not isinstance(command, str):
-            return _ALLOW
-        # rm + git push are classified by flag/refspec-robust helpers (a regex
-        # missed split/long rm flags, root children, and force/delete refspecs);
-        # the remaining regex patterns cover git-reset / gh / infra tools.
-        statements = _shell_statements(command)
-        severities = {
-            sev for stmt in statements for sev in (_rm_severity(stmt), _push_severity(stmt))
-        }
-        if "DENY" in severities or any(p.search(command) for p in _DENY_PATTERNS):
-            return _decision("DENY", f"{deny_reason} (irreversible: {command!r})")
-        if gate_pushes and ("ASK" in severities or any(p.search(command) for p in _ASK_PATTERNS)):
-            return _decision("ASK", f"High-blast-radius command needs approval: {command!r}")
-        return _ALLOW
+        return classify_command_severity(
+            args.get("command"),
+            gate_pushes=gate_pushes,
+            deny_reason=deny_reason,
+        )
 
     return _evaluate
 

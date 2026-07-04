@@ -9,6 +9,9 @@ declared schemas.
 from __future__ import annotations
 
 from omnigent.policies.registry import (
+    PolicyRegistryEntry,
+    _registry,
+    _registry_by_handler,
     get_params_schema,
     get_registry,
     is_registered_handler,
@@ -42,7 +45,7 @@ def test_registry_entries_have_correct_kind() -> None:
         by_handler["omnigent.policies.builtins.safety.max_tool_calls_per_session"].kind
         == "factory"
     )
-    assert by_handler["omnigent.policies.builtins.safety.ask_on_os_tools"].kind == "callable"
+    assert by_handler["omnigent.policies.builtins.safety.ask_on_os_tools"].kind == "factory"
 
 
 def test_registry_entries_have_descriptions() -> None:
@@ -69,9 +72,21 @@ def test_get_params_schema_returns_schema() -> None:
 def test_get_params_schema_none_for_direct_callable() -> None:
     """``get_params_schema`` returns ``None`` for a direct (non-factory) callable."""
     load_registry()
-    schema = get_params_schema("omnigent.policies.builtins.safety.ask_on_os_tools")
-
-    assert schema is None
+    _test_entry = PolicyRegistryEntry(
+        handler="test.direct_callable",
+        kind="callable",
+        name="Test Direct Callable",
+        description="Test-only entry",
+        params_schema=None,
+    )
+    _registry.append(_test_entry)
+    _registry_by_handler[_test_entry.handler] = _test_entry
+    try:
+        schema = get_params_schema("test.direct_callable")
+        assert schema is None
+    finally:
+        _registry.remove(_test_entry)
+        del _registry_by_handler[_test_entry.handler]
 
 
 def test_get_params_schema_none_for_unknown() -> None:
@@ -129,22 +144,48 @@ def test_validate_unknown_param() -> None:
 def test_validate_params_on_no_schema_callable() -> None:
     """Passing params to a callable with no schema returns an error."""
     load_registry()
-    error = validate_factory_params(
-        "omnigent.policies.builtins.safety.ask_on_os_tools",
-        {"unexpected": 1},
+    _test_entry = PolicyRegistryEntry(
+        handler="test.direct_callable",
+        kind="callable",
+        name="Test Direct Callable",
+        description="Test-only entry",
+        params_schema=None,
     )
-    assert error is not None
-    assert "does not accept" in error
+    _registry.append(_test_entry)
+    _registry_by_handler[_test_entry.handler] = _test_entry
+    try:
+        error = validate_factory_params(
+            "test.direct_callable",
+            {"unexpected": 1},
+        )
+        assert error is not None
+        assert "does not accept" in error
+    finally:
+        _registry.remove(_test_entry)
+        del _registry_by_handler[_test_entry.handler]
 
 
 def test_validate_none_params_on_no_schema() -> None:
     """``None`` params on a callable with no schema passes."""
     load_registry()
-    error = validate_factory_params(
-        "omnigent.policies.builtins.safety.ask_on_os_tools",
-        None,
+    _test_entry = PolicyRegistryEntry(
+        handler="test.direct_callable",
+        kind="callable",
+        name="Test Direct Callable",
+        description="Test-only entry",
+        params_schema=None,
     )
-    assert error is None
+    _registry.append(_test_entry)
+    _registry_by_handler[_test_entry.handler] = _test_entry
+    try:
+        error = validate_factory_params(
+            "test.direct_callable",
+            None,
+        )
+        assert error is None
+    finally:
+        _registry.remove(_test_entry)
+        del _registry_by_handler[_test_entry.handler]
 
 
 def test_validate_skips_unknown_handler() -> None:
