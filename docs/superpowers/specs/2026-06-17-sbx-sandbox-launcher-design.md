@@ -140,6 +140,13 @@ launcher so the shared `bootstrap.py` is untouched) that ensures:
 - `git`
 - `tmux`
 - the **Claude Code CLI** (claude-native needs it)
+- the **OpenCode CLI** (the `opencode` / `opencode-native` harnesses need it,
+  added once OpenCode support landed on `main`)
+
+Both npm packages (and their pinned versions, e.g. OpenCode's `~1.17.7` range)
+are sourced from `omnigent/onboarding/harness_install.py` rather than
+hardcoded in the launcher, so the sbx setup step can never drift from what
+`omnigent setup` installs elsewhere.
 
 **Verification task (implementation):** enumerate exactly what sbx's default
 `shell` sandbox image already provides, and install only the gap. Prefer

@@ -171,6 +171,7 @@ def test_provision_create_argv_and_setup(
     assert setup.args[1:4] == ["exec", "-u", "root"]
     assert setup.args[4] == "omnigent-host"
     assert "@anthropic-ai/claude-code" in setup.args[-1]
+    assert "opencode-ai@~1.17.7" in setup.args[-1]
 
 
 def test_provision_includes_kits_and_template(

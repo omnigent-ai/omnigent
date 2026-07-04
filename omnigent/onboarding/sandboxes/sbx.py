@@ -19,7 +19,7 @@ Platform notes that shape this launcher:
 - **Default image + full install.** Sandboxes boot sbx's default image
   (no prebaked omnigent), so :meth:`wheel_install_command` does a full
   dependency install and :meth:`provision` runs a one-time setup step to
-  install the host's runtime deps + the Claude Code CLI.
+  install the host's runtime deps + the Claude Code and OpenCode CLIs.
 - **No inbound port forwarding.** ``supports_local_port_forward`` stays
   ``False`` (matching Modal), so the CLI auto-skips the Databricks App
   OAuth step.
@@ -38,6 +38,11 @@ from typing import ClassVar
 
 import click
 
+from omnigent.onboarding.harness_install import (
+    ANTHROPIC_FAMILY,
+    OPENCODE_KEY,
+    harness_install_spec,
+)
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxLauncher,
@@ -60,11 +65,20 @@ KITS_ENV_VAR: str = "OMNIGENT_SBX_KITS"
 """Environment variable naming (comma- or whitespace-separated) sbx kit
 references applied at provision time (``sbx create --kit``)."""
 
+# npm package specs sourced from harness_install.py (not hardcoded here) so
+# this setup step tracks the same version pins `omnigent setup` installs —
+# notably OpenCode's `~1.17.7` range, required by the runtime's own
+# check_opencode_version gate.
+_claude_spec = harness_install_spec(ANTHROPIC_FAMILY)
+_opencode_spec = harness_install_spec(OPENCODE_KEY)
+assert _claude_spec is not None and _opencode_spec is not None
+
 # One-time root setup run after `sbx create` to make sbx's default image
 # a viable Omnigent host: ensure python/pip, git, tmux, node/npm, and the
-# Claude Code CLI. Idempotent — already-present tools no-op. (Discovery
-# task confirms the base image's gaps; absent tools are installed, present
-# ones skipped.)
+# Claude Code + OpenCode CLIs (claude-native and opencode/opencode-native
+# both gate on their respective binaries). Idempotent — already-present
+# tools no-op. (Discovery task confirms the base image's gaps; absent
+# tools are installed, present ones skipped.)
 _SETUP_COMMAND: str = (
     "set -e; "
     "if command -v apt-get >/dev/null 2>&1; then "
@@ -77,7 +91,10 @@ _SETUP_COMMAND: str = (
     'command -v npm >/dev/null 2>&1 || pkgs="$pkgs npm"; '
     'if [ -n "$pkgs" ]; then apt-get update && '
     "apt-get install -y --no-install-recommends $pkgs; fi; fi; "
-    "command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code"
+    f"command -v {_claude_spec.binary} >/dev/null 2>&1 || "
+    f"npm install -g {_claude_spec.package}; "
+    f"command -v {_opencode_spec.binary} >/dev/null 2>&1 || "
+    f"npm install -g {_opencode_spec.package}"
 )
 
 
