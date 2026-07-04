@@ -21,21 +21,31 @@ def _write_kiro_session(
     created_at: str = "2026-06-21T01:39:34.528139806Z",
     updated_at: str = "2026-06-21T01:40:41.838294036Z",
     lines: list[dict[str, Any]] | None = None,
+    user_turn_metadatas: list[dict[str, Any]] | None = None,
+    model_id: str | None = None,
 ) -> Path:
-    """Create a minimal Kiro CLI session metadata + JSONL fixture."""
+    """Create a minimal Kiro CLI session metadata + JSONL fixture.
+
+    Pass ``user_turn_metadatas`` / ``model_id`` to populate the credit-metering
+    fields the ``.json`` snapshot carries (``session_state.conversation_metadata
+    .user_turn_metadatas`` and ``session_state.rts_model_state.model_info``).
+    """
     root.mkdir(parents=True, exist_ok=True)
-    (root / f"{session_id}.json").write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "cwd": str(cwd),
-                "created_at": created_at,
-                "updated_at": updated_at,
-                "title": "hello",
-            }
-        ),
-        encoding="utf-8",
-    )
+    metadata: dict[str, Any] = {
+        "session_id": session_id,
+        "cwd": str(cwd),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "title": "hello",
+    }
+    if user_turn_metadatas is not None or model_id is not None:
+        session_state: dict[str, Any] = {}
+        if user_turn_metadatas is not None:
+            session_state["conversation_metadata"] = {"user_turn_metadatas": user_turn_metadatas}
+        if model_id is not None:
+            session_state["rts_model_state"] = {"model_info": {"model_id": model_id}}
+        metadata["session_state"] = session_state
+    (root / f"{session_id}.json").write_text(json.dumps(metadata), encoding="utf-8")
     jsonl_path = root / f"{session_id}.jsonl"
     jsonl_path.write_text(
         "\n".join(json.dumps(line) for line in (lines or [])) + "\n",
@@ -47,7 +57,11 @@ def _write_kiro_session(
 def test_discover_kiro_session_jsonl_filters_by_workspace_and_launch_time(
     tmp_path: Path,
 ) -> None:
-    """Discovery chooses the newest Kiro session for the runner workspace."""
+    """Discovery binds the unique qualifying Kiro session for the workspace.
+
+    The wrong-workspace and below-floor sessions are filtered out, leaving
+    exactly one candidate, which is bound.
+    """
     sessions_dir = tmp_path / "sessions" / "cli"
     workspace = tmp_path / "repo"
     other = tmp_path / "other"
@@ -73,6 +87,81 @@ def test_discover_kiro_session_jsonl_filters_by_workspace_and_launch_time(
         cwd=workspace,
         created_at="2026-06-21T01:39:35Z",
         updated_at="2026-06-21T01:40:00Z",
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered == ("current", expected)
+
+
+def test_discover_kiro_session_jsonl_returns_none_when_multiple_candidates(
+    tmp_path: Path,
+) -> None:
+    """Two concurrent same-workspace sessions are ambiguous → bind nothing.
+
+    Each Kiro session is its own JSONL, so two fresh sessions launched in the
+    same workspace within the discovery window both qualify. Picking newest-by-
+    ``updated_at`` could latch onto the other session's transcript (cross-talk),
+    so discovery must return ``None`` and retry rather than guess. Regression for
+    the #1137 'forwarder can bind the wrong session' item.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    # Both created after the launch floor, same workspace — indistinguishable.
+    _write_kiro_session(
+        sessions_dir,
+        session_id="session-a",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:40:10Z",
+    )
+    _write_kiro_session(
+        sessions_dir,
+        session_id="session-b",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:36Z",
+        updated_at="2026-06-21T01:41:00Z",  # newest updated_at — the old tie-break
+    )
+
+    discovered = forwarder._discover_kiro_session_jsonl(
+        workspace=str(workspace),
+        launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        sessions_dir=sessions_dir,
+    )
+
+    assert discovered is None
+
+
+def test_discover_kiro_session_jsonl_skips_session_with_unparseable_created_at(
+    tmp_path: Path,
+) -> None:
+    """An undateable same-workspace session can't poison the unique-bind count.
+
+    A session whose ``created_at`` won't parse can't be confirmed in-window, so it
+    is dropped rather than counted as a second candidate — otherwise a single
+    garbage straggler would make discovery permanently ambiguous and bind nothing.
+    """
+    sessions_dir = tmp_path / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="undateable",
+        cwd=workspace,
+        created_at="garbage",
+        updated_at="2026-06-21T01:41:00Z",
+    )
+    expected = _write_kiro_session(
+        sessions_dir,
+        session_id="current",
+        cwd=workspace,
+        created_at="2026-06-21T01:39:35Z",
+        updated_at="2026-06-21T01:40:10Z",
     )
 
     discovered = forwarder._discover_kiro_session_jsonl(
@@ -207,7 +296,6 @@ async def test_forward_kiro_session_posts_conversation_messages(
     )
     monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
     posted: list[tuple[str, str, forwarder._KiroConversationMessage]] = []
-    statuses: list[tuple[str, str, str | None]] = []
     external_ids: list[tuple[str, str]] = []
 
     async def _fake_post(
@@ -219,16 +307,6 @@ async def test_forward_kiro_session_posts_conversation_messages(
     ) -> None:
         del client
         posted.append((session_id, agent_name, message))
-
-    async def _fake_status(
-        client: httpx.AsyncClient,
-        *,
-        session_id: str,
-        status: str,
-        response_id: str | None = None,
-    ) -> None:
-        del client
-        statuses.append((session_id, status, response_id))
 
     async def _fake_patch_external_session_id(
         client: httpx.AsyncClient,
@@ -243,7 +321,6 @@ async def test_forward_kiro_session_posts_conversation_messages(
         raise asyncio.CancelledError
 
     monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
-    monkeypatch.setattr(forwarder, "_post_session_status", _fake_status)
     monkeypatch.setattr(
         forwarder,
         "_patch_external_session_id",
@@ -276,11 +353,135 @@ async def test_forward_kiro_session_posts_conversation_messages(
             ),
         ),
     ]
-    assert statuses == [
-        ("conv_kiro", "running", None),
-        ("conv_kiro", "idle", "kiro:assistant-1"),
-    ]
+    # The forwarder no longer posts session status; running/idle for
+    # kiro-native is owned by the PTY watcher's emit_status (#1137). See
+    # test_forward_kiro_session_does_not_post_session_status for the guard.
     assert external_ids == [("conv_kiro", "kiro-session")]
+
+
+def test_read_kiro_cumulative_credits_sums_every_turn(tmp_path: Path) -> None:
+    """Cumulative credits = sum of every turn's metering_usage values."""
+    sessions_dir = tmp_path / "cli"
+    _write_kiro_session(
+        sessions_dir,
+        session_id="k",
+        cwd=tmp_path,
+        user_turn_metadatas=[
+            {
+                "metering_usage": [
+                    {"value": 0.06, "unit": "credit"},
+                    {"value": 0.03, "unit": "credit"},
+                ],
+                "input_token_count": 0,
+            },
+            {"metering_usage": [{"value": 0.04, "unit": "credit"}], "input_token_count": 0},
+        ],
+        model_id="auto",
+    )
+
+    total, model = forwarder._read_kiro_cumulative_credits(sessions_dir / "k.json")
+
+    assert total == pytest.approx(0.13)
+    assert model == "auto"
+
+
+def test_read_kiro_cumulative_credits_none_without_metering(tmp_path: Path) -> None:
+    """No metering (or missing file) yields ``(None, None)`` so callers skip."""
+    sessions_dir = tmp_path / "cli"
+    _write_kiro_session(sessions_dir, session_id="k", cwd=tmp_path)
+
+    assert forwarder._read_kiro_cumulative_credits(sessions_dir / "k.json") == (None, None)
+    assert forwarder._read_kiro_cumulative_credits(sessions_dir / "missing.json") == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_posts_cumulative_cost_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forwarder posts kiro's summed credits as cumulative cost, then dedupes."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {"message_id": "a1", "content": [{"kind": "text", "data": "hi"}]},
+            },
+        ],
+        user_turn_metadatas=[
+            {
+                "metering_usage": [
+                    {"value": 0.06, "unit": "credit"},
+                    {"value": 0.03, "unit": "credit"},
+                ]
+            },
+            {"metering_usage": [{"value": 0.04, "unit": "credit"}]},
+        ],
+        model_id="auto",
+    )
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    costs: list[tuple[str, float, str | None]] = []
+
+    async def _fake_post_cost(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        cumulative_cost_usd: float,
+        model: str | None,
+    ) -> None:
+        del client
+        costs.append((session_id, cumulative_cost_usd, model))
+
+    async def _noop_message(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        agent_name: str,
+        message: forwarder._KiroConversationMessage,
+    ) -> None:
+        del client
+
+    async def _noop_patch(
+        client: httpx.AsyncClient, *, session_id: str, external_session_id: str
+    ) -> None:
+        del client
+
+    calls = {"n": 0}
+
+    async def _cancel_after_two_polls(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError
+
+    async def _noop_model(client: httpx.AsyncClient, *, session_id: str, model: str) -> None:
+        del client
+
+    monkeypatch.setattr(forwarder, "_post_session_cost", _fake_post_cost)
+    monkeypatch.setattr(forwarder, "_post_external_model_change", _noop_model)
+    monkeypatch.setattr(forwarder, "_post_conversation_message", _noop_message)
+    monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_after_two_polls)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    # Posted once with the summed credits + model; the unchanged second poll
+    # does not re-post (server treats cumulative_cost_usd as monotonic).
+    assert costs == [("conv_kiro", pytest.approx(0.13), "auto")]
     state = json.loads((tmp_path / "bridge" / "kiro_session_forwarder.json").read_text())
     assert state["session_id"] == "kiro-session"
     assert state["byte_offset"] > 0
@@ -344,7 +545,6 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
     )
     monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
     posted: list[forwarder._KiroConversationMessage] = []
-    statuses: list[tuple[str, str | None]] = []
     external_ids: list[str] = []
 
     async def _fake_post(
@@ -356,16 +556,6 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
     ) -> None:
         del client, session_id, agent_name
         posted.append(message)
-
-    async def _fake_status(
-        client: httpx.AsyncClient,
-        *,
-        session_id: str,
-        status: str,
-        response_id: str | None = None,
-    ) -> None:
-        del client, session_id
-        statuses.append((status, response_id))
 
     async def _fake_patch_external_session_id(
         client: httpx.AsyncClient,
@@ -380,7 +570,6 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
         raise asyncio.CancelledError
 
     monkeypatch.setattr(forwarder, "_post_conversation_message", _fake_post)
-    monkeypatch.setattr(forwarder, "_post_session_status", _fake_status)
     monkeypatch.setattr(
         forwarder,
         "_patch_external_session_id",
@@ -406,7 +595,7 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
             message_id="resumed-assistant", role="assistant", text="resumed reply"
         ),
     ]
-    assert statuses == [("running", None), ("idle", "kiro:resumed-assistant")]
+    # No session status is posted by the forwarder anymore (#1137).
     assert external_ids == ["resumed-session"]
     state = json.loads((bridge_dir / "kiro_session_forwarder.json").read_text())
     assert state["session_id"] == "resumed-session"
@@ -487,3 +676,158 @@ async def test_forward_kiro_session_waits_for_expected_resume_session(
 
     assert posted == []
     assert external_ids == []
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_does_not_post_session_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #1137: the forwarder mirrors the transcript but must NOT
+    post ``external_session_status``. Running/idle for kiro-native is owned by
+    the PTY watcher's ``emit_status`` (runner/resource_registry.py); posting it
+    here too double-sourced the session status. Captures real HTTP via a mock
+    transport so it guards the behaviour however status might be sent."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "Prompt",
+                "data": {"message_id": "user-1", "content": [{"kind": "text", "data": "hey"}]},
+            },
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {
+                    "message_id": "assistant-1",
+                    "content": [{"kind": "text", "data": "Hey!"}],
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+
+    posted_event_types: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posted_event_types.append(json.loads(request.content)["type"])
+        return httpx.Response(200, json={})
+
+    real_async_client = forwarder.httpx.AsyncClient
+
+    def _client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(*args, transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr(forwarder.httpx, "AsyncClient", _client_factory)
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    # The transcript is still mirrored…
+    assert "external_conversation_item" in posted_event_types
+    # …but the forwarder posts no session status (the PTY watcher owns it).
+    assert "external_session_status" not in posted_event_types
+
+
+def test_read_kiro_current_model_reads_without_metering(tmp_path: Path) -> None:
+    """The model id is read from rts_model_state even before any turn/metering."""
+    sessions_dir = tmp_path / "cli"
+    _write_kiro_session(sessions_dir, session_id="k", cwd=tmp_path, model_id="claude-haiku-4.5")
+    assert forwarder._read_kiro_current_model(sessions_dir / "k.json") == "claude-haiku-4.5"
+
+    # Missing file and a session with no model state both yield None.
+    assert forwarder._read_kiro_current_model(sessions_dir / "missing.json") is None
+    _write_kiro_session(sessions_dir, session_id="bare", cwd=tmp_path)
+    assert forwarder._read_kiro_current_model(sessions_dir / "bare.json") is None
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_mirrors_current_model_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forwarder mirrors kiro's current model via external_model_change, deduped."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            {
+                "version": "v1",
+                "kind": "AssistantMessage",
+                "data": {"message_id": "a1", "content": [{"kind": "text", "data": "hi"}]},
+            },
+        ],
+        # No metering: proves the model mirror fires at launch, before a turn's cost.
+        model_id="claude-haiku-4.5",
+    )
+    monkeypatch.setattr(forwarder, "_kiro_cli_sessions_dir", lambda: sessions_dir)
+    models: list[tuple[str, str]] = []
+
+    async def _fake_post_model(client: httpx.AsyncClient, *, session_id: str, model: str) -> None:
+        del client
+        models.append((session_id, model))
+
+    async def _noop_message(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        agent_name: str,
+        message: forwarder._KiroConversationMessage,
+    ) -> None:
+        del client
+
+    async def _noop_patch(
+        client: httpx.AsyncClient, *, session_id: str, external_session_id: str
+    ) -> None:
+        del client
+
+    calls = {"n": 0}
+
+    async def _cancel_after_two_polls(_seconds: float) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder, "_post_external_model_change", _fake_post_model)
+    monkeypatch.setattr(forwarder, "_post_conversation_message", _noop_message)
+    monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_after_two_polls)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    # Mirrored once; the unchanged second poll does not re-post.
+    assert models == [("conv_kiro", "claude-haiku-4.5")]

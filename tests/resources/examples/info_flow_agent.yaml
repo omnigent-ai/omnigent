@@ -1,0 +1,70 @@
+# Demo for the built-in Google Drive *Bell-LaPadula "no write-down"* policy.
+#
+# Bell-LaPadula is the classic confidentiality model. Its "*-property" forbids a
+# **write down**: once a subject is cleared for confidential material, it must
+# not write that material into a less-protected place (a leak).
+#
+# This policy models a simple two-level compartment. You declare a set of
+# confidential documents up front (``confidential_files``). The rule is:
+#
+#   * The agent may freely read and write anything to start with.
+#   * The moment it *reads* one of the confidential documents, the session is
+#     "in the compartment": from then on, its writes are confined to the
+#     confidential set. Writing to — or creating — any other file is a
+#     write-down and is blocked.
+#
+# The confidential set is declared explicitly rather than inferred from a
+# per-document label, so the policy works on any Google Drive tenant — nothing
+# depends on Databricks-internal classification labels.
+#
+# The very same "create a new doc and write the summary there" action is allowed
+# before the agent has opened the strategy doc, and denied after — the action
+# didn't change, the session state did.
+#
+# Usage:
+#   export DATABRICKS_CONFIG_PROFILE=<your-profile>
+#   python -m omnigent tests/resources/examples/info_flow_agent.yaml \
+#       --prompt "Read the strategy doc, then create a public summary doc and paste the highlights."
+#   # Reading the confidential strategy doc puts the session in the compartment;
+#   # the follow-up docs_document_create is then blocked as a write-down.
+
+name: info_flow_agent
+prompt: |
+  You are an assistant with Google Workspace tools. You can read, edit, and
+  create Google Drive files and Docs. Your actions are governed by an
+  information-flow policy: once you have opened a confidential document, you may
+  only write back into confidential documents — writing that content into any
+  other file (or a new one) is blocked to prevent leaks. If an action is denied,
+  explain that it was gated by the no-write-down policy and suggest keeping the
+  work inside the confidential document.
+
+executor:
+  harness: openai-agents
+  model: databricks-gpt-5-4-mini
+  auth:
+    type: databricks
+    profile: oss
+
+tools:
+  # Point this at your Google MCP server. The policy matches tools by canonical
+  # name regardless of the server prefix (mcp__google__*, google__*, or bare),
+  # so no server-specific configuration is needed here.
+  google:
+    type: mcp
+    command: npx
+    args: ["-y", "@your-org/google-mcp-server"]
+
+policies:
+  confidential_containment:
+    type: function
+    handler: omnigent.policies.builtins.google.gdrive_policy
+    factory_params:
+      # The confidential compartment. Replace these with your own document IDs
+      # or URLs. Reading any of them confines the session's writes to this set.
+      confidential_files:
+        - "1ConfidentialStrategyDocDEMO0000000000000000"
+      # Allow creating new files so the demo can show a *create* being gated as a
+      # write-down (rather than blocked outright by the base access rules).
+      allow_create: true
+      # DENY (hard block) or ASK (require human approval) on a write-down.
+      write_down_action: DENY

@@ -101,7 +101,7 @@ class Conversation:
         default from the spec's ``llm.model``. Mutable via
         ``PATCH /v1/sessions/{id}`` and the REPL's ``/model``
         command. Mirrors the persistence shape of
-        ``reasoning_effort`` so the ap-web UI and the TUI stay
+        ``reasoning_effort`` so the web UI and the TUI stay
         in sync — both read it from the session snapshot and
         write it through the same PATCH endpoint.
     :param cost_control_mode_override: Per-session cost-control
@@ -109,7 +109,7 @@ class Conversation:
         mode, ``"off"`` disables cost control for this session, and
         ``None`` (unset) defers to the spec default. Set at session
         creation via ``POST /v1/sessions`` and mutable via
-        ``PATCH /v1/sessions/{id}`` (the ap-web "Cost Optimized"
+        ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
     :param harness_override: Per-session harness override for the
@@ -407,6 +407,7 @@ class CompactionData(BaseModel):
     model: str | None = None
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
+    window_id: int | None = None
 
 
 class NativeToolData(BaseModel):

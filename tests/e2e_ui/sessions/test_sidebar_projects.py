@@ -41,8 +41,8 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
 
 def _section(page: Page, title: str) -> Locator:
     """Locate the sidebar ``<section>`` whose collapse-header button reads
-    *title* (e.g. "Chats" or a project name). Section headers carry no count or
-    icon, so the header's accessible name is the bare title."""
+    *title* (e.g. "Sessions" or a project name). Section headers carry no count
+    or icon, so the header's accessible name is the bare title."""
     return page.locator("section").filter(has=page.get_by_role("button", name=title, exact=True))
 
 
@@ -70,9 +70,9 @@ def test_move_session_into_new_project(
 ) -> None:
     """Creating a project from the kebab moves the row into it.
 
-    The session starts under "Chats"; after "Add to project → Create new
+    The session starts under "Sessions"; after "Add to project → Create new
     project", a project folder with that name appears under the "Projects" group and the
-    row lives under it (once expanded) and no longer under "Chats".
+    row lives under it (once expanded) and no longer under "Sessions".
     """
     base_url, session_id = seeded_session
     title = f"e2e-proj-{uuid.uuid4().hex[:8]}"
@@ -83,7 +83,7 @@ def test_move_session_into_new_project(
 
     row = _row(page, session_id)
     expect(row).to_be_visible()
-    expect(_section(page, "Chats").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
 
     _move_to_new_project(page, row, project)
 
@@ -94,17 +94,17 @@ def test_move_session_into_new_project(
     expect(header).to_have_attribute("aria-expanded", "true")
 
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(_section(page, "Chats").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
 
 def test_remove_session_from_project(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Removing a session from its project drops it back under "Chats".
+    """Removing a session from its project drops it back under "Sessions".
 
     Moves the row into a fresh project first, then uses the kebab's
-    "Remove from <project>" item and asserts the row returns to "Chats".
+    "Remove from <project>" item and asserts the row returns to "Sessions".
     """
     base_url, session_id = seeded_session
     title = f"e2e-proj-rm-{uuid.uuid4().hex[:8]}"
@@ -137,6 +137,6 @@ def test_remove_session_from_project(
     # Removal is confirmed (it may delete the implicit project) — accept it.
     page.get_by_role("button", name="Remove from project", exact=True).click()
 
-    # Back under "Chats", and the now-empty project folder is gone.
-    expect(_section(page, "Chats").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+    # Back under "Sessions", and the now-empty project folder is gone.
+    expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(page.get_by_role("button", name=project, exact=True)).to_have_count(0)

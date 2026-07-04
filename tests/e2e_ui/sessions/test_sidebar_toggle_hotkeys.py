@@ -1,6 +1,6 @@
 """E2E: ⌘⌥[ / ⌘⌥] toggle the left and right sidebars from the app shell.
 
-Covers ``useSidebarToggleHotkeys`` (``ap-web/src/hooks/useSidebarToggleHotkeys.ts``),
+Covers ``useSidebarToggleHotkeys`` (``web/src/hooks/useSidebarToggleHotkeys.ts``),
 wired in ``AppShell``: a window-level keydown listener flips the left
 (Conversations) sidebar on ⌘/Ctrl + ⌥/Alt + ``[`` and the right (Workspace)
 rail on ⌘/Ctrl + ⌥/Alt + ``]``. The hook matches the physical ``e.code``

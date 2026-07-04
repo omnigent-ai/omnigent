@@ -287,7 +287,10 @@ def test_edit_comment(
         file_viewer = _open_comments_panel(page, base_url, session_id)
 
         expect(file_viewer).to_contain_text(_SHORT_BODY)
-        file_viewer.get_by_role("button", name="Edit").click()
+        # exact=True so this matches only the comment card's "Edit" button, not
+        # the markdown toolbar's "View mode: Edit" dropdown trigger (markdown
+        # opens in the editor, whose picker label contains "Edit").
+        file_viewer.get_by_role("button", name="Edit", exact=True).click()
 
         # The inline editor pre-fills the current body. It is the only textarea
         # on screen (the add-comment form requires an active selection, which we
@@ -383,8 +386,10 @@ def test_single_user_comment_is_editable_and_deletable(
     file_viewer = _open_comments_panel(page, base_url, session_id)
     expect(file_viewer).to_contain_text(_SHORT_BODY)
 
-    # Edit renders for the header-less viewer and persists.
-    file_viewer.get_by_role("button", name="Edit").click()
+    # Edit renders for the header-less viewer and persists. exact=True so this
+    # matches only the comment card's "Edit" button, not the markdown toolbar's
+    # "View mode: Edit" dropdown trigger (markdown opens in the editor).
+    file_viewer.get_by_role("button", name="Edit", exact=True).click()
     edit_textarea = file_viewer.locator("textarea")
     expect(edit_textarea).to_have_value(_SHORT_BODY)
     edited_body = "Edited in single-user mode (e2e)."

@@ -9,11 +9,11 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT, PI_NATIVE_CODING_AGENT
 from omnigent.native_coding_agents import (
-    KIRO_NATIVE_CODING_AGENT,
-    PI_NATIVE_CODING_AGENT,
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
+    public_agent_name,
 )
 
 
@@ -80,3 +80,29 @@ def test_unknown_harness_returns_none() -> None:
     """A non-native harness stays unresolved (no terminal presentation)."""
     assert native_coding_agent_for_harness("claude-sdk") is None
     assert native_coding_agent_for_harness(None) is None
+
+
+def test_public_agent_name_hides_native_ui_wrapper_names() -> None:
+    """Native-UI wrapper agent names map to their clean public display name.
+
+    The raw ``<tool>-native-ui`` name is an internal implementation detail; a
+    session describing itself (``sys_session_get_info``) must surface the
+    display name (e.g. ``Pi``) so the model never repeats ``pi-native-ui`` to
+    the user.
+    """
+    assert public_agent_name("pi-native-ui") == "Pi"
+    assert public_agent_name("claude-native-ui") == "Claude"
+    assert public_agent_name("codex-native-ui") == "Codex"
+    assert public_agent_name("cursor-native-ui") == "Cursor"
+
+
+def test_public_agent_name_passes_through_regular_names() -> None:
+    """Non-wrapper names (and ``None``) are returned unchanged.
+
+    Regular Omnigent agents have user-meaningful names that are safe to expose,
+    so only the native-UI wrappers are rewritten.
+    """
+    assert public_agent_name("researcher") == "researcher"
+    assert public_agent_name("nessie") == "nessie"
+    assert public_agent_name("") == ""
+    assert public_agent_name(None) is None

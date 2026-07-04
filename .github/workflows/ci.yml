@@ -10,18 +10,18 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
   push:
     branches:
       - main
-    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
 
 permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync`; this job never serves the bundle.
+  # No web SPA build during `uv sync`; this job never serves the bundle.
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
@@ -264,6 +264,9 @@ jobs:
         shell: bash
         env:
           PYTHONFAULTHANDLER: "1"
+          # Reuse the binary from the "Build parity sidecar" step above so the
+          # fixture doesn't re-invoke cargo build during collection.
+          CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
         run: |
           mkdir -p artifacts
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \

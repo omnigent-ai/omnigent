@@ -64,6 +64,19 @@ def test_synthesize_env_key_anthropic() -> None:
     assert entries["anthropic"]["anthropic"]["base_url"] == "https://api.anthropic.com"
 
 
+def test_synthesize_env_key_preserves_omnigent_prefixed_source() -> None:
+    """A prefixed detection keeps the prefixed env ref in provider config."""
+    det = DetectedProvider(
+        name="anthropic",
+        kind="key",
+        family=ANTHROPIC_FAMILY,
+        source="$OMNIGENT_ANTHROPIC_API_KEY",
+    )
+    entries = synthesize_detected_entries([det])
+
+    assert entries["anthropic"]["anthropic"]["api_key_ref"] == ("env:OMNIGENT_ANTHROPIC_API_KEY")
+
+
 def test_synthesize_env_key_openrouter_uses_vendor_endpoint_and_chat_wire() -> None:
     """A detected OpenRouter key gets OpenRouter's base_url + chat wire.
 

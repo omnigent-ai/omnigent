@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import httpx
@@ -34,15 +33,20 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_returns_installed_package_version(
+async def test_version_returns_source_of_truth_version(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /api/version returns the installed omnigent package version.
+    """GET /api/version returns ``omnigent.version.VERSION``.
 
-    Compares the endpoint response against ``importlib.metadata.version``
-    directly — confirms the handler forwards the real installed version
-    rather than a hard-coded string.
+    The endpoint surfaces the shared source-of-truth constant, authoritative
+    regardless of how the package was installed. We deliberately do NOT assert
+    against ``importlib.metadata.version`` here: that is a frozen build-time
+    snapshot which can legitimately differ from ``VERSION`` (stale editable
+    install, or ``"source"`` placeholder metadata) — asserting equality would
+    re-couple to exactly the metadata this change moved off of.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/api/version")
     assert resp.status_code == 200
     body = resp.json()
@@ -50,15 +54,16 @@ async def test_version_returns_installed_package_version(
     # "version" key must be present — a missing key means the UI's
     # fetchVersion() falls back to "unknown" in every bug report.
     assert "version" in body
-
-    expected = _pkg_version("omnigent")
-    # Exact match against the installed version — confirms the endpoint
-    # calls importlib.metadata.version("omnigent"), not a constant.
-    assert body["version"] == expected, (
-        f"Expected version {expected!r} from importlib.metadata, "
-        f"got {body['version']!r}. If the handler hard-codes a version, "
-        "bug reports will always show the wrong version string."
+    assert body["version"] == VERSION, (
+        f"Expected version {VERSION!r} from omnigent.version.VERSION, got {body['version']!r}."
     )
+
+
+def test_server_version_reads_version_constant() -> None:
+    """The server version is the shared ``omnigent.version.VERSION`` constant."""
+    from omnigent.version import VERSION
+
+    assert server_app._server_version() == VERSION
 
 
 class _StubWebSocket:
@@ -369,17 +374,19 @@ async def test_info_includes_server_version(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``GET /v1/info`` includes ``server_version`` — the installed package
-    version (same source as ``/api/version``) — so the web UI can show it
+    ``GET /v1/info`` includes ``server_version`` — the shared ``VERSION``
+    constant (same source as ``/api/version``) — so the web UI can show it
     in the session info popover's version footer without a second fetch.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     body = resp.json()
-    # Exact match against the installed version confirms the handler reads
-    # importlib.metadata, not a constant — a stale constant would mislead
-    # anyone reading the version off the popover.
-    assert body["server_version"] == _pkg_version("omnigent")
+    # Matches the source-of-truth constant, not importlib.metadata: the latter
+    # is a frozen build-time snapshot that can drift from VERSION in a stale
+    # editable or "source"-placeholder install.
+    assert body["server_version"] == VERSION
 
 
 @pytest.mark.asyncio
@@ -985,3 +992,74 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     )
 
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
+
+
+def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """Build an app with the web UI bundle ABSENT (the API-only branch).
+
+    The dev checkout has a built ``static/web-ui`` (so ``create_app`` would
+    mount the SPA), so point ``_WEB_UI_DIST`` at an empty path to force the
+    API-only fallback branch under test.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    monkeypatch.setattr(server_app, "_WEB_UI_DIST", tmp_path / "no-web-ui")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_serves_html_200_to_any_client(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a no-web-UI server, ``GET /`` always returns the HTML explainer with a
+    200 — no content negotiation. A browser navigation and a plain JSON client
+    get the same page (``/`` is not used for anything else)."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for headers in ({"accept": "text/html"}, {"accept": "application/json"}):
+            resp = await c.get("/", headers=headers)
+            assert resp.status_code == 200, headers
+            assert resp.headers["content-type"].startswith("text/html"), headers
+            assert "web UI" in resp.text
+            assert "OMNIGENT_SKIP_WEB_UI" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_api_only_unknown_path_gets_json_404(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown path still returns the exact default ``404 {"detail": "Not
+    Found"}`` for every client — the landing is served only at ``/``, never as a
+    catch-all, so API consumers that parse that body are unaffected."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for headers in ({"accept": "text/html"}, {"accept": "application/json"}):
+            resp = await c.get("/c/conv_abc", headers=headers)
+            assert resp.status_code == 404, headers
+            assert resp.json() == {"detail": "Not Found"}, headers
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_does_not_shadow_real_routes(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``/`` landing is an exact-path route, so real routes like ``/health``
+    still serve their normal JSON even when the client prefers HTML."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/health", headers={"accept": "text/html"})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}

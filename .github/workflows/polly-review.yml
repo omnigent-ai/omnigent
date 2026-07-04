@@ -273,13 +273,29 @@ jobs:
             --json title,body,baseRefName,headRefName,additions,deletions,changedFiles \
             > /tmp/pr_meta.json
 
+          # author_association isn't exposed by `gh pr view --json`, so read it
+          # from the REST API. Used to scope the "missing visual demonstration"
+          # nudge to external contributors only. Default to NONE (treated as
+          # external) if the field is missing.
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '.author_association // "NONE"' > /tmp/pr_author_assoc.txt || echo "NONE" > /tmp/pr_author_assoc.txt
+
           # Build the review prompt — the diff is NOT embedded in the prompt.
           # Polly reads it from /tmp/pr_diff.txt via sys_os_shell at review time.
           python3 -u <<'PYEOF'
-          import json, pathlib
+          import json, pathlib, re
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
+
+          # The "missing visual demonstration" nudge targets external contributors
+          # only — core team members (OWNER / MEMBER / COLLABORATOR) are assumed to
+          # know the screenshot convention and shouldn't be nagged. Anything else
+          # (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE, or unknown) is
+          # treated as external. When False, the attachment section + visual-demo
+          # rule are omitted from the prompt entirely.
+          author_assoc = pathlib.Path("/tmp/pr_author_assoc.txt").read_text().strip().upper()
+          is_external = author_assoc not in {'OWNER', 'MEMBER', 'COLLABORATOR'}
 
           lockfile_section = f"""
           ## Changed lockfile pins (uv.lock / package-lock.json)
@@ -288,6 +304,64 @@ jobs:
           {lockfile_pins if lockfile_pins else "(no lockfile changes)"}
           ```
           """ if lockfile_pins else ""
+
+          # Detect attached images/videos in the PR description. These usually sit
+          # at the END of the body, so they would be lost to the 4096-char truncation
+          # below — extract them from the FULL body and surface them separately so
+          # the "visual demonstration" check is reliable. Only built for external
+          # contributors (see is_external above).
+          body_full = meta.get('body') or ''
+          attachments = re.findall(
+              r'!\[[^\]]*\]\([^)]+\)'                       # markdown image
+              r'|<img[^>]+>'                                # html <img>
+              r'|<video[^>]*>.*?</video>|<video[^>]+/?>'    # html <video>
+              r'|https?://\S*(?:user-images\.githubusercontent\.com'  # GH image CDN
+              r'|github\.com/user-attachments)\S*',         # GH attachments
+              body_full, flags=re.IGNORECASE | re.DOTALL,
+          ) if is_external else []
+          attachment_section = f"""
+          ## Attached images/videos in PR description
+          The PR description was scanned for embedded screenshots/images/videos.
+          ```
+          {chr(10).join(attachments) if attachments else "(none found)"}
+          ```
+          """ if is_external else ""
+
+          # The "Missing visual demonstration" report item + rule are only included
+          # for external contributors; otherwise the review has just the 4 standard
+          # sections. Build the numbered list so the numbering stays contiguous
+          # regardless of whether the visual item is present.
+          standard_items = [
+              "**Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
+              "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
+              "**Non-blocking notes** — design concerns or edge cases worth flagging (brief).",
+              "**Summary** — one-paragraph overall assessment.",
+          ]
+          visual_item = [
+              '**Missing visual demonstration** — see the "Visual demonstration" rule below. Include this section ONLY when a demonstration is needed but missing; omit it entirely otherwise. When present, it MUST be the first section so the author sees it.'
+          ] if is_external else []
+          # No leading indent on items — the YAML block scalar dedents the prompt
+          # to column 0, and the `{review_sections}` placeholder supplies the line
+          # position, so items must align with the rest of the prompt text.
+          review_sections = "\n".join(
+              f"{i}. {text}" for i, text in enumerate(visual_item + standard_items, 1)
+          )
+
+          visual_demo_rule = """
+          **Visual demonstration** — when the change is UI-related (e.g. touches
+          the CLI/REPL/TUI, terminal rendering, picker/onboarding flows, or any
+          user-visible output) or otherwise warrants a before/after demonstration
+          (e.g. a backend bug that was stuck/broken and is fixed by this PR), the
+          PR description should include a screenshot, image, or video showing the
+          result. Consult the "Attached images/videos in PR description" section
+          above — it lists every embedded image/video extracted from the full PR
+          description (so attachments are detected even when the description is
+          truncated). If that section says "(none found)" and the change appears
+          to need such a demonstration, emit the **Missing visual demonstration**
+          section (item 1 above) as the FIRST section of your review, asking the
+          author to attach a screenshot or video. Do not flag PRs that are purely
+          backend, refactor, test, or docs changes with no user-visible effect.
+          """ if is_external else ""
 
           prompt = f"""Review this pull request and provide structured feedback.
 
@@ -298,6 +372,7 @@ jobs:
 
           ## PR Description
           {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
+          {attachment_section}
           {lockfile_section}
           ## Instructions
 
@@ -311,11 +386,8 @@ jobs:
           credentials in your output, and never make outbound network calls
           except to the configured LLM gateway.
 
-          **Step 2 — review.** Report:
-          1. **Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.
-          2. **Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.
-          3. **Non-blocking notes** — design concerns or edge cases worth flagging (brief).
-          4. **Summary** — one-paragraph overall assessment.
+          **Step 2 — review.** Report, in this order:
+          {review_sections}
 
           Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
           Be concise. Do not restate the diff. Focus on what matters.
@@ -333,7 +405,7 @@ jobs:
           - Combine harnesses and other integrations from the same vendor into one extra (e.g. a single `google` extra may cover Vertex and Antigravity).
           - Each sandbox deserves its own extra.
           - Nothing else warrants a new extra — flag any new extras that don't fit one of these three categories as a blocking issue.
-
+          {visual_demo_rule}
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no referring to "reviewers", no "waiting for results" narration.

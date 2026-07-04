@@ -2781,3 +2781,41 @@ def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
     (home / ".codex" / "skills").mkdir(parents=True)
     assert codex_skill_sources(None, home) == [home / ".codex" / "skills"]
     assert codex_skill_sources(tmp_path / "no-bundle", home) == [home / ".codex" / "skills"]
+
+
+def test_clean_codex_env_honors_extra_allow(monkeypatch):
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("CRAWL4AI_API_TOKEN", "secret-tok")
+    monkeypatch.setenv("COMPANIES_HOUSE_API_KEY", "ch-key")
+    # undeclared → stripped by the hardcoded allowlist
+    assert "CRAWL4AI_API_TOKEN" not in _clean_codex_env()
+    # declared via env_passthrough → admitted
+    env = _clean_codex_env(["CRAWL4AI_API_TOKEN", "COMPANIES_HOUSE_API_KEY"])
+    assert env["CRAWL4AI_API_TOKEN"] == "secret-tok"
+    assert env["COMPANIES_HOUSE_API_KEY"] == "ch-key"
+
+
+def test_clean_codex_env_deny_wins_over_extra_allow(monkeypatch):
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-stripped")
+    # the deny rule (subscription auth) wins even if a caller declares it
+    assert "OPENAI_API_KEY" not in _clean_codex_env(["OPENAI_API_KEY"])
+
+
+def test_declared_passthrough_reads_sandbox_env_passthrough():
+    from omnigent.inner.codex_executor import _declared_passthrough
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    # env_passthrough lives on os_env.sandbox, not os_env directly
+    spec = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type="none", env_passthrough=["CRAWL4AI_API_TOKEN", "COMPANIES_HOUSE_API_KEY"]
+        )
+    )
+    assert _declared_passthrough(spec) == ("CRAWL4AI_API_TOKEN", "COMPANIES_HOUSE_API_KEY")
+    # guards: None os_env / None sandbox / unset list all yield ()
+    assert _declared_passthrough(None) == ()
+    assert _declared_passthrough(OSEnvSpec(sandbox=None)) == ()
+    assert _declared_passthrough(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))) == ()

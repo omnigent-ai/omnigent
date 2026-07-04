@@ -876,6 +876,12 @@ class Usage(BaseModel):
         (e.g. supervisors that delegate / use the harness default).
         ``None`` when the executor doesn't report it; the cost path
         then falls back to the session override / spec model.
+    :param cost_usd: Authoritative per-turn cost in USD reported
+        directly by the harness/provider (e.g. GitHub Copilot's
+        AI-credit total). When present, the server-side cost path uses
+        it in preference to the catalog token-price estimate; ``None``
+        when the harness doesn't report a cost (the common case, where
+        cost is computed from token counts x catalog pricing).
     """
 
     input_tokens: int = 0
@@ -886,6 +892,7 @@ class Usage(BaseModel):
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
+    cost_usd: float | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -1572,7 +1579,16 @@ class SessionResponse(BaseModel):
         be found (deleted or orphaned session).
     :param status: Session lifecycle status. One of
         ``"idle"`` (no loop running), ``"running"`` (loop
-        executing), or ``"failed"`` (terminal failure).
+        executing), ``"waiting"`` (loop parked on background
+        work / sub-agents), or ``"failed"`` (terminal failure).
+        Current read paths collapse ``"waiting"`` -> ``"running"``
+        before building this snapshot; the literal stays a superset
+        of what the runtime can produce so a server that forwards
+        the raw status never 500s on serialization.
+    :param background_task_count: Background shells (claude-native) still
+        running as of the last status edge, so a reload re-shows "N shells
+        still running" even though the session has settled to ``"idle"``.
+        ``None`` (the default / omitted) when no shells are tracked.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1648,7 +1664,7 @@ class SessionResponse(BaseModel):
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
         ``PATCH /v1/sessions/{id}`` or the REPL's ``/model``
-        command; both write the same column so the ap-web UI and
+        command; both write the same column so the web UI and
         the TUI stay in sync.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
@@ -1770,12 +1786,22 @@ class SessionResponse(BaseModel):
         ``_session_sandbox_status_cache`` at snapshot build time, so
         a client opening the session mid-launch sees the current
         stage.
+    :param active_response_id: Response id of the turn currently in
+        flight, or ``None`` when the session is idle. Sourced from the
+        server's ``_session_active_response_cache`` at snapshot build
+        time so a client connecting mid-turn can reopen a streaming
+        ``activeResponse`` — the SSE stream is snapshot + live tail with
+        no replay, so the turn-start ``running`` edge that carried this
+        id is not re-sent on reconnect. Today only native-terminal
+        forwarders (claude-native) stamp a turn id on their status
+        edges; other harnesses leave this ``None``.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
+    background_task_count: int | None = None
     created_at: int
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1818,6 +1844,7 @@ class SessionResponse(BaseModel):
     model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    active_response_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -1876,7 +1903,7 @@ class UpdateSessionRequest(BaseModel):
         the runner-side side effects — specifically the
         native ``/effort`` / ``/model`` / Codex collaboration-mode
         forwards into the live runtime. Used by automatic bind-time
-        handoffs (ap-web's sticky-pref apply on session switch, the
+        handoffs (web's sticky-pref apply on session switch, the
         REPL's pre-create ``/model`` snapshot) where injecting a
         visible slash command into a freshly-spawned pane would
         render as an unexpected "Command model X" item before the
@@ -2036,6 +2063,31 @@ class SessionForkRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ReadStatePutRequest(BaseModel):
+    """
+    Request body for ``PUT /v1/sessions/{session_id}/read-state``.
+
+    Sets the *calling user's* read tracking for one session. Mirrors the
+    two values the web client keeps per session: a "last seen" wall-clock
+    baseline (seconds since epoch) and an explicit "marked unread"
+    override. The unread dot shows when ``updated_at > last_seen`` and the
+    session is finished; ``unread`` separately pins the override so the
+    thread the user is *viewing* (or a running one) still surfaces the dot
+    where the automatic "seen" logic would otherwise suppress it.
+
+    :param last_seen: Wall-clock baseline in seconds, e.g. ``1717000000``.
+        Marking seen sets this to "now"; marking unread pins it to
+        ``updated_at - 1`` so the row reads unseen.
+    :param unread: Whether this session is explicitly flagged unread for
+        the caller.
+    """
+
+    last_seen: int
+    unread: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class SessionSwitchAgentRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{id}/switch-agent``.
@@ -2139,12 +2191,22 @@ class SessionListItem(BaseModel):
         distinguishable while staying an exact integer in JavaScript;
         clients only compare it for change. ``None`` when the session
         has no comments or the server has no comment store wired.
+    :param viewer_last_seen: The *requesting user's* "last seen"
+        wall-clock baseline in seconds for this session, or ``None``
+        when they have never seen it. Per-viewer (built from the
+        server's in-memory per-user read-state, written by
+        ``PUT /v1/sessions/{id}/read-state``); the unread dot shows
+        when ``updated_at > viewer_last_seen`` and the session is
+        finished. In-memory only — resets on a server restart.
+    :param viewer_unread: Whether the *requesting user* explicitly
+        marked this session unread. Per-viewer; lifts the active-row
+        dot suppression on the client. ``False`` by default.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
     title: str | None = None
@@ -2163,6 +2225,8 @@ class SessionListItem(BaseModel):
     archived: bool = False
     comments_count: int = 0
     comments_updated_at: int | None = None
+    viewer_last_seen: int | None = None
+    viewer_unread: bool = False
 
 
 class SessionList(BaseModel):
@@ -2365,6 +2429,7 @@ class SessionStatusEvent(_SSEEventBase):
     status: Literal["idle", "launching", "running", "waiting", "failed"]
     response_id: str | None = None
     error: ErrorDetail | None = None
+    background_task_count: int | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):
@@ -2526,7 +2591,7 @@ class SessionTodosEvent(_SSEEventBase):
     Emitted after an ``external_session_todos`` POST from the
     ``omnigent claude`` transcript forwarder, which captures todo
     updates via ``PostToolUse``/``TodoWrite`` hook events from Claude
-    Code and forwards them to the Omnigent server. Lets ap-web render a
+    Code and forwards them to the Omnigent server. Lets web render a
     live todo panel in the right column without polling.
 
     :param type: Always ``"session.todos"``.
@@ -2564,7 +2629,7 @@ class SessionTerminalPendingEvent(_SSEEventBase):
        sub-agents) and carries the authoritative ``pending=False`` clear
        emitted by the runner's ``finally`` block.
 
-    Together they allow ap-web to show a spinner on the Terminal pill
+    Together they allow web to show a spinner on the Terminal pill
     while the backend boots the terminal instead of a silent greyed-out
     button, and to distinguish "still starting up" from "no terminal"
     (killed or never created).

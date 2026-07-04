@@ -538,12 +538,13 @@ def worktree_guard(
     :returns: An evaluator ``fn(event, config)`` returning a V0 decision.
     """
 
-    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit
-    # (surfaced via the PreToolUse hook), and Pi's native lowercase
+    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit/
+    # MultiEdit (surfaced via the PreToolUse hook), and Pi's native lowercase
     # write/edit (surfaced via the pi ``tool_call`` hook). Pi uses the same
     # ``path`` argument key as the Omnigent tools, so no Pi-specific arg
-    # branch is needed below.
-    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "write", "edit"}
+    # branch is needed below. ``MultiEdit`` carries ``file_path`` like the
+    # other Claude native edit tools, so the extraction below already covers it.
+    _write_tools = {"sys_os_write", "sys_os_edit", "Write", "Edit", "MultiEdit", "write", "edit"}
 
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
@@ -568,13 +569,69 @@ def worktree_guard(
     return _evaluate
 
 
+def read_only_os(
+    *,
+    deny_reason: str = (
+        "This agent is report-only: it may read files and run shell, but never "
+        "write or edit them. Describe the change in your report instead of applying it."
+    ),
+) -> Callable[[_Json, _Json], _Json]:
+    """
+    Factory: deny the file-write/edit tools (best-effort report-only guardrail).
+
+    DENIES ``sys_os_write`` / ``sys_os_edit`` and the Claude/Codex/Pi native
+    ``Write`` / ``Edit`` / ``MultiEdit`` aliases, so an accidental edit is
+    refused at the policy layer rather than only discouraged in prose.
+
+    NOT a containment boundary. Reads, searches, and shell are left enabled, so
+    an agent can still mutate files via the shell (``echo > f``, ``sed -i``,
+    ``tee``) — this policy does not gate that, and command parsing cannot
+    reliably catch it. For a hard guarantee (e.g. reviewing untrusted input),
+    run the agent sandboxed — ``os_env.sandbox.type: linux_bwrap`` (Linux) /
+    ``darwin_seatbelt`` (macOS) binds cwd read-only — and treat this policy as
+    defense-in-depth. Use for agents whose contract is to investigate and
+    report (a security reviewer and its read-only sub-agents).
+
+    :param deny_reason: Reason text surfaced on a DENY decision.
+    :returns: An evaluator ``fn(event, config)`` returning DENY for any
+        write/edit tool call, ALLOW otherwise.
+    """
+
+    # Match Omnigent built-in OS write/edit, Claude/Codex native Write/Edit/
+    # MultiEdit, and Pi's native lowercase write/edit — the same tool set
+    # worktree_guard gates, so the two write policies stay in lockstep.
+    write_tools = {
+        "sys_os_write",
+        "sys_os_edit",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "write",
+        "edit",
+    }
+
+    def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
+        """
+        Deny any file-mutating tool call.
+
+        :param event: V0 ``tool_call`` event.
+        :param config: Runtime config dict (unused).
+        :returns: DENY for a write/edit tool, ALLOW otherwise.
+        """
+        if _tool_call(event, write_tools) is None:
+            return _ALLOW
+        return _decision("DENY", deny_reason)
+
+    return _evaluate
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
     {
         "handler": "omnigent.inner.nessie.policies.blast_radius",
         "kind": "factory",
-        "name": "Block Dangerous Shell Commands (force-push, rm -rf)",
+        "name": "Block Dangerous Shell Commands force-push, rm -rf",
         "description": "Classifies shell commands (sys_os_shell, Claude/Codex native Bash, "
         "and Pi native bash) as safe, risky (ASK), or catastrophic (DENY) to prevent "
         "destructive operations like force-push or rm -rf /",
@@ -600,5 +657,15 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "description": "Blocks file writes (sys_os_write/edit, Claude/Codex native "
         "Write/Edit, and Pi native write/edit) outside the worker's git worktree to "
         "prevent cross-branch contamination",
+    },
+    {
+        "handler": "omnigent.inner.nessie.policies.read_only_os",
+        "kind": "factory",
+        "name": "Report-Only (Deny File-Write Tools)",
+        "description": "Best-effort report-only guardrail: denies the file-write/edit tools "
+        "(sys_os_write/edit, Claude/Codex native Write/Edit/MultiEdit, and Pi native "
+        "write/edit). Shell stays enabled, so shell-based writes (echo >, sed -i) are NOT "
+        "blocked -- for a hard boundary against untrusted input, sandbox the agent "
+        "(os_env.sandbox.type: linux_bwrap / darwin_seatbelt binds cwd read-only)",
     },
 ]

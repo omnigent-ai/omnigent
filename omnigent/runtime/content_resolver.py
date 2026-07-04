@@ -99,7 +99,7 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 # pages, and ~32 MB per request total. The per-type caps below keep a
 # single attachment usable across a multi-turn conversation; the global
 # ceiling backstops the total request size after base64 inflation (~1.33x).
-# Mirrored client-side in ap-web/src/lib/attachments.ts — keep in sync.
+# Mirrored client-side in web/src/lib/attachments.ts — keep in sync.
 MAX_IMAGE_UPLOAD_BYTES: int = 5 * 1024 * 1024
 MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
 MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
@@ -152,7 +152,7 @@ def attachment_upload_limit(content_type: str) -> int | None:
 # declared MIME mislabels them as binary — e.g. a ``.csv`` tagged
 # ``application/vnd.ms-excel`` on Windows, or a ``.ts`` tagged
 # ``video/mp2t``. Mirrors TEXT_CODE_EXTENSIONS in
-# ap-web/src/lib/attachments.ts — keep in sync.
+# web/src/lib/attachments.ts — keep in sync.
 _TEXT_CODE_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".txt",

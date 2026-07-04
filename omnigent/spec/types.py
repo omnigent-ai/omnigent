@@ -925,6 +925,12 @@ class MCPServerConfig:
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict, repr=False)
+    # Optional per-server tool allow-list: only these tool names are exposed to
+    # the model; others are filtered at registration (server/mcp_pool.py,
+    # runner/mcp_manager.py). ``None`` exposes all. Applies to both transports
+    # and mirrors ``MCPTool.tools`` / the YAML ``tools:`` whitelist documented
+    # in docs/AGENT_YAML_SPEC.md.
+    tools: list[str] | None = None
     description: str | None = None
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.
@@ -1225,21 +1231,14 @@ class LabelDef:
     :param initial: Seed value written at conversation start.
         ``None`` means the label is unset until a policy
         writes it for the first time, e.g. ``"0"``.
-    :param values: Ordered list of allowed values. Position
-        defines ranking when ``monotonic`` is set. ``None``
+    :param values: Ordered list of allowed values. ``None``
         means schemaless — writes are unconstrained, e.g.
         ``["0", "1"]`` or
         ``["public", "internal", "confidential"]``.
-    :param monotonic: Update constraint when ``values`` is
-        declared. ``"increasing"`` means new index must be
-        ``>=`` current; ``"decreasing"`` means ``<=``.
-        ``None`` means free transitions between declared
-        values.
     """
 
     initial: str | None = None
     values: list[str] | None = None
-    monotonic: Literal["increasing", "decreasing"] | None = None
 
 
 @dataclass(frozen=True)
@@ -1320,11 +1319,6 @@ class FunctionPolicySpec(PolicySpec):
 
     :param function: Where the callable lives + optional
         factory kwargs.
-    :param action: Allowed actions the callable may return.
-        Returns outside this list → fail-closed DENY (or
-        substituted ALLOW when the list contains no DENY, per
-        the classifier-only carve-out in §13). ``None`` means
-        accept any action.
     :param set_labels: Whitelist of label keys the callable
         may write. Keys outside dropped silently. ``None``
         means no writes declared (any key the callable emits
@@ -1340,7 +1334,6 @@ class FunctionPolicySpec(PolicySpec):
     """
 
     function: FunctionRef | None = None
-    action: list[PolicyAction] | None = None
     set_labels: list[str] | None = None
     config: dict[str, str] | None = None
 

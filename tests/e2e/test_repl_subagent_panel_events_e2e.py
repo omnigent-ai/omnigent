@@ -174,7 +174,7 @@ def test_parent_stream_and_child_sessions_expose_subagents(
     # The SDK rollup (subtree_busy / tree_busy) an SDK driver consumes: against
     # the same real server, child_sessions_tree must list the spawned child and
     # subtree_busy must settle to False now the run is terminal — the SDK-side
-    # mirror of the data contract asserted above (issue #444).
+    # mirror of the data contract asserted above.
     async def _sdk_rollup() -> tuple[list[dict[str, Any]], bool]:
         async with httpx.AsyncClient(timeout=30.0) as ac:
             ns = SessionsNamespace(ac, live_server)

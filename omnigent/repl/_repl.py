@@ -15,6 +15,7 @@ import os
 import pathlib
 import re
 import sys
+import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, TextIO
@@ -60,7 +61,10 @@ from omnigent_ui_sdk.terminal._formatter import FormattedItem
 from omnigent_ui_sdk.terminal._theme import LIGHT_THEME, get_theme
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion, merge_completers
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import StyleAndTextTuples
+from prompt_toolkit.lexers import Lexer
 from rich.console import RenderableType
+from rich.markup import escape
 from rich.text import Text
 
 from omnigent.spec.types import SkillSpec
@@ -194,7 +198,7 @@ WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel"
 # position 99.
 _LIST_ITEMS_PAGE_SIZE = 100
 
-# Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors ap-web's
+# Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
 # cadence refreshes deeper levels (the SSE stream only carries the active
 # session's direct children) while sub-agents are active.
@@ -1512,7 +1516,7 @@ class _SessionsChatReplAdapter:
         event's workflow already sees ``conv.model_override`` via the
         server-side fallback. After the session exists, persists
         through ``PATCH /v1/sessions/{id}`` (matching
-        :meth:`set_reasoning_effort`) so the ap-web picker and the
+        :meth:`set_reasoning_effort`) so the web picker and the
         REPL stay in sync on the next snapshot read.
 
         :param model: New model identifier, e.g. ``"claude-opus-4-7"``,
@@ -3819,6 +3823,22 @@ async def run_repl(
 
     host.on_help = show_help
 
+    # Output of "!" shell commands, buffered and folded into the next turn's
+    # llm_text so the agent can reason about what the user ran.
+    _pending_bang_blocks: list[str] = []
+    # Lightweight cwd persistence for "!" commands: a standalone "!cd <dir>"
+    # updates this; other "!" commands run in it. One-element list so the
+    # nested closure can rebind the value.
+    _bang_cwd: list[str] = [os.getcwd()]
+
+    # Paint the composer in the omnigent-logo green while the line is a "!"
+    # shell command, so bang mode is visible before Enter is pressed.
+    # ``PromptSession`` reads ``.lexer`` through a ``DynamicLexer``, so setting
+    # it here takes effect live.
+    _prompt_session = getattr(host, "_prompt", None)
+    if _prompt_session is not None:
+        _prompt_session.lexer = _BangInputLexer()
+
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
 
@@ -3862,11 +3882,53 @@ async def run_repl(
             approval_state.resolve_verdict(verdict)
             return
 
+        # A line starting with "!" runs a shell command (Claude Code parity);
+        # its output is buffered and folded into the next agent turn. "!!"
+        # escapes — it sends a literal leading "!" as an ordinary prompt.
+        if text.startswith("!") and not text.startswith("!!"):
+            cmd = text[1:].strip()
+            if not cmd:
+                host.output(
+                    Text.from_markup(
+                        f"   [{fmt.muted}]! <command> runs a shell command · "
+                        f"!! sends a literal ![/{fmt.muted}]",
+                    ),
+                )
+                return
+            # Lightweight cwd persistence: a standalone "!cd <dir>" changes the
+            # directory subsequent "!" commands run in (see _resolve_cd).
+            cd_target = _resolve_cd(cmd, _bang_cwd[0])
+            if cd_target is not None:
+                if os.path.isdir(cd_target):
+                    _bang_cwd[0] = cd_target
+                    host.output(Text.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
+                    host.output(
+                        Text.from_markup(
+                            f"   [{fmt.muted}]now in {escape(cd_target)}[/{fmt.muted}]"
+                        ),
+                    )
+                    _pending_bang_blocks.append(
+                        f"$ {cmd}\n(changed shell directory to: {cd_target})"
+                    )
+                else:
+                    msg = f"cd: not a directory: {escape(cd_target)}"
+                    host.output(Text.from_markup(f"   [{fmt.warning}]{msg}[/{fmt.warning}]"))
+                return
+            _pending_bang_blocks.append(await _run_bang_command(cmd, host, fmt, cwd=_bang_cwd[0]))
+            return
+        if text.startswith("!!"):
+            text = text[1:]  # drop one "!"; fall through as a normal prompt
+
         # Slash commands are short tokens like "/help", "/clear".
         # File paths like "/Users/foo/bar.jpg" start with "/" but
         # contain more path separators — don't treat those as commands.
         first_token = text.split()[0] if text.split() else ""
         if first_token.startswith("/") and "/" not in first_token[1:]:
+            # Starting a new conversation orphans any buffered "!" output — it
+            # belonged to the prior conversation. Drop it so it can't leak into
+            # the fresh conversation's first turn.
+            if first_token in ("/clear", "/new"):
+                _pending_bang_blocks.clear()
             await handle_slash_command(text, session, client, host, fmt)
             return
 
@@ -3899,6 +3961,10 @@ async def run_repl(
         if filenames:
             suffix = " ".join(filenames)
             llm_text = f"{text} {suffix}".strip() if text else suffix
+        # Fold any buffered "!" shell output into this turn so the agent sees it.
+        if _pending_bang_blocks:
+            llm_text = "\n\n".join([*_pending_bang_blocks, llm_text]).strip()
+            _pending_bang_blocks.clear()
 
         if is_streaming:
             # Show the message immediately in dimmed style so the
@@ -4872,8 +4938,7 @@ def _build_model_readout_lines(
         # provider; switching the active provider mid-session is not wired,
         # so it goes through `configure harnesses` + a restart.
         lines.append(
-            "  /model <name> changes the model. To switch provider: "
-            "omnigent setup --no-internal-beta (then restart)."
+            "  /model <name> changes the model. To switch provider: omnigent setup (then restart)."
         )
     return lines
 
@@ -8250,6 +8315,227 @@ class _SlashCommandCompleter(Completer):
                 display=name,
                 display_meta=desc,
             )
+
+
+# ── "!" shell passthrough ──────────────────────────────────────────────
+# A line beginning with "!" runs the rest in the user's shell; its output is
+# shown and folded into the next agent turn so the agent can reason about it.
+# Env-overridable knobs (Claude Code-parity defaults).
+_BANG_TIMEOUT_S: float = float(os.environ.get("OMNIGENT_BANG_TIMEOUT_S") or 120.0)
+_BANG_DISPLAY_MAX: int = int(os.environ.get("OMNIGENT_BANG_DISPLAY_MAX") or 30_000)
+_BANG_CONTEXT_MAX: int = int(os.environ.get("OMNIGENT_BANG_CONTEXT_MAX") or 16_000)
+
+# The omnigent-logo green. Marks a "!" shell command consistently: the composer
+# while it's being typed, and the echoed command line once it runs.
+_BANG_GREEN = "#26a079"
+_BANG_INPUT_STYLE = f"fg:{_BANG_GREEN} bold"  # prompt-toolkit composer style
+# Rich-markup style for the echoed "! <cmd>" line (see _run_bang_command).
+_BANG_ECHO_MARKUP = f"bold {_BANG_GREEN}"
+
+
+class _BangInputLexer(Lexer):
+    """
+    Color the composer green while the current line is a "!" shell command.
+
+    A line that begins with ``!`` (but not the ``!!`` literal-escape) runs in
+    the shell via the passthrough; painting it in the omnigent-logo green is
+    live feedback that bang mode is active. Any other input renders unstyled.
+    """
+
+    def lex_document(self, document: Document) -> Callable[[int], StyleAndTextTuples]:
+        text = document.text
+        is_bang = text.startswith("!") and not text.startswith("!!")
+        style = _BANG_INPUT_STYLE if is_bang else ""
+        lines = document.lines
+
+        def get_line(lineno: int) -> StyleAndTextTuples:
+            return [(style, lines[lineno])]
+
+        return get_line
+
+
+def _bang_shell_argv(cmd: str) -> list[str]:
+    """Argv to run ``cmd`` via the platform shell.
+
+    POSIX: ``$SHELL -c <cmd>`` (falling back to ``/bin/sh``). Windows:
+    ``%COMSPEC% /c <cmd>`` (falling back to ``cmd.exe``). ``-c`` (not a login
+    shell) keeps it predictable and avoids ``!``-history expansion, at the cost
+    of not loading interactive-rc aliases.
+    """
+    if os.name == "nt":
+        return [os.environ.get("COMSPEC") or "cmd.exe", "/c", cmd]
+    return [os.environ.get("SHELL") or "/bin/sh", "-c", cmd]
+
+
+def _resolve_cd(cmd: str, cwd: str) -> str | None:
+    """If ``cmd`` is a standalone ``cd`` (no shell operators), return the
+    resolved absolute target directory, else ``None``.
+
+    ``cd`` with no argument resolves to home. Only a lone ``cd`` is handled —
+    a ``cd`` inside a compound command (``cd x && …``) runs in its own subshell
+    and does not persist (lightweight cwd model; full shell-state persistence
+    would need a long-lived shell).
+    """
+    s = cmd.strip()
+    if s != "cd" and not s.startswith("cd "):
+        return None
+    if any(op in s for op in ("&&", "||", ";", "|", ">", "<", "`", "$(", "\n")):
+        return None
+    arg = s[2:].strip().strip("\"'")
+    if not arg or arg == "~":
+        return os.path.expanduser("~")
+    target = os.path.expanduser(arg)
+    if not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    return os.path.normpath(target)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Clip ``text`` to ``limit`` chars, keeping head + tail with a marker."""
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 4
+    tail = limit - head
+    omitted = len(text) - limit
+    return f"{text[:head]}\n… [{omitted} chars truncated] …\n{text[-tail:]}"
+
+
+def _write_bang_overflow(cmd: str, stdout: str, stderr: str) -> str | None:
+    """
+    When combined output exceeds the model cap, spill the FULL (ANSI-stripped)
+    capture to a temp file and return its path; else ``None``. Lets the agent
+    read everything instead of losing the truncated remainder.
+
+    The overflow is measured on the ANSI-stripped text — the same form the
+    context builder caps — so heavily-styled output doesn't trip the spill when
+    the text the model sees would fit. The file is intentionally left in place
+    for the agent to read on a later turn; the OS temp dir reclaims it.
+    """
+    from rich.text import Text as _RText
+
+    plain_out = _RText.from_ansi(stdout).plain if stdout else ""
+    plain_err = _RText.from_ansi(stderr).plain if stderr else ""
+    if len(plain_out) + len(plain_err) <= _BANG_CONTEXT_MAX:
+        return None
+    fd, path = tempfile.mkstemp(prefix="omnigent-bang-", suffix=".log")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(f"$ {cmd}\n\n")
+        if plain_out:
+            fh.write(plain_out)
+        if plain_err:
+            fh.write("\n--- stderr ---\n")
+            fh.write(plain_err)
+    return path
+
+
+def _build_bang_context(
+    cmd: str,
+    stdout: str,
+    stderr: str,
+    status: str,
+    overflow_path: str | None = None,
+) -> str:
+    """Build the model-facing block for a "!" command: ANSI stripped, capped,
+    with separate stdout/stderr fences. ``status`` is e.g. ``"exit: 0"``. When
+    ``overflow_path`` is given, the full output was spilled there and is noted
+    so the agent can read it in full."""
+    from rich.text import Text as _RText
+
+    parts = [
+        "I ran a shell command in the terminal. Here is the command and its output.",
+        "",
+        f"$ {cmd}",
+        status,
+    ]
+    out = _clip_text(_RText.from_ansi(stdout).plain.rstrip(), _BANG_CONTEXT_MAX)
+    err = _clip_text(_RText.from_ansi(stderr).plain.rstrip(), _BANG_CONTEXT_MAX)
+    if out:
+        parts += ["", "```stdout", out, "```"]
+    if err:
+        parts += ["", "```stderr", err, "```"]
+    if not out and not err:
+        parts += ["", "(no output)"]
+    if overflow_path:
+        parts += ["", f"(output truncated above — full output saved to: {overflow_path})"]
+    return "\n".join(parts)
+
+
+async def _run_bang_command(
+    cmd: str, host: TerminalHost, fmt: RichBlockFormatter, *, cwd: str | None = None
+) -> str:
+    """Run ``cmd`` in the user's shell, render its output, and return a
+    model-facing block to fold into the next turn.
+
+    Best-effort and non-interactive: stdin is ``/dev/null`` (interactive
+    commands fail fast instead of hanging) and the run is bounded by a timeout.
+    Cross-platform (POSIX ``$SHELL -c`` / Windows ``cmd.exe /c``). stdout/stderr
+    are captured separately; ANSI is preserved on screen and stripped for the
+    model; output is capped, with the full capture spilled to a temp file when
+    it overflows.
+    """
+    from rich.text import Text as _RText
+
+    host.output(_RText.from_markup(""))
+    host.output(_RText.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_bang_shell_argv(cmd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            cwd=cwd or os.getcwd(),
+        )
+    except OSError as exc:
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.warning}]! could not run: {escape(str(exc))}[/{fmt.warning}]"
+            ),
+        )
+        return f"$ {cmd}\n(command could not be started: {exc})"
+
+    timed_out = False
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=_BANG_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        out_b, err_b = await proc.communicate()
+
+    elapsed = loop.time() - start
+    stdout = out_b.decode(errors="replace")
+    stderr = err_b.decode(errors="replace")
+    code = proc.returncode
+
+    if stdout:
+        host.output(_RText.from_ansi(_clip_text(stdout, _BANG_DISPLAY_MAX)))
+    if stderr:
+        host.output(_RText.from_markup(f"  [{fmt.muted}][stderr][/{fmt.muted}]"))
+        host.output(_RText.from_ansi(_clip_text(stderr, _BANG_DISPLAY_MAX)))
+
+    overflow_path = _write_bang_overflow(cmd, stdout, stderr)
+    if overflow_path:
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.muted}]full output: {escape(overflow_path)}[/{fmt.muted}]"
+            )
+        )
+
+    if timed_out:
+        secs = int(_BANG_TIMEOUT_S)
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.warning}]⏱ killed after {secs}s (timeout)[/{fmt.warning}]"
+            )
+        )
+        status = f"timed out and was killed after {secs}s"
+    else:
+        style = fmt.muted if code == 0 else fmt.warning
+        host.output(_RText.from_markup(f"   [{style}]exit {code} · {elapsed:.1f}s[/{style}]"))
+        status = f"exit: {code}"
+    return _build_bang_context(cmd, stdout, stderr, status, overflow_path)
 
 
 async def handle_slash_command(

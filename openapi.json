@@ -737,6 +737,17 @@
             "description": "Approximate token count of the summary text, for budget tracking, e.g. `342`.",
             "title": "Token Count",
             "type": "integer"
+          },
+          "window_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Id"
           }
         },
         "required": [
@@ -2237,6 +2248,28 @@
           "response"
         ],
         "title": "QueuedEvent",
+        "type": "object"
+      },
+      "ReadStatePutRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PUT /v1/sessions/{session_id}/read-state`.\n\nSets the *calling user's* read tracking for one session. Mirrors the\ntwo values the web client keeps per session: a \"last seen\" wall-clock\nbaseline (seconds since epoch) and an explicit \"marked unread\"\noverride. The unread dot shows when `updated_at > last_seen` and the\nsession is finished; `unread` separately pins the override so the\nthread the user is *viewing* (or a running one) still surfaces the dot\nwhere the automatic \"seen\" logic would otherwise suppress it.",
+        "properties": {
+          "last_seen": {
+            "description": "Wall-clock baseline in seconds, e.g. `1717000000`. Marking seen sets this to \"now\"; marking unread pins it to `updated_at - 1` so the row reads unseen.",
+            "title": "Last Seen",
+            "type": "integer"
+          },
+          "unread": {
+            "description": "Whether this session is explicitly flagged unread for the caller.",
+            "title": "Unread",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "last_seen",
+          "unread"
+        ],
+        "title": "ReadStatePutRequest",
         "type": "object"
       },
       "ReasoningData": {
@@ -3769,6 +3802,7 @@
             "enum": [
               "idle",
               "running",
+              "waiting",
               "failed"
             ],
             "title": "Status",
@@ -3790,6 +3824,24 @@
             "description": "Unix epoch seconds of last update.",
             "title": "Updated At",
             "type": "integer"
+          },
+          "viewer_last_seen": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The *requesting user's* \"last seen\" wall-clock baseline in seconds for this session, or `None` when they have never seen it. Per-viewer (built from the server's in-memory per-user read-state, written by `PUT /v1/sessions/{id}/read-state`); the unread dot shows when `updated_at > viewer_last_seen` and the session is finished. In-memory only \u2014 resets on a server restart.",
+            "title": "Viewer Last Seen"
+          },
+          "viewer_unread": {
+            "default": false,
+            "description": "Whether the *requesting user* explicitly marked this session unread. Per-viewer; lifts the active-row dot suppression on the client. `False` by default.",
+            "title": "Viewer Unread",
+            "type": "boolean"
           },
           "workspace": {
             "anyOf": [
@@ -4173,6 +4225,18 @@
       "SessionResponse": {
         "description": "API representation of a session.\n\nReturned by `POST /v1/sessions`, `GET /v1/sessions/{id}`,\nand `PATCH /v1/sessions/{id}`.",
         "properties": {
+          "active_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Response id of the turn currently in flight, or `None` when the session is idle. Sourced from the server's `_session_active_response_cache` at snapshot build time so a client connecting mid-turn can reopen a streaming `activeResponse` \u2014 the SSE stream is snapshot + live tail with no replay, so the turn-start `running` edge that carried this id is not re-sent on reconnect. Today only native-terminal forwarders (claude-native) stamp a turn id on their status edges; other harnesses leave this `None`.",
+            "title": "Active Response Id"
+          },
           "agent_id": {
             "description": "Durable identifier of the bound agent, e.g. `\"ag_abc123\"`. Stable across renames of the agent.",
             "title": "Agent Id",
@@ -4195,6 +4259,18 @@
             "description": "Whether the session is archived. Archived sessions are hidden from the default sidebar listing and surface only behind the \"Show archived\" toggle. `False` for normal sessions. Toggled via `PATCH /v1/sessions/{id}`.",
             "title": "Archived",
             "type": "boolean"
+          },
+          "background_task_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Background shells (claude-native) still running as of the last status edge, so a reload re-shows \"N shells still running\" even though the session has settled to `\"idle\"`. `None` (the default / omitted) when no shells are tracked.",
+            "title": "Background Task Count"
           },
           "context_window": {
             "anyOf": [
@@ -4369,7 +4445,7 @@
                 "type": "null"
               }
             ],
-            "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the ap-web UI and the TUI stay in sync.",
+            "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the web UI and the TUI stay in sync.",
             "title": "Model Override"
           },
           "parent_session_id": {
@@ -4482,10 +4558,11 @@
             "type": "array"
           },
           "status": {
-            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), or `\"failed\"` (terminal failure).",
+            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
               "idle",
               "running",
+              "waiting",
               "failed"
             ],
             "title": "Status",
@@ -4692,6 +4769,18 @@
       "SessionStatusEvent": {
         "description": "Session lifecycle status transition.\n\nEmitted by the runtime / session route handler at every\ntransition between `launching` / `running` / `waiting` /\n`idle` / `failed`. Wire shape is\nFLAT (not enveloped): `{\"type\": \"session.status\", \"conversation_id\": \"...\", \"status\": \"...\", \"sequence_number\": null}`.\n\nThe `waiting` value is emitted by the runtime's parent agent\nloop when it parks on the `async_work_complete` drain\n(`_drain_async_completions(block_for_one=True)` in\n`omnigent/runtime/workflow.py`) \u2014 i.e. while the parent\nturn is suspended waiting for background tools or sub-agents\nto complete. Per the session-rearchitecture spec \u00a73\n(\"Event types and direction\"), `waiting` is the\nsession-status companion of the spec's `turn.waiting`\ntransient \u2014 clients should render the session as actively\nblocked-on-async-work, distinct from `running`. When the\ndrain wakes (a child completed), the runtime emits a follow-up\n`running` to resume.",
         "properties": {
+          "background_task_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Background Task Count"
+          },
           "conversation_id": {
             "description": "The conversation/session identifier whose status changed, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",
@@ -4865,7 +4954,7 @@
         "type": "object"
       },
       "SessionTerminalPendingEvent": {
-        "description": "Terminal spin-up status for a terminal-first session.\n\nTwo sources emit this event:\n\n1. The Omnigent server at `POST /v1/sessions` for host-launched\n   terminal-first sessions \u2014 the earliest possible point, before\n   the runner even starts, so the spinner appears immediately on\n   session create rather than after the runner boots.\n2. The Omnigent relay when the runner's `session.terminal_pending` frame\n   arrives \u2014 covers non-host-launched sessions (e.g. server-dispatched\n   sub-agents) and carries the authoritative `pending=False` clear\n   emitted by the runner's `finally` block.\n\nTogether they allow ap-web to show a spinner on the Terminal pill\nwhile the backend boots the terminal instead of a silent greyed-out\nbutton, and to distinguish \"still starting up\" from \"no terminal\"\n(killed or never created).",
+        "description": "Terminal spin-up status for a terminal-first session.\n\nTwo sources emit this event:\n\n1. The Omnigent server at `POST /v1/sessions` for host-launched\n   terminal-first sessions \u2014 the earliest possible point, before\n   the runner even starts, so the spinner appears immediately on\n   session create rather than after the runner boots.\n2. The Omnigent relay when the runner's `session.terminal_pending` frame\n   arrives \u2014 covers non-host-launched sessions (e.g. server-dispatched\n   sub-agents) and carries the authoritative `pending=False` clear\n   emitted by the runner's `finally` block.\n\nTogether they allow web to show a spinner on the Terminal pill\nwhile the backend boots the terminal instead of a silent greyed-out\nbutton, and to distinguish \"still starting up\" from \"no terminal\"\n(killed or never created).",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -4905,7 +4994,7 @@
         "type": "object"
       },
       "SessionTodosEvent": {
-        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets ap-web render a\nlive todo panel in the right column without polling.",
+        "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
@@ -5594,7 +5683,7 @@
           },
           "silent": {
             "default": false,
-            "description": "When `True`, persist metadata changes but skip the runner-side side effects \u2014 specifically the native `/effort` / `/model` / Codex collaboration-mode forwards into the live runtime. Used by automatic bind-time handoffs (ap-web's sticky-pref apply on session switch, the REPL's pre-create `/model` snapshot) where injecting a visible slash command into a freshly-spawned pane would render as an unexpected \"Command model X\" item before the user has sent anything. Default `False` preserves the user-driven picker / `/model` behaviour where the live forward IS the desired feedback.",
+            "description": "When `True`, persist metadata changes but skip the runner-side side effects \u2014 specifically the native `/effort` / `/model` / Codex collaboration-mode forwards into the live runtime. Used by automatic bind-time handoffs (web's sticky-pref apply on session switch, the REPL's pre-create `/model` snapshot) where injecting a visible slash command into a freshly-spawned pane would render as an unexpected \"Command model X\" item before the user has sent anything. Default `False` preserves the user-driven picker / `/model` behaviour where the live forward IS the desired feedback.",
             "title": "Silent",
             "type": "boolean"
           },
@@ -5724,6 +5813,19 @@
             "default": null,
             "description": "Context-fill estimate for the next turn \u2014 set only by executors that make multiple LLM sub-calls per turn (e.g. `openai-agents`). For single-call executors this is absent and `total_tokens` serves the same purpose. The toolbar context ring and `/context` command use this field when present, falling back to `total_tokens`.",
             "title": "Context Tokens"
+          },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Authoritative per-turn cost in USD reported directly by the harness/provider (e.g. GitHub Copilot's AI-credit total). When present, the server-side cost path uses it in preference to the catalog token-price estimate; `None` when the harness doesn't report a cost (the common case, where cost is computed from token counts x catalog pricing).",
+            "title": "Cost Usd"
           },
           "input_tokens": {
             "default": 0,
@@ -6026,6 +6128,35 @@
         "summary": "List Builtin Agents",
         "tags": [
           "agents"
+        ]
+      }
+    },
+    "/v1/harnesses": {
+      "get": {
+        "operationId": "list_harnesses_v1_harnesses_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Harnesses V1 Harnesses Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Harnesses",
+        "tags": [
+          "harnesses"
         ]
       }
     },
@@ -6451,7 +6582,7 @@
     },
     "/v1/me": {
       "get": {
-        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\"}`, `{\"user_id\": null}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
+        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nAlso returns `is_admin` \u2014 the mode-agnostic admin signal\n(the shared `users.is_admin` column, set by the admin-list\npromotion at login). The SPA gates admin chrome on it in\nEVERY mode, including OIDC/SSO where the accounts-only\n`/auth/me` endpoint does not exist.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\", \"is_admin\": true}`, `{\"user_id\": null, \"is_admin\": false}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
         "operationId": "me_v1_me_get",
         "responses": {
           "200": {
@@ -6783,6 +6914,61 @@
           }
         },
         "summary": "Runner Status",
+        "tags": [
+          "runners"
+        ]
+      }
+    },
+    "/v1/runners/{runner_id}/token": {
+      "post": {
+        "description": "Mint a short-lived owner bearer for a managed-sandbox runner.\n\nA managed sandbox runner has no user credential of its own; it\npresents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and managed sandboxes always run\ntoken-bound (no allow-list).\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
+        "operationId": "mint_runner_owner_token_v1_runners__runner_id__token_post",
+        "parameters": [
+          {
+            "description": "Token-bound runner id from the path.",
+            "in": "path",
+            "name": "runner_id",
+            "required": true,
+            "schema": {
+              "title": "Runner Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "title": "Response Mint Runner Owner Token V1 Runners  Runner Id  Token Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Runner Owner Token",
         "tags": [
           "runners"
         ]
@@ -8783,6 +8969,53 @@
         "summary": "Update Policy",
         "tags": [
           "session_policies"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/read-state": {
+      "put": {
+        "description": "Set the calling user's read-state for one session.\n\nRequires `LEVEL_READ` on the session in multi-user mode \u2014 you can\nonly track read-state for sessions you can see. Stores the values\nverbatim (the client enforces the baseline's monotonicity and the\nunread semantics); the server does not interpret them against\nsession status. Returns `204` \u2014 the client already has the\noptimistic state and re-reads the authoritative value on the next\n`GET /v1/sessions` poll.\n\n**Parameters**\n\n- `body` \u2014 The validated `ReadStatePutRequest`.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks read access.",
+        "operationId": "put_read_state_v1_sessions__session_id__read_state_put",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReadStatePutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Read State",
+        "tags": [
+          "sessions"
         ]
       }
     },

@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any
 
 import pytest
@@ -468,4 +468,163 @@ async def test_relay_publishes_failed_status_on_tunnel_close() -> None:
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(handle.task, timeout=1.0)
         sessions_module._runner_relay_tasks.clear()
+        session_stream.close(session_id)
+
+
+class _RecordingLabelStore:
+    """Minimal conversation store that records ``set_labels`` calls.
+
+    The disconnect path persists the failure cause as durable labels so
+    snapshots and child summaries can tell a benign runner disconnect
+    from a real task failure (Option B). ``set_labels`` is exercised by
+    the tunnel-close path; ``get_conversation`` is read by
+    ``_publish_runner_recovered_status`` to gate the clear on the
+    persisted disconnect code, so both are implemented here.
+    """
+
+    def __init__(self) -> None:
+        self.labels: dict[str, dict[str, str]] = {}
+
+    def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
+        self.labels.setdefault(conversation_id, {}).update(updates)
+
+    def get_conversation(self, conversation_id: str) -> Any:
+        """Return a conversation-shaped object exposing ``.labels``.
+
+        Only ``.labels`` is read by the recovery guard, so a lightweight
+        namespace over the recorded labels is enough.
+        """
+        return SimpleNamespace(labels=dict(self.labels.get(conversation_id, {})))
+
+
+@pytest.mark.asyncio
+async def test_relay_persists_disconnect_error_labels_on_tunnel_close() -> None:
+    """
+    A tunnel close persists the ``runner_disconnected`` cause as labels.
+
+    Option B: a runner that merely disconnected must be distinguishable
+    from a genuine task failure. The relay-fed status cache only carries a
+    generic ``failed``, so the disconnect cause is preserved as durable
+    ``last_task_error`` labels — these survive into snapshots and child
+    summaries, letting the UI render a "Disconnected" pill (not red
+    "Failed"). The code must be ``runner_disconnected`` so the UI can
+    branch on it before the generic failed path.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore()
+    session_id = "conv_tunnel_close_labels"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_tunnel_close_labels",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+
+        # The relay task should finish quickly after the ConnectionError.
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        persisted = store.labels.get(session_id)
+        assert persisted is not None, "disconnect did not persist failure labels"
+        assert persisted[sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY] == "runner_disconnected"
+        # The message is non-empty so the projection surfaces a typed
+        # ``last_task_error`` (both code and message are required there).
+        assert persisted[sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY]
+
+        # The persisted labels project back to a code-preserving
+        # ``last_task_error`` — proving the disconnect cause is NOT
+        # collapsed into an indistinguishable generic failure.
+        projected = sessions_module._last_task_error_from_labels(persisted)
+        assert projected == {
+            "code": "runner_disconnected",
+            "message": "Runner disconnected unexpectedly.",
+        }
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_runner_recovery_clears_persisted_disconnect_error_labels() -> None:
+    """
+    Runner recovery drops the persisted ``runner_disconnected`` labels.
+
+    A disconnect persists durable ``last_task_error`` labels so an
+    ongoing disconnect still projects a "Disconnected" pill after reload.
+    But recovery goes through ``_publish_runner_recovered_status`` — it
+    flips the cached ``failed`` back to ``idle`` without a ``running``
+    edge, so nothing else clears those labels. Without clearing them here,
+    a healthy reconnected-to-idle session keeps reporting
+    ``runner_disconnected`` and the Subagents panel keeps the grey dot.
+    This asserts recovery clears the labels so the projection returns
+    ``None`` again.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore()
+    session_id = "conv_runner_recovery_labels"
+
+    try:
+        # Disconnect first: the relay persists the runner_disconnected
+        # labels and marks the status cache "failed".
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_recovery_labels",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        persisted = store.labels.get(session_id)
+        assert persisted is not None
+        assert sessions_module._last_task_error_from_labels(persisted) == {
+            "code": "runner_disconnected",
+            "message": "Runner disconnected unexpectedly.",
+        }
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+
+        # Recovery: a successful runner rebind / session-init flips the
+        # cached failed back to idle and must drop the durable labels.
+        await sessions_module._publish_runner_recovered_status(
+            session_id,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert sessions_module._session_status_cache.get(session_id) == "idle"
+        cleared = store.labels.get(session_id)
+        assert cleared is not None
+        # Both label values are emptied, so the projection collapses back
+        # to None — no more runner_disconnected, so no "Disconnected" pill.
+        assert cleared[sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY] == ""
+        assert cleared[sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY] == ""
+        assert sessions_module._last_task_error_from_labels(cleared) is None
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)

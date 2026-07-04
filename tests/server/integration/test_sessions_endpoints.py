@@ -2853,6 +2853,42 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
     assert cache_after == "idle"
 
 
+async def test_publish_status_tracks_in_flight_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_publish_status`` records the in-flight response id and clears it on end.
+
+    A ``running``/``waiting`` edge carrying a ``response_id`` opens the
+    ``_session_active_response_cache`` entry (projected onto the snapshot as
+    ``active_response_id`` so a mid-turn reconnect reopens the streaming
+    ``activeResponse``); any ``idle``/``failed`` edge clears it. A bare
+    ``running`` (no id, e.g. the PTY badge edge) must NOT clobber a tracked id.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, _event: None,
+    )
+    sid = "conv_active_resp"
+    sessions_module._session_status_cache.pop(sid, None)
+    sessions_module._session_active_response_cache.pop(sid, None)
+    try:
+        # Turn start: running with the turn id opens the tracked entry.
+        sessions_module._publish_status(sid, "running", response_id="resp_turn_1")
+        assert sessions_module._session_active_response_cache.get(sid) == "resp_turn_1"
+        # Bare PTY running (no id) must not erase the tracked turn id.
+        sessions_module._publish_status(sid, "running")
+        assert sessions_module._session_active_response_cache.get(sid) == "resp_turn_1"
+        # Turn end: idle clears it.
+        sessions_module._publish_status(sid, "idle", response_id="resp_turn_1")
+        assert sessions_module._session_active_response_cache.get(sid) is None
+    finally:
+        sessions_module._session_status_cache.pop(sid, None)
+        sessions_module._session_active_response_cache.pop(sid, None)
+
+
 async def test_patch_runner_rebind_clears_stale_failed_status(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -3666,7 +3702,7 @@ async def test_post_external_session_usage_publishes_session_usage(
     persists the value on the conversation labels.
 
     The claude-native forwarder posts this whenever Claude's transcript
-    grows a fresh ``message.usage`` block so the ap-web context ring
+    grows a fresh ``message.usage`` block so the web context ring
     updates without waiting for a ``response.completed`` event (Claude
     Code runs in a separate process and never produces one). Both the
     live SSE path and the snapshot-restore path read from this event:
@@ -4217,6 +4253,81 @@ async def test_accumulate_session_usage_prices_from_usage_model(
     assert usage.get("total_cost_usd") == pytest.approx(0.002)
 
 
+async def test_accumulate_session_usage_prefers_provider_cost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness-reported ``cost_usd`` is used verbatim, overriding the catalog estimate.
+
+    Copilot reports the authoritative AI-credit cost it billed; the relay must
+    prefer that over recomputing from token counts x catalog pricing (which can
+    diverge, e.g. when the catalog lacks a cache-write rate).
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    # The catalog WOULD price this turn at 2.0 USD; the provider cost must win.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "model": "harness-model",
+                "cost_usd": 0.01827875,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Catalog would charge 1000*1e-3 + 500*2e-3 = 2.0; the provider cost wins.
+    assert usage.get("total_cost_usd") == pytest.approx(0.01827875)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(0.01827875)
+
+
+async def test_accumulate_session_usage_provider_cost_prices_uncatalogued_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness ``cost_usd`` makes a turn priced even when the catalog can't price it.
+
+    Without a catalog entry the token-price path leaves the turn unpriced; an
+    authoritative provider cost should still record ``total_cost_usd``.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,  # catalog can't price anything
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "model": "grok-4.3",
+                "cost_usd": 0.0042,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage.get("total_cost_usd") == pytest.approx(0.0042)
+    assert usage["by_model"]["grok-4.3"]["total_cost_usd"] == pytest.approx(0.0042)
+
+
 async def test_accumulate_session_usage_unpriced_without_usage_model(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -4330,6 +4441,68 @@ async def test_accumulate_session_usage_unpriced_model_has_tokens_no_cost(
     assert usage["by_model"]["free-model"]["input_tokens"] == 1000
     assert usage["by_model"]["free-model"]["output_tokens"] == 500
     assert "total_cost_usd" not in usage["by_model"]["free-model"]
+
+
+async def test_accumulate_session_usage_concurrent_calls_accumulate_both_deltas(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent _accumulate_session_usage calls each persist their full delta.
+
+    Regression guard for the read-modify-write lost-update bug (#9): the old
+    implementation read session_usage in one transaction and wrote back in
+    another, so two concurrent completions could each read the same stale total,
+    compute their own delta, and overwrite the other's result — silently dropping
+    a delta. The fix (increment_session_usage — single atomic transaction with
+    SELECT FOR UPDATE on PostgreSQL/MySQL) serialises concurrent writers so both
+    deltas are always preserved.
+
+    The calls are dispatched from two threads simultaneously via
+    concurrent.futures.ThreadPoolExecutor so the race window genuinely exists:
+    the old non-atomic implementation would fail this test non-deterministically
+    (or always, if the two reads are forced to coincide).
+    """
+    import concurrent.futures
+
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-6, output_per_token=2e-6),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    def _call(input_tokens: int, output_tokens: int) -> None:
+        # Each thread gets its own store instance (its own DB connection) so
+        # the concurrency is real — not short-circuited by a shared connection.
+        store = SqlAlchemyConversationStore(db_uri)
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "model": "m1",
+                }
+            },
+            session["id"],
+            store,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_call, 1000, 500)
+        f2 = pool.submit(_call, 200, 100)
+        f1.result()
+        f2.result()
+
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["input_tokens"] == 1200  # 1000 + 200
+    assert usage["output_tokens"] == 600  # 500 + 100
+    # cost = (1000+200)*1e-6 + (500+100)*2e-6 = 0.0012 + 0.0012 = 0.0024
+    assert usage.get("total_cost_usd") == pytest.approx(0.0024)
+    assert usage["by_model"]["m1"]["input_tokens"] == 1200
+    assert usage["by_model"]["m1"]["total_cost_usd"] == pytest.approx(0.0024)
 
 
 async def test_external_session_usage_records_per_model_breakdown(
@@ -5443,7 +5616,7 @@ async def test_post_external_session_usage_rejects_negative_context_tokens(
     """
     Negative or non-int ``context_tokens`` is rejected with a 400.
 
-    Defends ap-web's ring math (``pct = tokensUsed / contextWindow``)
+    Defends web's ring math (``pct = tokensUsed / contextWindow``)
     from inheriting a bogus negative numerator that would clamp the
     arc to zero and silently mislead users about their context budget.
     """
@@ -5466,7 +5639,7 @@ async def test_post_external_session_todos_publishes_session_todos(
     ``external_session_todos`` publishes a ``session.todos`` SSE event.
 
     The claude-native forwarder posts this on every PostToolUse / TodoWrite
-    hook so the ap-web todo panel updates in real time. A regression here
+    hook so the web todo panel updates in real time. A regression here
     would break the panel for ``omnigent claude`` sessions: the UI would
     never receive a ``session.todos`` broadcast and the panel would stay
     blank even when Claude has active tasks.

@@ -845,7 +845,7 @@ async def _run_layer2(
         if _is_summary_auth_error(exc):
             # Distinct, actionable signal: an auth/config problem (not a
             # transient blip) is silently degrading compaction to lossy
-            # truncation. Don't bury a 401 as a routine fallback (issue #1121).
+            # truncation. Don't bury a 401 as a routine fallback.
             _logger.error(
                 "Compaction Layer 2 summarisation is UNAUTHORIZED for task %s "
                 "(%s) — the summarizer's credentials are missing or invalid, so "

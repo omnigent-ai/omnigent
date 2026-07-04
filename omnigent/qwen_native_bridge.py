@@ -31,9 +31,13 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import socket
 import subprocess
+import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +58,25 @@ _EVENTS_FILE = "qwen_out.ndjson"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
+
+#: Token config the shared Omnigent MCP relay (``serve-mcp``) reads from the
+#: bridge dir. Mirrors cursor-/claude-native (``cursor_native_bridge.py``).
+_BRIDGE_CONFIG_FILE = "bridge.json"
+#: Name qwen lists the Omnigent MCP server under (shows in ``/mcp``).
+_MCP_SERVER_NAME = "omnigent"
+#: Per-session MCP config passed to qwen via ``--mcp-config <path>``. Lives in
+#: the bridge dir (NOT the workspace), so we never drop a file in the user's repo
+#: and concurrent same-workspace sessions can't collide. CLI-provided MCP servers
+#: are also ungated (no "Untrusted MCP server" prompt), unlike a project
+#: ``.mcp.json`` / ``.qwen/settings.json``. The claude-native ``--mcp-config``
+#: model (it writes no workspace file either).
+_MCP_CONFIG_FILE = "mcp_config.json"
+#: qwen version string stamped on synthesized recording records + sidecars. Must
+#: be a version qwen's resume loader accepts; verified loadable on qwen v0.18.2.
+_QWEN_SYNTH_VERSION = "0.18.2"
+#: ``contextWindowSize`` stamped on synthesized assistant records. Informational
+#: only — the live resume uses the resolved model's real window.
+_QWEN_SYNTH_CONTEXT_WINDOW = 131072
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -140,6 +163,235 @@ def qwen_session_recording_exists(session_id: str, workspace: Path | str) -> boo
         return False
 
 
+def _qwen_iso_now() -> str:
+    """Return the current UTC time as a qwen-style ISO-8601 millisecond stamp."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _qwen_synth_uuid(qwen_session_id: str, index: int) -> str:
+    """Return a deterministic record uuid for a synthesized qwen recording.
+
+    UUIDv5 over the session id + position so re-running the fork rebuild
+    produces a byte-identical recording (idempotent rebuilds, stable tests)
+    instead of fresh random ids each launch.
+    """
+    return str(uuid.uuid5(_QWEN_SESSION_NAMESPACE, f"{qwen_session_id}:{index}"))
+
+
+def _qwen_text_from_api_content(content: object, api_type: str) -> str:
+    """Concatenate the text of an Omnigent content array's blocks of *api_type*.
+
+    :param content: Omnigent content array, e.g. ``[{"type":"input_text","text":"hi"}]``.
+    :param api_type: Block type to include, ``"input_text"`` or ``"output_text"``.
+    :returns: The joined text, or ``""`` when there is none.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == api_type:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
+
+
+def qwen_session_records_from_session_items(
+    items: list[dict[str, Any]],
+    *,
+    qwen_session_id: str,
+    cwd: Path | str,
+    model: str = "",
+    timestamp: str | None = None,
+) -> list[dict[str, Any]]:
+    """Convert Omnigent session items into qwen chat-recording JSONL records.
+
+    qwen's recording is a linked list chained by ``uuid`` / ``parentUuid``. We
+    emit only the ``user`` / ``assistant`` message records qwen reconstructs
+    history from; the ``system`` snapshot records it writes live are telemetry
+    and not required for ``--resume`` (verified on v0.18.2). Tool calls are
+    dropped — text turns carry the context a cross-harness fork needs.
+
+    Omnigent items map as:
+
+    - user ``message`` → ``{"type":"user","message":{"role":"user","parts":[{"text"}]}}``
+    - assistant ``message`` → ``{"type":"assistant","message":{"role":"model",...}}``
+
+    Cancelled turns aren't restored: an interrupted assistant turn and its
+    response group are skipped (claude/codex/pi share a ``response_id`` across
+    the turn), and a trailing unanswered user prompt is dropped (covers a
+    qwen-native source, whose per-event ``response_id`` doesn't group a turn).
+
+    :param items: Flat Omnigent item dicts in chronological order.
+    :param qwen_session_id: qwen session id stamped on every record.
+    :param cwd: Working directory stamped on records (realpath'd to match the
+        project slug qwen records under).
+    :param model: Default model id for assistant records; overridden per-item by
+        the item's own ``model`` when present.
+    :param timestamp: ISO stamp for all records; defaults to now. Pass a fixed
+        value for deterministic output in tests.
+    :returns: qwen recording record dicts in order (empty if nothing carryable).
+    """
+    ts = timestamp or _qwen_iso_now()
+    cwd_str = os.path.realpath(str(cwd))
+    skip_response_ids = {
+        item.get("response_id")
+        for item in items
+        if item.get("type") == "message"
+        and item.get("role") == "assistant"
+        and item.get("interrupted") is True
+        and isinstance(item.get("response_id"), str)
+        and item.get("response_id")
+    }
+    records: list[dict[str, Any]] = []
+    parent_uuid: str | None = None
+    for index, item in enumerate(items):
+        if item.get("type") != "message":
+            continue
+        response_id = item.get("response_id")
+        if isinstance(response_id, str) and response_id in skip_response_ids:
+            continue
+        role = item.get("role")
+        if role == "user":
+            text = _qwen_text_from_api_content(item.get("content"), "input_text")
+            if not text:
+                continue
+            rec_uuid = _qwen_synth_uuid(qwen_session_id, index)
+            records.append(
+                {
+                    "uuid": rec_uuid,
+                    "parentUuid": parent_uuid,
+                    "sessionId": qwen_session_id,
+                    "timestamp": ts,
+                    "type": "user",
+                    "cwd": cwd_str,
+                    "version": _QWEN_SYNTH_VERSION,
+                    "message": {"role": "user", "parts": [{"text": text}]},
+                }
+            )
+            parent_uuid = rec_uuid
+        elif role == "assistant":
+            text = _qwen_text_from_api_content(item.get("content"), "output_text")
+            if not text:
+                continue
+            item_model = item.get("model")
+            eff_model = item_model if isinstance(item_model, str) and item_model else model
+            rec_uuid = _qwen_synth_uuid(qwen_session_id, index)
+            records.append(
+                {
+                    "uuid": rec_uuid,
+                    "parentUuid": parent_uuid,
+                    "sessionId": qwen_session_id,
+                    "timestamp": ts,
+                    "type": "assistant",
+                    "cwd": cwd_str,
+                    "version": _QWEN_SYNTH_VERSION,
+                    "model": eff_model,
+                    "message": {"role": "model", "parts": [{"text": text}]},
+                    "usageMetadata": {
+                        "promptTokenCount": 0,
+                        "candidatesTokenCount": 0,
+                        "totalTokenCount": 0,
+                    },
+                    "contextWindowSize": _QWEN_SYNTH_CONTEXT_WINDOW,
+                }
+            )
+            parent_uuid = rec_uuid
+    # Drop a trailing unanswered user prompt (a turn cancelled before any reply).
+    # The response-group skip can't catch it for a qwen-native source, whose
+    # per-event ``response_id`` (``qwen:<uuid>``) doesn't group a turn; a
+    # committed transcript otherwise ends on a completed assistant turn.
+    while records and records[-1]["type"] == "user":
+        records.pop()
+    return records
+
+
+def write_qwen_session_recording(
+    qwen_session_id: str,
+    workspace: Path | str,
+    records: list[dict[str, Any]],
+    *,
+    timestamp: str | None = None,
+) -> Path:
+    """Write a synthesized qwen chat recording (+ discovery sidecars) to disk.
+
+    qwen resolves ``--resume <id>`` from THREE files under its per-project dir,
+    not the ``.jsonl`` alone (verified on v0.18.2 — a bare recording lands the
+    user on the blocking "No saved session found" screen):
+
+    - ``chats/<id>.jsonl`` — the conversation records (*records*).
+    - ``chats/<id>.runtime.json`` — the session index entry ``sessions list`` /
+      ``--resume`` read to discover the session.
+    - ``meta.json`` — the project-level marker (created if absent; an existing
+      one is left untouched so we don't reset another session's ``createdAt``).
+
+    All three are written atomically, and the ``.jsonl`` is committed LAST (after
+    both sidecars): :func:`qwen_session_recording_exists` keys on the ``.jsonl``,
+    so a failed sidecar write leaves no ``.jsonl`` and the launch degrades to a
+    clean fresh start, never the blocking "No saved session found" screen.
+
+    :param qwen_session_id: qwen session id (file stem + ``session_id`` field).
+    :param workspace: cwd qwen will resume in; its realpath drives the project slug.
+    :param records: qwen recording records (see
+        :func:`qwen_session_records_from_session_items`).
+    :param timestamp: ISO stamp for the project ``meta.json``; defaults to now.
+    :returns: The written ``chats/<id>.jsonl`` recording path.
+    :raises RuntimeError: If the recording cannot be written.
+    """
+    recording = qwen_session_recording_path(qwen_session_id, workspace)
+    chats_dir = recording.parent
+    chats_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    try:
+        hostname = socket.gethostname() or "omnigent"
+    except OSError:
+        hostname = "omnigent"
+
+    # Sidecars first so the gate file (``.jsonl``) lands last: a sidecar failure
+    # then leaves no ``.jsonl`` and the resume gate cleanly picks a fresh launch.
+    meta_path = chats_dir.parent / "meta.json"
+    if not meta_path.exists():
+        stamp = timestamp or _qwen_iso_now()
+        _atomic_write_text(
+            meta_path, json.dumps({"version": 1, "createdAt": stamp, "updatedAt": stamp})
+        )
+    _atomic_write_text(
+        chats_dir / f"{qwen_session_id}.runtime.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pid": os.getpid(),
+                "session_id": qwen_session_id,
+                "work_dir": os.path.realpath(str(workspace)),
+                "hostname": hostname,
+                "started_at": time.time(),
+                "qwen_version": _QWEN_SYNTH_VERSION,
+            }
+        ),
+    )
+    _atomic_write_text(
+        recording, "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
+    )
+    return recording
+
+
+def _atomic_write_text(target: Path, text: str) -> None:
+    """Atomically write *text* to *target* (temp file + ``os.replace``).
+
+    :param target: Destination path.
+    :param text: Full file contents to write.
+    :raises RuntimeError: If the file cannot be written; the temp is cleaned up.
+    """
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise RuntimeError(f"Failed to write {target}: {exc}") from exc
+
+
 def input_file_path(bridge_dir: Path) -> Path:
     """Return the ``--input-file`` path qwen watches for JSONL commands."""
     return bridge_dir / _INPUT_FILE
@@ -155,6 +407,28 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(path, 0o700)
+
+
+def _ensure_secure_bridge_dir(bridge_dir: Path) -> None:
+    """Create/validate *bridge_dir* as an owner-only chain before writing secrets.
+
+    ``_ensure_dir`` only ``mkdir(parents=True, exist_ok=True)`` + a suppressed
+    ``chmod`` on the leaf: it trusts pre-existing ancestors, so on a shared host
+    an attacker could pre-create ``$TMPDIR/omnigent-<uid>`` (or a deeper ancestor)
+    as a symlink / world-writable dir and redirect the bridge tree. That tree now
+    holds ``bridge.json`` — a bearer token for the relay's localhost control
+    endpoint — so its directory must be hardened. Delegate to the same
+    ``_ensure_secure_dir`` the shared relay (``start_tool_relay``) already applies
+    to token-bearing trees; it rejects symlinked / non-owned / group-or-other
+    accessible ancestors (the qwen-native root is in its allowlist). Lazy import
+    avoids a cycle (``claude_native_bridge`` resolves qwen's ``bridge_root`` lazily
+    in turn).
+
+    :raises RuntimeError: If any ancestor fails owner-only validation.
+    """
+    from omnigent.claude_native_bridge import _ensure_secure_dir
+
+    _ensure_secure_dir(bridge_dir)
 
 
 def prepare_bridge_files(bridge_dir: Path) -> None:
@@ -183,6 +457,115 @@ def build_qwen_native_spawn_env(session_id: str) -> dict[str, str]:
     bridge_dir = bridge_dir_for_session_id(session_id)
     _ensure_dir(bridge_dir)
     return {BRIDGE_DIR_ENV_VAR: str(bridge_dir)}
+
+
+# ---------------------------------------------------------------------------
+# Omnigent MCP server config — expose Omnigent's builtin tools (sys_*,
+# load_skill, web_fetch, …) to the qwen TUI so it can call them and ``/mcp``
+# lists them. Reuses the shared stdio relay implemented in
+# ``omnigent.claude_native_bridge serve-mcp`` (same server cursor-/claude-/
+# opencode-native point at); only the *registration* surface differs per CLI.
+# ---------------------------------------------------------------------------
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config the shared Omnigent MCP relay reads at startup.
+
+    The ``serve-mcp`` relay (spawned by qwen) reads ``bridge.json`` for a bearer
+    token and exits if it's missing, so this must exist *before* qwen launches.
+    ``bridge.json`` only ever holds ``{token}``; the live tool surface is
+    advertised separately via the ``tool_relay.json`` that the runner's comment
+    relay (``ensure_comment_relay`` → ``_ensure_comment_relay_started``) writes
+    into this same bridge dir when it starts. Mirrors
+    :func:`omnigent.cursor_native_bridge.write_mcp_bridge_config`.
+
+    :raises RuntimeError: If the bridge dir fails owner-only validation
+        (:func:`_ensure_secure_bridge_dir`) — the token is not written.
+    """
+    _ensure_secure_bridge_dir(bridge_dir)
+    config_path = bridge_dir / _BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
+
+
+def build_mcp_server_entry(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, Any]:
+    """Build qwen's ``mcpServers.omnigent`` entry for the Omnigent relay.
+
+    ``trust: true`` auto-approves the qwen-side MCP tool gate so the TUI doesn't
+    add a second in-terminal prompt: Omnigent already gates these calls through
+    its own policy/elicitation engine (surfaced as web cards by the approval
+    mirror), so qwen's prompt would only be a hidden duplicate. Same rationale
+    as cursor's ``autoApprove`` (see ``cursor_native_bridge.build_mcp_config``).
+    """
+    python = python_executable or sys.executable
+    return {
+        "command": python,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.claude_native_bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        "env": {
+            "PYTHONUNBUFFERED": "1",
+            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        },
+        "trust": True,
+    }
+
+
+def mcp_config_path(bridge_dir: Path) -> Path:
+    """Return the per-session ``--mcp-config`` file path inside the bridge dir."""
+    return bridge_dir / _MCP_CONFIG_FILE
+
+
+def write_mcp_config(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> Path:
+    """Write the per-session Omnigent MCP config for qwen's ``--mcp-config`` flag.
+
+    Writes ``{"mcpServers": {"omnigent": ...}}`` to a file *inside the bridge dir*
+    (never the workspace) and the relay token (:func:`write_mcp_bridge_config`).
+    The runner passes the returned path to qwen via ``--mcp-config <path>``. Unlike
+    a project ``.mcp.json`` / ``.qwen/settings.json``, a CLI-provided MCP server:
+
+    - drops no file in the user's (often git) workspace — nothing to accidentally
+      commit, nothing left behind pointing at a dead bridge dir;
+    - is per-session by construction (the file and its ``--bridge-dir`` live in
+      this session's bridge dir), so concurrent same-workspace sessions can't
+      collide on a shared file;
+    - is **not** gated behind qwen's "Untrusted MCP server" prompt (CLI servers
+      carry no project/workspace scope), so no pre-approval step is needed.
+
+    The claude-native ``--mcp-config`` model (it writes no workspace file either).
+
+    :returns: Path to the written ``--mcp-config`` file.
+    """
+    write_mcp_bridge_config(bridge_dir)
+    path = mcp_config_path(bridge_dir)
+    payload = {
+        "mcpServers": {
+            _MCP_SERVER_NAME: build_mcp_server_entry(
+                bridge_dir, python_executable=python_executable
+            )
+        }
+    }
+    tmp = path.with_name(f"{_MCP_CONFIG_FILE}.{secrets.token_hex(8)}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 def _append_command(bridge_dir: Path, command: dict[str, Any]) -> None:

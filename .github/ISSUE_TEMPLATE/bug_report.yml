@@ -15,13 +15,17 @@ body:
     id: repro-steps
     attributes:
       label: Steps to reproduce
-      description: Minimal steps to reproduce the issue.
+      description: >
+        Minimal steps to reproduce the issue. If you can't reproduce it
+        reliably (e.g. an intermittent crash or race), describe what you
+        observed and when — write "N/A — cannot reproduce reliably" and give
+        as much detail as you can.
       placeholder: |
         1. ...
         2. ...
         3. ...
     validations:
-      required: false
+      required: true
 
   - type: input
     id: version

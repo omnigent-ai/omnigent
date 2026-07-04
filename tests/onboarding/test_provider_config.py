@@ -17,6 +17,7 @@ from omnigent.onboarding.provider_config import (
     load_providers,
     provider_families,
     provider_family_for_harness,
+    resolve_secret,
     set_default_provider,
     surface_default_model,
     surface_default_provider,
@@ -38,6 +39,11 @@ from omnigent.onboarding.provider_config import (
         ("native-codex", OPENAI_FAMILY),
         ("codex", OPENAI_FAMILY),
         ("openai-agents", OPENAI_FAMILY),
+        # Qwen Code is OpenAI-compatible; the native TUI harness keys both
+        # spellings so a same-agent qwen→qwen fork/switch reads same-family.
+        ("qwen", OPENAI_FAMILY),
+        ("qwen-native", OPENAI_FAMILY),
+        ("native-qwen", OPENAI_FAMILY),
         # An unknown harness has no family (caller falls back / shows nothing).
         ("some-unknown-harness", None),
     ],
@@ -88,6 +94,17 @@ def test_provider_family_for_harness_accepts_executor_type_spellings(
     same-family (anthropic) and carries history.
     """
     assert provider_family_for_harness(harness) == expected
+
+
+def test_resolve_secret_env_ref_accepts_omnigent_prefixed_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``env:ANTHROPIC_API_KEY`` falls back to ``OMNIGENT_ANTHROPIC_API_KEY``."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
+
+    assert resolve_secret("env:ANTHROPIC_API_KEY") == "sk-ant-prefixed"
+    assert resolve_secret("$ANTHROPIC_API_KEY") == "sk-ant-prefixed"
 
 
 def test_default_provider_for_pi_skips_subscription_defaults() -> None:

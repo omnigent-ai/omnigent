@@ -504,6 +504,12 @@ class SqlConversationItem(Base):
     )
 
 
+# Width of the ``conversation_labels.value`` column. Exported so the store
+# (and the session-status error-label path) can clamp values to fit instead
+# of letting an over-length write raise ``DataError`` on PostgreSQL.
+LABEL_VALUE_MAX_LEN = 256
+
+
 class SqlConversationLabel(Base):
     """
     SQLAlchemy model for the ``conversation_labels`` table.
@@ -542,7 +548,7 @@ class SqlConversationLabel(Base):
         primary_key=True,
     )
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    value: Mapped[str] = mapped_column(String(256))
+    value: Mapped[str] = mapped_column(String(LABEL_VALUE_MAX_LEN))
     updated_at: Mapped[int] = mapped_column(Integer)
 
 

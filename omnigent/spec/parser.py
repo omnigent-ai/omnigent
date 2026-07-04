@@ -41,7 +41,6 @@ from omnigent.spec.types import (
     ModalityConfig,
     Phase,
     PhaseSelector,
-    PolicyAction,
     PolicySpec,
     ProviderAuth,
     RetryPolicy,
@@ -181,6 +180,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             model=executor.model or llm.model,
             extra=llm.extra,
             connection=executor.connection,
+            profile=llm.profile,
             request_timeout=llm.request_timeout,
             retry=llm.retry,
         )
@@ -2229,6 +2229,17 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
+        # Optional per-server tool allow-list (the YAML ``tools:`` whitelist) —
+        # only these tool names are exposed to the model; ``None`` exposes all.
+        # Mirrors ``MCPTool.tools`` and is filtered downstream in
+        # server/mcp_pool.py + runner/mcp_manager.py.
+        raw_allow = val.get("tools")
+        if raw_allow is not None and not isinstance(raw_allow, list):
+            raise OmnigentError(
+                f"Inline MCP server {name!r} 'tools' must be a list of tool names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        tool_allowlist = [str(t) for t in raw_allow] if raw_allow else None
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2243,6 +2254,7 @@ def _parse_inline_mcp_servers(
                 headers=headers,
                 env=env,
                 databricks_profile=databricks_profile,
+                tools=tool_allowlist,
             )
         )
     return servers
@@ -2577,7 +2589,7 @@ def _parse_guardrails(
     :param raw: The ``guardrails:`` mapping from config.yaml,
         or ``None`` when the block was absent. Example:
         ``{"labels": {"integrity": {"initial": "1",
-        "values": ["0", "1"], "monotonic": "decreasing"}},
+        "values": ["0", "1"]}},
         "policies": {"block_canada_input": {"type": "prompt",
         ...}}, "ask_timeout": 30}``.
     :param expand_env: Whether to expand ``${VAR}`` references
@@ -2613,8 +2625,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
     rejects ``<= 0`` at spec load per POLICIES.md §13. The
     ambiguity between "instant DENY" and "wait forever"
     drove the strict > 0 rule — both intents have explicit
-    paths (omit ASK from action list; use a large finite
-    number).
+    paths (use a large finite number for long waits).
 
     :param raw: Raw ``guardrails.ask_timeout:`` value.
     :returns: Validated timeout in seconds.
@@ -2650,16 +2661,15 @@ def _parse_label_defs(
     - Bare string: ``integrity: "1"`` → schemaless with
       ``initial="1"``.
     - Dict (schema'd with initial):
-      ``{initial: "1", values: [...], monotonic: ...}``.
+      ``{initial: "1", values: [...]}``.
     - Dict (schema'd without initial):
-      ``{values: [...], monotonic: ...}``.
+      ``{values: [...]}``.
 
     :param raw: The ``labels:`` mapping, or ``None``.
     :returns: Dict mapping each label key to its
         :class:`LabelDef`. ``None`` when *raw* is ``None``.
     :raises OmnigentError: On malformed entries — empty
-        dict, ``initial`` not in ``values``, unknown
-        ``monotonic`` direction, etc.
+        dict, ``initial`` not in ``values``, etc.
     """
     if raw is None:
         return None
@@ -2682,7 +2692,7 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         ``"integrity"``.
     :param entry: Either a string (shorthand: value becomes
         ``initial``) or a dict with one or more of
-        ``initial``, ``values``, ``monotonic``.
+        ``initial``, ``values``.
     :returns: A populated :class:`LabelDef`.
     :raises OmnigentError: On any malformed value.
     """
@@ -2703,14 +2713,13 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         # Empty-dict typo guard — matches POLICIES.md §13.
         raise OmnigentError(
             f"label {key!r} declares an empty dict — must contain at "
-            f"least one of `initial`, `values`, or `monotonic`",
+            f"least one of `initial` or `values`",
             code=ErrorCode.INVALID_INPUT,
         )
     initial = _coerce_label_initial(entry.get("initial"))
     values = _coerce_label_values(key, entry.get("values"))
-    monotonic = _coerce_label_monotonic(key, entry.get("monotonic"))
-    _validate_label_def_cross_fields(key, initial, values, monotonic)
-    return LabelDef(initial=initial, values=values, monotonic=monotonic)
+    _validate_label_def_cross_fields(key, initial, values)
+    return LabelDef(initial=initial, values=values)
 
 
 def _coerce_label_initial(raw: Any) -> str | None:
@@ -2739,59 +2748,24 @@ def _coerce_label_values(key: str, raw: Any) -> list[str] | None:
     return [str(v) for v in raw]
 
 
-def _coerce_label_monotonic(
-    key: str,
-    raw: Any,
-) -> Literal["increasing", "decreasing"] | None:
-    """
-    Validate a ``monotonic:`` direction.
-
-    :param key: Label key, for error messages.
-    :param raw: Raw ``monotonic:`` value from YAML — must
-        be ``"increasing"``, ``"decreasing"``, or absent.
-    :returns: The validated direction, or ``None`` when
-        *raw* is ``None``.
-    :raises OmnigentError: On any other value.
-    """
-    if raw is None:
-        return None
-    if raw == "increasing":
-        return "increasing"
-    if raw == "decreasing":
-        return "decreasing"
-    raise OmnigentError(
-        f"label {key!r}: `monotonic` must be 'increasing' or 'decreasing', got {raw!r}",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
 def _validate_label_def_cross_fields(
     key: str,
     initial: str | None,
     values: list[str] | None,
-    monotonic: Literal["increasing", "decreasing"] | None,
 ) -> None:
     """
     Enforce cross-field constraints on a :class:`LabelDef`.
 
     Per POLICIES.md §13:
 
-    - ``monotonic`` requires ``values`` (no positions to
-      order without them).
     - When both ``initial`` and ``values`` are declared,
       ``initial`` must be in ``values``.
 
     :param key: Label key, for error messages.
     :param initial: Pre-coerced initial value.
     :param values: Pre-coerced values list.
-    :param monotonic: Pre-validated direction.
     :raises OmnigentError: On any cross-field violation.
     """
-    if monotonic is not None and values is None:
-        raise OmnigentError(
-            f"label {key!r}: `monotonic` requires a `values` list to order against",
-            code=ErrorCode.INVALID_INPUT,
-        )
     if initial is not None and values is not None and initial not in values:
         raise OmnigentError(
             f"label {key!r}: `initial` value {initial!r} is not in declared `values` {values!r}",
@@ -2955,7 +2929,6 @@ def _parse_function_policy(
             f"policy {name!r}: `function` policies require a `function:` or `handler:` field",
             code=ErrorCode.INVALID_INPUT,
         )
-    action = _parse_action_list(data["action"], policy_name=name) if "action" in data else None
     set_labels = (
         _parse_writable_labels(data["set_labels"], policy_name=name)
         if "set_labels" in data
@@ -2970,7 +2943,6 @@ def _parse_function_policy(
     return FunctionPolicySpec(
         **base_kwargs,
         function=_parse_function_ref(function_raw, policy_name=name),
-        action=action,
         set_labels=set_labels,
         config=config,
     )
@@ -3143,53 +3115,6 @@ def _parse_condition(
     return coerced
 
 
-def _parse_action_list(
-    raw: Any,
-    *,
-    policy_name: str,
-) -> list[PolicyAction]:
-    """
-    Parse a policy's ``action:`` whitelist into a list of
-    :class:`PolicyAction` enums.
-
-    Accepts a bare string (single-element list sugar) or a
-    list of strings. Validates each entry against the enum.
-
-    :param raw: The ``action:`` value from YAML.
-    :param policy_name: Enclosing policy name for error
-        messages.
-    :returns: List of :class:`PolicyAction` values.
-    :raises OmnigentError: On empty list or unknown
-        action value.
-    """
-    if isinstance(raw, str):
-        strings = [raw]
-    elif isinstance(raw, list):
-        strings = [str(s) for s in raw]
-    else:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` must be a string or "
-            f"list of strings, got {type(raw).__name__}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not strings:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` list must be non-empty",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    actions: list[PolicyAction] = []
-    for s in strings:
-        try:
-            actions.append(PolicyAction(s))
-        except ValueError as exc:
-            raise OmnigentError(
-                f"policy {policy_name!r}: invalid action {s!r} "
-                f"(must be one of 'allow', 'ask', 'deny')",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
-    return actions
-
-
 def _parse_writable_labels(
     raw: Any,
     *,
@@ -3303,7 +3228,7 @@ def _parse_policy_ask_timeout(
     if value <= 0:
         raise OmnigentError(
             f"policy {policy_name!r}: `ask_timeout` must be > 0 "
-            f"(omit ASK from the policy's action list for instant-DENY)",
+            "(use large finite values for long waits)",
             code=ErrorCode.INVALID_INPUT,
         )
     return value

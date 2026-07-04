@@ -90,6 +90,7 @@ from omnigent.antigravity_native_bridge import (
     AntigravityNativeBridgeState,
     bridge_dir_for_bridge_id,
     clear_bridge_state,
+    ensure_agy_feedback_survey_disabled,
     ensure_agy_onboarding_complete,
     is_placeholder_conversation_id,
     prepare_bridge_dir,
@@ -973,6 +974,14 @@ async def _launch_and_record(
         permission_mode=permission_mode,
         headless=headless,
         extra_args=antigravity_args,
+    )
+    # agy's feedback survey shares its "esc to cancel" footer with the running-turn
+    # marker, so a web turn injected into this CLI-launched session while the survey
+    # is up would be silently lost (#1494). Disable it in the launch HOME before agy
+    # starts. This path emits no HOME override, so agy runs under the real ~/.gemini.
+    await asyncio.to_thread(
+        ensure_agy_feedback_survey_disabled,
+        Path(env_overrides.get("HOME") or Path.home()),
     )
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(

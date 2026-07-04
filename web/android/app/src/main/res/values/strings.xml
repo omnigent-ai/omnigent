@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Omnigent</string>
+    <string name="notification_channel_name">Sessions</string>
+    <string name="signed_in_title">Signed in to Omnigent</string>
+    <string name="signed_in_body">Tap to return to the app.</string>
+    <plurals name="badge_text">
+        <item quantity="one">%1$d pending</item>
+        <item quantity="other">%1$d pending</item>
+    </plurals>
+    <string name="connect_logo_desc">Omnigent</string>
+    <string name="connect_subtitle">Enter the URL of the Omnigent server. The Android app loads its web UI directly.</string>
+    <string name="connect_label">Server URL</string>
+    <string name="connect_hint">https://omnigent.example.com</string>
+    <string name="connect_action">Connect</string>
+    <string name="connect_recents">Recent servers</string>
+    <string name="connect_invalid">Enter a valid http(s) server URL</string>
+</resources>
