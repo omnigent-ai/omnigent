@@ -330,6 +330,7 @@ async def test_policy_registry_handler_matches_create_allowlist(
     reg_resp = await auth_client.get("/v1/policy-registry", headers=headers)
     assert reg_resp.status_code == 200, reg_resp.text
     entries = reg_resp.json()["data"]
+
     # Pick a factory entry whose required params all have defaults so the
     # policy can be created without explicit factory_params.
     def _no_required_params(entry: dict) -> bool:
