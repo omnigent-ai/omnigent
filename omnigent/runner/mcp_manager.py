@@ -331,7 +331,11 @@ class RunnerMcpManager:
         return _elicit
 
     async def prewarm(self, spec: AgentSpec) -> None:
-        """Register *spec*'s MCPs without spawning transports. Idempotent."""
+        """Register *spec*'s MCPs without spawning transports.
+
+        This keeps runner startup cheap when a spec lists many MCPs; the
+        first schema lookup or tool call still pays the server cold-start.
+        """
         configs = list(spec.mcp_servers or [])
         if not configs:
             return

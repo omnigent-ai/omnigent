@@ -270,9 +270,7 @@ async def test_shared_server_reused_across_different_specs(
     spec_search = _make_spec(cfg_search)
     spec_create = _make_spec(cfg_create)
 
-    assert compute_spec_hash(spec_search.mcp_servers) != compute_spec_hash(
-        spec_create.mcp_servers
-    )
+    assert compute_spec_hash(spec_search.mcp_servers) != compute_spec_hash(spec_create.mcp_servers)
     assert compute_server_hash(cfg_search) == compute_server_hash(cfg_create)
 
     manager = RunnerMcpManager()
