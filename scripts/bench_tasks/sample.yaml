@@ -1,0 +1,6 @@
+name: sample-marker
+workspace: ./sample_workspace
+prompt: "Create marker.txt in the current workspace."
+success:
+  type: command
+  command: "python -c \"from pathlib import Path; raise SystemExit(0 if Path('marker.txt').exists() else 1)\""
