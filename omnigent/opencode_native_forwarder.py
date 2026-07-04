@@ -419,11 +419,12 @@ class OpenCodeNativeForwarder:
             },
         )
 
-    async def _begin_turn_if_needed(self) -> None:
+    async def _begin_turn_if_needed(self, *, message_id: str | None = None) -> None:
         """Post a single ``running`` status at the start of a turn."""
         if not self.state.turn_active:
             self.state.turn_active = True
-            await self._post_status(_STATUS_RUNNING)
+            extra = {"response_id": self._response_id(message_id)} if message_id else None
+            await self._post_status(_STATUS_RUNNING, extra=extra)
 
     async def _end_turn(
         self, *, status: str = _STATUS_IDLE, extra: Mapping[str, Any] | None = None
@@ -457,7 +458,7 @@ class OpenCodeNativeForwarder:
         if role == "assistant":
             if self._bridge_dir is not None:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
-            await self._begin_turn_if_needed()
+            await self._begin_turn_if_needed(message_id=message_id)
             self._record_assistant_usage(message_id, info)
             await self._post_session_usage()
 
@@ -485,7 +486,7 @@ class OpenCodeNativeForwarder:
         elif part_type == "file":
             await self._handle_file_part(part)
         elif part_type == "step-start":
-            await self._begin_turn_if_needed()
+            await self._begin_turn_if_needed(message_id=part.get("messageID"))
         elif part_type == "step-finish":
             # A step's assistant text is complete once the step closes; flush
             # it so text and tool items land in the chat in step order.
