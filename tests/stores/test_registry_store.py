@@ -89,8 +89,9 @@ def test_publish_duplicate_raises(store: SqlAlchemyRegistryStore) -> None:
 def test_get_returns_exact_version(store: SqlAlchemyRegistryStore) -> None:
     """``get`` retrieves the exact ``name@version`` entry."""
     _publish(store, name="agent-a", version="1.0.0", publication_id="pa_a1")
-    _publish(store, name="agent-a", version="2.0.0", publication_id="pa_a2",
-             created_at=1_700_000_001)
+    _publish(
+        store, name="agent-a", version="2.0.0", publication_id="pa_a2", created_at=1_700_000_001
+    )
     result = store.get("agent-a", "1.0.0")
     assert result is not None
     assert result.version == "1.0.0"
@@ -107,10 +108,12 @@ def test_get_returns_none_for_missing(store: SqlAlchemyRegistryStore) -> None:
 
 def test_get_latest_returns_most_recent(store: SqlAlchemyRegistryStore) -> None:
     """``get_latest`` returns the entry with the highest ``created_at``."""
-    _publish(store, name="multi", version="1.0.0", publication_id="pa_m1",
-             created_at=1_700_000_000)
-    _publish(store, name="multi", version="2.0.0", publication_id="pa_m2",
-             created_at=1_700_000_100)
+    _publish(
+        store, name="multi", version="1.0.0", publication_id="pa_m1", created_at=1_700_000_000
+    )
+    _publish(
+        store, name="multi", version="2.0.0", publication_id="pa_m2", created_at=1_700_000_100
+    )
     latest = store.get_latest("multi")
     assert latest is not None
     assert latest.version == "2.0.0"
@@ -136,8 +139,9 @@ def test_browse_returns_all_entries(store: SqlAlchemyRegistryStore) -> None:
 def test_browse_filter_by_category(store: SqlAlchemyRegistryStore) -> None:
     """``browse`` with ``category=`` returns only matching entries."""
     _publish(store, name="coding-agent", publication_id="pa_c1", category="coding")
-    _publish(store, name="ops-agent", publication_id="pa_c2", category="ops",
-             created_at=1_700_000_001)
+    _publish(
+        store, name="ops-agent", publication_id="pa_c2", category="ops", created_at=1_700_000_001
+    )
     page = store.browse(category="coding")
     assert len(page.data) == 1
     assert page.data[0].name == "coding-agent"
@@ -146,8 +150,13 @@ def test_browse_filter_by_category(store: SqlAlchemyRegistryStore) -> None:
 def test_browse_filter_by_harness(store: SqlAlchemyRegistryStore) -> None:
     """``browse`` with ``harness=`` returns only matching entries."""
     _publish(store, name="claude-agent", publication_id="pa_h1", harness="claude-sdk")
-    _publish(store, name="codex-agent", publication_id="pa_h2", harness="codex",
-             created_at=1_700_000_001)
+    _publish(
+        store,
+        name="codex-agent",
+        publication_id="pa_h2",
+        harness="codex",
+        created_at=1_700_000_001,
+    )
     page = store.browse(harness="codex")
     assert len(page.data) == 1
     assert page.data[0].harness == "codex"
@@ -156,8 +165,7 @@ def test_browse_filter_by_harness(store: SqlAlchemyRegistryStore) -> None:
 def test_browse_filter_by_tag(store: SqlAlchemyRegistryStore) -> None:
     """``browse`` with ``tag=`` returns only agents whose tags include the value."""
     _publish(store, name="rag-agent", publication_id="pa_t1", tags=["rag", "search"])
-    _publish(store, name="plain-agent", publication_id="pa_t2", tags=[],
-             created_at=1_700_000_001)
+    _publish(store, name="plain-agent", publication_id="pa_t2", tags=[], created_at=1_700_000_001)
     page = store.browse(tag="rag")
     assert len(page.data) == 1
     assert page.data[0].name == "rag-agent"
@@ -165,10 +173,19 @@ def test_browse_filter_by_tag(store: SqlAlchemyRegistryStore) -> None:
 
 def test_browse_keyword_search(store: SqlAlchemyRegistryStore) -> None:
     """``browse`` with ``q=`` matches on name and description."""
-    _publish(store, name="typescript-helper", publication_id="pa_q1",
-             description="Helps with TypeScript projects.")
-    _publish(store, name="python-expert", publication_id="pa_q2",
-             description="Expert in Python.", created_at=1_700_000_001)
+    _publish(
+        store,
+        name="typescript-helper",
+        publication_id="pa_q1",
+        description="Helps with TypeScript projects.",
+    )
+    _publish(
+        store,
+        name="python-expert",
+        publication_id="pa_q2",
+        description="Expert in Python.",
+        created_at=1_700_000_001,
+    )
     page = store.browse(q="typescript")
     assert len(page.data) == 1
     assert page.data[0].name == "typescript-helper"
@@ -177,8 +194,7 @@ def test_browse_keyword_search(store: SqlAlchemyRegistryStore) -> None:
 def test_browse_pagination_limit(store: SqlAlchemyRegistryStore) -> None:
     """``browse`` with ``limit=1`` returns one entry and sets ``has_more``."""
     for i in range(3):
-        _publish(store, name=f"agent-{i}", publication_id=f"pa_p{i}",
-                 created_at=1_700_000_000 + i)
+        _publish(store, name=f"agent-{i}", publication_id=f"pa_p{i}", created_at=1_700_000_000 + i)
     page = store.browse(limit=1)
     assert len(page.data) == 1
     assert page.has_more is True
@@ -187,8 +203,9 @@ def test_browse_pagination_limit(store: SqlAlchemyRegistryStore) -> None:
 def test_browse_cursor_pagination(store: SqlAlchemyRegistryStore) -> None:
     """``browse`` cursor returns the next page correctly."""
     for i in range(3):
-        _publish(store, name=f"paged-{i}", publication_id=f"pa_pp{i}",
-                 created_at=1_700_000_000 + i)
+        _publish(
+            store, name=f"paged-{i}", publication_id=f"pa_pp{i}", created_at=1_700_000_000 + i
+        )
     page1 = store.browse(limit=2)
     assert len(page1.data) == 2
     assert page1.has_more is True
