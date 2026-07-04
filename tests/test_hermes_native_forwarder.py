@@ -525,8 +525,11 @@ async def test_forward_loop_rebases_idle_count_on_compaction_repin(tmp_path, mon
 
     idle_posts: list[str] = []
 
-    async def _fake_idle(_client, *, session_id, status):
-        idle_posts.append(status)
+    async def _fake_idle(_client, *, session_id, status, response_id=None):
+        # This test isolates the idle/parent-wake dedup; the running edge (live
+        # card) is covered by the _annotate_turn_actions tests below.
+        if status == "idle":
+            idle_posts.append(status)
 
     monkeypatch.setattr(f, "_post_external_session_status", _fake_idle)
 
@@ -856,8 +859,11 @@ async def _run_hermes_loop(
     async def _noop_item(_client, *, session_id, item):
         pass
 
-    async def _record_status(_client, *, session_id, status):
-        statuses.append(status)
+    async def _record_status(_client, *, session_id, status, response_id=None):
+        # Idle-only: these loop tests assert the parent-wake idle dedup; the
+        # running edge has dedicated coverage in the _annotate_turn_actions tests.
+        if status == "idle":
+            statuses.append(status)
 
     monkeypatch.setattr(f, "_post_conversation_item", _noop_item)
     monkeypatch.setattr(f, "_post_external_session_status", _record_status)
@@ -936,8 +942,9 @@ async def test_forward_loop_idle_dedupes_and_posts_per_new_turn(tmp_path, monkey
     async def _noop_item(_client, *, session_id, item):
         pass
 
-    async def _record_status(_client, *, session_id, status):
-        statuses.append(status)
+    async def _record_status(_client, *, session_id, status, response_id=None):
+        if status == "idle":
+            statuses.append(status)
 
     monkeypatch.setattr(f, "_post_conversation_item", _noop_item)
     monkeypatch.setattr(f, "_post_external_session_status", _record_status)
@@ -978,3 +985,184 @@ async def test_forward_loop_idle_dedupes_and_posts_per_new_turn(tmp_path, monkey
     # one-per-poll across the six iterations.
     assert statuses == ["idle", "idle"]
     assert hstatus.read_posted_count(bridge_dir) == 2
+
+
+# ---------------------------------------------------------------------------
+# Live tool-call cards: per-turn response_id + running edge (issue #1874).
+# ---------------------------------------------------------------------------
+
+
+def _mi(msg_id: int, item_type: str, *, role: str | None = None) -> f._MirrorItem:
+    """Build a mirror item like ``_read_new_items`` produces (per-row id)."""
+    data: dict[str, object] = {}
+    if role is not None:
+        data["role"] = role
+    return f._MirrorItem(
+        msg_id=msg_id, item_type=item_type, item_data=data, response_id=f"hermes:{msg_id}"
+    )
+
+
+def test_annotate_shares_one_turn_id_and_emits_running_once() -> None:
+    # user -> assistant+tool_call -> tool -> assistant(final): one turn.
+    items = [
+        _mi(1, "message", role="user"),
+        _mi(2, "function_call"),
+        _mi(3, "function_call_output"),
+        _mi(4, "message", role="assistant"),
+    ]
+    actions, active = f._annotate_turn_actions(items, None)
+    running = [a.response_id for a in actions if a.kind == "running"]
+    assert running == ["hermes_turn_1"]  # exactly one running edge, at the open
+    stamped = {a.item.response_id for a in actions if a.kind == "item" and a.item.item_type}
+    assert stamped == {"hermes_turn_1"}  # every item shares the turn id
+    assert active is None  # terminal assistant row closes the turn
+    assert actions[-1].turn_id_after is None
+
+
+def test_annotate_new_id_per_turn_across_polls() -> None:
+    # Turn 1 completes in poll 1; turn 2 opens in poll 2 → a distinct id, and the
+    # running edge fires once per turn (state carried via the returned active id).
+    a1, active = f._annotate_turn_actions(
+        [_mi(1, "message", role="user"), _mi(2, "message", role="assistant")], None
+    )
+    assert [a.response_id for a in a1 if a.kind == "running"] == ["hermes_turn_1"]
+    assert active is None
+    a2, active = f._annotate_turn_actions(
+        [_mi(3, "message", role="user"), _mi(4, "message", role="assistant")], active
+    )
+    assert [a.response_id for a in a2 if a.kind == "running"] == ["hermes_turn_3"]
+    assert active is None
+
+
+def test_annotate_no_duplicate_running_mid_turn() -> None:
+    # A turn split across polls: the opener is in poll 1, the rest in poll 2 with
+    # the id carried in — no second running edge.
+    a1, active = f._annotate_turn_actions(
+        [_mi(1, "message", role="user"), _mi(2, "function_call")], None
+    )
+    assert [a.response_id for a in a1 if a.kind == "running"] == ["hermes_turn_1"]
+    assert active == "hermes_turn_1"
+    a2, active = f._annotate_turn_actions(
+        [_mi(3, "function_call_output"), _mi(4, "message", role="assistant")], active
+    )
+    assert [a.kind for a in a2 if a.kind == "running"] == []  # no re-open
+    assert {a.item.response_id for a in a2 if a.kind == "item" and a.item.item_type} == {
+        "hermes_turn_1"
+    }
+    assert active is None
+
+
+def test_annotate_abort_then_new_user_reopens() -> None:
+    # Turn opens but never reaches a terminal row (abort); a new user row still
+    # starts a fresh turn (id overwritten), proving no stuck state blocks it.
+    a1, active = f._annotate_turn_actions(
+        [_mi(1, "message", role="user"), _mi(2, "function_call")], None
+    )
+    assert [a.response_id for a in a1 if a.kind == "running"] == ["hermes_turn_1"]
+    assert active == "hermes_turn_1"  # still in flight, no terminal seen
+    a2, active = f._annotate_turn_actions([_mi(5, "message", role="user")], active)
+    assert [a.response_id for a in a2 if a.kind == "running"] == ["hermes_turn_5"]
+    assert active == "hermes_turn_5"
+
+
+def test_annotate_recovers_missed_opener() -> None:
+    # Forwarder starts mid-turn (no user opener in the batch); assistant activity
+    # with no active turn mints an id and emits running so its cards still go live.
+    items = [_mi(7, "function_call"), _mi(8, "function_call_output")]
+    actions, active = f._annotate_turn_actions(items, None)
+    assert [a.response_id for a in actions if a.kind == "running"] == ["hermes_turn_7"]
+    assert active == "hermes_turn_7"
+
+
+async def test_post_external_session_status_carries_response_id(tmp_path) -> None:
+    client = _FakeClient()
+    await f._post_external_session_status(
+        client, session_id="conv_r", status="running", response_id="hermes_turn_9"
+    )
+    _url, body = client.posts[0]
+    assert body["type"] == "external_session_status"
+    assert body["data"] == {"status": "running", "response_id": "hermes_turn_9"}
+    # idle omits response_id (server pops the active id on any idle).
+    await f._post_external_session_status(client, session_id="conv_r", status="idle")
+    _url, body = client.posts[1]
+    assert body["data"] == {"status": "idle"}
+
+
+def test_forward_state_active_turn_id_roundtrip(tmp_path: Path) -> None:
+    state = f._ForwardState(
+        hermes_session_id="s1", last_id=4, launch_epoch_s=1.0, active_turn_id="hermes_turn_4"
+    )
+    assert f._write_state(tmp_path, state) is True
+    assert f._read_state(tmp_path).active_turn_id == "hermes_turn_4"
+
+
+async def test_forward_loop_emits_running_then_idle_for_tool_call_turn(
+    tmp_path, monkeypatch
+) -> None:
+    """End-to-end over the poll loop: a tool-call turn yields a running edge (with
+    the turn id) followed by idle, and the mirrored items carry that same id."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    tc = json.dumps([{"id": "c1", "call_id": "c1", "function": {"name": "f", "arguments": "{}"}}])
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [
+            ("s1", "user", "do it", None, None, None, 1),
+            ("s1", "assistant", "", None, tc, None, 1),
+            ("s1", "tool", "result", "c1", None, "f", 1),
+            ("s1", "assistant", "done", None, None, None, 1),
+        ],
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    statuses: list[tuple[str, str | None]] = []
+    posted_items: list[f._MirrorItem] = []
+
+    async def _record_item(_client, *, session_id, item):
+        posted_items.append(item)
+
+    async def _record_status(_client, *, session_id, status, response_id=None):
+        statuses.append((status, response_id))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _record_item)
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_tc",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # running (with the turn id) before idle; the function_call item carries the
+    # same id so the web renders the card live against the running edge.
+    assert ("running", "hermes_turn_1") in statuses
+    assert statuses[0] == ("running", "hermes_turn_1")
+    assert ("idle", None) in statuses
+    fc = [it for it in posted_items if it.item_type == "function_call"]
+    assert fc and all(it.response_id == "hermes_turn_1" for it in fc)
