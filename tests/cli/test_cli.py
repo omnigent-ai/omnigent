@@ -49,6 +49,7 @@ from omnigent.cli import (
     _resolve_bundle_env_vars,
     _resolve_default_agent_target,
     _resolve_first_run_plan,
+    _sanitize_no_proxy_env,
     _save_global_config,
     _start_cli_runner_process,
     _warn_missing_harness_dependencies,
@@ -3226,6 +3227,53 @@ def test_is_run_shorthand(argv: list[str], expected: bool) -> None:
     :param expected: Whether the arguments should be redirected to ``run``.
     """
     assert _is_run_shorthand(argv) is expected
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_no_proxy_env
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_no_proxy_env_strips_bracketed_ipv6_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Docker Sandboxes (``sbx``) sets ``no_proxy`` with both the bare and
+    bracketed forms of the IPv6 loopback (``::1,[::1]``). httpx's own
+    ``is_ipv6_hostname`` rejects the bracketed form, so it falls through to
+    a wildcard-domain mount pattern (``all://*[::1]``) that then fails
+    httpx's own URL parsing with ``Invalid port: ':1]'`` — crashing any
+    ``httpx.Client()`` construction in that process. Stripping brackets
+    (and deduping) fixes this without disabling proxy support outright.
+    """
+    monkeypatch.setenv("no_proxy", "localhost,127.0.0.1,::1,[::1],gateway.docker.internal")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    _sanitize_no_proxy_env()
+
+    assert os.environ["no_proxy"] == "localhost,127.0.0.1,::1,gateway.docker.internal"
+
+
+def test_sanitize_no_proxy_env_normalizes_both_casings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both ``NO_PROXY`` and ``no_proxy`` are sanitized independently."""
+    monkeypatch.setenv("NO_PROXY", "[::1]")
+    monkeypatch.setenv("no_proxy", "[::1]")
+
+    _sanitize_no_proxy_env()
+
+    assert os.environ["NO_PROXY"] == "::1"
+    assert os.environ["no_proxy"] == "::1"
+
+
+def test_sanitize_no_proxy_env_noop_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No crash and no env var created when neither casing is set."""
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    _sanitize_no_proxy_env()
+
+    assert "NO_PROXY" not in os.environ
+    assert "no_proxy" not in os.environ
 
 
 # ---------------------------------------------------------------------------
