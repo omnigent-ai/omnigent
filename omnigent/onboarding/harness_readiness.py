@@ -34,6 +34,7 @@ from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
+    DROID_KEY,
     GOOSE_KEY,
     HERMES_KEY,
     KIMI_KEY,
@@ -215,6 +216,13 @@ def harness_is_configured(harness: str) -> bool:
         # Research). Auth/provider config surfaces at run time via Hermes' own
         # ``hermes model`` flow; gate only on binary presence.
         return harness_cli_installed(HERMES_KEY)
+    if canonical == DROID_KEY:
+        # Droid — the headless ACP harness (``droid``, drives ``droid exec
+        # --output-format acp``) — wraps Factory AI's ``droid`` CLI (installed
+        # via a curl script from Factory). Auth is Droid's own configuration (a
+        # ``FACTORY_API_KEY`` env var or ``droid`` login) which the daemon can't
+        # inspect, so gate only on binary presence — like Goose/Hermes.
+        return harness_cli_installed(DROID_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -319,6 +327,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(KIMI_SURFACE)
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
+    spellings.add(DROID_KEY)  # headless Droid (``droid exec``) wraps the ``droid`` CLI
     spellings.add(COPILOT_KEY)
     return {
         spelling: _harness_availability(_canonical_harness(spelling)) for spelling in spellings

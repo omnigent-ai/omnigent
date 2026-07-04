@@ -220,6 +220,14 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    ``droid`` (headless ACP) is excluded for the same reason as ``goose`` /
+    ``hermes``: it wraps Factory AI's ``droid`` CLI and authenticates from
+    Droid's own configuration (a ``FACTORY_API_KEY`` env var / ``droid`` login),
+    not the shared ``HARNESS_<HARNESS>_GATEWAY`` / profile probe wiring this
+    matrix drives — so it emits none of the gateway/profile vars this matrix
+    needs. Its coverage is the dedicated ``tests/inner/test_droid_executor.py``
+    ACP unit suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -240,5 +248,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        "droid",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

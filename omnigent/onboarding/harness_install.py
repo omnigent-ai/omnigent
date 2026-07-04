@@ -89,6 +89,13 @@ COPILOT_KEY = "copilot"
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
 
+# Factory AI's Droid CLI ships via a curl installer (no npm) and authenticates
+# through its own configuration — a ``FACTORY_API_KEY`` env var or the ``droid``
+# login flow — with no Omnigent-managed credential. Like Goose/Hermes it is
+# binary-gated: the headless ``droid`` ACP harness cannot launch without the
+# ``droid`` binary on PATH.
+DROID_KEY = "droid"
+
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
 # fallback. Binaries/packages mirror ucode's ``TOOL_SPECS`` so the two tools
@@ -196,6 +203,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
     ),
+    DROID_KEY: HarnessInstallSpec(
+        "Droid",
+        "droid",
+        package=None,
+        install_hint="curl -fsSL https://app.factory.ai/cli | sh",
+    ),
 }
 
 
@@ -260,6 +273,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Headless Droid (``harness: droid``, drives ``droid exec --output-format
+    # acp``) wraps Factory AI's ``droid`` CLI. It has no native TUI spelling —
+    # this ACP surface is the only one — so a single entry gates it.
+    DROID_KEY: DROID_KEY,
 }
 
 

@@ -188,6 +188,8 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # Droid — headless ACP harness (``droid exec``); gates on the droid CLI.
+        "droid",
     }
     assert set(result) == expected_keys
 
@@ -237,6 +239,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "native-goose",
         "qwen",
         "hermes",
+        "droid",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
     for codex in ("codex", "codex-native", "native-codex"):
