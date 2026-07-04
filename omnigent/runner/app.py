@@ -17586,32 +17586,59 @@ def create_runner_app(
     @app.get("/v1/sessions/{session_id}/models")
     async def get_session_models(session_id: str) -> JSONResponse:
         """
-        Return the per-worker model catalog for a session.
+        Return the per-worker model catalog plus any harness-owned provider list.
 
-        The Omnigent server calls this before routing a turn so the
-        intelligent model router can use live, provider-resolved model
-        lists instead of the static fallback table.
+        Two independent, best-effort payloads merged onto one response
+        (:func:`~omnigent.server.smart_routing.fetch_runner_models` reads
+        ``workers``; the AP server's harness-models cache
+        (``omnigent/server/routes/sessions.py``) reads ``providers``), so
+        neither caller need special-case the other's failure:
+
+        - ``workers``: the per-worker model catalog from
+          :func:`~omnigent.model_catalog.catalog_for_spec`. The Omnigent
+          server calls this before routing a turn so the intelligent model
+          router can use live, provider-resolved model lists instead of the
+          static fallback table.
+        - ``providers``: for opencode sessions, a proxied query to the
+          harness subprocess, which boots ``opencode serve`` (if not already
+          running) and returns the full provider/model list. Empty for
+          harnesses with no live provider catalog of their own.
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :returns: JSON ``{"workers": {<name>: {source, verified, models,
-            note}, ...}}`` shaped like the ``sys_list_models`` payload.
-            ``"self"`` is the calling session's own harness.  Returns an
-            empty workers dict when no spec resolver is configured.
+            note}, ...}, "providers": [{"id", "name", "models": [{"id",
+            "name"}]}, ...]}``. Both default to empty when unavailable.
         """
+        workers: dict[str, Any] = {}
         spec = await _resolve_session_agent_spec(session_id)
-        if spec is None:
-            return JSONResponse(status_code=200, content={"workers": {}})
-        from omnigent.model_catalog import catalog_for_spec
+        if spec is not None:
+            from omnigent.model_catalog import catalog_for_spec
 
+            try:
+                workers = await asyncio.to_thread(catalog_for_spec, spec)
+            except Exception:
+                _logger.exception(
+                    "get_session_models: catalog_for_spec failed for session=%s", session_id
+                )
+
+        providers: list[dict[str, Any]] = []
         try:
-            catalog = await asyncio.to_thread(catalog_for_spec, spec)
-        except Exception:
-            _logger.exception(
-                "get_session_models: catalog_for_spec failed for session=%s", session_id
-            )
-            return JSONResponse(status_code=200, content={"workers": {}})
-        return JSONResponse(status_code=200, content={"workers": catalog})
+            harness_client = await process_manager.get_client(session_id, "any")
+        except Exception:  # noqa: BLE001 - no harness subprocess is a normal, best-effort case.
+            harness_client = None
+        if harness_client is not None:
+            try:
+                resp = await harness_client.get(
+                    f"/v1/sessions/{session_id}/providers",
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    providers = resp.json().get("providers", [])
+            except Exception:  # noqa: BLE001 - provider query is best effort.
+                _logger.debug("Harness providers query failed for %s", session_id)
+
+        return JSONResponse(status_code=200, content={"workers": workers, "providers": providers})
 
     @app.get("/v1/sessions/{session_id}/codex-model-options")
     async def get_session_codex_model_options(session_id: str) -> JSONResponse:
@@ -18905,6 +18932,11 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "codex": "HARNESS_CODEX_MODEL",
     "pi": "HARNESS_PI_MODEL",
     "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
+    # OpenCode reads ``HARNESS_OPENCODE_MODEL`` in
+    # :mod:`omnigent.inner.opencode_executor`; without this mapping a
+    # per-session ``/model`` override would silently drop on the
+    # opencode harness path.
+    "opencode": "HARNESS_OPENCODE_MODEL",
     "cursor": "HARNESS_CURSOR_MODEL",
     # cursor-native is intentionally omitted here (and from
     # model_override._SDK_MODEL_OVERRIDE_HARNESSES): like the other native CLIs
@@ -18957,6 +18989,7 @@ def _build_spawn_env_from_spec(
             _build_goose_spawn_env,
             _build_kimi_spawn_env,
             _build_openai_agents_sdk_spawn_env,
+            _build_opencode_spawn_env,
             _build_pi_spawn_env,
             _build_qwen_spawn_env,
         )
@@ -18969,6 +19002,8 @@ def _build_spawn_env_from_spec(
             env = _build_pi_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(spec)
+        elif harness == "opencode":
+            env = _build_opencode_spawn_env(spec, workdir=workdir)
         elif harness == "cursor":
             env = _build_cursor_spawn_env(spec, workdir=workdir)
         elif harness == "antigravity":

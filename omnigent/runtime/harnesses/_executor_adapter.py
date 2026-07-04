@@ -42,7 +42,8 @@ from collections import deque
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import Response
+from fastapi import APIRouter, Request, Response
+from fastapi.responses import JSONResponse
 
 from omnigent.inner.executor import (
     CompactionComplete,
@@ -1070,6 +1071,49 @@ class ExecutorAdapter(HarnessApp):
         # operators can still grep for it in logs, even though
         # AP's retry allowlist won't match.
         return super()._build_error_detail(exception)
+
+    def _build_v1_router(self) -> APIRouter:
+        """Extend the v1 router with a providers endpoint.
+
+        Adds ``GET /v1/sessions/{conversation_id}/providers`` which
+        delegates to the inner executor's ``get_providers()`` if it
+        has one (opencode), returning 404 otherwise.
+        """
+        router = super()._build_v1_router()
+        router.add_api_route(
+            "/sessions/{conversation_id}/providers",
+            self._get_providers,
+            methods=["GET"],
+            response_model=None,
+        )
+        return router
+
+    async def _get_providers(self, request: Request, conversation_id: str) -> Response:
+        """Return the harness's provider/model list (opencode-only).
+
+        :param request: The incoming FastAPI request.
+        :param conversation_id: The conversation id from the path.
+        :returns: A ``JSONResponse`` with ``{"providers": [...]}`` for
+            opencode, or a 404 ``JSONResponse`` for harnesses whose
+            executor doesn't expose ``get_providers``.
+        """
+        self._check_conversation_id(request, conversation_id)
+        executor = self._ensure_executor()
+        get_providers = getattr(executor, "get_providers", None)
+        if get_providers is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "providers not available for this harness"},
+            )
+        try:
+            providers = await get_providers()
+        except Exception as exc:
+            _logger.warning("get_providers failed: %s", exc)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": f"providers unavailable: {exc}"},
+            )
+        return JSONResponse(status_code=200, content={"providers": providers})
 
     async def on_shutdown(self) -> None:
         """

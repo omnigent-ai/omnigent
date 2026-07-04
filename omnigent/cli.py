@@ -488,13 +488,24 @@ def _pick_first_run_harness() -> _FirstRunPlan | None:
         return _FirstRunPlan(harness="codex", agent=None)
     if default_provider_for_harness(config, "pi") is not None:
         return _FirstRunPlan(harness="pi", agent=None)
+    # OpenCode is multi-provider and stores its auth via ``opencode auth
+    # login`` rather than the ambient-detected provider config, so
+    # ``default_provider_for_harness`` can't gate it. Fall back to
+    # "binary installed" as the readiness proxy: the executor will fail
+    # loud at the first turn if no provider is actually configured.
+    from omnigent.onboarding.harness_install import (
+        KIMI_KEY,
+        OPENCODE_KEY,
+        harness_cli_installed,
+    )
+
+    if harness_cli_installed(OPENCODE_KEY):
+        return _FirstRunPlan(harness="opencode", agent=None)
     # Kimi authenticates against its own backend (``kimi login`` OAuth or a
     # Moonshot API key) rather than the ambient-detected provider config, so
     # ``default_provider_for_harness`` can't gate it. Fall back to "binary
     # installed" as the readiness proxy: the executor will fail loud at the
     # first turn if no provider is actually configured.
-    from omnigent.onboarding.harness_install import KIMI_KEY, harness_cli_installed
-
     if harness_cli_installed(KIMI_KEY):
         return _FirstRunPlan(harness="kimi", agent=None)
     return None
@@ -1189,6 +1200,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "lakebox",
         "login",
         "opencode",
+        "opencode-sdk",
         "pane-picker",
         "pane-split",
         "pi",
@@ -5318,6 +5330,47 @@ def polly(run_args: tuple[str, ...]) -> None:
 
 
 @cli.command(
+    "opencode-sdk",
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    },
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def opencode_sdk(run_args: tuple[str, ...]) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param run_args: Pass-through args for ``run``.
+    """Launch the OpenCode SDK harness through Omnigent.
+
+    Shorthand for ``omnigent run --harness opencode``. OpenCode
+    (https://opencode.ai) is a multi-provider coding agent; Omnigent
+    drives it via a persistent ``opencode serve`` process and the Python
+    SDK, running it headlessly behind the standard Omnigent REPL. All
+    ``run`` options are accepted and forwarded.
+
+    Named ``opencode-sdk`` (not the bare ``opencode``, which is the native
+    TUI launcher — see ``omnigent opencode``) — this does **not** launch a
+    TUI in a tmux pane, it runs OpenCode headlessly behind the standard
+    Omnigent REPL. ``omnigent auth login`` / ``opencode auth login``
+    configures provider credentials.
+
+    \b
+    Examples:
+      omnigent opencode-sdk
+      omnigent opencode-sdk -p "summarise the README"
+      omnigent opencode-sdk -m anthropic/claude-sonnet-4-5
+    """
+    # standalone_mode=False mirrors :func:`_run_bundled_agent` so
+    # ClickExceptions propagate to ``main`` (CLI diagnostics + setup
+    # hint) instead of exiting inline.
+    run.main(
+        args=["--harness", "opencode", *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+@cli.command(
     context_settings={
         "ignore_unknown_options": True,
         "allow_extra_args": True,
@@ -5489,8 +5542,8 @@ def resume(
 # into a materialized copy of the spec before the server starts.
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
-    "'cursor', 'kimi', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
+    "'opencode', 'cursor', 'kimi', 'openai-agents', 'open-responses', 'pi', "
+    "'antigravity', 'qwen', 'goose', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -5518,6 +5571,10 @@ _DEFAULT_HARNESS_PROMPTS = {
     ),
     "codex": (
         "You are Codex, running through Omnigent. Help the user with software engineering tasks."
+    ),
+    "opencode": (
+        "You are OpenCode, running through Omnigent. "
+        "Help the user with software engineering tasks."
     ),
     "cursor": (
         "You are Cursor, running through Omnigent. Help the user with software engineering tasks."

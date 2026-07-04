@@ -175,6 +175,12 @@ describe("useAvailableAgents", () => {
             harness: "claude-sdk",
           },
           {
+            id: "ag_opencode",
+            name: "opencode",
+            description: "Multi-provider coding agent.",
+            harness: "opencode",
+          },
+          {
             id: "ag_yaml",
             name: "databricks_coding_agent",
             description: "A coding agent",
@@ -254,6 +260,14 @@ describe("useAvailableAgents", () => {
         display_name: "Debby",
         description: "A two-headed brainstorming partner.",
         harness: "claude-sdk",
+        skills: [],
+      },
+      {
+        id: "ag_opencode",
+        name: "opencode",
+        display_name: "OpenCode",
+        description: "Multi-provider coding agent.",
+        harness: "opencode",
         skills: [],
       },
       {

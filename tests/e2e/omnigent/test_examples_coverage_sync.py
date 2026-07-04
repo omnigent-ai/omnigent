@@ -187,6 +187,12 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # CI), so there is no test_example_<name>.py file — same shape as
         # qwen_perm_test above.
         "kimi_hello",
+        # opencode / opencode_hello: the SDK opencode harness needs a live
+        # ``opencode serve`` + configured provider, not available in CI. The
+        # live round-trip lives in tests/e2e/test_opencode_executor_e2e.py
+        # (gated on OMNIGENT_E2E_OPENCODE=1) — same shape as kimi_hello above.
+        "opencode",
+        "opencode_hello",
         # ── tests/resources/agents/ fixtures covered by name elsewhere ──
         # workspace-file-writer: loaded by the changed-files e2e tests
         # (test_filesystem_changed_files_e2e.py /

@@ -103,11 +103,19 @@ dependencies = [
 # working; the underlying packages are now default deps above.
 claude-sdk = []
 openai-agents = []
-# `all` additionally carries databricks-sdk: the SDK moved out of the
-# default install (it now lives in the `databricks` extra), but internal
-# CI / dev installs use `--extra all` and the test suite, deploy tooling,
-# and databricks_mcps servers import it.
-all = ["databricks-sdk>=0.56.0,<1"]
+# OpenCode harness transport: the Stainless-generated httpx SDK for talking
+# to a persistent ``opencode serve`` process. Optional + lazily imported
+# (only ``OpenCodeExecutor`` needs it), so it stays out of the default install.
+# Pre-release package — the explicit ``a36`` floor lets pip resolve it without
+# a global ``--pre``. The ``opencode`` binary is installed separately (npm
+# `opencode-ai` or opencode.ai/install).
+opencode = ["opencode-ai>=0.1.0a36"]
+# `all` additionally carries databricks-sdk + opencode-ai: those moved out of
+# the default install (databricks-sdk lives in the `databricks` extra,
+# opencode-ai in the `opencode` extra), but internal CI / dev installs use
+# `--extra all` and the test suite, deploy tooling, and databricks_mcps servers
+# import them.
+all = ["databricks-sdk>=0.56.0,<1", "opencode-ai>=0.1.0a36"]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
@@ -266,7 +274,7 @@ include = ["omnigent*"]
 [tool.setuptools.package-data]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
-"omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
+"omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*", "opencode/**/*"]
 "omnigent.resources.pi_native" = ["*.js"]
 # include UI assets in build
 "omnigent.server" = ["static/web-ui/**/*"]

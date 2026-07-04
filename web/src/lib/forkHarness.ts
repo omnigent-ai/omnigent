@@ -115,6 +115,16 @@ const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * SDK (non-native) harnesses that don't map to a single provider family —
+ * so {@link harnessFamily} returns null for them — but still replay the
+ * Omnigent transcript as LLM context like any other SDK harness, and so
+ * carry history on BOTH fork and switch. OpenCode's SDK harness is
+ * multi-provider (routes to whichever provider the user picks), unlike
+ * e.g. claude-sdk/codex which are single-family.
+ */
+const MULTI_PROVIDER_SDK_HARNESSES: ReadonlySet<string> = new Set(["opencode"]);
+
+/**
  * Whether forking into `targetHarness` keeps the source's conversation
  * history (and so should be offered in the fork picker): a native-rebuild
  * target, a preamble (cursor/opencode) target, or an SDK-family target (which
@@ -137,6 +147,7 @@ export function forkTargetCarriesHistory(targetHarness: string | null | undefine
   return (
     NATIVE_REBUILD_HARNESSES.has(targetHarness) ||
     PREAMBLE_FORK_HARNESSES.has(targetHarness) ||
+    MULTI_PROVIDER_SDK_HARNESSES.has(targetHarness) ||
     harnessFamily(targetHarness) !== null
   );
 }
@@ -155,7 +166,11 @@ export function forkTargetCarriesHistory(targetHarness: string | null | undefine
  */
 export function switchTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
   if (!targetHarness) return false;
-  return NATIVE_REBUILD_HARNESSES.has(targetHarness) || harnessFamily(targetHarness) !== null;
+  return (
+    NATIVE_REBUILD_HARNESSES.has(targetHarness) ||
+    MULTI_PROVIDER_SDK_HARNESSES.has(targetHarness) ||
+    harnessFamily(targetHarness) !== null
+  );
 }
 
 /**

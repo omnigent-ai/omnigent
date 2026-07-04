@@ -1074,7 +1074,8 @@ export function ChatPage() {
       readOnlyReason={readOnlyReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
-      showModels={modelPickerKind !== null}
+      showModels={shouldShowModelPicker(capabilitySource)}
+      isOpencode={shouldShowOpencodeModelInput(capabilitySource)}
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
@@ -1299,6 +1300,8 @@ interface MainAgentSurfaceProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Whether the model section should render a free-text input (opencode SDK). */
+  isOpencode: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
   /** Codex app-server model options for codex-native sessions. */
@@ -1377,6 +1380,7 @@ function MainAgentSurface({
   effortLevels,
   showEffort,
   showModels,
+  isOpencode,
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
@@ -1720,6 +1724,7 @@ function MainAgentSurface({
         effortLevels={effortLevels}
         showEffort={showEffort}
         showModels={showModels}
+        isOpencode={isOpencode}
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
@@ -3073,6 +3078,8 @@ interface ComposerProps {
   showEffort: boolean;
   /** Whether the picker dropdown should include a Models section. */
   showModels: boolean;
+  /** Whether the model section should render a free-text input (opencode SDK). */
+  isOpencode?: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
   /** Codex app-server model options for codex-native sessions. */
@@ -3518,6 +3525,7 @@ export function Composer({
   effortLevels,
   showEffort,
   showModels,
+  isOpencode = false,
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
@@ -4633,6 +4641,8 @@ export function Composer({
               onSelect={onSelectAgent}
               effortLevels={effortLevels}
               showEffort={showEffort}
+              showModels={showModels}
+              isOpencode={isOpencode}
               modelPickerKind={modelPickerKind}
               codexModelOptions={codexModelOptions}
               disabled={isReadOnly}
@@ -4930,7 +4940,20 @@ export function modelPickerKindForConv(
 export function shouldShowModelPicker(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return modelPickerKindForConv(conv) !== null;
+  return (
+    modelPickerKindForConv(conv) !== null || conv?.labels?.["omnigent.wrapper"] === "opencode-sdk"
+  );
+}
+
+/**
+ * True when the model picker should render a free-text model input
+ * (opencode SDK sessions) instead of the fixed claude-native model list or
+ * a native-wrapper picker.
+ */
+export function shouldShowOpencodeModelInput(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return conv?.labels?.["omnigent.wrapper"] === "opencode-sdk";
 }
 
 /**
@@ -4983,10 +5006,17 @@ interface AgentPickerProps {
   effortLevels: readonly string[];
   /** Show the Effort section and selected effort. */
   showEffort: boolean;
+  /** Whether the picker dropdown should include a Models section. */
+  showModels: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
   /** Codex app-server model options for codex-native sessions. */
   codexModelOptions: readonly CodexModelOption[];
+  /**
+   * Render a free-text model input (opencode SDK sessions) instead of the
+   * fixed claude-native model list. Only meaningful with ``showModels``.
+   */
+  isOpencode?: boolean;
   /**
    * Disables the picker trigger. The picker is purely a write
    * surface (selecting an agent / model / effort changes how the
@@ -5014,6 +5044,7 @@ function AgentPicker({
   onSelect,
   effortLevels,
   showEffort,
+  isOpencode = false,
   modelPickerKind,
   codexModelOptions,
   disabled = false,
@@ -5033,6 +5064,7 @@ function AgentPicker({
   const selectedModel = useChatStore((s) => s.selectedModel);
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
+  const harnessModels = useChatStore((s) => s.harnessModels);
 
   // Codex and cursor both populate the picker from the server-provided
   // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
@@ -5100,12 +5132,27 @@ function AgentPicker({
           (sessionModelOverride ?? llmModel)
         : null
     : nonNativeModel;
-  const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
+  // opencode SDK sessions resolve to a "provider/model" id; look up the
+  // human-readable model name from the live harness models list rather than
+  // showing the raw id (formatStatusModelLabel only knows codex/claude-native).
+  const opencodeModelLabel =
+    isOpencode && effectiveModel
+      ? (() => {
+          const [provId, mdlId] = effectiveModel.includes("/")
+            ? effectiveModel.split("/", 2)
+            : [null, effectiveModel];
+          const prov = harnessModels.find((p) => p.id === provId);
+          const mdl = prov?.models.find((m) => m.id === mdlId);
+          return mdl?.name ?? effectiveModel;
+        })()
+      : null;
+  const modelLabel =
+    opencodeModelLabel ?? formatStatusModelLabel(effectiveModel, codexModelOptions);
   const effortTriggerLabel =
     showEffort && selectedEffort
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
       : null;
-  const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
+  const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort || isOpencode;
 
   // Until kiro mirrors its live model (its first session ``.json`` write), there
   // is no resolved model to show; fall back to the catalog default (e.g. "Auto")
@@ -5195,48 +5242,88 @@ function AgentPicker({
             ))}
           </>
         )}
-        {modelOptions.length > 0 && (
+        {(modelOptions.length > 0 || isOpencode) && (
           <>
             {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Models</PickerSectionHeader>
-            {modelOptions.map((m) => {
-              const isExplicit = pickerSelectedModel === m.id;
-              const isImplicit =
-                pickerSelectedModel === null &&
-                (usesServerModelOptions
-                  ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
-                  : isModelImplicitlySelected(m.id, llmModel));
-              const isActive = isExplicit || isImplicit;
-              return (
-                <DropdownMenuItem
-                  key={m.id}
-                  data-testid="model-picker-item"
-                  data-model-id={m.id}
-                  data-active={isActive ? "true" : undefined}
-                  onSelect={() =>
-                    void useChatStore
-                      .getState()
-                      .setModel(m.id)
-                      .catch(() => {})
-                  }
-                  className={cn(
-                    "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
-                    "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
-                  )}
-                >
-                  <span className="flex-1 truncate">
-                    {usesServerModelOptions ? (m.displayName ?? m.id) : m.label}
-                  </span>
-                </DropdownMenuItem>
-              );
-            })}
+            {isOpencode ? (
+              harnessModels.length === 0 ? (
+                <div className="px-2 py-1.5 text-xs text-muted-foreground/70">Loading models…</div>
+              ) : (
+                harnessModels.map((provider) => (
+                  <div key={provider.id}>
+                    <div className="px-2 pt-2 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
+                      {provider.name}
+                    </div>
+                    {provider.models.map((model) => {
+                      const modelId = `${provider.id}/${model.id}`;
+                      const isActive = selectedModel === modelId;
+                      return (
+                        <DropdownMenuItem
+                          key={modelId}
+                          data-testid="model-picker-item"
+                          data-model-id={modelId}
+                          data-active={isActive ? "true" : undefined}
+                          onSelect={() =>
+                            void useChatStore
+                              .getState()
+                              .setModel(modelId)
+                              .catch(() => {})
+                          }
+                          className={cn(
+                            "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                            "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
+                          )}
+                        >
+                          <span className="flex-1 truncate">{model.name}</span>
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </div>
+                ))
+              )
+            ) : (
+              modelOptions.map((m) => {
+                const isExplicit = pickerSelectedModel === m.id;
+                const isImplicit =
+                  pickerSelectedModel === null &&
+                  (usesServerModelOptions
+                    ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
+                    : isModelImplicitlySelected(m.id, llmModel));
+                const isActive = isExplicit || isImplicit;
+                return (
+                  <DropdownMenuItem
+                    key={m.id}
+                    data-testid="model-picker-item"
+                    data-model-id={m.id}
+                    data-active={isActive ? "true" : undefined}
+                    onSelect={() =>
+                      void useChatStore
+                        .getState()
+                        .setModel(m.id)
+                        .catch(() => {})
+                    }
+                    className={cn(
+                      "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
+                      "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
+                    )}
+                  >
+                    <span className="flex-1 truncate">
+                      {usesServerModelOptions ? (m.displayName ?? m.id) : m.label}
+                    </span>
+                  </DropdownMenuItem>
+                );
+              })
+            )}
           </>
         )}
         {/* Skip the leading rule when Effort is the only section, so the
             dropdown doesn't open with a stray divider at the top. */}
         {showEffort && (
           <>
-            {(showAgents || modelOptions.length > 0) && <DropdownMenuSeparator className="my-1" />}
+            {(showAgents || modelOptions.length > 0 || isOpencode) && (
+              <DropdownMenuSeparator className="my-1" />
+            )}
             <PickerSectionHeader>Effort</PickerSectionHeader>
             {effortLevels.map((level) => (
               <DropdownMenuItem

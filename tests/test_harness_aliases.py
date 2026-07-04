@@ -106,12 +106,15 @@ def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
         ("pi-native", "pi"),
         ("antigravity-native", "antigravity"),
         ("opencode-native", "opencode"),
-        ("opencode", "opencode"),  # alias folds to opencode-native
+        ("native-opencode", "opencode"),  # reversed alias
         # Non-native harnesses (and the SDK shorthands) have no native pane.
+        # Bare "opencode" is now the canonical headless SDK harness (not an
+        # alias for opencode-native), so it has no native pane either.
         ("claude-sdk", None),
         ("claude", None),
         ("codex", None),
         ("cursor", None),
+        ("opencode", None),
         ("agents_sdk", None),
         ("some-unknown-harness", None),
         (None, None),

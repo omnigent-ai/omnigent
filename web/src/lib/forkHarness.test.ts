@@ -78,6 +78,8 @@ describe("forkTargetCarriesHistory", () => {
     ["agents_sdk"],
     // antigravity is the Gemini-family SDK target.
     ["antigravity"],
+    // opencode is a multi-provider SDK target (no single harnessFamily).
+    ["opencode"],
   ])("SDK target %s carries history", (target) => {
     expect(forkTargetCarriesHistory(target)).toBe(true);
   });
@@ -159,6 +161,8 @@ describe("switchTargetCarriesHistory", () => {
     // antigravity-native currently carries via the family proxy (see the
     // forkTargetCarriesHistory NOTE); kept offered until verified.
     ["antigravity-native"],
+    // opencode's SDK harness replays the transcript as context on switch too.
+    ["opencode"],
   ])("switch target %s carries history", (target) => {
     expect(switchTargetCarriesHistory(target)).toBe(true);
   });

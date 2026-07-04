@@ -63,6 +63,23 @@ _HARNESS_MODULES: dict[str, str] = {
     # the underlying SDK package is ``openai-agents`` and the
     # executor class is :class:`OpenAIAgentsSDKExecutor`.
     "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
+    # Supervisor harness wrap. See
+    # omnigent/inner/databricks_supervisor_harness.py. Drives the Databricks
+    # Agent Bricks Supervisor API at
+    # ``{workspace}/ai-gateway/mlflow/v1/responses``. Differs from
+    # the SDK-wrapping harnesses above in that the inner executor
+    # has no third-party SDK dependency — it talks HTTP / SSE
+    # directly to the Databricks gateway.
+    "databricks_supervisor": "omnigent.inner.databricks_supervisor_harness",
+    # OpenCode SDK harness wrap. See omnigent/inner/opencode_harness.py.
+    # Drives OpenCode (https://opencode.ai) via a persistent
+    # ``opencode serve`` process talked to over HTTP/SSE with the
+    # ``opencode-ai`` Python SDK; headless (``omnigent opencode-sdk``).
+    # Distinct from the native ``opencode-native`` / ``native-opencode``
+    # terminal wrapper below, which owns the bare ``omnigent opencode``
+    # CLI launcher — this SDK harness owns the bare ``opencode`` harness
+    # key instead.
+    "opencode": "omnigent.inner.opencode_harness",
     # cursor harness wrap (Cursor's ``cursor-agent`` CLI, headless). See
     # omnigent/inner/cursor_harness.py.
     "cursor": "omnigent.inner.cursor_harness",
@@ -121,9 +138,6 @@ _HARNESS_MODULES: dict[str, str] = {
     # alias are in ``NATIVE_HARNESSES``. See
     # omnigent/inner/opencode_native_harness.py.
     "opencode-native": "omnigent.inner.opencode_native_harness",
-    # ``opencode`` is accepted as a friendly alias for the canonical
-    # ``opencode-native`` (there is no separate SDK ``opencode`` harness).
-    "opencode": "omnigent.inner.opencode_native_harness",
     # GitHub Copilot SDK harness wrap. See omnigent/inner/copilot_harness.py.
     # In-process SDK harness (``github-copilot-sdk``), like cursor / antigravity:
     # the SDK bundles the Copilot CLI binary it drives as a backing server, so

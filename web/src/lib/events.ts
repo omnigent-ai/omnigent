@@ -752,6 +752,16 @@ export interface SessionSkillsEvent {
 }
 
 /**
+ * `session.models` — the session's harness-owned model/providers list
+ * just resolved (opencode). Same nudge-and-refetch shape as
+ * `session.skills`.
+ */
+export interface SessionModelsEvent {
+  type: "session_models";
+  conversationId: string;
+}
+
+/**
  * `session.model_options` — the Codex app-server model catalog just
  * resolved for a session. Consumers refetch the session snapshot and apply
  * its now-populated `codexModelOptions`.
@@ -854,5 +864,6 @@ export type StreamEvent =
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
+  | SessionModelsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent;

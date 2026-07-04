@@ -49,12 +49,27 @@ resolved from the YAML file's directory.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, opencode, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
     profile: oss             # Databricks profile for model routing
 ```
+
+Supported `harness` values:
+
+| Harness | Notes |
+|---|---|
+| `claude-sdk` | Claude Agent SDK (default). Reads `ANTHROPIC_API_KEY` or routes through a configured provider. |
+| `claude-native` | Native Claude Code TUI launched in a tmux pane (`omnigent claude`). |
+| `codex` | OpenAI Codex SDK. |
+| `codex-native` | Native Codex TUI launched in a tmux pane (`omnigent codex`). |
+| `openai-agents` | OpenAI Agents SDK. |
+| `pi` | Pi multi-model CLI agent. |
+| `cursor` | Cursor's `cursor-agent` CLI. Talks only to Cursor's backend; see notes below. |
+| `antigravity` | Google Antigravity SDK (Gemini-native, also drives Claude / GPT-OSS). See section below. |
+| `opencode` | [OpenCode](https://opencode.ai) driven headlessly via a persistent `opencode serve` process + the Python SDK (`omnigent opencode`). Multi-provider; credentials via `opencode auth login`. Gateway routing via `HARNESS_OPENCODE_GATEWAY_*` env vars or `executor.auth: {type: databricks, profile: …}`. |
+| `databricks_supervisor` | Databricks Agent Bricks Supervisor API. |
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.

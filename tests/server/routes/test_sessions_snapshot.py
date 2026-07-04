@@ -45,6 +45,19 @@ async def _drain_model_options(session_id: str) -> None:
         await asyncio.sleep(0)
 
 
+async def _drain_runner_models(session_id: str) -> None:
+    """Pump the loop until the snapshot's background harness-models fetch lands.
+
+    Harness-owned models (opencode) are eventual-consistent like skills:
+    the first snapshot returns ``[]`` and kicks off the runner query; a
+    later snapshot serves the cache.
+    """
+    for _ in range(100):
+        if session_id in _sessions_mod._runner_models_cache:
+            return
+        await asyncio.sleep(0)
+
+
 class _ConversationStore:
     """Minimal store that records ``list_items`` calls.
 
@@ -376,10 +389,13 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
     # Still "running" from the cached value.
     assert snapshot2.status == "running"
     # Status is server-cached, so only the FIRST snapshot queries the
-    # runner for status; the second hits the cache. (Skills are
-    # runner-owned and fetched every snapshot via ``/skills`` — the
-    # runner caches them per session — so filter those out here.)
-    status_calls = [u for u in fake_client.get_calls if not u.endswith("/skills")]
+    # runner for status; the second hits the cache. (Skills and harness
+    # models are runner-owned and fetched every snapshot via ``/skills``
+    # and ``/models`` — the runner caches them per session — so filter
+    # those out here.)
+    status_calls = [
+        u for u in fake_client.get_calls if not u.endswith("/skills") and not u.endswith("/models")
+    ]
     assert len(status_calls) == 1, (
         f"Expected 1 runner status GET (cache hit on second call), "
         f"got {len(status_calls)}. If 2, the cache "
@@ -434,6 +450,8 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _FakeResponse:
         status_code = 200
@@ -485,12 +503,17 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         "instead of synthesizing a default status"
     )
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
+    # Status is synchronous; the skills and harness-models GETs are now
+    # background fetches.
     await _drain_runner_skills("conv_router_only")
-    assert fake_client.get_calls == [
-        "/v1/sessions/conv_router_only",
-        "/v1/sessions/conv_router_only/skills",
-    ]
+    await _drain_runner_models("conv_router_only")
+    assert sorted(fake_client.get_calls) == sorted(
+        [
+            "/v1/sessions/conv_router_only",
+            "/v1/sessions/conv_router_only/skills",
+            "/v1/sessions/conv_router_only/models",
+        ]
+    )
 
 
 @pytest.mark.asyncio
@@ -508,6 +531,8 @@ async def test_session_snapshot_includes_skills_from_runner(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -574,6 +599,8 @@ async def test_session_snapshot_includes_model_options_from_runner(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -674,6 +701,8 @@ async def test_session_snapshot_serves_static_cursor_model_options(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -748,6 +777,8 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_cache["conv_codex_refresh"] = [
@@ -851,6 +882,8 @@ async def test_session_snapshot_retries_empty_model_options(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -950,6 +983,8 @@ async def test_session_snapshot_retries_503_model_options(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -1061,6 +1096,8 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -1200,6 +1237,8 @@ async def test_session_snapshot_prefers_router_over_singleton(
     _mod._session_status_cache.clear()
     _mod._runner_skills_cache.clear()
     _mod._runner_skills_inflight.clear()
+    _mod._runner_models_cache.clear()
+    _mod._runner_models_inflight.clear()
 
     class _Response:
         def __init__(self, status: str) -> None:
@@ -1241,12 +1280,17 @@ async def test_session_snapshot_prefers_router_over_singleton(
     )
 
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
+    # Status is synchronous; the skills and harness-models GETs are now
+    # background fetches.
     await _drain_runner_skills("conv_prefer_router")
-    assert router_client.get_calls == [
-        "/v1/sessions/conv_prefer_router",
-        "/v1/sessions/conv_prefer_router/skills",
-    ]
+    await _drain_runner_models("conv_prefer_router")
+    assert sorted(router_client.get_calls) == sorted(
+        [
+            "/v1/sessions/conv_prefer_router",
+            "/v1/sessions/conv_prefer_router/skills",
+            "/v1/sessions/conv_prefer_router/models",
+        ]
+    )
     assert singleton_client.get_calls == [], (
         "singleton should not have been queried when the router resolved a client"
     )

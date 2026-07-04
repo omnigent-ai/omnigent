@@ -1,0 +1,38 @@
+spec_version: 1
+name: opencode
+description: >-
+  OpenCode coding agent. A multi-provider coding harness driven headlessly
+  via a persistent ``opencode serve`` process; configure providers with
+  ``opencode auth login``.
+
+executor:
+  type: omnigent
+  config:
+    harness: opencode
+  # No model pinned: OpenCode uses its configured default provider/model.
+  # Override per-invocation via the web UI's /model picker or the REPL.
+
+prompt: |
+  You are OpenCode, running headlessly inside Omnigent. Help the user with
+  software engineering tasks — read files, edit code, run tests, and explain
+  your reasoning. Keep responses concise and prefer showing the user diffs /
+  commands over describing them in prose.
+
+# OpenCode is a multi-provider coding agent. Credentials live inside
+# OpenCode's own ``opencode auth login`` flow, NOT in Omnigent's provider
+# config — so this spec declares no ``executor.auth`` block.
+#
+# To route through a gateway (Databricks AI gateway / vendor-neutral proxy)
+# instead, either set ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` +
+# ``HARNESS_OPENCODE_GATEWAY_API_KEY`` in the shell, or declare a
+# ``executor.auth: {type: databricks, profile: …}`` block and let Omnigent
+# resolve the workspace.
+#
+# OpenCode owns its own file/shell tools (bash, edit, read, …) and runs
+# them inside its own loop. The harness therefore advertises
+# ``handles_tools_internally=True`` and does NOT need an ``os_env`` block to
+# inject the ``sys_os_*`` tools — adding one would just duplicate every
+# operation against Omnigent's dispatch path.
+
+async: true
+cancellable: true

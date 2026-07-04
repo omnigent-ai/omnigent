@@ -141,9 +141,10 @@ _QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
 _KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_OPENCODE_AGENT_NAME = "opencode"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
-# polly's and debby's multi-file bundles are packaged under
+# polly's, debby's, and opencode's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
 # seeder is a safety net.
@@ -151,6 +152,9 @@ _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+_OPENCODE_BUNDLE_SOURCE = resolve_repo_symlink(
+    Path(_examples_resources.__file__).parent / "opencode"
+)
 
 
 class _FastAPICallNext(Protocol):
@@ -424,6 +428,7 @@ def _ensure_default_agents(
     _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -982,6 +987,61 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+
+
+def _build_opencode_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the ``examples/opencode`` agent bundle.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(_OPENCODE_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_opencode_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register the OpenCode coding agent if its bundle ships here.
+
+    OpenCode (https://opencode.ai) is a multi-provider coding agent;
+    Omnigent drives it via a persistent ``opencode serve`` process and
+    the Python SDK. Seeding it lets the Web UI's new-session picker
+    offer OpenCode as a host-launchable card alongside Claude Code,
+    Codex, polly, and debby. When the bundle is absent (generic
+    deployment that didn't package it), seeding is skipped so no card
+    is offered for an agent that can't be launched here — mirroring
+    the other default built-ins. Content-aware via
+    :func:`_ensure_builtin_agent`: when a new wheel ships a changed
+    spec, the existing row is refreshed in place instead of being
+    ignored.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    if not (_OPENCODE_BUNDLE_SOURCE / "config.yaml").is_file():
+        _logger.debug(
+            "opencode bundle not found at %s; skipping seed",
+            _OPENCODE_BUNDLE_SOURCE,
+        )
+        return
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_OPENCODE_AGENT_NAME,
+        bundle_bytes=_build_opencode_bundle(),
     )
 
 

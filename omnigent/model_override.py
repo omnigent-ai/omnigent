@@ -37,6 +37,7 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "qwen",
         "goose",
         "copilot",
+        "opencode",
     }
 )
 

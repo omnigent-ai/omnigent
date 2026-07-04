@@ -1525,6 +1525,52 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HarnessProvider": {
+        "description": "A provider and its available models (opencode).",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/HarnessProviderModel"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "models"
+        ],
+        "title": "HarnessProvider",
+        "type": "object"
+      },
+      "HarnessProviderModel": {
+        "description": "A single model entry within a harness provider (opencode).",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "HarnessProviderModel",
+        "type": "object"
+      },
       "HeartbeatEvent": {
         "description": "Keepalive event emitted on a fixed cadence during streaming.\n\nLets consumers detect stalled producers via missed-interval\ntiming. Cadence is set by `_HEARTBEAT_INTERVAL_S` in\n`omnigent/runtime/workflow.py` (15 seconds at the time of\nwriting). Wire shape matches the existing emit at\n`omnigent/runtime/workflow.py:4636-4639`.\n\nPer `designs/SERVER_HARNESS_CONTRACT.md` \u00a7Heartbeats, the\nevent MAY carry timing metadata so consumers can do richer\ndead-detection than \"did anything arrive\":\n\n- `server_time` is the producer's wall-clock at emission,\n  letting consumers detect clock drift between producer and\n  consumer.\n- `last_event_seq` is the `sequence_number` of the most\n  recent NON-heartbeat event (or `None` when this is the\n  first heartbeat before any user-visible event), letting\n  consumers detect dropped events on reconnect.\n\nBoth fields are optional on the wire (`None` round-trips as\nomitted) so older AP\u2192harness pairs that pre-date the field\naddition still parse cleanly.",
         "properties": {
@@ -2874,6 +2920,7 @@
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
+            "session.models": "#/components/schemas/SessionModelsEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
@@ -2923,6 +2970,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSkillsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionModelsEvent"
           },
           {
             "$ref": "#/components/schemas/SessionModelOptionsEvent"
@@ -3940,6 +3990,40 @@
         "title": "SessionModelOptionsEvent",
         "type": "object"
       },
+      "SessionModelsEvent": {
+        "description": "Signal that a session's harness-owned models have resolved.\n\nMirrors `SessionSkillsEvent` for the model-provider list.\nFires when the background fetch populates the per-session models\ncache, nudging connected clients to re-read the snapshot.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.models",
+            "description": "Always `\"session.models\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionModelsEvent",
+        "type": "object"
+      },
       "SessionPresenceEvent": {
         "description": "The session's viewer list changed \u2014 full state, not a delta.\n\nEmitted on `GET /v1/sessions/{id}/stream` whenever a user\njoins, leaves (after the server-side grace window absorbs\nreconnect churn), or flips their idle aggregate, and once to\neach newly-connected stream as a snapshot-on-connect. Every\nevent carries the COMPLETE viewer list so clients replace their\nstate wholesale \u2014 missed events self-heal on the next event or\nreconnect. Viewers are scoped to the session *tree* (the root\nconversation and every sub-agent conversation under it), so a\nuser on a sub-agent page and a user on the root page appear in\neach other's lists. See `omnigent/server/presence.py` and\n`designs/UI/PRESENCE.md`.",
         "properties": {
@@ -4324,6 +4408,13 @@
             ],
             "description": "The bound agent's canonical harness, e.g. `\"claude-sdk\"` or `\"openai-agents\"`. Lets the client render the active credential for the correct provider family instead of inferring it from the model string (which is wrong when the agent declares no model). `None` when the agent cannot be looked up.",
             "title": "Harness"
+          },
+          "harness_models": {
+            "items": {
+              "$ref": "#/components/schemas/HarnessProvider"
+            },
+            "title": "Harness Models",
+            "type": "array"
           },
           "host_id": {
             "anyOf": [

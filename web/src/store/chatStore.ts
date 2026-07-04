@@ -88,6 +88,7 @@ import type {
   Session,
   SessionStatus,
   SkillSummary,
+  HarnessProvider,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
@@ -446,6 +447,12 @@ export interface ChatState {
    */
   skills: SkillSummary[];
   /**
+   * Harness-owned provider/model list (opencode). Populated from the
+   * session snapshot's `harness_models` field. Empty for non-opencode
+   * sessions or before the background fetch warms the server cache.
+   */
+  harnessModels: HarnessProvider[];
+  /**
    * Codex app-server model options for the active codex-native session.
    * Populated from the session snapshot and updated when the server's
    * background Codex ``model/list`` fetch lands.
@@ -767,6 +774,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   gitBranch: null,
   todos: [],
   skills: [],
+  harnessModels: [],
   codexModelOptions: [],
   terminalPending: false,
   viewers: [],
@@ -1257,6 +1265,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         gitBranch: null,
         todos: [],
         skills: [],
+        harnessModels: [],
         codexModelOptions: [],
         terminalPending: false,
         viewers: [],
@@ -1705,6 +1714,7 @@ function sessionBindingPatch(
   | "contextWindow"
   | "gitBranch"
   | "skills"
+  | "harnessModels"
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
@@ -1728,6 +1738,7 @@ function sessionBindingPatch(
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
     skills: session.skills ?? [],
+    harnessModels: session.harnessModels ?? [],
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
@@ -3314,6 +3325,7 @@ async function refetchRunnerBackedSessionState(
       ? sessionBindingPatch(session)
       : {
           skills: session.skills ?? [],
+          harnessModels: session.harnessModels ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
         },
   );
@@ -3919,6 +3931,12 @@ export function handleSessionEvent(event: StreamEvent): void {
       // Codex app-server `model/list` just resolved. Refetch the
       // cache-warmed snapshot and apply `codexModelOptions`; the picker
       // derives both model rows and effort levels from that catalog.
+      void refetchRunnerBackedSessionState(event.conversationId);
+      return;
+    case "session_models":
+      // Same nudge for harness-owned models (opencode providers).
+      // refetchRunnerBackedSessionState also applies harnessModels from
+      // the snapshot.
       void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "tool_result":

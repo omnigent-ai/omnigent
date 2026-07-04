@@ -89,7 +89,9 @@ KIMI_SURFACE = "kimi"
 
 # Native OpenCode harness. Like pi, it wraps a CLI (``opencode``) with no
 # ``_HARNESS_FAMILY`` entry, so it must be gated explicitly or it would fail
-# open like an unknown harness.
+# open like an unknown harness. The bare ``opencode`` SDK harness (which
+# shells out to ``opencode serve``) gates on the same binary via the
+# ``OPENCODE_KEY`` surface check below, not this set.
 _OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native"})
 
 # Native Cursor harnesses. These boot the ``cursor-agent`` TUI (``omni cursor``)
@@ -162,7 +164,7 @@ def _install_key(canonical: str) -> str:
     """
     if canonical == KIMI_SURFACE or canonical in _KIMI_NATIVE_HARNESSES:
         return KIMI_KEY
-    if canonical in _OPENCODE_HARNESSES:
+    if canonical == OPENCODE_KEY or canonical in _OPENCODE_HARNESSES:
         return OPENCODE_KEY
     if canonical in _QWEN_HARNESSES:
         return QWEN_KEY
@@ -250,6 +252,7 @@ def harness_is_configured(harness: str) -> bool:
         and canonical not in _PI_HARNESSES
         and canonical != KIMI_SURFACE
         and canonical not in _KIMI_NATIVE_HARNESSES
+        and canonical != OPENCODE_KEY
         and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
@@ -312,6 +315,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
+    spellings.add(OPENCODE_KEY)  # headless SDK OpenCode gates on the opencode binary
     return {
         spelling: _harness_availability(_canonical_harness(spelling)) for spelling in spellings
     }

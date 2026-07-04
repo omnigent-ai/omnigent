@@ -220,11 +220,24 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    ``opencode`` is excluded for the same reason as ``qwen``: it does not follow
+    the shared ``HARNESS_<HARNESS>_GATEWAY``/``DATABRICKS_PROFILE`` probe wiring
+    this matrix (and ``test_harness_wrap_e2e.py``) drive harnesses with — its
+    wrap routes through ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` /
+    ``_API_KEY`` / ``_PROVIDER`` instead (see
+    ``_apply_databricks_profile_to_opencode``). Its live round-trip is the
+    gated ``tests/e2e/test_opencode_executor_e2e.py`` suite.
+
+    ``opencode-native`` is excluded for the same reason as ``goose-native`` /
+    ``qwen-native``: it is a terminal-first TUI launched via ``omni opencode``
+    (tmux pane + bridge dir), not ``omnigent run --harness opencode-native``.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
         "codex-native",
         "pi-native",
+        "opencode",
         "opencode-native",
         "cursor",
         "cursor-native",

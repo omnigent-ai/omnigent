@@ -207,6 +207,7 @@ from omnigent.server.schemas import (
     ErrorDetail,
     ErrorEvent,
     GrantPermissionRequest,
+    HarnessProvider,
     MCPServerSummary,
     ModelUsage,
     OutputItemDoneEvent,
@@ -237,6 +238,7 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionModelEvent,
     SessionModelOptionsEvent,
+    SessionModelsEvent,
     SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourceObject,
@@ -528,6 +530,7 @@ _CLAUDE_NATIVE_UI_LABEL_VALUE = "terminal"
 _CLAUDE_NATIVE_HARNESS = CLAUDE_NATIVE_CODING_AGENT.harness
 _CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
+_OPENCODE_WRAPPER_LABEL_VALUE = "opencode-sdk"
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
@@ -1038,6 +1041,12 @@ _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _model_options_inflight: dict[str, asyncio.Task[None]] = {}
 _CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
+
+# Per-session harness-models cache + in-flight fetch. Same single-flight
+# background pattern as skills — the opencode harness subprocess boots
+# ``opencode serve`` on first query and returns the provider/model list.
+_runner_models_cache: dict[str, list[dict[str, object]]] = {}
+_runner_models_inflight: dict[str, asyncio.Task[None]] = {}
 
 
 @dataclass
@@ -2363,6 +2372,7 @@ def _build_session_response(
     last_task_error: dict[str, str] | None = None,
     agent_name: str | None = None,
     skills: list[SkillSummary] | None = None,
+    harness_models: list[HarnessProvider] | None = None,
     runner_online: bool | None = None,
     host_online: bool | None = None,
     host_resumable: bool = False,
@@ -2519,6 +2529,7 @@ def _build_session_response(
         # non-claude-native sessions or before the first poll tick.
         todos=_session_todos_cache.get(conv.id, []),
         skills=skills or [],
+        harness_models=harness_models or [],
         model_options=model_options or [],
         # Replay terminal spin-up state so a client connecting while the
         # runner is still creating a terminal-first session's terminal
@@ -5654,11 +5665,12 @@ def _invalidate_runner_backed_snapshot_state(
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    These fields are discovered from the bound runner (skills and the
-    codex-native ``model/list`` catalog), so browser reloads can ask the
-    next snapshot to refresh them from the live session instead of serving
-    stale AP-process memory. Runner teardown additionally cancels any
-    in-flight fetch so a dead runner cannot land a late stale value.
+    These fields are discovered from the bound runner (skills, the
+    codex-native ``model/list`` catalog, and opencode's harness-owned
+    provider/model list), so browser reloads can ask the next snapshot to
+    refresh them from the live session instead of serving stale AP-process
+    memory. Runner teardown additionally cancels any in-flight fetch so a
+    dead runner cannot land a late stale value.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -5676,6 +5688,11 @@ def _invalidate_runner_backed_snapshot_state(
         codex_inflight = _model_options_inflight.pop(session_id, None)
         if codex_inflight is not None:
             codex_inflight.cancel()
+    _runner_models_cache.pop(session_id, None)
+    if cancel_inflight:
+        models_inflight = _runner_models_inflight.pop(session_id, None)
+        if models_inflight is not None:
+            models_inflight.cancel()
 
 
 def _publish_changed_files_invalidated(session_id: str, environment_id: str = "default") -> None:
@@ -12267,6 +12284,11 @@ async def _create_session_from_existing_agent(
         _native_labels = dict(body.labels) if body.labels else {}
         _native_labels.update(native_agent.presentation_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _native_labels)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+    elif agent.name == "opencode":
+        _oc_labels = dict(body.labels) if body.labels else {}
+        _oc_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _OPENCODE_WRAPPER_LABEL_VALUE
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _oc_labels)
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif (
         body.sub_agent_name
@@ -20343,6 +20365,72 @@ async def _load_runner_skills(
     _publish_runner_skills(session_id)
 
 
+def _publish_runner_models(session_id: str) -> None:
+    """Publish a ``session.models`` SSE nudge (mirrors skills)."""
+    event = SessionModelsEvent(
+        type="session.models",
+        conversation_id=session_id,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+async def _fetch_runner_models(
+    runner_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> list[HarnessProvider]:
+    """Fetch a session's harness-owned model/providers list.
+
+    Same single-flight background pattern as :func:`_fetch_runner_skills`:
+    returns cached result or kicks a background fetch and returns ``[]``.
+    """
+    if runner_client is None:
+        return []
+    cached = _runner_models_cache.get(session_id)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+    if session_id not in _runner_models_inflight:
+        task = asyncio.create_task(_load_runner_models(runner_client, session_id))
+        _runner_models_inflight[session_id] = task
+        task.add_done_callback(lambda _t, sid=session_id: _runner_models_inflight.pop(sid, None))
+    return []
+
+
+async def _load_runner_models(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Background single-flight fetch of a session's harness models."""
+    try:
+        resp = await runner_client.get(
+            f"/v1/sessions/{session_id}/models",
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        _logger.debug("Runner models query failed for %s", session_id)
+        return
+    if resp.status_code != 200:
+        return
+    try:
+        raw_providers = resp.json().get("providers", [])
+        providers: list[dict[str, object]] = []
+        for p in raw_providers:
+            models = [
+                {"id": m["id"], "name": m.get("name", m["id"])} for m in (p.get("models") or [])
+            ]
+            providers.append(
+                {
+                    "id": p["id"],
+                    "name": p.get("name", p["id"]),
+                    "models": models,
+                }
+            )
+    except (ValueError, AttributeError, KeyError, TypeError):
+        _logger.debug("Runner models payload malformed for %s", session_id)
+        return
+    _runner_models_cache[session_id] = providers
+    _publish_runner_models(session_id)
+
+
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     """
     Validate runner-returned raw Codex ``model/list`` data.
@@ -20686,6 +20774,9 @@ async def _get_session_snapshot(
     # server only overlays the result; best-effort, empty when no runner
     # is bound or it can't be reached.
     skills = await _fetch_runner_skills(runner_client, session_id)
+    # Harness-owned provider/model list (opencode). Same single-flight
+    # background fetch as skills — returns [] until the cache warms.
+    models = await _fetch_runner_models(runner_client, session_id)
     # Codex model options are also runner-owned: they come from the
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed like skills so a snapshot poll cannot wedge the
@@ -20740,6 +20831,7 @@ async def _get_session_snapshot(
         last_task_error=last_task_error,
         agent_name=agent_name,
         skills=skills,
+        harness_models=models,
         model_options=model_options,
         runner_online=runner_online,
         host_online=host_online,

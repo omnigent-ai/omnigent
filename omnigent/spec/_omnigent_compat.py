@@ -75,8 +75,9 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 # 'open-responses'" error.
 #
 # ``opencode-native`` is the native OpenCode server bridge (runner-owned
-# ``opencode serve`` + SSE forwarder); its ``opencode`` / ``native-opencode``
-# spellings are accepted aliases below.
+# ``opencode serve`` + SSE forwarder); its ``native-opencode`` reversed
+# spelling is an accepted alias below. ``opencode`` (bare) is the separate
+# headless SDK harness — both are canonical, not aliases of each other.
 OMNIGENT_HARNESSES = frozenset(
     {
         "antigravity",
@@ -97,6 +98,7 @@ OMNIGENT_HARNESSES = frozenset(
         "hermes-native",
         "openai-agents",
         "open-responses",
+        "opencode",
         "opencode-native",
         "pi",
         "pi-native",
@@ -117,7 +119,6 @@ OMNIGENT_HARNESS_ALIASES = frozenset(
         "google-antigravity",
         "kimi-code",
         "qwen-code",
-        "opencode",
         "native-opencode",
         "native-hermes",
         "github-copilot",

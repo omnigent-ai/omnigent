@@ -14,7 +14,8 @@ import { nativeAgentSortRank } from "@/lib/nativeCodingAgents";
 export const BUILTIN_AGENTS = new Set([
   "claude-native-ui", // Claude Code
   "codex-native-ui", // Codex
-  "opencode-native-ui", // OpenCode
+  "opencode-native-ui", // OpenCode (native)
+  "opencode", // OpenCode (SDK)
   "pi-native-ui", // Pi
   "cursor-native-ui", // Cursor
   "kiro-native-ui", // Kiro

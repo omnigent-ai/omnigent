@@ -1736,6 +1736,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
+    harness_models: list[HarnessProvider] = Field(default_factory=list)
     model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
@@ -2607,6 +2608,36 @@ class SessionSkillsEvent(_SSEEventBase):
     """
 
     type: Literal["session.skills"]
+    conversation_id: str
+
+
+class HarnessProviderModel(BaseModel):
+    """A single model entry within a harness provider (opencode)."""
+
+    id: str
+    name: str
+
+
+class HarnessProvider(BaseModel):
+    """A provider and its available models (opencode)."""
+
+    id: str
+    name: str
+    models: list[HarnessProviderModel]
+
+
+class SessionModelsEvent(_SSEEventBase):
+    """Signal that a session's harness-owned models have resolved.
+
+    Mirrors :class:`SessionSkillsEvent` for the model-provider list.
+    Fires when the background fetch populates the per-session models
+    cache, nudging connected clients to re-read the snapshot.
+
+    :param type: Always ``"session.models"``.
+    :param conversation_id: Session identifier.
+    """
+
+    type: Literal["session.models"]
     conversation_id: str
 
 
@@ -3733,6 +3764,7 @@ ServerStreamEvent = Annotated[
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionSkillsEvent
+    | SessionModelsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent

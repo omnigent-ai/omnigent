@@ -126,6 +126,17 @@ HARNESS_PROBES: list[HarnessProbe] = [
     ),
 ]
 
+# NB: no ``opencode`` row here. Unlike the harnesses above,
+# OpenCode's gateway routing reads ``HARNESS_OPENCODE_GATEWAY_BASE_URL`` /
+# ``_API_KEY`` / ``_PROVIDER`` directly (see
+# ``_apply_databricks_profile_to_opencode`` in
+# ``omnigent/runtime/workflow.py``) rather than the shared
+# ``{env_prefix}GATEWAY`` boolean flag + ``{env_prefix}DATABRICKS_PROFILE``
+# convention every probe consumer here (``test_harness_wrap_e2e.py``,
+# ``harness_bench``) sets — so a probe row would silently fail to route
+# through the mock/gateway. Tracked as a follow-up once that wiring is
+# unified with the other SDK harnesses.
+
 
 # Convenience: list of just (harness, model) tuples for tests
 # that don't need the env-var prefix or marker. Pass to

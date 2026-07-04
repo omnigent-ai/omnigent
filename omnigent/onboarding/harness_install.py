@@ -66,9 +66,10 @@ KIMI_KEY = "kimi"
 # installer, not an npm package managed by ``omnigent setup``.
 KIRO_KEY = "kiro"
 
-# OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
-# installed via the ``opencode-ai`` npm package. No login/logout/status argv
-# is wired yet — readiness is binary-only until an auth check exists.
+# OpenCode CLI (``opencode serve`` / ``opencode attach``), installed via the
+# ``opencode-ai`` npm package. Shared by both the SDK harness (``opencode``,
+# which shells out to ``opencode serve``) and the native harness
+# (``opencode-native``) — both gate on the same binary.
 OPENCODE_KEY = "opencode"
 
 # Goose authenticates against its own config (``goose configure`` → keyring /
@@ -163,8 +164,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
     # Pin the install to the supported 1.17.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
     # version the runtime version-check (``check_opencode_version``,
-    # >=1.17.7,<1.18.0) then rejects. ``~1.17.7`` mirrors that exact range.
-    OPENCODE_KEY: HarnessInstallSpec("OpenCode", "opencode", "opencode-ai@~1.17.7"),
+    # >=1.17.7,<1.18.0) then rejects. ``~1.17.7`` mirrors that exact range. This
+    # spec is shared by both the SDK (``opencode``) and native
+    # (``opencode-native``) harnesses — they gate on the same CLI binary.
+    OPENCODE_KEY: HarnessInstallSpec(
+        "OpenCode",
+        "opencode",
+        "opencode-ai@~1.17.7",
+        login_args=("auth", "login"),
+        logout_args=("auth", "logout"),
+    ),
     QWEN_KEY: HarnessInstallSpec(
         "Qwen Code",
         "qwen",
@@ -265,6 +274,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
+    # Bare ``opencode`` is the SDK harness identifier; it shells out to
+    # ``opencode serve`` and so gates on the same CLI binary as the native
+    # wrapper below.
+    OPENCODE_KEY: OPENCODE_KEY,
     "pi-native": PI_KEY,
     # Kimi is multi-provider but binary-gated: cannot launch without the
     # ``kimi`` CLI on PATH. Listed here so ``required_cli_for_harness``

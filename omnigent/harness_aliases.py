@@ -30,10 +30,9 @@ HARNESS_ALIASES: dict[str, str] = {
     # User-facing reversed spelling for the qwen native-CLI harness; canonical
     # id is "qwen-native" (the ACP-piped harness keeps the bare "qwen" name).
     "native-qwen": "qwen-native",
-    # OpenCode native-server harness: the bare ``opencode`` name and the
-    # reversed ``native-opencode`` spelling both fold to ``opencode-native``
-    # (there is no separate SDK ``opencode`` harness, so the bare name is free).
-    "opencode": "opencode-native",
+    # User-facing reversed spelling for the OpenCode native-server harness;
+    # canonical id is "opencode-native" (the SDK harness keeps the bare
+    # "opencode" id, like goose vs goose-native / hermes vs hermes-native).
     "native-opencode": "opencode-native",
     # User-facing reversed spelling for the Hermes native-CLI (TUI) harness;
     # canonical id is "hermes-native" (the headless subprocess harness keeps the

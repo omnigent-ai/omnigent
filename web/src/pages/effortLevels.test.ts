@@ -6,6 +6,7 @@ import {
   shouldShowCodexPlanModeControl,
   shouldShowEffortPicker,
   shouldShowModelPicker,
+  shouldShowOpencodeModelInput,
 } from "./ChatPage";
 
 const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
@@ -105,6 +106,30 @@ describe("shouldShowModelPicker", () => {
   it("returns false for unrelated wrapper values", () => {
     const conv = { labels: { "omnigent.wrapper": "some-other-wrapper" } };
     expect(shouldShowModelPicker(conv)).toBe(false);
+  });
+
+  it("returns true for opencode-sdk wrapper", () => {
+    const conv = { labels: { "omnigent.wrapper": "opencode-sdk" } };
+    expect(shouldShowModelPicker(conv)).toBe(true);
+  });
+});
+
+describe("shouldShowOpencodeModelInput", () => {
+  it("returns true for opencode-sdk wrapper", () => {
+    const conv = { labels: { "omnigent.wrapper": "opencode-sdk" } };
+    expect(shouldShowOpencodeModelInput(conv)).toBe(true);
+  });
+
+  it("returns false for claude-code-native-ui wrapper", () => {
+    const conv = { labels: { "omnigent.wrapper": "claude-code-native-ui" } };
+    expect(shouldShowOpencodeModelInput(conv)).toBe(false);
+  });
+
+  it("returns false when labels are missing or conv is null/undefined", () => {
+    expect(shouldShowOpencodeModelInput(null)).toBe(false);
+    expect(shouldShowOpencodeModelInput(undefined)).toBe(false);
+    expect(shouldShowOpencodeModelInput({})).toBe(false);
+    expect(shouldShowOpencodeModelInput({ labels: {} })).toBe(false);
   });
 });
 

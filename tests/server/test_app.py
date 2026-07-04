@@ -992,3 +992,49 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     )
 
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
+
+
+def test_ensure_default_opencode_agent_seeds_card(seed_stores: _SeedStores) -> None:
+    """
+    Seeding registers OpenCode as a built-in the picker can render.
+
+    The new-session picker reads built-ins from ``GET /v1/agents`` and
+    renders each as a card; this is what makes OpenCode launchable next
+    to Claude Code, Codex, polly, and debby. The deeper
+    refresh/idempotency behavior lives in the shared
+    ``_ensure_builtin_agent`` and is covered by the polly tests above —
+    this verifies OpenCode's wiring (name constant, packaged bundle
+    source) specifically.
+    """
+    server_app._ensure_default_opencode_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._OPENCODE_AGENT_NAME)
+    assert seeded is not None, "opencode was not registered"
+    assert seeded.name == "opencode"
+    # The bundle must be retrievable, not just referenced.
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_opencode_agent_skips_when_bundle_absent(
+    seed_stores: _SeedStores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    No bundle on disk → no card. Seeding is skipped, not errored.
+
+    On a deployment that didn't package the ``examples/opencode`` bundle,
+    seeding must skip silently so startup doesn't fail and no broken
+    card (an agent that can't launch here) appears.
+    """
+    monkeypatch.setattr(server_app, "_OPENCODE_BUNDLE_SOURCE", tmp_path / "no-such-opencode")
+
+    server_app._ensure_default_opencode_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    assert seed_stores.agent_store.get_by_name(server_app._OPENCODE_AGENT_NAME) is None
