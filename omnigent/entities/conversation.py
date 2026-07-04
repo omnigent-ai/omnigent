@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 # Attachment path markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
@@ -685,10 +685,6 @@ class ConversationItem(BaseModel):
     A persisted item with a store-assigned ID.
 
     :param id: Store-assigned item ID, e.g. ``"msg_abc123"``.
-    :param conversation_id: Conversation that owns the item when the
-        item was loaded from a store. Excluded from generic
-        ``model_dump()`` output so existing item API payloads stay
-        stable.
     :param type: Item type, e.g. ``"message"``,
         ``"function_call"``.
     :param status: Item status, e.g. ``"completed"``.
@@ -700,14 +696,25 @@ class ConversationItem(BaseModel):
         mode. Lets owner and collaborator messages be distinguished.
     """
 
+    _conversation_id: str | None = PrivateAttr(default=None)
+
     id: str
-    conversation_id: str | None = Field(default=None, exclude=True)
     type: str
     status: str
     response_id: str
     created_at: int
     data: ItemData
     created_by: str | None = None
+
+    def __init__(self, **data: Any) -> None:
+        conversation_id = data.pop("conversation_id", None)
+        super().__init__(**data)
+        self._conversation_id = conversation_id
+
+    @property
+    def conversation_id(self) -> str | None:
+        """Conversation that owns this item when loaded from a store."""
+        return self._conversation_id
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:
