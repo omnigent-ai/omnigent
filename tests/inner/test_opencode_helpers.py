@@ -8,10 +8,19 @@ from omnigent.inner.opencode_executor import (
 )
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("1", True), ("true", True), ("YES", True), ("on", True),
-    ("0", False), ("", False), (None, False), ("nope", False),
-])
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("1", True),
+        ("true", True),
+        ("YES", True),
+        ("on", True),
+        ("0", False),
+        ("", False),
+        (None, False),
+        ("nope", False),
+    ],
+)
 def test_parse_truthy(raw, expected):
     assert _parse_truthy(raw) is expected
 
@@ -37,10 +46,15 @@ def test_latest_user_text_plain_string():
 
 
 def test_latest_user_text_blocks():
-    msgs = [{"role": "user", "content": [
-        {"type": "input_text", "text": "a"},
-        {"type": "input_text", "text": "b"},
-    ]}]
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "a"},
+                {"type": "input_text", "text": "b"},
+            ],
+        }
+    ]
     assert _latest_user_text(msgs) == "a\nb"
 
 

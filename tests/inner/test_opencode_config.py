@@ -23,8 +23,11 @@ def test_config_gateway_default_provider(monkeypatch):
     monkeypatch.delenv(_ENV_MCP_SERVERS, raising=False)
     payload = _build_opencode_config_content()
     assert payload == {
-        "provider": {"anthropic": {"options": {
-            "baseURL": "https://gw/serving-endpoints", "apiKey": "sk-test"}}}
+        "provider": {
+            "anthropic": {
+                "options": {"baseURL": "https://gw/serving-endpoints", "apiKey": "sk-test"}
+            }
+        }
     }
 
 

@@ -3,18 +3,18 @@ index 5da18bac..0f28282f 100644
 --- a/README.md
 +++ b/README.md
 @@ -4,7 +4,7 @@
- 
+
  ### A meta-harness for all your AI agents
- 
+
 -Omnigent provides a common layer over Claude Code, Codex, Cursor, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
 +Omnigent provides a common layer over Claude Code, Codex, Cursor, OpenCode, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, keep them in check with policies and sandboxing, and collaborate in real time on the same live session, from any device.
- 
+
  [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
  ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 @@ -28,10 +28,10 @@ Omnigent lets you:
    follow you: start in your terminal, continue in the browser, pick it up on
    your phone. Messages, sub-agents, terminals, and files stay in sync.
- 
+
 -- **🤖 Supervise multiple agents.** Use Claude Code, Codex, Pi, and custom
 -  agents (defined in YAML) together in the same session. Ask one agent to
 -  review another's work, or split a task across agents that are each good at
@@ -23,7 +23,7 @@ index 5da18bac..0f28282f 100644
 +  custom agents (defined in YAML) together in the same session. Ask one agent
 +  to review another's work, or split a task across agents that are each good
 +  at different things.
- 
+
  - **🔌 Use any model.** A first-party API key, a Claude/ChatGPT subscription,
    or any compatible gateway. All first-class.
 @@ -161,6 +161,7 @@ Or launch a specific agent runtime, or your own agent:
@@ -33,14 +33,14 @@ index 5da18bac..0f28282f 100644
 +omnigent opencode                    # OpenCode (https://opencode.ai), headless
  omnigent run path/to/agent.yaml      # your own agent (see "Write your own agent")
  ```
- 
+
 @@ -367,7 +368,7 @@ name: my_agent
  prompt: You are a helpful data analyst.
- 
+
  executor:
 -  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi, antigravity
 +  harness: claude-sdk          # or: codex, codex-native, claude-native, cursor, openai-agents, pi, antigravity, opencode
- 
+
  tools:
    # A local Python function (schema auto-generated from the signature)
 diff --git a/ap-web/src/components/AgentCard.tsx b/ap-web/src/components/AgentCard.tsx
@@ -57,13 +57,13 @@ index 837361aa..8e40508f 100644
 +  // ``components/icons/``.
    return BotIcon;
  }
- 
+
 diff --git a/docs/AGENT_YAML_SPEC.md b/docs/AGENT_YAML_SPEC.md
 index e309a88f..1a91fdba 100644
 --- a/docs/AGENT_YAML_SPEC.md
 +++ b/docs/AGENT_YAML_SPEC.md
 @@ -49,13 +49,28 @@ resolved from the YAML file's directory.
- 
+
  ```yaml
  executor:
 -  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, pi, antigravity, ...
@@ -73,7 +73,7 @@ index e309a88f..1a91fdba 100644
      type: databricks
      profile: oss             # Databricks profile for model routing
  ```
- 
+
 +Supported `harness` values:
 +
 +| Harness | Notes |
@@ -91,7 +91,7 @@ index e309a88f..1a91fdba 100644
 +
  Set the Databricks profile under `executor.auth`. The older top-level
  `executor.profile` shorthand is legacy and should not be used in new specs.
- 
+
 diff --git a/docs/OPENCODE_FOLLOWUPS.md b/docs/OPENCODE_FOLLOWUPS.md
 new file mode 100644
 index 00000000..5df94961
@@ -346,8 +346,8 @@ index a6deae9f..05f40f7e 100644
 +    if harness_cli_installed(OPENCODE_KEY):
 +        return _FirstRunPlan(harness="opencode", agent=None)
      return None
- 
- 
+
+
 @@ -1135,6 +1144,7 @@ def cli() -> None:
          "host",
          "lakebox",
@@ -358,8 +358,8 @@ index a6deae9f..05f40f7e 100644
          "pi",
 @@ -4224,6 +4234,45 @@ def polly(run_args: tuple[str, ...]) -> None:
      _run_bundled_agent("polly", run_args)
- 
- 
+
+
 +@cli.command(
 +    context_settings={
 +        "ignore_unknown_options": True,
@@ -421,7 +421,7 @@ index a6deae9f..05f40f7e 100644
 +    ),
  }
  _DEFAULT_HARNESS_PROMPT = "You are a helpful coding agent running through Omnigent."
- 
+
 diff --git a/omnigent/inner/opencode_executor.py b/omnigent/inner/opencode_executor.py
 new file mode 100644
 index 00000000..bfaff81d
@@ -1307,7 +1307,7 @@ index 6731ca97..6c19e882 100644
 +    # branch.
 +    "opencode": "opencode",
  }
- 
+
  # Preferred inline family per single-family harness (pi consumes both).
 diff --git a/omnigent/model_override.py b/omnigent/model_override.py
 index a7bc1228..82ddacc9 100644
@@ -1320,8 +1320,8 @@ index a7bc1228..82ddacc9 100644
 -    {"claude-sdk", "codex", "pi", "openai-agents", "cursor", "antigravity"}
 +    {"claude-sdk", "codex", "pi", "openai-agents", "cursor", "antigravity", "opencode"}
  )
- 
- 
+
+
 diff --git a/omnigent/onboarding/harness_install.py b/omnigent/onboarding/harness_install.py
 index 501b1669..08cf9c76 100644
 --- a/omnigent/onboarding/harness_install.py
@@ -1329,14 +1329,14 @@ index 501b1669..08cf9c76 100644
 @@ -52,6 +52,12 @@
  # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
  CURSOR_KEY = "cursor"
- 
+
 +# Like Pi, OpenCode (https://opencode.ai) is a CLI-backed harness that doesn't
 +# fit either the Anthropic or OpenAI family — it's multi-provider, configured
 +# per-invocation via ``OPENCODE_CONFIG_CONTENT``. Treated as its own install
 +# key so the binary and login plumbing have a place to land.
 +OPENCODE_KEY = "opencode"
 +
- 
+
  @dataclass(frozen=True)
  class HarnessInstallSpec:
 @@ -124,6 +130,22 @@ class HarnessInstallSpec:
@@ -1360,8 +1360,8 @@ index 501b1669..08cf9c76 100644
 +        logout_args=("auth", "logout"),
 +    ),
  }
- 
- 
+
+
 @@ -142,6 +164,11 @@ class HarnessInstallSpec:
      "codex-native": OPENAI_FAMILY,
      PI_KEY: PI_KEY,
@@ -1372,15 +1372,15 @@ index 501b1669..08cf9c76 100644
 +    # ``missing_harness_cli`` fails loud before a subagent spawn.
 +    OPENCODE_KEY: OPENCODE_KEY,
  }
- 
- 
+
+
 diff --git a/omnigent/onboarding/harness_readiness.py b/omnigent/onboarding/harness_readiness.py
 index 68c2c598..7dea7aa9 100644
 --- a/omnigent/onboarding/harness_readiness.py
 +++ b/omnigent/onboarding/harness_readiness.py
 @@ -27,13 +27,24 @@
  import os
- 
+
  from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 -from omnigent.onboarding.harness_install import CURSOR_KEY, PI_KEY, harness_cli_installed
 +from omnigent.onboarding.harness_install import (
@@ -1394,7 +1394,7 @@ index 68c2c598..7dea7aa9 100644
      _HARNESS_FAMILY,
      PI_SURFACE,
  )
- 
+
 +# Surface name for OpenCode in the readiness map. Mirrors :data:`PI_SURFACE`
 +# — both are CLI-backed harnesses without a single provider family, so they
 +# carry their own surface keys rather than living under
@@ -1406,7 +1406,7 @@ index 68c2c598..7dea7aa9 100644
  # the canonical ``openai-agents`` and the ``openai-agents-sdk`` spelling the
 @@ -72,10 +83,15 @@ def _install_key(canonical: str) -> str:
      """Return the install-spec key whose CLI binary *canonical* requires.
- 
+
      :param canonical: A canonical CLI-wrapping harness id keyed in
 -        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), or ``"pi"``.
 +        ``_HARNESS_FAMILY`` (e.g. ``"codex-native"``), ``"pi"``, or
@@ -1420,11 +1420,11 @@ index 68c2c598..7dea7aa9 100644
 +    if canonical == OPENCODE_SURFACE:
 +        return OPENCODE_KEY
      return _HARNESS_FAMILY.get(canonical) or PI_KEY
- 
- 
+
+
 @@ -113,7 +129,11 @@ def harness_is_configured(harness: str) -> bool:
          from omnigent.onboarding.cursor_auth import cursor_api_key_configured
- 
+
          return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
 -    if canonical not in _HARNESS_FAMILY and canonical not in _PI_HARNESSES:
 +    if (
@@ -1455,8 +1455,8 @@ index 34abc236..2c51896f 100644
 +    # opencode harness path.
 +    "opencode": "HARNESS_OPENCODE_MODEL",
  }
- 
- 
+
+
 @@ -12868,6 +12873,7 @@ def _build_spawn_env_from_spec(
              _build_codex_spawn_env,
              _build_cursor_spawn_env,
@@ -1464,7 +1464,7 @@ index 34abc236..2c51896f 100644
 +            _build_opencode_spawn_env,
              _build_pi_spawn_env,
          )
- 
+
 @@ -12883,6 +12889,8 @@ def _build_spawn_env_from_spec(
              env = _build_cursor_spawn_env(spec, workdir=workdir)
          elif harness == "antigravity":
@@ -1488,7 +1488,7 @@ index 7f8bb312..9394e333 100644
 +    # parsing the line-delimited JSON event stream.
 +    "opencode": "omnigent.inner.opencode_harness",
  }
- 
+
  __all__ = ["_HARNESS_MODULES"]
 diff --git a/omnigent/runtime/workflow.py b/omnigent/runtime/workflow.py
 index 729ad473..372424cd 100644
@@ -1496,14 +1496,14 @@ index 729ad473..372424cd 100644
 +++ b/omnigent/runtime/workflow.py
 @@ -139,7 +139,9 @@
  # (hyphen), e.g. ``"claude_sdk"`` → ``"claude-sdk"`` used by ``_HARNESS_MODULES``.
- 
- 
+
+
 -AgentHarnessType = Literal["claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity"]
 +AgentHarnessType = Literal[
 +    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "opencode"
 +]
- 
- 
+
+
  @dataclass(frozen=True)
 @@ -415,6 +417,12 @@ def _inject_ucode_agent_state(
      "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
@@ -1517,7 +1517,7 @@ index 729ad473..372424cd 100644
 +    "opencode": "HARNESS_OPENCODE_DATABRICKS_PROFILE",
      # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
  }
- 
+
 @@ -580,6 +588,13 @@ def configure_agent_harness_with_provider(
          # Databricks AI gateway is one producer of that transport), record
          # the Databricks profile (Databricks-specific, used by the executor
@@ -1544,8 +1544,8 @@ index 729ad473..372424cd 100644
      if family is None:
 @@ -703,6 +721,158 @@ def _apply_provider_family(
          env["HARNESS_CODEX_WIRE_API"] = family.wire_api or RESPONSES_WIRE_API
- 
- 
+
+
 +def _apply_databricks_profile_to_opencode(env: dict[str, str], profile: str | None) -> None:
 +    """Resolve a Databricks profile and write opencode's gateway env vars.
 +
@@ -1700,11 +1700,11 @@ index 729ad473..372424cd 100644
 +
  def _apply_provider_to_openai_agents(env: dict[str, str], family: FamilyConfig) -> None:
      """Apply a provider family to the openai-agents-sdk harness.
- 
+
 @@ -1416,6 +1586,83 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
      return env
- 
- 
+
+
 +def _build_opencode_spawn_env(
 +    spec: AgentSpec,
 +    *,
@@ -1827,8 +1827,8 @@ index 51ffd12b..bea8ea97 100644
 +        lambda _key: False,
 +    )
      assert _pick_first_run_harness() is None
- 
- 
+
+
 @@ -4010,6 +4024,13 @@ def test_resolve_first_run_plan_drops_into_configure_when_empty(
          "omnigent.onboarding.provider_config.default_provider_for_harness",
          _fake_provider_for(),  # nothing configured, before and after configure
@@ -1842,7 +1842,7 @@ index 51ffd12b..bea8ea97 100644
 +    )
      configure = Mock()
      monkeypatch.setattr("omnigent.cli._run_configure_harnesses_interactive", configure)
- 
+
 diff --git a/tests/e2e/test_opencode_executor_e2e.py b/tests/e2e/test_opencode_executor_e2e.py
 new file mode 100644
 index 00000000..a49b1354
@@ -2882,7 +2882,7 @@ index f14ebfc4..0c155a4f 100644
 +        "opencode",
      }
      assert set(result) == expected_keys
- 
+
 @@ -165,6 +174,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
          "codex-native",
          "native-codex",
@@ -2890,7 +2890,7 @@ index f14ebfc4..0c155a4f 100644
 +        "opencode",
      ):
          assert result[cli] is False, f"{cli} should be gated on its CLI binary"
- 
+
 diff --git a/tests/runtime/test_provider_spawn_env.py b/tests/runtime/test_provider_spawn_env.py
 index 4c9261a9..d475e3ab 100644
 --- a/tests/runtime/test_provider_spawn_env.py
@@ -2905,8 +2905,8 @@ index 4c9261a9..d475e3ab 100644
  from omnigent.spec.types import (
 @@ -306,6 +307,68 @@ def test_openai_agents_uses_openai_global_default(config_home: Path) -> None:
      assert "HARNESS_OPENAI_AGENTS_DATABRICKS" not in env
- 
- 
+
+
 +def test_opencode_uses_anthropic_global_default(config_home: Path) -> None:
 +    """A ``default: true`` anthropic provider routes the opencode harness.
 +

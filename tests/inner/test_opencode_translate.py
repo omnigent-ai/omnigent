@@ -35,9 +35,17 @@ def test_reasoning_gated():
 def test_tool_completed_emits_request_and_complete():
     tracker = _PartTracker()
     p = {
-        "id": "t1", "type": "tool", "tool": "bash", "callID": "c1",
-        "state": {"status": "completed", "input": {"command": "ls"},
-                  "output": "file.txt", "title": "ls", "metadata": {}},
+        "id": "t1",
+        "type": "tool",
+        "tool": "bash",
+        "callID": "c1",
+        "state": {
+            "status": "completed",
+            "input": {"command": "ls"},
+            "output": "file.txt",
+            "title": "ls",
+            "metadata": {},
+        },
     }
     out = _translate_part_event(p, tracker, emit_reasoning=False)
     req = [e for e in out if isinstance(e, ToolCallRequest)]
@@ -49,8 +57,13 @@ def test_tool_completed_emits_request_and_complete():
 
 def test_tool_running_emits_request_only():
     tracker = _PartTracker()
-    p = {"id": "t2", "type": "tool", "tool": "edit", "callID": "c2",
-         "state": {"status": "running", "input": {"path": "x"}}}
+    p = {
+        "id": "t2",
+        "type": "tool",
+        "tool": "edit",
+        "callID": "c2",
+        "state": {"status": "running", "input": {"path": "x"}},
+    }
     out = _translate_part_event(p, tracker, emit_reasoning=False)
     assert [type(e).__name__ for e in out] == ["ToolCallRequest"]
     # Re-emitting the same running part again must not duplicate the request.
@@ -59,32 +72,53 @@ def test_tool_running_emits_request_only():
 
 def test_tool_error_status():
     tracker = _PartTracker()
-    p = {"id": "t3", "type": "tool", "tool": "bash", "callID": "c3",
-         "state": {"status": "error", "error": "boom", "input": {}}}
+    p = {
+        "id": "t3",
+        "type": "tool",
+        "tool": "bash",
+        "callID": "c3",
+        "state": {"status": "error", "error": "boom", "input": {}},
+    }
     out = _translate_part_event(p, tracker, emit_reasoning=False)
     comp = [e for e in out if isinstance(e, ToolCallComplete)]
     assert comp and comp[0].status == ToolCallStatus.ERROR and comp[0].error == "boom"
 
 
 def test_tokens_to_usage():
-    tokens = {"input": 100, "output": 50, "reasoning": 10,
-              "cache": {"read": 20, "write": 5}}
+    tokens = {"input": 100, "output": 50, "reasoning": 10, "cache": {"read": 20, "write": 5}}
     assert _tokens_to_usage(tokens) == {
-        "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
-        "cache_read_input_tokens": 20, "cache_creation_input_tokens": 5,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 150,
+        "cache_read_input_tokens": 20,
+        "cache_creation_input_tokens": 5,
     }
 
 
 def test_tool_pending_then_completed_emits_request_with_real_args():
     tracker = _PartTracker()
     pid = "t-pending"
-    pending = {"id": pid, "type": "tool", "tool": "bash", "callID": "c9",
-               "state": {"status": "pending"}}
-    running = {"id": pid, "type": "tool", "tool": "bash", "callID": "c9",
-               "state": {"status": "running", "input": {"command": "ls -la"}}}
-    completed = {"id": pid, "type": "tool", "tool": "bash", "callID": "c9",
-                 "state": {"status": "completed", "input": {"command": "ls -la"},
-                           "output": "ok"}}
+    pending = {
+        "id": pid,
+        "type": "tool",
+        "tool": "bash",
+        "callID": "c9",
+        "state": {"status": "pending"},
+    }
+    running = {
+        "id": pid,
+        "type": "tool",
+        "tool": "bash",
+        "callID": "c9",
+        "state": {"status": "running", "input": {"command": "ls -la"}},
+    }
+    completed = {
+        "id": pid,
+        "type": "tool",
+        "tool": "bash",
+        "callID": "c9",
+        "state": {"status": "completed", "input": {"command": "ls -la"}, "output": "ok"},
+    }
     out_pending = _translate_part_event(pending, tracker, emit_reasoning=False)
     out_running = _translate_part_event(running, tracker, emit_reasoning=False)
     out_completed = _translate_part_event(completed, tracker, emit_reasoning=False)

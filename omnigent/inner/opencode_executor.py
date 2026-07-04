@@ -363,7 +363,7 @@ class _OpenCodeServer:
             raise ImportError(
                 "The 'opencode' harness needs the optional 'opencode-ai' "
                 "Python SDK, which is not installed. Install it with "
-                "`pip install \"omnigent[opencode]\"` (or `pip install --pre "
+                '`pip install "omnigent[opencode]"` (or `pip install --pre '
                 "opencode-ai`)."
             ) from exc
 
@@ -371,7 +371,13 @@ class _OpenCodeServer:
         env = dict(os.environ)
         env.update(extra_env)
         self._proc = await asyncio.create_subprocess_exec(
-            binary, "serve", "--port", "0", "--hostname", "127.0.0.1", "--print-logs",
+            binary,
+            "serve",
+            "--port",
+            "0",
+            "--hostname",
+            "127.0.0.1",
+            "--print-logs",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd or None,
@@ -488,9 +494,7 @@ class _OmnigentToolBridge:
             await asyncio.sleep(0.05)
         else:
             await self.close()
-            raise RuntimeError(
-                "opencode tool-bridge MCP server failed to start within 5s"
-            )
+            raise RuntimeError("opencode tool-bridge MCP server failed to start within 5s")
         return f"http://127.0.0.1:{self._port}/mcp"
 
     def _register_tool(self, mcp: Any, spec: ToolSpec) -> None:
@@ -663,9 +667,7 @@ class OpenCodeExecutor(Executor):
             )
         return result
 
-    async def _resolve_provider_model(
-        self, config_model: str | None
-    ) -> tuple[str, str]:
+    async def _resolve_provider_model(self, config_model: str | None) -> tuple[str, str]:
         """Resolve ``(provider_id, model_id)`` for ``session.chat``.
 
         Both fields are required by the SDK; this method always returns a
@@ -688,9 +690,7 @@ class OpenCodeExecutor(Executor):
             resp = await self._require_client().app.providers()
             default_map: dict[str, str] = dict(getattr(resp, "default", {}) or {})
             if not default_map:
-                raise RuntimeError(
-                    "opencode: no providers configured; run `opencode auth login`"
-                )
+                raise RuntimeError("opencode: no providers configured; run `opencode auth login`")
             # default_map is {provider_id: default_model_id}; take the first entry.
             dprov, dmodel = next(iter(default_map.items()))
             self._default_provider_model = (dprov, dmodel)
@@ -825,19 +825,13 @@ class OpenCodeExecutor(Executor):
                         continue
                     # Correction (B): no reasoning part type in this SDK;
                     # emit_reasoning=self._thinking kept for future compat.
-                    for out in _translate_part_event(
-                        part, tracker, emit_reasoning=self._thinking
-                    ):
+                    for out in _translate_part_event(part, tracker, emit_reasoning=self._thinking):
                         if isinstance(out, TextChunk):
                             final_text.append(out.text)
                         yield out
-                elif etype == "session.error" and (
-                    ev_session in (None, session_id)
-                ):
+                elif etype == "session.error" and (ev_session in (None, session_id)):
                     err = self._as_dict(props.get("error"))
-                    yield ExecutorError(
-                        message=f"opencode: {err.get('name') or err or 'error'}"
-                    )
+                    yield ExecutorError(message=f"opencode: {err.get('name') or err or 'error'}")
                     return
                 elif etype == "session.idle" and ev_session == session_id:
                     idle_seen = True
@@ -898,9 +892,7 @@ class OpenCodeExecutor(Executor):
             return True
         return False
 
-    async def enqueue_session_message(
-        self, session_key: str, content: EnqueuedContent
-    ) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """Fire-and-forget a new message into an already-running session.
 
         Sends a second ``session.chat`` without waiting for it — OpenCode

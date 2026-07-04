@@ -1088,9 +1088,7 @@ class ExecutorAdapter(HarnessApp):
         )
         return router
 
-    async def _get_providers(
-        self, request: Request, conversation_id: str
-    ) -> Response:
+    async def _get_providers(self, request: Request, conversation_id: str) -> Response:
         """Return the harness's provider/model list (opencode-only).
 
         :param request: The incoming FastAPI request.

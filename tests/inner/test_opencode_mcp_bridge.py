@@ -15,8 +15,13 @@ async def test_bridge_starts_and_reports_url():
         called["args"] = args
         return {"ok": True}
 
-    tools = [{"name": "echo", "description": "echo", "parameters": {
-        "type": "object", "properties": {"msg": {"type": "string"}}}}]
+    tools = [
+        {
+            "name": "echo",
+            "description": "echo",
+            "parameters": {"type": "object", "properties": {"msg": {"type": "string"}}},
+        }
+    ]
     bridge = _OmnigentToolBridge(tools, fake_executor)
     url = await bridge.start()
     try:

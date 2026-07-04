@@ -1200,6 +1200,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "lakebox",
         "login",
         "opencode",
+        "opencode-sdk",
         "pane-picker",
         "pane-split",
         "pi",
