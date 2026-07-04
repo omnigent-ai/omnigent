@@ -31,8 +31,10 @@ export function useSidebarToggleHotkeys(handlers: SidebarToggleHandlers): void {
       // reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
       if (!(e.metaKey || e.ctrlKey) || !e.altKey || e.shiftKey) return;
       // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
-      // accidentally toggle sidebars while focused in an editor/composer.
-      if (e.getModifierState("AltGraph")) return;
+      // accidentally toggle sidebars while focused in an editor/composer. Guard
+      // the call: not every environment implements getModifierState, and an
+      // unguarded call there would throw and break the whole keydown handler.
+      if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return;
       // Ignore auto-repeat: holding the chord would flap the panel open/closed.
       if (e.repeat) return;
       // Match the physical key, not the character: ⌥ turns "[" / "]" into "“" /

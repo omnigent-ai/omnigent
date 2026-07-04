@@ -119,21 +119,26 @@ class ProbeResult:
 
 
 def reconcile(observed: Verdict, declared: Verdict) -> Verdict:
-    """Compare an observed verdict against the harness's declared verdict.
+    """Compare observed behavior against the harness's *declared capability*.
 
-    Returns :attr:`Verdict.DRIFT` when both sides assert a concrete fact
-    and those facts differ — the alarm the whole bench exists to raise
-    (a harness that *claims* a capability but no longer exhibits it, or
-    the reverse). Otherwise returns *observed* unchanged.
+    The declared verdict is derived from the harness's published capability
+    model (``harness_capabilities()``); the observed verdict is what a probe
+    measured live. Returns :attr:`Verdict.DRIFT` when both sides assert a
+    concrete fact and those facts differ — i.e. **the harness's capability
+    declaration is false** (it claims a capability it does not exhibit, or
+    exhibits one it does not claim). This makes the capability table
+    self-enforcing: a wrong entry in the model surfaces as DRIFT on the next
+    live run. Otherwise returns *observed* unchanged.
 
-    Drift is symmetric on purpose: a capability that regressed
-    (declared ``SUPPORTED``, observed ``UNSUPPORTED``) and one that
-    quietly gained coverage (declared ``UNSUPPORTED``, observed
-    ``SUPPORTED``) both mean the matrix is now lying, and both deserve a
-    human's attention.
+    Drift is symmetric on purpose: a declared capability that is not observed
+    (declared ``SUPPORTED``, observed ``UNSUPPORTED``) and an observed
+    behavior that was not declared (declared ``UNSUPPORTED``, observed
+    ``SUPPORTED``) both mean the declaration is out of sync with reality, and
+    both deserve a human's attention.
 
-    :param observed: The verdict a probe produced this run.
-    :param declared: The verdict the :class:`BenchProfile` claims.
+    :param observed: The verdict a probe measured this run.
+    :param declared: The verdict derived from the harness's declared
+        capability.
     :returns: ``DRIFT`` on a concrete mismatch, else *observed*.
     """
     if observed in _CONCRETE and declared in _CONCRETE and observed != declared:

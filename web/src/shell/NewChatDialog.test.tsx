@@ -60,6 +60,20 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: [] }),
 }));
+// The harness-label catalog is not under test here. Keep it synchronous so
+// create-session fetch assertions only observe the POST/PATCH calls they own.
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  useBrainHarnessLabels: () => ({
+    "claude-sdk": "Claude SDK",
+    "openai-agents": "OpenAI Agents SDK",
+    codex: "Codex",
+    cursor: "Cursor",
+    pi: "Pi",
+    antigravity: "Antigravity",
+    copilot: "Copilot",
+  }),
+}));
 // Partial mock: only spy on the first-message handoff so the "@"-mention
 // tests can assert the prepended attachment marker. Everything else
 // (composerAttachmentKey, useChatStore, …) stays real for the render tree.

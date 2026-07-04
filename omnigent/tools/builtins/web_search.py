@@ -4,10 +4,14 @@ Backend selection is fully determined by the agent spec:
 
 - **OpenAI model** → passthrough to OpenAI's native
   ``web_search_preview`` (server-side, uses the LLM API key).
-- **Other models** → requires ``search_provider`` in config
-  (``"google"``, ``"perplexity"``, ``"nimble"``, or ``"tavily"``)
-  with the appropriate credentials. No env var fallbacks — the spec
-  is self-contained.
+- **Other models** → use the ``search_provider`` named in the spec. Both
+  keyless backends (no ``api_key``) and keyed ones (credentials for a
+  sturdier / higher-rate backend) are supported; the ``_BACKENDS`` registry
+  at the bottom of this module is the single source of truth for which
+  engines exist. ``web_search`` never picks an engine for you — with no
+  ``search_provider`` set it returns an error naming the options, so it is
+  always explicit which engine ran. No env var fallbacks — the spec is
+  self-contained.
 
 Usage in config.yaml::
 
@@ -16,18 +20,20 @@ Usage in config.yaml::
       builtins:
         - web_search
 
-    # Non-OpenAI model — must specify search_provider + credentials:
+    # Non-OpenAI model — name a search_provider (there is no default):
     tools:
       builtins:
         - name: web_search
-          search_provider: perplexity
-          api_key: ${PERPLEXITY_API_KEY}
+          search_provider: duckduckgo   # a keyless backend, as an example
+          # api_key: ${PERPLEXITY_API_KEY}   # required for keyed backends
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
@@ -35,15 +41,28 @@ from omnigent.tools.base import Tool, ToolContext
 _logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _Backend:
+    """A selectable ``search_provider`` engine in the ``_BACKENDS`` registry.
+
+    :param run: Callable ``(query, config) -> result_or_error`` for the engine.
+    :param keyless: True if the engine needs no ``api_key`` (drives hint text).
+    """
+
+    run: Callable[[str, dict[str, str]], str]
+    keyless: bool
+
+
 class WebSearchTool(Tool):
     """
     Unified web search tool with backend determined by the agent spec.
 
     When the agent uses an OpenAI model, this emits the native
-    ``web_search_preview`` passthrough schema. For other models,
-    the spec must set ``search_provider`` to ``"google"`` or
-    ``"perplexity"`` with credentials — there is no env var
-    fallback because the agent spec must be self-contained.
+    ``web_search_preview`` passthrough schema. For other models, the
+    spec must set ``search_provider`` to one of the engines in the
+    ``_BACKENDS`` registry (some keyless, some needing credentials) —
+    there is no default and no env var fallback, so the spec is
+    self-contained and the engine used is explicit.
 
     :param config: Spec-level config from config.yaml, e.g.
         ``{"search_provider": "perplexity", "api_key": "pplx-..."}``.
@@ -177,42 +196,26 @@ def _search(query: str, config: dict[str, str]) -> str:
     :param query: The search query string.
     :param config: Spec-level config. Required keys:
 
-        - ``search_provider``: ``"google"``, ``"perplexity"``, ``"nimble"``, or ``"tavily"``
-        - ``api_key``: API key for the chosen backend
+        - ``search_provider`` (required; no default): one of the engine
+          names in the ``_BACKENDS`` registry
+        - ``api_key``: API key for the chosen backend (keyless backends
+          ignore it)
         - ``engine_id``: Required for Google only
 
-    :returns: Search results, or an error message.
+    :returns: Search results, or an error message (including when no
+        ``search_provider`` is configured).
     """
     backend = config.get("search_provider")
 
-    if backend == "google":
-        return _run_google(query, config)
+    engine = _BACKENDS.get(backend) if backend else None
+    if engine is not None:
+        return engine.run(query, config)
 
-    if backend == "perplexity":
-        return _run_perplexity(query, config)
-
-    if backend == "nimble":
-        return _run_nimble(query, config)
-
-    if backend == "tavily":
-        return _run_tavily(query, config)
-
-    return (
-        "web_search requires configuration for non-OpenAI models. "
-        "(For OpenAI models, web_search works automatically with no "
-        "config needed.)\n\n"
-        "Set search_provider and credentials in config.yaml:\n"
-        "  tools:\n"
-        "    builtins:\n"
-        "      - name: web_search\n"
-        "        search_provider: perplexity  # or google, nimble, tavily\n"
-        "        api_key: ${PERPLEXITY_API_KEY}\n\n"
-        "Supported backends:\n"
-        "  - google (requires api_key + engine_id)\n"
-        "  - perplexity (requires api_key)\n"
-        "  - nimble (requires api_key)\n"
-        "  - tavily (requires api_key)"
-    )
+    # Fail loudly instead of silently picking an engine, so the user always
+    # knows which engine ran and opts in explicitly (per maintainer review).
+    if backend:
+        return f"web_search error: unknown search_provider {backend!r}. {_backend_hint()}"
+    return f"web_search error: no search_provider configured. {_backend_hint()}"
 
 
 def _run_google(query: str, config: dict[str, str]) -> str:
@@ -290,3 +293,72 @@ def _run_tavily(query: str, config: dict[str, str]) -> str:
         return "Tavily web search requires api_key in the web_search config."
 
     return _search_tavily(query, config)
+
+
+def _run_duckduckgo(query: str, config: dict[str, str]) -> str:
+    """
+    Run a keyless DuckDuckGo HTML search.
+
+    An opt-in, zero-credential backend — set ``search_provider: duckduckgo``
+    to use it. Best-effort (the public HTML endpoint can rate-limit) — for
+    robust/high-volume search, configure a keyed backend instead.
+
+    :param query: The search query.
+    :param config: Spec-level config (unused; DuckDuckGo needs no credentials).
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_duckduckgo import (
+        _search_duckduckgo,
+    )
+
+    return _search_duckduckgo(query, config)
+
+
+def _run_keenable(query: str, config: dict[str, str]) -> str:
+    """
+    Run a Keenable web search query.
+
+    Keyless by default: unlike the other backends, ``api_key`` is optional.
+    Without it the keyless public endpoint is used; with it the
+    authenticated endpoint is used and rate limits are lifted.
+
+    :param query: The search query.
+    :param config: May contain ``api_key`` and ``max_results`` (both optional).
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_keenable import (
+        _search_keenable,
+    )
+
+    return _search_keenable(query, config)
+
+
+# Single source of truth for the selectable backends. To add an engine, write
+# its ``_run_*`` above and add one row here — the dispatch in ``_search`` and
+# the error hint below both derive from this map, so nothing else needs editing.
+# ``keyless`` drives only the hint wording (which engines need no ``api_key``).
+_BACKENDS: dict[str, _Backend] = {
+    "duckduckgo": _Backend(_run_duckduckgo, keyless=True),
+    "keenable": _Backend(_run_keenable, keyless=True),
+    "google": _Backend(_run_google, keyless=False),
+    "perplexity": _Backend(_run_perplexity, keyless=False),
+    "nimble": _Backend(_run_nimble, keyless=False),
+    "tavily": _Backend(_run_tavily, keyless=False),
+}
+
+
+def _backend_hint() -> str:
+    """Build the "set search_provider to one of ..." hint from ``_BACKENDS``.
+
+    Derived from the registry so the error text can never drift from the set of
+    engines that actually dispatch.
+
+    :returns: A one-line hint naming the keyless and keyed engines.
+    """
+    keyless = [name for name, b in _BACKENDS.items() if b.keyless]
+    keyed = [name for name, b in _BACKENDS.items() if not b.keyless]
+    return (
+        f"Set search_provider to one of: {', '.join(keyless)} (keyless, no API "
+        f"key), or {', '.join(keyed)} with credentials for a sturdier, "
+        "higher-rate backend. No env var fallbacks — the spec is self-contained."
+    )

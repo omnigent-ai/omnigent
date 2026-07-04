@@ -7,9 +7,9 @@ name: Draft release notes
 #   1. Open a PR to omnigent/main updating the granular CHANGELOG.md (harvested
 #      from each merged PR's "## Changelog" section), so the draft's
 #      "Full Changelog" link resolves before the release goes public.
-#   2. Synthesize concise, curated two-section release notes (an Omnigent agent
-#      collapses the merged PRs into ~4-5 themed highlights per section) and drop
-#      them into the GitHub Release DRAFT body for the coordinator to edit.
+#   2. Synthesize concise, curated release notes (an Omnigent agent collapses the
+#      merged PRs into ~4-5 themed highlights per section) and drop them into the
+#      GitHub Release DRAFT body for the coordinator to edit.
 #
 # Why `workflow_run` (not extending github-release.yml): that workflow is
 # deliberately minimal — it runs NO project code, only `gh release create`, so a
@@ -29,9 +29,25 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Final release tag to (re)draft, e.g. v0.3.0
+        description: Release tag/ref to (re)draft (head of the range), e.g. v0.3.0
         required: true
         type: string
+      base:
+        description: >-
+          Optional range-start override (tag/branch/sha). Needed when `tag` is not
+          a final vX.Y.Z. Providing it makes the run a preview unless dry_run=false.
+        required: false
+        type: string
+      dry_run:
+        description: >-
+          Preview only:
+          auto (default) - preview for dev/rc tags, real PR for final versions;
+          true - print the generated notes, don't open a PR;
+          false - open a real PR to CHANGELOG.md
+        required: false
+        type: choice
+        options: [auto, "true", "false"]
+        default: auto
 
 permissions:
   contents: read
@@ -61,41 +77,57 @@ jobs:
         id: guard
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           # On tag push, workflow_run.head_branch is the tag name (v0.3.0).
           RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$RUN_BRANCH}"
-          proceed=true; is_draft=false
+          base="${INPUT_BASE:-}"
+          proceed=false; dry_run=false
 
-          # Final vX.Y.Z only — exclude rc/dev/alpha/beta and non-version tags.
+          # Does the tag look like a final release (vX.Y.Z, not rc/dev/alpha/beta)?
+          is_version=true
           case "$tag" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) proceed=false ;;
+            *) is_version=false ;;
           esac
           case "$tag" in
-            *rc*|*dev*|*a[0-9]*|*b[0-9]*) proceed=false ;;
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_version=false ;;
           esac
 
-          # Is there a DRAFT release for this tag? If it's already published (or a
-          # re-push after publish re-fired this workflow), we must NOT touch the
-          # notes — the coordinator has curated them. The CHANGELOG PR is still
-          # safe to (re)open, so we track isDraft separately.
-          if [ "$proceed" = "true" ]; then
-            state="$(gh release view "$tag" --repo "$SOURCE_REPO" --json isDraft,tagName 2>/dev/null || true)"
-            if [ -z "$state" ]; then
-              echo "::warning::No release found for ${tag} yet — skipping note draft (CHANGELOG PR still runs)."
-              is_draft=false
-            else
-              is_draft="$(printf '%s' "$state" | jq -r '.isDraft')"
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            # Real release cut: strict — only a final version tag proceeds.
+            [ "$is_version" = "true" ] && proceed=true
+          else
+            # Manual dispatch: proceed for a final version tag OR when a base
+            # override is given (arbitrary-ref preview/real run).
+            if [ "$is_version" = "true" ] || [ -n "$base" ]; then
+              proceed=true
             fi
+            # dry_run: `auto` previews for a non-version tag or a base override,
+            # and does a real run for a plain version tag; true/false force it.
+            case "$INPUT_DRY_RUN" in
+              true)  dry_run=true ;;
+              false) dry_run=false ;;
+              *)     if [ "$is_version" != "true" ] || [ -n "$base" ]; then dry_run=true; fi ;;
+            esac
           fi
 
+          # NOTE: we do NOT probe for the draft release here. This step runs with
+          # the read-only GITHUB_TOKEN, and GitHub hides DRAFT releases from tokens
+          # without push access — the probe would always come back empty and wrongly
+          # report "no draft". Draft detection happens after the App token is minted
+          # (see "Resolve draft release"), which can see drafts.
+
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
           echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
-          echo "is_draft=${is_draft}" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=${tag} proceed=${proceed} is_draft=${is_draft}" \
+          echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} base=${base:-<none>} proceed=${proceed} dry_run=${dry_run}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Trusted default branch, full history + tags for the range computation.
@@ -121,15 +153,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.guard.outputs.tag }}
+          BASE: ${{ steps.guard.outputs.base }}
+          DRY_RUN: ${{ steps.guard.outputs.dry_run }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/changelog/generate.py \
-            --tag "$TAG" --repo "$SOURCE_REPO" \
-            --changelog-file CHANGELOG.md \
-            --draft-notes-out /tmp/mechanical_notes.md \
-            --pr-list-out /tmp/pr_list.txt
+          # generate.py orders CHANGELOG.md by PEP 440 (packaging). This step runs
+          # bare python3 (before uv sync), so ensure packaging is importable.
+          python3 -m pip install --quiet --disable-pip-version-check packaging
+          args=(--tag "$TAG" --repo "$SOURCE_REPO"
+                --draft-notes-out /tmp/mechanical_notes.md
+                --pr-list-out /tmp/pr_list.txt
+                --section-out /tmp/section.md)
+          [ -n "${BASE:-}" ] && args+=(--base "$BASE")
+          if [ "$DRY_RUN" = "true" ]; then
+            # Preview only — render, don't touch CHANGELOG.md.
+            args+=(--no-changelog-update)
+          else
+            args+=(--changelog-file CHANGELOG.md)
+          fi
+          python3 .github/scripts/changelog/generate.py "${args[@]}"
           # The mechanical scaffold is the fallback release-notes body.
           cp /tmp/mechanical_notes.md /tmp/release_notes.md
+
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "## Preview — CHANGELOG.md section for \`${TAG}\`"
+              echo '```markdown'; cat /tmp/section.md; echo '```'
+              echo "## Preview — mechanical draft notes"
+              echo '```markdown'; cat /tmp/mechanical_notes.md; echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # --- 2) AI synthesis (primary; degrades to the mechanical scaffold) ---
       - name: Check LLM credentials
@@ -269,7 +322,7 @@ jobs:
       # --- 3) Mint the write-token — ONLY now, after the agent has run ---
       - name: Mint App token (omnigent)
         id: app-token
-        if: steps.guard.outputs.proceed == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
@@ -277,9 +330,42 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: omnigent
 
+      # Find the DRAFT release for this tag using the App token (push access) — a
+      # read-only token can't see drafts. Match by tag_name over the release list:
+      # GitHub's get-by-tag REST endpoint 404s on drafts (their tag isn't "real"
+      # until published), so only a list-and-filter finds them. Sets:
+      #   is_draft   — true only when a matching UNPUBLISHED draft exists (so we
+      #                never clobber notes a maintainer already published).
+      #   release_id — numeric id to edit by (editing by tag would 404 on a draft).
+      - name: Resolve draft release
+        id: release
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.app-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Read TAG via jq's `env`, not by interpolating it into the jq program —
+          # a tag containing `"` or jq syntax would otherwise alter the filter.
+          # (gh api's built-in --jq has no --arg; env keeps the value as data.)
+          match="$(gh api "repos/${SOURCE_REPO}/releases" --paginate \
+            --jq 'map(select(.tag_name == env.TAG)) | first // empty')"
+          is_draft=false; release_id=""
+          if [ -n "$match" ]; then
+            is_draft="$(printf '%s' "$match" | jq -r '.draft')"
+            release_id="$(printf '%s' "$match" | jq -r '.id')"
+          fi
+          if [ "$is_draft" != "true" ]; then
+            echo "::notice::No unpublished draft release found for ${TAG} — leaving release notes untouched (the CHANGELOG PR still runs)."
+          fi
+          echo "is_draft=${is_draft}" >> "$GITHUB_OUTPUT"
+          echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+          echo "Draft release for ${TAG}: is_draft=${is_draft} release_id=${release_id:-<none>}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       # --- 4) Open/update the CHANGELOG.md PR ---
       - name: Open or update the CHANGELOG.md PR
-        if: steps.guard.outputs.proceed == 'true' && steps.app-token.outputs.token != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.app-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SITE_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -316,34 +402,21 @@ jobs:
 
       # --- 5) Enrich the GitHub Release DRAFT body (only while still a draft) ---
       - name: Enrich the release draft body
-        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.is_draft == 'true' && steps.app-token.outputs.token != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.release.outputs.is_draft == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ steps.guard.outputs.tag }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
         run: |
           set -euo pipefail
-          # Preserve the original auto-generated notes in a collapsed section for
-          # the coordinator's reference.
-          orig="$(gh release view "$TAG" --repo "$SOURCE_REPO" --json body -q .body || true)"
-          {
-            cat /tmp/release_notes.md
-            echo
-            echo "<details><summary>Auto-generated notes (reference)</summary>"
-            echo
-            printf '%s\n' "$orig"
-            echo
-            echo "</details>"
-          } > /tmp/final_notes.md
-          gh release edit "$TAG" --repo "$SOURCE_REPO" --notes-file /tmp/final_notes.md
+          # github-release.yml seeds only a short placeholder body (no
+          # auto-generated notes), so replace it wholesale with the curated notes.
+          # Edit by release ID: a draft release can't be addressed by tag (the
+          # get/edit-by-tag REST endpoint 404s until the release is published).
+          gh api --method PATCH "repos/${SOURCE_REPO}/releases/${RELEASE_ID}" \
+            --field body=@/tmp/release_notes.md > /dev/null
           echo "Enriched the ${TAG} release draft with curated notes." \
             | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Note draft skipped (already published)
-        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.is_draft != 'true'
-        env:
-          TAG: ${{ steps.guard.outputs.tag }}
-        run: |
-          echo "::notice::Release ${TAG} is not a draft — left its notes untouched (only the CHANGELOG PR ran)."
 
       # ::add-mask:: redacts rendered logs, not artifact files — scrub the key
       # from artifacts (incl. the unscanned stderr) before upload.

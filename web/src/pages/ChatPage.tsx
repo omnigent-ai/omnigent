@@ -78,7 +78,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
@@ -2831,6 +2831,21 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
+  const [isCopied, setIsCopied] = useState(false);
+  const copyTimeoutRef = useRef<number>(0);
+
+  const handleCopy = async () => {
+    if (!text || !navigator?.clipboard?.writeText) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setIsCopied(true);
+      window.clearTimeout(copyTimeoutRef.current);
+      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
+
   return (
     <Message
       from="user"
@@ -2950,6 +2965,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
+      {text && (
+        <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <MessageAction tooltip="Copy" onClick={handleCopy}>
+            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+          </MessageAction>
+        </MessageActions>
+      )}
     </Message>
   );
 }
@@ -3314,6 +3336,7 @@ export function composerHarnessLabel(
   modelPickerKind: NativeModelPickerKind | null,
   agentName: string | null | undefined,
   sessionHarness: string | null,
+  harnessLabels: Record<string, string> = BRAIN_HARNESS_LABELS,
 ): string | null {
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
@@ -3321,7 +3344,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
   const display = agentName ? agentDisplayLabel(agentName) : null;
-  const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
+  const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
   return display ?? harness;
 }
@@ -3601,6 +3624,7 @@ export function Composer({
   // picker trigger owns model/effort now, so the identity moves here.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   const subAgentName = useChatStore((s) => s.subAgentName);
+  const brainHarnessLabels = useBrainHarnessLabels();
   const harnessLabel = composerHarnessLabel(
     modelPickerKind,
     // For a sub-agent (head) session, identify the head family being viewed
@@ -3611,6 +3635,7 @@ export function Composer({
       agents?.[0]?.name ??
       null,
     sessionHarness,
+    brainHarnessLabels,
   );
 
   // Preserve unsent text + file attachments per session so switching

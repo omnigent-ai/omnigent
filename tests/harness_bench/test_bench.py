@@ -161,3 +161,72 @@ async def test_live_harness_matches_declared(
             for c in drifted
         )
     )
+
+
+# ── full-server async shims (offline) ───────────────────────────
+
+
+async def test_full_server_async_shims_delegate_to_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FullServerDriver async protocol methods delegate to the sync ones.
+
+    The live gated tests exercise the sync entry points; this covers the
+    asyncio.to_thread shims (and __aenter__/__aexit__) offline so a regression
+    in the async binding is caught without a server+runner. Builds no driver
+    state — every sync method is stubbed.
+    """
+    from tests.harness_bench.driver import TurnResult
+    from tests.harness_bench.full_server_driver import FullServerDriver
+    from tests.harness_bench.profile import BenchProfile
+
+    profile = BenchProfile(harness="stub", model="m", env_prefix="HARNESS_STUB_", marker="STUB_OK")
+    driver = FullServerDriver(profile, databricks_profile="oss")
+    calls: list[str] = []
+
+    def _stub(name: str, **kw: object):
+        calls.append(f"{name}:{kw}")
+        return TurnResult(completed=True)
+
+    monkeypatch.setattr(driver, "__enter__", lambda: (calls.append("enter"), driver)[1])
+    monkeypatch.setattr(driver, "__exit__", lambda *a: calls.append("exit"))
+    monkeypatch.setattr(driver, "run_turn", lambda prompt, **kw: _stub("run_turn", prompt=prompt))
+    monkeypatch.setattr(driver, "streaming_probe_turn", lambda **kw: _stub("streaming"))
+    monkeypatch.setattr(driver, "tool_probe_turn", lambda **kw: _stub("tool", **kw))
+    monkeypatch.setattr(driver, "interrupt_probe_turn", lambda **kw: _stub("interrupt"))
+
+    async with driver as d:
+        assert d is driver
+        assert (await d.run_basic_turn("STUB_OK")).completed
+        assert (await d.run_streaming_turn()).completed
+        assert (await d.run_tool_turn(deny=True)).completed
+        assert (await d.run_interrupt_turn()).completed
+
+    assert calls[0] == "enter" and calls[-1] == "exit"
+    assert any(c.startswith("tool:") and "True" in c for c in calls)
+
+
+# ── native-tui transport (offline) ──────────────────────────────
+
+
+def test_native_tui_registered_and_gates() -> None:
+    """native-tui is in the registry and gates unwired vendors cleanly."""
+    from tests.harness_bench.native_tui_driver import NativeTuiDriver
+    from tests.harness_bench.transport import driver_registry, resolve_driver_class
+
+    assert driver_registry()["native-tui"] is NativeTuiDriver
+
+    # A --transport override routes any profile to the native driver.
+    claude_native = BenchProfile(
+        harness="claude-native", model="m", env_prefix="HARNESS_CLAUDE_NATIVE_", marker="X"
+    )
+    assert resolve_driver_class(claude_native, override="native-tui") is NativeTuiDriver
+
+    # A native harness with no vendor entry (not yet wired) is a clean skip,
+    # never a crash — the walking skeleton only wires claude-native.
+    cursor_native = BenchProfile(
+        harness="cursor-native", model="m", env_prefix="HARNESS_CURSOR_NATIVE_", marker="X"
+    )
+    reason = NativeTuiDriver.unavailable(cursor_native, databricks_profile="oss")
+    assert reason is not None and "cursor-native" in reason
+
+    # No profile → the same capability-neutral skip contract as other drivers.
+    assert NativeTuiDriver.unavailable(claude_native, databricks_profile=None) is not None

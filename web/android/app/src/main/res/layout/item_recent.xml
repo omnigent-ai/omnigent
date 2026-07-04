@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A single recent-server row: bordered, truncated in the middle, like iOS. -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="48dp"
+    android:layout_marginBottom="8dp"
+    android:background="@drawable/bg_recent"
+    android:ellipsize="middle"
+    android:gravity="center_vertical"
+    android:paddingHorizontal="12dp"
+    android:singleLine="true"
+    android:textColor="@color/brand_foreground"
+    android:textSize="14sp" />

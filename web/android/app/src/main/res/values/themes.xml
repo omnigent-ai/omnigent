@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Edge-to-edge is driven in code (WindowCompat.setDecorFitsSystemWindows).
+      The cutout mode lets the WebView extend into the display cutout so
+      injected safe-area insets cover notched devices.
+    -->
+    <style name="Theme.Omnigent" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

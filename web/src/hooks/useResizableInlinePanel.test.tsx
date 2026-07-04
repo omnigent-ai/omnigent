@@ -91,3 +91,43 @@ describe("useResizableInlinePanel persistence", () => {
     expect(result.current.panelWidth).toBe(620);
   });
 });
+
+describe("useResizableInlinePanel drag overlay", () => {
+  const overlaySelector = () =>
+    [...document.body.children].find(
+      (c): c is HTMLElement =>
+        c instanceof HTMLElement && c.style.position === "fixed" && c.style.zIndex === "2147483647",
+    ) ?? null;
+
+  it("mounts a full-window overlay during a drag so mouseup isn't lost to an iframe", () => {
+    // The panel sits beside the sandboxed HTML-preview iframe. Without an
+    // overlay, dragging over the frame routes mousemove/mouseup into it and the
+    // parent never sees the release, so the drag sticks to the cursor.
+    const { result, unmount } = renderHook(() => useResizableInlinePanel(SESSION));
+    expect(overlaySelector()).toBeNull();
+
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    const overlay = overlaySelector();
+    expect(overlay).not.toBeNull();
+    expect(overlay?.style.cursor).toBe("col-resize");
+
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(overlaySelector()).toBeNull();
+    unmount();
+  });
+
+  it("removes the overlay if unmounted mid-drag", () => {
+    const { result, unmount } = renderHook(() => useResizableInlinePanel(SESSION));
+    act(() =>
+      result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
+    );
+    expect(overlaySelector()).not.toBeNull();
+
+    // Panel closes (e.g. tab switch) while still dragging — cleanup must not
+    // leave the transparent overlay swallowing every click on the page.
+    unmount();
+    expect(overlaySelector()).toBeNull();
+  });
+});

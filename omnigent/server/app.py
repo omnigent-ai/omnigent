@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -23,7 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.native_coding_agents import (
+from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -58,6 +58,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -124,7 +125,18 @@ def _register_web_mimetypes() -> None:
 
 _register_web_mimetypes()
 
-_WEB_UI_DIST = Path(__file__).parent / "static" / "web-ui"
+# Default: the SPA bundled into the installed wheel's package data. A deploy
+# that ships the SPA outside the wheel (e.g. as loose files in the app source
+# tree, to keep the wheel under a per-file size cap) can point here instead via
+# OMNIGENT_WEB_UI_DIST, without rebuilding or repackaging.
+_WEB_UI_DIST = Path(
+    os.environ.get("OMNIGENT_WEB_UI_DIST") or (Path(__file__).parent / "static" / "web-ui")
+)
+# Static explainer served at "/" when no web UI bundle is present (an API-only
+# build, or an install that skipped the web UI). Kept as a file rather than an
+# inline string so it doesn't clutter the app definition; it's pure static
+# markup with no interpolation. Shipped via package-data in pyproject.toml.
+_API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.html"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
@@ -420,7 +432,7 @@ def _ensure_default_agents(
     _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_opencode_native_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
@@ -605,7 +617,7 @@ def _build_opencode_native_bundle() -> bytes:
         return _tar_gz_dir(bundle_dir)
 
 
-def _ensure_default_opencode_agent(
+def _ensure_default_opencode_native_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
@@ -1341,6 +1353,16 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
+    # Admin roster: the config ``admins:`` list (canonical) union'd with the
+    # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
+    # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
+    # same source — otherwise an identity listed in the file but not yet
+    # promoted (``promote_if_listed`` runs at login) would be authorized by the
+    # routes yet see no admin chrome. The file portion lazily reloads on mtime
+    # change (no restart).
+    from omnigent.server.admin_list import load_admin_list
+
+    admin_list = load_admin_list(extra=frozenset(admins or ()))
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -1825,21 +1847,27 @@ def create_app(
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
-    async def me(request: Request) -> dict[str, str | None] | JSONResponse:
+    async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
         """Return the current user's identity.
 
         Reads the user from the auth provider (same logic that
         session routes use). The frontend calls this on load to
         discover who it is.
 
+        Also returns ``is_admin`` — the mode-agnostic admin signal
+        (the shared ``users.is_admin`` column, set by the admin-list
+        promotion at login). The SPA gates admin chrome on it in
+        EVERY mode, including OIDC/SSO where the accounts-only
+        ``/auth/me`` endpoint does not exist.
+
         When OIDC is active and the user is unauthenticated,
         returns 401 with a ``login_url`` so the frontend knows
         where to redirect.
 
         :param request: The incoming FastAPI request.
-        :returns: ``{"user_id": "alice@example.com"}``,
-            ``{"user_id": null}`` if unauthenticated in header
-            mode, or 401 with ``login_url`` in OIDC mode.
+        :returns: ``{"user_id": "alice@example.com", "is_admin": true}``,
+            ``{"user_id": null, "is_admin": false}`` if unauthenticated
+            in header mode, or 401 with ``login_url`` in OIDC mode.
         """
         user_id: str | None = None
         if auth_provider is not None:
@@ -1850,7 +1878,17 @@ def create_app(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
             )
-        return {"user_id": user_id}
+        # Mirror the admin check the auth routes use
+        # (``permission_store.is_admin(caller) or admin_list.is_admin(caller)``)
+        # so the SPA's admin chrome never under-reports relative to what the
+        # endpoints actually authorize — e.g. for an identity added to the
+        # admin-list file who hasn't re-logged-in yet (so ``promote_if_listed``
+        # hasn't flipped the DB flag).
+        is_admin = user_id is not None and (
+            (permission_store is not None and permission_store.is_admin(user_id))
+            or admin_list.is_admin(user_id)
+        )
+        return {"user_id": user_id, "is_admin": is_admin}
 
     app.include_router(
         create_sessions_router(
@@ -1892,6 +1930,11 @@ def create_app(
         ),
         prefix="/v1",
         tags=["agents"],
+    )
+    app.include_router(
+        create_harnesses_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["harnesses"],
     )
     app.include_router(
         create_terminal_attach_router(
@@ -1971,6 +2014,25 @@ def create_app(
             _session_status_cache,
         )
 
+        # Newest-wins guard: a superseded tunnel's teardown fires this
+        # hook after a fresh tunnel for the same ``runner_id`` already
+        # registered (``TunnelRegistry.register`` retires the old
+        # session, whose helper tasks then error out and run this
+        # teardown). Marking the runner's sessions ``failed`` here would
+        # clobber the live tunnel's recovery: reconnect-recovery
+        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
+        # may have just cleared a stale ``runner_disconnected`` failure,
+        # and this stale disconnect would silently re-fail the session.
+        # If a live tunnel is registered for this runner, the runner is
+        # NOT offline, so skip. Mirrors the registry's own
+        # generation-guarded ``deregister``.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                runner_id,
+            )
+            return
+
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -2042,7 +2104,10 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
-        from omnigent.server.routes.sessions import _ensure_runner_relay
+        from omnigent.server.routes.sessions import (
+            _ensure_runner_relay,
+            _publish_runner_recovered_status,
+        )
 
         # Direct by-runner lookup instead of list-everything-and-filter:
         # the listing path may be backed by an eventually-consistent
@@ -2106,6 +2171,19 @@ def create_app(
                 runner_id,
                 routed.client,
                 conversation_store,
+            )
+            # A reconnect can land the runner back on an idle session with
+            # no new turn (a transient WS blip; the runner process
+            # survived). The disconnect left the session marked failed with
+            # persisted ``runner_disconnected`` labels, and without a
+            # ``running`` edge nothing clears them — the Subagents panel
+            # keeps the grey "Disconnected" dot until the next user
+            # message. Clearing on reconnect drops it as soon as the runner
+            # is reachable again. The helper self-guards: it only clears a
+            # session whose persisted failure is ``runner_disconnected``, so
+            # a genuine task failure survives the reconnect untouched.
+            await _publish_runner_recovered_status(
+                conv.id, conversation_store, require_disconnect_code=True
             )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
@@ -2186,16 +2264,12 @@ def create_app(
     # Must be registered BEFORE the SPA static mount because the SPA's
     # HTML5-history fallback catches all unmatched extensionless paths.
     if auth_provider is not None and getattr(auth_provider, "login_url", None):
-        from omnigent.server.admin_list import load_admin_list
         from omnigent.server.auth import UnifiedAuthProvider
 
-        # Admin roster: the config ``admins:`` list (canonical) union'd
-        # with the runtime-editable ``<data_dir>/admins`` file. Consulted
-        # on each login to promote listed identities — the only admin
-        # path for OIDC, and an additive convenience for accounts. The
-        # file portion lazily reloads on mtime change (no restart).
-        admin_list = load_admin_list(extra=frozenset(admins or ()))
-
+        # ``admin_list`` is built once near app creation (see above) so the
+        # auth routes and ``/v1/me`` share one roster. Consulted on each login
+        # to promote listed identities — the only admin path for OIDC, and an
+        # additive convenience for accounts.
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
@@ -2265,7 +2339,8 @@ def create_app(
             app.include_router(router, prefix=prefix, tags=tags)
 
     web_ui_dist = _WEB_UI_DIST
-    if web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file():
+    web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
+    if web_ui_present:
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
@@ -2275,26 +2350,16 @@ def create_app(
             name="web-ui",
         )
     else:
+        # No SPA bundle (API-only build, or an install that skipped the web
+        # UI). The "/" route isn't used for anything else, so just always serve
+        # a short HTML explainer there with a 200 — no content negotiation. A
+        # normal install bundles the UI and the static mount above owns "/", so
+        # this only applies to API-only servers.
 
         @app.get("/", include_in_schema=False)
-        async def root() -> dict[str, str]:
-            """
-            Return API server metadata when no web UI build is bundled.
-
-            Databricks Apps opens the app URL at ``/`` in a browser.
-            API-only wheels intentionally omit the SPA assets, so serve
-            a small JSON landing response instead of FastAPI's generic
-            404. When a web UI build is present, the static mount above
-            owns ``/`` and this fallback is not registered.
-
-            :returns: Service metadata with health and docs paths.
-            """
-            return {
-                "service": "omnigent",
-                "status": "ok",
-                "health": "/health",
-                "docs": "/docs",
-            }
+        async def root() -> FileResponse:
+            """Serve the API-only landing page (no web UI bundle present)."""
+            return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     return app
 

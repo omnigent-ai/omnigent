@@ -11,9 +11,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from tests.harness_bench.driver import SdkInprocDriver
 from tests.harness_bench.probes import ALL_PROBES, CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import resolve_driver_class
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict, reconcile
 
 # A progress sink: the bench calls it with human-readable status lines as it
@@ -138,6 +138,7 @@ async def run_harness(
     probes: list[CapabilityProbe] | None = None,
     databricks_profile: str | None = None,
     live: bool = True,
+    transport: str | None = None,
     progress: Progress | None = None,
 ) -> HarnessReport:
     """Run every applicable probe against one harness.
@@ -149,6 +150,8 @@ async def run_harness(
     :param live: When ``False``, produce a declared-only report (every
         cell ``SKIPPED`` with an "offline" note) without spawning
         anything — used for a fast ``--list``/dry render.
+    :param transport: ``--transport`` override; wins over the profile's
+        declared transport when set (see :func:`resolve_driver_class`).
     :param progress: Optional status sink called with human-readable lines
         as the harness spawns and each probe runs. ``None`` stays silent.
     :returns: The :class:`HarnessReport`.
@@ -158,7 +161,8 @@ async def run_harness(
     if not live:
         return _uniform_report(profile, probes, ProbeResult.skipped("offline (declared shown)"))
 
-    unavailable = SdkInprocDriver.unavailable(profile, databricks_profile=databricks_profile)
+    driver_cls = resolve_driver_class(profile, override=transport)
+    unavailable = driver_cls.unavailable(profile, databricks_profile=databricks_profile)
     if unavailable is not None:
         _emit(progress, f"[{profile.harness}] skipped: {unavailable}")
         return _uniform_report(
@@ -168,11 +172,11 @@ async def run_harness(
     assert databricks_profile is not None  # guaranteed by the unavailable() check
     _emit(
         progress,
-        f"[{profile.harness}] launching wrap subprocess "
-        f"(transport={profile.transport}, model={profile.model}); first turn may take ~10-30s...",
+        f"[{profile.harness}] provisioning {driver_cls.transport} transport "
+        f"(model={profile.model}); first turn may take ~10-30s...",
     )
     cells: list[CellResult] = []
-    async with SdkInprocDriver(profile, databricks_profile=databricks_profile) as driver:
+    async with driver_cls(profile, databricks_profile=databricks_profile) as driver:
         prereq_skip: str | None = None
         for probe in probes:
             if not _applicable(probe, profile):
@@ -207,6 +211,7 @@ async def run_bench(
     probes: list[CapabilityProbe] | None = None,
     databricks_profile: str | None = None,
     live: bool = True,
+    transport: str | None = None,
     progress: Progress | None = None,
 ) -> BenchMatrix:
     """Run the bench across *profiles*, sequentially, into a :class:`BenchMatrix`."""
@@ -216,6 +221,7 @@ async def run_bench(
             probes=probes,
             databricks_profile=databricks_profile,
             live=live,
+            transport=transport,
             progress=progress,
         )
         for p in profiles

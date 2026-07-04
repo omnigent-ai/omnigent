@@ -37,8 +37,8 @@ def test_preserves_existing_sections_and_adds_missing_optional_context() -> None
     assert "## Changelog" in formatted
 
 
-def test_scaffolds_changelog_section_with_skip_default() -> None:
+def test_scaffolds_changelog_section_with_delete_placeholder() -> None:
     formatted = pr_autoformat.format_body("Fix the important thing.")
     assert "## Changelog" in formatted
-    # The scaffolded section defaults to the `skip` sentinel.
-    assert formatted.rstrip().endswith("skip")
+    # The scaffolded section defaults to the delete-if-not-noteworthy placeholder.
+    assert formatted.rstrip().endswith("else delete this section>")

@@ -161,6 +161,16 @@ def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
             if val is not None:
                 usage[dst] = val
                 break
+    # cursor's inputTokens is INCLUSIVE of cache read + write. compute_llm_cost
+    # expects input_tokens to be the NON-cached portion and prices the cache
+    # buckets additively, so subtract the cached tokens here — otherwise they
+    # are billed twice (once at the full input rate, once at their cache rate).
+    # Mirrors the qwen / antigravity executors. Clamp so a malformed cached >
+    # input never goes negative. total_tokens keeps the reported inclusive total.
+    cached = (usage.get("cache_read_input_tokens") or 0) + (
+        usage.get("cache_creation_input_tokens") or 0
+    )
+    usage["input_tokens"] = max(0, in_tok - cached)
     return usage
 
 
@@ -660,9 +670,12 @@ class CursorExecutor(Executor):
         try:
             from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
         except ImportError as exc:
+            from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
+            from omnigent.onboarding.extra_install import extra_install_display
+
             raise ImportError(
                 "CursorExecutor requires the 'cursor-sdk' package. "
-                "Install it with: uv pip install cursor-sdk"
+                f"Install it with: {extra_install_display(CURSOR_EXTRA)}"
             ) from exc
 
         loop = asyncio.get_running_loop()

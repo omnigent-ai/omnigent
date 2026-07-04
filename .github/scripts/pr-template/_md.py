@@ -12,6 +12,7 @@ import re
 
 _HEADING_RE = re.compile(r"(?im)^\s*##\s+(.+?)\s*$")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_CHECKBOX_RE = re.compile(r"(?im)^\s*-\s*\[(?P<mark>[ xX])\]\s*(?P<label>.+?)\s*$")
 
 
 def strip_html_comments(text: str) -> str:
@@ -49,50 +50,76 @@ def section_text(body: str, heading: str) -> str:
     return section(body, heading_spans(body), heading)
 
 
+# --- checkbox parsing (shared by the gate and the harvester) ----------------
+
+
+def checked_labels(section_raw: str, expected_labels: tuple[str, ...]) -> set[str]:
+    """Return the canonical labels whose checkbox is ticked in *section_raw*."""
+    expected_by_lower = {label.lower(): label for label in expected_labels}
+    checked: set[str] = set()
+    for match in _CHECKBOX_RE.finditer(section_raw):
+        label = match.group("label").strip()
+        canonical = expected_by_lower.get(label.lower())
+        if canonical and match.group("mark").lower() == "x":
+            checked.add(canonical)
+    return checked
+
+
 # --- "## Changelog" section format ------------------------------------------
 #
-# Authors write zero or more `<Category>: one-line description` lines, or the
-# `skip` sentinel when there's nothing user-facing to announce. The same parser
-# backs the PR gate (validate.py) and the release harvester (generate.py).
+# The section holds a free-text, user-voice one-liner describing the change (the
+# author may hard-wrap it — we take the first line). The category/tag is NOT
+# written here; it is derived from the "Type of change" checkboxes via TYPE_TAGS.
+# The section is optional: an author deletes it (or leaves the `<…>` placeholder)
+# when the change isn't noteworthy, and the PR is then omitted from the changelog.
+# The same parser backs the PR gate (validate.py) and the harvester (generate.py).
 
-CHANGELOG_CATEGORIES = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
+# "Type of change" checkbox label -> bracket tag rendered in CHANGELOG.md.
+TYPE_TAGS: dict[str, str] = {
+    "UI / frontend change": "UI",
+    "Bug fix": "Bug fix",
+    "Feature": "Feature",
+    "Docs": "Docs",
+    "Refactor / chore": "Chore",
+    "Test / CI": "Test/CI",
+    "Breaking change": "Breaking",
+}
 
-_SKIP_SENTINELS = frozenset({"skip", "n/a", "na", "none", "-"})
-_ENTRY_RE = re.compile(
-    r"(?i)^\s*[-*]?\s*(?P<cat>Added|Changed|Deprecated|Removed|Fixed|Security)"
-    r"\s*:\s*(?P<text>.+\S)\s*$"
-)
-
-
-def _content_lines(section_raw: str) -> list[str]:
-    return [ln.strip() for ln in strip_html_comments(section_raw).splitlines() if ln.strip()]
-
-
-def is_changelog_skip(section_raw: str) -> bool:
-    """True when the section is empty or only the `skip`/`n/a` sentinel."""
-    lines = _content_lines(section_raw)
-    if not lines:
-        return True
-    return all(ln.lstrip("-* ").strip().lower() in _SKIP_SENTINELS for ln in lines)
+_PLACEHOLDER_RE = re.compile(r"^\s*<.*>\s*$")
+# Markers meaning "nothing to announce" — the section is optional and deletable,
+# but authors (and the old template's `skip` sentinel) still write these; treat
+# them as an absent section rather than leaking them in as literal entries.
+_OMIT_MARKERS = frozenset({"skip", "n/a", "na", "none", "-"})
 
 
-def parse_changelog_entries(section_raw: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """Parse a "## Changelog" section.
+def is_placeholder(line: str) -> bool:
+    """True when *line* is the untouched ``<…>`` template placeholder."""
+    return bool(_PLACEHOLDER_RE.match(line))
 
-    Returns ``(entries, malformed)`` where *entries* is a list of
-    ``(canonical_category, description)`` tuples and *malformed* is the list of
-    non-blank, non-sentinel lines that did not match ``<Category>: text``.
+
+def changelog_description(section_raw: str) -> str:
+    """First meaningful line of a "## Changelog" section.
+
+    Strips HTML comments, then returns the first non-blank line — unless that
+    line is the ``<…>`` placeholder or an omit marker (``skip``/``n/a``/…), in
+    which case the section counts as absent and this returns ``""``. Multi-line /
+    wrapped bodies collapse to their first line.
     """
-    entries: list[tuple[str, str]] = []
-    malformed: list[str] = []
-    for line in _content_lines(section_raw):
-        if line.lstrip("-* ").strip().lower() in _SKIP_SENTINELS:
+    for raw in strip_html_comments(section_raw).splitlines():
+        line = raw.strip()
+        if not line:
             continue
-        match = _ENTRY_RE.match(line)
-        if match:
-            cat = match.group("cat").lower()
-            canonical = next(c for c in CHANGELOG_CATEGORIES if c.lower() == cat)
-            entries.append((canonical, match.group("text").strip()))
-        else:
-            malformed.append(line)
-    return entries, malformed
+        if is_placeholder(line) or line.lower() in _OMIT_MARKERS:
+            return ""
+        return line
+    return ""
+
+
+def type_tag(labels: set[str]) -> str:
+    """Render the bracket tag for the checked Type-of-change *labels*.
+
+    Joined with ` / ` in TYPE_TAGS declaration order (e.g. ``[UI / Bug fix]``).
+    Returns ``""`` when no known type is checked.
+    """
+    tags = [tag for label, tag in TYPE_TAGS.items() if label in labels]
+    return f"[{' / '.join(tags)}]" if tags else ""

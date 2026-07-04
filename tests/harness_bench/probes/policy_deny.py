@@ -14,28 +14,10 @@ was actually surfaced and that the DENY landed on ``PHASE_TOOL_CALL``.
 
 from __future__ import annotations
 
-from tests.harness_bench.driver import PHASE_TOOL_CALL, SdkInprocDriver
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict
-
-_TOOL_NAME = "bench_forbidden"
-_TOOL_SPEC = [
-    {
-        "type": "function",
-        "function": {
-            "name": _TOOL_NAME,
-            "description": "A tool the policy engine will deny. Call it when asked.",
-            "parameters": {
-                "type": "object",
-                "properties": {"arg": {"type": "string"}},
-                "required": ["arg"],
-            },
-        },
-    }
-]
-
-_DENY_REASON = "bench-policy-deny"
 
 
 class PolicyDenyProbe(CapabilityProbe):
@@ -44,16 +26,11 @@ class PolicyDenyProbe(CapabilityProbe):
     priority = Priority.P0
     applies_to = Applicability.BOTH
 
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
-        result = await driver.run_turn(
-            f"Call the {_TOOL_NAME} tool with arg='go'. It is required.",
-            tools=_TOOL_SPEC,
-            deny_phases=frozenset({PHASE_TOOL_CALL}),
-            policy_reason=_DENY_REASON,
-            # No auto tool output: a correctly-enforced DENY means the tool
-            # never runs, so there is no result to return.
-            timeout=150.0,
-        )
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
+        # The driver owns the deny mechanism (a tool_call-phase verdict on the
+        # wrap path, a spec-baked deny policy on full-server); the probe only
+        # cares whether a surfaced tool call was actually blocked.
+        result = await driver.run_tool_turn(deny=True)
         detail = {
             "policy_actions": result.policy_actions,
             "tool_call_denied": result.tool_call_denied,

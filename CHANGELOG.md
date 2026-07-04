@@ -1,10 +1,9 @@
 # Changelog
 
 All notable user-facing changes to omnigent are documented here. This file is
-generated at release time from each PR's `## Changelog` section; the concise,
-curated highlights live on the website under `/releases`.
-
-The format follows [Keep a Changelog](https://keepachangelog.com/).
+generated at release time from each PR's `## Changelog` section, tagged by the
+PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
+website under `/releases`.
 
 ## [v0.3.0] — 2026-06-26
 

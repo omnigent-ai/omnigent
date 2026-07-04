@@ -73,9 +73,10 @@ def format_body(body: str) -> str:
     body = _append_section(
         body,
         "Changelog",
-        "<!-- One or more '<Category>: description' lines (Added | Changed | "
-        "Fixed | Deprecated | Removed | Security) for user-facing changes, or "
-        "'skip'. A Breaking change must always be announced. -->\n\nskip",
+        "<!-- One line, in the user's voice, describing the user-facing change; "
+        "the category comes from the 'Type of change' boxes above. DELETE this "
+        "section if the change isn't noteworthy (a Breaking change must keep it). "
+        "-->\n\n<Add a line to describe the change, else delete this section>",
     )
     return body.rstrip() + "\n"
 

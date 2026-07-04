@@ -42,6 +42,33 @@ PHASE_TOOL_CALL = "PHASE_TOOL_CALL"
 
 _CONV_ID = "conv_bench"
 
+# Wrap-transport turn shapes for the semantic driver methods. The wrap path
+# provokes a tool call with a request-level function tool (unlike full-server,
+# which uses a builtin); prompts are long enough that a streaming harness
+# emits many deltas and an interrupted turn has visibly less output.
+_STREAM_PROMPT = (
+    "Count from 1 to 30 in words, one number per line, and add a short note after each."
+)
+_LONG_PROMPT = (
+    "Write a very detailed 600-word essay about the history of computing, in full paragraphs."
+)
+_BENCH_TOOL_NAME = "bench_tool"
+_BENCH_DENY_REASON = "bench-policy-deny"
+_BENCH_TOOL_SPEC = [
+    {
+        "type": "function",
+        "function": {
+            "name": _BENCH_TOOL_NAME,
+            "description": "A bench probe tool. Call it when asked.",
+            "parameters": {
+                "type": "object",
+                "properties": {"arg": {"type": "string"}},
+                "required": ["arg"],
+            },
+        },
+    }
+]
+
 # Substrings in a turn error that mean the *environment* is the problem
 # (auth, entitlement, gateway, connectivity) rather than a real capability
 # gap. Turns that fail this way are reported SKIPPED, never UNSUPPORTED, so
@@ -291,6 +318,45 @@ class SdkInprocDriver:
         except (asyncio.TimeoutError, httpx.ReadTimeout):
             result.timed_out = True
         return result
+
+    # ── semantic driver protocol ─────────────────────────────
+    # The probe-facing surface (see tests/harness_bench/transport.py). Each
+    # method wraps run_turn with the wrap-transport mechanism for one
+    # capability dimension, so probes stay transport-agnostic.
+
+    async def run_basic_turn(self, marker: str) -> TurnResult:
+        return await self.run_turn(
+            f"Reply with exactly the literal string {marker} and nothing else."
+        )
+
+    async def run_streaming_turn(self) -> TurnResult:
+        return await self.run_turn(_STREAM_PROMPT)
+
+    async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+        """Provoke a tool call via a request-level function tool.
+
+        With *deny*, answer the tool-call policy evaluation DENY (and post no
+        tool result, since a blocked call never runs); otherwise auto-answer
+        the call so the turn completes.
+        """
+        if deny:
+            return await self.run_turn(
+                f"Call the {_BENCH_TOOL_NAME} tool with arg='go'. It is required.",
+                tools=_BENCH_TOOL_SPEC,
+                deny_phases=frozenset({PHASE_TOOL_CALL}),
+                policy_reason=_BENCH_DENY_REASON,
+                timeout=150.0,
+            )
+        return await self.run_turn(
+            f"You must call the {_BENCH_TOOL_NAME} tool with arg='go', "
+            "then reply with the tool's output verbatim.",
+            tools=_BENCH_TOOL_SPEC,
+            auto_tool_output="bench-tool-ok",
+            timeout=150.0,
+        )
+
+    async def run_interrupt_turn(self) -> TurnResult:
+        return await self.run_turn(_LONG_PROMPT, interrupt_on_first_delta=True, timeout=120.0)
 
     async def _drive(
         self,
