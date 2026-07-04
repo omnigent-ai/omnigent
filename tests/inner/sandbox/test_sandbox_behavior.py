@@ -26,6 +26,7 @@ Backend-specific emit assertions live in the per-backend modules
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from collections.abc import Callable
@@ -34,7 +35,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.os_env import _project_root, create_os_environment
 from tests.inner.sandbox.conftest import run_async
 
 # ---------------------------------------------------------------------------
@@ -645,6 +646,41 @@ def test_sandbox_helper_inherits_explicit_env_passthrough(
         f"stdout={result['stdout']!r} stderr={result.get('stderr')!r}"
     )
     assert "sk-still-blocked" not in (leak_check.get("stdout", "") + leak_check.get("stderr", ""))
+
+
+def test_sandbox_shell_child_pythonpath_excludes_omnigent_project_root(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+) -> None:
+    """
+    Shell children should not import through the helper's omnigent
+    checkout entry in ``PYTHONPATH``.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            # The stripped entry comes from _start_locked's helper injection.
+            sandbox=active_sandbox_spec_factory(),
+        )
+    )
+    try:
+        result = run_async(
+            os_env.shell(
+                f"{sys.executable} -c \"import os;print(os.environ.get('PYTHONPATH',''))\""
+            )
+        )
+    finally:
+        os_env.close()
+
+    assert result["exit_code"] == 0, (
+        "Expected child shell to print PYTHONPATH successfully: "
+        f"stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
+    )
+    child_pythonpath_entries = [
+        entry for entry in result["stdout"].strip().split(os.pathsep) if entry
+    ]
+    assert str(_project_root()) not in child_pythonpath_entries
 
 
 # ---------------------------------------------------------------------------

@@ -1329,10 +1329,24 @@ def _shell_impl(
         characters.
     """
     argv = _shell_argv(shell_path, command)
+    child_env = os.environ.copy()
+    if "PYTHONPATH" in child_env:
+        project_root = str(_project_root())
+        # The helper needs this checkout to import itself, but project
+        # commands should resolve packages from their own environment.
+        pythonpath_entries = [
+            entry for entry in child_env["PYTHONPATH"].split(os.pathsep) if entry != project_root
+        ]
+        if pythonpath_entries:
+            child_env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+        else:
+            del child_env["PYTHONPATH"]
+
     try:
         completed = subprocess.run(
             argv,
             cwd=str(cwd),
+            env=child_env,
             text=True,
             capture_output=True,
             timeout=timeout,

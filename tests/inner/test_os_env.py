@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import base64
+import os
+import sys
 import tracemalloc
 from pathlib import Path
 
-from omnigent.inner.os_env import _read_impl, build_helper_env
+import pytest
+
+from omnigent.inner.os_env import _project_root, _read_impl, _shell_impl, build_helper_env
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VALUE,
@@ -109,6 +113,78 @@ def test_build_helper_env_active_passes_omnigent_session_marker() -> None:
     env = build_helper_env(parent, _active_policy())
 
     assert env[OMNIGENT_SESSION_ENV_VAR] == OMNIGENT_SESSION_ENV_VALUE
+
+
+# ---------------------------------------------------------------------------
+# _shell_impl
+# ---------------------------------------------------------------------------
+
+
+def _print_pythonpath_command() -> str:
+    return f"{sys.executable} -c \"import os;print(os.environ.get('PYTHONPATH',''))\""
+
+
+def test_shell_impl_strips_only_omnigent_project_root_from_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the helper checkout entry is stripped from child ``PYTHONPATH``."""
+    sentinel = "/tmp/omni1860-sentinel-does-not-exist"
+    project_root = str(_project_root())
+    monkeypatch.setenv("PYTHONPATH", f"{project_root}{os.pathsep}{sentinel}")
+
+    result = _shell_impl(
+        command=_print_pythonpath_command(),
+        timeout=5,
+        shell_path="/bin/sh",
+        cwd=tmp_path,
+    )
+
+    assert result["exit_code"] == 0, (
+        "Expected child shell to print PYTHONPATH successfully: "
+        f"stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
+    )
+    child_pythonpath_entries = [
+        entry for entry in result["stdout"].strip().split(os.pathsep) if entry
+    ]
+    assert project_root not in child_pythonpath_entries
+    assert sentinel in child_pythonpath_entries
+
+
+def test_shell_impl_handles_absent_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing ``PYTHONPATH`` stays missing for child shell commands."""
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    result = _shell_impl(
+        command=_print_pythonpath_command(),
+        timeout=5,
+        shell_path="/bin/sh",
+        cwd=tmp_path,
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == ""
+
+
+def test_shell_impl_removes_pythonpath_when_only_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A helper-only ``PYTHONPATH`` entry is removed instead of left empty."""
+    monkeypatch.setenv("PYTHONPATH", str(_project_root()))
+
+    result = _shell_impl(
+        command=_print_pythonpath_command(),
+        timeout=5,
+        shell_path="/bin/sh",
+        cwd=tmp_path,
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip() == ""
 
 
 # ---------------------------------------------------------------------------
