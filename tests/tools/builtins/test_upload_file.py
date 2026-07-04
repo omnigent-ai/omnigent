@@ -179,3 +179,21 @@ def test_upload_file_rejects_empty_path(
 
     assert "Error" in result
     assert "empty" in result.lower()
+
+
+def test_upload_file_rejects_invalid_arguments(tool_ctx: ToolContext) -> None:
+    """Malformed and non-object JSON return tool errors instead of raising."""
+    tool = UploadFileTool()
+    malformed = tool.invoke("{", tool_ctx)
+    non_object = tool.invoke("[]", tool_ctx)
+    assert "Error" in malformed and "malformed JSON" in malformed
+    assert "Error" in non_object and "JSON object" in non_object
+
+
+@pytest.mark.parametrize("path", [123, True])
+def test_upload_file_rejects_non_string_path(tool_ctx: ToolContext, path: object) -> None:
+    """Non-string paths are rejected before path resolution."""
+    tool = UploadFileTool()
+    result = tool.invoke(json.dumps({"path": path}), tool_ctx)
+    assert "Error" in result
+    assert "non-empty string" in result
