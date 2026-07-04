@@ -60,6 +60,10 @@ from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_m
             "moonshot/kimi-k2-instruct",
             RoutedModel(provider="moonshot", model="kimi-k2-instruct"),
         ),
+        (
+            "minimax/MiniMax-M3",
+            RoutedModel(provider="minimax", model="MiniMax-M3"),
+        ),
     ],
 )
 def test_parse_with_provider_prefix(

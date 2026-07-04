@@ -57,6 +57,7 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
         "openrouter": "https://openrouter.ai/api/v1",
         "ollama": "http://localhost:11434/v1",
         "moonshot": "https://api.moonshot.cn/v1",
+        "minimax": "https://api.minimax.io/v1",
     }
 
     if provider in openai_compat_providers:
