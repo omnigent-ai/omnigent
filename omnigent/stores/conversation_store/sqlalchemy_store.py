@@ -1596,6 +1596,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         accessible_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        title: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1679,6 +1680,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # an agent binding (legacy rows) correctly return no results
                 # because their agent_id column is NULL.
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
+            if title is not None:
+                stmt = stmt.where(SqlConversation.title == title)
             if accessible_by is not None:
                 from omnigent.db.db_models import SqlSessionPermission
 
