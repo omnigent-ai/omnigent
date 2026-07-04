@@ -178,6 +178,33 @@ def _migrate_legacy_state_dir() -> None:
     click.echo(f"Migrated per-user state from {legacy_src} to ~/.omnigent.", err=True)
 
 
+def _sanitize_no_proxy_env() -> None:
+    """
+    Strip bracketed IPv6 literals out of ``NO_PROXY``/``no_proxy``.
+
+    httpx builds its environment-proxy mounts from ``NO_PROXY`` entries via
+    its own ``is_ipv6_hostname``, which only accepts the bare form
+    (``::1``) — an already-bracketed entry (``[::1]``) fails that check and
+    falls through to a wildcard-domain mount pattern (``all://*[::1]``)
+    that then fails httpx's own URL parsing (``Invalid port: ':1]'``),
+    crashing construction of *any* ``httpx.Client()`` for the rest of the
+    process. Docker Sandboxes (``sbx``) sets exactly this redundant,
+    dual-format no_proxy list (``::1,[::1]``) by default, so every httpx
+    call inside an sbx-hosted ``omnigent host`` hit this. Stripping
+    brackets (and deduping) normalizes to the form httpx expects without
+    disabling proxy support.
+    """
+    for name in ("NO_PROXY", "no_proxy"):
+        value = os.environ.get(name)
+        if not value:
+            continue
+        cleaned = ",".join(
+            dict.fromkeys(host.strip().strip("[]") for host in value.split(",") if host.strip())
+        )
+        if cleaned != value:
+            os.environ[name] = cleaned
+
+
 # Project-level config relative to cwd, analogous to .git/config.
 # Resolved at call time so tests can control cwd.
 _LOCAL_CONFIG_RELPATH: Path = Path(".omnigent") / "config.yaml"
@@ -1274,6 +1301,12 @@ def main() -> None:
     # Relocate pre-rename ~/.omniagents state before anything reads ~/.omnigent
     # (update-check cache, diagnostics logs, config). No-op once migrated.
     _migrate_legacy_state_dir()
+
+    # Normalize NO_PROXY/no_proxy before any httpx.Client() gets constructed
+    # (e.g. the Databricks auth pre-flight in `host`/`run`) — see
+    # _sanitize_no_proxy_env's docstring for the sbx-triggered crash this
+    # prevents.
+    _sanitize_no_proxy_env()
 
     argv = sys.argv[1:]
 
