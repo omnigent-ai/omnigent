@@ -6,10 +6,16 @@ usage mapping, prompt-block folding, the permission → policy/elicitation
 round-trip, run_turn streaming (text / reasoning / tool events), interrupt, and
 the harness wrap.
 
-The ``initialize`` handshake shape is VERIFIED against Factory CLI 0.164.0 (see
-docs/droid-spike.md); the per-turn ``session/update`` payloads are ACP-standard
-and mirror goose/qwen but could not be captured live (Factory account required),
-so those assertions pin our *assumed* shapes.
+The ``initialize`` handshake AND every per-turn ``session/update`` payload are
+VERIFIED live against Factory CLI 0.164.0 with a working ``FACTORY_API_KEY`` —
+real ``session/prompt`` turns were captured (see docs/droid-spike.md), so the
+shapes asserted here (agent_message_chunk / agent_thought_chunk / tool_call /
+tool_call_update / session/request_permission options / session/cancel) mirror
+the actual wire. Notable verified deviations pinned below: droid ignores the
+``--auto`` / ``-m`` / ``-r`` CLI flags in acp mode (model is applied via
+``session/set_model``); the ``session/prompt`` result is ``{"stopReason": ...}``
+with no usage; permission ``optionId`` values (``proceed_once`` …) differ from
+their ``kind`` values.
 """
 
 from __future__ import annotations
@@ -41,7 +47,9 @@ def test_executor_default_attributes() -> None:
     executor = DroidExecutor(droid_path="droid")
     assert executor._droid_path == "droid"
     assert executor._model is None
-    assert executor._auto == "high"  # default enables write/execute tools
+    # ``--auto`` is passed but IGNORED by acp mode (session stays in normal /
+    # Auto-Off); the default is retained only for forward-compat.
+    assert executor._auto == "high"
     assert executor._reasoning is None
     assert executor._proc is None
     assert executor._session_id is None
@@ -141,6 +149,50 @@ def test_extract_tool_call_falls_back_to_kind_then_tool() -> None:
     assert DroidExecutor._extract_tool_call({}) == ("tool", {})
 
 
+def test_extract_tool_call_verified_droid_edit_shape() -> None:
+    # VERIFIED live: a droid ``edit`` tool_call has NO ``_meta.toolName`` — the
+    # name resolves to the human ``title``; ``rawInput`` holds the args.
+    update = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "toolu_bdrk_01QAwPetASkE8K97tSBbAfAG",
+        "title": "Create /work/hello.txt",
+        "kind": "edit",
+        "status": "pending",
+        "rawInput": {"file_path": "/work/hello.txt", "content": "hi from droid"},
+    }
+    name, args = DroidExecutor._extract_tool_call(update)
+    assert name == "Create /work/hello.txt"
+    assert args == {"file_path": "/work/hello.txt", "content": "hi from droid"}
+
+
+def test_tool_call_complete_event_read_rawoutput_dict() -> None:
+    # VERIFIED live: a ``read`` tool_call_update carries ``rawOutput`` as a
+    # ``{"text": ...}`` dict (edit/execute carry none).
+    executor = DroidExecutor()
+    done = executor._tool_call_complete_event(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_read_1",
+            "title": "Read /work/readme.txt",
+            "status": "completed",
+            "rawOutput": {"text": "line one\nline two\nline three"},
+        }
+    )
+    assert isinstance(done, ToolCallComplete)
+    assert done.status is ToolCallStatus.SUCCESS
+    assert done.result == {"text": "line one\nline two\nline three"}
+
+
+def test_tool_call_complete_event_status_only_edit() -> None:
+    # VERIFIED live: a completed ``edit`` update is status-only (no rawOutput).
+    executor = DroidExecutor()
+    done = executor._tool_call_complete_event(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c", "status": "completed"}
+    )
+    assert isinstance(done, ToolCallComplete)
+    assert done.result is None
+
+
 # ---------------------------------------------------------------------------
 # Permission outcome mapping
 # ---------------------------------------------------------------------------
@@ -170,6 +222,32 @@ def test_permission_outcome_cancels_when_no_matching_option() -> None:
     }
     assert DroidExecutor._permission_outcome({"options": []}, allow=False) == {
         "outcome": "cancelled"
+    }
+
+
+# The exact option set droid 0.164.0 offers for a write/execute permission
+# (VERIFIED live) — note the ``optionId`` values differ from ``kind``.
+_DROID_REAL_OPTIONS = [
+    {"optionId": "proceed_once", "name": "Allow", "kind": "allow_once"},
+    {
+        "optionId": "proceed_always",
+        "name": "Allow & auto-run low risk commands",
+        "kind": "allow_always",
+    },
+    {"optionId": "cancel", "name": "No, cancel", "kind": "reject_once"},
+]
+
+
+def test_permission_outcome_maps_verified_droid_option_ids() -> None:
+    # allow → proceed_once (once-scoped, by kind not optionId)
+    assert DroidExecutor._permission_outcome({"options": _DROID_REAL_OPTIONS}, allow=True) == {
+        "outcome": "selected",
+        "optionId": "proceed_once",
+    }
+    # deny → the only reject_* option droid offers
+    assert DroidExecutor._permission_outcome({"options": _DROID_REAL_OPTIONS}, allow=False) == {
+        "outcome": "selected",
+        "optionId": "cancel",
     }
 
 
@@ -251,7 +329,23 @@ def test_usage_from_result_maps_camel_keys() -> None:
     }
 
 
+def test_usage_from_result_maps_snake_keys() -> None:
+    # droid's non-acp ``--output-format json`` reports snake_case usage; the
+    # mapper accepts it too (forward-compat if acp ever gains usage).
+    result = {
+        "stopReason": "end_turn",
+        "usage": {"total_tokens": 100, "input_tokens": 80, "output_tokens": 20},
+    }
+    assert DroidExecutor._usage_from_result(result) == {
+        "input_tokens": 80,
+        "output_tokens": 20,
+        "total_tokens": 100,
+    }
+
+
 def test_usage_from_result_none_when_absent() -> None:
+    # VERIFIED live: droid acp ``session/prompt`` result is stopReason-only, so
+    # this is the real per-turn path — usage is None.
     assert DroidExecutor._usage_from_result({"stopReason": "end_turn"}) is None
     assert DroidExecutor._usage_from_result({"usage": "nope"}) is None
 
@@ -678,6 +772,98 @@ async def test_run_turn_emits_tool_call_request_and_complete() -> None:
     assert len(completes) == 1 and completes[0].status is ToolCallStatus.SUCCESS
 
 
+@pytest.mark.asyncio
+async def test_run_turn_real_shape_text_then_stopreason_only() -> None:
+    # VERIFIED live: a plain turn streams agent_message_chunk(s), the session's
+    # metadata updates (current_mode/config/available_commands), then resolves
+    # with a stopReason-only result → usage is None.
+    executor = _ready_executor()
+    loop = asyncio.get_event_loop()
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            rid = msg["id"]
+            for upd in (
+                {"sessionUpdate": "current_mode_update", "currentModeId": "normal"},
+                {"sessionUpdate": "config_option_update", "configOptions": []},
+                {"sessionUpdate": "available_commands_update", "availableCommands": []},
+                {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "P"}},
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "ONG"},
+                },
+            ):
+                await executor._queue.put(
+                    {"jsonrpc": "2.0", "method": "session/update", "params": {"update": upd}}
+                )
+            loop.call_soon(
+                lambda: executor._pending[rid].set_result(
+                    {"id": rid, "result": {"stopReason": "end_turn"}}
+                )
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    text = "".join(e.text for e in events if isinstance(e, TextChunk))
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert text == "PONG"
+    assert len(completes) == 1
+    assert completes[0].response == "PONG"
+    assert completes[0].usage is None
+
+
+@pytest.mark.asyncio
+async def test_run_turn_survives_malformed_update_params() -> None:
+    # follow-up (a): a null / non-dict ``params`` or ``update`` must not raise
+    # (which would drop the turn); it is coerced to empty and skipped.
+    executor = _ready_executor()
+    loop = asyncio.get_event_loop()
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            rid = msg["id"]
+            await executor._queue.put(
+                {"jsonrpc": "2.0", "method": "session/update", "params": None}
+            )
+            await executor._queue.put(
+                {"jsonrpc": "2.0", "method": "session/update", "params": {"update": None}}
+            )
+            await executor._queue.put(
+                {"jsonrpc": "2.0", "method": "session/update", "params": {"update": "nope"}}
+            )
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"update": {"sessionUpdate": "some_future_variant", "x": 1}},
+                }
+            )
+            await executor._queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "ok"},
+                        }
+                    },
+                }
+            )
+            loop.call_soon(
+                lambda: executor._pending[rid].set_result(
+                    {"id": rid, "result": {"stopReason": "end_turn"}}
+                )
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    text = "".join(e.text for e in events if isinstance(e, TextChunk))
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert text == "ok"
+    assert len(completes) == 1 and completes[0].response == "ok"
+
+
 def test_history_prefix_serializes_prior_turns() -> None:
     prior = [
         {"role": "user", "content": "what is 2+2"},
@@ -953,6 +1139,50 @@ async def test_ensure_session_raises_on_missing_session_id() -> None:
     executor._rpc = AsyncMock(return_value={"result": {}})  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="session/new"):
         await executor._ensure_session()
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_applies_model_via_set_model() -> None:
+    # VERIFIED live: ``-m`` is ignored in acp mode, so the configured model is
+    # applied over the wire with ``session/set_model {sessionId, modelId}``.
+    executor = DroidExecutor(model="claude-opus-4-8")
+    calls: list[tuple] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        if method == "session/new":
+            return {"result": {"sessionId": "sess_m"}}
+        return {"result": {}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    sid = await executor._ensure_session()
+    assert sid == "sess_m"
+    assert ("session/new", {"cwd": executor._cwd, "mcpServers": []}) in calls
+    assert ("session/set_model", {"sessionId": "sess_m", "modelId": "claude-opus-4-8"}) in calls
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_no_set_model_without_model() -> None:
+    executor = DroidExecutor()  # no model
+    methods: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        methods.append(method)
+        return {"result": {"sessionId": "sess_n"}}
+
+    executor._rpc = fake_rpc  # type: ignore[method-assign]
+    await executor._ensure_session()
+    assert "session/set_model" not in methods
+
+
+@pytest.mark.asyncio
+async def test_apply_model_swallows_rejection() -> None:
+    # A rejected set_model must not fail the turn — session keeps the default.
+    executor = DroidExecutor(model="bogus-model")
+    executor._rpc = AsyncMock(  # type: ignore[method-assign]
+        return_value={"error": {"message": "unknown model"}}
+    )
+    await executor._apply_model("sess_x")  # no raise
 
 
 # ---------------------------------------------------------------------------

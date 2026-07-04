@@ -7,20 +7,34 @@ newline-delimited JSON on stdin/stdout. This is the *headless* Droid harness
 Droid's mid-turn tool approvals surface as web elicitation cards rather than
 in-terminal prompts. It mirrors the goose/qwen ACP harnesses.
 
-Protocol flow (``initialize`` VERIFIED live against Factory CLI 0.164.0; the
-per-turn stream shapes below are ACP-standard and mirror goose/qwen but could
-NOT be captured live here — a Factory account is required to get past
-``session/new``, so they are marked ``# UNVERIFIED`` at each site):
+Protocol flow (VERIFIED live end-to-end against Factory CLI 0.164.0 with a
+working ``FACTORY_API_KEY`` — real ``session/prompt`` turns were captured and
+every per-turn ``session/update`` shape below was reconciled against the wire):
   1. ``initialize``   — handshake; learn ``agentCapabilities`` (image support).
      Droid returns ``protocolVersion: 1`` and advertises ``factory-api-key``
      (``FACTORY_API_KEY``) auth.
-  2. ``session/new``  — create a session; Droid returns the ``sessionId``.
+  2. ``session/new``  — create a session; Droid returns the ``sessionId`` (plus
+     ``models`` / ``modes`` / ``configOptions`` blocks we don't need). The
+     session always starts in the ``normal`` (Auto-Off) mode with model
+     ``claude-sonnet-5`` — the ``--auto`` / ``-m`` / ``-r`` CLI flags are
+     *ignored* in acp mode (see :meth:`_launch_argv`). The configured model is
+     applied via ``session/set_model`` right after ``session/new``.
   3. ``session/prompt`` — send a user turn; consume streaming ``session/update``
      notifications (``agent_message_chunk`` text, ``agent_thought_chunk``
      reasoning, ``tool_call`` / ``tool_call_update``) and answer any
      server-initiated ``session/request_permission`` requests, then read the
-     final response (``stopReason`` + ``usage``).
+     final response — which is ``{"stopReason": ...}`` only: **droid acp mode
+     0.164.0 reports no per-turn token usage** (neither in the result nor as a
+     ``session/update``), so usage surfaces as ``None``.
   4. Re-use the same ``sessionId`` for subsequent turns.
+
+Autonomy note: because the session runs in ``normal`` mode (reads auto-approved;
+writes/executes gated), every write/execute tool call arrives as a
+``session/request_permission`` — which is exactly what routes it through
+Omnigent's TOOL_CALL policy + human-consent elicitation. Droid also does *not*
+use ACP ``fs/*`` delegation (it reads/writes with its own internal tools even
+when we advertise ``clientCapabilities.fs``), so file confinement rests on the
+process-level sandbox, not fs delegation.
 
 Unlike goose/qwen, Droid runs a first-party tool loop we surface: ``tool_call``
 updates become :class:`ToolCallRequest` / :class:`ToolCallComplete` events and
@@ -70,9 +84,12 @@ from omnigent.inner.os_env import OSEnvironment, create_os_environment
 
 logger = logging.getLogger(__name__)
 
-# ACP error code Droid is assumed to map to a filesystem "not found" (ENOENT)
-# when a delegated ``fs/read_text_file`` fails — the shared ACP convention
-# (goose/qwen both use -32002). Any other code surfaces raw.  # UNVERIFIED for droid
+# ACP error code we return when a *delegated* ``fs/read_text_file`` misses
+# (ENOENT) — the shared ACP convention (goose/qwen both use -32002). Any other
+# code surfaces raw. NOTE: droid 0.164.0 never delegates fs (it uses its own
+# read/edit tools even when we advertise ``clientCapabilities.fs``), so this
+# mapping stays UNEXERCISED with droid — kept for spec-conformance / other
+# agents.  # UNVERIFIED for droid: fs delegation never fires.
 _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 
 
@@ -114,19 +131,33 @@ _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
 # Notifications sent *from* the agent to the client.
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
 
-# Notification sent *to* the agent to cancel an in-flight prompt (ACP standard;
-# used by :meth:`interrupt_session`).  # UNVERIFIED for droid
+# Notification sent *to* the agent to cancel an in-flight prompt (used by
+# :meth:`interrupt_session`). VERIFIED live: droid honors ``session/cancel`` and
+# ends the in-flight ``session/prompt`` with ``stopReason: "cancelled"``.
 _AGENT_NOTIFICATION_SESSION_CANCEL = "session/cancel"
+
+# Request sent *to* the agent to select the session model (VERIFIED live: droid
+# accepts ``{sessionId, modelId}`` and the model config option flips to it).
+_AGENT_METHOD_SESSION_SET_MODEL = "session/set_model"
 
 # Server-initiated request methods (agent → client).
 _AGENT_REQUEST_REQUEST_PERMISSION = "session/request_permission"
 
-# session/update.update.sessionUpdate values we map.  # UNVERIFIED payload keys
+# session/update.update.sessionUpdate values we map. The chunk/tool variants are
+# VERIFIED live (captured on real turns); ``_UPDATE_USAGE`` is NOT — droid
+# 0.164.0 never emits a usage stream (see :meth:`_usage_from_result`), so that
+# one is retained defensively but stays unexercised.
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
 _UPDATE_AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
 _UPDATE_TOOL_CALL = "tool_call"
 _UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
-_UPDATE_USAGE = "usage_update"
+_UPDATE_USAGE = "usage_update"  # UNVERIFIED for droid: no usage stream observed
+
+# session/update variants droid emits that carry only session metadata (not
+# turn content) — silently ignored so they don't trip the unknown-variant log.
+_BENIGN_UPDATE_TYPES = frozenset(
+    {"current_mode_update", "config_option_update", "available_commands_update"}
+)
 
 # Idle (time-without-progress) timeouts in seconds.
 _PROMPT_TIMEOUT_SECONDS = 300.0
@@ -135,13 +166,15 @@ _INIT_TIMEOUT_SECONDS = 30.0
 # ACP protocol version this executor targets (Droid 0.164.0 → 1, VERIFIED).
 _PROTOCOL_VERSION = 1
 
-# Default Droid autonomy tier. Droid's DEFAULT (no flag) is read-only: its
-# Edit/Create/Execute tools are *blocked* (verified via ``droid exec
-# --list-tools``), so a coding harness must raise autonomy to make those tools
-# available. ``high`` enables them; Omnigent still gates individual calls
-# through the ACP ``session/request_permission`` → policy/elicitation path.
-# Overridable via ``HARNESS_DROID_AUTO``.  # UNVERIFIED: whether droid still
-# emits request_permission under --auto high (vs auto-approving).
+# Default Droid autonomy tier, passed as ``--auto`` and overridable via
+# ``HARNESS_DROID_AUTO``. VERIFIED live: the ``--auto`` CLI flag is IGNORED in
+# acp mode — the session always starts in ``normal`` (Auto-Off) regardless, so
+# reads are auto-approved and every write/execute arrives as a
+# ``session/request_permission`` that we route through policy/elicitation. That
+# is exactly the gating Omnigent wants; write/execute tools are NOT blocked in
+# normal mode (they run once approved). The flag is kept (harmless, ignored) so
+# a future droid that honors it would raise autonomy — but note that ``high``
+# would auto-approve and *bypass* the elicitation gate, so normal is preferable.
 _DEFAULT_AUTO = "high"
 
 
@@ -275,10 +308,15 @@ class DroidExecutor(Executor):
         """Build the ``droid exec`` argument vector (after argv[0]).
 
         ``--output-format acp`` selects the ACP JSON-RPC mode (VERIFIED). The
-        autonomy / model / reasoning flags are accepted alongside it (VERIFIED
-        that ``initialize`` still succeeds with them present); whether ``-m`` /
-        ``-r`` are *honored* in acp mode is  # UNVERIFIED (the help notes they
-        are ignored for the distinct ``--input-format stream-jsonrpc`` mode).
+        autonomy / model / reasoning flags are accepted at launch but VERIFIED
+        live to be *ignored* by the acp session: ``session/new`` always reports
+        ``autonomy_level=normal``, ``model=claude-sonnet-5``,
+        ``reasoning_effort=max`` regardless of ``--auto`` / ``-m`` / ``-r``. The
+        configured model is instead applied over the wire via
+        ``session/set_model`` after ``session/new`` (see :meth:`_ensure_session`).
+        Reasoning effort has no working acp setter in 0.164.0, so ``-r`` stays a
+        no-op and the model's default reasoning effort is used. The flags are
+        left on argv (harmless) for forward-compat / non-acp parity.
         """
         argv: list[str] = ["exec", "--output-format", "acp", "--cwd", self._cwd]
         if self._auto:
@@ -502,9 +540,12 @@ class DroidExecutor(Executor):
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning Droid's assigned id.
 
-        Sends only ``cwd`` + ``mcpServers`` and uses whatever the server returns
-        as ``sessionId`` — the ACP standard shape goose/qwen also use.
-        # UNVERIFIED for droid: blocked by the ``session/new`` auth wall.
+        Sends only ``cwd`` + ``mcpServers`` and reads back ``sessionId`` (VERIFIED
+        live: droid returns ``result.sessionId`` alongside ``models`` / ``modes``
+        / ``configOptions`` blocks we don't consume). When a model is configured,
+        applies it via ``session/set_model`` — the ``-m`` CLI flag is ignored in
+        acp mode, so this over-the-wire select is the only thing that takes
+        effect (VERIFIED live).
         """
         if self._session_id is not None:
             return self._session_id
@@ -525,7 +566,34 @@ class DroidExecutor(Executor):
                 "droid ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = server_session_id
+        await self._apply_model(server_session_id)
         return self._session_id
+
+    async def _apply_model(self, session_id: str) -> None:
+        """Select the configured model over the wire (``session/set_model``).
+
+        No-op when no model is configured. Failures are logged and swallowed —
+        the session keeps droid's default model rather than failing the turn.
+        VERIFIED live: droid replies ``result: {}`` and the ``model`` config
+        option flips to the requested id; the ``-m`` CLI flag alone does nothing.
+        """
+        if not self._model:
+            return
+        try:
+            resp = await self._rpc(
+                _AGENT_METHOD_SESSION_SET_MODEL,
+                {"sessionId": session_id, "modelId": self._model},
+                timeout=_INIT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 — model select is best-effort
+            logger.warning("droid session/set_model(%s) failed: %s", self._model, exc)
+            return
+        if "error" in resp:
+            logger.warning(
+                "droid session/set_model(%s) rejected: %s",
+                self._model,
+                resp["error"].get("message", resp["error"]),
+            )
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -650,7 +718,12 @@ class DroidExecutor(Executor):
         a nested ``toolCall``) or a ``session/update`` tool-call update (fields
         at the top level) — falls back to *params* itself when there is no nested
         ``toolCall``.
-        # UNVERIFIED for droid: exact ``toolCall`` shape blocked by the auth wall.
+
+        VERIFIED live: droid's tool calls carry ``toolCallId`` + ``title`` +
+        ``kind`` (e.g. ``edit`` / ``execute`` / ``read``) + ``rawInput`` (the
+        args dict) and NO ``_meta.toolName`` — so the name resolves to the human
+        ``title`` (e.g. ``"Create /path"``). The ``_meta`` vendor-key lookup is
+        retained as harmless generality for other ACP agents (goose).
         """
         nested = params.get("toolCall")
         tool_call = nested if isinstance(nested, dict) else params
@@ -741,7 +814,14 @@ class DroidExecutor(Executor):
         On allow, prefer a once-scoped grant (``allow_once``) over
         ``allow_always`` so we never persist a blanket "always allow". On deny,
         pick a ``reject_*`` option, or ``cancelled`` when none is offered.
-        # UNVERIFIED for droid: exact ``options`` kinds blocked by the auth wall.
+
+        VERIFIED live: droid offers three options —
+        ``{optionId:"proceed_once",  kind:"allow_once"}``,
+        ``{optionId:"proceed_always",kind:"allow_always"}``,
+        ``{optionId:"cancel",        kind:"reject_once"}`` — so ``allow_once``
+        maps to ``proceed_once`` and the reply
+        ``{"outcome":{"outcome":"selected","optionId":"proceed_once"}}`` is
+        accepted and the tool proceeds.
         """
         options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
 
@@ -775,7 +855,10 @@ class DroidExecutor(Executor):
 
         Returns ``None`` when the tool-call id was already surfaced (Droid can
         re-send ``tool_call`` for the same id as its status advances).
-        # UNVERIFIED for droid: the ``toolCallId`` / ``rawInput`` shape.
+
+        VERIFIED live: the ``tool_call`` update carries ``toolCallId`` and
+        ``rawInput`` (args) at the top level (e.g. ``rawInput.file_path`` /
+        ``rawInput.command``).
         """
         call_id = update.get("toolCallId") or update.get("id")
         key = str(call_id) if call_id is not None else ""
@@ -791,7 +874,12 @@ class DroidExecutor(Executor):
 
         Only ``completed`` / ``failed`` / ``error`` statuses complete the call;
         interim ``in_progress`` / ``pending`` updates return ``None``.
-        # UNVERIFIED for droid: the ``status`` / ``rawOutput`` shape.
+
+        VERIFIED live: the terminal ``tool_call_update`` carries ``toolCallId`` +
+        ``status``. ``rawOutput`` is present for ``read`` tools (a ``{"text":...}``
+        dict) but ABSENT for ``edit`` (status-only) and ``execute`` (output goes
+        to a ``terminal``/``terminalId``); the fallback to ``content`` then
+        ``None`` handles all three.
         """
         status = str(update.get("status", ""))
         if status not in ("completed", "failed", "error"):
@@ -924,23 +1012,29 @@ class DroidExecutor(Executor):
 
     @staticmethod
     def _usage_from_result(result: dict[str, Any]) -> dict[str, Any] | None:  # type: ignore[explicit-any]
-        """Map Droid's final ``result.usage`` to Omnigent's usage keys.
+        """Map a final ``result.usage`` block to Omnigent's usage keys, if any.
 
-        Assumes the ACP camelCase shape goose reports
-        (``{totalTokens, inputTokens, outputTokens}``) → Omnigent's
-        ``{input_tokens, output_tokens, total_tokens}``.
-        # UNVERIFIED for droid: blocked by the auth wall.
+        VERIFIED live: droid acp mode 0.164.0 reports **no** per-turn usage — the
+        ``session/prompt`` result is ``{"stopReason": ...}`` only (and no
+        ``session/update`` carries usage either), so this returns ``None`` in
+        practice. It is kept defensively for a future droid that adds usage, and
+        accepts BOTH the snake_case shape droid's non-acp ``--output-format json``
+        uses (``input_tokens`` / ``output_tokens`` / ``total_tokens``) and the
+        ACP camelCase shape goose reports (``inputTokens`` / …).
         """
         usage = result.get("usage")
         if not isinstance(usage, dict):
             return None
         out: dict[str, Any] = {}
-        if isinstance(usage.get("inputTokens"), int):
-            out["input_tokens"] = usage["inputTokens"]
-        if isinstance(usage.get("outputTokens"), int):
-            out["output_tokens"] = usage["outputTokens"]
-        if isinstance(usage.get("totalTokens"), int):
-            out["total_tokens"] = usage["totalTokens"]
+        for omni_key, candidates in (
+            ("input_tokens", ("input_tokens", "inputTokens")),
+            ("output_tokens", ("output_tokens", "outputTokens")),
+            ("total_tokens", ("total_tokens", "totalTokens")),
+        ):
+            for cand in candidates:
+                if isinstance(usage.get(cand), int):
+                    out[omni_key] = usage[cand]
+                    break
         return out or None
 
     async def run_turn(
@@ -1075,10 +1169,17 @@ class DroidExecutor(Executor):
                 continue
 
             method = notification.get("method", "")
-            params = notification.get("params", {})
+            # A malformed notification can carry a null / non-dict ``params`` (or
+            # a null ``update`` inside it); coerce to an empty dict so the
+            # ``.get()`` chain below never raises and drops the turn.
+            params = notification.get("params")
+            if not isinstance(params, dict):
+                params = {}
 
             if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                update = params.get("update", {})
+                update = params.get("update")
+                if not isinstance(update, dict):
+                    update = {}
                 update_type = update.get("sessionUpdate", "")
 
                 if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
@@ -1104,6 +1205,10 @@ class DroidExecutor(Executor):
                     complete_event = self._tool_call_complete_event(update)
                     if complete_event is not None:
                         yield complete_event
+                elif update_type not in _BENIGN_UPDATE_TYPES:
+                    # An unrecognized (non-benign) variant — log so a future
+                    # droid change surfaces instead of being silently dropped.
+                    logger.debug("droid: unhandled sessionUpdate variant %r", update_type)
 
             elif notification.get("id") is not None and notification.get("method"):
                 # Server-initiated request (session/request_permission): routes
@@ -1123,7 +1228,10 @@ class DroidExecutor(Executor):
         Sends the ACP ``session/cancel`` notification for the live session, then
         drops the session so the next turn starts fresh (a resumed turn would
         bypass the runner's interrupt marker — mirrors cursor/pi).
-        # UNVERIFIED for droid: ``session/cancel`` is the ACP-standard method.
+
+        VERIFIED live: droid honors the no-id ``session/cancel`` notification —
+        the in-flight ``session/prompt`` resolves with ``stopReason: "cancelled"``
+        (mid-turn, before any further chunks stream).
         """
         if self._session_id is None or self._proc is None or self._proc.returncode is not None:
             return False

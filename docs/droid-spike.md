@@ -66,46 +66,129 @@ So: `protocolVersion: 1`, image prompts supported, `factory-api-key` auth via
 accepted alongside `--output-format acp` — the `initialize` handshake succeeds
 with them present.
 
-## Auth wall (blocks the rest of the spike)
+## Per-turn stream (VERIFIED live with a working `FACTORY_API_KEY`)
 
-`session/new` requires a Factory account. Without `FACTORY_API_KEY`:
+With a valid `FACTORY_API_KEY`, real `session/prompt` turns were driven headlessly
+in a throwaway temp dir (`droid exec --output-format acp`) and every per-turn
+shape below was captured off the wire (secrets never appear in these payloads;
+any `fk-…` token would be redacted). Transport note: ACP is NDJSON over
+stdin/stdout — the client must **keep stdin open** for the session's lifetime and
+run a continuous stdout reader; `initialize` only responds once a reader is
+draining.
+
+### `session/new` result
+
+Returns `sessionId` (as assumed) **plus** large `models` / `modes` /
+`configOptions` blocks Omnigent doesn't consume. Trimmed:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"...","mcpServers":[]}}
-→ {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Authentication required: ...code: MSKD-TXZD... set a FACTORY_API_KEY environment variable."}}
+{"jsonrpc":"2.0","id":2,"result":{"sessionId":"e4f4d9c4-…","models":{"currentModelId":"claude-sonnet-5","availableModels":[…]},"modes":{"currentModeId":"normal","availableModes":[{"id":"normal","name":"Auto (Off)","description":"Auto-approves only read operations"},{"id":"auto-low",…},{"id":"auto-medium",…},{"id":"auto-high","name":"Auto (High)","description":"Auto-approves all actions"}]},"configOptions":[{"id":"autonomy_level","currentValue":"normal",…},{"id":"model","currentValue":"claude-sonnet-5",…},{"id":"reasoning_effort","currentValue":"max",…}]}}
 ```
 
-No Factory credentials are available in this environment, so **`session/prompt`,
-`session/update` streaming payload shapes, and `session/request_permission`
-could not be captured live.**
+**Key finding — CLI flags are IGNORED in acp mode.** Launched with
+`--auto high -m claude-haiku-4-5-20251001 -r low`, `session/new` still reported
+`autonomy_level=normal`, `model=claude-sonnet-5`, `reasoning_effort=max`. The
+`--auto` / `-m` / `-r` flags do nothing in acp mode. The session default is
+`claude-sonnet-5` / `normal` / reasoning `max`, **not** the `claude-opus-4-8`
+the non-acp help advertises.
 
-## VERIFIED vs UNVERIFIED
+- **Model** *can* be set over the wire: `session/set_model {sessionId, modelId}`
+  → `result:{}`, and a following `config_option_update` shows the new
+  `model.currentValue`. The executor now sends this after `session/new` to honor
+  the configured model.
+- **Reasoning effort** has no working acp setter (`session/set_reasoning_effort`
+  → method-not-found; a `reasoningEffort` field on `session/set_model` is
+  accepted but does not change `reasoning_effort`). Left at the model default.
+- `session/set_mode {sessionId, modeId}` is accepted too, but we deliberately do
+  **not** raise autonomy: `normal` mode is what makes writes/executes emit
+  `session/request_permission` (see below) — auto-high would auto-approve and
+  bypass Omnigent's elicitation gate.
 
-**Verified live:**
-- Install path + binary.
-- `droid exec` CLI surface (`--output-format acp`, `-m`, `-r`, `--auto`,
-  `--cwd`, `--skip-permissions-unsafe`, mutual exclusion, default read-only).
-- ACP `initialize` handshake: JSON-RPC 2.0, `protocolVersion: 1`, image support,
-  `FACTORY_API_KEY` auth.
-- Flags coexist with `--output-format acp` at launch.
+### `session/update` variants (VERIFIED)
 
-**UNVERIFIED (guarded with `# UNVERIFIED` in code) — blocked by the auth wall,
-assumed to follow the ACP spec + goose/qwen shapes:**
-- `session/new` response field is `sessionId` (ACP standard; goose/qwen match).
-- `session/prompt` streaming `session/update` payloads:
-  `agent_message_chunk` (text), `agent_thought_chunk` (reasoning — ACP-standard
-  name; droid's exact key unconfirmed), `tool_call` / `tool_call_update` (tool
-  events), `usage`.
-- `session/request_permission` `toolCall` / `options` shape and the `outcome`
-  reply shape.
-- Whether droid still emits `session/request_permission` under `--auto high`
-  (vs. auto-approving) — this governs whether Omnigent's elicitation gate is
-  reached.
-- `fs/read_text_file` / `fs/write_text_file` delegation param names.
-- `session/cancel` as the interrupt method (ACP standard).
-- Whether `-m` / `-r` on the CLI are honored in `--output-format acp` mode (the
-  help notes they are ignored for `--input-format stream-jsonrpc`, a *different*
-  mode; unconfirmed for `acp`).
+At turn start droid emits three **metadata** updates we ignore:
+`current_mode_update`, `config_option_update`, `available_commands_update`.
+Content variants:
 
-When Factory credentials become available, re-run a real `session/prompt` and
-reconcile the `# UNVERIFIED` sites in `omnigent/inner/droid_executor.py`.
+```json
+// agent_message_chunk — content is a {type,text} dict
+{"method":"session/update","params":{"sessionId":"…","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":".\n\nPONG"}}}}
+
+// agent_thought_chunk — same content shape (reasoning)
+{"method":"session/update","params":{"sessionId":"…","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"I'll just create the file directly"}}}}
+
+// tool_call (edit) — NO _meta.toolName; name falls back to `title`; args in rawInput
+{"method":"session/update","params":{"sessionId":"…","update":{"sessionUpdate":"tool_call","toolCallId":"toolu_bdrk_01QAw…","title":"Create /work/hello.txt","kind":"edit","status":"pending","rawInput":{"file_path":"/work/hello.txt","content":"hi from droid"},"content":[{"type":"diff","path":"/work/hello.txt","oldText":null,"newText":"hi from droid"}],"locations":[{"path":"/work/hello.txt"}]}}}
+
+// tool_call (execute) — kind:"execute"; rawInput carries command + risk fields
+{"…":{"sessionUpdate":"tool_call","toolCallId":"toolu_…","title":"`echo hi` (low)","kind":"execute","status":"pending","rawInput":{"command":"echo hi","summary":"…","riskLevel":"low","riskLevelReason":"…"}}}
+
+// tool_call_update — edit: status only (no rawOutput)
+{"…":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_…","status":"completed"}}
+
+// tool_call_update — read: rawOutput present as a {"text":…} dict (+ content)
+{"…":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_…","status":"completed","rawOutput":{"text":"line one\nline two\nline three"},"content":[{"type":"content","content":{"type":"text","text":"line one\n…"}}]}}
+
+// tool_call_update — execute: output goes to a terminal, not inline
+{"…":{"sessionUpdate":"tool_call_update","toolCallId":"toolu_…","status":"in_progress","content":[{"type":"terminal","terminalId":"181ac1fe-…"}]}}
+```
+
+No `plan` update was emitted even when prompting for a plan (the model answered
+inline). No `usage` / `usage_update` / token / `size` field appeared in ANY
+turn.
+
+### `session/request_permission` (VERIFIED) + reply
+
+Fires for write/execute tools because the session runs in `normal` mode (reads
+are auto-approved and do **not** prompt). This is exactly the hook Omnigent's
+policy/elicitation gate needs.
+
+```json
+// request (agent → client)
+{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"…","options":[{"optionId":"proceed_once","name":"Allow","kind":"allow_once"},{"optionId":"proceed_always","name":"Allow & auto-run low risk commands","kind":"allow_always"},{"optionId":"cancel","name":"No, cancel","kind":"reject_once"}],"toolCall":{"toolCallId":"toolu_…","title":"Create /work/hello.txt","rawInput":{"file_path":"…","content":"…"},"kind":"edit"}}}
+
+// reply (client → agent) — the DOUBLE-nested outcome is required and works
+{"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"proceed_once"}}}
+```
+
+Note `optionId` (`proceed_once` / `proceed_always` / `cancel`) differs from
+`kind` (`allow_once` / `allow_always` / `reject_once`); the executor selects by
+`kind`, which is correct. After `proceed_once` the file was written to disk.
+
+### Final result + interrupt (VERIFIED)
+
+Every `session/prompt` result is **stopReason-only** — no usage:
+
+```json
+{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}
+```
+
+`session/cancel` (a no-id notification with `{sessionId}`) is honored: the
+in-flight `session/prompt` resolves mid-turn with:
+
+```json
+{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled"}}
+```
+
+### fs delegation — droid does NOT use it
+
+Even with `clientCapabilities.fs.readTextFile/writeTextFile: true` advertised,
+droid 0.164.0 **never** sent `fs/read_text_file` / `fs/write_text_file`; it read
+the file with its own internal `read` tool (a normal `tool_call kind:"read"`).
+So the `fs/*` delegation handlers stay unexercised with droid, and file
+confinement relies on the process-level sandbox, not fs delegation. (`droid exec
+--output-format json` non-acp usage is snake_case:
+`{input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens}`.)
+
+## Reconciliation summary
+
+All previously-`# UNVERIFIED` per-turn sites in
+`omnigent/inner/droid_executor.py` were reconciled against the captures above:
+`session/new sessionId`, the four chunk/tool `sessionUpdate` variants,
+`request_permission` options + double-nested outcome reply, `tool_call` /
+`tool_call_update` `toolCallId` / `rawInput` / `status` / `rawOutput`, and
+`session/cancel` are **CONFIRMED**. Usage extraction was **CORRECTED** (acp emits
+no usage; the mapper now also accepts snake_case defensively). Model selection
+was **CORRECTED** (`-m` ignored → `session/set_model` wired). Two markers remain,
+both justified: the `fs/*` ENOENT mapping and the `usage_update` variant are
+**unexercised** because droid never delegates fs and never streams usage.
