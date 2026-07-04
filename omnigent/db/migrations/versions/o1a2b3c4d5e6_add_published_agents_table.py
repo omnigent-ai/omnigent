@@ -46,18 +46,12 @@ def upgrade() -> None:
         sa.Column("category", sa.String(length=64), nullable=True),
         sa.Column("tags", sa.Text(), nullable=False, server_default="'[]'"),
         sa.Column("prompt_excerpt", sa.Text(), nullable=True),
-        sa.Column(
-            "network_access", sa.Boolean(), nullable=False, server_default=sa.false()
-        ),
-        sa.Column(
-            "write_access", sa.Boolean(), nullable=False, server_default=sa.false()
-        ),
+        sa.Column("network_access", sa.Boolean(), nullable=False, server_default=sa.false()),
+        sa.Column("write_access", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("guardrails", sa.Text(), nullable=True),
         sa.Column("author", sa.String(length=256), nullable=False),
         sa.Column("source_url", sa.Text(), nullable=True),
-        sa.Column(
-            "stars_count", sa.Integer(), nullable=False, server_default=sa.text("0")
-        ),
+        sa.Column("stars_count", sa.Integer(), nullable=False, server_default=sa.text("0")),
         sa.Column("bundle_location", sa.String(length=512), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),

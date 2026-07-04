@@ -117,9 +117,7 @@ class SqlAlchemyRegistryStore(RegistryStore):
                 # Tags are stored as a JSON array string; use LIKE for portability
                 # across SQLite and PostgreSQL without JSON operators.
                 stmt = stmt.where(
-                    func.lower(SqlPublishedAgent.tags).contains(
-                        json.dumps(tag).lower()
-                    )
+                    func.lower(SqlPublishedAgent.tags).contains(json.dumps(tag).lower())
                 )
             if q is not None:
                 pattern = f"%{q.lower()}%"
@@ -138,10 +136,7 @@ class SqlAlchemyRegistryStore(RegistryStore):
                 )
                 stmt = stmt.where(
                     (SqlPublishedAgent.created_at < sub)
-                    | (
-                        (SqlPublishedAgent.created_at == sub)
-                        & (SqlPublishedAgent.id < after)
-                    )
+                    | ((SqlPublishedAgent.created_at == sub) & (SqlPublishedAgent.id < after))
                 )
 
             stmt = stmt.order_by(

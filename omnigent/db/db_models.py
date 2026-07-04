@@ -790,18 +790,12 @@ class SqlPublishedAgent(Base):
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tags: Mapped[str] = mapped_column(Text, default="[]", server_default=text("'[]'"))
     prompt_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    network_access: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default=false()
-    )
-    write_access: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default=false()
-    )
+    network_access: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    write_access: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     guardrails: Mapped[str | None] = mapped_column(Text, nullable=True)
     author: Mapped[str] = mapped_column(String(256))
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    stars_count: Mapped[int] = mapped_column(
-        Integer, default=0, server_default=text("0")
-    )
+    stars_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     bundle_location: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)

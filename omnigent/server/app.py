@@ -51,10 +51,10 @@ from omnigent.server.performance_metrics import (
     set_request_duration_for_access_log,
 )
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
-from omnigent.server.routes.registry import create_registry_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.registry import create_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -72,11 +72,11 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
-from omnigent.stores.registry_store import RegistryStore
 from omnigent.stores.conversation_store import SessionConnectivity
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.registry_store import RegistryStore
 
 _logger = logging.getLogger(__name__)
 
