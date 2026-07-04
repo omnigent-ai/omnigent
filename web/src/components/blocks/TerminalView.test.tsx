@@ -20,6 +20,8 @@ import {
 
 const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as Array<{
+    url: string;
+    nativeSelection: boolean;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
@@ -36,10 +38,16 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
 
     constructor(
       _container: HTMLDivElement,
-      _url: string,
+      url: string,
       onState: (state: ConnectionState) => void,
+      _isDark?: boolean,
+      _onActivity?: () => void,
+      _onInput?: () => void,
+      nativeSelection = false,
     ) {
       terminalSessionMock.instances.push({
+        url,
+        nativeSelection,
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
@@ -74,6 +82,24 @@ describe("buildAttachPath", () => {
     );
   });
 
+  it("appends ?transport= when a transport override is given", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "control")).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
+    );
+  });
+
+  it("combines read_only and transport params", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "control");
+    expect(path).toContain("read_only=true");
+    expect(path).toContain("transport=control");
+  });
+
+  it("omits ?transport when no override is given", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false).includes("transport")).toBe(
+      false,
+    );
+  });
+
   it("url-encodes the session and terminal ids", () => {
     const path = buildAttachPath("conv with space", "terminal/odd:id", false);
     expect(path).toContain("/v1/sessions/conv%20with%20space/");
@@ -94,6 +120,31 @@ describe("buildAttachPath", () => {
     // a leading slash is required for that concatenation to be
     // correct against any page origin.
     expect(buildAttachPath("conv_abc", "terminal_bash_s1", false).startsWith("/")).toBe(true);
+  });
+});
+
+describe("control-mode transport", () => {
+  it("forwards ?transport=control and enables native selection when transport=control", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.url).toContain("transport=control");
+    expect(inst.nativeSelection).toBe(true);
+  });
+
+  it("hides the selection hint bar in control mode", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" transport="control" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
+  });
+
+  it("keeps the hint bar and PTY behavior by default (no transport prop)", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.url).not.toContain("transport");
+    expect(inst.nativeSelection).toBe(false);
+    expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
   });
 });
 
