@@ -46,20 +46,33 @@ _POOL_SPEC_CAPACITY = 8
 
 
 @dataclass
-class _ServerEntry:
-    """One MCP server within a spec's pool entry."""
+class _SharedServerEntry:
+    """One live MCP server connection shared by any spec with the same config."""
 
+    server_hash: str
     config: MCPServerConfig
     connection: McpServerConnection | None = None
     tools: list[McpToolDef] = field(default_factory=list)
     error: str | None = None
+    ref_count: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+
+@dataclass
+class _SpecServerRef:
+    """A spec-specific name/filter pointing at a shared MCP server."""
+
+    config: MCPServerConfig
+    server_hash: str
+    entry: _SharedServerEntry
 
 
 @dataclass
 class _SpecEntry:
     spec_hash: str
-    servers: dict[str, _ServerEntry] = field(default_factory=dict)
-    prewarm_task: asyncio.Task[None] | None = None
+    servers: dict[str, _SpecServerRef] = field(default_factory=dict)
+    server_hashes: set[str] = field(default_factory=set)
+    connect_task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True)
@@ -81,13 +94,53 @@ def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -
                     "name": c.name,
                     "transport": c.transport,
                     "url": c.url,
+                    "headers": dict(c.headers or {}),
+                    "databricks_profile": c.databricks_profile,
                     "command": c.command,
                     "args": list(c.args or []),
                     "env": dict(c.env or {}),
                     "tools": list(getattr(c, "tools", None) or []),
+                    "timeout": c.timeout,
+                    "retry": _retry_payload(c.retry),
                 }
                 for c in configs
             ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _retry_payload(retry: Any | None) -> Any:
+    """Return a stable JSON payload for a retry policy-like object."""
+    if retry is None:
+        return None
+    to_json = getattr(retry, "to_json", None)
+    if callable(to_json):
+        return json.loads(to_json())
+    return repr(retry)
+
+
+def compute_server_hash(config: MCPServerConfig, cwd: Path | None = None) -> str:
+    """Stable content hash over fields that determine one MCP connection.
+
+    ``name`` and ``tools`` are intentionally excluded: two specs can expose
+    the same underlying server with different namespaces or allow-lists while
+    sharing one transport/subprocess.
+    """
+    payload = json.dumps(
+        {
+            "cwd": str(cwd) if config.transport == "stdio" and cwd is not None else None,
+            "transport": config.transport,
+            "url": config.url,
+            "headers": dict(config.headers or {}),
+            "databricks_profile": config.databricks_profile,
+            "command": config.command,
+            "args": list(config.args or []),
+            "env": dict(config.env or {}),
+            "timeout": config.timeout,
+            "retry": _retry_payload(config.retry),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -171,6 +224,7 @@ class RunnerMcpManager:
             API. When ``None``, inline elicitations are declined.
         """
         self._specs: dict[str, _SpecEntry] = {}
+        self._servers: dict[str, _SharedServerEntry] = {}
         self._lru: list[str] = []  # most-recent at end
         self._lock = asyncio.Lock()
         # Hold strong refs to fire-and-forget eviction-close tasks so
@@ -277,21 +331,17 @@ class RunnerMcpManager:
         return _elicit
 
     async def prewarm(self, spec: AgentSpec) -> None:
-        """Fire-and-forget background spawn of *spec*'s MCPs. Idempotent."""
+        """Register *spec*'s MCPs without spawning transports. Idempotent."""
         configs = list(spec.mcp_servers or [])
         if not configs:
             return
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
         async with self._lock:
-            entry = self._ensure_entry(spec_hash, configs)
-            if entry.prewarm_task is None or entry.prewarm_task.done():
-                entry.prewarm_task = asyncio.create_task(
-                    self._connect_all(entry),
-                    name=f"runner-mcp-prewarm:{spec_hash}",
-                )
+            self._ensure_entry(spec_hash, configs)
+            self._touch(spec_hash)
 
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
-        """Resolve MCP schemas for *spec*; awaits any in-flight prewarm."""
+        """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
         configs = list(spec.mcp_servers or [])
         if not configs:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
@@ -299,36 +349,37 @@ class RunnerMcpManager:
         async with self._lock:
             entry = self._ensure_entry(spec_hash, configs)
             self._touch(spec_hash)
-            prewarm = entry.prewarm_task
-            needs_connect = any(s.connection is None for s in entry.servers.values())
-            if needs_connect and (prewarm is None or prewarm.done()):
-                entry.prewarm_task = asyncio.create_task(
+            connect_task = entry.connect_task
+            needs_connect = any(s.entry.connection is None for s in entry.servers.values())
+            if needs_connect and (connect_task is None or connect_task.done()):
+                entry.connect_task = asyncio.create_task(
                     self._connect_all(entry),
                     name=f"runner-mcp-on-demand:{spec_hash}",
                 )
-                prewarm = entry.prewarm_task
+                connect_task = entry.connect_task
 
-        # Await outside the lock so concurrent prewarms can proceed.
-        if prewarm is not None:
+        # Await outside the lock so concurrent connects can proceed.
+        if connect_task is not None:
             try:
-                await prewarm
+                await connect_task
             except Exception:
-                _logger.exception("runner mcp prewarm task raised; surfacing partial results")
+                _logger.exception("runner mcp connect task raised; surfacing partial results")
 
         schemas: list[dict[str, Any]] = []
         tool_names: set[str] = set()
         failures: dict[str, str] = {}
-        for server in entry.servers.values():
+        for ref in entry.servers.values():
+            server = ref.entry
             if server.error is not None:
-                failures[server.config.name] = server.error
+                failures[ref.config.name] = server.error
                 continue
             allowed = (
-                set(getattr(server.config, "tools", None) or [])
-                if getattr(server.config, "tools", None)
+                set(getattr(ref.config, "tools", None) or [])
+                if getattr(ref.config, "tools", None)
                 else None
             )
             for td in server.tools:
-                schema = _mcp_tool_schema(server.config.name, td, allowed)
+                schema = _mcp_tool_schema(ref.config.name, td, allowed)
                 if schema is None:
                     continue
                 schemas.append(schema)
@@ -363,15 +414,11 @@ class RunnerMcpManager:
                 f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"
             )
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
-        entry = self._specs.get(spec_hash)
-        if entry is None:
-            # Dispatch before schemas_for(): populate + await prewarm.
-            await self.schemas_for(spec)
-            entry = self._specs.get(spec_hash)
-        if entry is None:
-            raise RuntimeError(f"runner failed to initialize MCPs for spec {spec.name!r}")
+        async with self._lock:
+            entry = self._ensure_entry(spec_hash, configs)
+            self._touch(spec_hash)
 
-        route = self._resolve_tool_route(spec, tool_name)
+        route = await self._resolve_tool_route_connected(entry, spec, tool_name)
         if route is None:
             raise RuntimeError(f"runner has no live MCP serving tool {tool_name!r}")
         owning_server, bare_name = route
@@ -388,7 +435,7 @@ class RunnerMcpManager:
         self,
         spec: AgentSpec,
         tool_name: str,
-    ) -> tuple[_ServerEntry, str] | None:
+    ) -> tuple[_SharedServerEntry, str] | None:
         """
         Find the live server and bare MCP tool name for *tool_name*.
 
@@ -402,10 +449,11 @@ class RunnerMcpManager:
         entry = self._specs.get(spec_hash)
         if entry is None:
             return None
-        for server in entry.servers.values():
+        for ref in entry.servers.values():
+            server = ref.entry
             if server.error is not None:
                 continue
-            prefix = f"{server.config.name}__"
+            prefix = f"{ref.config.name}__"
             if tool_name.startswith(prefix):
                 bare_tool = tool_name[len(prefix) :]
                 if any(td.name == bare_tool for td in server.tools):
@@ -419,7 +467,7 @@ class RunnerMcpManager:
         self,
         spec: AgentSpec,
         tool_name: str,
-    ) -> _ServerEntry | None:
+    ) -> _SharedServerEntry | None:
         """
         Find the server entry that owns *tool_name*.
 
@@ -429,7 +477,7 @@ class RunnerMcpManager:
 
         :param spec: Agent spec whose MCP servers to search.
         :param tool_name: Namespaced or bare MCP tool name.
-        :returns: The owning ``_ServerEntry``, or ``None`` if the
+        :returns: The owning shared server entry, or ``None`` if the
             tool is not found.
         """
         route = self._resolve_tool_route(spec, tool_name)
@@ -437,21 +485,22 @@ class RunnerMcpManager:
 
     async def shutdown(self) -> None:
         """Best-effort close of every active MCP connection."""
-        for spec_hash, entry in list(self._specs.items()):
-            if entry.prewarm_task is not None and not entry.prewarm_task.done():
-                entry.prewarm_task.cancel()
-            for server in entry.servers.values():
-                if server.connection is None:
-                    continue
-                try:
-                    await server.connection.close()
-                except Exception:
-                    _logger.exception(
-                        "error closing MCP %r in spec %s during shutdown",
-                        server.config.name,
-                        spec_hash,
-                    )
+        for _spec_hash, entry in list(self._specs.items()):
+            if entry.connect_task is not None and not entry.connect_task.done():
+                entry.connect_task.cancel()
+        for server_hash, server in list(self._servers.items()):
+            if server.connection is None:
+                continue
+            try:
+                await server.connection.close()
+            except Exception:
+                _logger.exception(
+                    "error closing MCP %r (%s) during shutdown",
+                    server.config.name,
+                    server_hash,
+                )
         self._specs.clear()
+        self._servers.clear()
         self._lru.clear()
 
     def _ensure_entry(self, spec_hash: str, configs: list[MCPServerConfig]) -> _SpecEntry:
@@ -461,7 +510,19 @@ class RunnerMcpManager:
             return entry
         entry = _SpecEntry(spec_hash=spec_hash)
         for cfg in configs:
-            entry.servers[cfg.name] = _ServerEntry(config=cfg)
+            server_hash = compute_server_hash(cfg, self._stdio_cwd)
+            server = self._servers.get(server_hash)
+            if server is None:
+                server = _SharedServerEntry(server_hash=server_hash, config=cfg)
+                self._servers[server_hash] = server
+            if server_hash not in entry.server_hashes:
+                server.ref_count += 1
+                entry.server_hashes.add(server_hash)
+            entry.servers[cfg.name] = _SpecServerRef(
+                config=cfg,
+                server_hash=server_hash,
+                entry=server,
+            )
         self._specs[spec_hash] = entry
         self._lru.append(spec_hash)
         self._evict_if_needed()
@@ -485,16 +546,28 @@ class RunnerMcpManager:
                 victim,
                 _POOL_SPEC_CAPACITY,
             )
-            if entry.prewarm_task is not None and not entry.prewarm_task.done():
-                entry.prewarm_task.cancel()
-            for server in entry.servers.values():
-                if server.connection is not None:
-                    task = asyncio.create_task(
-                        self._safe_close(server.connection, victim, server.config.name),
-                        name=f"runner-mcp-evict-close:{victim}:{server.config.name}",
-                    )
-                    self._evict_tasks.add(task)
-                    task.add_done_callback(self._evict_tasks.discard)
+            self._release_spec_entry(victim, entry)
+
+    def _release_spec_entry(self, spec_hash: str, entry: _SpecEntry) -> None:
+        """Release one spec entry and close shared servers no longer referenced."""
+        if entry.connect_task is not None and not entry.connect_task.done():
+            entry.connect_task.cancel()
+        for server_hash in entry.server_hashes:
+            server = self._servers.get(server_hash)
+            if server is None:
+                continue
+            server.ref_count -= 1
+            if server.ref_count > 0:
+                continue
+            self._servers.pop(server_hash, None)
+            if server.connection is None:
+                continue
+            task = asyncio.create_task(
+                self._safe_close(server.connection, spec_hash, server.config.name),
+                name=f"runner-mcp-evict-close:{spec_hash}:{server.config.name}",
+            )
+            self._evict_tasks.add(task)
+            task.add_done_callback(self._evict_tasks.discard)
 
     @staticmethod
     async def _safe_close(conn: McpServerConnection, spec_hash: str, name: str) -> None:
@@ -505,8 +578,20 @@ class RunnerMcpManager:
 
     async def _connect_all(self, entry: _SpecEntry) -> None:
         """Connect every MCP in *entry* concurrently. Failures recorded per server."""
+        unique_servers: dict[str, _SharedServerEntry] = {}
+        for ref in entry.servers.values():
+            unique_servers.setdefault(ref.server_hash, ref.entry)
+        await asyncio.gather(
+            *[
+                self._connect_server(server, entry.spec_hash)
+                for server in unique_servers.values()
+                if server.connection is None
+            ]
+        )
 
-        async def _one(server: _ServerEntry) -> None:
+    async def _connect_server(self, server: _SharedServerEntry, spec_hash: str) -> None:
+        """Connect one shared MCP server if needed."""
+        async with server.lock:
             if server.connection is not None:
                 return
             try:
@@ -520,8 +605,9 @@ class RunnerMcpManager:
                 server.tools = tools
                 server.error = None
                 _logger.info(
-                    "runner mcp connected: spec=%s server=%s tools=%d",
-                    entry.spec_hash,
+                    "runner mcp connected: spec=%s server_hash=%s server=%s tools=%d",
+                    spec_hash,
+                    server.server_hash,
                     server.config.name,
                     len(tools),
                 )
@@ -530,13 +616,36 @@ class RunnerMcpManager:
                 server.connection = None
                 server.tools = []
                 _logger.warning(
-                    "runner mcp connect failed: spec=%s server=%s error=%s",
-                    entry.spec_hash,
+                    "runner mcp connect failed: spec=%s server_hash=%s server=%s error=%s",
+                    spec_hash,
+                    server.server_hash,
                     server.config.name,
                     server.error,
                 )
 
-        await asyncio.gather(*[_one(s) for s in entry.servers.values()])
+    async def _resolve_tool_route_connected(
+        self,
+        entry: _SpecEntry,
+        spec: AgentSpec,
+        tool_name: str,
+    ) -> tuple[_SharedServerEntry, str] | None:
+        """Resolve a route, connecting only the named server when possible."""
+        if "__" in tool_name:
+            for ref in entry.servers.values():
+                prefix = f"{ref.config.name}__"
+                if not tool_name.startswith(prefix):
+                    continue
+                bare_name = tool_name[len(prefix) :]
+                await self._connect_server(ref.entry, entry.spec_hash)
+                if ref.entry.error is not None or ref.entry.connection is None:
+                    return None
+                if any(td.name == bare_name for td in ref.entry.tools):
+                    return ref.entry, bare_name
+                return None
+            return None
+
+        await self.schemas_for(spec)
+        return self._resolve_tool_route(spec, tool_name)
 
     def status_snapshot(self) -> dict[str, Any]:
         """JSON-able view of pool state for introspection."""
@@ -552,10 +661,10 @@ class RunnerMcpManager:
                         {
                             "name": s.config.name,
                             "status": "ready"
-                            if s.connection is not None and s.error is None
-                            else ("failed" if s.error else "pending"),
-                            "tools": [t.name for t in s.tools],
-                            "error": s.error,
+                            if s.entry.connection is not None and s.entry.error is None
+                            else ("failed" if s.entry.error else "pending"),
+                            "tools": [t.name for t in s.entry.tools],
+                            "error": s.entry.error,
                         }
                         for s in entry.servers.values()
                     ],
