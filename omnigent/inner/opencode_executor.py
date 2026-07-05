@@ -354,17 +354,19 @@ class _OpenCodeServer:
 
         :param cwd: Working directory for the server (``--dir`` equivalent).
         :param extra_env: Extra env vars (e.g. ``OPENCODE_CONFIG_CONTENT``).
-        :raises ImportError: If the optional ``opencode-ai`` SDK is not installed.
+        :raises ImportError: If the ``opencode-ai`` SDK is not installed.
         :raises RuntimeError: If the server doesn't announce a URL in time.
         """
         try:
-            from opencode_ai import AsyncOpencode  # lazy: optional dep
+            # Lazy: keeps startup cheap and tolerates older installs that
+            # predate opencode-ai joining the baseline dependencies.
+            from opencode_ai import AsyncOpencode
         except ImportError as exc:
             raise ImportError(
-                "The 'opencode' harness needs the optional 'opencode-ai' "
-                "Python SDK, which is not installed. Install it with "
-                '`pip install "omnigent[opencode]"` (or `pip install --pre '
-                "opencode-ai`)."
+                "The 'opencode' harness needs the 'opencode-ai' Python SDK, "
+                "which is not installed. It ships with omnigent's default "
+                "install — upgrade omnigent (`pip install -U omnigent`) or "
+                "run `pip install --pre opencode-ai`."
             ) from exc
 
         binary = _resolve_opencode_binary()

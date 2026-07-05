@@ -18,8 +18,8 @@
 # and server-launched managed hosts. It bakes the full omnigent
 # install plus the tools a host needs at runtime — git (workspaces /
 # worktrees), tmux (terminal sessions spawned by native harnesses),
-# and the coding-harness CLIs (claude / codex / pi, via Node; kiro-cli via
-# Kiro's installer) — and
+# and the coding-harness CLIs (claude / codex / pi / opencode, via Node;
+# kiro-cli via Kiro's installer) — and
 # skips everything server-only: no SPA bundle, no psycopg, no
 # uvicorn entrypoint. Modal's `Image.from_registry` requirements shape
 # it: `python` + `pip` on $PATH, and CMD-only (an ENTRYPOINT that
@@ -169,9 +169,9 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 # port" and breaks web-turn injection), bubblewrap to OS-sandbox the
 # native harness terminals (mandatory and fail-loud on Linux), curl + CA
 # certificates for outbound HTTPS and in-sandbox downloads, plus the
-# coding-harness CLIs (claude / codex / pi / kiro-cli) so claude-sdk,
-# claude-native, codex, pi, and kiro-native agents can run in managed
-# sandboxes without an in-sandbox install. No SPA, no psycopg, no server
+# coding-harness CLIs (claude / codex / pi / opencode / kiro-cli) so
+# claude-sdk, claude-native, codex, pi, opencode, and kiro-native agents
+# can run in managed sandboxes without an in-sandbox install. No SPA, no psycopg, no server
 # entrypoint.
 #
 # Also carries two additions required only by the NVIDIA OpenShell provider
@@ -240,10 +240,14 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # (the binary/package map `omnigent setup` installs from) — keep the
 # two in sync. Unpinned on purpose: the official image is rebuilt by
 # CI, so it tracks the same "latest" a laptop install would get.
+# Exception: opencode-ai carries harness_install.py's ~1.17.7 range —
+# its npm `latest` is a 0.0.0-beta pre-release that the runtime
+# version check rejects.
 RUN npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
       @earendil-works/pi-coding-agent \
+      opencode-ai@~1.17.7 \
  && npm cache clean --force
 
 # Kiro CLI is not published as an npm package, and its installer has NO version

@@ -2794,6 +2794,7 @@ dependencies = [
     { name = "omnigent-ui-sdk" },
     { name = "openai" },
     { name = "openai-agents" },
+    { name = "opencode-ai" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-fastapi" },
@@ -2823,7 +2824,6 @@ agents-sdk = [
 ]
 all = [
     { name = "databricks-sdk" },
-    { name = "opencode-ai" },
 ]
 antigravity = [
     { name = "google-antigravity" },
@@ -2883,9 +2883,6 @@ kubernetes = [
 modal = [
     { name = "modal" },
 ]
-opencode = [
-    { name = "opencode-ai" },
-]
 openshell = [
     { name = "openshell" },
 ]
@@ -2937,8 +2934,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0,<3" },
     { name = "openai-agents", specifier = ">=0.0.17" },
     { name = "openai-agents", marker = "extra == 'agents-sdk'", specifier = ">=0.1,<1" },
-    { name = "opencode-ai", marker = "extra == 'all'", specifier = ">=0.1.0a36" },
-    { name = "opencode-ai", marker = "extra == 'opencode'", specifier = ">=0.1.0a36" },
+    { name = "opencode-ai", specifier = ">=0.1.0a36" },
     { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.7,<1" },
     { name = "opentelemetry-distro", marker = "extra == 'databricks'", specifier = ">=0,<1" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.20,<2" },

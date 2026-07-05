@@ -89,6 +89,14 @@ dependencies = [
     # to remember `--extra all`. Issue #406.
     "claude-agent-sdk>=0.1.62",
     "openai-agents>=0.0.17",
+    # The OpenCode harness SDK is baseline for the same reason: runners are
+    # provisioned from the plain package (host image `pip install -e .`, sbx
+    # wheel install), so keeping it optional left every provisioned runner
+    # unable to start the opencode harness. Pre-release package — the explicit
+    # ``a36`` floor lets pip/uv resolve it without a global ``--pre``. The
+    # ``opencode`` binary is installed separately (npm `opencode-ai` or
+    # opencode.ai/install).
+    "opencode-ai>=0.1.0a36",
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
     # PEP 440 version comparison for the update check / `omni upgrade`
@@ -103,19 +111,12 @@ dependencies = [
 # working; the underlying packages are now default deps above.
 claude-sdk = []
 openai-agents = []
-# OpenCode harness transport: the Stainless-generated httpx SDK for talking
-# to a persistent ``opencode serve`` process. Optional + lazily imported
-# (only ``OpenCodeExecutor`` needs it), so it stays out of the default install.
-# Pre-release package — the explicit ``a36`` floor lets pip resolve it without
-# a global ``--pre``. The ``opencode`` binary is installed separately (npm
-# `opencode-ai` or opencode.ai/install).
-opencode = ["opencode-ai>=0.1.0a36"]
-# `all` additionally carries databricks-sdk + opencode-ai: those moved out of
-# the default install (databricks-sdk lives in the `databricks` extra,
-# opencode-ai in the `opencode` extra), but internal CI / dev installs use
+opencode = []
+# `all` additionally carries databricks-sdk: it moved out of the default
+# install (into the `databricks` extra), but internal CI / dev installs use
 # `--extra all` and the test suite, deploy tooling, and databricks_mcps servers
-# import them.
-all = ["databricks-sdk>=0.56.0,<1", "opencode-ai>=0.1.0a36"]
+# import it.
+all = ["databricks-sdk>=0.56.0,<1"]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
