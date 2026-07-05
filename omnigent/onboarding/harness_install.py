@@ -89,6 +89,10 @@ COPILOT_KEY = "copilot"
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
 
+# ForgeCode is installed via Forge's curl installer and authenticates through
+# its own OAuth/config. The ``forge`` binary must be on PATH.
+FORGE_KEY = "forge"
+
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
 # fallback. Binaries/packages mirror ucode's ``TOOL_SPECS`` so the two tools
@@ -196,6 +200,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
     ),
+    FORGE_KEY: HarnessInstallSpec(
+        "Forge",
+        "forge",
+        package=None,
+        install_hint="curl -fsSL https://forgecode.dev/cli | sh",
+    ),
 }
 
 
@@ -207,9 +217,9 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``opencode-native`` the
 # ``opencode`` CLI, ``qwen`` / ``qwen-code`` the ``qwen`` CLI,
 # ``cursor-native`` / ``native-cursor`` the ``cursor-agent`` CLI, and
-# ``kiro-native`` / ``native-kiro`` the ``kiro-cli`` CLI. Cursor and Kiro
-# install out-of-band rather than through npm — see their ``install_hint``
-# values.
+# ``kiro-native`` / ``native-kiro`` the ``kiro-cli`` CLI, and ``forge`` the
+# ``forge`` CLI. Cursor, Kiro, and Forge install out-of-band rather than
+# through npm — see their ``install_hint`` values.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # the in-process ``antigravity`` Gemini SDK harness, and the SDK ``cursor``
@@ -255,6 +265,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-opencode": OPENCODE_KEY,
     # Hermes Agent (``harness: hermes``) wraps the ``hermes`` CLI.
     HERMES_KEY: HERMES_KEY,
+    # ForgeCode harness wraps the ``forge`` CLI.
+    FORGE_KEY: FORGE_KEY,
     # Native Hermes TUI (``hermes-native``, via ``omni hermes``) wraps the same
     # ``hermes`` CLI as the headless harness; ``native-hermes`` reversed spelling
     # gates on the same binary.

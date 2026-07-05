@@ -220,6 +220,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    ``forge`` is excluded for the same reason as ``kimi`` / ``hermes``: it wraps
+    the ForgeCode CLI and authenticates through Forge's own OAuth/config rather
+    than the mock Databricks gateway/profile wiring used by this matrix. Its
+    harness contract is covered by the forge executor tests, including a real
+    PTY-backed subprocess path.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "claude-native",
@@ -240,5 +246,6 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        "forge",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

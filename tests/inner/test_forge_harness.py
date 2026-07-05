@@ -306,8 +306,22 @@ async def test_run_turn_writes_forge_config_for_bare_model_with_provider(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_empty_message_yields_none() -> None:
-    executor = ForgeExecutor(binary_path="forge")
+async def test_run_turn_empty_message_yields_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.inner import sandbox as sandbox_mod
+
+    monkeypatch.setattr("omnigent.inner.forge_executor.shutil.which", lambda _binary: None)
+    monkeypatch.setattr(
+        sandbox_mod,
+        "resolve_sandbox",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("sandbox unavailable")),
+    )
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        fork=False,
+    )
+    executor = ForgeExecutor(binary_path="forge", os_env=os_env)
     events = []
     async for event in executor.run_turn(
         messages=[{"role": "assistant", "content": "Hello"}],

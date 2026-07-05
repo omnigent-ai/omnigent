@@ -256,6 +256,11 @@ class ForgeExecutor(Executor):
             )
             self._warned_tools_without_bridge = True
 
+        prompt_text = _latest_user_text(messages)
+        if not prompt_text:
+            yield TurnComplete(response=None)
+            return
+
         if shutil.which(self._binary_path) is None and not Path(self._binary_path).exists():
             yield ExecutorError(
                 message=(
@@ -265,11 +270,6 @@ class ForgeExecutor(Executor):
                 ),
                 retryable=False,
             )
-            return
-
-        prompt_text = _latest_user_text(messages)
-        if not prompt_text:
-            yield TurnComplete(response=None)
             return
 
         model = (config.model if config else None) or self._model
