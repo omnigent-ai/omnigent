@@ -58,14 +58,19 @@ class _FakeWebSocket:
     messages, and captures the close code.
     """
 
-    def __init__(self, inbound: list[dict[str, object]]) -> None:
+    def __init__(self, inbound: list[dict[str, object]], send_delay_s: float = 0.0) -> None:
         self._inbound = list(inbound)
         self.sent: list[bytes] = []
         self.close_code: int | None = None
         self.close_reason: str | None = None
         self._recv_gate = asyncio.Event()
+        # Per-send delay simulates a real network so a burst backlogs behind the
+        # send — the condition under which the forwarder coalesces.
+        self._send_delay_s = send_delay_s
 
     async def send_bytes(self, data: bytes) -> None:
+        if self._send_delay_s:
+            await asyncio.sleep(self._send_delay_s)
         self.sent.append(data)
 
     async def receive(self) -> dict[str, object]:
@@ -159,11 +164,10 @@ async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
 async def test_control_bridge_streams_large_output_burst() -> None:
     """A large post-attach output burst streams through intact, no reader crash.
 
-    tmux chunks ``%output`` into small lines, but the raised StreamReader limit
-    guards against a build that emits one line past asyncio's 64 KiB default
-    (where ``readline()`` would raise ``LimitOverrunError`` and kill the reader).
-    Assert a ~200 KiB live burst reaches the browser fully rather than dropping
-    the connection.
+    The raw-``read()`` reader (not ``readline()``) has no per-line length cap,
+    so a big burst can't raise ``LimitOverrunError`` and kill the reader. Assert
+    a ~200 KiB live burst reaches the browser fully rather than dropping the
+    connection.
     """
     # Hold the pane quiet for 1s, THEN emit ~200 KiB in one burst — so the
     # payload arrives as live post-attach %output (the readline path), not via
@@ -187,11 +191,107 @@ async def test_control_bridge_streams_large_output_burst() -> None:
     # Wait past the burst so the big %output line is read and forwarded.
     await asyncio.sleep(2.0)
 
-    # The reader must still be alive (no LimitOverrunError crash) and the large
-    # payload must have reached the browser via the live stream.
+    # The reader must still be alive and the large payload must have reached the
+    # browser via the live stream.
     total_x = sum(frame.count(b"X") for frame in ws.sent)
     assert total_x >= payload_len, (
         f"large output truncated/dropped: got {total_x} X bytes of {payload_len}"
+    )
+
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_coalesces_burst_when_send_lags() -> None:
+    """A burst behind a slow send collapses into far fewer, larger frames.
+
+    tmux firehoses ``%output`` as many small per-line writes; when the browser
+    send can't keep pace a backlog forms, and the forwarder merges it into large
+    ``send_bytes`` instead of thousands of tiny ones. Assert on the *average
+    frame size* rather than an absolute frame count: the count is scheduling-
+    dependent (how much backlog accrues between drains varies with load), but a
+    coalesced frame is always many times a single ``%output`` line (~1 KB),
+    which is the timing-robust signal that merging happened at all.
+    """
+    payload_len = 500_000
+    sock, target = await _new_private_tmux(
+        f'python3 -c \'import sys,time; time.sleep(1.0); sys.stdout.write("X"*{payload_len}); '
+        "sys.stdout.flush(); time.sleep(30)'"
+    )
+    await asyncio.sleep(0.2)
+
+    # A per-frame send delay makes the browser lag tmux's firehose so a backlog
+    # forms; 5 ms is generous enough that a backlog reliably accrues even under
+    # a loaded CI runner (where a 1 ms delay can keep pace and defeat merging).
+    ws = _FakeWebSocket(inbound=[], send_delay_s=0.005)
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    # Allow ample time for the full burst to drain through the slow send.
+    await asyncio.sleep(8.0)
+
+    burst_frames = [f for f in ws.sent if b"X" in f]
+    total_x = sum(f.count(b"X") for f in ws.sent)
+    assert total_x >= payload_len, f"burst truncated: got {total_x} X bytes of {payload_len}"
+    # Coalesced frames are far larger than a single ``%output`` line (~1 KB).
+    # Require a comfortably-above-per-line average — proves merging without
+    # depending on the exact (scheduling-dependent) frame count. Without
+    # coalescing this average would be ~1 KB; merged it is many KB.
+    avg_frame = total_x / max(1, len(burst_frames))
+    assert avg_frame > 4000, (
+        f"expected coalesced frames (avg > 4 KB), got avg {avg_frame:.0f}B over "
+        f"{len(burst_frames)} frames — forwarder is not merging the backlog"
+    )
+
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
+    """A burst-then-exit program's tail isn't dropped when %exit races the drain.
+
+    The reader and forwarder are separate tasks; shutdown keys on the reader.
+    When a program dumps a big burst and exits immediately (``cat bigfile``,
+    build output), ``%exit`` arrives while the slow browser send is still
+    draining the queued backlog. The bridge must let the forwarder finish
+    draining the sentinel-terminated queue before teardown, or the tail is
+    silently lost. Emit the burst then exit (no trailing sleep) behind a slow
+    send and assert the FULL payload still reaches the browser.
+    """
+    # The backlog must be too big to fully drain before the reader hits %exit,
+    # or the forwarder finishes on its own and the race never triggers. 2 MB
+    # behind a 5 ms/frame send leaves a large queued tail at %exit time — the
+    # pre-fix code (cancel forwarder on reader-done) drops ~35% of it.
+    payload_len = 2_000_000
+    sock, target = await _new_private_tmux(
+        # Sleep first so the control client attaches BEFORE the burst — the
+        # payload then arrives as live %output. Then burst and exit immediately
+        # (no trailing sleep) so %exit races the still-draining slow send: the
+        # regression window. (A burst emitted before attach is gone at the tmux
+        # layer, not a bridge concern.)
+        f'python3 -c \'import sys,time; time.sleep(1.5); sys.stdout.write("Y"*{payload_len}); '
+        "sys.stdout.flush()'"
+    )
+    await asyncio.sleep(0.2)
+
+    ws = _FakeWebSocket(inbound=[], send_delay_s=0.005)
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    # Wait past attach + burst + the bounded drain (coalesced to ~100 frames of
+    # ~20 KB, so ~0.5 s of 5 ms sends; generous margin below).
+    await asyncio.sleep(10.0)
+
+    total_y = sum(f.count(b"Y") for f in ws.sent)
+    assert total_y >= payload_len, (
+        f"burst-then-exit dropped the tail: got {total_y} Y bytes of {payload_len} "
+        "— forwarder was cancelled before draining the queued backlog"
     )
 
     await _kill_and_join(sock, task)

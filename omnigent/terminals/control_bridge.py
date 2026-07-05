@@ -58,13 +58,23 @@ from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-# Re-export the PTY bridge's application close codes so both transports speak
-# the same dialect to the frontend reconnect logic (see ws_bridge for the
-# authoritative definitions and the client-side classification).
+# Reuse the PTY bridge's application close codes AND its coalescing forwarder so
+# both transports speak the same dialect to the frontend and merge burst output
+# the same way (see ws_bridge for the authoritative definitions).
+# ``_forward_pty_to_ws`` is queue-driven and transport-agnostic — it drains
+# everything already queued into one bounded ``send_bytes`` — so the control
+# reader can feed it decoded ``%output`` payloads exactly like the PTY reader
+# feeds raw PTY reads. Under a burst the browser send lags tmux's firehose, a
+# backlog forms, and the forwarder collapses thousands of tiny per-line frames
+# into a few large ones. ``_coalesce_limit_after_input`` keeps the frame right
+# after a keystroke small so the echo stays on xterm's synchronous paint path.
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    _coalesce_limit_after_input,
+    _forward_pty_to_ws,
+    _monotonic,
 )
 
 _logger = logging.getLogger(__name__)
@@ -89,16 +99,23 @@ _CAPTURE_ROW_SEP_RE: Final = re.compile(rb"(?<!\r)\n")
 # contiguous stream. Matches terminal.py's literal-send chunking rationale.
 _SEND_KEYS_HEX_BYTES_PER_CALL: Final[int] = 1024
 
-# StreamReader line-length cap for the control client's stdout. In practice
-# tmux 3.6b chunks control-mode ``%output`` into small lines (a few KB even for
-# a 500 KB burst of octal-escaped control bytes on a huge pane), so lines stay
-# far under asyncio's 64 KiB default. But that chunk size is a tmux internal,
-# not a documented guarantee — a different version/build emitting one line past
-# 64 KiB would make ``readline()`` raise ``LimitOverrunError`` and crash the
-# reader (a disconnect/reconnect loop under burst output the PTY bridge handles
-# fine). Raising the cap to 16 MiB removes that failure mode for negligible
-# cost; it is a safety ceiling, not a steady buffer.
-_CONTROL_STDOUT_LINE_LIMIT: Final[int] = 16 * 1024 * 1024
+# Raw-read chunk for the control client's stdout. The reader uses
+# ``stdout.read(n)`` (not ``readline()``) and parses lines from its own buffer:
+# one wakeup can pull many ``%output`` lines so the forwarder coalesces them,
+# and raw reads sidestep ``readline()``'s line-length cap (an oversized line
+# would otherwise raise ``LimitOverrunError`` and crash the reader on a tmux
+# build that chunks ``%output`` more coarsely than 3.6b's few-KB lines).
+_CONTROL_READ_CHUNK: Final[int] = 256 * 1024
+# StreamReader buffer cap. ``read(n)`` returns as soon as any bytes arrive and
+# doesn't enforce a line limit, but the 64 KiB default would still bound a
+# single read; raise it so a large burst can be pulled in one wakeup.
+_CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
+
+# When the control reader ends with a send backlog still queued (a
+# burst-then-exit program), how long to let the forwarder finish draining that
+# sentinel-terminated backlog before teardown cancels it. Bounds teardown so a
+# stuck-slow client can't hang the close; a normal drain completes well within.
+_FORWARD_DRAIN_TIMEOUT_S: Final[float] = 5.0
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -345,10 +362,10 @@ async def bridge_tmux_control_to_websocket(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            # Raise the stdout StreamReader line cap well above the 64 KiB
-            # default so an oversized ``%output`` line can't crash the reader
-            # (see _CONTROL_STDOUT_LINE_LIMIT).
-            limit=_CONTROL_STDOUT_LINE_LIMIT,
+            # Raise the stdout StreamReader buffer above the 64 KiB default so a
+            # single ``read`` can pull a whole output burst (see
+            # _CONTROL_STDOUT_BUFFER_LIMIT).
+            limit=_CONTROL_STDOUT_BUFFER_LIMIT,
         )
     except (OSError, ValueError):
         _logger.exception("control-attach spawn failed target=%s", tmux_target)
@@ -360,6 +377,20 @@ async def bridge_tmux_control_to_websocket(
     stdin = proc.stdin
     stdout = proc.stdout
 
+    # Decoded ``%output`` payloads flow reader → forwarder through this queue
+    # (``None`` = EOF sentinel). The forwarder coalesces everything queued into
+    # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
+    # a backlog of tiny per-line payloads collapses into a few large frames.
+    output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    # Monotonic stamp of the last forwarded browser input; the forwarder reads
+    # it to shrink the frame cap right after a keystroke (keeps the echo on
+    # xterm's synchronous paint path — see the PTY bridge).
+    last_client_input_at: float | None = None
+
+    def _current_ws_coalesce_limit() -> int:
+        """Per-frame cap: small right after input, larger for output floods."""
+        return _coalesce_limit_after_input(last_client_input_at)
+
     async def _send_command(line: bytes) -> None:
         """Write one newline-terminated control command, ignoring a dead pipe."""
         if stdin.is_closing():
@@ -370,37 +401,64 @@ async def bridge_tmux_control_to_websocket(
         except (ConnectionResetError, BrokenPipeError, OSError):
             return
 
-    async def _control_to_ws() -> None:
-        """Read tmux control-protocol lines; forward %output, watch lifecycle."""
-        while True:
-            line = await stdout.readline()
-            if not line:
-                # tmux control client closed its stdout — server/session gone.
-                return
-            line = line.rstrip(b"\r\n")
-            if line.startswith(b"%output "):
-                # %output %<pane-id> <escaped-bytes>
-                parts = line.split(b" ", 2)
-                if len(parts) == 3:
-                    raw = unescape_control_output(parts[2])
-                    try:
-                        await websocket.send_bytes(raw)
-                    except (RuntimeError, WebSocketDisconnect):
+    def _handle_control_line(line: bytes) -> bool:
+        """Route one protocol line; return ``True`` to keep reading.
+
+        Queues decoded ``%output`` payloads for the forwarder and detects the
+        lifecycle lines that end the stream (session gone / ``%exit`` /
+        window-close). Pure parsing — the actual browser send is the
+        forwarder's job.
+
+        :param line: One control-protocol line, without its trailing newline.
+        :returns: ``True`` to continue reading, ``False`` to stop.
+        """
+        if line.startswith(b"%output "):
+            # %output %<pane-id> <escaped-bytes>
+            parts = line.split(b" ", 2)
+            if len(parts) == 3:
+                output_chunks.put_nowait(unescape_control_output(parts[2]))
+            return True
+        if line.startswith(b"%exit"):
+            return False
+        if line.startswith(b"%window-close"):
+            # The single-pane session's only window closing means the pane is
+            # gone. Let the exit path decide detach-vs-gone via a liveness
+            # probe. (%pane-mode-changed — copy-mode enter/leave — is
+            # deliberately NOT a close trigger.)
+            return False
+        # %begin/%end/%error reply blocks and other notifications
+        # (%layout-change, %session-changed, %window-*) need no browser
+        # forwarding — the browser xterm renders purely from %output.
+        return True
+
+    async def _read_control() -> None:
+        """Read raw control-stream chunks, parse lines, queue %output.
+
+        Reads with ``stdout.read()`` rather than ``readline()`` so one wakeup
+        can pull many buffered ``%output`` lines at once — letting the
+        forwarder coalesce them — and so an oversized line can't raise
+        ``LimitOverrunError``. Always enqueues the ``None`` EOF sentinel on exit
+        so the forwarder terminates.
+        """
+        buffer = b""
+        try:
+            while True:
+                data = await stdout.read(_CONTROL_READ_CHUNK)
+                if not data:
+                    # tmux control client closed its stdout — server/session gone.
+                    return
+                buffer += data
+                # Parse all COMPLETE lines; keep any trailing partial for next read.
+                *lines, buffer = buffer.split(b"\n")
+                for raw_line in lines:
+                    if not _handle_control_line(raw_line.rstrip(b"\r")):
                         return
-            elif line.startswith(b"%exit"):
-                return
-            elif line.startswith(b"%window-close"):
-                # The single-pane session's only window closing means the pane
-                # is gone. Let the exit path decide detach-vs-gone via a
-                # liveness probe. (%pane-mode-changed — copy-mode enter/leave —
-                # is deliberately NOT a close trigger.)
-                return
-            # %begin/%end/%error reply blocks and other notifications
-            # (%layout-change, %session-changed, %window-*) need no browser
-            # forwarding — the browser xterm renders purely from %output.
+        finally:
+            output_chunks.put_nowait(None)
 
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
+        nonlocal last_client_input_at
         try:
             while True:
                 msg = await websocket.receive()
@@ -423,6 +481,9 @@ async def bridge_tmux_control_to_websocket(
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                 elif data is not None and not read_only:
+                    # Stamp before sending so the next %output (the echo) takes
+                    # the small interactive frame cap.
+                    last_client_input_at = _monotonic()
                     for cmd in _hex_send_keys_commands(tmux_target, data):
                         await _send_command(cmd)
         except WebSocketDisconnect:
@@ -438,22 +499,56 @@ async def bridge_tmux_control_to_websocket(
     # matches the current window size, so a re-attach at an unchanged size emits
     # no resize at all.
 
-    control_task = asyncio.create_task(_control_to_ws(), name="tmux-control-to-ws")
+    # Reader parses the control stream and queues %output; forwarder coalesces
+    # queued payloads into bounded WebSocket frames; ws task drives input.
+    read_task = asyncio.create_task(_read_control(), name="tmux-control-read")
+    forward_task = asyncio.create_task(
+        _forward_pty_to_ws(
+            websocket, output_chunks, max_coalesce_bytes=_current_ws_coalesce_limit
+        ),
+        name="tmux-control-forward",
+    )
     ws_task = asyncio.create_task(_ws_to_control(), name="tmux-ws-to-control")
+    # "Control side ended" == the reader finished (session gone / %exit /
+    # window-close) — the signal the close-code logic keys on. The forwarder
+    # finishing is downstream (it drains, then sees the EOF sentinel).
     control_ended_first = False
     try:
         done, pending = await asyncio.wait(
-            {control_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
+            {read_task, forward_task, ws_task}, return_when=asyncio.FIRST_COMPLETED
         )
-        control_ended_first = control_task in done
+        control_ended_first = read_task in done
+        # When the reader finished first it already queued every remaining
+        # %output plus the None EOF sentinel, so the forwarder will drain the
+        # backlog and exit on its own. Await it (bounded) BEFORE cancelling so a
+        # burst-then-exit program's tail isn't dropped mid-drain — the exact
+        # loss the old inline-send loop couldn't have (it flushed each frame
+        # before reading the next line). Bounded so a wedged/stuck-slow send
+        # can't hang teardown; the timeout then falls through to cancel.
+        if control_ended_first and not forward_task.done():
+            # Suppress everything here (TimeoutError → drain took too long, fall
+            # through to cancel; any other error → the forwarder itself raised,
+            # which asyncio.shield propagates out of wait_for instead of
+            # TimeoutError). Letting either escape would skip the cancel/log
+            # bookkeeping below (the finally still runs). A real forwarder error
+            # is still surfaced by the exception-logging loop, since forward_task
+            # is then done() with it stored. ``Exception`` (not BaseException)
+            # so a CancelledError of the outer bridge still propagates.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(forward_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
+                )
         for task in pending:
+            if task.done():
+                continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        for task in done:
-            exc = task.exception()
-            if exc is not None:
-                _logger.warning("control-attach: bridge task crashed: %r", exc)
+        for task in {read_task, forward_task, ws_task}:
+            if task.done() and not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    _logger.warning("control-attach: bridge task crashed: %r", exc)
     finally:
         # Detach reflows the pane back to remaining clients — stamp it.
         if on_client_interaction is not None:
