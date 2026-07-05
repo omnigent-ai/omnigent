@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from omnigent.inner import forge_harness
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
 from omnigent.inner.forge_executor import (
     ForgeExecutor,
@@ -133,9 +134,18 @@ def test_latest_user_text_content_blocks() -> None:
 
 
 def test_strip_terminal_metadata_removes_ansi_spinner_and_errors() -> None:
-    raw = "\x1b[2K⠋ Migrating credentials 00s · Ctrl+C to interrupt\r\x1b[2KHello\n"
+    raw = (
+        "\x1b[2K⠋ Migrating credentials 00s · Ctrl+C to interrupt\r"
+        "\x1b[2K● [16:56:51] Initialize f220280d-a20b-4f3a-b186-36111df3ee43\r"
+        "\x1b[2KHello\n"
+        "\x1b[2K● [16:56:53] Finished f220280d-a20b-4f3a-b186-36111df3ee43\r"
+    )
     assert _strip_terminal_metadata(raw) == "Hello"
     assert _strip_terminal_metadata("● [05:05:11] ERROR: nope") == ""
+    assert (
+        _strip_terminal_metadata("Here is a literal line: ● [05:05:11] ERROR: nope")
+        == "Here is a literal line: ● [05:05:11] ERROR: nope"
+    )
 
 
 def test_split_model_override() -> None:
@@ -170,7 +180,7 @@ async def test_run_turn_returns_text_chunk_and_turn_complete(
     process.communicate = AsyncMock(return_value=(b"Hello, world!\n", b""))
 
     with patch(
-        "omnigent.inner.forge_executor._create_subprocess_exec",
+        "omnigent.inner.forge_executor._create_pty_subprocess_exec",
         new=AsyncMock(return_value=process),
     ) as create_proc:
         executor = ForgeExecutor(binary_path="forge", cwd="/tmp")
@@ -183,6 +193,9 @@ async def test_run_turn_returns_text_chunk_and_turn_complete(
             events.append(event)
 
     assert create_proc.await_args.args[:5] == ("forge", "-p", "Hi", "-C", "/tmp")
+    assert "stdin" not in create_proc.await_args.kwargs
+    assert "stdout" not in create_proc.await_args.kwargs
+    assert "stderr" not in create_proc.await_args.kwargs
     assert isinstance(events[0], TextChunk)
     assert events[0].text == "Hello, world!"
     assert isinstance(events[-1], TurnComplete)
@@ -204,7 +217,7 @@ async def test_run_turn_empty_output_is_error_even_with_zero_exit(
     )
 
     with patch(
-        "omnigent.inner.forge_executor._create_subprocess_exec",
+        "omnigent.inner.forge_executor._create_pty_subprocess_exec",
         new=AsyncMock(return_value=process),
     ):
         executor = ForgeExecutor(binary_path="forge")
@@ -232,7 +245,7 @@ async def test_run_turn_writes_forge_config_for_model(
     process.communicate = AsyncMock(return_value=(b"ok", b""))
 
     with patch(
-        "omnigent.inner.forge_executor._create_subprocess_exec",
+        "omnigent.inner.forge_executor._create_pty_subprocess_exec",
         new=AsyncMock(return_value=process),
     ) as create_proc:
         executor = ForgeExecutor(
@@ -251,6 +264,40 @@ async def test_run_turn_writes_forge_config_for_model(
     config = (tmp_path / ".forge.toml").read_text()
     assert 'provider_id = "openai"' in config
     assert 'model_id = "gpt-5"' in config
+    assert isinstance(events[-1], TurnComplete)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_writes_forge_config_for_bare_model_with_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setattr("omnigent.inner.forge_executor.shutil.which", lambda _binary: "/bin/forge")
+    monkeypatch.setattr(
+        "omnigent.inner.forge_executor._configured_provider_id", lambda _dir: "codex"
+    )
+    process = MagicMock()
+    process.returncode = 0
+    process.communicate = AsyncMock(return_value=(b"ok", b""))
+
+    with patch(
+        "omnigent.inner.forge_executor._create_pty_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        executor = ForgeExecutor(
+            binary_path="forge", model="gpt-5.3-codex-spark", config_dir=str(tmp_path)
+        )
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            system_prompt="",
+        ):
+            events.append(event)
+
+    config = (tmp_path / ".forge.toml").read_text()
+    assert 'provider_id = "codex"' in config
+    assert 'model_id = "gpt-5.3-codex-spark"' in config
     assert isinstance(events[-1], TurnComplete)
 
 
@@ -279,3 +326,39 @@ def test_os_env_json_roundtrip_in_factory(monkeypatch: pytest.MonkeyPatch) -> No
     ):
         forge_harness._build_forge_executor()
     assert captured["os_env"].sandbox.type == "none"
+
+
+def test_sandbox_launch_path_bare_binary_when_no_sandbox() -> None:
+    os_env = OSEnvSpec(
+        type="caller_process", cwd=None, sandbox=OSEnvSandboxSpec(type="none"), fork=False
+    )
+    assert ForgeExecutor(binary_path="forge")._sandbox_launch_path(()) == "forge"
+    assert ForgeExecutor(binary_path="forge", os_env=os_env)._sandbox_launch_path(()) == "forge"
+
+
+def test_sandbox_launch_path_wraps_when_sandbox_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import sandbox as sandbox_mod
+
+    class _ActivePolicy:
+        active = True
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", lambda *_a, **_k: _ActivePolicy())
+    monkeypatch.setattr(sandbox_mod, "with_additional_read_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_spawn_env_allowlist", lambda s, _names: s)
+    monkeypatch.setattr(
+        sandbox_mod, "create_exec_launcher", lambda target, _policy: f"LAUNCHER::{target}"
+    )
+    monkeypatch.setattr("omnigent.inner.forge_executor.shutil.which", lambda _binary: "/bin/forge")
+
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        fork=False,
+    )
+    launch = ForgeExecutor(binary_path="forge", os_env=os_env)._sandbox_launch_path(("PATH",))
+
+    assert launch == "LAUNCHER::/bin/forge"

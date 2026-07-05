@@ -22,16 +22,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import fcntl
 import logging
 import os
 import re
 import shutil
+import signal
+import stat
 import tempfile
-from collections.abc import AsyncIterator
+import termios
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from omnigent.inner.datamodel import OSEnvSpec
+import tomllib
+
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -48,7 +55,11 @@ _logger = logging.getLogger(__name__)
 
 _FORGE_TURN_TIMEOUT_S = 600.0
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_FORGE_ERROR_RE = re.compile(r"(?:^|\n)\s*[●!]\s+\[[^\n]*\]\s+ERROR:", re.IGNORECASE)
+_FORGE_STATUS_RE = re.compile(
+    r"^[●!]\s+\[\d{2}:\d{2}:\d{2}\]\s+(?:Initialize|Finished)\s+"
+    r"[0-9a-fA-F-]{36}$"
+)
+_FORGE_ERROR_RE = re.compile(r"^[●!]\s+\[\d{2}:\d{2}:\d{2}\]\s+ERROR:", re.IGNORECASE)
 
 
 def _resolve_forge_binary() -> str:
@@ -95,7 +106,9 @@ def _strip_terminal_metadata(output: str) -> str:
             continue
         if "Ctrl+C to interrupt" in stripped:
             continue
-        if _FORGE_ERROR_RE.search(stripped):
+        if _FORGE_STATUS_RE.match(stripped):
+            continue
+        if _FORGE_ERROR_RE.match(stripped):
             continue
         lines.append(line.rstrip())
     return "\n".join(lines).strip()
@@ -110,20 +123,29 @@ def _split_model_override(model: str) -> tuple[str | None, str]:
     return None, model
 
 
+def _configured_provider_id(config_dir: Path) -> str:
+    for path in (config_dir / ".forge.toml", Path.home() / ".forge" / ".forge.toml"):
+        with contextlib.suppress(OSError, tomllib.TOMLDecodeError):
+            payload = tomllib.loads(path.read_text(encoding="utf-8"))
+            session = payload.get("session")
+            if isinstance(session, dict):
+                provider_id = session.get("provider_id")
+                if isinstance(provider_id, str) and provider_id.strip():
+                    return provider_id.strip()
+    return "codex"
+
+
 def _write_model_config(config_dir: Path, model: str) -> None:
     """Write the minimal Forge session model config.
 
-    Forge docs verify ``[session].provider_id`` + ``model_id``. A bare
-    model id has no verified provider, so keep that as model-only and let
-    Forge merge/resolve provider state from its own defaults.
+    Forge requires both ``[session].provider_id`` and ``model_id``; a
+    bare model id is paired with the configured default provider.
     """
     config_dir.mkdir(parents=True, exist_ok=True)
     provider_id, model_id = _split_model_override(model)
+    provider_id = provider_id or _configured_provider_id(config_dir)
     lines = ["[session]", f'model_id = "{model_id}"']
-    if provider_id:
-        lines.insert(1, f'provider_id = "{provider_id}"')
-    else:
-        lines.insert(0, "# UNVERIFIED: bare HARNESS_FORGE_MODEL has no provider_id.")
+    lines.insert(1, f'provider_id = "{provider_id}"')
     (config_dir / ".forge.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -147,7 +169,7 @@ class ForgeExecutor(Executor):
         self._agent = agent
         self._config_dir = Path(config_dir) if config_dir else None
         self._temp_config_dir: Path | None = None
-        self._active_process: asyncio.subprocess.Process | None = None
+        self._active_process: _PtyProcess | None = None
         self._warned_tools_without_bridge = False
 
     def handles_tools_internally(self) -> bool:
@@ -163,6 +185,37 @@ class ForgeExecutor(Executor):
         if self._agent:
             argv.extend(["--agent", self._agent])
         return argv
+
+    def _sandbox_launch_path(self, spawn_env_names: Sequence[str]) -> str:
+        """Return the forge binary or a sandbox launcher wrapping it."""
+        os_env = self._os_env
+        if os_env is None:
+            return self._binary_path
+        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+        if sandbox_spec.type == "none":
+            return self._binary_path
+        try:
+            from .sandbox import (
+                create_exec_launcher,
+                resolve_sandbox,
+                with_additional_read_roots,
+                with_additional_write_roots,
+                with_spawn_env_allowlist,
+            )
+
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            sandbox = resolve_sandbox(os_env, cwd)
+            if not sandbox.active:
+                return self._binary_path
+            resolved_bin = shutil.which(self._binary_path) or self._binary_path
+            bin_dir = Path(resolved_bin).resolve(strict=False).parent
+            sandbox = with_additional_read_roots(sandbox, [bin_dir])
+            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".forge", Path("/tmp")])
+            sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+            return create_exec_launcher(resolved_bin, sandbox)
+        except (OSError, ImportError, NotImplementedError, ValueError) as exc:
+            _logger.warning("Could not apply sandbox for forge; running unsandboxed: %s", exc)
+            return self._binary_path
 
     def _config_path(self) -> Path | None:
         if self._config_dir is not None:
@@ -220,16 +273,14 @@ class ForgeExecutor(Executor):
         try:
             argv = self._build_argv(prompt_text=prompt_text)
             env = self._build_spawn_env()
+            argv[0] = self._sandbox_launch_path(tuple(env.keys()))
         finally:
             self._model = old_model
 
-        process: asyncio.subprocess.Process | None = None
+        process: _PtyProcess | None = None
         try:
-            process = await _create_subprocess_exec(
+            process = await _create_pty_subprocess_exec(
                 *argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd or None,
                 env=env,
             )
@@ -308,9 +359,91 @@ class ForgeExecutor(Executor):
         return False
 
 
-async def _create_subprocess_exec(
+class _PtyProcess:
+    """Small process facade for a child spawned with ``forkpty``."""
+
+    def __init__(self, pid: int, master_fd: int) -> None:
+        self.pid = pid
+        self.master_fd = master_fd
+        self.returncode: int | None = None
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        loop = asyncio.get_running_loop()
+        output = bytearray()
+        read_done = loop.create_future()
+
+        def _read_ready() -> None:
+            try:
+                chunk = os.read(self.master_fd, 4096)
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    if not read_done.done():
+                        read_done.set_exception(exc)
+                    return
+                chunk = b""
+            if chunk:
+                output.extend(chunk)
+                return
+            loop.remove_reader(self.master_fd)
+            if not read_done.done():
+                read_done.set_result(None)
+
+        flags = fcntl.fcntl(self.master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        loop.add_reader(self.master_fd, _read_ready)
+        wait_task = asyncio.create_task(asyncio.to_thread(os.waitpid, self.pid, 0))
+        try:
+            pid, status_value = await wait_task
+            if pid == self.pid:
+                self.returncode = _returncode_from_wait_status(status_value)
+            await read_done
+        finally:
+            loop.remove_reader(self.master_fd)
+            with contextlib.suppress(OSError):
+                os.close(self.master_fd)
+        return bytes(output), b""
+
+    def terminate(self) -> None:
+        os.kill(self.pid, signal.SIGTERM)
+
+
+def _returncode_from_wait_status(status_value: int) -> int:
+    if os.WIFEXITED(status_value):
+        return os.WEXITSTATUS(status_value)
+    if os.WIFSIGNALED(status_value):
+        return -os.WTERMSIG(status_value)
+    return 1
+
+
+async def _create_pty_subprocess_exec(
     *args: Any,  # type: ignore[explicit-any]
     **kwargs: Any,  # type: ignore[explicit-any]
-) -> asyncio.subprocess.Process:
-    """Indirection point for tests."""
-    return await asyncio.create_subprocess_exec(*args, **kwargs)
+) -> _PtyProcess:
+    """Spawn a process under a controlling PTY.
+
+    Forge's ``-p`` path can stall when run without a terminal. ``forkpty``
+    creates a session with the slave side as the child process's controlling
+    terminal, while the parent asynchronously drains the master side.
+    """
+    cwd = kwargs.pop("cwd", None)
+    env = kwargs.pop("env", None)
+    if kwargs:
+        raise TypeError(f"unsupported PTY spawn kwargs: {', '.join(sorted(kwargs))}")
+    argv = [str(arg) for arg in args]
+    pid, master_fd = os.forkpty()
+    if pid == 0:
+        try:
+            if cwd is not None:
+                os.chdir(cwd)
+            with contextlib.suppress(AttributeError, OSError):
+                termios.tcsetwinsize(0, (24, 120))
+            executable = argv[0]
+            exec_env = env if env is not None else os.environ.copy()
+            os.execvpe(executable, argv, exec_env)
+        except OSError:
+            os._exit(127)
+    mode = os.fstat(master_fd).st_mode
+    if not stat.S_ISCHR(mode):
+        os.close(master_fd)
+        raise OSError("forkpty did not return a character device")
+    return _PtyProcess(pid, master_fd)
