@@ -62,6 +62,10 @@ _FORGE_STATUS_RE = re.compile(
 _FORGE_ERROR_RE = re.compile(r"^[●!]\s+\[\d{2}:\d{2}:\d{2}\]\s+ERROR:", re.IGNORECASE)
 
 
+class SandboxLaunchError(RuntimeError):
+    """Raised when a requested OS sandbox cannot wrap Forge."""
+
+
 def _resolve_forge_binary() -> str:
     explicit = os.environ.get("HARNESS_FORGE_PATH", "").strip()
     if explicit:
@@ -206,7 +210,7 @@ class ForgeExecutor(Executor):
             cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
-                return self._binary_path
+                raise SandboxLaunchError("requested sandbox resolved to an inactive policy")
             resolved_bin = shutil.which(self._binary_path) or self._binary_path
             bin_dir = Path(resolved_bin).resolve(strict=False).parent
             sandbox = with_additional_read_roots(sandbox, [bin_dir])
@@ -214,8 +218,9 @@ class ForgeExecutor(Executor):
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(resolved_bin, sandbox)
         except (OSError, ImportError, NotImplementedError, ValueError) as exc:
-            _logger.warning("Could not apply sandbox for forge; running unsandboxed: %s", exc)
-            return self._binary_path
+            raise SandboxLaunchError(
+                f"could not apply requested sandbox for forge: {exc}"
+            ) from exc
 
     def _config_path(self) -> Path | None:
         if self._config_dir is not None:
@@ -274,6 +279,9 @@ class ForgeExecutor(Executor):
             argv = self._build_argv(prompt_text=prompt_text)
             env = self._build_spawn_env()
             argv[0] = self._sandbox_launch_path(tuple(env.keys()))
+        except SandboxLaunchError as exc:
+            yield ExecutorError(message=str(exc), retryable=False)
+            return
         finally:
             self._model = old_model
 
@@ -444,6 +452,10 @@ async def _create_pty_subprocess_exec(
             os._exit(127)
     mode = os.fstat(master_fd).st_mode
     if not stat.S_ISCHR(mode):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+        with contextlib.suppress(ChildProcessError):
+            await asyncio.to_thread(os.waitpid, pid, 0)
         os.close(master_fd)
         raise OSError("forkpty did not return a character device")
     return _PtyProcess(pid, master_fd)

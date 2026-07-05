@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
+import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +16,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
 from omnigent.inner.forge_executor import (
     ForgeExecutor,
+    _create_pty_subprocess_exec,
     _latest_user_text,
     _resolve_forge_binary,
     _split_model_override,
@@ -362,3 +366,148 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     launch = ForgeExecutor(binary_path="forge", os_env=os_env)._sandbox_launch_path(("PATH",))
 
     assert launch == "LAUNCHER::/bin/forge"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_fails_closed_when_requested_sandbox_cannot_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import sandbox as sandbox_mod
+
+    class _ActivePolicy:
+        active = True
+
+    monkeypatch.setattr("omnigent.inner.forge_executor.shutil.which", lambda _binary: "/bin/forge")
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", lambda *_a, **_k: _ActivePolicy())
+    monkeypatch.setattr(sandbox_mod, "with_additional_read_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", lambda s, _roots: s)
+    monkeypatch.setattr(sandbox_mod, "with_spawn_env_allowlist", lambda s, _names: s)
+    monkeypatch.setattr(
+        sandbox_mod,
+        "create_exec_launcher",
+        lambda _target, _policy: (_ for _ in ()).throw(OSError("launcher failed")),
+    )
+
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        fork=False,
+    )
+    spawn = AsyncMock()
+    with patch("omnigent.inner.forge_executor._create_pty_subprocess_exec", new=spawn):
+        executor = ForgeExecutor(binary_path="forge", os_env=os_env)
+        events = []
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            system_prompt="",
+        ):
+            events.append(event)
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "could not apply requested sandbox" in events[0].message
+    spawn.assert_not_awaited()
+
+
+_FORKPTY_AVAILABLE = hasattr(os, "forkpty")
+
+
+@pytest.mark.skipif(not _FORKPTY_AVAILABLE, reason="os.forkpty is unavailable")
+@pytest.mark.asyncio
+async def test_pty_spawn_drains_output_reaps_child_closes_fd_and_applies_cwd_env(
+    tmp_path: Any,
+) -> None:
+    env = os.environ.copy()
+    env["FORGE_PTY_TEST_ENV"] = "env-ok"
+    code = (
+        "import os, sys; "
+        "print('cwd=' + os.getcwd()); "
+        "print('env=' + os.environ['FORGE_PTY_TEST_ENV']); "
+        "sys.stderr.write('stderr-line\\n'); "
+        "print('stdout-line')"
+    )
+
+    process = await _create_pty_subprocess_exec(
+        sys.executable,
+        "-c",
+        code,
+        cwd=str(tmp_path),
+        env=env,
+    )
+    master_fd = process.master_fd
+    pid = process.pid
+
+    stdout, stderr = await process.communicate()
+
+    text = stdout.decode("utf-8", errors="replace")
+    assert stderr == b""
+    assert f"cwd={tmp_path}" in text
+    assert "env=env-ok" in text
+    assert "stdout-line" in text
+    assert "stderr-line" in text
+    assert process.returncode == 0
+    with pytest.raises(OSError) as fd_error:
+        os.fstat(master_fd)
+    assert fd_error.value.errno == errno.EBADF
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+
+
+@pytest.mark.skipif(not _FORKPTY_AVAILABLE, reason="os.forkpty is unavailable")
+@pytest.mark.asyncio
+async def test_pty_linux_eio_on_master_read_is_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = await _create_pty_subprocess_exec(
+        sys.executable,
+        "-c",
+        "print('eio-eof-ok')",
+    )
+    original_read = os.read
+    saw_eio = False
+
+    def _tracking_read(fd: int, size: int) -> bytes:
+        nonlocal saw_eio
+        try:
+            return original_read(fd, size)
+        except OSError as exc:
+            if fd == process.master_fd and exc.errno == errno.EIO:
+                saw_eio = True
+            raise
+
+    monkeypatch.setattr(os, "read", _tracking_read)
+
+    stdout, stderr = await process.communicate()
+
+    assert stderr == b""
+    assert b"eio-eof-ok" in stdout
+    assert saw_eio
+    assert process.returncode == 0
+
+
+@pytest.mark.skipif(not _FORKPTY_AVAILABLE, reason="os.forkpty is unavailable")
+@pytest.mark.asyncio
+async def test_pty_spawn_reaps_child_when_parent_fd_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_forkpty = os.forkpty
+    child_pid: int | None = None
+
+    def _capturing_forkpty() -> tuple[int, int]:
+        nonlocal child_pid
+        pid, master_fd = original_forkpty()
+        if pid != 0:
+            child_pid = pid
+        return pid, master_fd
+
+    monkeypatch.setattr(os, "forkpty", _capturing_forkpty)
+    monkeypatch.setattr("omnigent.inner.forge_executor.stat.S_ISCHR", lambda _mode: False)
+
+    with pytest.raises(OSError, match="forkpty did not return a character device"):
+        await _create_pty_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")
+
+    assert child_pid is not None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child_pid, os.WNOHANG)
