@@ -306,7 +306,7 @@ def test_put_gives_up_after_retries_exhausted(
     )
     with pytest.raises(click.ClickException, match="Unexpected EOF"):
         SbxSandboxLauncher().put("box", Path("/tmp/x"), "/tmp/x")
-    assert len(fake_sbx.calls) == 3
+    assert len(fake_sbx.calls) == 6
 
 
 # ── wheel_install_command ───────────────────────────────────
@@ -315,13 +315,18 @@ def test_put_gives_up_after_retries_exhausted(
 def test_wheel_install_is_full_install(fake_sbx: _FakeSbx) -> None:
     """
     The default sbx image has no baked omnigent, so the install is a
-    FULL dependency install into the user site — NOT the host-image
-    overlay (no --no-deps / --force-reinstall).
+    FULL dependency install into a dedicated venv — NOT the host-image
+    overlay (no --no-deps / --force-reinstall), and NOT a --user
+    install: native-harness hook commands run under `python3 -I`,
+    which disables user site-packages, so a --user install is
+    invisible to them (confirmed against a real sbx sandbox).
     """
     cmd = SbxSandboxLauncher().wheel_install_command("/tmp/oa-wheels.tgz")
     assert "tar xzf /tmp/oa-wheels.tgz" in cmd
-    assert "pip install" in cmd
-    assert "--user" in cmd
+    assert "python3 -m venv" in cmd
+    assert "pip" in cmd
+    assert "install" in cmd
+    assert "--user" not in cmd
     # Required: opentelemetry-instrumentation-fastapi has never cut a
     # non-beta release, so a plain install excludes every version
     # matching the pin and fails outright (confirmed against a real
@@ -330,6 +335,10 @@ def test_wheel_install_is_full_install(fake_sbx: _FakeSbx) -> None:
     assert "--pre" in cmd
     assert "--no-deps" not in cmd
     assert "--force-reinstall" not in cmd
+    # PATH persistence for the venv's entry points, mirroring the
+    # generic bootstrap's ~/.local/bin persistence step.
+    assert ".omnigent-venv/bin" in cmd
+    assert "PATH" in cmd
 
 
 # ── exec_foreground ─────────────────────────────────────────

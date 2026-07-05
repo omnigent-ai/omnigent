@@ -65,6 +65,16 @@ KITS_ENV_VAR: str = "OMNIGENT_SBX_KITS"
 """Environment variable naming (comma- or whitespace-separated) sbx kit
 references applied at provision time (``sbx create --kit``)."""
 
+_VENV_DIR: str = "$HOME/.omnigent-venv"
+"""In-sandbox venv omnigent is installed into (remote shell syntax, not
+a Python path — expanded by the sandbox's own shell). A real venv, not
+a ``--user`` install against the bare system Python: every native-harness
+hook command runs as ``python3 -I ...``, and isolated mode (``-I``)
+disables the user site-packages directory, so a ``--user`` install is
+invisible to those hook subprocesses even though plain ``python3 -c
+"import omnigent"`` finds it fine. A venv's site-packages aren't subject
+to that exclusion."""
+
 # npm specs come from harness_install.py so this setup tracks the same version
 # pins `omnigent setup` installs (e.g. OpenCode's `~1.17.7` range).
 _claude_spec = harness_install_spec(ANTHROPIC_FAMILY)
@@ -80,6 +90,7 @@ _SETUP_COMMAND: str = (
     "export DEBIAN_FRONTEND=noninteractive; pkgs=''; "
     'command -v python3 >/dev/null 2>&1 || pkgs="$pkgs python3"; '
     'command -v pip3 >/dev/null 2>&1 || pkgs="$pkgs python3-pip"; '
+    'python3 -c "import venv" >/dev/null 2>&1 || pkgs="$pkgs python3-venv"; '
     'command -v git >/dev/null 2>&1 || pkgs="$pkgs git"; '
     'command -v tmux >/dev/null 2>&1 || pkgs="$pkgs tmux"; '
     'command -v node >/dev/null 2>&1 || pkgs="$pkgs nodejs"; '
@@ -236,16 +247,20 @@ class SbxSandboxLauncher(SandboxLauncher):
         Copy a local file into the sandbox via ``sbx cp``.
 
         The first ``sbx cp`` into a freshly-provisioned sandbox can flake
-        with a truncated-tar extract; an immediate retry clears it, and
-        ``cp`` is idempotent. Only that transient is retried — a permanent
-        error (bad path, missing sandbox) fails fast.
+        with a truncated-tar extract; the copy transport isn't always
+        warmed up by the time ``provision``'s setup step (apt + npm
+        installs) finishes, and how long that takes varies with the
+        host's network — a short fixed retry budget isn't always enough.
+        An immediate retry clears it once the transport is up, and
+        ``cp`` is idempotent. Only that transient is retried — a
+        permanent error (bad path, missing sandbox) fails fast.
 
         :param sandbox_id: Target sandbox name.
         :param local_path: Local file to read.
         :param remote_path: Absolute destination path inside the sandbox.
         :raises click.ClickException: When the copy fails.
         """
-        attempts = 3
+        attempts = 6
         for attempt in range(1, attempts + 1):
             result = self._run_sbx(["cp", str(local_path), f"{sandbox_id}:{remote_path}"])
             if result.returncode == 0:
@@ -255,24 +270,28 @@ class SbxSandboxLauncher(SandboxLauncher):
             transient = "unexpected eof" in low or "tar extract failed" in low
             if not transient or attempt == attempts:
                 raise click.ClickException(f"File copy to sandbox '{sandbox_id}' failed: {detail}")
-            time.sleep(2)
+            time.sleep(3)
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """
-        Full dependency install of the shipped wheels into the user site.
+        Full dependency install of the shipped wheels into :data:`_VENV_DIR`.
 
         Unlike the prebaked-host-image launchers, sbx's default image has
         no baked omnigent, so this installs WITH dependencies (no
-        ``--no-deps`` / ``--force-reinstall``). ``--user`` lands the
-        install where the bootstrap's PATH-persistence step adds to PATH
-        (``$HOME/.local/bin``). ``--break-system-packages`` tolerates a
-        PEP-668 externally-managed base python. ``--pre`` is required:
+        ``--no-deps`` / ``--force-reinstall``). It lands in a dedicated
+        venv rather than ``--user`` site-packages — see :data:`_VENV_DIR`
+        for why a ``--user`` install breaks native-harness hook commands.
+        The venv is created on first install and reused after (``pip
+        install`` alone is idempotent already). ``--pre`` is required:
         omnigent depends on ``opentelemetry-instrumentation-fastapi``,
         which has never cut a non-beta release, so a plain ``pip
         install`` excludes every version that satisfies the pin and
         fails outright — confirmed live against a real sbx sandbox,
         where the prebaked-image launchers' ``--no-deps`` install never
-        exercises this dependency at all.
+        exercises this dependency at all. The final line appends the
+        venv's ``bin/`` to ``PATH`` (idempotent), mirroring the generic
+        bootstrap's ``~/.local/bin`` persistence step for the launchers
+        that use it.
 
         :param remote_tgz_path: Sandbox path of the shipped tarball.
         :returns: Shell command string for :meth:`run`.
@@ -280,8 +299,13 @@ class SbxSandboxLauncher(SandboxLauncher):
         return (
             "cd /tmp && rm -rf oa-wheels && mkdir oa-wheels && "
             f"tar xzf {remote_tgz_path} -C oa-wheels --warning=no-unknown-keyword && "
-            "pip install --user --break-system-packages --pre "
-            "--no-warn-script-location oa-wheels/*.whl"
+            f'[ -x "{_VENV_DIR}/bin/python3" ] || python3 -m venv "{_VENV_DIR}" && '
+            f'"{_VENV_DIR}/bin/pip" install --quiet --pre '
+            "--no-warn-script-location oa-wheels/*.whl && "
+            "for f in ~/.bashrc ~/.bash_profile; do "
+            f'grep -q "{_VENV_DIR}/bin" "$f" 2>/dev/null || '
+            f'echo "export PATH={_VENV_DIR}/bin:\\$PATH" >> "$f"; '
+            "done"
         )
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
