@@ -11,6 +11,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
+    OPENCODE_FAMILY,
     PI_SURFACE,
     default_provider_for_harness,
     harness_family,
@@ -481,6 +482,88 @@ def test_auth_command_still_valid_for_non_gemini_families() -> None:
     key = {"kind": "key", "openai": {"base_url": "https://x/v1", "auth_command": "mint-tok"}}
     key_entry = load_providers({"providers": {"k": key}})["k"]
     assert key_entry.families[OPENAI_FAMILY].auth_command == "mint-tok"
+
+
+def test_opencode_family_parses_without_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ``opencode:`` key (OpenCode Zen/Go account key) needs no base_url.
+
+    The key authenticates OpenCode's own fixed gateway — there is no endpoint
+    to point at — so requiring base_url would force a meaningless value into
+    every OpenCode Go config. The family must parse, serve only the opencode
+    surface, and resolve its secret via the normal api_key_ref path.
+    """
+    monkeypatch.setenv("OPENCODE_KEY", "oc-secret")
+    raw = {"kind": "key", "opencode": {"api_key_ref": "env:OPENCODE_KEY"}}
+    entry = load_providers({"providers": {"opencode-go": raw}})["opencode-go"]
+    assert provider_families(entry) == frozenset({OPENCODE_FAMILY})
+    family = entry.family(OPENCODE_FAMILY)
+    assert family is not None
+    assert family.api_key == "oc-secret"
+    assert family.base_url == ""
+
+
+def test_opencode_key_never_serves_pi_or_other_surfaces() -> None:
+    """An opencode-only key serves the opencode scope and nothing else.
+
+    Pi consumes the anthropic/openai families only; a regression that lets an
+    opencode key claim the pi scope would wedge pi launch on a credential it
+    cannot consume (the gemini-key precedent).
+    """
+    raw = {"kind": "key", "opencode": {"api_key_ref": "env:K"}, "default": True}
+    config = {"providers": {"oc": raw}}
+    entry = load_providers(config)["oc"]
+    assert PI_SURFACE not in provider_families(entry)
+    assert default_provider_for_harness(config, "pi") is None
+    assert default_provider_for_harness(config, "claude-sdk") is None
+    # An explicit pi scope is rejected at parse.
+    with pytest.raises(OmnigentError):
+        load_providers({"providers": {"oc": {**raw, "default": ["opencode", "pi"]}}})
+
+
+def test_opencode_auth_command_rejected_at_parse() -> None:
+    """An ``opencode:`` family with ``auth_command`` fails loud at parse.
+
+    The credential is a static OPENCODE_API_KEY delivered to the OpenCode
+    server's environment; an auth_command bearer token has no consumer, so
+    reject it at parse (parity with the gemini rule).
+    """
+    raw = {"kind": "key", "opencode": {"auth_command": "echo tok"}}
+    with pytest.raises(OmnigentError, match="auth_command is not allowed on an 'opencode'"):
+        load_providers({"providers": {"oc": raw}})
+
+
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+def test_opencode_only_gateway_local_rejected_at_parse(kind: str) -> None:
+    """A gateway/local whose ONLY family is opencode fails loud at parse.
+
+    The opencode family is key-only (an account key for OpenCode's own fixed
+    gateway), so such an entry configures nothing it can serve — reject it
+    rather than parse a silently-surfaceless provider (the gemini precedent).
+    """
+    raw = {"kind": kind, "opencode": {"api_key_ref": "env:K"}}
+    with pytest.raises(OmnigentError, match="key-only families"):
+        load_providers({"providers": {"gw": raw}})
+
+
+def test_gateway_with_opencode_block_keeps_other_families() -> None:
+    """A gateway carrying opencode + openai stays usable for openai only.
+
+    The stray ``opencode:`` block is stripped from the served surfaces (like a
+    gateway's gemini block) instead of failing the whole entry, so the
+    gateway's real families keep working; the opencode scope cannot be claimed
+    via ``default:`` either.
+    """
+    raw = {
+        "kind": "gateway",
+        "openai": {"base_url": "https://gw/v1", "api_key_ref": "env:K"},
+        "opencode": {"api_key_ref": "env:K2"},
+    }
+    entry = load_providers({"providers": {"gw": raw}})["gw"]
+    families = provider_families(entry)
+    assert OPENAI_FAMILY in families
+    assert OPENCODE_FAMILY not in families
+    with pytest.raises(OmnigentError):
+        load_providers({"providers": {"gw": {**raw, "default": ["opencode"]}}})
 
 
 def test_key_with_gemini_block_still_serves_gemini() -> None:

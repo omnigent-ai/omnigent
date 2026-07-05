@@ -31,6 +31,10 @@ from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_cli_instal
 _ENV_PROVIDER_VARS: tuple[tuple[str, str, str], ...] = (
     ("openai", "OpenAI", "OPENAI_API_KEY"),
     ("anthropic", "Anthropic", "ANTHROPIC_API_KEY"),
+    # OpenCode's own gateway: Zen (provider id ``opencode``) and the Go
+    # subscription (``opencode-go``) share one OPENCODE_API_KEY.
+    ("opencode", "OpenCode Zen/Go", "OPENCODE_API_KEY"),
+    ("opencode-go", "OpenCode Zen/Go", "OPENCODE_API_KEY"),
     ("google", "Google Gemini", "GEMINI_API_KEY"),
     ("google", "Google Gemini", "GOOGLE_GENERATIVE_AI_API_KEY"),
     ("groq", "Groq", "GROQ_API_KEY"),
@@ -90,6 +94,10 @@ def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[s
     for provider_id, _label, var in _ENV_PROVIDER_VARS:
         if env.get(var, "").strip():
             ids.add(provider_id)
+    # Zen and Go share one account key, so a credential stored under either
+    # id (whichever the ``/connect`` flow wrote) reaches both surfaces.
+    if ids & {"opencode", "opencode-go"}:
+        ids.update({"opencode", "opencode-go"})
     return frozenset(ids)
 
 

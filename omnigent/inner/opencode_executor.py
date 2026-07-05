@@ -67,9 +67,13 @@ _ENV_SKIP_PERMISSIONS = "HARNESS_OPENCODE_DANGEROUSLY_SKIP_PERMISSIONS"
 _ENV_GATEWAY_PROVIDER = "HARNESS_OPENCODE_GATEWAY_PROVIDER"
 _ENV_GATEWAY_BASE_URL = "HARNESS_OPENCODE_GATEWAY_BASE_URL"
 _ENV_GATEWAY_API_KEY = "HARNESS_OPENCODE_GATEWAY_API_KEY"
+_ENV_API_KEY = "HARNESS_OPENCODE_API_KEY"
 _ENV_MCP_SERVERS = "HARNESS_OPENCODE_MCP_SERVERS"
 _OPENCODE_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT"
 _OPENCODE_DISABLE_PROJECT_CONFIG_ENV = "OPENCODE_DISABLE_PROJECT_CONFIG"
+# OpenCode's own account-key env var (Zen / Go): its auth layer resolves
+# this for both the ``opencode`` and ``opencode-go`` provider ids.
+_OPENCODE_API_KEY_ENV = "OPENCODE_API_KEY"
 
 _SERVER_BOOT_TIMEOUT_S = 30.0
 # Read size for draining the server's stderr pipe. The output is discarded
@@ -637,6 +641,9 @@ class OpenCodeExecutor(Executor):
                 url = await self._bridge.start()
                 mcp_extra = {"omnigent": {"type": "remote", "url": url}}
             extra_env: dict[str, str] = {}
+            opencode_api_key = os.environ.get(_ENV_API_KEY, "").strip()
+            if opencode_api_key:
+                extra_env[_OPENCODE_API_KEY_ENV] = opencode_api_key
             payload = _build_opencode_config_content(mcp_extra=mcp_extra)
             if payload is not None:
                 extra_env[_OPENCODE_CONFIG_CONTENT_ENV] = json.dumps(

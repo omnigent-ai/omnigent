@@ -21,6 +21,7 @@ from omnigent.spec.types import (
     ApiKeyAuth,
     ExecutorSpec,
     LLMConfig,
+    ProviderAuth,
 )
 
 
@@ -38,7 +39,7 @@ def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def _spec(
     *,
     model: str | None = None,
-    auth: ApiKeyAuth | None = None,
+    auth: ApiKeyAuth | ProviderAuth | None = None,
 ) -> AgentSpec:
     """
     Build a minimal AgentSpec for the opencode harness.
@@ -75,3 +76,59 @@ def test_api_key_auth_bakes_gateway_key() -> None:
         _spec(auth=ApiKeyAuth(api_key="sk-xyz")),
     )
     assert env["HARNESS_OPENCODE_GATEWAY_API_KEY"] == "sk-xyz"
+
+
+def test_opencode_family_provider_sets_account_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A named provider with an ``opencode:`` family delivers the account key.
+
+    OpenCode Zen / Go credentials route as ``HARNESS_OPENCODE_API_KEY`` (the
+    executor exports it as ``OPENCODE_API_KEY``), NOT through the
+    ``HARNESS_OPENCODE_GATEWAY_*`` provider override — the key authenticates
+    OpenCode's own gateway, which needs no baseURL/apiKey config rewrite. The
+    family's ``models.default`` also becomes the spawn model when the spec
+    pins none.
+    """
+    monkeypatch.setenv("OC_GO_KEY", "oc-secret")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  opencode-go:\n"
+        "    kind: key\n"
+        "    opencode:\n"
+        "      api_key_ref: env:OC_GO_KEY\n"
+        "      models:\n"
+        "        default: opencode-go/kimi-k2.7-code\n",
+        encoding="utf-8",
+    )
+    env = _build_opencode_spawn_env(_spec(auth=ProviderAuth(name="opencode-go")))
+    assert env["HARNESS_OPENCODE_API_KEY"] == "oc-secret"
+    assert env["HARNESS_OPENCODE_MODEL"] == "opencode-go/kimi-k2.7-code"
+    assert "HARNESS_OPENCODE_GATEWAY_API_KEY" not in env
+    assert "HARNESS_OPENCODE_GATEWAY_BASE_URL" not in env
+
+
+def test_opencode_family_preferred_over_anthropic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider carrying both opencode and anthropic families routes opencode.
+
+    The opencode family is OpenCode's native credential, so it outranks the
+    gateway-override families in the dispatch order.
+    """
+    monkeypatch.setenv("OC_KEY", "oc-secret")
+    monkeypatch.setenv("ANTH_KEY", "sk-ant")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  both:\n"
+        "    kind: key\n"
+        "    opencode:\n"
+        "      api_key_ref: env:OC_KEY\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key_ref: env:ANTH_KEY\n",
+        encoding="utf-8",
+    )
+    env = _build_opencode_spawn_env(_spec(auth=ProviderAuth(name="both")))
+    assert env["HARNESS_OPENCODE_API_KEY"] == "oc-secret"
+    assert "HARNESS_OPENCODE_GATEWAY_API_KEY" not in env

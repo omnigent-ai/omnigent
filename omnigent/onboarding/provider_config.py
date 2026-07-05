@@ -69,10 +69,21 @@ from omnigent.spec.parser import check_unresolved_env_vars
 ANTHROPIC_FAMILY = "anthropic"
 OPENAI_FAMILY = "openai"
 GEMINI_FAMILY = "gemini"
+# ``opencode`` is OpenCode's own gateway surface (OpenCode Zen / Go), keyed
+# by an ``OPENCODE_API_KEY`` account key. Like ``gemini`` it is key-only —
+# the key authenticates OpenCode's fixed gateway, so a gateway/local proxy
+# cannot serve it — and it is consumed only by the ``opencode`` harness
+# (which also consumes the anthropic / openai families, mirroring pi).
+OPENCODE_FAMILY = "opencode"
 # ``gemini`` joins the inline-credential families so a ``providers: gemini:``
 # block (the detected GEMINI_API_KEY path) parses and validates like the
 # anthropic / openai families.
-_VALID_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY)
+_VALID_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, OPENCODE_FAMILY)
+
+# Families a gateway/local proxy (or a databricks profile) can never serve:
+# ``gemini`` needs a raw GEMINI_API_KEY through the google SDK, and
+# ``opencode`` is an account key for OpenCode's own fixed gateway.
+_KEY_ONLY_FAMILIES = frozenset({GEMINI_FAMILY, OPENCODE_FAMILY})
 
 # Families the unmapped ``pi`` surface can actually consume, in fallback
 # preference order. Gemini is EXCLUDED: a gemini key serves ONLY the Gemini
@@ -583,10 +594,16 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
     prefix = f"providers.{provider_name}.{family_name}"
     base_url_raw = raw.get("base_url")
     if not isinstance(base_url_raw, str) or not base_url_raw:
-        raise OmnigentError(
-            f"{prefix}.base_url is required and must be a string.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        # The opencode family authenticates OpenCode's own fixed gateway
+        # (Zen / Go) — there is no endpoint to point at, so base_url is
+        # optional and stored empty.
+        if family_name == OPENCODE_FAMILY:
+            base_url_raw = ""
+        else:
+            raise OmnigentError(
+                f"{prefix}.base_url is required and must be a string.",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     # Exactly one of {api_key, api_key_ref, auth_command} must be set.
     api_key_raw = raw.get("api_key")
@@ -623,6 +640,16 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
             "antigravity harness drives Gemini with a static GEMINI_API_KEY, and "
             "an auth_command mints a bearer token the google SDK cannot use as one. "
             "Use a static key source ('api_key' or 'api_key_ref') instead.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Same static-key rule for the opencode family: the credential is a
+    # static OPENCODE_API_KEY account key delivered via the environment, not
+    # a rotating bearer token an auth_command would mint.
+    if family_name == OPENCODE_FAMILY and isinstance(auth_command_raw, str) and auth_command_raw:
+        raise OmnigentError(
+            f"{prefix}.auth_command is not allowed on an 'opencode' family: the "
+            "opencode harness delivers a static OPENCODE_API_KEY to the OpenCode "
+            "server. Use a static key source ('api_key' or 'api_key_ref') instead.",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -860,15 +887,17 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 code=ErrorCode.INVALID_INPUT,
             )
         # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
-        # gemini: the antigravity harness drives Gemini via the dedicated google
-        # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
-        # profile cannot serve (or default) the Gemini surface.
+        # the key-only families: the antigravity harness drives Gemini via the
+        # dedicated google SDK + GEMINI_API_KEY, and the opencode family is an
+        # OPENCODE_API_KEY for OpenCode's own gateway — neither routes through
+        # an OpenAI-compatible gateway, so a databricks profile cannot serve
+        # (or default) those surfaces.
         return ProviderEntry(
             name=name,
             kind=kind,
             profile=profile_raw,
             default_families=_parse_default_families(
-                name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
+                name, default_raw, set(_VALID_FAMILIES) - _KEY_ONLY_FAMILIES, pi_capable=True
             ),
         )
 
@@ -881,7 +910,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
     if not families:
         raise OmnigentError(
             f"provider {name!r} (kind {kind!r}) configures no "
-            "'anthropic', 'openai', or 'gemini' family.",
+            "'anthropic', 'openai', 'gemini', or 'opencode' family.",
             code=ErrorCode.INVALID_INPUT,
         )
     # The Gemini surface is key-ONLY (the antigravity flavors need either a raw
@@ -897,13 +926,28 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             "harness). Use kind: 'key', or add an 'anthropic'/'openai' family.",
             code=ErrorCode.INVALID_INPUT,
         )
+    # Same key-only rule for the opencode family: the credential is an
+    # OPENCODE_API_KEY for OpenCode's own fixed gateway, which a gateway/local
+    # proxy cannot stand in for.
+    if (
+        kind != KEY_KIND
+        and not (set(families) - _KEY_ONLY_FAMILIES)
+        and OPENCODE_FAMILY in families
+    ):
+        raise OmnigentError(
+            f"provider {name!r} (kind {kind!r}) declares only key-only families "
+            f"({', '.join(sorted(families))}), but the 'opencode' family is served "
+            "only by a 'key' provider (an OPENCODE_API_KEY for OpenCode's own "
+            "gateway). Use kind: 'key', or add an 'anthropic'/'openai' family.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # Scope the parseable default to the families this kind can actually serve:
-    # a gateway/local's gemini block never grants the Gemini surface, so a
-    # hand-edited ``default: gemini`` on a gateway must fail at parse (parity
-    # with how a databricks profile cannot name the gemini scope).
+    # a gateway/local's gemini/opencode block never grants those key-only
+    # surfaces, so a hand-edited ``default: gemini`` on a gateway must fail at
+    # parse (parity with how a databricks profile cannot name those scopes).
     served_for_default = set(families)
     if kind != KEY_KIND:
-        served_for_default -= {GEMINI_FAMILY}
+        served_for_default -= _KEY_ONLY_FAMILIES
     return ProviderEntry(
         name=name,
         kind=kind,
@@ -1033,12 +1077,14 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         # flavors (the SDK harness via a raw GEMINI_API_KEY, antigravity-native
         # via OAuth), neither driveable by a gateway / local proxy. So a
         # ``gateway`` / ``local`` declaring a ``gemini:`` block must NOT claim
-        # the Gemini surface — only a ``key`` may. Stripping it here (rather than
-        # at parse) keeps a multi-family gateway usable for its anthropic /
-        # openai surfaces; a gateway whose ONLY family is gemini is rejected at
-        # parse (see :func:`_parse_provider`).
+        # the Gemini surface — only a ``key`` may. The same applies to the
+        # ``opencode`` family (an OPENCODE_API_KEY for OpenCode's own fixed
+        # gateway). Stripping them here (rather than at parse) keeps a
+        # multi-family gateway usable for its anthropic / openai surfaces; a
+        # gateway whose ONLY families are key-only is rejected at parse (see
+        # :func:`_parse_provider`).
         if entry.kind != KEY_KIND:
-            served = served - {GEMINI_FAMILY}
+            served = served - _KEY_ONLY_FAMILIES
         # pi consumes the anthropic / openai families only — a gemini-only key
         # serves just the Gemini surface, never pi (see ``_PI_FALLBACK_FAMILIES``).
         # Granting pi here would let the add flow auto-default pi to a gemini key
@@ -1070,9 +1116,11 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        # ucode routes anthropic/openai + pi, never the Gemini surface (which
-        # needs the antigravity SDK + GEMINI_API_KEY, not a gateway).
-        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
+        # ucode routes anthropic/openai + pi, never the key-only surfaces
+        # (Gemini needs the antigravity SDK + GEMINI_API_KEY; opencode needs
+        # an OPENCODE_API_KEY for OpenCode's own gateway — neither is a
+        # gateway a profile can stand in for).
+        return (frozenset(_VALID_FAMILIES) - _KEY_ONLY_FAMILIES) | {PI_SURFACE}
     return frozenset()
 
 

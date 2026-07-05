@@ -48,6 +48,7 @@ from omnigent.onboarding.provider_config import (
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     OPENAI_FAMILY,
+    OPENCODE_FAMILY,
     RESPONSES_WIRE_API,
     SUBSCRIPTION_KIND,
     FamilyConfig,
@@ -966,8 +967,17 @@ def _apply_provider_to_opencode(env: dict[str, str], entry: ProviderEntry) -> No
 
     OpenCode is multi-provider. Rather than picking one family for it
     here, this looks for the first family the entry actually provides
-    in the order ``anthropic`` → ``openai`` (matching ``pi``'s family
-    preference) and writes the resulting base URL + key into
+    in the order ``opencode`` → ``anthropic`` → ``openai`` (OpenCode's
+    own account key first, then ``pi``'s family preference).
+
+    An ``opencode`` family (an OpenCode Zen / Go account key) is
+    delivered as ``HARNESS_OPENCODE_API_KEY``, which the executor
+    exports to the ``opencode serve`` process as ``OPENCODE_API_KEY``
+    — OpenCode's own auth resolves it for both the ``opencode`` (Zen)
+    and ``opencode-go`` provider ids, so no provider override is
+    needed.
+
+    An anthropic/openai family writes the base URL + key into
     ``HARNESS_OPENCODE_GATEWAY_*`` env vars. The executor synthesises
     these into an ``OPENCODE_CONFIG_CONTENT`` payload at spawn time
     per ``packages/opencode/src/config/config.ts`` so the override is
@@ -982,9 +992,18 @@ def _apply_provider_to_opencode(env: dict[str, str], entry: ProviderEntry) -> No
     :param env: Mutable spawn-env dict, modified in place.
     :param entry: The resolved provider entry; must declare at least
         one of the supported families.
-    :raises OmnigentError: If the provider declares neither an
-        ``anthropic`` nor an ``openai`` family.
+    :raises OmnigentError: If the provider declares no ``opencode``,
+        ``anthropic``, or ``openai`` family.
     """
+    opencode_family = entry.family(OPENCODE_FAMILY)
+    if opencode_family is not None:
+        # api_key is always populated here: the opencode family is
+        # static-key-only (auth_command is rejected at parse), and
+        # api_key_ref is collapsed into api_key by ``entry.family``.
+        env["HARNESS_OPENCODE_API_KEY"] = opencode_family.api_key or ""
+        if "HARNESS_OPENCODE_MODEL" not in env and opencode_family.default_model:
+            env["HARNESS_OPENCODE_MODEL"] = opencode_family.default_model
+        return
     family: FamilyConfig | None = None
     provider_id: str | None = None
     for family_name, opencode_provider_id in (
@@ -998,11 +1017,10 @@ def _apply_provider_to_opencode(env: dict[str, str], entry: ProviderEntry) -> No
             break
     if family is None or provider_id is None:
         raise OmnigentError(
-            f"provider {entry.name!r} has no 'anthropic' or 'openai' family — "
-            "the 'opencode' harness needs one of them to route through its "
-            "OPENCODE_CONFIG_CONTENT provider override. Add an "
-            "'anthropic:' or 'openai:' family block to that provider in "
-            "~/.omnigent/config.yaml.",
+            f"provider {entry.name!r} has no 'opencode', 'anthropic', or "
+            "'openai' family — the 'opencode' harness needs one of them. Add "
+            "an 'opencode:' (OpenCode Zen/Go key), 'anthropic:', or 'openai:' "
+            "family block to that provider in ~/.omnigent/config.yaml.",
             code=ErrorCode.INVALID_INPUT,
         )
     env["HARNESS_OPENCODE_GATEWAY_PROVIDER"] = provider_id

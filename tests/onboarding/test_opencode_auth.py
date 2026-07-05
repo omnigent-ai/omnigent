@@ -100,3 +100,31 @@ def test_reachable_provider_ids_merges_stored_and_env(
     assert "anthropic" in ids  # from auth.json
     assert "openai" in ids  # from env key
     assert "groq" not in ids
+
+
+def test_opencode_api_key_env_reaches_zen_and_go(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OPENCODE_API_KEY makes both OpenCode gateway surfaces reachable.
+
+    Zen (provider id ``opencode``) and the Go subscription (``opencode-go``)
+    share one account key. Before this mapping, a Go subscriber whose only
+    credential was the env key saw "no provider configured yet" in setup and
+    the model picker filtered out every ``opencode-go/*`` model.
+    """
+    monkeypatch.setenv("OPENCODE_API_KEY", "oc-x")
+    ids = oc.reachable_provider_ids()
+    assert "opencode" in ids
+    assert "opencode-go" in ids
+    assert oc._env_providers() == ("OpenCode Zen/Go",)
+
+
+@pytest.mark.parametrize("stored_id", ["opencode", "opencode-go"])
+def test_stored_opencode_credential_reaches_both_ids(stored_id: str, tmp_path: Path) -> None:
+    """An auth.json credential under either OpenCode id unlocks both surfaces.
+
+    The ``/connect`` flow may store the shared key under either provider id;
+    the model-picker filter must not hide Go models because the key sits under
+    the Zen id (or vice versa).
+    """
+    _write_auth(tmp_path, {stored_id: {"type": "api", "key": "oc-x"}})
+    ids = oc.reachable_provider_ids()
+    assert {"opencode", "opencode-go"} <= ids

@@ -122,3 +122,38 @@ def test_capabilities():
     assert ex.handles_tools_internally() is True
     assert ex.supports_streaming() is True
     assert ex.supports_live_message_queue() is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_exports_opencode_account_key(monkeypatch):
+    """HARNESS_OPENCODE_API_KEY is exported to the serve process as OPENCODE_API_KEY.
+
+    The OpenCode Zen / Go account key rides the server's environment (its own
+    auth resolves OPENCODE_API_KEY for both the ``opencode`` and
+    ``opencode-go`` provider ids), not the OPENCODE_CONFIG_CONTENT provider
+    override.
+    """
+    monkeypatch.setenv("HARNESS_OPENCODE_API_KEY", "oc-secret")
+    for var in (
+        "HARNESS_OPENCODE_GATEWAY_PROVIDER",
+        "HARNESS_OPENCODE_GATEWAY_BASE_URL",
+        "HARNESS_OPENCODE_GATEWAY_API_KEY",
+        "HARNESS_OPENCODE_MCP_SERVERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    class _StubServer:
+        client = object()
+
+        def __init__(self):
+            self.extra_env: dict | None = None
+
+        async def start(self, *, cwd, extra_env):
+            self.extra_env = dict(extra_env)
+
+    ex = OpenCodeExecutor()
+    stub = _StubServer()
+    ex._server = stub
+    await ex._ensure_server([])
+    assert stub.extra_env is not None
+    assert stub.extra_env["OPENCODE_API_KEY"] == "oc-secret"

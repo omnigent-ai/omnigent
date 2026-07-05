@@ -48,6 +48,11 @@ Env vars read at startup (all optional):
   gateway, e.g. ``"https://example.databricks.com/ai-gateway/anthropic/v1"``.
 - ``HARNESS_OPENCODE_GATEWAY_API_KEY``: API key for the gateway.  Set
   when the agent spec declares ``executor.auth: {type: api_key, …}``.
+- ``HARNESS_OPENCODE_API_KEY``: an OpenCode Zen / Go account key,
+  exported to the ``opencode serve`` process as ``OPENCODE_API_KEY``
+  (OpenCode's own auth resolves it for both the ``opencode`` and
+  ``opencode-go`` provider ids).  Set when the agent's provider entry
+  declares an ``opencode:`` family.
 - ``HARNESS_OPENCODE_MCP_SERVERS``: JSON object whose keys are MCP
   server names and whose values are the server-info dicts OpenCode
   accepts (``{"type": "remote", "url": "…"}``).  Merged with the
