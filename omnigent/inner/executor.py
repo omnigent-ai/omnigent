@@ -99,6 +99,11 @@ class ExecutorEvent:
 
 
 @dataclass
+class ExecutorProgress(ExecutorEvent):
+    """Non-text progress marker for long executor waits."""
+
+
+@dataclass
 class TextChunk(ExecutorEvent):
     """Streaming text output.
 

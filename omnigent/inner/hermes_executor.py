@@ -39,6 +39,7 @@ Env vars read at construction:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -55,6 +56,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorProgress,
     Message,
     TextChunk,
     ToolSpec,
@@ -66,6 +68,7 @@ _logger = logging.getLogger(__name__)
 # Maximum seconds to wait for a Hermes subprocess to complete a single turn.
 # Complex tasks (multi-tool-calling loops) may take several minutes.
 _HERMES_TURN_TIMEOUT_S = 600.0
+_HERMES_SUBPROCESS_PROGRESS_INTERVAL_S = 15.0
 
 # Regex to extract the session_id from Hermes' quiet-mode output line.
 # Matches lines like ``session_id: 20260620_142506_c51451``.
@@ -500,10 +503,31 @@ class HermesExecutor(Executor):
                 env=proc_env,
             )
 
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=_HERMES_TURN_TIMEOUT_S,
-            )
+            communicate_task = asyncio.create_task(proc.communicate())
+            deadline = asyncio.get_running_loop().time() + _HERMES_TURN_TIMEOUT_S
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    communicate_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await communicate_task
+                    raise asyncio.TimeoutError
+                interval = min(_HERMES_SUBPROCESS_PROGRESS_INTERVAL_S, remaining)
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        asyncio.shield(communicate_task),
+                        timeout=interval,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if communicate_task.done():
+                        raise
+                    if asyncio.get_running_loop().time() >= deadline:
+                        communicate_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await communicate_task
+                        raise
+                    yield ExecutorProgress()
         except asyncio.TimeoutError:
             _logger.warning("Hermes subprocess timed out after %ss", _HERMES_TURN_TIMEOUT_S)
             yield ExecutorError(
