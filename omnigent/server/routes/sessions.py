@@ -20457,7 +20457,9 @@ def create_supervisor_sessions_router(
                 "No pending elicitation for session",
                 code=ErrorCode.NOT_FOUND,
             )
-        params = pending_event.get("params") if isinstance(pending_event.get("params"), dict) else {}
+        params = pending_event.get("params")
+        if not isinstance(params, dict):
+            params = {}
         target_session_id = sessionId
         if isinstance(params, dict):
             target = params.get("target_session_id")
@@ -20479,7 +20481,8 @@ def create_supervisor_sessions_router(
         resolve_data = {"elicitation_id": elicitation_id, "action": action}
         if body.auditMetadata:
             _logger.info(
-                "Supervisor-session resolve audit metadata session=%s target=%s elicitation=%s keys=%s",
+                "Supervisor-session resolve audit metadata "
+                "session=%s target=%s elicitation=%s keys=%s",
                 sessionId,
                 target_session_id,
                 elicitation_id,

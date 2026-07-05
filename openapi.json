@@ -5299,6 +5299,44 @@
         "title": "SlashCommandData",
         "type": "object"
       },
+      "SupervisorSessionResolveRequest": {
+        "description": "Adapter request for resolving the pending elicitation on a supervisor session.\n\nThis is a stable, externally owned shape that intentionally does\nnot expose the internal elicitation id or the internal MCP action\nliterals. The route layer translates `decision` into the\nexisting `ElicitationResult` primitive.",
+        "properties": {
+          "auditMetadata": {
+            "additionalProperties": true,
+            "description": "Opaque caller-provided audit data that is accepted for logging / future transport and does not affect resolution semantics.",
+            "title": "Auditmetadata",
+            "type": "object"
+          },
+          "decision": {
+            "description": "External verdict label, `\"approve\"` or `\"deny\"`.",
+            "enum": [
+              "approve",
+              "deny"
+            ],
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "title": "SupervisorSessionResolveRequest",
+        "type": "object"
+      },
+      "SupervisorSessionResolveResponse": {
+        "description": "Acknowledge a supervisor-session resolve request.",
+        "properties": {
+          "queued": {
+            "default": false,
+            "description": "Always `False` for the synchronous adapter path.",
+            "title": "Queued",
+            "type": "boolean"
+          }
+        },
+        "title": "SupervisorSessionResolveResponse",
+        "type": "object"
+      },
       "TerminalCommandData": {
         "description": "Data payload for a runner-side terminal command (`!cmd`) observed\nin a harness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nClaude Code writes two sibling transcript records per `!cmd`\ninvocation: one `<bash-input>` record and one combined\n`<bash-stdout>`/`<bash-stderr>` record. Each maps to one\n`terminal_command` item with `kind=\"input\"` or\n`kind=\"output\"` respectively.",
         "properties": {
@@ -5999,6 +6037,60 @@
   },
   "openapi": "3.2.0",
   "paths": {
+    "/api/supervisor-sessions/{sessionId}/resolve": {
+      "post": {
+        "description": "Resolve the pending elicitation currently visible for a supervisor session.\n\nThe adapter is intentionally decoupled from the internal\nelicitation path. Callers provide the stable external\n`decision` label and any audit metadata; the route looks up the\npending prompt for the session, translates `approve` to the\ninternal `accept` action and `deny` to `decline`, then\ndelegates to `_resolve_elicitation`.\n\nWhen the visible pending prompt is a mirrored child-session\nelicitation, the adapter follows `params.target_session_id` and\nresolves the child session that actually owns the parked future.\n\n**Parameters**\n\n- `body` \u2014 Stable adapter payload containing `decision` and opaque `auditMetadata`.\n\n**Returns:** `{\"queued\": false}` once the underlying elicitation has been resolved.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the session does not exist or no pending elicitation is visible for the session.",
+        "operationId": "resolve_supervisor_session_api_supervisor_sessions__sessionId__resolve_post",
+        "parameters": [
+          {
+            "description": "Supervisor session identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "sessionId",
+            "required": true,
+            "schema": {
+              "title": "Sessionid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SupervisorSessionResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupervisorSessionResolveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Supervisor Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/api/version": {
       "get": {
         "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`.",
