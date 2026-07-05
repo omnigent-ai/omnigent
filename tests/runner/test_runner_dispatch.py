@@ -3628,6 +3628,7 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
         "claude-opus-4-8",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
+        "claude-fable-5",
     ]
     assert worker["note"]
 
