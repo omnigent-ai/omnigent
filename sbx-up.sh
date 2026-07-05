@@ -8,23 +8,52 @@ set -euo pipefail
 REPO_ROOT="$HOME/workspace/omnigent"
 KIT="$HOME/workspace/sbxkit/opencode"
 SANDBOX_NAME="omnigent-sandbox"
-PORT=6767
+
+# `omnigent server` is a canonical singleton keyed on a pidfile, not a
+# fixed port: if one is already running (started by this script, the
+# REPL, another tool, ...) it reuses whatever port THAT one bound,
+# which need not be 6767. Discover the real port from the pidfile
+# rather than assuming one.
+DATA_DIR="${OMNIGENT_DATA_DIR:-$HOME/.omnigent}"
+PID_FILE="$DATA_DIR/local_server.pid"
+
+cd "$REPO_ROOT"
+
+discover_port() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid port
+  pid=$(sed -n '1p' "$PID_FILE")
+  port=$(sed -n '2p' "$PID_FILE")
+  [ -n "$pid" ] && [ -n "$port" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1 || return 1
+  echo "$port"
+}
+
+PORT="$(discover_port || true)"
+if [ -z "$PORT" ]; then
+  echo "Starting omnigent server..."
+  nohup uv run omnigent server >/tmp/omnigent-server.log 2>&1 &
+  for _ in $(seq 1 30); do
+    PORT="$(discover_port || true)"
+    [ -n "$PORT" ] && break
+    sleep 1
+  done
+  if [ -z "$PORT" ]; then
+    echo "omnigent server did not come up; check /tmp/omnigent-server.log" >&2
+    exit 1
+  fi
+  echo "omnigent server up on :${PORT}."
+else
+  echo "omnigent server already running on :${PORT}."
+fi
 
 SERVER_URL="http://host.docker.internal:${PORT}"
 LOCAL_URL="http://localhost:${PORT}"
 
-cd "$REPO_ROOT"
-
-if ! curl -fsS "$LOCAL_URL" >/dev/null 2>&1; then
-  echo "Starting omnigent server on :${PORT}..."
-  nohup uv run omnigent server >/tmp/omnigent-server.log 2>&1 &
-  for _ in $(seq 1 30); do
-    curl -fsS "$LOCAL_URL" >/dev/null 2>&1 && break
-    sleep 1
-  done
-else
-  echo "omnigent server already running on :${PORT}."
-fi
+# One-time-per-port egress allow; `sbx policy allow` is idempotent so
+# re-adding an existing rule on every run is harmless.
+sbx policy allow network "localhost:${PORT},host.docker.internal:${PORT}" >/dev/null 2>&1 || true
 
 SANDBOX_READY=false
 if sbx ls -q 2>/dev/null | grep -qx "$SANDBOX_NAME"; then
