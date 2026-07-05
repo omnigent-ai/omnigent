@@ -369,6 +369,12 @@ class _OpenCodeServer:
                 "run `pip install --pre opencode-ai`."
             ) from exc
 
+        # The SDK's discriminated-union cache breaks on Python 3.14; see
+        # omnigent/inner/opencode_compat.py.
+        from omnigent.inner.opencode_compat import patch_discriminator_cache
+
+        patch_discriminator_cache()
+
         binary = _resolve_opencode_binary()
         env = dict(os.environ)
         env.update(extra_env)
