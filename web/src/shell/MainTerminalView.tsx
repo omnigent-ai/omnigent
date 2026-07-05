@@ -164,6 +164,7 @@ export function MainTerminalView({
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}
                     readOnly={readOnly}
+                    transport={activeTerminal.transport}
                     onStateChange={(state) => {
                       setTerminalConnectionState(activeTerminal.id, state);
                     }}
