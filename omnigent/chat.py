@@ -2166,13 +2166,41 @@ async def _query_sessions_once(
     # interactive REPL is immune by construction (it renders a ``failed``
     # status as a transient error and polls the snapshot as a backstop),
     # so this brings headless ``-p`` to parity.
+    # Race-window guard for the first turn, mirroring the multi-turn loop's
+    # ``_PER_TURN_TIMEOUT_S`` below (defined here too since this call
+    # precedes that loop). Two failure modes are already reconciled via
+    # ``_persisted_turn_text`` above: an ``OmnigentError`` (session flipped
+    # to ``failed``) and an empty ``result.text`` (subscribe-after-post
+    # race where the SSE subscription missed ``response.completed`` but
+    # the connection closed promptly). A THIRD variant of the same race is
+    # NOT an error and does NOT close the connection: the runner's
+    # terminal event is dropped, but the stream's periodic heartbeats
+    # (``session.heartbeat``, not a turn-terminal event) keep arriving on
+    # schedule forever, so ``SessionsChat.send`` never raises and never
+    # returns — it awaits a terminal event that will never come. Without a
+    # bound here, a lost terminal event hangs the CLI indefinitely even
+    # though the runner already completed and persisted the turn
+    # server-side. ``asyncio.wait_for`` cancels the underlying ``send()``
+    # generator on timeout, which runs its ``finally`` and closes the SSE
+    # subscription cleanly.
+    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard per synthesis turn
     try:
-        result = await chat.query(prompt)
+        result = await asyncio.wait_for(chat.query(prompt), timeout=_PER_TURN_TIMEOUT_S)
     except ClientOmnigentError:
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
         raise
+    except TimeoutError:
+        reconciled = await _persisted_turn_text(client, bound.id)
+        if reconciled is not None:
+            return reconciled
+        raise RuntimeError(
+            f"Turn did not complete within {_PER_TURN_TIMEOUT_S:.0f}s and no "
+            "persisted assistant text was found to reconcile against "
+            "(subscribe-after-post race: the terminal event was lost and "
+            "the runner appears not to have completed either)."
+        ) from None
     all_text_parts: list[str] = []
     if result.text:
         all_text_parts.append(result.text)
@@ -2218,7 +2246,8 @@ async def _query_sessions_once(
     # even when await_turn times out (sub-agents still running), unlike the
     # last_turn_saw_waiting flag which would incorrectly exit on timeout.
     _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
-    _PER_TURN_TIMEOUT_S = 120.0  # race-window guard per synthesis turn
+    # _PER_TURN_TIMEOUT_S is defined above, ahead of the first-turn query,
+    # so it also guards that call; reused here for the extra-turns loop.
     _LOOP_TIMEOUT_S = 1800.0  # 30 min total
 
     async def _drain_extra_turns() -> None:
