@@ -49,15 +49,18 @@ fi
 # plain non-interactive exec so the VM/Docker daemon is already up.
 sbx exec "$SANDBOX_NAME" true >/dev/null 2>&1 || true
 
-echo "Connecting sandbox to server (Ctrl-C to disconnect)..."
-uv run omnigent sandbox connect --provider sbx --sandbox-id "$SANDBOX_NAME" \
-  --server "$SERVER_URL" &
-CONNECT_PID=$!
-trap 'kill -INT "$CONNECT_PID" 2>/dev/null || true' INT TERM
-
-sleep 2
+# Open the browser from a detached background job (no TTY interaction,
+# so no job-control conflict) rather than backgrounding `connect`
+# itself — `connect` needs to be the terminal's actual foreground
+# process, since it hands off to `sbx exec -it` for an interactive
+# TTY session. Backgrounding it made it a background job w.r.t. the
+# terminal, and its raw-mode terminal setup triggered SIGTTOU, which
+# stalled it long enough to blow sbx's own exec-readiness deadline.
 if command -v xdg-open >/dev/null 2>&1; then
-  xdg-open "$LOCAL_URL" >/dev/null 2>&1 &
+  (sleep 2 && xdg-open "$LOCAL_URL" >/dev/null 2>&1) &
+  disown
 fi
 
-wait "$CONNECT_PID"
+echo "Connecting sandbox to server (Ctrl-C to disconnect)..."
+uv run omnigent sandbox connect --provider sbx --sandbox-id "$SANDBOX_NAME" \
+  --server "$SERVER_URL"
