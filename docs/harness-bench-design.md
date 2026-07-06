@@ -311,6 +311,39 @@ deltas as `UNSUPPORTED`, not `PARTIAL`. This bit the transcript-mirror natives
 message rather than streaming deltas: they declare `streaming=False` →
 `UNSUPPORTED`, matching what the probe observes.
 
+## Which transport exercises which dimension
+
+Not every dimension is observable on every transport, so a `·` (SKIPPED) in a
+default run often means "this transport can't exercise it here," not "the
+harness lacks it." Two dimensions in particular only get a real verdict on the
+`full-server` transport:
+
+| Dimension | sdk-inproc | full-server | native-tui |
+|---|---|---|---|
+| Basic turn, Streaming, Model override, Interrupt | ✓ | ✓ | ✓ |
+| **Tool calling** | · (harness dispatches tools internally) | ✓ (server-dispatched builtin) | · (not yet wired) |
+| **Policy DENY** | · (wrap-direct: no tool-call policy hook) | ✓ (spec-baked deny, enforced) | · (not yet wired) |
+
+So to see Tool calling and Policy DENY actually proven, run the SDK harnesses
+over `full-server`:
+
+```
+python -m tests.harness_bench --harness claude-sdk --profile oss --transport full-server
+```
+
+Live-verified: `claude-sdk` completes the full matrix on `full-server` —
+Tool calling `✓` and Policy DENY `✓` (the deny is delivered and the blocked
+call does not stall the turn). The default `--profile oss` run shows `·` for
+those two columns only because it uses `sdk-inproc` (for SDK harnesses) and
+`native-tui` (for natives), neither of which routes a tool call through a
+server policy evaluation.
+
+`full-server` covers **SDK harnesses only** — it registers the harness via an
+agent bundle, which is the SDK-wrap path; native harnesses need the host-daemon
+provisioning the `native-tui` driver owns. So Tool calling / Policy DENY for
+native harnesses remain genuinely unwired (a follow-up), distinct from the
+sdk-inproc `·` which is a transport limitation with `full-server` as the answer.
+
 ## Open items
 
 - Exact `BenchProfile` field set and whether it subsumes `HarnessProbe` or wraps
@@ -319,3 +352,12 @@ message rather than streaming deltas: they declare `streaming=False` →
   an exported CSV so the sheet stays canonical during transition.
 - Native transport drivers are the larger half of the work; sequence them by
   which harnesses matter most for the matrix.
+- `full-server` cannot yet provision codex / pi gateway auth (their basic turn
+  fails with an empty/absent gateway token), so Tool calling / Policy DENY are
+  only live-proven on `claude-sdk` today; wiring codex/pi full-server auth would
+  extend that coverage. (The token-provisioning failure is classified as a SKIP,
+  not a false capability drift.)
+- Tool calling / Policy DENY on the `native-tui` transport are unwired — native
+  tool calls are the vendor's own and a native deny is a vendor permission
+  decision, not a server-dispatched `function_call_output`; observing them needs
+  new driver work.
