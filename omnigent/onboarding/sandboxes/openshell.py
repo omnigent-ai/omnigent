@@ -140,9 +140,24 @@ class _OpenShellClient:
         """Create a sandbox from *image*, wait until ready, return its name."""
         from openshell._proto import openshell_pb2
 
+        sb = openshell_pb2.sandbox__pb2
         spec = openshell_pb2.SandboxSpec(
             template=openshell_pb2.SandboxTemplate(image=image),
             environment=env or {},
+            policy=sb.SandboxPolicy(
+                filesystem=sb.FilesystemPolicy(
+                    include_workdir=True,
+                    read_only=[
+                        "/usr",
+                        "/opt",
+                        "/etc",
+                        "/lib",
+                        "/lib64",
+                    ],
+                    read_write=["/sandbox", "/tmp", "/run"],
+                ),
+                landlock=sb.LandlockPolicy(compatibility="best_effort"),
+            ),
         )
         ref = self._guard(
             "OpenShell sandbox creation failed",
