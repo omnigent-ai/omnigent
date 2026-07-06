@@ -41,6 +41,56 @@ interface ExtractedAlert {
 }
 
 /**
+ * Node types that are inline in the editor schema. Everything else parsed as a
+ * blockquote child is block-level. `image` counts because the workspace image
+ * extension configures it `inline: true`.
+ */
+const INLINE_TYPES = new Set(["text", "image", "hardBreak"]);
+
+/**
+ * Coerce parsed blockquote children into valid `block+` content.
+ *
+ * `@tiptap/markdown` (beta) can hand back bare inline nodes for a blockquote
+ * whose content is a lone inline atom — `> ![img](x)` yields a single image
+ * with no wrapping paragraph — and yields nothing at all for an empty quote
+ * (`>`). A blockquote's content expression is `block+`, so both shapes make
+ * the parsed document schema-invalid. Because ProseMirror builds the initial
+ * doc via `nodeFromJSON` (which does NOT validate content), the bad doc loads
+ * silently; the first edit transaction that touches the blockquote then calls
+ * `contentMatchAt` on it and throws ("Called contentMatchAt on a node with
+ * invalid content"), which the editor's React panel boundary catches — the
+ * whole file view crashes instead of rendering.
+ *
+ * Wrapping each run of loose inline nodes in a paragraph, and guaranteeing at
+ * least one block, keeps the document valid and byte-faithful on round-trip
+ * (the serialiser re-emits `> ![img](x)` from the wrapping paragraph).
+ *
+ * :param children: Parsed block/inline children of the blockquote token.
+ * :returns: Equivalent content that satisfies the blockquote's `block+` model.
+ */
+export function toBlockContent(children: JSONContent[]): JSONContent[] {
+  const blocks: JSONContent[] = [];
+  let inlineRun: JSONContent[] = [];
+  const flushInline = () => {
+    if (inlineRun.length > 0) {
+      blocks.push({ type: "paragraph", content: inlineRun });
+      inlineRun = [];
+    }
+  };
+  for (const child of children) {
+    if (child.type != null && INLINE_TYPES.has(child.type)) {
+      inlineRun.push(child);
+    } else {
+      flushInline();
+      blocks.push(child);
+    }
+  }
+  flushInline();
+  // block+ requires at least one block; an empty quote keeps one empty paragraph.
+  return blocks.length > 0 ? blocks : [{ type: "paragraph" }];
+}
+
+/**
  * Detect and strip a GitHub alert marker from parsed blockquote children.
  *
  * Handles both source shapes: the marker sharing the first paragraph with
@@ -119,7 +169,14 @@ export const GitHubAlertBlockquote = Blockquote.extend({
   parseMarkdown: (token, helpers) => {
     const parseBlockChildren = helpers.parseBlockChildren ?? helpers.parseChildren;
     const { alertType, children } = extractAlert(parseBlockChildren(token.tokens || []));
-    return helpers.createNode("blockquote", alertType ? { alertType } : undefined, children);
+    // toBlockContent guards against @tiptap/markdown emitting inline-only or
+    // empty blockquote content, which would make the doc schema-invalid and
+    // crash the editor on the first edit.
+    return helpers.createNode(
+      "blockquote",
+      alertType ? { alertType } : undefined,
+      toBlockContent(children),
+    );
   },
   renderMarkdown: (node, h) => {
     if (!node.content) {
