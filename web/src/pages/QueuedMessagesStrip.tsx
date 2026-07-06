@@ -39,15 +39,17 @@ export function QueuedMessagesStrip({
         {messages.map((message) => (
           <div
             key={message.queueId}
-            className="group flex items-center gap-1.5 text-xs text-muted-foreground"
+            className="flex items-center gap-1.5 text-xs text-muted-foreground"
           >
             <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">{message.text}</span>
             <span className="shrink-0 text-muted-foreground/70">Queued</span>
+            {/* Always visible (not hover-gated) so delete is discoverable; it
+                brightens on hover/focus. */}
             <button
               type="button"
               aria-label="Remove queued message"
-              className="shrink-0 rounded p-0.5 text-muted-foreground/60 opacity-0 transition hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+              className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
               onClick={() => onDelete(message.queueId)}
             >
               <XIcon className="size-3.5" aria-hidden="true" />
