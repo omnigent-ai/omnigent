@@ -84,6 +84,27 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("ZEBRA-99", prompt)
         self.assertIn("Summarize our conversation.", prompt)
 
+    def test_history_unresolved_file_id_becomes_visible_marker(self):
+        # A prior-turn attachment the content resolver never inlined must
+        # not be serialized as raw block JSON — the model reads that as if
+        # the attachment were present and hallucinates its content.
+        executor = self._make_executor()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "file_img", "filename": "photo.png"},
+                    {"type": "input_text", "text": "look at this image"},
+                ],
+            },
+            {"role": "assistant", "content": "A photo."},
+            {"role": "user", "content": "What did I show you?"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=False)
+        self.assertIn("[Attachment photo.png could not be loaded]", prompt)
+        self.assertNotIn("file_id", prompt)
+        self.assertIn("look at this image", prompt)
+
     def test_historical_image_data_uri_is_replaced_with_compact_placeholder(self):
         executor = self._make_executor()
         image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")

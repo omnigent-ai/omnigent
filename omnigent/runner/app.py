@@ -9708,11 +9708,13 @@ def create_runner_app(
         # Crash recovery (Step 8.5 Scenario A): if the session
         # has existing history, check whether the last item
         # indicates an incomplete turn that needs restarting.
-        history = await _load_history_as_input(session_id)
         # Native terminal transcripts are mirrored from the underlying
-        # runtime. A trailing user item can be a real failed/errored native
-        # turn with no assistant item, not an unanswered Omnigent task to replay.
-        if history and not is_native_harness(harness_name):
+        # runtime — a trailing user item can be a real failed native turn —
+        # so skip the history load (and its attachment downloads) entirely.
+        history = (
+            [] if is_native_harness(harness_name) else await _load_history_as_input(session_id)
+        )
+        if history:
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
@@ -10080,7 +10082,19 @@ def create_runner_app(
         if drop_item_id is not None:
             all_items = [it for it in all_items if it.get("id") != drop_item_id]
 
-        return _convert_raw_items_to_input(all_items)
+        converted = _convert_raw_items_to_input(all_items)
+        # Items are persisted pre-resolution, so reloaded history can still
+        # carry raw file_id blocks (the runner has no file/artifact stores).
+        # Resolve them the same way current-turn intake does.
+        for item in converted:
+            content = item.get("content")
+            if item.get("type") == "message" and isinstance(content, list):
+                item["content"] = await _resolve_forwarded_message_content(
+                    content,
+                    session_id=session_id,
+                    server_client=server_client,
+                )
+        return converted
 
     def _convert_raw_items_to_input(
         items: list[dict[str, Any]],

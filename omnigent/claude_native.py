@@ -3408,16 +3408,23 @@ async def _ensure_local_claude_resume_transcript(
     """
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return None
+    from omnigent.claude_native_bridge import bridge_dir_for_conversation_id
+
     current = workspace
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
     items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    # Items are persisted with unresolved file_id attachment blocks;
+    # fetch the bytes back so the rebuilt transcript can reference a
+    # live local file instead of silently dropping the attachment.
+    items = await _resolve_session_item_file_references(client, session_id=session_id, items=items)
     records = _claude_transcript_records_from_session_items(
         items,
         session_id=session_id,
         external_session_id=external_session_id,
         cwd=current,
+        bridge_dir=bridge_dir_for_conversation_id(session_id),
     )
     # Empty transcript → ``claude --resume`` exits fatally ("No conversation
     # found"), killing the terminal-as-agent. Return None so the caller
@@ -3495,12 +3502,97 @@ async def _fetch_all_session_items_for_claude_resume(
         after = last_id
 
 
+async def _resolve_session_item_file_references(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Inline ``file_id`` attachment blocks as base64 data URIs.
+
+    Message items come back from the server in pre-resolution form (the
+    upload's raw ``file_id``). The transcript rebuild runs where no
+    file/artifact stores exist, so bytes are fetched back through the
+    session-scoped file resource endpoints — the same fetch the runner's
+    current-message fallback performs. A failed fetch is non-fatal: the
+    block stays unresolved and the converter surfaces a visible marker.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param items: Flat API item dicts from ``GET /v1/sessions/{id}/items``.
+    :returns: The same items with resolvable attachment blocks rewritten
+        to carry ``image_url`` / ``file_data`` data URIs.
+    """
+    import base64 as _base64
+
+    for item in items:
+        content = item.get("content")
+        if item.get("type") != "message" or not isinstance(content, list):
+            continue
+        resolved: list[Any] = []
+        changed = False
+        for block in content:
+            if not isinstance(block, dict):
+                resolved.append(block)
+                continue
+            file_id = block.get("file_id")
+            data_uri = block.get("image_url") or block.get("file_data")
+            already_inline = isinstance(data_uri, str) and data_uri.startswith("data:")
+            if not isinstance(file_id, str) or not file_id or already_inline:
+                resolved.append(block)
+                continue
+            try:
+                meta_resp = await client.get(
+                    f"/v1/sessions/{url_component(session_id)}/resources/files/{file_id}",
+                    timeout=10.0,
+                )
+                content_resp = await client.get(
+                    f"/v1/sessions/{url_component(session_id)}/resources/files/{file_id}/content",
+                    timeout=30.0,
+                )
+                meta_resp.raise_for_status()
+                content_resp.raise_for_status()
+            except httpx.HTTPError:
+                _logger.warning(
+                    "transcript rebuild failed to resolve file_id=%s for session=%s",
+                    file_id,
+                    session_id,
+                    exc_info=True,
+                )
+                resolved.append(block)
+                continue
+            meta = meta_resp.json() if meta_resp.content else {}
+            content_type = (
+                meta.get("content_type")
+                or content_resp.headers.get("content-type")
+                or "application/octet-stream"
+            )
+            # Strip any charset suffix: data URIs need the media type hint.
+            if isinstance(content_type, str):
+                content_type = content_type.split(";", 1)[0]
+            else:
+                content_type = "application/octet-stream"
+            encoded = _base64.b64encode(content_resp.content).decode("ascii")
+            new_block = {k: v for k, v in block.items() if k != "file_id"}
+            if block.get("type") == "input_image":
+                new_block["image_url"] = f"data:{content_type};base64,{encoded}"
+            else:
+                new_block["file_data"] = f"data:{content_type};base64,{encoded}"
+            resolved.append(new_block)
+            changed = True
+        if changed:
+            item["content"] = resolved
+    return items
+
+
 def _claude_transcript_records_from_session_items(
     items: list[dict[str, Any]],
     *,
     session_id: str,
     external_session_id: str,
     cwd: Path,
+    bridge_dir: Path,
 ) -> list[dict[str, Any]]:
     """
     Convert Omnigent session items into Claude Code transcript records.
@@ -3514,6 +3606,8 @@ def _claude_transcript_records_from_session_items(
         ``"02857840-6362-408f-b41f-309e396ed7c6"``.
     :param cwd: Working directory to write into each transcript
         record, e.g. ``Path("/home/me/repo")``.
+    :param bridge_dir: Session bridge directory; resolved attachment
+        blocks are re-materialized under its ``uploads/`` subdirectory.
     :returns: Claude JSONL record dictionaries.
     """
     records: list[dict[str, Any]] = []
@@ -3572,6 +3666,7 @@ def _claude_transcript_records_from_session_items(
                         record_uuid=cm_uuid,
                         parent_uuid=parent_uuid,
                         cwd=cwd,
+                        bridge_dir=bridge_dir,
                     )
                     if cm_record is not None:
                         records.append(cm_record)
@@ -3589,6 +3684,7 @@ def _claude_transcript_records_from_session_items(
             record_uuid=record_uuid,
             parent_uuid=tool_parent_by_call_id.get(str(item.get("call_id"))) or parent_uuid,
             cwd=cwd,
+            bridge_dir=bridge_dir,
         )
         if record is None:
             continue
@@ -3608,6 +3704,7 @@ def _claude_transcript_record_from_session_item(
     record_uuid: str,
     parent_uuid: str | None,
     cwd: Path,
+    bridge_dir: Path,
 ) -> dict[str, Any] | None:
     """
     Convert one Omnigent item into one Claude transcript record.
@@ -3622,6 +3719,8 @@ def _claude_transcript_record_from_session_item(
         for the first line.
     :param cwd: Current working directory to record, e.g.
         ``Path("/home/me/repo")``.
+    :param bridge_dir: Session bridge directory for re-materializing
+        attachment blocks.
     :returns: Claude transcript record, or ``None`` for unsupported or
         empty Omnigent items.
     """
@@ -3632,7 +3731,7 @@ def _claude_transcript_record_from_session_item(
     if item_type == "message":
         role = item.get("role")
         if role == "user":
-            content = _claude_user_content_from_api_blocks(item.get("content"))
+            content = _claude_user_content_from_api_blocks(item.get("content"), bridge_dir)
             if content is None:
                 return None
             record_type = "user"
@@ -3742,20 +3841,69 @@ def _synthetic_claude_transcript_uuid(
     )
 
 
-def _claude_user_content_from_api_blocks(content: object) -> str | list[dict[str, Any]] | None:
+def _claude_user_content_from_api_blocks(
+    content: object,
+    bridge_dir: Path,
+) -> str | list[dict[str, Any]] | None:
     """
     Convert Omnigent user message blocks into Claude message content.
 
+    Attachment blocks (``input_image`` / ``input_file``) cannot ride the
+    transcript as bytes; resolved ones are re-materialized under the
+    bridge dir and referenced by an ``[Attached: <path>]`` line, and
+    unresolved ones surface as a visible could-not-load marker — never a
+    silent drop.
+
     :param content: Omnigent ``content`` value, e.g.
         ``[{"type": "input_text", "text": "hello"}]``.
+    :param bridge_dir: Session bridge directory for re-materializing
+        attachment blocks.
     :returns: A string for simple text prompts, a Claude content block
         list for multi-block prompts, or ``None`` when no text exists.
     """
-    blocks = _claude_text_blocks_from_api_content(content, api_type="input_text")
+    blocks = _claude_attachment_text_blocks_from_api_content(content, bridge_dir)
+    blocks += _claude_text_blocks_from_api_content(content, api_type="input_text")
     if not blocks:
         return None
     if len(blocks) == 1:
         return str(blocks[0]["text"])
+    return blocks
+
+
+def _claude_attachment_text_blocks_from_api_content(
+    content: object,
+    bridge_dir: Path,
+) -> list[dict[str, Any]]:
+    """
+    Re-materialize attachment blocks as transcript text references.
+
+    Mirrors the native executors' turn-time behavior: a resolved data-URI
+    block is decoded to ``<bridge_dir>/uploads/`` and referenced with the
+    ``[Attached: <path>]`` marker so Claude can Read it after a resume; a
+    block whose bytes never arrived yields the could-not-load placeholder
+    instead of vanishing from the rebuilt transcript.
+
+    :param content: Omnigent content array, e.g.
+        ``[{"type": "input_image", "image_url": "data:image/png;..."}]``.
+    :param bridge_dir: Session bridge directory to write files under.
+    :returns: Claude ``{"type": "text", "text": ...}`` blocks.
+    """
+    from omnigent.inner.native_attachments import (
+        materialize_attachment,
+        unresolved_attachment_marker,
+    )
+
+    if not isinstance(content, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in ("input_image", "input_file"):
+            continue
+        path = materialize_attachment(block, bridge_dir)
+        if path is not None:
+            blocks.append({"type": "text", "text": f"[Attached: {path}]"})
+        else:
+            blocks.append({"type": "text", "text": unresolved_attachment_marker(block)})
     return blocks
 
 

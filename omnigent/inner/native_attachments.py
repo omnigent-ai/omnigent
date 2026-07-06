@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,7 +87,7 @@ def materialize_attachment(block: dict[str, Any], bridge_dir: Path) -> Path | No
     data_uri = block.get("image_url") or block.get("file_data")
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
         if block.get("file_id"):
-            _logger.warning(
+            _logger.error(
                 "Native executor received unresolved file_id %s — "
                 "content resolver may not have run",
                 block["file_id"],
@@ -111,8 +112,50 @@ def materialize_attachment(block: dict[str, Any], bridge_dir: Path) -> Path | No
     uploads_dir.mkdir(parents=True, exist_ok=True)
     dest = uploads_dir / filename
     if dest.exists():
+        # Same bytes already on disk (e.g. the same history re-materialized
+        # on every resume) — reuse it instead of accumulating copies.
+        if dest.read_bytes() == raw_bytes:
+            return dest
         stem = dest.stem
         dest = uploads_dir / f"{stem}_{uuid.uuid4().hex[:6]}{dest.suffix}"
 
     dest.write_bytes(raw_bytes)
     return dest
+
+
+# Regex source matching the exact line unresolved_attachment_marker() emits.
+# Consumers (title synthesis, TUI forwarders) compose their marker-matching
+# patterns from this so the shapes cannot drift apart.
+UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded\]"
+
+
+def attachment_marker_name(block: dict[str, Any]) -> str:
+    """
+    Display name for an attachment block, safe inside a marker line.
+
+    :param block: Content block; named by its ``filename``, falling back
+        to ``file_id`` then ``"attachment"``.
+    :returns: The name with ``[``, ``]``, and newlines replaced by ``_``
+        so a marker built from it always matches the consumer regexes,
+        e.g. ``"shot _final_.png"`` for ``"shot [final].png"``.
+    """
+    name = str(block.get("filename") or block.get("file_id") or "attachment")
+    return re.sub(r"[\[\]\r\n]", "_", name)
+
+
+def unresolved_attachment_marker(block: dict[str, Any]) -> str:
+    """
+    Visible placeholder for an attachment that could not be loaded.
+
+    Callers emit this in place of the usual path reference when
+    :func:`materialize_attachment` fails, so the model (and the mirrored
+    transcript) sees that an attachment was lost instead of silently
+    receiving nothing and hallucinating its content.
+
+    :param block: The content block that failed to materialize. Named
+        via :func:`attachment_marker_name`, e.g. ``"photo.png"``.
+    :returns: Marker line, e.g.
+        ``"[Attachment photo.png could not be loaded]"``. Always matches
+        :data:`UNRESOLVED_ATTACHMENT_MARKER_PATTERN`.
+    """
+    return f"[Attachment {attachment_marker_name(block)} could not be loaded]"

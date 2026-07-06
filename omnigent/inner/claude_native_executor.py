@@ -24,7 +24,10 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment
+from omnigent.inner.native_attachments import (
+    materialize_attachment,
+    unresolved_attachment_marker,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -256,6 +259,8 @@ def _content_to_text(content: Any, bridge_dir: Path) -> str:
                     # seeding strips lines matching _ATTACHMENT_MARKER_RE in
                     # omnigent/entities/conversation.py. Keep in sync.
                     attachment_lines.append(f"[Attached: {path}]")
+                else:
+                    attachment_lines.append(unresolved_attachment_marker(block))
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""

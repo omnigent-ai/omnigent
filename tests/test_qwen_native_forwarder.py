@@ -114,6 +114,23 @@ def test_attachment_marker_stripped() -> None:
     assert item.item_data["content"][0]["text"] == "look"
 
 
+def test_could_not_load_marker_stripped() -> None:
+    # The executor types the failed-attachment placeholder into the pane,
+    # so it mirrors back as user text; strip it like the path markers.
+    item = _event_to_item(
+        _user_ev("u3", "[Attachment photo.png could not be loaded]\n\nlook"), _AGENT
+    )
+    assert item is not None
+    assert item.item_data["content"][0]["text"] == "look"
+    # Bracketed filenames arrive pre-sanitized ("shot [final].png" →
+    # "shot _final_.png"), so the marker still strips cleanly.
+    item = _event_to_item(
+        _user_ev("u4", "[Attachment shot _final_.png could not be loaded]\n\nlook"), _AGENT
+    )
+    assert item is not None
+    assert item.item_data["content"][0]["text"] == "look"
+
+
 def test_read_new_events_incremental_and_partial_line(tmp_path: Path) -> None:
     f = tmp_path / "out.ndjson"
     f.write_bytes(_ev_bytes(_user_ev("u1", "q")))

@@ -217,7 +217,11 @@ def test_run_turn_flattens_content_blocks(tmp_path: Path, injected: dict[str, ob
         ]
 
     events = asyncio.run(_drive())
-    assert _injected(injected)[0]["content"] == "line one\nline two"
+    # The unmaterializable image contributes a visible marker, not a
+    # silent drop; attachment lines precede the text lines.
+    assert _injected(injected)[0]["content"] == (
+        "[Attachment attachment could not be loaded]\nline one\nline two"
+    )
     assert isinstance(events[0], TurnComplete)
 
 
@@ -729,9 +733,9 @@ def test_content_to_text_handles_string_blocks_none_and_other(tmp_path: Path) ->
     Flattening covers every content shape the executor may receive.
 
     A plain string passes through; ``input_text``/``text`` blocks join by newline
-    while an unmaterializable image/file block contributes nothing; ``None``
-    yields ``""``; any other shape falls back to a JSON encoding rather than
-    crashing.
+    while an unmaterializable image/file block contributes a visible
+    could-not-load marker; ``None`` yields ``""``; any other shape falls back to
+    a JSON encoding rather than crashing.
     """
     from omnigent.inner.antigravity_native_executor import _content_to_text
 
@@ -746,7 +750,7 @@ def test_content_to_text_handles_string_blocks_none_and_other(tmp_path: Path) ->
             ],
             tmp_path,
         )
-        == "a\nb"
+        == "[Attachment attachment could not be loaded]\na\nb"
     )
     assert _content_to_text(None, tmp_path) == ""
     # Defensive fallback for an unexpected shape: encoded, not crashed.

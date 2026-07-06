@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import base64
+import logging
+import re
 from pathlib import Path
 
 import pytest
 
 from omnigent.inner.native_attachments import (
+    UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
     materialize_attachment,
     parse_data_uri,
+    unresolved_attachment_marker,
 )
 
 # A 1x1 transparent PNG, base64-encoded — small but a real decodable image.
@@ -101,3 +105,91 @@ def test_materialize_attachment_returns_none_without_data_uri(tmp_path: Path) ->
 
     assert path is None
     assert not (tmp_path / "uploads").exists()
+
+
+def test_materialize_attachment_unresolved_file_id_logs_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    An unresolved ``file_id`` block is logged at ERROR, not WARNING.
+
+    The block reaching an executor unresolved means the attachment is
+    about to be lost for the whole turn; a warning was too quiet for a
+    failure whose user-visible symptom is a hallucinated attachment.
+    """
+    block = {"type": "input_image", "file_id": "file_unresolved"}
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.native_attachments"):
+        path = materialize_attachment(block, tmp_path)
+
+    assert path is None
+    records = [
+        record
+        for record in caplog.records
+        if "unresolved file_id file_unresolved" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+
+
+def test_unresolved_attachment_marker_names_the_attachment() -> None:
+    """
+    The marker names the attachment by filename, falling back to file_id.
+
+    Proves the placeholder callers emit for a failed attachment tells
+    the model (and the user, via the mirrored transcript) WHICH file was
+    lost, instead of the attachment silently vanishing.
+    """
+    named = {"type": "input_image", "file_id": "file_x", "filename": "photo.png"}
+    unnamed = {"type": "input_image", "file_id": "file_x"}
+    bare = {"type": "input_image"}
+
+    assert unresolved_attachment_marker(named) == "[Attachment photo.png could not be loaded]"
+    assert unresolved_attachment_marker(unnamed) == "[Attachment file_x could not be loaded]"
+    assert unresolved_attachment_marker(bare) == "[Attachment attachment could not be loaded]"
+
+
+def test_unresolved_attachment_marker_sanitizes_bracketed_names() -> None:
+    """
+    Brackets and newlines in the filename cannot break the marker shape.
+
+    Consumers (title synthesis, TUI forwarders) match the marker via
+    UNRESOLVED_ATTACHMENT_MARKER_PATTERN; an unsanitized ``]`` in the
+    name would end their match early and leak marker fragments into
+    titles and mirrored chat bubbles.
+    """
+    bracketed = unresolved_attachment_marker(
+        {"type": "input_image", "filename": "shot [final].png"}
+    )
+    multiline = unresolved_attachment_marker({"type": "input_image", "filename": "a\nb.png"})
+
+    assert bracketed == "[Attachment shot _final_.png could not be loaded]"
+    assert re.fullmatch(UNRESOLVED_ATTACHMENT_MARKER_PATTERN, bracketed)
+    assert re.fullmatch(UNRESOLVED_ATTACHMENT_MARKER_PATTERN, multiline)
+
+
+def test_materialize_attachment_reuses_identical_existing_file(tmp_path: Path) -> None:
+    """
+    Re-materializing identical bytes returns the existing file.
+
+    History replays re-materialize the same blocks on every resume;
+    without content-equal dedupe the uploads dir would grow a suffixed
+    copy per resume. Different bytes under the same name still get a
+    fresh suffixed path.
+    """
+    block = {"type": "input_image", "image_url": _PNG_DATA_URI, "filename": "photo.png"}
+    other_payload = base64.b64encode(b"other-bytes").decode()
+    other = {
+        "type": "input_image",
+        "image_url": f"data:image/png;base64,{other_payload}",
+        "filename": "photo.png",
+    }
+
+    first = materialize_attachment(block, tmp_path)
+    second = materialize_attachment(block, tmp_path)
+    third = materialize_attachment(other, tmp_path)
+
+    assert first is not None
+    assert second == first
+    assert third is not None and third != first
+    assert len(list((tmp_path / "uploads").iterdir())) == 2

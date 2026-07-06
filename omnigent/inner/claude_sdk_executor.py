@@ -69,6 +69,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
+from .native_attachments import unresolved_attachment_marker
 from .sandbox import (
     create_exec_launcher,
     get_backend,
@@ -438,6 +439,13 @@ def _render_prior_content(content: Any) -> str:  # type: ignore[explicit-any]
                 rendered.append(
                     f"[{kind}: {identifier}, {media_type}, {payload_chars} base64 chars]"
                 )
+                continue
+
+            if block.get("file_id"):
+                # No inline bytes and no resolved payload: the resolver never
+                # inlined this attachment. Serializing the raw block would read
+                # as if the attachment were present; say it was lost instead.
+                rendered.append(unresolved_attachment_marker(block))
                 continue
 
         rendered.append(json.dumps(_redact_inline_base64(block), ensure_ascii=True))
