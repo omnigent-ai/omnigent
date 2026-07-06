@@ -129,12 +129,28 @@ class NativeVendor:
     :param own_auth: ``True`` when the vendor logs in itself (auth is not
         ``OMNIGENT_CREDENTIAL``), so the bench cannot provision it — runnable
         only on a host where the vendor CLI is already logged in.
+    :param lazy_chat: ``True`` when the vendor's ``external_session_id`` (its
+        chat/thread id) is created by the FIRST message rather than at TUI
+        launch (cursor writes its chat store lazily on the first message). For
+        such a vendor the driver must NOT gate provisioning on
+        ``external_session_id`` — that id cannot exist until a turn is posted,
+        so waiting for it pre-turn deadlocks. Thread-at-launch vendors
+        (claude/codex) leave this ``False`` and are gated normally.
     """
 
     harness: str
     agent_name: str
     terminal_name: str
     own_auth: bool = False
+    lazy_chat: bool = False
+
+
+# Vendors whose external_session_id is created by the first message, not at TUI
+# launch (see NativeVendor.lazy_chat). A delivery-mechanism fact not derivable
+# from the capability model, so it is an explicit set. cursor is confirmed
+# (its forwarder discovers the chat store written on the first message); others
+# are added only once live-verified to behave this way.
+_LAZY_CHAT_HARNESSES: frozenset[str] = frozenset({"cursor-native"})
 
 
 def native_vendor(harness: str) -> NativeVendor | None:
@@ -162,6 +178,7 @@ def native_vendor(harness: str) -> NativeVendor | None:
         agent_name=f"{harness}-ui",
         terminal_name=harness.removesuffix("-native"),
         own_auth=caps.auth is not AuthModel.OMNIGENT_CREDENTIAL,
+        lazy_chat=harness in _LAZY_CHAT_HARNESSES,
     )
 
 
@@ -323,9 +340,14 @@ class NativeTuiDriver:
             timeout=90.0,
         )
         ensure.raise_for_status()
-        # Gate on the forwarder wiring up: it stamps external_session_id (the
-        # vendor thread id) on the session once the TUI creates its thread.
-        # Posting a turn before this races ahead of the forwarder subscription.
+        # A lazy-chat vendor (cursor) does not create its external_session_id
+        # until the first message lands, so it cannot be gated on here — waiting
+        # pre-turn would deadlock. The terminal is ensured; the first probe turn
+        # triggers the chat, and the forwarder discovers it then. Thread-at-launch
+        # vendors (claude/codex) stamp external_session_id at TUI launch, so gate
+        # on it to avoid racing a turn ahead of the forwarder subscription.
+        if self._vendor.lazy_chat:
+            return
         deadline = time.monotonic() + _FORWARDER_READY_TIMEOUT_S
         while time.monotonic() < deadline:
             snap = self._client.get(f"/v1/sessions/{session_id}")
