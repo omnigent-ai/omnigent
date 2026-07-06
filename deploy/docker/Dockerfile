@@ -152,7 +152,7 @@ RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]
 # with `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
 ARG OMNIGENT_EXTRAS=
 RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
-        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
+        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} ".[${OMNIGENT_EXTRAS}]"; \
     fi
 
 # ── Node alias stage ─────────────────────────────────────
@@ -332,6 +332,7 @@ RUN set -eu; \
 # Copy the venv with all packages installed non-editably under site-packages.
 # No need to preserve /build/ since everything is already in site-packages.
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /build/LICENSE /build/NOTICE /root/
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
@@ -364,6 +365,7 @@ RUN apt-get update \
 # Copy the venv with all packages installed non-editably under site-packages.
 # No need to preserve /build/ since everything is already in site-packages.
 COPY --from=server-builder /opt/venv /opt/venv
+COPY --from=server-builder /build/LICENSE /build/NOTICE /app/
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app
