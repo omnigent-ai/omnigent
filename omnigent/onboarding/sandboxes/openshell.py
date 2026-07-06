@@ -83,12 +83,11 @@ _FOREGROUND_PIDFILE_TEMPLATE = "/tmp/oa-openshell-foreground-{sandbox_id}.pid"
 
 # OpenShell runs the agent as the non-root ``sandbox`` user (its image
 # contract; see deploy/docker/Dockerfile), whose home is ``/home/sandbox``.
-# The host image keeps ``WORKDIR /root`` for the root-based providers, so we
-# pin every exec's cwd + ``$HOME`` to the sandbox user's writable home here
-# rather than changing the shared image — otherwise ``omnigent host`` resolves
-# its config under ``/root`` (unreadable to the sandbox user) and crashes, and
-# the managed flow's ``$HOME/workspace`` lands somewhere unwritable.
-_SANDBOX_HOME = "/home/sandbox"
+# However, OpenShell's Landlock security policy only allows access to ``/sandbox``
+# (the actual workspace mount point), not ``/home``. We pin every exec's cwd +
+# ``$HOME`` to ``/sandbox`` so all exec calls (execute, run_foreground, exec_background)
+# can access their working directory without hitting Landlock denials.
+_SANDBOX_HOME = "/sandbox"
 
 _T = TypeVar("_T")
 

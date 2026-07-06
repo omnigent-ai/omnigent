@@ -121,11 +121,12 @@ RUN python -m venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:${PATH}"
 
-# Install omnigent. Editable install (-e) is required because
-# pyproject.toml declares the sibling SDKs as editable path deps via
-# [tool.uv.sources]. The runtime stages preserve /build/ so the venv's
-# .pth references stay valid.
-RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e .
+# Install omnigent and sibling SDKs non-editably. This installs everything
+# under /opt/venv/lib/python*/site-packages (inside Landlock's allowed paths),
+# rather than leaving source at /build with .pth references (which Landlock blocks).
+# Install sibling SDKs first, then omnigent.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} ./sdks/python-client ./sdks/ui
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} .
 
 # ── Server builder ──────────────────────────────────────
 # Server-only additions on top of the shared builder: the SPA bundle
@@ -328,11 +329,9 @@ RUN set -eu; \
     fi; \
     echo "agy ${AGY_VERSION} pinned (sha256 verified)"
 
-# Preserve /build/ — the venv's editable install .pth files reference
-# /build/omnigent and /build/sdks/* by absolute path. Copying these to
-# /app/ would break the import paths silently.
+# Copy the venv with all packages installed non-editably under site-packages.
+# No need to preserve /build/ since everything is already in site-packages.
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /build /build
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
@@ -362,11 +361,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Preserve /build/ in the runtime stage — the venv's editable install
-# .pth files reference /build/omnigent and /build/sdks/* by absolute
-# path. Copying these to /app/ would break the import paths silently.
+# Copy the venv with all packages installed non-editably under site-packages.
+# No need to preserve /build/ since everything is already in site-packages.
 COPY --from=server-builder /opt/venv /opt/venv
-COPY --from=server-builder /build /build
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app
