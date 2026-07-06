@@ -1,0 +1,88 @@
+# Keeps this fork in sync with omnigent-ai/omnigent by opening a PR that
+# merges upstream/main into main. Runs on a schedule plus manual dispatch;
+# never merges automatically — a human (or Claude) reviews and resolves any
+# conflicts, since past syncs have needed judgment calls (e.g. reconciling the
+# fork's opencode SDK harness with upstream's harness-plugin registry, in
+# omnigent/harness_plugins.py / omnigent/harness_aliases.py).
+#
+# sync/upstream-main is a bot-owned tracking branch: it's force-pushed to
+# upstream's tip on every run, so don't commit work there directly — it will
+# be overwritten. Resolve conflicts on a separate branch instead.
+name: Sync upstream
+
+on:
+  schedule:
+    # Weekly, Monday ~08:17 UTC (off the hour to dodge cron congestion).
+    - cron: "17 8 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    # Only meaningful on the fork itself.
+    if: github.repository == 'landreville/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: diff
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with upstream/main."
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "count=$(git rev-list --count HEAD..upstream/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push upstream tip to a sync branch
+        if: steps.diff.outputs.new == 'true'
+        run: git push origin upstream/main:refs/heads/sync/upstream-main --force
+
+      - name: Open the sync PR (if none is open)
+        if: steps.diff.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ steps.diff.outputs.count }}
+        run: |
+          if [ -n "$(gh pr list --head sync/upstream-main --state open --json number --jq '.[0].number')" ]; then
+            echo "Sync PR already open; branch tip updated above."
+            exit 0
+          fi
+          gh pr create \
+            --title "Sync upstream: $COUNT commit(s) from omnigent-ai/omnigent@main" \
+            --head sync/upstream-main \
+            --base main \
+            --body "$(cat <<EOF
+          Brings in the latest commits from omnigent-ai/omnigent (main).
+
+          This PR is opened automatically and is **not auto-merged**. GitHub will
+          show below whether it can merge cleanly:
+
+          - **Mergeable**: review the diff and merge with a merge commit (not
+            squash/rebase) to preserve upstream history, matching prior syncs.
+          - **Conflicting**: check out this branch locally (or ask Claude to) and
+            resolve — \`git fetch origin && git checkout sync/upstream-main && git merge main\`.
+            Past conflicts landed in \`omnigent/harness_plugins.py\` /
+            \`omnigent/harness_aliases.py\`, where the fork's opencode SDK harness
+            registration needs reconciling with upstream's harness-plugin registry.
+
+          Note: this PR was opened with the default \`GITHUB_TOKEN\`, so it will
+          **not** auto-trigger CI — push any commit (e.g. while resolving
+          conflicts) to run checks.
+          EOF
+          )"
