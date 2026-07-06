@@ -126,7 +126,7 @@ class ElicitationDeclinedError(Exception):
     :param message: Human-readable description, typically the policy
         reason that triggered the elicitation.
     :param policy_name: Name of the deciding policy, e.g.
-        ``"intent_gate"``. ``None`` when not available.
+        ``"intent_based_authorization"``. ``None`` when not available.
     """
 
     def __init__(self, message: str = "", *, policy_name: str | None = None) -> None:

@@ -82,6 +82,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
     bridge_tmux_pty_to_websocket,
@@ -16864,6 +16865,7 @@ def create_runner_app(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        transport: str | None = Query(default=None),
     ) -> None:
         """Attach to a terminal resource by id via WebSocket.
 
@@ -16926,7 +16928,21 @@ def create_runner_app(
         )
         _COST_POPUP_REPOP_TASKS.add(_repop_task)
         _repop_task.add_done_callback(_COST_POPUP_REPOP_TASKS.discard)
-        await bridge_tmux_pty_to_websocket(
+        from omnigent.inner.terminal import (
+            TERMINAL_TRANSPORT_CONTROL,
+            resolve_terminal_transport,
+        )
+
+        resolved_transport = resolve_terminal_transport(
+            override=transport,
+            spec_transport=entry.instance.terminal_transport,
+        )
+        bridge = (
+            bridge_tmux_control_to_websocket
+            if resolved_transport == TERMINAL_TRANSPORT_CONTROL
+            else bridge_tmux_pty_to_websocket
+        )
+        await bridge(
             websocket,
             socket_path=str(entry.instance.socket_path),
             tmux_target=entry.instance.tmux_target,

@@ -87,6 +87,7 @@ import {
   type SaveStatus,
   detectLang,
   isImageFile,
+  isNotebookPath,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
@@ -600,10 +601,10 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [open, onCloseTab, searchOpen, guardDirty]);
 
-  // View mode toggle — markdown defaults to the rich-text editor, HTML to its
-  // rendered preview, and everything else to source.
+  // View mode toggle — markdown defaults to the rich-text editor, HTML and
+  // notebooks to their rendered preview, and everything else to source.
   const lang = detectLang(path);
-  const isPreviewable = lang === "markdown" || lang === "html";
+  const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
   // Images render through CodeViewer's <ImageViewer> regardless of view mode;
   // they have no source/diff representation, so diff is suppressed for them
   // (Monaco would otherwise render the base64 payload as garbage text).
@@ -616,7 +617,8 @@ function FileViewerBody({
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
-  // files (markdown/html), while non-previewable files always render as source.
+  // files (markdown/html/notebooks), while non-previewable files always render
+  // as source.
   // These are app-global *preferences*, persisted to localStorage so they also
   // survive a page refresh (and seed a brand-new conversation). Seed precedence:
   //   1. an explicit ?diff=1 link (shareable override, diff only),
@@ -663,8 +665,8 @@ function FileViewerBody({
     writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
   }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
   // Markdown supports all three previewable modes (preview / editor / source).
-  // HTML has no rich-text editor, so its "editor" preference falls back to the
-  // rendered preview; "preview" / "source" pass through for both. The shared
+  // HTML and notebooks have no rich-text editor, so their "editor" preference
+  // falls back to the rendered preview; "preview" / "source" pass through. The shared
   // preference still carries across file types — opening markdown in source
   // then switching to an HTML file keeps you in source, etc.
   const fileViewMode: "editor" | "preview" | "source" = isPreviewable
@@ -821,8 +823,9 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if (lang === "html" && viewMode !== "diff") {
-    // HTML has no rich-text editor — a single toggle flips preview ↔ source.
+  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
+    // HTML and notebooks have no rich-text editor — a single toggle flips
+    // preview ↔ source.
     toolbarActions.push({
       key: "preview",
       label: viewMode === "preview" ? "View source" : "View preview",

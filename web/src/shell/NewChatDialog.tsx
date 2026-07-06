@@ -61,6 +61,7 @@ import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1270,7 +1271,7 @@ function AgentHarnessPicker({
   setBypassSandbox: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
-  setPickedHarness: (harness: string | null) => void;
+  setPickedHarness: (harness: string | null, agentId?: string) => void;
 }) {
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
@@ -1459,7 +1460,7 @@ function AgentHarnessPicker({
             onSelectAgent(agent);
             // Picking the spec default clears the override so the session
             // tracks the spec.
-            setPickedHarness(h === defaultHarness ? null : h);
+            setPickedHarness(h === defaultHarness ? null : h, agent.id);
           }}
           host={host}
           labels={brainHarnessLabels}
@@ -1873,10 +1874,12 @@ export function NewChatLandingScreen() {
     () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
   // Per-session brain-harness override for bundle agents (polly / debby).
-  // null = the agent spec's declared harness (no override sent); cleared on
-  // every agent switch so a pick never leaks across agents.
+  // null = the agent spec's declared harness (no override sent). On agent
+  // switch, seeded from the user's last stored pick for that agent.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
-    () => landingDraft?.pickedHarness ?? null,
+    () =>
+      landingDraft?.pickedHarness ??
+      readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
   );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
@@ -2344,11 +2347,25 @@ export function NewChatLandingScreen() {
   // redundant.
   const agentLabel = selectedAgent ? selectedAgent.display_name : "Select agent";
 
-  // Select an agent/harness from the picker. Switching agents drops the
-  // harness override so a pick never leaks across agents; explicit picks
-  // persist (auto-defaults never do).
+  // Wrap the harness setter so every explicit pick is persisted to
+  // localStorage. The caller can pass an explicit `agentId` for the
+  // switch-via-submenu path where `effectiveAgentId` still reflects the
+  // previously selected agent (the state update from `onSelectAgent` hasn't
+  // applied yet).
+  const handleSetPickedHarness = useCallback(
+    (harness: string | null, agentId?: string) => {
+      setPickedHarness(harness);
+      writeLastHarness(agentId ?? effectiveAgentId, harness);
+    },
+    [effectiveAgentId],
+  );
+
+  // Select an agent/harness from the picker. Switching agents seeds the
+  // harness override from the user's last pick for that agent (so a
+  // returning user lands on the harness they used last); explicit picks
+  // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
-    if (agent.id !== effectiveAgentId) setPickedHarness(null);
+    if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
@@ -2904,7 +2921,7 @@ export function NewChatLandingScreen() {
                   setBypassSandbox={setBypassSandbox}
                   setPickedModel={setPickedModel}
                   setPickedEffort={setPickedEffort}
-                  setPickedHarness={setPickedHarness}
+                  setPickedHarness={handleSetPickedHarness}
                 />
                 {smartRoutingEnabled &&
                   selectedAgent &&

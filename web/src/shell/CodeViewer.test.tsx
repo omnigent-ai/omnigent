@@ -10,7 +10,11 @@ import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 // Stub Shiki so the highlighting effect never fires an async callback that
 // would mutate state after the test cleans up.
-vi.mock("@/components/ai-elements/code-block", () => ({ highlightCode: vi.fn(() => null) }));
+vi.mock("@/components/ai-elements/code-block", () => ({
+  highlightCode: vi.fn(() => null),
+  // NotebookPreview renders notebook code cells through CodeBlockContent.
+  CodeBlockContent: ({ code }: { code: string }) => <pre>{code}</pre>,
+}));
 vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null }));
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
@@ -473,5 +477,34 @@ describe("CodeViewer image rendering", () => {
     expect(await screen.findByRole("dialog")).toBeDefined();
     expect(screen.getByLabelText("Zoom in")).toBeDefined();
     expect(screen.getByLabelText("Zoom out")).toBeDefined();
+  });
+});
+
+describe("CodeViewer .ipynb routing", () => {
+  const MINIMAL_NB = JSON.stringify({
+    nbformat: 4,
+    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
+  });
+
+  it("renders the notebook preview in preview mode", () => {
+    renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "preview" });
+    expect(screen.getByRole("heading", { name: "Notebook Title" })).toBeDefined();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("keeps raw-JSON Monaco as the source-view escape hatch", () => {
+    renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "source" });
+    expect(screen.getByTestId("monaco-editor-stub")).toBeDefined();
+  });
+
+  it("warns about truncated notebooks instead of rendering silently-incomplete cells", () => {
+    renderViewer(MINIMAL_NB.slice(0, 40), true, "analysis.ipynb", {
+      viewMode: "preview",
+      truncated: true,
+    });
+    // Truncated JSON cannot parse — the preview shows its parse-error state…
+    expect(screen.getByText(/Cannot render notebook/)).toBeDefined();
+    // …and the shared truncation banner is stacked above it.
+    expect(screen.getByText(/truncated/i)).toBeDefined();
   });
 });

@@ -1959,6 +1959,16 @@ if (!gotLock) {
     registerWebAuthn();
     registerIpc();
     buildMenu();
+    // Patch PATH for GUI-launched Electron on macOS/Linux:
+    // A desktop launcher inherits a minimal system PATH that omits directories like
+    // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
+    // One synchronous login-shell invocation at startup merges the user's full PATH
+    // into process.env so every subsequent spawn/execFile call inherits it.
+    const { resolveLoginShellPath } = require("./loginShellPath");
+    const _loginPath = resolveLoginShellPath();
+    if (_loginPath) {
+      process.env.PATH = _loginPath;
+    }
     // Resolve the CLI path once at startup so the first status/control call is
     // instant (primes the in-memory cache in resolvedCliPath); also lets the
     // setup page / Local CLI settings pre-fill the resolved path immediately.
