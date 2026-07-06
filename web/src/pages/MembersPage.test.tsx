@@ -15,10 +15,18 @@ import type { AccountListEntry } from "@/lib/accountsApi";
 import * as accountsApi from "@/lib/accountsApi";
 import * as identity from "@/lib/identity";
 
-const mocks = vi.hoisted(() => ({ accountsEnabled: true }));
+const mocks = vi.hoisted(() => ({
+  accountsEnabled: true,
+  loginUrl: null as string | null,
+  serverVersion: "0.3.0.dev0" as string | null,
+}));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ accounts_enabled: mocks.accountsEnabled }),
+  useServerInfo: () => ({
+    accounts_enabled: mocks.accountsEnabled,
+    login_url: mocks.loginUrl,
+    server_version: mocks.serverVersion,
+  }),
 }));
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: vi.fn(),
@@ -52,6 +60,8 @@ function renderPage() {
 
 beforeEach(() => {
   mocks.accountsEnabled = true;
+  mocks.loginUrl = null;
+  mocks.serverVersion = "0.3.0.dev0";
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   vi.mocked(accountsApi.listUsers).mockResolvedValue([]);
@@ -183,12 +193,32 @@ describe("MembersPage actions", () => {
   });
 });
 
+describe("MembersPage in plain header/single-user mode", () => {
+  beforeEach(() => {
+    // Single-user mode: no accounts, no IdP (login_url is null). The
+    // /auth/users endpoint does not exist, so the page must skip the fetch
+    // and show a "not available" message instead.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = null;
+    mocks.serverVersion = "0.3.0.dev0";
+  });
+
+  it("shows a not-available message and never calls listUsers", async () => {
+    renderPage();
+    expect(
+      await screen.findByText("Member management is not available in single-user mode."),
+    ).toBeInTheDocument();
+    expect(accountsApi.listUsers).not.toHaveBeenCalled();
+  });
+});
+
 describe("MembersPage under OIDC (read-only)", () => {
   beforeEach(() => {
-    // OIDC: accounts disabled → no password-based management. The list still
-    // renders (admins can see who's provisioned), but every management
-    // affordance is gone.
+    // OIDC: accounts disabled but login_url is non-null (IdP present).
+    // The list still renders (admins can see who's provisioned), but every
+    // management affordance is gone.
     mocks.accountsEnabled = false;
+    mocks.loginUrl = "/auth/login";
   });
 
   it("lists users but offers no management actions", async () => {
