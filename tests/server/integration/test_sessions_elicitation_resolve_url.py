@@ -1450,9 +1450,7 @@ def test_supervisor_resolve_adapter_round_trip(
             )
         assert verdict.status_code == 202, verdict.text
         assert verdict.json() == {"queued": False}
-        assert calls == [
-            (child.id, {"elicitation_id": elicitation_id, "action": expected_action})
-        ]
+        assert calls == [(child.id, {"elicitation_id": elicitation_id, "action": expected_action})]
     finally:
         pending_elicitations.reset_for_tests()
 
