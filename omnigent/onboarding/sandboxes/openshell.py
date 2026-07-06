@@ -385,8 +385,22 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         base class's ``setsid nohup`` detach pattern doesn't work. Instead
         the command runs in the foreground of an ``exec_stream`` drained on
         a daemon thread — the stream stays open for the process's lifetime.
+
+        ``omnigent`` is invoked via Python explicitly rather than as a script
+        to avoid Landlock's execve restriction on shebang scripts under ``/opt``:
+        the script path is not in the default exec allowlist, but
+        ``/opt/venv/bin/python3`` (an ELF binary) can exec it directly.
         """
-        bg_command = f"{command} > {log_path} 2>&1 < /dev/null"
+        # Replace leading `omnigent ` with an explicit Python invocation so
+        # Landlock's execve policy (which blocks shebang scripts under /opt)
+        # is bypassed: python3 is an ELF binary, not a script.
+        _PYTHON = "/opt/venv/bin/python3"
+        _OMNIGENT = "/opt/venv/bin/omnigent"
+        if command.startswith("omnigent "):
+            invoke = f"{_PYTHON} {_OMNIGENT} {command[len('omnigent '):]}"
+        else:
+            invoke = command
+        bg_command = f"{invoke} > {log_path} 2>&1 < /dev/null"
         self._openshell().exec_background(
             sandbox_id, ["bash", "-lc", bg_command], timeout=_FOREGROUND_TIMEOUT_S
         )
