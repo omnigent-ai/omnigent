@@ -350,3 +350,26 @@ async def test_policy_empty_reason_preserved(
     assert r.action == PolicyAction.DENY
     # reason is None, not empty string.
     assert r.reason is None
+
+
+# ── _compose_ask_reason unit tests ──────────────────────
+
+
+def test_compose_ask_reason_single() -> None:
+    """Single ASK reason is returned as-is."""
+    from omnigent.runtime.policies.engine import _compose_ask_reason
+
+    assert _compose_ask_reason(["policy_a: needs approval"]) == "policy_a: needs approval"
+
+
+def test_compose_ask_reason_multiple_uses_last() -> None:
+    """Multiple ASK reasons collapse to the last (most specific)."""
+    from omnigent.runtime.policies.engine import _compose_ask_reason
+
+    reasons = [
+        "broad_gate: Agent wants to call Bash('git push'). Approve?",
+        "blast_radius: High-blast-radius command needs approval: 'git push'",
+    ]
+    result = _compose_ask_reason(reasons)
+    assert result == reasons[-1]
+    assert "broad_gate" not in result

@@ -393,7 +393,7 @@ class PolicyEngine:
             # preserving the "no side effects from a denied ASK" invariant.
             return PolicyResult(
                 action=PolicyAction.ASK,
-                reason="; ".join(ask_reasons),
+                reason=_compose_ask_reason(ask_reasons),
                 set_labels=dict(accumulated) if accumulated else None,
                 state_updates=list(accumulated_state) if accumulated_state else None,
                 deciding_policies=deciding_ask_policies,
@@ -1055,6 +1055,26 @@ def _condition_matches(
             if actual != expected:
                 return False
     return True
+
+
+def _compose_ask_reason(ask_reasons: list[str]) -> str:
+    """
+    Compose a single user-facing reason from one or more ASK verdicts.
+
+    When only one policy ASKs, its reason is used as-is. When multiple
+    policies ASK on the same event, use the last reason (typically the
+    most specific — broader gates like ``ask_on_os_tools`` fire before
+    targeted classifiers like ``blast_radius``). All policy names are
+    carried separately in ``deciding_policies``, so no information is
+    lost.
+
+    :param ask_reasons: Non-empty list of ``"<policy>: <reason>"``
+        strings accumulated during the evaluate loop.
+    :returns: A single reason string for the composed ASK result.
+    """
+    if len(ask_reasons) == 1:
+        return ask_reasons[0]
+    return ask_reasons[-1]
 
 
 # Re-export the defaults for callers that need them without

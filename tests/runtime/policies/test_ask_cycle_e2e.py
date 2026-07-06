@@ -325,9 +325,8 @@ async def test_ask_cycle_multiple_askers_combined_approval(
     assert result.deciding_policy == "first"
     # All three ASKing policies are captured in deciding_policies.
     assert result.deciding_policies == ["first", "second", "third"]
-    # Combined reason mentions all three policies.
-    assert "first:" in result.reason
-    assert "second:" in result.reason
+    # Composed reason uses the last (most specific) policy's reason;
+    # all policy names are still in deciding_policies.
     assert "third:" in result.reason
     # All three policies' set_labels landed — single
     # approval authorized every write.
@@ -353,6 +352,34 @@ async def test_ask_cycle_multiple_askers_combined_decline(
     _, approved = await _run_ask_cycle(engine, ctx, harness)
     assert approved is False
     assert engine.labels == {}
+
+
+@pytest.mark.asyncio
+async def test_ask_multiple_policies_uses_last_reason(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """When multiple policies ASK, the composed reason uses the last
+    policy's reason — typically the most specific. All policy names are
+    still captured in ``deciding_policies``.
+
+    Without this, the user sees a redundant concatenation of overlapping
+    reasons (e.g. both a blanket OS-tool gate and a blast-radius
+    classifier mentioning the same command).
+    """
+    broad = _ask_policy("broad_gate", reason="shell tool needs approval")
+    specific = _ask_policy("specific_classifier", reason="high-blast-radius command")
+    engine = _build_engine(conversation_store, [broad, specific])
+    ctx = EvaluationContext(
+        phase=Phase.TOOL_CALL,
+        content={"name": "run_shell", "arguments": {}},
+        tool_name="run_shell",
+    )
+    result = await engine.evaluate(ctx)
+    assert result.action == PolicyAction.ASK
+    assert result.deciding_policies == ["broad_gate", "specific_classifier"]
+    assert "specific_classifier:" in result.reason
+    assert "high-blast-radius command" in result.reason
+    assert "broad_gate:" not in result.reason
 
 
 # ── State flows across ASK cycles ─────────────────────
