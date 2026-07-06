@@ -26,6 +26,17 @@ def test_runtime_caps_custom_value() -> None:
     assert caps.execution_timeout == 3600
 
 
+def test_runtime_caps_canvas_enabled_default_true() -> None:
+    """Canvas (#2) is on by default — absence of ``canvas.enabled`` in the
+    server config is backwards-compatible (the tool, routes, and tab all work)."""
+    assert RuntimeCaps().canvas_enabled is True
+
+
+def test_runtime_caps_canvas_enabled_can_be_disabled() -> None:
+    """Operators can turn Canvas off via ``canvas: {enabled: false}``."""
+    assert RuntimeCaps(canvas_enabled=False).canvas_enabled is False
+
+
 def test_execution_config_default_values() -> None:
     """
     ExecutorSpec defaults match the values the runtime relies on.
