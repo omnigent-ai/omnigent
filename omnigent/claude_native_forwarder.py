@@ -18,9 +18,11 @@ from typing import Any
 import httpx
 
 from omnigent._native_post_delivery import (
+    RepostResult,
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
+    replay_dead_letters,
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -221,6 +223,12 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
 _POST_TIMEOUT_S = 10.0
+# Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
+# or a slow/hung server cannot stall forwarder startup.
+_REPLAY_MAX_RECORDS = 500
+_REPLAY_POST_TIMEOUT_SECONDS = 5.0
+_REPLAY_DEADLINE_SECONDS = 30.0
+_POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _MAX_SEEN_SOURCE_IDS = 2000
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
@@ -684,6 +692,65 @@ class _PostRetryTracker:
         )
 
 
+async def _replay_dead_letters_on_startup(
+    client: httpx.AsyncClient,
+    bridge_dir: Path,
+) -> None:
+    """
+    Re-POST proven-undelivered dead-lettered forwards on forwarder startup (#1579).
+
+    Best-effort recovery for the realistic case — the host/server returned after
+    an outage or a restart. Never raises: a replay failure must not block live
+    forwarding.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param bridge_dir: Native Claude bridge directory holding the dead-letter files.
+    :returns: None.
+    """
+
+    async def _repost(record: dict[str, object]) -> RepostResult:
+        session_id = record["session_id"]
+        event_type = record["event_type"]
+        payload = record["payload"]
+        assert isinstance(session_id, str)
+        assert isinstance(event_type, str)
+        assert isinstance(payload, dict)
+        try:
+            resp = await client.post(
+                f"/v1/sessions/{url_component(session_id)}/events",
+                json={"type": event_type, "data": payload},
+                timeout=_REPLAY_POST_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError as exc:
+            delivered_ambiguous = (
+                event_type == "external_conversation_item"
+                and post_may_have_been_delivered(exc)
+            )
+            return RepostResult(
+                delivered=False,
+                delivered_ambiguous=delivered_ambiguous,
+                http_status=None,
+            )
+        delivered = resp.status_code < 400
+        return RepostResult(
+            delivered=delivered,
+            delivered_ambiguous=False,
+            http_status=None if delivered else resp.status_code,
+        )
+
+    try:
+        await replay_dead_letters(
+            bridge_dir,
+            repost=_repost,
+            retryable_status_codes=_POST_RETRY_STATUS_CODES,
+            logger_name=__name__,
+            max_records=_REPLAY_MAX_RECORDS,
+            deadline_seconds=_REPLAY_DEADLINE_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 — replay must never block forwarder startup.
+        _logger.warning("Claude forwarder dead-letter replay failed", exc_info=True)
+
+
 async def forward_claude_transcript_to_session(
     *,
     base_url: str,
@@ -770,6 +837,7 @@ async def forward_claude_transcript_to_session(
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
+        await _replay_dead_letters_on_startup(client, bridge_dir)
         while True:
             try:
                 current_session_id = read_active_session_id(bridge_dir) or session_id

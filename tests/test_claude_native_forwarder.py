@@ -6913,3 +6913,82 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
         and body["body"]["data"]["item_type"] == "function_call"
     )
     assert function_call["body"]["data"]["response_id"] == running_rid
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
+    tmp_path: Path,
+) -> None:
+    """
+    On startup, a proven-undelivered record is re-POSTed and removed (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :returns: None.
+    """
+    from omnigent._native_post_delivery import append_dead_letter
+
+    append_dead_letter(
+        tmp_path,
+        session_id="conv_claude1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="proven-undelivered transport failure after retries",
+        delivered_ambiguous=False,
+        http_status=None,
+        transport_error="ConnectError",
+    )
+
+    posted: list[dict[str, object]] = []
+
+    class _Client:
+        async def post(
+            self, url: str, *, json: dict[str, object], timeout: float
+        ) -> httpx.Response:
+            posted.append({"url": url, "json": json, "timeout": timeout})
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    await forwarder._replay_dead_letters_on_startup(_Client(), tmp_path)  # type: ignore[arg-type]
+
+    assert len(posted) == 1
+    assert posted[0]["json"] == {
+        "type": "external_conversation_item",
+        "data": {"item_type": "message"},
+    }
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_skips_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """
+    On startup, an ambiguous record is never re-POSTed and is retained (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :returns: None.
+    """
+    from omnigent._native_post_delivery import append_dead_letter
+
+    append_dead_letter(
+        tmp_path,
+        session_id="conv_claude1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="ambiguous transport failure (may already be committed)",
+        delivered_ambiguous=True,
+    )
+
+    called = False
+
+    class _Client:
+        async def post(
+            self, url: str, *, json: dict[str, object], timeout: float
+        ) -> httpx.Response:
+            nonlocal called
+            called = True
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    await forwarder._replay_dead_letters_on_startup(_Client(), tmp_path)  # type: ignore[arg-type]
+
+    assert called is False
+    assert (tmp_path / "dead_letter.jsonl").exists()

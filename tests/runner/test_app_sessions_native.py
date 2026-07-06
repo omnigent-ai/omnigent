@@ -17277,6 +17277,60 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
 
 
 @pytest.mark.asyncio
+async def test_start_claude_transcript_forwarder_if_needed_starts_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A dead forwarder slot is repopulated so Chat can mirror terminal output.
+
+    Daemon-owned claude-native sessions defer forwarding to the runner; if the
+    supervisor task died while tmux is still live, this helper must start a new
+    one without double-registering a live incumbent.
+    """
+    from omnigent.runner import app as runner_app
+
+    session_id = "conv_fwd_restart"
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    started: list[dict[str, object]] = []
+    run = _ForwarderRun()
+
+    async def _fake_supervise(**kwargs: object) -> None:
+        started.append(kwargs)
+        run.task = asyncio.current_task()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _fake_supervise,
+    )
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    try:
+        assert await runner_app._start_claude_transcript_forwarder_if_needed(
+            session_id,
+            bridge_dir,
+            start_at_end=False,
+        )
+        await asyncio.sleep(0)
+        assert len(started) == 1
+        assert started[0]["session_id"] == session_id
+        assert started[0]["bridge_dir"] == bridge_dir
+
+        # Second call is a no-op while the first task is still live.
+        assert not await runner_app._start_claude_transcript_forwarder_if_needed(
+            session_id,
+            bridge_dir,
+            start_at_end=False,
+        )
+        assert len(started) == 1
+    finally:
+        runner_app._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        await _drain_forwarder_runs([run])
+
+
+@pytest.mark.asyncio
 async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stale_evict() -> None:
     """
     Re-registration cancels the incumbent; its done-callback can't evict the successor.
