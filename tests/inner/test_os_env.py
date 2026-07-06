@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import base64
+import shutil
 import tracemalloc
 from pathlib import Path
 
-from omnigent.inner.os_env import _read_impl, build_helper_env
+from omnigent.inner.os_env import _read_impl, _shell_impl, build_helper_env
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VALUE,
@@ -109,6 +110,30 @@ def test_build_helper_env_active_passes_omnigent_session_marker() -> None:
     env = build_helper_env(parent, _active_policy())
 
     assert env[OMNIGENT_SESSION_ENV_VAR] == OMNIGENT_SESSION_ENV_VALUE
+
+
+# ---------------------------------------------------------------------------
+# _shell_impl — timeout result shape
+# ---------------------------------------------------------------------------
+
+
+def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
+    """Timed-out shell commands still return the documented result fields."""
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    assert shell_path is not None
+
+    result = _shell_impl(
+        command="sleep 2",
+        timeout=1,
+        shell_path=shell_path,
+        cwd=tmp_path,
+    )
+
+    assert result["stdout"] == ""
+    assert result["stderr"] == ""
+    assert result["exit_code"] is None
+    assert result["timed_out"] is True
+    assert result["error"] == "Command timed out after 1 seconds"
 
 
 # ---------------------------------------------------------------------------

@@ -263,6 +263,54 @@ is not.
   gated on CLI + creds, P0 blocking, P1 report-only. Follows the existing
   nightly/flake-stress pattern rather than blocking every PR on live turns.
 
+## Running the bench and reading the result
+
+```
+# Offline: the declared matrix, no creds, every harness. Fast.
+python -m tests.harness_bench
+
+# Live: probe one harness against a gateway profile.
+python -m tests.harness_bench --harness codex-native --profile oss
+
+# Live: probe every official harness (SDK + native) sequentially.
+python -m tests.harness_bench --profile oss
+
+# A community harness that ships its own BenchProfile.
+python -m tests.harness_bench --harness mypkg.harness:PROFILE --profile oss
+```
+
+**You do not need to live-probe every harness on every host — and you cannot.**
+Each native harness needs its own vendor CLI logged in (a login the bench
+cannot provision), so no single host has them all. The two layers split the
+work:
+
+- **Offline conformance** already covers every harness in CI — registration,
+  the declared matrix, capability derivation. No host access needed.
+- **Live probes** only answer "does observed behavior match the declaration?"
+  You get value from live-probing a harness where the declaration is unverified
+  or might be wrong — not from chasing 100% coverage on one box.
+
+Run the full set on whatever host you have (`--profile oss`); harnesses whose
+vendor CLI is absent or logged out **skip cleanly** (they do not fail or abort
+the run). Read two signals only: any `!!` DRIFT, and any harness you *can* run
+that shows an unexpected `✗` / `·`. A single live run is a spot-check, not a
+gate — live probes are non-deterministic (model behavior, timing), so re-run
+before treating one `·`/timeout as a regression. Drift coverage is cumulative:
+each host that has harness X logged in contributes a live check for X.
+
+## Streaming is a binary declared capability
+
+A recurring subtlety worth stating: the `streaming` capability is **binary** —
+a harness either forwards token-level deltas (`SUPPORTED`) or it does not
+(`UNSUPPORTED`). `PARTIAL` is a *probe observation only*: the streaming probe
+returns it for the ambiguous coalesced-single-delta case against a `SUPPORTED`
+declaration. It is **never a declared value**. Declaring a non-streaming
+harness as `PARTIAL` drifts against reality, because the probe reports zero
+deltas as `UNSUPPORTED`, not `PARTIAL`. This bit the transcript-mirror natives
+(kiro/goose/qwen/hermes/cursor/kimi/pi), which deliver each complete assistant
+message rather than streaming deltas: they declare `streaming=False` →
+`UNSUPPORTED`, matching what the probe observes.
+
 ## Open items
 
 - Exact `BenchProfile` field set and whether it subsumes `HarnessProbe` or wraps

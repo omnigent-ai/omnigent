@@ -33,13 +33,17 @@ records, so adding a harness is a config entry, not a new driver — until a
 vendor diverges in kind (codex-native is RPC-delivered; opencode-native is
 ``native-server`` not ``native-tui``), which will want its own handling.
 
-Scope: this driver ships **claude-native** and **codex-native**, both
-live-verified end to end (basic turn, delta streaming, model override,
-interrupt) on a host with the vendor CLI logged in. They reach the same shared
-observe path by different means: claude-native tails a transcript (forwarder
-auto-starts on bind), codex-native rides an app-server-RPC forwarder that the
-driver wires up via an explicit runner launch/bind + native terminal ensure +
-provider config (``needs_terminal_ensure``; see ``_provision``).
+Scope: this driver runs **any** native-tui harness — the two shipped
+(claude-native, codex-native) and any other in-repo or community-plugin native
+harness — with no per-vendor table. It derives what it needs (agent name,
+terminal name, whether the vendor self-authenticates) from the capability model
+via :func:`native_vendor`, and provisions every native uniformly: launch/bind a
+runner, ensure the native terminal, and wait for the runner-side forwarder to
+come live (all natives stamp ``external_session_id`` once their terminal thread
+starts) before driving turns on the shared observe path. An OMNIGENT_CREDENTIAL
+native (claude, codex) is routed through the run's Databricks profile via a
+written config home; an own-auth native runs only where its vendor CLI is
+already logged in.
 """
 
 from __future__ import annotations
@@ -114,33 +118,51 @@ _READER_TERMINAL = frozenset({_OUTPUT_DONE_EVENT, _FAILED_EVENT, _INTERRUPTED_EV
 class NativeVendor:
     """Per-vendor facts a native-tui harness needs beyond the shared path.
 
+    Derived from the capability model (see :func:`native_vendor`), so a native
+    harness — in-repo or a community plugin — is probeable with no bench edit.
+
     :param harness: The native harness id, e.g. ``"claude-native"``.
-    :param agent_name: The server's auto-registered UI agent, e.g.
-        ``"claude-native-ui"``.
-    :param own_auth: ``True`` when the vendor uses its own login (cannot take
-        a minted bearer); such a harness is only runnable pre-logged-in.
-    :param needs_terminal_ensure: ``True`` when a turn's output only reaches
-        the shared session stream after the vendor's runner-side forwarder is
-        wired up, which requires an explicit runner launch/bind + native
-        terminal ensure during provisioning (codex-native). claude-native's
-        forwarder auto-starts on session bind, so it needs none of this.
+    :param agent_name: The server's auto-registered UI agent, by convention
+        ``"<harness>-ui"`` (e.g. ``"claude-native-ui"``).
+    :param terminal_name: The native terminal to ensure, by convention the
+        vendor CLI name (``"<harness>" minus "-native"``, e.g. ``"codex"``).
+    :param own_auth: ``True`` when the vendor logs in itself (auth is not
+        ``OMNIGENT_CREDENTIAL``), so the bench cannot provision it — runnable
+        only on a host where the vendor CLI is already logged in.
     """
 
     harness: str
     agent_name: str
+    terminal_name: str
     own_auth: bool = False
-    needs_terminal_ensure: bool = False
 
 
-# Both shipped vendors surface output on the shared session stream; codex-native
-# needs extra provisioning first (see ``needs_terminal_ensure``). OWN_AUTH
-# natives are absent (login the bench cannot provision).
-_VENDORS: dict[str, NativeVendor] = {
-    "claude-native": NativeVendor("claude-native", "claude-native-ui", own_auth=False),
-    "codex-native": NativeVendor(
-        "codex-native", "codex-native-ui", own_auth=False, needs_terminal_ensure=True
-    ),
-}
+def native_vendor(harness: str) -> NativeVendor | None:
+    """Derive the :class:`NativeVendor` for *harness* from its capabilities.
+
+    Returns ``None`` unless the harness declares ``integration_mode ==
+    NATIVE_TUI`` in :func:`omnigent.harness_plugins.harness_capabilities`
+    (which already discovers community plugins via entry points), so any
+    native-tui harness is drivable by name with no per-vendor table here.
+    ``native-server`` harnesses (e.g. opencode-native) are a different
+    transport and return ``None``.
+    """
+    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
+
+    caps = harness_capabilities().get(harness)
+    if caps is None or caps.integration_mode is not IntegrationMode.NATIVE_TUI:
+        return None
+    # agent_name and terminal_name are convention (``<harness>-ui`` and the
+    # vendor CLI name), which holds for every in-repo native. A community
+    # plugin whose registered terminal/agent name diverges would need an
+    # override map here, mirroring the manifest's _NATIVE_CLI_BINARY.
+    return NativeVendor(
+        harness=harness,
+        agent_name=f"{harness}-ui",
+        terminal_name=harness.removesuffix("-native"),
+        own_auth=caps.auth is not AuthModel.OMNIGENT_CREDENTIAL,
+    )
 
 
 class NativeTuiDriver:
@@ -158,7 +180,7 @@ class NativeTuiDriver:
     def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
         self._profile = profile
         self._db_profile = databricks_profile
-        self._vendor = _VENDORS.get(profile.harness)
+        self._vendor = native_vendor(profile.harness)
         self._proc: subprocess.Popen[bytes] | None = None
         self._daemon: subprocess.Popen[bytes] | None = None
         self._client: httpx.Client | None = None
@@ -169,9 +191,9 @@ class NativeTuiDriver:
     @staticmethod
     def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
         """Return a skip reason if this driver cannot run *profile*, else None."""
-        vendor = _VENDORS.get(profile.harness)
+        vendor = native_vendor(profile.harness)
         if vendor is None:
-            return f"no native-tui vendor entry for {profile.harness!r}"
+            return f"{profile.harness!r} is not a native-tui harness"
         if not databricks_profile:
             return "no --profile / databricks profile provided; native-tui needs a gateway route"
         if lookup_databricks_host(databricks_profile) is None:
@@ -239,10 +261,11 @@ class NativeTuiDriver:
             "DATABRICKS_CONFIG_PROFILE": self._db_profile,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         }
-        # codex reads its provider from omnigent's global config, not from
-        # DATABRICKS_CONFIG_PROFILE; without it the TUI hits the vendor login
-        # screen and never starts a thread.
-        if self._vendor.needs_terminal_ensure:
+        # An omnigent-credential native resolves its provider from omnigent's
+        # global config, not DATABRICKS_CONFIG_PROFILE; without it some vendors
+        # (codex) hit the login screen and never start a thread. Own-auth
+        # vendors use their own login and are left untouched.
+        if not self._vendor.own_auth:
             base_env["OMNIGENT_CONFIG_HOME"] = str(self._write_provider_config())
         self._proc = spawn_omnigent_server(self._tmp, port, base_env, binding_token)
         self._wait_health()
@@ -263,8 +286,10 @@ class NativeTuiDriver:
         )
         created.raise_for_status()
         self._session_id = str(created.json()["id"])
-        if self._vendor.needs_terminal_ensure:
-            self._wire_native_forwarder(host_id, workspace)
+        # Ensure the native terminal + wait for the forwarder for every
+        # native-tui harness: it is the uniform readiness protocol (all natives
+        # stamp external_session_id once their terminal thread starts).
+        self._wire_native_forwarder(host_id, workspace)
 
     def _write_provider_config(self) -> Path:
         """Write the ``OMNIGENT_CONFIG_HOME`` config that routes the vendor's
@@ -285,16 +310,21 @@ class NativeTuiDriver:
         vendor thread id), which the forwarder sets once its thread starts.
         """
         assert self._client is not None and self._session_id is not None
+        assert self._vendor is not None
         session_id = self._session_id
         self._launch_and_bind_runner(host_id, workspace)
         ensure = self._client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
-            json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+            json={
+                "terminal": self._vendor.terminal_name,
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
             timeout=90.0,
         )
         ensure.raise_for_status()
         # Gate on the forwarder wiring up: it stamps external_session_id (the
-        # codex thread id) on the session once the TUI creates its thread.
+        # vendor thread id) on the session once the TUI creates its thread.
         # Posting a turn before this races ahead of the forwarder subscription.
         deadline = time.monotonic() + _FORWARDER_READY_TIMEOUT_S
         while time.monotonic() < deadline:
