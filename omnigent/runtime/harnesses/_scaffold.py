@@ -42,7 +42,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -99,6 +99,14 @@ _SHUTDOWN_GRACE_S = 4.5
 # (now rare) expiry the fallback below is phase-aware — TOOL_CALL fails CLOSED
 # (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
 _POLICY_EVAL_TIMEOUT_S = 86400.0
+
+# Cap on how long ``elicit`` parks awaiting a human reply — the same
+# ask_timeout-scale budget as ``_POLICY_EVAL_TIMEOUT_S``. The per-turn
+# watchdogs stand down while a turn is parked on a human (see
+# ``TurnContext._parked_on_human``), so every such park needs its own
+# explicit human-scale bound or an orphaned elicitation would park the
+# turn forever.
+_ELICITATION_TIMEOUT_S = 86400.0
 
 # Per-turn IDLE watchdog: max gap WITHOUT progress before a wedged
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).
@@ -421,6 +429,12 @@ class TurnContext:
         # event so a long-but-active turn isn't killed mid-turn.
         # ``None`` disables it (watchdog off, or outside a guarded run).
         self._reset_idle_watchdog: Callable[[], None] | None = None
+        # Park bracketing hooks. ``_guarded_run_turn`` sets these so
+        # ``_parked_on_human`` can suspend/resume the per-turn watchdogs
+        # around a wait on a human (elicitation reply, ASK policy
+        # verdict). ``None`` outside a guarded run.
+        self._park_watchdogs_begin: Callable[[], None] | None = None
+        self._park_watchdogs_end: Callable[[], None] | None = None
 
     def emit(self, event: HarnessStreamEvent) -> None:
         """
@@ -514,6 +528,29 @@ class TurnContext:
             # leak memory across turns.
             self._pending_tool_calls.pop(call_id, None)
 
+    @contextlib.contextmanager
+    def _parked_on_human(self) -> Iterator[None]:
+        """
+        Suspend the per-turn watchdogs while parked on a human.
+
+        Brackets a wait whose duration is the human's to spend (an
+        elicitation reply, an ASK policy verdict): the idle watchdog
+        would otherwise read the zero-emit wait as a wedged turn, and
+        the absolute ceiling would bill it as machine time. Re-reads
+        the end hook in ``finally`` because ``_guarded_run_turn``
+        detaches both hooks once its timeout contexts unwind — a late
+        resume must not reschedule a finished timeout.
+        """
+        begin = self._park_watchdogs_begin
+        if begin is not None:
+            begin()
+        try:
+            yield
+        finally:
+            end = self._park_watchdogs_end
+            if begin is not None and end is not None:
+                end()
+
     async def elicit(
         self, elicitation_id: str, params: ElicitationRequestParams
     ) -> ElicitationResult:
@@ -533,6 +570,8 @@ class TurnContext:
         :returns: The MCP-shaped
             :class:`ElicitationResult` reply.
         :raises asyncio.CancelledError: If the turn is cancelled.
+        :raises asyncio.TimeoutError: If no reply arrives within the
+            day-long ``_ELICITATION_TIMEOUT_S`` cap.
         """
         future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
         self._pending_elicitations[elicitation_id] = future
@@ -544,7 +583,8 @@ class TurnContext:
             )
         )
         try:
-            return await future
+            with self._parked_on_human():
+                return await asyncio.wait_for(future, timeout=_ELICITATION_TIMEOUT_S)
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
 
@@ -642,7 +682,8 @@ class TurnContext:
             )
         )
         try:
-            return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
+            with self._parked_on_human():
+                return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
             # Phase-aware default: advisory LLM phases and TOOL_RESULT (the
             # tool already ran) fail OPEN so a missing verdict never hangs the
@@ -1451,9 +1492,15 @@ class HarnessApp:
           whole window. This replaces the prior fixed *cumulative* cap,
           which guillotined long-but-healthy turns mid-stream.
         - ABSOLUTE (:data:`_TURN_ABSOLUTE_TIMEOUT_S`): a hard ceiling on
-          total duration, never rescheduled. Backstops the idle watchdog
-          against a runaway-but-active loop the idle one never sees as
-          stuck.
+          total *machine* time, never rescheduled by progress. Backstops
+          the idle watchdog against a runaway-but-active loop the idle
+          one never sees as stuck.
+
+        Both stand down while the turn is parked on a human (see
+        :meth:`TurnContext._parked_on_human`): the idle deadline is
+        suspended and the absolute ceiling is pushed out by the parked
+        duration, so a slow human answer is never billed as a wedged or
+        runaway turn.
 
         Either expiry surfaces a wedged/runaway ``run_turn`` as
         ``response.failed``.
@@ -1466,17 +1513,59 @@ class HarnessApp:
         # ``asyncio.timeout(None)`` is a no-op, so ``<= 0`` disables each.
         idle_wd = asyncio.timeout(idle_timeout if idle_timeout > 0 else None)
         absolute_wd = asyncio.timeout(absolute_timeout if absolute_timeout > 0 else None)
+        loop = asyncio.get_running_loop()
+        # Depth of active waits on a human (elicitation reply, ASK policy
+        # verdict). While > 0 both watchdogs stand down: the wait is
+        # healthy but zero-emit and open-ended, so its duration is the
+        # human's to spend, not machine time. Each park carries its own
+        # day-long cap, so the stand-down is bounded.
+        park_depth = 0
+        park_started = 0.0
+        absolute_deadline: float | None = None
+
         if idle_timeout > 0:
-            loop = asyncio.get_running_loop()
 
             def _reset() -> None:
                 # Push ONLY the idle deadline ``idle_timeout`` s past now
-                # (the absolute ceiling is never rescheduled). Called from
-                # ``ctx.emit`` during ``run_turn`` (inside the active
-                # context), so the reschedule is always valid.
-                idle_wd.reschedule(loop.time() + idle_timeout)
+                # (the absolute ceiling is never rescheduled by progress).
+                # Called from ``ctx.emit`` during ``run_turn`` (inside the
+                # active context), so the reschedule is always valid. A
+                # background emit during a park must not re-arm the
+                # suspended deadline — the park's resume re-arms it.
+                if park_depth == 0:
+                    idle_wd.reschedule(loop.time() + idle_timeout)
 
             ctx._reset_idle_watchdog = _reset
+
+        def _park_begin() -> None:
+            nonlocal park_depth, park_started, absolute_deadline
+            park_depth += 1
+            if park_depth > 1:
+                return
+            park_started = loop.time()
+            if idle_timeout > 0:
+                idle_wd.reschedule(None)
+            if absolute_timeout > 0:
+                absolute_deadline = absolute_wd.when()
+                absolute_wd.reschedule(None)
+
+        def _park_end() -> None:
+            nonlocal park_depth, absolute_deadline
+            park_depth -= 1
+            if park_depth > 0:
+                return
+            parked = loop.time() - park_started
+            # The ceiling keeps its full machine-time budget: its deadline
+            # moves out by exactly the parked duration, no more — a
+            # runaway loop that resumes after the park is still capped.
+            if absolute_timeout > 0 and absolute_deadline is not None:
+                absolute_wd.reschedule(absolute_deadline + parked)
+                absolute_deadline = None
+            if idle_timeout > 0:
+                idle_wd.reschedule(loop.time() + idle_timeout)
+
+        ctx._park_watchdogs_begin = _park_begin
+        ctx._park_watchdogs_end = _park_end
         try:
             # Absolute outer, idle inner: ``.expired()`` on each tells which
             # ceiling tripped so the error message is accurate.
@@ -1532,9 +1621,12 @@ class HarnessApp:
             # ``response.cancelled`` event.
             raise
         finally:
-            # Detach the reset hook before the timeout context unwinds so
-            # a stray late ``emit`` can't reschedule a finished timeout.
+            # Detach the hooks before the timeout contexts unwind so a
+            # stray late ``emit`` or park resume can't reschedule a
+            # finished timeout.
             ctx._reset_idle_watchdog = None
+            ctx._park_watchdogs_begin = None
+            ctx._park_watchdogs_end = None
             # Sentinel that tells ``_stream_turn`` to stop reading
             # the queue and emit the terminal event.
             ctx._event_queue.put_nowait(None)

@@ -123,6 +123,56 @@ class _ElicitationHarness(HarnessApp):
         )
 
 
+class _ElicitThenRunawayHarness(HarnessApp):
+    """
+    Parks on an elicitation, then busy-loops forever emitting deltas.
+
+    Exercises the boundary of the park exemption: standing the
+    watchdogs down while parked on a human must not hand a
+    runaway-but-active turn extra machine time — after the park
+    resumes, the absolute ceiling must still fire on its original
+    (shifted, not enlarged) budget.
+    """
+
+    _tick_seconds: float = 0.1
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        del request
+        await ctx.elicit(
+            elicitation_id="elicit_test_1",
+            params=ElicitationRequestParams(mode="form", message="approve?"),
+        )
+        i = 0
+        while True:  # runaway: active forever, never completes
+            ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta=f"tick-{i} "))
+            i += 1
+            await asyncio.sleep(self._tick_seconds)
+
+
+class _PolicyParkHarness(HarnessApp):
+    """
+    Parks on ``ctx.evaluate_policy`` (a human-answered ASK), then
+    emits the verdict action as a text delta.
+
+    Exercises the wait-on-a-human path: the turn emits nothing while
+    the evaluation Future is parked, so the per-turn watchdogs must
+    not count the wait as the turn being wedged or runaway.
+    """
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        del request
+        verdict = await ctx.evaluate_policy(
+            "poleval_test_1",
+            "PHASE_TOOL_CALL",
+            {"name": "dangerous_tool", "arguments": {}},
+        )
+        ctx.emit(
+            OutputTextDeltaEvent(
+                type="response.output_text.delta", delta=f"verdict:{verdict.action}"
+            )
+        )
+
+
 class _CancellableHarness(HarnessApp):
     """
     Sleeps in a poll loop checking ``ctx.cancelled`` every 50ms,
@@ -433,6 +483,8 @@ _FIXTURES: dict[str, type[HarnessApp]] = {
     "usage": _UsageHarness,
     "tool_dispatch": _ToolDispatchHarness,
     "elicitation": _ElicitationHarness,
+    "policy_park": _PolicyParkHarness,
+    "elicit_then_runaway": _ElicitThenRunawayHarness,
     "cancellable": _CancellableHarness,
     "injection": _InjectionHarness,
     "native_tool": _NativeToolEmittingHarness,

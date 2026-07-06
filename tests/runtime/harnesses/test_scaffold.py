@@ -373,6 +373,36 @@ def use_busy_absolute_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "2")
 
 
+@pytest.fixture
+def use_elicitation_idle_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Elicitation harness with a 2s idle watchdog (read at import)."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "elicitation")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
+
+
+@pytest.fixture
+def use_elicitation_absolute_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Elicitation harness; idle high so only the 2s absolute ceiling can fire."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "elicitation")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "10")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "2")
+
+
+@pytest.fixture
+def use_policy_park_idle_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Policy-park harness with a 2s idle watchdog (read at import)."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "policy_park")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
+
+
+@pytest.fixture
+def use_elicit_then_runaway_absolute_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Park-then-runaway harness; idle high so only the 2s absolute ceiling can fire."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "elicit_then_runaway")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "10")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "2")
+
+
 # ── Native function_call emission ──────────────────────────────
 
 
@@ -767,6 +797,191 @@ async def test_per_turn_absolute_watchdog_caps_runaway_active_turn(
     # wedged) — distinguishes this from the idle/wedged path.
     assert "response.output_text.delta" in event_types, (
         f"Expected progress deltas before the absolute cap; got {event_types!r}."
+    )
+
+
+async def _run_turn_answering_park_late(
+    manager: HarnessProcessManager,
+    conv_id: str,
+    *,
+    park_event: str,
+    reply_body: dict[str, object],
+    answer_after_s: float,
+) -> list[_ParsedSSEEvent]:
+    """Start a turn, answer its human park only after ``answer_after_s``.
+
+    Drives a fixture harness that parks on a human (elicitation or
+    policy ASK): waits for ``park_event`` on the stream, sleeps past the
+    watchdog window under test — a human taking longer than the watchdog
+    to decide — then posts ``reply_body`` and drains the stream.
+
+    :returns: All streamed events, for terminal/delta assertions.
+    """
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    events: list[_ParsedSSEEvent] = []
+    try:
+        # Bounds a hang; the slow path here is the deliberate sleep.
+        async with asyncio.timeout(30):
+            async with stream_client.stream(
+                "POST", f"/v1/sessions/{conv_id}/events", json=body
+            ) as response:
+                replied = False
+                async for event in _stream_iter(response):
+                    events.append(event)
+                    if not replied and event.event == park_event:
+                        replied = True
+                        await asyncio.sleep(answer_after_s)
+                        # No status assert: on the unfixed path the turn is
+                        # already dead by now and the reply 404s; the terminal
+                        # event carries the actual verdict.
+                        await side_client.post(f"/v1/sessions/{conv_id}/events", json=reply_body)
+    finally:
+        await side_client.aclose()
+    return events
+
+
+async def test_idle_watchdog_spares_turn_parked_on_elicitation(
+    use_elicitation_idle_cap: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    A turn parked on an elicitation must survive a human answering
+    slower than the idle window.
+
+    An elicitation (approval card) blocks until the human replies —
+    by contract as long as the policy ``ask_timeout`` (a day) — and
+    emits nothing while parked. The idle watchdog must not read that
+    silence as a wedged turn: here the human takes ~3.2s against a 2s
+    idle window, and the turn must still complete with the reply.
+    """
+    events = await _run_turn_answering_park_late(
+        manager,
+        "conv_elicit_idle_park",
+        park_event="response.elicitation_request",
+        reply_body={"type": "approval", "elicitation_id": "elicit_test_1", "action": "accept"},
+        answer_after_s=3.2,
+    )
+    event_types = [e.event for e in events]
+    assert event_types[-1] == "response.completed", (
+        f"A turn parked on a human must outlive the idle watchdog; got "
+        f"terminal {event_types[-1]!r} (full: {event_types!r}). "
+        f"response.failed means the idle watchdog counted the human's "
+        f"thinking time as the turn being wedged."
+    )
+    deltas = [e.data["delta"] for e in events if e.event == "response.output_text.delta"]
+    assert deltas == ["action:accept"], (
+        f"The late human reply must still reach the parked turn; got {deltas!r}."
+    )
+
+
+async def test_absolute_watchdog_spares_turn_parked_on_elicitation(
+    use_elicitation_absolute_cap: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    A turn parked on an elicitation must survive a human answering
+    slower than the absolute ceiling.
+
+    The absolute ceiling is never rescheduled by emits, so it is the
+    binding cap on a human park even when the idle watchdog spares it
+    (idle is set high here so only the ceiling can fire). Time parked
+    on a human must not count against the ceiling's machine-time
+    budget: the human takes ~3.2s against a 2s ceiling, and the turn
+    must still complete with the reply.
+    """
+    events = await _run_turn_answering_park_late(
+        manager,
+        "conv_elicit_absolute_park",
+        park_event="response.elicitation_request",
+        reply_body={"type": "approval", "elicitation_id": "elicit_test_1", "action": "accept"},
+        answer_after_s=3.2,
+    )
+    event_types = [e.event for e in events]
+    assert event_types[-1] == "response.completed", (
+        f"A turn parked on a human must outlive the absolute ceiling; got "
+        f"terminal {event_types[-1]!r} (full: {event_types!r}). "
+        f"response.failed means park time was billed to the ceiling's "
+        f"machine-time budget."
+    )
+    deltas = [e.data["delta"] for e in events if e.event == "response.output_text.delta"]
+    assert deltas == ["action:accept"], (
+        f"The late human reply must still reach the parked turn; got {deltas!r}."
+    )
+
+
+async def test_absolute_watchdog_still_caps_runaway_after_park(
+    use_elicit_then_runaway_absolute_cap: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    The park exemption must not enlarge the absolute machine-time budget.
+
+    The park only *shifts* the ceiling's deadline by the parked
+    duration — it never adds budget. This harness parks ~1s on an
+    elicitation (exempt), then busy-loops forever: the ceiling must
+    still fire once its original 2s of machine time is spent, so the
+    runaway is capped at ~3s wall clock, not spared.
+    """
+    events = await _run_turn_answering_park_late(
+        manager,
+        "conv_runaway_after_park",
+        park_event="response.elicitation_request",
+        reply_body={"type": "approval", "elicitation_id": "elicit_test_1", "action": "accept"},
+        answer_after_s=1.0,
+    )
+    event_types = [e.event for e in events]
+    assert event_types[-1] == "response.failed", (
+        f"A runaway turn must still hit the absolute ceiling after a park; "
+        f"got terminal {event_types[-1]!r}. response.completed/no-terminal "
+        f"means the park exemption handed the runaway extra budget."
+    )
+    # The error must name the ABSOLUTE watchdog — proves the ceiling
+    # resumed with its shifted deadline rather than being disarmed.
+    error = events[-1].data["response"]["error"]
+    assert error is not None and "absolute" in error["message"], (
+        f"Failure must come from the absolute ceiling; got {error!r}."
+    )
+    # The runaway actively streamed after the park before being capped.
+    assert "response.output_text.delta" in event_types, (
+        f"Expected post-park runaway deltas before the cap; got {event_types!r}."
+    )
+
+
+async def test_idle_watchdog_spares_turn_parked_on_policy_ask(
+    use_policy_park_idle_cap: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    A turn parked on a policy ASK verdict must survive a human
+    answering slower than the idle window.
+
+    ``evaluate_policy`` parks up to the policy ``ask_timeout`` (a day)
+    awaiting a human verdict and emits nothing meanwhile — the same
+    zero-emit park as an elicitation, on the other park primitive. The
+    verdict arrives ~3.2s in against a 2s idle window; the turn must
+    complete carrying the verdict, not fail as wedged.
+    """
+    events = await _run_turn_answering_park_late(
+        manager,
+        "conv_policy_idle_park",
+        park_event="policy_evaluation.requested",
+        reply_body={
+            "type": "policy_verdict",
+            "evaluation_id": "poleval_test_1",
+            "action": "POLICY_ACTION_ALLOW",
+        },
+        answer_after_s=3.2,
+    )
+    event_types = [e.event for e in events]
+    assert event_types[-1] == "response.completed", (
+        f"A turn parked on a policy ASK must outlive the idle watchdog; got "
+        f"terminal {event_types[-1]!r} (full: {event_types!r})."
+    )
+    deltas = [e.data["delta"] for e in events if e.event == "response.output_text.delta"]
+    assert deltas == ["verdict:POLICY_ACTION_ALLOW"], (
+        f"The late verdict must still reach the parked turn; got {deltas!r}."
     )
 
 
