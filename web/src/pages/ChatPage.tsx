@@ -4368,16 +4368,14 @@ export function Composer({
         messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
         onDelete={dequeueMessage}
         onEdit={(queueId) => {
-          // Pull the queued message back into the composer for editing: load
-          // its text + attachments, remove it from the queue, and focus the
-          // textarea. Prepend any in-progress draft so an unsent draft isn't
-          // lost. Re-sending re-queues it (busy) or sends it (idle).
+          // Pull the queued message back into the composer for editing:
+          // replace the composer's text + attachments with the queued
+          // message's, remove it from the queue, and focus the textarea.
+          // Re-sending re-queues it (busy) or sends it (idle).
           const target = queuedMessages.find((m) => m.queueId === queueId);
           if (!target) return;
-          setValue((prev) => (prev.trim() ? `${target.text}\n\n${prev}` : target.text));
-          if (target.files && target.files.length > 0) {
-            setFiles((prev) => [...target.files!, ...prev]);
-          }
+          setValue(target.text);
+          setFiles(target.files ?? []);
           dequeueMessage(queueId);
           textareaRef.current?.focus();
         }}
