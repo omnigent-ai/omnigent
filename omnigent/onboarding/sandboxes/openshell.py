@@ -391,15 +391,11 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         the script path is not in the default exec allowlist, but
         ``/opt/venv/bin/python3`` (an ELF binary) can exec it directly.
         """
-        # Replace leading `omnigent ` with an explicit Python invocation so
-        # Landlock's execve policy (which blocks shebang scripts under /opt)
-        # is bypassed: python3 is an ELF binary, not a script.
         _PYTHON = "/opt/venv/bin/python3"
         _OMNIGENT = "/opt/venv/bin/omnigent"
-        if command.startswith("omnigent "):
-            invoke = f"{_PYTHON} {_OMNIGENT} {command[len('omnigent '):]}"
-        else:
-            invoke = command
+        # The base class passes "ENV=val omnigent host --server ...", so
+        # "omnigent" is never at position 0. Replace it wherever it appears.
+        invoke = command.replace("omnigent ", f"{_PYTHON} {_OMNIGENT} ", 1)
         bg_command = f"{invoke} > {log_path} 2>&1 < /dev/null"
         self._openshell().exec_background(
             sandbox_id, ["bash", "-lc", bg_command], timeout=_FOREGROUND_TIMEOUT_S
