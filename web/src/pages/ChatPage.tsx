@@ -60,6 +60,7 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
+import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
@@ -968,6 +969,18 @@ export function ChatPage() {
     // a void.
     if (urlConvId && isUnreachable) {
       setReconnectDialogOpen(true);
+      return;
+    }
+    // Busy → hold the message in the client-side queue (shown in the strip
+    // above the composer) instead of POSTing now. The queue head is flushed
+    // FIFO when the session next goes idle. Only queue for an already-bound
+    // conversation; a brand-new chat (no conversationId) always sends so the
+    // session gets created.
+    const chat = useChatStore.getState();
+    const isBusy =
+      chat.status === "streaming" || ["running", "waiting"].includes(chat.sessionStatus);
+    if (isBusy && chat.conversationId !== null) {
+      chat.enqueueMessage(text, files);
       return;
     }
     void useChatStore.getState().send(text, agentId, files, {
@@ -3635,6 +3648,31 @@ export function Composer({
   // module scope (not useRef) because Composer unmounts during the
   // loading gate between session switches.
   const conversationId = useChatStore((s) => s.conversationId);
+  const queuedMessages = useChatStore((s) => s.queuedMessages);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
+  const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
+  // Drain the queue whenever idle with a waiting head — level-triggered so a
+  // message queued right after the turn ended (or after an SSE reconnect that
+  // carries no fresh idle transition) still sends instead of stranding. Hold
+  // while unreachable: flushing would POST into a void (no executor / no host
+  // to wake), bypassing onSend's reconnect dialog. The next reachable render
+  // re-fires this effect and drains. `boundAgentId` is a dep because the flush
+  // needs it: on navigate-back the binding lands after the status settles, and
+  // without this dep the effect wouldn't re-fire to drain a queue for the
+  // returned-to conversation.
+  useEffect(() => {
+    if (unreachable) return;
+    maybeFlushQueuedHead();
+  }, [
+    status,
+    sessionStatus,
+    queuedMessages,
+    conversationId,
+    flushBoundAgentId,
+    unreachable,
+    maybeFlushQueuedHead,
+  ]);
   const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
     conversationId,
     showCodexGoal,
@@ -4321,6 +4359,13 @@ export function Composer({
             e.target.value = "";
           }
         }}
+      />
+      {/* Queued messages — peeks above the card like the sub-agent tray.
+          Lists follow-ups held while the agent is busy; drains FIFO on idle.
+          Scope to this conversation so a queue held elsewhere never leaks in. */}
+      <QueuedMessagesStrip
+        messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
+        widthClassName={CHAT_COLUMN_WIDTH}
       />
       {/* Sub-agent context tray — peeks above the card; reserves its own
           layout slot so the card sits below it (see SubagentComposerTray).

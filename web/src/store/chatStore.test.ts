@@ -350,6 +350,7 @@ beforeEach(() => {
     conversationId: null,
     blocks: [],
     pendingUserMessages: [],
+    queuedMessages: [],
     // Reset the per-conversation stash too, or a stash entry left by one
     // navigation test leaks into the next (the entry survives switchTo by
     // design — that's the whole point — so beforeEach must clear it).
@@ -7450,5 +7451,197 @@ describe("chatStore — policy deny renders once", () => {
     expect(
       await run({ delta: "[Denied by policy: over budget]", message_id: "deny_abc", index: 0 }),
     ).toBe(1);
+  });
+});
+
+describe("chatStore — client-side message queue", () => {
+  it("enqueueMessage holds the message client-side without POSTing while busy", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    // Busy: the enqueue-time flush must NOT fire, so both messages stay queued.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "streaming",
+      sessionStatus: "running",
+      send: sendSpy,
+    });
+    useChatStore.getState().enqueueMessage("first", undefined);
+    useChatStore.getState().enqueueMessage("second", undefined);
+
+    const state = useChatStore.getState();
+    expect(state.queuedMessages.map((m) => m.text)).toEqual(["first", "second"]);
+    expect(state.queuedMessages.every((m) => m.conversationId === "conv_abc")).toBe(true);
+    // Nothing is sent to the server while the agent is busy.
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it("enqueueMessage is a no-op with no bound conversation", () => {
+    useChatStore.setState({ conversationId: null });
+    useChatStore.getState().enqueueMessage("orphan", undefined);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("maybeFlushQueuedHead flushes the head FIFO, one per idle", async () => {
+    // Spy on send so the flush's contract (which head, in what order) is
+    // asserted without depending on the full bind→/events network path.
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: "conv_abc" },
+        { queueId: "q_2", text: "second", conversationId: "conv_abc" },
+      ],
+    });
+
+    // Idle + head present → head ("first") is removed and sent; tail remains.
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["second"]);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["first", "agent_xyz"]);
+
+    // Next idle → the next message flushes; queue empties.
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(sendSpy).toHaveBeenCalledTimes(2);
+    expect(sendSpy.mock.calls[1]!.slice(0, 2)).toEqual(["second", "agent_xyz"]);
+  });
+
+  it("does not flush a queue owned by a different conversation", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [{ queueId: "q_1", text: "elsewhere", conversationId: "conv_other" }],
+    });
+    useChatStore.getState().maybeFlushQueuedHead();
+    // The only queued message belongs to conv_other, so nothing flushes here.
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["elsewhere"]);
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  // Regression: the queue is one flat array across conversations. An undrained
+  // message from another conversation must NOT block the bound conversation's
+  // messages — flush the first message OF THE BOUND CONVERSATION, not the global
+  // array head. A head-only guard stranded the local messages forever.
+  it("flushes past a foreign head to reach the bound conversation's message", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [
+        // Foreign message sits at index 0 (queued in conv_other, never drained).
+        { queueId: "q_1", text: "foreign", conversationId: "conv_other" },
+        { queueId: "q_2", text: "mine-1", conversationId: "conv_abc" },
+        { queueId: "q_3", text: "mine-2", conversationId: "conv_abc" },
+      ],
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    // The bound conversation's FIRST message flushes; the foreign head is left
+    // untouched, and the bound conversation's FIFO order is preserved.
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["mine-1", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "foreign",
+      "mine-2",
+    ]);
+  });
+
+  // Regression: a message flushes to the agent it was COMPOSED for, even if the
+  // binding changed (e.g. a /model switch) between enqueue and drain.
+  it("flushes to the agent captured at enqueue time, not the current binding", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    // Bound to agent_one when queuing.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_one",
+      status: "streaming",
+      sessionStatus: "running",
+      send: sendSpy,
+    });
+    useChatStore.getState().enqueueMessage("composed for one", undefined);
+    expect(useChatStore.getState().queuedMessages[0]!.agentId).toBe("agent_one");
+
+    // Binding changes to agent_two, then the session idles and flushes.
+    useChatStore.setState({ boundAgentId: "agent_two", status: "idle", sessionStatus: "idle" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["composed for one", "agent_one"]);
+  });
+
+  it("clearQueuedMessages drops only the given conversation's messages", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "q_1", text: "a1", conversationId: "conv_abc" },
+        { queueId: "q_2", text: "b1", conversationId: "conv_other" },
+        { queueId: "q_3", text: "a2", conversationId: "conv_abc" },
+      ],
+    });
+    useChatStore.getState().clearQueuedMessages("conv_abc");
+    // Only conv_other's message survives.
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["b1"]);
+  });
+
+  it("does not flush while busy (streaming or running/waiting)", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    const base = {
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      send: sendSpy,
+      queuedMessages: [{ queueId: "q_1", text: "wait", conversationId: "conv_abc" }],
+    };
+
+    // Local send still in flight.
+    useChatStore.setState({ ...base, status: "streaming", sessionStatus: "idle" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    // Server-side turn still running.
+    useChatStore.setState({ ...base, status: "idle", sessionStatus: "running" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    // Draining background work.
+    useChatStore.setState({ ...base, status: "idle", sessionStatus: "waiting" });
+    useChatStore.getState().maybeFlushQueuedHead();
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["wait"]);
+  });
+
+  // Regression: a message queued while the agent was ALREADY idle (the send
+  // routed to the queue on a stale busy read, but no future idle edge follows)
+  // must still flush. Edge-triggering on the idle SSE event stranded it — the
+  // bug this level-triggered design fixes.
+  it("flushes a message queued while already idle (no future idle edge)", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [],
+    });
+
+    // Enqueue while idle — enqueueMessage triggers a flush itself, so no
+    // session_status event is needed to unstick it.
+    useChatStore.getState().enqueueMessage("stranded?", undefined);
+    await tick();
+
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["stranded?", "agent_xyz"]);
   });
 });

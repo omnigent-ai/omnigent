@@ -144,6 +144,33 @@ export interface PendingUserMessage {
 }
 
 /**
+ * A message the user submitted while the agent was busy. It is held
+ * client-side — NOT yet POSTed — and shown in the docked queue strip above
+ * the composer until the agent goes idle, when the head is flushed FIFO (one
+ * per turn). This is the opposite of {@link PendingUserMessage}, which is
+ * already POSTed and renders as an optimistic bubble in the transcript.
+ *
+ * In-memory only: a hard reload clears the queue, so `files` can be held
+ * directly (no serialization concern).
+ */
+export interface QueuedMessage {
+  /** Client-only id, e.g. `q_1`. */
+  queueId: string;
+  /** Fully-assembled message text (mentions/quotes already applied). */
+  text: string;
+  /** Attachments to send with the message. */
+  files?: File[];
+  /** Owning conversation, so a switch/idle only flushes its own queue. */
+  conversationId: string;
+  /**
+   * Agent bound when the message was queued, so it flushes to the agent it was
+   * composed for even if the binding changed meanwhile (e.g. a `/model` switch).
+   * Falls back to the current `boundAgentId` when absent.
+   */
+  agentId?: string;
+}
+
+/**
  * A conversation's in-flight optimistic bubbles, stashed so they survive
  * in-app navigation. See {@link ChatState.pendingByConversation}.
  */
@@ -222,6 +249,12 @@ export interface ChatState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * Messages submitted while the agent is busy, held client-side (not yet
+   * POSTed) and shown in the composer's queue strip. The head is flushed
+   * FIFO — one per turn — when the session goes idle. In-memory only.
+   */
+  queuedMessages: QueuedMessage[];
   /**
    * In-flight optimistic bubbles stashed per conversation so they survive
    * in-app navigation (`switchTo`), keyed by conversation id.
@@ -495,6 +528,26 @@ export interface ChatState {
   // Actions.
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
   /**
+   * Queue a message client-side instead of POSTing it now, for a send made
+   * while the agent is busy. The head is flushed automatically (FIFO, one per
+   * turn) when the session next goes idle — see the `session_status` handler.
+   */
+  enqueueMessage: (text: string, files?: File[]) => void;
+  /**
+   * Drop all queued messages for a conversation. Called when a conversation is
+   * deleted so its queue can't linger in memory (it would never flush — you
+   * can't be bound to a deleted session).
+   */
+  clearQueuedMessages: (conversationId: string) => void;
+  /**
+   * Flush the queue head if the session is idle and ready. Level-triggered:
+   * safe to call on any state change (idempotent — no-ops when busy, when the
+   * queue is empty, or when the head isn't for the bound conversation). POSTing
+   * the head starts a turn → the session goes busy → this no-ops until the next
+   * idle, so the queue drains FIFO one per turn.
+   */
+  maybeFlushQueuedHead: () => void;
+  /**
    * Invoke a skill by posting a ``slash_command`` event — the same wire
    * shape the REPL sends. The server resolves the skill, persists the
    * visible receipt + hidden ``<skill>`` meta message, and forwards the
@@ -573,6 +626,7 @@ export interface ChatState {
 
 let queryClient: QueryClient | null = null;
 let pendingSeq = 0;
+let queueSeq = 0;
 // Tail of the send chain. Each `send` waits on the previous send's network
 // work before issuing its own POST, so rapid-fire messages reach the server
 // in submission order. Concurrent `fetch` POSTs have no ordering guarantee,
@@ -735,6 +789,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  queuedMessages: [],
   pendingByConversation: {},
   activeResponse: null,
   interruptedResponseIds: [],
@@ -773,6 +828,62 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sandboxStatus: null,
   abortController: null,
   historyGeneration: 0,
+
+  enqueueMessage: (text, files) => {
+    const { conversationId, boundAgentId } = get();
+    if (conversationId === null) return;
+    queueSeq += 1;
+    const queueId = `q_${queueSeq}`;
+    set((s) => ({
+      queuedMessages: [
+        ...s.queuedMessages,
+        {
+          queueId,
+          text,
+          conversationId,
+          ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
+          ...(files && files.length > 0 ? { files } : {}),
+        },
+      ],
+    }));
+    // A message queued while the agent is idle (a race where the send routed
+    // to the queue but the turn had already ended) would otherwise wait for an
+    // idle edge that never comes — flush now.
+    get().maybeFlushQueuedHead();
+  },
+
+  clearQueuedMessages: (conversationId) => {
+    set((s) => {
+      if (!s.queuedMessages.some((m) => m.conversationId === conversationId)) return {};
+      return {
+        queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+      };
+    });
+  },
+
+  maybeFlushQueuedHead: () => {
+    const s = get();
+    // Only when fully idle: both the local send lifecycle AND the server-side
+    // session status. No agent → nothing to send to.
+    if (
+      s.conversationId === null ||
+      s.boundAgentId === null ||
+      s.status === "streaming" ||
+      s.sessionStatus === "running" ||
+      s.sessionStatus === "waiting"
+    ) {
+      return;
+    }
+    // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
+    // the global array head. The queue is one flat array across conversations,
+    // so an undrained message from another conversation can sit at index 0; a
+    // head-only guard would let it block this conversation's messages forever.
+    const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
+    if (head === undefined) return;
+    // Remove it BEFORE the POST so a re-entrant flush can't double-send.
+    set({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+  },
 
   send: async (text, agentId, files, opts) => {
     if (!agentId) {
@@ -3741,6 +3852,11 @@ export function handleSessionEvent(event: StreamEvent): void {
           });
         }
       }
+      // Draining the queue is level-triggered (a React effect calls
+      // maybeFlushQueuedHead on every status/queue change), NOT edge-triggered
+      // here — a single "flush on the idle event" is fragile: a message queued
+      // just after the idle edge, or an SSE reconnect that replays state
+      // without a fresh transition, would strand the queue forever.
       return;
     }
     case "session_input_consumed":
