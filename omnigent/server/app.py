@@ -28,6 +28,8 @@ from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
+    GOOSE_NATIVE_CODING_AGENT,
+    HERMES_NATIVE_CODING_AGENT,
     KIMI_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
@@ -148,6 +150,8 @@ _PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
 _OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
 _KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
+_GOOSE_NATIVE_AGENT_NAME = GOOSE_NATIVE_CODING_AGENT.agent_name
+_HERMES_NATIVE_AGENT_NAME = HERMES_NATIVE_CODING_AGENT.agent_name
 _ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
 _QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
 _KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
@@ -431,6 +435,8 @@ def _ensure_default_agents(
     _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_goose_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_hermes_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
@@ -749,6 +755,62 @@ def _ensure_default_kiro_agent(
         agent_cache,
         name=_KIRO_NATIVE_AGENT_NAME,
         bundle_bytes=_build_kiro_native_bundle(),
+    )
+
+
+def _build_goose_native_bundle() -> bytes:
+    """Build a gzipped tarball of the goose-native-ui agent spec."""
+    import tempfile
+
+    from omnigent.goose_native import _materialize_goose_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_goose_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_goose_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the goose-native-ui agent."""
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_GOOSE_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_goose_native_bundle(),
+    )
+
+
+def _build_hermes_native_bundle() -> bytes:
+    """Build a gzipped tarball of the hermes-native-ui agent spec."""
+    import tempfile
+
+    from omnigent.hermes_native import _materialize_hermes_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_hermes_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_hermes_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the hermes-native-ui agent."""
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_HERMES_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_hermes_native_bundle(),
     )
 
 
