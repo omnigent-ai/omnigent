@@ -19,6 +19,9 @@ on:
   schedule:
     - cron: "0 9 * * *"
   pull_request:
+    # labeled/unlabeled: kept for the skip-security-scan recovery path
+    # (rerun-security-gate-run.yml falls back to this trigger). The concurrency
+    # group key isolates label events so they never cancel a code-push run.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths-ignore: ['web/**', 'tests/e2e_ui/**']
   workflow_dispatch:
@@ -34,8 +37,9 @@ on:
 
 concurrency:
   # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
-  # by SHA so each merge to `main` gets its own run.
-  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
+  # by SHA so each merge to `main` gets its own run. Label events append the
+  # label name so they get an isolated slot and never cancel a code-push run.
+  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name || 'run' }}
   cancel-in-progress: true
 
 permissions:
@@ -54,11 +58,14 @@ env:
 jobs:
   # Security gate: untrusted PRs wait on the deterministic scan
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
-  # Skip when the automerge label is applied/removed -- safe to short-circuit
-  # here because every non-gate job is transitively downstream of gate, so
-  # no skipped check-run can overwrite an existing result on this SHA.
+  # Short-circuit for label events that aren't skip-security-scan (e.g.
+  # automerge): those run in their own isolated concurrency slot (above) and
+  # don't need the full suite — just exit fast.
   gate:
-    if: github.event.label.name != 'automerge'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
 
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by

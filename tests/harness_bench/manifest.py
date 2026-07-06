@@ -100,8 +100,11 @@ def _declared_from_capabilities(harness: str) -> dict[str, Verdict]:
 
     caps = harness_capabilities().get(harness)
     if caps is not None:
-        # streaming: True → deltas (SUPPORTED); False → complete-only (PARTIAL).
-        declared["streaming"] = Verdict.SUPPORTED if caps.streaming else Verdict.PARTIAL
+        # streaming is binary: True → SUPPORTED, False → UNSUPPORTED. PARTIAL is
+        # a probe observation (coalesced single delta), never a declared value —
+        # declaring False as PARTIAL would drift against a harness the probe
+        # reports UNSUPPORTED (0 deltas).
+        declared["streaming"] = Verdict.SUPPORTED if caps.streaming else Verdict.UNSUPPORTED
         # interrupt: True → SUPPORTED; False → UNSUPPORTED.
         declared["interrupt"] = Verdict.SUPPORTED if caps.interrupt else Verdict.UNSUPPORTED
 

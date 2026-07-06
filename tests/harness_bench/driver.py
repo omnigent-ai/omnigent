@@ -91,6 +91,15 @@ _INFRA_ERROR_MARKERS: tuple[str, ...] = (
     # Sequencing, not capability: a prior turn on the shared session had not
     # fully settled. Reported SKIPPED so it never reads as a capability gap.
     "already processing",
+    # Token provisioning failed before the harness could reach the model — an
+    # environment/auth gap (a missing/empty gateway token, a provider auth
+    # command that produced nothing), not a capability the harness lacks.
+    # Seen on full-server for codex ("provider auth command ... empty token")
+    # and pi ("could not fetch a gateway token").
+    "could not fetch a gateway token",
+    "provider auth command",
+    "empty token",
+    "Failed to resolve external API key auth",
 )
 
 
@@ -125,6 +134,19 @@ def infra_failure_reason(result: TurnResult) -> str | None:
             )
     if "already processing" in text:
         return "session busy from a prior turn (sequencing, not a capability gap)"
+    if any(
+        marker in text
+        for marker in (
+            "could not fetch a gateway token",
+            "provider auth command",
+            "empty token",
+            "Failed to resolve external API key auth",
+        )
+    ):
+        return (
+            "gateway/provider token could not be provisioned for this transport "
+            "(environment/auth gap, not a capability the harness lacks)"
+        )
     if "unexpected status" in text:
         return "gateway returned an unexpected status (environment/auth issue)"
     return "environment/connectivity error reaching the gateway"

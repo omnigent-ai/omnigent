@@ -4852,6 +4852,55 @@ def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_above_running_turn_footer() -> None:
+    """
+    The readiness scan reaches the prompt above a tall running-turn footer.
+
+    When a web-UI message is injected while Claude is mid-turn, the footer
+    grows extra status rows below the input box — a running-subagent line
+    (``○ Explore …``) on top of the usual box rule, model, auto-mode, and
+    branch rows. That pushes the live ``❯`` row to the 6th non-empty line
+    from the bottom, one past the old 5-line window, so the readiness gate
+    timed out and the web UI rendered a spurious "did not become ready"
+    runtime-error card even though the terminal was healthy.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live prompt row (6th non-empty line from bottom)
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | thinking medium",  # model + effort line
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",  # permission-mode hint
+            "  main",  # branch label
+            "  ○ Explore  Find session sidebar state… 1m 4s",  # subagent status
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
+    """
+    A glyph in the wider window without a box rule below is not trusted.
+
+    The framed window that lets the scan reach a prompt under a tall
+    running-turn footer must not resurrect the scrollback false positive:
+    a ``❯`` echoed into prior output sits in the wider window too, but
+    without the input box's closing ``────`` rule beneath it. Only plain
+    output follows here, so the gate must still report "not ready".
+    """
+    pane = "\n".join(
+        [
+            "❯ old prompt echo",  # 6th non-empty line from bottom, no rule below
+            "output line 1",
+            "output line 2",
+            "output line 3",
+            "output line 4",
+            "output line 5",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
     """
     Append raw JSONL lines to the bridge deltas file.

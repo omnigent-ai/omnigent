@@ -324,9 +324,9 @@ function CodexGoalActions({
         variant="outline"
         onClick={onClear}
         disabled={readOnly || busy || !hasGoal}
+        loading={clearing}
         data-testid="codex-goal-clear"
       >
-        {clearing ? <Loader2Icon className="size-3.5 animate-spin" /> : null}
         Clear
       </Button>
       {showPause && (
@@ -335,13 +335,10 @@ function CodexGoalActions({
           variant="outline"
           onClick={onPause}
           disabled={readOnly || busy}
+          loading={statusUpdating === "paused"}
           data-testid="codex-goal-pause"
         >
-          {statusUpdating === "paused" ? (
-            <Loader2Icon className="size-3.5 animate-spin" />
-          ) : (
-            <PauseCircleIcon className="size-3.5" />
-          )}
+          <PauseCircleIcon className="size-3.5" />
           Pause
         </Button>
       )}
@@ -351,13 +348,10 @@ function CodexGoalActions({
           variant="outline"
           onClick={onResume}
           disabled={readOnly || busy}
+          loading={statusUpdating === "active"}
           data-testid="codex-goal-resume"
         >
-          {statusUpdating === "active" ? (
-            <Loader2Icon className="size-3.5 animate-spin" />
-          ) : (
-            <PlayCircleIcon className="size-3.5" />
-          )}
+          <PlayCircleIcon className="size-3.5" />
           Resume
         </Button>
       )}
@@ -365,9 +359,9 @@ function CodexGoalActions({
         type="button"
         onClick={onSave}
         disabled={readOnly || busy}
+        loading={saving}
         data-testid="codex-goal-save"
       >
-        {saving ? <Loader2Icon className="size-3.5 animate-spin" /> : null}
         {hasGoal ? "Update goal" : "Set goal"}
       </Button>
     </DialogFooter>

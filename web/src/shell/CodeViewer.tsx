@@ -56,8 +56,10 @@ import {
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isNotebookPath,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
+import { NotebookPreview } from "./NotebookPreview";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -586,8 +588,12 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "preview" && lang === "markdown") {
-    const preview = <MarkdownPreview content={content} />;
+  if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+    const preview = isNotebookPath(path) ? (
+      <NotebookPreview content={content} />
+    ) : (
+      <MarkdownPreview content={content} />
+    );
     // A truncated preview renders incomplete content; warn the user (the editor
     // and source surfaces already do). No layout change when not truncated.
     if (!truncated) return preview;
