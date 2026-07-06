@@ -45,11 +45,11 @@ describe("CLAUDE_NATIVE_MODELS", () => {
     // the installed version supports, so the list never drifts. Guard
     // against a regression back to version-numbered IDs.
     const ids = CLAUDE_NATIVE_MODELS.map((m) => m.id);
-    // Capability order, most powerful first. Fable is temporarily withheld.
-    // "sonnet_4_6" is the one exception: Claude Code's single custom
-    // /model slot pinned to a concrete older Sonnet generation, kept
-    // selectable alongside the "sonnet" alias while both are in use.
-    expect(ids).toEqual(["opus", "sonnet", "sonnet_4_6", "haiku"]);
+    // Capability order, most powerful first. "sonnet_4_6" is the one
+    // exception: Claude Code's single custom /model slot pinned to a
+    // concrete older Sonnet generation, kept selectable alongside the
+    // "sonnet" alias while both are in use.
+    expect(ids).toEqual(["fable", "opus", "sonnet", "sonnet_4_6", "haiku"]);
     for (const id of ids) {
       if (id === "sonnet_4_6") continue;
       expect(id).not.toMatch(/\d/); // an alias carries no version digits
@@ -58,8 +58,9 @@ describe("CLAUDE_NATIVE_MODELS", () => {
 
   it("labels each alias by tier", () => {
     expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual([
+      "Fable",
       "Opus",
-      "Sonnet",
+      "Sonnet 5",
       "Sonnet 4.6",
       "Haiku",
     ]);
