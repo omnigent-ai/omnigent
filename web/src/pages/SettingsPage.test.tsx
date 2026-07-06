@@ -107,6 +107,36 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
+  it("shows the default UI font size and steps it up, persisting the choice", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
+    // No stored preference → 16px default.
+    expect(input.value).toBe("16");
+
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(input.value).toBe("17");
+    // The choice is persisted so it survives a refresh.
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("17");
+    // The scale is applied live to the document root (17 / 16).
+    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.0625");
+  });
+
+  it("disables the steppers at the min and max bounds", () => {
+    localStorage.setItem("omnigent:ui-font-size", "20");
+    renderPage("/settings/appearance");
+    // At the 20px max, only the increase button is disabled.
+    expect(screen.getByTestId("ui-font-size-inc")).toBeDisabled();
+    expect(screen.getByTestId("ui-font-size-dec")).not.toBeDisabled();
+
+    cleanup();
+    localStorage.setItem("omnigent:ui-font-size", "12");
+    renderPage("/settings/appearance");
+    // At the 12px min, only the decrease button is disabled.
+    expect(screen.getByTestId("ui-font-size-dec")).toBeDisabled();
+    expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
+  });
+
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {
     // Login session (accounts OR OIDC) → Account leads, so /settings lands on it.
     renderPage("/settings");

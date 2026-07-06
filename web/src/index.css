@@ -103,6 +103,12 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
+  /* User-controlled UI font size, as a unitless multiplier on the root
+   * font-size (see Appearance settings / lib/uiFontPreferences.ts). 1 = the
+   * browser default; the root `html` rules multiply it into their font-size so
+   * the whole rem-based UI scales. Overridden at runtime on documentElement. */
+  --ui-font-scale: 1;
+
   /* ---- Inset system -------------------------------------------------------
    * Single source of truth for how far content must stay clear of screen
    * chrome. The SAME bundle runs in a browser, in Electron, and inside the
@@ -717,6 +723,10 @@
   }
   html {
     @apply font-sans;
+    /* Root size for the whole rem-based UI. `1em` resolves against the
+     * browser default so a customized default is preserved; --ui-font-scale
+     * layers the user's Appearance choice on top. */
+    font-size: calc(1em * var(--ui-font-scale));
   }
   /* Text selection — brand pink highlight. Light: gentle wash + dark pink
    * text. Dark: solid brand pink background + white text. */
@@ -736,14 +746,15 @@
  * Tailwind's `md` breakpoint. Tailwind v4 sizes typography AND spacing in
  * `rem`, so the whole UI scales up ~12.5% uniformly — easier to read at
  * arm's length and slightly more forgiving touch targets. Desktop is
- * untouched.
+ * untouched. `--ui-font-scale` (the user's Appearance choice) multiplies in
+ * here too, so the bump composes with the setting instead of being lost.
  *
  * Note that `rem` in `@media` queries always refers to the user-agent's
  * default (16px) per the CSS spec — so `48rem` here is the same 768px
  * Tailwind uses for `md:*` utilities, regardless of our root override. */
 @media (width < 48rem) {
   html {
-    font-size: 18px;
+    font-size: calc(1.125em * var(--ui-font-scale));
   }
 }
 

@@ -14,6 +14,7 @@ import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
+import { applyUiFontScale, readUiFontSizePx } from "./lib/uiFontPreferences";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
 
@@ -47,6 +48,9 @@ void resolveIdentity();
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
+
+// Apply the saved UI font size before first paint so there's no size flash.
+applyUiFontScale(readUiFontSizePx());
 
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the

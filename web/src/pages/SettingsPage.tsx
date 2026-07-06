@@ -32,7 +32,7 @@ import {
   Trash2Icon,
   UserCogIcon,
 } from "lucide-react";
-import { LaptopMinimalIcon, MoonIcon, SunIcon } from "lucide-react";
+import { LaptopMinimalIcon, MinusIcon, MoonIcon, PlusIcon, SunIcon } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -59,6 +59,15 @@ import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { type ThemeMode, normalizeThemeMode } from "@/components/theme/themeMode";
+import {
+  applyUiFontScale,
+  clampUiFontSizePx,
+  readUiFontSizePx,
+  UI_FONT_SIZE_MAX,
+  UI_FONT_SIZE_MIN,
+  UI_FONT_SIZE_STEP,
+  writeUiFontSizePx,
+} from "@/lib/uiFontPreferences";
 import { useIsEmbedded } from "@/lib/embedded";
 import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -147,35 +156,151 @@ function AppearanceSection() {
 
   return (
     <Section title="Appearance" description="Choose how Omnigent looks on this device.">
-      {isEmbedded ? (
-        <p className="text-sm text-muted-foreground">
-          Appearance is controlled by the host application.
-        </p>
-      ) : (
-        <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
-          {themeCards.map(({ mode: cardMode, label, icon: Icon }) => {
-            const selected = mode === cardMode;
-            return (
-              <button
-                key={cardMode}
-                type="button"
-                role="radio"
-                aria-checked={selected}
-                data-testid={`theme-${cardMode}`}
-                onClick={() => setTheme(cardMode)}
-                className={cn(
-                  "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
-                  selected ? "border-primary bg-primary/5" : "border-border",
-                )}
-              >
-                <Icon className="size-6 text-muted-foreground" />
-                <span className="text-sm font-medium">{label}</span>
-              </button>
-            );
-          })}
+      <div className="flex flex-col gap-8">
+        <div className="flex flex-col gap-3">
+          <span className="text-sm font-medium">Theme</span>
+          {/* Embedded: the host owns the theme (embed.tsx forces light), so the
+              selector would be a no-op — match ThemeModeMenu and hide it. */}
+          {isEmbedded ? (
+            <p className="text-sm text-muted-foreground">
+              Theme is controlled by the host application.
+            </p>
+          ) : (
+            <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
+              {themeCards.map(({ mode: cardMode, label, icon: Icon }) => {
+                const selected = mode === cardMode;
+                return (
+                  <button
+                    key={cardMode}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    data-testid={`theme-${cardMode}`}
+                    onClick={() => setTheme(cardMode)}
+                    className={cn(
+                      "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
+                      selected ? "border-primary bg-primary/5" : "border-border",
+                    )}
+                  >
+                    <Icon className="size-6 text-muted-foreground" />
+                    <span className="text-sm font-medium">{label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
-      )}
+
+        <UiFontSizeControl />
+      </div>
     </Section>
+  );
+}
+
+/**
+ * UI font size stepper. Scales the whole rem-based UI via the --ui-font-scale
+ * variable (see lib/uiFontPreferences.ts). Applied live and persisted on every
+ * change; unlike the theme picker it stays visible when embedded, since it's a
+ * per-device readability pref that doesn't conflict with host theming.
+ */
+function UiFontSizeControl() {
+  const [px, setPx] = useState(() => readUiFontSizePx());
+
+  const update = useCallback((next: number) => {
+    const clamped = clampUiFontSizePx(next);
+    setPx(clamped);
+    writeUiFontSizePx(clamped);
+    applyUiFontScale(clamped);
+  }, []);
+
+  const atMin = px <= UI_FONT_SIZE_MIN;
+  const atMax = px >= UI_FONT_SIZE_MAX;
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="flex flex-col">
+        <span className="text-sm font-medium">Font size</span>
+        <span className="text-sm text-muted-foreground">
+          Scale the interface text and spacing on this device.
+        </span>
+      </div>
+      {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
+          border via inner dividers rather than floating as separate boxes. */}
+      <div
+        role="group"
+        aria-label="Font size"
+        className={cn(
+          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
+        )}
+      >
+        <StepperButton
+          label="Decrease font size"
+          testId="ui-font-size-dec"
+          disabled={atMin}
+          onClick={() => update(px - UI_FONT_SIZE_STEP)}
+        >
+          <MinusIcon className="size-4" />
+        </StepperButton>
+        <div className="flex items-center border-x border-input px-2 tabular-nums">
+          <input
+            type="number"
+            inputMode="numeric"
+            min={UI_FONT_SIZE_MIN}
+            max={UI_FONT_SIZE_MAX}
+            step={UI_FONT_SIZE_STEP}
+            aria-label="Font size in pixels"
+            data-testid="ui-font-size-input"
+            className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+            value={px}
+            onChange={(e) => {
+              const next = Number(e.target.value);
+              if (Number.isFinite(next)) update(next);
+            }}
+          />
+        </div>
+        <StepperButton
+          label="Increase font size"
+          testId="ui-font-size-inc"
+          disabled={atMax}
+          onClick={() => update(px + UI_FONT_SIZE_STEP)}
+        >
+          <PlusIcon className="size-4" />
+        </StepperButton>
+      </div>
+    </div>
+  );
+}
+
+/** Flanking +/- segment of the font-size pill: square, ghost-hover, no border. */
+function StepperButton({
+  label,
+  testId,
+  disabled,
+  onClick,
+  children,
+}: {
+  label: string;
+  testId: string;
+  disabled: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      data-testid={testId}
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(
+        "flex w-9 items-center justify-center text-muted-foreground transition-colors",
+        "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
+        "disabled:pointer-events-none disabled:opacity-40",
+      )}
+    >
+      {children}
+    </button>
   );
 }
 
