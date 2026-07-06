@@ -280,7 +280,7 @@ def test_insert_dev_tag_idempotent() -> None:
 _REPO = "omnigent-ai/omnigent"
 
 
-def test_draft_notes_groups_into_two_sections_by_type() -> None:
+def test_draft_notes_groups_into_sections_by_type() -> None:
     results = [
         _result(10, "a new capability", ["Feature"]),
         _result(20, "moved a button", ["UI / frontend change"]),
@@ -289,13 +289,20 @@ def test_draft_notes_groups_into_two_sections_by_type() -> None:
     ]
     notes = gen.render_draft_notes(results, _REPO)
     assert "## Major new features" in notes
-    assert "## Bug fixes & hardening" in notes
-    # Feature/UI land in features; Bug fix/Breaking in hardening.
-    feat, hard = notes.split("## Bug fixes & hardening")
+    assert "## Breaking changes" in notes
+    assert "## Bug fixes" in notes
+    # Feature/UI land in features; Breaking and Bug fix each get their own section.
+    feat, rest = notes.split("## Breaking changes")
+    breaking, fixes = rest.split("## Bug fixes")
     assert "a new capability (#10)" in feat and "moved a button (#20)" in feat
-    assert "a crash fix (#30)" in hard and "dropped a flag (#40)" in hard
-    # Features section comes first.
-    assert notes.index("## Major new features") < notes.index("## Bug fixes & hardening")
+    assert "dropped a flag (#40)" in breaking
+    assert "a crash fix (#30)" in fixes
+    # Sections appear in features → breaking → bug fixes order.
+    assert (
+        notes.index("## Major new features")
+        < notes.index("## Breaking changes")
+        < notes.index("## Bug fixes")
+    )
 
 
 def test_draft_notes_has_full_changelog_footer() -> None:
@@ -306,9 +313,9 @@ def test_draft_notes_has_full_changelog_footer() -> None:
 
 
 def test_draft_notes_empty_section_keeps_placeholder() -> None:
-    # Only a feature entry — the hardening section should still appear with a hint.
+    # Only a feature entry — the bug-fixes section should still appear with a hint.
     notes = gen.render_draft_notes([_result(1, "x", ["Feature"])], _REPO)
-    assert "## Bug fixes & hardening" in notes
+    assert "## Bug fixes" in notes
     assert "no entries harvested" in notes
 
 

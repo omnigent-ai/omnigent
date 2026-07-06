@@ -503,10 +503,10 @@ jobs:
             maintainer_assigned=true
           fi
 
-          # Otherwise, assign an owner for P0/P1 issues: the LLM's top-ranked area
-          # owner, breaking ties by open-assigned-issue load (fairness). Symmetric
-          # with the PR reviewer path (rank primary, load secondary). Skipped if
-          # the maintainer-author was already assigned above.
+          # Otherwise, assign an owner for P0/P1 issues: the least-loaded area
+          # owner, with LLM rank as a tiebreaker (load primary, rank secondary).
+          # Symmetric with the PR reviewer path. Skipped if the maintainer-author
+          # was already assigned above.
           priority=$(jq -r '.priority // empty' /tmp/triage_result.json)
           if [ "$maintainer_assigned" = "false" ] && { [ "$priority" = "P0-critical" ] || [ "$priority" = "P1-high" ]; }; then
             # Open-issue load per candidate (fewest assigned open issues wins ties).
@@ -533,12 +533,12 @@ jobs:
                   if a.get("login"):
                       load[a["login"]] += 1
 
-          # Sort by (rank, load, login): LLM rank first, then fewest open issues,
-          # then a stable alphabetical tie-break (deterministic, unlike a random
-          # one — matches the previous round-robin's determinism guarantee).
+          # Sort by (load, rank, login): fewest open assigned issues first so
+          # the workload stays balanced; LLM rank breaks ties within the same
+          # load bucket; alphabetical login is the final deterministic tiebreak.
           candidates = sorted(
               candidates,
-              key=lambda u: (rank_of.get(u, float("inf")), load[u], u),
+              key=lambda u: (load[u], rank_of.get(u, float("inf")), u),
           )
           assignee = candidates[0] if candidates else ""
           if assignee:

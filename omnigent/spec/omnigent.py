@@ -885,8 +885,7 @@ def _translate_prompt_policy_yaml(
       ``model: databricks-claude-sonnet-4`` parses as provider
       ``"openai"`` and the request hits ``api.openai.com``.
     - Other fields (``on``, ``condition``, ``prompt``,
-      ``action``, ``set_labels``, ``ask_timeout``) pass through
-      unchanged.
+      ``set_labels``, ``ask_timeout``) pass through unchanged.
 
     :param raw_entry: Raw YAML mapping for one ``type: prompt``
         policy, e.g. ``{"type": "prompt", "on": ["request"],

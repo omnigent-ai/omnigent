@@ -7,7 +7,7 @@
 
 import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -32,7 +32,12 @@ vi.mock("@/hooks/useIsAdmin", () => ({
   useIsAdmin: () => mocks.isAdmin,
 }));
 
-import { SettingsSidebarBody, settingsNavGroups, useSettingsRoute } from "./settingsNav";
+import {
+  SettingsSidebarBody,
+  settingsNavGroups,
+  useSettingsRoute,
+  useTrackSettingsReturn,
+} from "./settingsNav";
 
 function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}) {
   const onNavClick = opts.onNavClick ?? vi.fn();
@@ -123,6 +128,37 @@ describe("SettingsSidebarBody", () => {
     const { onNavClick } = renderBody();
     fireEvent.click(screen.getByRole("link", { name: /Back to Omnigent/ }));
     expect(onNavClick).not.toHaveBeenCalled();
+  });
+
+  it("'Back to Omnigent' returns to the conversation the user came from", () => {
+    // Simulate the real flow: the sidebar (which stays mounted) tracks the
+    // pre-settings location, then the user enters /settings. Back must point at
+    // the conversation, not the home page.
+    function Harness() {
+      useTrackSettingsReturn();
+      const navigate = useNavigate();
+      const { inSettings } = useSettingsRoute();
+      return (
+        <>
+          <button type="button" onClick={() => navigate("/settings")}>
+            go-settings
+          </button>
+          {inSettings && <SettingsSidebarBody onNavClick={vi.fn()} onClose={vi.fn()} />}
+        </>
+      );
+    }
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={["/c/conv_123?file=foo.ts"]}>
+          <Harness />
+        </MemoryRouter>
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByText("go-settings"));
+    expect(screen.getByRole("link", { name: /Back to Omnigent/ })).toHaveAttribute(
+      "href",
+      "/c/conv_123?file=foo.ts",
+    );
   });
 
   it("DOES close the sidebar when a section is tapped (drills into content)", () => {

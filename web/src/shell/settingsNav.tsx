@@ -6,6 +6,7 @@
 // selection is URL-driven (/settings/<section>) so the nav (in the sidebar)
 // and the content (in the outlet) stay in sync without shared state.
 
+import { useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
@@ -142,6 +143,27 @@ export function useSettingsRoute(): { inSettings: boolean; section: SettingsSect
   return { inSettings: true, section };
 }
 
+// Last location the user was on before entering /settings — path + search so
+// the conversation (and its ?file= etc.) is preserved. "Back to Omnigent"
+// returns here instead of the home page. Module-scoped: the sidebar stays
+// mounted across the settings transition, so the value captured on the last
+// non-settings render survives into settings.
+let settingsReturnPath = "/";
+
+/**
+ * Record the current location as the settings return target whenever the user
+ * is NOT in settings. Call from a component that stays mounted across the
+ * transition into /settings (the Sidebar) so the last conversation is captured
+ * before the swap.
+ */
+export function useTrackSettingsReturn(): void {
+  const { pathname, search } = useLocation();
+  const { inSettings } = useSettingsRoute();
+  useEffect(() => {
+    if (!inSettings) settingsReturnPath = `${pathname}${search}`;
+  }, [inSettings, pathname, search]);
+}
+
 /**
  * Settings nav rendered INSIDE the sidebar card (replacing the conversation
  * list on /settings). Keeps the card chrome — a top row with "Back to
@@ -168,13 +190,14 @@ export function SettingsSidebarBody({
     <>
       <div className="flex items-center justify-between px-3 pt-3">
         <Button asChild variant="ghost" size="sm" className="gap-2 text-muted-foreground">
-          {/* No onNavClick here: on mobile the sidebar is a full-screen
-          overlay. Navigating to "/" exits /settings, so the sidebar swaps
-          back to the conversation list — but we keep the overlay OPEN so
-          mobile lands on that list rather than closing onto the homepage
-          content behind it. On desktop onNavClick is a no-op (persistent
-          card), so dropping it changes nothing there. */}
-          <Link to="/">
+          {/* Returns to wherever the user was before entering settings (the
+          conversation they were viewing, or home) — see settingsReturnPath.
+          No onNavClick here: on mobile the sidebar is a full-screen overlay.
+          Leaving /settings swaps the sidebar back to the conversation list —
+          but we keep the overlay OPEN so mobile lands on that list rather than
+          closing onto the content behind it. On desktop onNavClick is a no-op
+          (persistent card), so dropping it changes nothing there. */}
+          <Link to={settingsReturnPath}>
             <ArrowLeftIcon className="size-4" />
             Back to Omnigent
           </Link>

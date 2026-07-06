@@ -10,8 +10,7 @@ Assertions cover:
 
 - FunctionPolicy composition on the same
   tool name (taint + rate-limit on web_search).
-- FunctionPolicy classifier-only carve-out via the
-  ``observe_writes`` policy.
+- FunctionPolicy observer policy (``observe_writes``) always ALLOWs.
 - Multi-label DENY gate (`deny_exfil`): fires only when BOTH
   integrity and sensitivity labels are tainted.
 - End-to-end IFC sequence: clean → web search taints
@@ -146,8 +145,7 @@ async def test_observe_writes_never_blocks(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """write_file (in clean state) passes through the
-    observe_writes policy; its action:[allow] carve-out
-    rules out any accidental DENY even on exceptions."""
+    observe_writes policy without blocking."""
     engine = _engine(conversation_store)
     r = await _enforce_policy(
         engine,

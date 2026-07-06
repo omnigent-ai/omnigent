@@ -64,9 +64,8 @@ import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/l
 import { cn } from "@/lib/utils";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
-// sub-categories. Lazy-loaded so non-accounts deploys (where these sections
-// never appear) don't pull them into the settings chunk — mirrors the
-// route-level lazy loading these had when they were standalone pages.
+// sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
+// Lazy-loaded to keep the settings chunk small.
 const MembersPage = lazy(() =>
   import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
 );

@@ -10,7 +10,11 @@ import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 // Stub Shiki so the highlighting effect never fires an async callback that
 // would mutate state after the test cleans up.
-vi.mock("@/components/ai-elements/code-block", () => ({ highlightCode: vi.fn(() => null) }));
+vi.mock("@/components/ai-elements/code-block", () => ({
+  highlightCode: vi.fn(() => null),
+  // NotebookPreview renders notebook code cells through CodeBlockContent.
+  CodeBlockContent: ({ code }: { code: string }) => <pre>{code}</pre>,
+}));
 vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null }));
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
@@ -231,6 +235,129 @@ describe("CodeViewer truncated preview", () => {
   });
 });
 
+describe("CodeViewer markdown preview rendering (issue #970)", () => {
+  // The read-only markdown preview is now the default surface for .md files, so
+  // it must faithfully render the GFM feature set the issue calls out:
+  // headings, lists, tables, code blocks, blockquotes, task lists, emoji.
+  const renderMd = (content: string) =>
+    renderViewer(content, true, "doc.md", { viewMode: "preview" });
+
+  it("renders headings", () => {
+    const { container } = renderMd("# Title\n\n## Subtitle");
+    expect(container.querySelector("h1")?.textContent).toBe("Title");
+    expect(container.querySelector("h2")?.textContent).toBe("Subtitle");
+  });
+
+  it("renders bullet and ordered lists", () => {
+    const { container } = renderMd("- one\n- two\n\n1. first\n2. second");
+    expect(container.querySelectorAll("ul li")).toHaveLength(2);
+    expect(container.querySelectorAll("ol li")).toHaveLength(2);
+  });
+
+  it("renders GFM tables", () => {
+    const { container } = renderMd("| A | B |\n| - | - |\n| 1 | 2 |");
+    expect(container.querySelector("table")).not.toBeNull();
+    expect(container.querySelectorAll("th")).toHaveLength(2);
+    expect(container.querySelectorAll("tbody td")).toHaveLength(2);
+  });
+
+  it("renders fenced code blocks", () => {
+    const { container } = renderMd("```js\nconst x = 1;\n```");
+    expect(container.querySelector("pre code")?.textContent).toContain("const x = 1;");
+  });
+
+  it("renders blockquotes", () => {
+    const { container } = renderMd("> quoted text");
+    expect(container.querySelector("blockquote")?.textContent).toContain("quoted text");
+  });
+
+  it("renders GFM task lists as checkboxes reflecting their checked state", () => {
+    const { container } = renderMd("- [x] done\n- [ ] todo");
+    const boxes = container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+    expect(boxes).toHaveLength(2);
+    expect(boxes[0].checked).toBe(true);
+    expect(boxes[1].checked).toBe(false);
+  });
+
+  it("renders :shortcode: emoji as their unicode glyphs", () => {
+    // GitHub renders `:tada:` as 🎉; the preview matches that so agent-authored
+    // docs/summaries read the same here as on GitHub.
+    const { container } = renderMd("Ship it :tada: :rocket:");
+    expect(container.textContent).toContain("🎉");
+    expect(container.textContent).toContain("🚀");
+  });
+
+  it("renders embedded raw HTML that GitHub supports", () => {
+    // Markdown routinely embeds raw HTML (collapsible sections, sub/superscript,
+    // keyboard keys, line breaks). Without rehype-raw these render as escaped
+    // literal tags; the preview must render them as real elements like GitHub.
+    const { container } = renderMd(
+      [
+        "<details><summary>More</summary>Hidden body</details>",
+        "",
+        "H<sub>2</sub>O and E=mc<sup>2</sup>",
+        "",
+        "press <kbd>Enter</kbd>",
+        "",
+        "line one<br>line two",
+      ].join("\n"),
+    );
+    expect(container.querySelector("details summary")?.textContent).toBe("More");
+    expect(container.querySelector("sub")?.textContent).toBe("2");
+    expect(container.querySelector("sup")?.textContent).toBe("2");
+    expect(container.querySelector("kbd")?.textContent).toBe("Enter");
+    expect(container.querySelector("br")).not.toBeNull();
+    // The literal, un-rendered tag must not leak through as visible text.
+    expect(container.textContent).not.toContain("<details>");
+  });
+
+  it("sanitizes dangerous raw HTML (no scripts, event handlers, or js: URLs)", () => {
+    // Markdown content is untrusted (agent/user-authored). rehype-raw parses raw
+    // HTML, so rehype-sanitize must strip anything executable before it renders
+    // inline in the host document (unlike the iframe-isolated HTML preview).
+    const { container } = renderMd(
+      "<script>window.__pwned = true</script>\n\n" +
+        '<img src="x" onerror="window.__pwned = true" alt="x">\n\n' +
+        '<a href="javascript:window.__pwned = true">click</a>',
+    );
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("img")?.hasAttribute("onerror")).toBe(false);
+    // A javascript: href is dropped entirely rather than left clickable.
+    expect(container.querySelector("a")?.getAttribute("href")).toBeNull();
+  });
+
+  it("renders GitHub alerts as typed callouts, not literal blockquote text", () => {
+    // `> [!NOTE]` etc. are GitHub alerts. GFM alone leaves them as plain
+    // blockquotes with a literal "[!NOTE]" first line; rehype-github-alerts
+    // turns them into typed callouts (a .markdown-alert wrapper + a titled
+    // header) that CSS then styles per type, matching GitHub and the editor.
+    const { container } = renderMd(
+      ["> [!NOTE]\n> Useful information.", "", "> [!WARNING]\n> Careful here."].join("\n"),
+    );
+    const note = container.querySelector(".markdown-alert.markdown-alert-note");
+    const warning = container.querySelector(".markdown-alert.markdown-alert-warning");
+    expect(note).not.toBeNull();
+    expect(warning).not.toBeNull();
+    expect(note?.querySelector(".markdown-alert-title")?.textContent).toBe("Note");
+    expect(note?.textContent).toContain("Useful information.");
+    // The raw marker must be consumed, not shown verbatim.
+    expect(container.textContent).not.toContain("[!NOTE]");
+  });
+
+  it("keeps explicit width/height on an embedded <img>", () => {
+    // GitHub honors <img width/height>. Tailwind Preflight's `img { height:
+    // auto }` overrides the HTML attributes, so the preview forwards them to an
+    // inline style (which wins the cascade) — the sized image is not left square.
+    const { container } = renderMd(
+      '<img src="https://example.com/logo.png" alt="logo" width="200" height="100">',
+    );
+    const img = container.querySelector<HTMLImageElement>('img[alt="logo"]');
+    expect(img).not.toBeNull();
+    expect(img?.style.width).toBe("200px");
+    expect(img?.style.height).toBe("100px");
+  });
+});
+
 describe("CodeViewer HTML preview sandbox", () => {
   // The HTML preview is the security-load-bearing surface: artifact content is
   // untrusted (agent/user-generated), so these assertions lock in the iframe's
@@ -350,5 +477,34 @@ describe("CodeViewer image rendering", () => {
     expect(await screen.findByRole("dialog")).toBeDefined();
     expect(screen.getByLabelText("Zoom in")).toBeDefined();
     expect(screen.getByLabelText("Zoom out")).toBeDefined();
+  });
+});
+
+describe("CodeViewer .ipynb routing", () => {
+  const MINIMAL_NB = JSON.stringify({
+    nbformat: 4,
+    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
+  });
+
+  it("renders the notebook preview in preview mode", () => {
+    renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "preview" });
+    expect(screen.getByRole("heading", { name: "Notebook Title" })).toBeDefined();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+  });
+
+  it("keeps raw-JSON Monaco as the source-view escape hatch", () => {
+    renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "source" });
+    expect(screen.getByTestId("monaco-editor-stub")).toBeDefined();
+  });
+
+  it("warns about truncated notebooks instead of rendering silently-incomplete cells", () => {
+    renderViewer(MINIMAL_NB.slice(0, 40), true, "analysis.ipynb", {
+      viewMode: "preview",
+      truncated: true,
+    });
+    // Truncated JSON cannot parse — the preview shows its parse-error state…
+    expect(screen.getByText(/Cannot render notebook/)).toBeDefined();
+    // …and the shared truncation banner is stacked above it.
+    expect(screen.getByText(/truncated/i)).toBeDefined();
   });
 });

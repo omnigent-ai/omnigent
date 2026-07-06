@@ -54,7 +54,6 @@ policies:
   observe_writes:
     type: function
     handler: tests._fixtures.agents.combined_policies.observe_all
-    action: [allow]
 
   deny_exfil:
     type: function

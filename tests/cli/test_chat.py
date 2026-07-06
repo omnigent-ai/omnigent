@@ -1970,6 +1970,8 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
                 "claude_code": "claude-native",
                 "codex": "codex-native",
                 "opencode": "opencode-native",
+                "cursor": "cursor-native",
+                "hermes": "hermes-native",
                 "pi": "pi",
             },
         ),

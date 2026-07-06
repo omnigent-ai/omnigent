@@ -106,7 +106,9 @@ def test_runner_resource_attach_spawns_tmux_for_running_terminal(
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
+            # ``?transport=pty`` pins this to the PTY bridge (the one that forks
+            # tmux attach) independent of the global control-mode default.
+            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=pty"
         ):
             pass
 
@@ -166,12 +168,67 @@ def test_runner_resource_attach_passes_read_only_to_tmux(
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?read_only=true"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
+            "?read_only=true&transport=pty"
         ):
             pass
 
     assert "-r" in captured["argv"], (
         f"Expected -r with read_only=true, got argv={captured['argv']!r}"
+    )
+
+
+def test_runner_resource_attach_selects_control_bridge_on_transport_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?transport=control`` dispatches to the control-mode bridge, not the PTY one.
+
+    Both bridges share the same signature and browser wire protocol, so the
+    route just picks one. Patch each to record which was invoked and close the
+    socket cleanly, then assert on the selection per query.
+
+    :param tmp_path: Pytest tmp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    registry = TerminalRegistry()
+    _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    calls: list[str] = []
+
+    async def fake_control(websocket, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("control")
+        await websocket.close()
+
+    async def fake_pty(websocket, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("pty")
+        await websocket.close()
+
+    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_control_to_websocket", fake_control)
+    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_pty_to_websocket", fake_pty)
+    # Point config resolution at an empty scratch dir so the no-query case is
+    # deterministic regardless of the developer's real ~/.omnigent/config.yaml.
+    # With no terminal.transport configured, control mode is the product default.
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    base = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
+    client = TestClient(app)
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(f"{base}?transport=control"):
+            pass
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(f"{base}?transport=pty"):
+            pass
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(base):  # no query → control default
+            pass
+
+    assert calls == ["control", "pty", "control"], (
+        f"transport query did not select the expected bridge: {calls!r}"
     )
 
 
@@ -390,7 +447,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     # First attach: dead pane → recreate → bridge the fresh pane.
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
         ):
             pass
 
@@ -412,7 +469,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     # unconditionally, killing the user's running REPL on every attach.
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
         ):
             pass
 
@@ -521,7 +578,7 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
         ):
             pass
 
@@ -531,7 +588,7 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
         ):
             pass
 

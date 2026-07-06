@@ -728,6 +728,13 @@ class TerminalEnvSpec:
         into ``no server running``. Opt-in because it changes the
         ``has-session``-means-alive contract; enabled for the claude-native
         agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
+    :param terminal_transport: How the web UI attaches to this terminal:
+        ``"control"`` (``tmux -C`` control mode, giving the browser xterm
+        native scrollback + selection — the default) or ``"pty"`` (the legacy
+        forked-``tmux attach`` PTY stream). ``None`` defers to the global
+        default, which is control mode unless ``terminal.transport`` in
+        ``~/.omnigent/config.yaml`` opts out to ``pty``. A per-attach
+        ``?transport=`` query overrides both.
     """
 
     command: str | None = None
@@ -744,6 +751,7 @@ class TerminalEnvSpec:
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
+    terminal_transport: str | None = None
 
 
 # ---------------------------------------------------------------------------
