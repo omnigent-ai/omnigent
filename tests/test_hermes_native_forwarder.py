@@ -182,6 +182,39 @@ def test_read_new_items_mirrors_tool_calls(tmp_path: Path) -> None:
     assert posted[1].item_data["output"] == "found 3 files"
 
 
+def test_assistant_prose_precedes_its_tool_calls(tmp_path: Path) -> None:
+    """An assistant row with BOTH prose and tool_calls emits the message first,
+    then the function_call items. The prose is the model's preamble ('I'll run
+    X…'), so it belongs before the calls; it also keeps the in-flight tool as the
+    trailing item on the web so its live spinner renders (the tool card would go
+    static if a trailing message followed it)."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", str(tmp_path), 1000.0),
+    )
+    tc = json.dumps(
+        [
+            {"id": "c1", "call_id": "c1", "function": {"name": "terminal", "arguments": "{}"}},
+            {"id": "c2", "call_id": "c2", "function": {"name": "terminal", "arguments": "{}"}},
+        ]
+    )
+    con.execute(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        ("s1", "assistant", "I'll run the sleep command twice in parallel.", None, tc, None, 1),
+    )
+    con.commit()
+    con.close()
+
+    posted = [i for i in f._read_new_items(db, "s1", 0, "agent") if i.item_type]
+    assert [i.item_type for i in posted] == ["message", "function_call", "function_call"]
+    assert posted[0].item_data["role"] == "assistant"
+
+
 def test_read_new_items_idempotent_past_high_water(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     _seed_db(db, cwd=str(tmp_path), started_at=1000.0)
@@ -1160,9 +1193,344 @@ async def test_forward_loop_emits_running_then_idle_for_tool_call_turn(
         )
 
     # running (with the turn id) before idle; the function_call item carries the
-    # same id so the web renders the card live against the running edge.
+    # same id so the web renders the card live against the running edge. The
+    # clean-close idle carries that same id so the web settles the exact card
+    # (an id-less idle is a no-op there while the response is still streaming).
     assert ("running", "hermes_turn_1") in statuses
     assert statuses[0] == ("running", "hermes_turn_1")
-    assert ("idle", None) in statuses
+    assert ("idle", "hermes_turn_1") in statuses
+    assert statuses.index(("running", "hermes_turn_1")) < statuses.index(("idle", "hermes_turn_1"))
     fc = [it for it in posted_items if it.item_type == "function_call"]
     assert fc and all(it.response_id == "hermes_turn_1" for it in fc)
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_reasserts_running_while_turn_in_flight(tmp_path, monkeypatch) -> None:
+    """A turn that stays in flight across polls (no terminal row yet) re-posts its
+    ``running`` edge each poll, so the runner's PTY-activity ``idle`` (fired when the
+    pane goes quiet mid-tool) can't strand the live card. No ``idle`` is posted while
+    the turn is unfinished, and the open poll does not double-post ``running``."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    tc = json.dumps([{"id": "c1", "call_id": "c1", "function": {"name": "f", "arguments": "{}"}}])
+    # user + assistant+tool_call, but NO tool result / terminal assistant row: the
+    # turn is still running (e.g. a long, silent `sleep`).
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [
+            ("s1", "user", "run a slow sleep", None, None, None, 1),
+            ("s1", "assistant", "", None, tc, None, 1),
+        ],
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    statuses: list[tuple[str, str | None]] = []
+
+    async def _record_item(_client, *, session_id, item):
+        pass
+
+    async def _record_status(_client, *, session_id, status, response_id=None):
+        statuses.append((status, response_id))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _record_item)
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_slow",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    running = [s for s in statuses if s[0] == "running"]
+    # Open poll posts running once (no re-assert that poll); subsequent polls with
+    # no new rows re-assert it — so the turn's running edge is posted more than once.
+    assert running[0] == ("running", "hermes_turn_1")
+    assert running.count(("running", "hermes_turn_1")) >= 2
+    # The turn never completed, so no idle is posted.
+    assert not any(s[0] == "idle" for s in statuses)
+
+
+async def _run_forward_over_seeded_rows(
+    tmp_path, monkeypatch, rows: list[tuple], *, iterations: int = 2
+) -> tuple[list[tuple[str, str | None]], list]:
+    """Drive the poll loop once over a fully-seeded ``messages`` table.
+
+    Returns ``(statuses, posted_items)`` captured from the stubbed sessions client.
+    """
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    statuses: list[tuple[str, str | None]] = []
+    posted_items: list = []
+
+    async def _record_item(_client, *, session_id, item):
+        posted_items.append(item)
+
+    async def _record_status(_client, *, session_id, status, response_id=None):
+        statuses.append((status, response_id))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _record_item)
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= iterations:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_multi",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+    return statuses, posted_items
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_sequential_two_tool_calls_share_one_turn_id(
+    tmp_path, monkeypatch
+) -> None:
+    """A turn with two SEQUENTIAL tool calls (user → asst+tc1 → tool1 → asst+tc2 →
+    tool2 → asst-final) stamps every function_call / output with the one turn id,
+    opens the turn once, and closes it once at the terminal — the intermediate
+    asst+tc2 step must NOT re-open a new turn."""
+    tc1 = json.dumps([{"id": "c1", "call_id": "c1", "function": {"name": "f", "arguments": "{}"}}])
+    tc2 = json.dumps([{"id": "c2", "call_id": "c2", "function": {"name": "g", "arguments": "{}"}}])
+    rows = [
+        ("s1", "user", "run two things", None, None, None, 1),
+        ("s1", "assistant", "", None, tc1, None, 1),
+        ("s1", "tool", "res1", "c1", None, "f", 1),
+        ("s1", "assistant", "", None, tc2, None, 1),
+        ("s1", "tool", "res2", "c2", None, "g", 1),
+        ("s1", "assistant", "done", None, None, None, 1),
+    ]
+    statuses, posted_items = await _run_forward_over_seeded_rows(tmp_path, monkeypatch, rows)
+
+    fc = [it for it in posted_items if it.item_type == "function_call"]
+    fco = [it for it in posted_items if it.item_type == "function_call_output"]
+    assert len(fc) == 2 and len(fco) == 2
+    ids = {it.response_id for it in fc + fco}
+    assert ids == {"hermes_turn_1"}
+    # Opened exactly once (no re-open on the intermediate asst+tc2 step).
+    assert [s for s in statuses if s[0] == "running"] == [("running", "hermes_turn_1")]
+    # Closed once, carrying the turn id so the web settles the card deterministically.
+    assert [s for s in statuses if s[0] == "idle"] == [("idle", "hermes_turn_1")]
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_parallel_two_tool_calls_share_one_turn_id(
+    tmp_path, monkeypatch
+) -> None:
+    """A turn whose single assistant row carries two PARALLEL tool_calls emits two
+    function_call items (one per call), both stamped with the one turn id, alongside
+    their two outputs — one running edge at open, one idle at close."""
+    parallel = json.dumps(
+        [
+            {"id": "c1", "call_id": "c1", "function": {"name": "read", "arguments": '{"p":"A"}'}},
+            {"id": "c2", "call_id": "c2", "function": {"name": "read", "arguments": '{"p":"B"}'}},
+        ]
+    )
+    rows = [
+        ("s1", "user", "read A and B", None, None, None, 1),
+        ("s1", "assistant", "", None, parallel, None, 1),
+        ("s1", "tool", "resA", "c1", None, "read", 1),
+        ("s1", "tool", "resB", "c2", None, "read", 1),
+        ("s1", "assistant", "done", None, None, None, 1),
+    ]
+    statuses, posted_items = await _run_forward_over_seeded_rows(tmp_path, monkeypatch, rows)
+
+    fc = [it for it in posted_items if it.item_type == "function_call"]
+    fco = [it for it in posted_items if it.item_type == "function_call_output"]
+    assert len(fc) == 2 and len(fco) == 2
+    assert {it.item_data["call_id"] for it in fc} == {"c1", "c2"}
+    ids = {it.response_id for it in fc + fco}
+    assert ids == {"hermes_turn_1"}
+    assert [s for s in statuses if s[0] == "running"] == [("running", "hermes_turn_1")]
+    assert [s for s in statuses if s[0] == "idle"] == [("idle", "hermes_turn_1")]
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_running_edge_does_not_advance_cursor_before_item(
+    tmp_path, monkeypatch
+) -> None:
+    """A crash between the turn's running edge and the opening row's item POST must
+    NOT advance last_id. The running edge mirrors no message row; only the item
+    POST advances the cursor, and only after it succeeds. Otherwise a restart reads
+    an advanced last_id and _read_new_items (WHERE id > last_id) skips the opening
+    user row, permanently dropping it from the mirrored session."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    con.execute(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        ("s1", "user", "do it", None, None, None, 1),
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    statuses: list[tuple[str, str | None]] = []
+
+    async def _record_status(_client, *, session_id, status, response_id=None):
+        statuses.append((status, response_id))
+
+    async def _boom_item(_client, *, session_id, item):
+        raise RuntimeError("simulated crash while POSTing the opening row")
+
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+    monkeypatch.setattr(f, "_post_conversation_item", _boom_item)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_crash",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # The running edge was posted (best-effort), but the item POST crashed — so
+    # last_id must still be 0, letting a restart re-read the opening row.
+    assert ("running", "hermes_turn_1") in statuses
+    assert f._read_state(bridge_dir).last_id == 0
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_empty_prose_terminal_closes_turn(tmp_path, monkeypatch) -> None:
+    """An assistant terminal row with empty content (no prose, no tool_calls)
+    yields a role-less sentinel, but must still CLOSE the turn: active_turn_id is
+    cleared so the running re-assert stops. Otherwise the id leaks and the
+    re-assert re-posts running forever, stranding the web card as live."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    tc = json.dumps([{"id": "c1", "call_id": "c1", "function": {"name": "f", "arguments": "{}"}}])
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [
+            ("s1", "user", "do it", None, None, None, 1),
+            ("s1", "assistant", "", None, tc, None, 1),
+            ("s1", "tool", "result", "c1", None, "f", 1),
+            ("s1", "assistant", "", None, None, None, 1),  # empty-prose terminal
+        ],
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    statuses: list[tuple[str, str | None]] = []
+
+    async def _record_item(_client, *, session_id, item):
+        pass
+
+    async def _record_status(_client, *, session_id, status, response_id=None):
+        statuses.append((status, response_id))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _record_item)
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_empty_terminal",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # The empty-prose terminal closed the turn: id cleared, so the re-assert
+    # stops (exactly one running, at open — no perpetual re-post).
+    assert f._read_state(bridge_dir).active_turn_id is None
+    assert [s for s in statuses if s[0] == "running"] == [("running", "hermes_turn_1")]
+    assert ("idle", "hermes_turn_1") in statuses

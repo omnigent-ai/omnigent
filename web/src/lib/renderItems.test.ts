@@ -563,6 +563,52 @@ describe("buildBubbles — tool joining", () => {
     ]);
   });
 
+  it("two calls under one response_id: the tool_result-resolved call completes while the live one spins", () => {
+    // The hermes-native contract: every tool call in a turn shares one
+    // response_id, so the bubble lifecycle is streaming for the whole turn.
+    // A finished call (resolved by its tool_result) must still render as
+    // completed, not inherit the turn's spinner — only the trailing live call.
+    const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_read", responseId: "resp_1", timestamp: 10 }),
+        executions: [mkExec("Read", "call_read")],
+        iteration: 0,
+      },
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_read", responseId: "resp_1", timestamp: 12 }),
+        name: "Read",
+        callId: "call_read",
+        agentName: "test",
+        output: "file content",
+      },
+      {
+        type: "text_chunk",
+        ctx: ctx({ responseId: "resp_1" }),
+        text: "Now running a slow tool.\n",
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_sleep", responseId: "resp_1", timestamp: 13 }),
+        executions: [mkExec("sleep", "call_sleep")],
+        iteration: 0,
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, active);
+    const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
+    const tools = items.filter((item): item is Extract<RenderItem, { kind: "tool" }> => {
+      return item.kind === "tool";
+    });
+
+    expect(tools.map((tool) => [tool.execution.name, tool.state])).toEqual([
+      ["Read", "output-available"],
+      ["sleep", "input-available"],
+    ]);
+  });
+
   it("keeps all unresolved tools in the trailing streaming tool phase active", () => {
     const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
     const blocks: AnyBlock[] = [
