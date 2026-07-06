@@ -14,11 +14,6 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
 }));
 
-const openKeyboardShortcuts = vi.fn();
-vi.mock("@/components/KeyboardShortcutsDialog", () => ({
-  openKeyboardShortcuts: () => openKeyboardShortcuts(),
-}));
-
 function conv(id: string, title: string | null, agent_name: string | null = null) {
   return { id, title, agent_name, archived: false };
 }
@@ -41,7 +36,6 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
 
 beforeEach(() => {
   navigate.mockClear();
-  openKeyboardShortcuts.mockClear();
   useConversations.mockReset();
   setSessions([]);
 });
@@ -118,7 +112,6 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
-    expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
   });
 
   it("runs a navigation action and closes the palette", () => {
@@ -141,12 +134,6 @@ describe("CommandPalette — actions", () => {
 
     fireEvent.click(screen.getByText("Toggle workspace sidebar"));
     expect(onToggleRightSidebar).toHaveBeenCalledTimes(1);
-  });
-
-  it("opens the keyboard-shortcuts dialog", () => {
-    renderPalette();
-    fireEvent.click(screen.getByText("Keyboard shortcuts"));
-    expect(openKeyboardShortcuts).toHaveBeenCalledTimes(1);
   });
 
   it("filters actions client-side against the query", () => {

@@ -1,7 +1,7 @@
 // Global command palette (⌘K). Two command groups:
 //
-//   • Actions — static app commands (new chat, navigate, toggle panels,
-//     keyboard shortcuts). Filtered client-side against the live query.
+//   • Actions — static app commands (new chat, navigate, toggle panels).
+//     Filtered client-side against the live query.
 //   • Sessions — fuzzy session switching from the SAME server-search source the
 //     sidebar uses (`useConversations(query)` → `GET /v1/sessions?search_query=`),
 //     debounced. Not a static first page: a user with hundreds of sessions must
@@ -12,9 +12,16 @@
 // groups react to the same input.
 
 import { useEffect, useMemo, useState } from "react";
+import {
+  InboxIcon,
+  type LucideIcon,
+  PanelLeftIcon,
+  PanelRightIcon,
+  SettingsIcon,
+  SquarePenIcon,
+} from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
-import { openKeyboardShortcuts } from "@/components/KeyboardShortcutsDialog";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   Command,
@@ -38,6 +45,8 @@ export interface CommandPaletteProps {
 interface ActionCommand {
   id: string;
   label: string;
+  /** Mirrors the icon on the equivalent button elsewhere in the UI. */
+  icon: LucideIcon;
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
   run: () => void;
@@ -76,38 +85,37 @@ export function CommandPalette({
       {
         id: "new-chat",
         label: "New chat",
+        icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
         run: () => navigate("/"),
       },
       {
         id: "go-inbox",
         label: "Go to Inbox",
+        icon: InboxIcon,
         keywords: ["notifications", "comments", "needs response"],
         run: () => navigate("/inbox"),
       },
       {
         id: "go-settings",
         label: "Go to Settings",
+        icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
         run: () => navigate("/settings"),
       },
       {
         id: "toggle-left-sidebar",
         label: "Toggle conversations sidebar",
+        icon: PanelLeftIcon,
         keywords: ["panel", "left", "sessions list"],
         run: onToggleLeftSidebar,
       },
       {
         id: "toggle-right-sidebar",
         label: "Toggle workspace sidebar",
+        icon: PanelRightIcon,
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
-      },
-      {
-        id: "keyboard-shortcuts",
-        label: "Keyboard shortcuts",
-        keywords: ["help", "keys", "hotkeys"],
-        run: openKeyboardShortcuts,
       },
     ],
     [navigate, onToggleLeftSidebar, onToggleRightSidebar],
@@ -158,7 +166,7 @@ export function CommandPalette({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         aria-describedby={undefined}
-        className="top-1/4 translate-y-0 overflow-hidden p-0"
+        className="top-1/4 translate-y-0 overflow-hidden p-0 sm:max-w-2xl"
         showCloseButton={false}
       >
         <DialogTitle className="sr-only">Command palette</DialogTitle>
@@ -178,11 +186,15 @@ export function CommandPalette({
             </CommandEmpty>
             {filteredActions.length > 0 && (
               <CommandGroup heading="Actions">
-                {filteredActions.map((a) => (
-                  <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
-                    <span className="flex-1 truncate text-left">{a.label}</span>
-                  </CommandItem>
-                ))}
+                {filteredActions.map((a) => {
+                  const Icon = a.icon;
+                  return (
+                    <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
+                      <Icon />
+                      <span className="flex-1 truncate text-left">{a.label}</span>
+                    </CommandItem>
+                  );
+                })}
               </CommandGroup>
             )}
             {sessions.length > 0 && (
