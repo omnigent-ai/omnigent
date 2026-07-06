@@ -7481,6 +7481,22 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  it("dequeueMessage removes the message with the given id, keeping order", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: "conv_abc" },
+        { queueId: "q_2", text: "second", conversationId: "conv_abc" },
+        { queueId: "q_3", text: "third", conversationId: "conv_abc" },
+      ],
+    });
+    useChatStore.getState().dequeueMessage("q_2");
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["first", "third"]);
+    // Removing a missing id is a no-op.
+    useChatStore.getState().dequeueMessage("q_missing");
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["first", "third"]);
+  });
+
   it("maybeFlushQueuedHead flushes the head FIFO, one per idle", async () => {
     // Spy on send so the flush's contract (which head, in what order) is
     // asserted without depending on the full bind→/events network path.

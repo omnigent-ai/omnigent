@@ -533,6 +533,8 @@ export interface ChatState {
    * turn) when the session next goes idle — see the `session_status` handler.
    */
   enqueueMessage: (text: string, files?: File[]) => void;
+  /** Remove a queued message by id (the strip's per-row delete). */
+  dequeueMessage: (queueId: string) => void;
   /**
    * Drop all queued messages for a conversation. Called when a conversation is
    * deleted so its queue can't linger in memory (it would never flush — you
@@ -850,6 +852,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // to the queue but the turn had already ended) would otherwise wait for an
     // idle edge that never comes — flush now.
     get().maybeFlushQueuedHead();
+  },
+
+  dequeueMessage: (queueId) => {
+    set((s) => ({
+      queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId),
+    }));
   },
 
   clearQueuedMessages: (conversationId) => {
