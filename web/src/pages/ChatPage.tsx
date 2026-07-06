@@ -4367,6 +4367,18 @@ export function Composer({
       <QueuedMessagesStrip
         messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
         onDelete={dequeueMessage}
+        onEdit={(queueId) => {
+          // Pull the queued message back into the composer for editing:
+          // replace the composer's text + attachments with the queued
+          // message's, remove it from the queue, and focus the textarea.
+          // Re-sending re-queues it (busy) or sends it (idle).
+          const target = queuedMessages.find((m) => m.queueId === queueId);
+          if (!target) return;
+          setValue(target.text);
+          setFiles(target.files ?? []);
+          dequeueMessage(queueId);
+          textareaRef.current?.focus();
+        }}
         widthClassName={CHAT_COLUMN_WIDTH}
       />
       {/* Sub-agent context tray — peeks above the card; reserves its own
