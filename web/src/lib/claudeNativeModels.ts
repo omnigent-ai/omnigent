@@ -14,6 +14,11 @@ export const CLAUDE_NATIVE_MODELS = [
   // { id: "fable", label: "Fable" },
   { id: "opus", label: "Opus" },
   { id: "sonnet", label: "Sonnet" },
+  // Older Sonnet generation, kept selectable alongside "sonnet" (which
+  // tracks the newest one) while both remain in active use across
+  // workspaces/regions. Backed by Claude Code's one custom /model slot
+  // (ANTHROPIC_CUSTOM_MODEL_OPTION), not a family alias.
+  { id: "sonnet_4_6", label: "Sonnet 4.6" },
   { id: "haiku", label: "Haiku" },
 ] as const;
 

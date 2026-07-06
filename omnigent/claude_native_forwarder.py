@@ -3611,7 +3611,10 @@ def _model_alias_for(model: str | None) -> str | None:
     Collapse a concrete Claude model id to the picker's tier alias.
 
     The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``); the
+    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
+    extra concrete-id slot ``"sonnet_4_6"`` (see
+    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the older
+    Sonnet generation kept selectable alongside the newest one; the
     transcript records the resolved concrete id (e.g.
     ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``).
     Mapping to the tier keeps the mirrored value in the picker's
@@ -3619,14 +3622,16 @@ def _model_alias_for(model: str | None) -> str | None:
 
     :param model: Concrete model id from the transcript, e.g.
         ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``
-        when the id carries a known tier token, else ``None`` (the
-        caller skips the post rather than surface an id the picker
+    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_4_6"`` /
+        ``"haiku"`` when the id carries a known tier token, else ``None``
+        (the caller skips the post rather than surface an id the picker
         can't render).
     """
     if not model:
         return None
     lowered = model.lower()
+    if "sonnet-4-6" in lowered or "sonnet_4_6" in lowered:
+        return "sonnet_4_6"
     for tier in ("fable", "opus", "sonnet", "haiku"):
         if tier in lowered:
             return tier

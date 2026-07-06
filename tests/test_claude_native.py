@@ -385,6 +385,48 @@ def test_ucode_config_for_profile_sets_only_present_tier_env_vars(
     assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in config.env
 
 
+def test_ucode_config_for_profile_sets_custom_model_option_for_second_sonnet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``claude_models["sonnet_4_6"]`` entry pins Claude Code's one custom
+    ``/model`` slot (``ANTHROPIC_CUSTOM_MODEL_OPTION``), alongside the
+    ``sonnet`` tier alias pinned to the newest Sonnet — letting both
+    generations stay independently selectable while both are in use.
+    """
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={
+            "sonnet": "databricks-claude-sonnet-5",
+            "sonnet_4_6": "databricks-claude-sonnet-4-6",
+        },
+        agents={
+            "claude": UcodeAgentState(
+                model="databricks-claude-sonnet-5",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-5"
+    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-sonnet-4-6"
+    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Sonnet 4.6"
+
+
 def test_ucode_config_for_profile_omits_model_tier_vars_when_no_claude_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -149,6 +149,16 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
+# The 4 family aliases above pin one model ID each. Claude Code has exactly
+# one more independently-selectable /model picker slot beyond those
+# families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface a second
+# Sonnet generation (e.g. Sonnet 4.6) alongside the "sonnet" alias pinned to
+# the newest Sonnet, for workspaces where both are in active use.
+# See https://code.claude.com/docs/en/model-config#custom-model-options
+_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION"
+_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
+_UCODE_CLAUDE_CUSTOM_TIER = "sonnet_4_6"
+_UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 4.6"
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
@@ -1449,6 +1459,10 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
         model_id = workspace_state.claude_models.get(tier)
         if model_id:
             env[env_var] = model_id
+    custom_model_id = workspace_state.claude_models.get(_UCODE_CLAUDE_CUSTOM_TIER)
+    if custom_model_id:
+        env[_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV] = custom_model_id
+        env[_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV] = _UCODE_CLAUDE_CUSTOM_TIER_LABEL
     # When ucode caches no model, default it so Claude Code doesn't fall back
     # to its host-config model (an Anthropic-direct id the gateway rejects).
     return ClaudeNativeUcodeConfig(

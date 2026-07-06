@@ -46,14 +46,23 @@ describe("CLAUDE_NATIVE_MODELS", () => {
     // against a regression back to version-numbered IDs.
     const ids = CLAUDE_NATIVE_MODELS.map((m) => m.id);
     // Capability order, most powerful first. Fable is temporarily withheld.
-    expect(ids).toEqual(["opus", "sonnet", "haiku"]);
+    // "sonnet_4_6" is the one exception: Claude Code's single custom
+    // /model slot pinned to a concrete older Sonnet generation, kept
+    // selectable alongside the "sonnet" alias while both are in use.
+    expect(ids).toEqual(["opus", "sonnet", "sonnet_4_6", "haiku"]);
     for (const id of ids) {
+      if (id === "sonnet_4_6") continue;
       expect(id).not.toMatch(/\d/); // an alias carries no version digits
     }
   });
 
   it("labels each alias by tier", () => {
-    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual(["Opus", "Sonnet", "Haiku"]);
+    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual([
+      "Opus",
+      "Sonnet",
+      "Sonnet 4.6",
+      "Haiku",
+    ]);
   });
 });
 
@@ -88,7 +97,7 @@ describe("isModelImplicitlySelected", () => {
     // version (4.7) must not break matching — both resolve to the tier.
     expect(isModelImplicitlySelected("opus", "anthropic/claude-opus-4-8")).toBe(true);
     expect(isModelImplicitlySelected("opus", "anthropic/claude-opus-4-7")).toBe(true);
-    expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet-4-6")).toBe(true);
+    expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet-5")).toBe(true);
     // Fable's concrete id (claude-fable-5) must light up the "fable" row.
     expect(isModelImplicitlySelected("fable", "anthropic/claude-fable-5")).toBe(true);
     // ucode gateway IDs carry the tier token too, so the same row lights up.
@@ -98,6 +107,16 @@ describe("isModelImplicitlySelected", () => {
 
   it("matches when llmModel is already the bare alias", () => {
     expect(isModelImplicitlySelected("opus", "opus")).toBe(true);
+  });
+
+  it("routes Sonnet 4.6 to its own row instead of the generic Sonnet row", () => {
+    // Both ids happen to contain the substring "sonnet", so the generic
+    // "sonnet" row must not also light up for a 4.6 pin.
+    expect(isModelImplicitlySelected("sonnet_4_6", "anthropic/claude-sonnet-4-6")).toBe(true);
+    expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet-4-6")).toBe(false);
+    expect(isModelImplicitlySelected("sonnet_4_6", "databricks-claude-sonnet-4-6")).toBe(true);
+    // A 4.6 id must not light up the "sonnet_4_6" row for the newest Sonnet.
+    expect(isModelImplicitlySelected("sonnet_4_6", "anthropic/claude-sonnet-5")).toBe(false);
   });
 
   it("does not cross-match a different tier", () => {

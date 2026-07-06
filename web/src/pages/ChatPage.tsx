@@ -4994,9 +4994,17 @@ export function shouldShowCodexGoalControl(
  * Highlight a model row when ``selectedModel`` is null by matching the
  * bound spec ``llmModel`` to its tier alias (e.g.
  * ``"anthropic/claude-opus-4-8"`` matches ``"opus"``).
+ *
+ * Sonnet 4.6 is special-cased both ways: its concrete id ("...-sonnet-4-6")
+ * would otherwise substring-match the generic "sonnet" row (since "sonnet"
+ * is itself a substring), and its own row's id ("sonnet_4_6") never
+ * literally appears in a hyphenated concrete id.
  */
 export function isModelImplicitlySelected(modelId: string, llmModel: string | null): boolean {
   if (!llmModel) return false;
+  const isSonnet46 = llmModel.includes("sonnet-4-6") || llmModel.includes("sonnet_4_6");
+  if (modelId === "sonnet_4_6") return isSonnet46;
+  if (modelId === "sonnet" && isSonnet46) return false;
   return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
 }
 

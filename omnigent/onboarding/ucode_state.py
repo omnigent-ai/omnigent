@@ -58,6 +58,11 @@ class UcodeWorkspaceState:
         ``"https://example.databricks.com"``.
     :param claude_models: Mapping of tier to model id,
         e.g. ``{"opus": "databricks-claude-opus-4-7", "sonnet": "..."}``.
+        An optional ``"sonnet_4_6"`` key pins Claude Code's one custom
+        ``/model`` picker slot (see
+        :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) to a
+        second Sonnet generation, for workspaces where two Sonnet versions
+        are in active use side by side.
     :param codex_models: Ordered list of Codex model ids available on this
         workspace, e.g. ``["databricks-gpt-5-5"]``.
     :param base_urls: Mapping of tool name to base URL,
