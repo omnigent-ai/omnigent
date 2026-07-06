@@ -2149,6 +2149,48 @@ def test_augment_claude_args_registers_permission_command_hook(
     assert "omnigent.claude_native_status" in settings["statusLine"]["command"]
 
 
+def test_augment_claude_args_evaluate_policy_hook_has_day_long_timeout(
+    tmp_path: Path,
+) -> None:
+    """
+    The evaluate-policy command hook must carry the same day-long timeout
+    as the permission hook.
+
+    A TOOL_CALL/REQUEST policy ASK parks server-side until a human resolves
+    it (up to the deciding policy's ``ask_timeout``), and the evaluate-policy
+    client waits the full day for that verdict. But the hook is a command
+    hook, so without an explicit ``timeout`` Claude Code's ~60s default kills
+    the subprocess long before the human answers — capping every admin-policy
+    ASK (e.g. a cost-budget gate) at 60s. In acceptEdits/bypassPermissions
+    mode, where PermissionRequest never fires, this is the sole human gate.
+    Must stay in lockstep with ``permission_hook``'s 86400 so no layer caps
+    the wait first.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787/",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    settings = json.loads(args[args.index("--settings") + 1])
+    evaluate_hooks = [
+        hook
+        for phase in ("PreToolUse", "PostToolUse", "UserPromptSubmit")
+        for entry in settings["hooks"].get(phase, [])
+        for hook in entry["hooks"]
+        if "evaluate-policy" in hook["command"]
+    ]
+    assert evaluate_hooks, "expected at least one evaluate-policy hook to be registered"
+    for hook in evaluate_hooks:
+        assert hook["type"] == "command"
+        assert hook["timeout"] == 86400, (
+            "evaluate-policy hook must carry the day-long timeout so a parked "
+            "policy ASK is not killed by Claude Code's ~60s command-hook default; "
+            f"got {hook.get('timeout')!r}."
+        )
+
+
 def test_augment_claude_args_registers_user_prompt_submit_policy_hook(
     tmp_path: Path,
 ) -> None:

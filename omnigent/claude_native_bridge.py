@@ -1211,6 +1211,14 @@ def build_hook_settings(
         evaluate_policy_hook: dict[str, Any] = {
             "type": "command",
             "command": shlex.join(evaluate_policy_command_parts),
+            # A TOOL_CALL/REQUEST policy ASK parks server-side until a human
+            # answers (up to the policy's ``ask_timeout``), and the client
+            # waits the full day for that verdict — so, like ``permission_hook``
+            # above, this command hook needs the day-long timeout. Without it
+            # Claude Code's ~60s command-hook default kills the subprocess long
+            # before the user answers, capping every admin-policy ASK at 60s
+            # (and in bypassPermissions mode this is the sole human gate).
+            "timeout": 86400,
         }
         # In bypassPermissions mode PermissionRequest never fires, so
         # AskUserQuestion needs its own PreToolUse hook to surface the
