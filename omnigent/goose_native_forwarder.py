@@ -37,6 +37,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_session_event_with_retry
+
 _logger = logging.getLogger(__name__)
 
 #: Seconds between store polls. Goose flushes a ``messages`` row per agentic
@@ -46,6 +48,9 @@ _logger = logging.getLogger(__name__)
 #: rather than lagging a beat behind each one. 0.4s balances liveness vs. load.
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
+_POST_MAX_ATTEMPTS = 3
+_POST_RETRY_DELAY_SECONDS = 0.1
+_POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 # Supervisor backoff (mirrors cursor_native_forwarder.supervise_cursor_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -300,11 +305,12 @@ def _read_new_items(
 
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
-) -> None:
+) -> httpx.Response | None:
     """POST one mirrored item as an ``external_conversation_item`` event."""
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
+    return await post_session_event_with_retry(
+        client=client,
+        url=f"/v1/sessions/{session_id}/events",
+        payload={
             "type": "external_conversation_item",
             "data": {
                 "item_type": item.item_type,
@@ -312,8 +318,13 @@ async def _post_conversation_item(
                 "response_id": item.response_id,
             },
         },
+        event_type="external_conversation_item",
+        max_attempts=_POST_MAX_ATTEMPTS,
+        retry_status_codes=_POST_RETRY_STATUS_CODES,
+        sleep=_sleep,
+        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        logger_name=__name__,
     )
-    resp.raise_for_status()
 
 
 async def forward_goose_store_to_session(
@@ -374,7 +385,11 @@ async def forward_goose_store_to_session(
                     )
                     for item in items:
                         if item.item_type:
-                            await _post_conversation_item(client, session_id=session_id, item=item)
+                            response = await _post_conversation_item(
+                                client, session_id=session_id, item=item
+                            )
+                            if response is None or response.status_code >= 400:
+                                break
                         last_id = item.msg_id
                         _write_state(
                             bridge_dir,
@@ -394,6 +409,11 @@ async def forward_goose_store_to_session(
 def _supervisor_monotonic() -> float:
     """Indirection so tests can stub the supervisor's clock."""
     return time.monotonic()
+
+
+async def _sleep(seconds: float) -> None:
+    """Stubbable indirection for the per-POST retry backoff."""
+    await asyncio.sleep(seconds)
 
 
 async def _supervisor_sleep(seconds: float) -> None:

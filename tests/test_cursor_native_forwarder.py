@@ -420,6 +420,20 @@ class _RecordingClient:
         return httpx.Response(200, request=httpx.Request("POST", url))
 
 
+class _PostHelperSink:
+    """Capture calls to ``post_session_event_with_retry``."""
+
+    def __init__(self, responses: list[httpx.Response | None] | None = None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._responses = list(responses or [])
+
+    async def __call__(self, **kwargs: object) -> httpx.Response | None:
+        self.calls.append(kwargs)
+        if self._responses:
+            return self._responses.pop(0)
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+
+
 def _write_meta_model(con: sqlite3.Connection, model: str | None, *, key: str = "0") -> None:
     """Add cursor's ``meta`` table to *con* and store a hex-encoded model blob.
 
@@ -481,36 +495,45 @@ class TestReadLastUsedModel:
 
 class TestPostModelChangeIfNew:
     @pytest.mark.asyncio
-    async def test_first_observation_is_posted(self) -> None:
+    async def test_first_observation_is_posted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Unlike claude-native, cursor posts the FIRST observed model so an
         # un-pinned session shows the real cursor model instead of omnigent's
         # default ("fable") in the Web UI pill.
-        client = _RecordingClient()
+        sink = _PostHelperSink()
+        monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
         state = fwd._ModelMirrorState()
         await fwd._post_model_change_if_new(
-            client,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
             session_id="conv_1",
             state=state,
             model="claude-sonnet-4-5",
         )
-        url, body = client.posts[0]
-        assert url == "/v1/sessions/conv_1/events"
-        assert body == {"type": "external_model_change", "data": {"model": "claude-sonnet-4-5"}}
+        assert len(sink.calls) == 1
+        assert sink.calls[0]["event_type"] == "external_model_change"
+        assert sink.calls[0]["url"] == "/v1/sessions/conv_1/events"
+        assert sink.calls[0]["payload"] == {
+            "type": "external_model_change",
+            "data": {"model": "claude-sonnet-4-5"},
+        }
         assert state.posted == "claude-sonnet-4-5"
 
     @pytest.mark.asyncio
-    async def test_switch_after_seed_posts_external_model_change(self) -> None:
-        client = _RecordingClient()
+    async def test_switch_after_seed_posts_external_model_change(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sink = _PostHelperSink()
+        monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
         state = fwd._ModelMirrorState(observed="composer-2.5", posted="composer-2.5")
         await fwd._post_model_change_if_new(
-            client,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
             session_id="conv_1",
             state=state,
             model="gpt-5.2",
         )
-        url, body = client.posts[0]
-        assert url == "/v1/sessions/conv_1/events"
-        assert body == {"type": "external_model_change", "data": {"model": "gpt-5.2"}}
+        assert sink.calls[0]["payload"] == {
+            "type": "external_model_change",
+            "data": {"model": "gpt-5.2"},
+        }
         assert state.posted == "gpt-5.2"
 
     @pytest.mark.asyncio
@@ -539,22 +562,18 @@ class TestPostModelChangeIfNew:
         assert state.observed == "gpt-5.2"
 
     @pytest.mark.asyncio
-    async def test_failed_post_retries_next_poll(self) -> None:
-        class _FailingThenOkClient:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            async def post(self, url: str, *, json: dict) -> httpx.Response:
-                self.calls += 1
-                if self.calls == 1:
-                    raise httpx.ConnectError("boom")
-                return httpx.Response(200, request=httpx.Request("POST", url))
-
-        client = _FailingThenOkClient()
+    async def test_failed_post_retries_next_poll(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sink = _PostHelperSink(
+            [
+                httpx.Response(503, request=httpx.Request("POST", "http://t/")),
+                httpx.Response(200, request=httpx.Request("POST", "http://t/")),
+            ]
+        )
+        monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
         state = fwd._ModelMirrorState(observed="composer-2.5", posted="composer-2.5")
         # First poll: switch observed, POST fails → posted stays behind observed.
         await fwd._post_model_change_if_new(
-            client,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
             session_id="conv_1",
             state=state,
             model="gpt-5.2",
@@ -562,13 +581,37 @@ class TestPostModelChangeIfNew:
         assert state.posted == "composer-2.5" and state.observed == "gpt-5.2"
         # Next poll retries (model=None means "no fresh read") and succeeds.
         await fwd._post_model_change_if_new(
-            client,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
             session_id="conv_1",
             state=state,
             model=None,
         )
         assert state.posted == "gpt-5.2"
-        assert client.calls == 2
+        assert len(sink.calls) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failed_response", [503, None])
+    async def test_failed_helper_response_does_not_advance_posted_model(
+        self, monkeypatch: pytest.MonkeyPatch, failed_response: int | None
+    ) -> None:
+        response = (
+            None
+            if failed_response is None
+            else httpx.Response(failed_response, request=httpx.Request("POST", "http://t/"))
+        )
+        sink = _PostHelperSink([response])
+        monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
+        state = fwd._ModelMirrorState(observed="composer-2.5", posted="composer-2.5")
+
+        await fwd._post_model_change_if_new(
+            object(),  # type: ignore[arg-type]
+            session_id="conv_1",
+            state=state,
+            model="gpt-5.2",
+        )
+
+        assert state.observed == "gpt-5.2"
+        assert state.posted == "composer-2.5"
 
 
 @pytest.mark.asyncio
@@ -589,6 +632,118 @@ async def test_post_conversation_item_shape() -> None:
         "item_data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
         "response_id": "cursor:bid",
     }
+
+
+@pytest.mark.asyncio
+async def test_post_external_compaction_status_uses_session_event_retry_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _PostHelperSink()
+    monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
+
+    response = await fwd._post_external_compaction_status(
+        object(),  # type: ignore[arg-type]
+        session_id="conv_1",
+        status="completed",
+    )
+
+    assert response.status_code == 200
+    assert sink.calls[0]["event_type"] == "external_compaction_status"
+    assert sink.calls[0]["url"] == "/v1/sessions/conv_1/events"
+    assert sink.calls[0]["payload"] == {
+        "type": "external_compaction_status",
+        "data": {"status": "completed"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_persist_native_compaction_item_uses_session_event_retry_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _PostHelperSink()
+    monkeypatch.setattr(fwd, "post_session_event_with_retry", sink, raising=False)
+    client = MagicMock()
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"data": [{"id": "item_789"}]}
+    get_resp.raise_for_status = MagicMock()
+    client.get = AsyncMock(return_value=get_resp)
+
+    with patch.object(fwd, "_read_blob_rows", return_value=[]):
+        await _persist_native_compaction_item(
+            client, session_id="conv_cursor", store_path=Path("/fake")
+        )
+
+    assert len(sink.calls) == 1
+    assert sink.calls[0]["event_type"] == "compaction"
+    assert sink.calls[0]["url"] == "/v1/sessions/conv_cursor/events"
+    payload = sink.calls[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["type"] == "compaction"
+    assert payload["data"]["last_item_id"] == "item_789"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("post_func", "event_type"),
+    [
+        ("model", "external_model_change"),
+        ("status", "external_compaction_status"),
+        ("compaction", "compaction"),
+    ],
+)
+async def test_migrated_posts_record_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+    post_func: str,
+    event_type: str,
+) -> None:
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    class _CompactionClient(_AlwaysConnectError):
+        async def get(self, url: str, *, params: dict[str, object]) -> httpx.Response:
+            del params
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "item_789"}]},
+                request=httpx.Request("GET", url),
+            )
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(fwd, "_sleep", no_sleep, raising=False)
+    health.clear()
+    try:
+        if post_func == "model":
+            await fwd._post_model_change_if_new(
+                _AlwaysConnectError(),  # type: ignore[arg-type]
+                session_id="conv_1",
+                state=fwd._ModelMirrorState(),
+                model="gpt-5.2",
+            )
+        elif post_func == "status":
+            response = await fwd._post_external_compaction_status(
+                _AlwaysConnectError(),  # type: ignore[arg-type]
+                session_id="conv_1",
+                status="completed",
+            )
+            assert response is None
+        else:
+            await _persist_native_compaction_item(
+                _CompactionClient(),  # type: ignore[arg-type]
+                session_id="conv_1",
+                store_path=Path("/fake"),
+            )
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert event_type in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()
 
 
 def _http_status_error(status: int) -> httpx.HTTPStatusError:
@@ -641,6 +796,11 @@ async def _drive_forwarder(
     monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
     monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
     monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+
+    async def _skip_patch(client: object, *, session_id: str, chat_id: str) -> None:
+        del client, session_id, chat_id
+
+    monkeypatch.setattr(fwd, "_patch_external_session_id", _skip_patch)
     task = asyncio.create_task(
         fwd.forward_cursor_store_to_session(
             base_url="http://test",
@@ -1129,7 +1289,11 @@ class TestCompactionCompletedForwarding:
         async def _fake_compaction(client: object, *, session_id: str, status: str) -> None:
             completions.append(status)
 
+        async def _skip_persist(client: object, *, session_id: str, store_path: Path) -> None:
+            del client, session_id, store_path
+
         monkeypatch.setattr(fwd, "_post_external_compaction_status", _fake_compaction)
+        monkeypatch.setattr(fwd, "_persist_native_compaction_item", _skip_persist)
 
         poster = _FakePoster(lambda item: None)
         bridge = await _drive_forwarder(
@@ -1171,10 +1335,18 @@ class TestCompactionCompletedForwarding:
         )
         writer.close()
 
-        async def _failing_compaction(client: object, *, session_id: str, status: str) -> None:
-            raise _http_status_error(500)
+        async def _failing_compaction(
+            client: object, *, session_id: str, status: str
+        ) -> httpx.Response:
+            del client, session_id, status
+            return httpx.Response(503, request=httpx.Request("POST", "http://t/"))
 
         monkeypatch.setattr(fwd, "_post_external_compaction_status", _failing_compaction)
+
+        async def _skip_persist(client: object, *, session_id: str, store_path: Path) -> None:
+            del client, session_id, store_path
+
+        monkeypatch.setattr(fwd, "_persist_native_compaction_item", _skip_persist)
 
         poster = _FakePoster(lambda item: None)
         bridge = await _drive_forwarder(
@@ -1205,8 +1377,7 @@ async def test_persist_native_compaction_item_posts_compaction_event() -> None:
     get_resp.raise_for_status = MagicMock()
     client.get = AsyncMock(return_value=get_resp)
 
-    post_resp = MagicMock()
-    post_resp.raise_for_status = MagicMock()
+    post_resp = httpx.Response(200, request=httpx.Request("POST", "http://t/"))
     client.post = AsyncMock(return_value=post_resp)
 
     fake_rows = [
@@ -1238,8 +1409,7 @@ async def test_persist_native_compaction_item_no_store_skips_messages() -> None:
     get_resp.raise_for_status = MagicMock()
     client.get = AsyncMock(return_value=get_resp)
 
-    post_resp = MagicMock()
-    post_resp.raise_for_status = MagicMock()
+    post_resp = httpx.Response(200, request=httpx.Request("POST", "http://t/"))
     client.post = AsyncMock(return_value=post_resp)
 
     with patch.object(fwd, "_read_blob_rows", side_effect=sqlite3.Error("no db")):

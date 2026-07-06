@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pytest
 
 import omnigent.opencode_native_forwarder as fwd_mod
 from omnigent.opencode_native_client import OpenCodeEvent
@@ -59,6 +60,71 @@ def _event(event_type: str, **props: Any) -> OpenCodeEvent:
 
 def _types(posts: list[tuple[str, dict[str, Any]]]) -> list[str]:
     return [body["type"] for _url, body in posts]
+
+
+class _PostHelperSink:
+    """Capture calls to ``post_session_event_with_retry``."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def __call__(self, **kwargs: object) -> httpx.Response:
+        self.calls.append(kwargs)
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+
+
+async def test_post_event_uses_session_event_retry_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _PostHelperSink()
+    monkeypatch.setattr(fwd_mod, "post_session_event_with_retry", sink, raising=False)
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+
+    response = await fwd._post_event("external_session_status", {"status": "running"})
+    item_response = await fwd._post_event(
+        "external_conversation_item",
+        {"item_type": "message", "item_data": {}, "response_id": "msg_1"},
+    )
+
+    assert response.status_code == 200
+    assert item_response.status_code == 200
+    assert sink.calls[0]["event_type"] == "external_session_status"
+    assert sink.calls[0]["url"] == "/v1/sessions/conv_1/events"
+    assert sink.calls[0]["payload"] == {
+        "type": "external_session_status",
+        "data": {"status": "running"},
+    }
+    assert sink.calls[1]["event_type"] == "external_conversation_item"
+    assert sink.calls[1]["payload"]["type"] == "external_conversation_item"
+
+
+async def test_post_event_records_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(fwd_mod, "_sleep", no_sleep, raising=False)
+    fwd = _forwarder(_AlwaysConnectError(), _FakeOpenCodeClient())  # type: ignore[arg-type]
+
+    health.clear()
+    try:
+        response = await fwd._post_event("external_session_status", {"status": "running"})
+        assert response is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "external_session_status" in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()
 
 
 async def test_part_delta_is_not_forwarded() -> None:

@@ -8,9 +8,13 @@ stripping, role mapping, and the idempotent high-water cursor.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
+
+import httpx
+import pytest
 
 from omnigent import goose_native_forwarder as f
 
@@ -110,3 +114,160 @@ def test_default_sessions_db_honors_override(monkeypatch) -> None:
     assert f.default_sessions_db() == Path("/custom/sessions.db")
     monkeypatch.delenv("GOOSE_SESSIONS_DB", raising=False)
     assert f.default_sessions_db().name == "sessions.db"
+
+
+@pytest.mark.asyncio
+async def test_post_conversation_item_uses_session_event_retry_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def sink(**kwargs: object) -> httpx.Response:
+        calls.append(kwargs)
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+
+    monkeypatch.setattr(f, "post_session_event_with_retry", sink, raising=False)
+    item = f._MirrorItem(
+        msg_id=1,
+        item_type="message",
+        item_data={"role": "assistant"},
+        response_id="goose:1",
+    )
+
+    response = await f._post_conversation_item(object(), session_id="conv goose", item=item)  # type: ignore[arg-type]
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["event_type"] == "external_conversation_item"
+    assert calls[0]["url"] == "/v1/sessions/conv goose/events"
+    payload = calls[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["type"] == "external_conversation_item"
+
+
+@pytest.mark.asyncio
+async def test_post_conversation_item_records_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(f, "_sleep", no_sleep, raising=False)
+    item = f._MirrorItem(
+        msg_id=1,
+        item_type="message",
+        item_data={"role": "assistant"},
+        response_id="goose:1",
+    )
+
+    health.clear()
+    try:
+        response = await f._post_conversation_item(
+            _AlwaysConnectError(),  # type: ignore[arg-type]
+            session_id="conv_x",
+            item=item,
+        )
+        assert response is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "external_conversation_item" in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_response", [503, None])
+async def test_forwarder_does_not_advance_cursor_past_failed_item(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failed_response: int | None,
+) -> None:
+    db = tmp_path / "sessions.db"
+    _seed_db(db)
+    bridge_dir = tmp_path / "bridge"
+    calls = 0
+
+    async def post_stub(
+        client: httpx.AsyncClient, *, session_id: str, item: f._MirrorItem
+    ) -> httpx.Response | None:
+        nonlocal calls
+        del client, session_id
+        calls += 1
+        if calls == 1:
+            return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+        assert item.msg_id == 2
+        if failed_response is None:
+            return None
+        return httpx.Response(failed_response, request=httpx.Request("POST", "http://t/"))
+
+    async def stop_after_poll(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(f, "_post_conversation_item", post_stub)
+    monkeypatch.setattr(f.asyncio, "sleep", stop_after_poll)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_goose_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="goose-native-ui",
+            goose_session_name="omni-1",
+            db_path=db,
+            poll_interval_s=0,
+        )
+
+    state = f._read_state(bridge_dir)
+    assert calls == 2
+    assert state.goose_session_id == "20260619_1"
+    assert state.last_id == 1
+
+
+@pytest.mark.asyncio
+async def test_forwarder_advances_cursor_after_successful_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "sessions.db"
+    _seed_db(db)
+    bridge_dir = tmp_path / "bridge"
+    posted_ids: list[int] = []
+
+    async def post_stub(
+        client: httpx.AsyncClient, *, session_id: str, item: f._MirrorItem
+    ) -> httpx.Response:
+        del client, session_id
+        posted_ids.append(item.msg_id)
+        return httpx.Response(200, request=httpx.Request("POST", "http://t/"))
+
+    async def stop_after_poll(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(f, "_post_conversation_item", post_stub)
+    monkeypatch.setattr(f.asyncio, "sleep", stop_after_poll)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_goose_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            agent_name="goose-native-ui",
+            goose_session_name="omni-1",
+            db_path=db,
+            poll_interval_s=0,
+        )
+
+    state = f._read_state(bridge_dir)
+    assert posted_ids == [1, 2]
+    assert state.goose_session_id == "20260619_1"
+    assert state.last_id == 3
