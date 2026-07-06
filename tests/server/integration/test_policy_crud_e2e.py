@@ -330,31 +330,23 @@ async def test_policy_registry_handler_matches_create_allowlist(
     reg_resp = await auth_client.get("/v1/policy-registry", headers=headers)
     assert reg_resp.status_code == 200, reg_resp.text
     entries = reg_resp.json()["data"]
-
-    # Pick a factory entry whose required params all have defaults so the
-    # policy can be created without explicit factory_params.
-    def _no_required_params(entry: dict) -> bool:
-        schema = entry.get("params_schema")
-        if schema is None:
-            return True
-        required = schema.get("required", [])
-        props = schema.get("properties", {})
-        return all("default" in props.get(k, {}) for k in required)
-
-    usable_entry = next((e for e in entries if _no_required_params(e)), None)
-    assert usable_entry is not None, "No registry entry with all-default params"
+    # Pick a callable (not factory) entry to avoid needing factory_params.
+    callable_entry = next((e for e in entries if e["kind"] == "callable"), None)
+    assert callable_entry is not None, (
+        f"No callable entry in registry; got kinds: {[e.get('kind') for e in entries]}"
+    )
 
     create_resp = await auth_client.post(
         "/v1/policies",
         json={
             "name": "from_registry",
             "type": "python",
-            "handler": usable_entry["handler"],
+            "handler": callable_entry["handler"],
         },
         headers=headers,
     )
     assert create_resp.status_code == 200
-    assert create_resp.json()["handler"] == usable_entry["handler"]
+    assert create_resp.json()["handler"] == callable_entry["handler"]
 
 
 # ── Cross-scope isolation ────────────────────────────────────────────────────
