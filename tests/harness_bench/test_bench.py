@@ -67,6 +67,25 @@ def test_declared_covers_every_p0_dimension(profile: BenchProfile) -> None:
             )
 
 
+def test_streaming_capability_declares_binary_verdict() -> None:
+    # Guards the kiro-native drift: streaming declares binary (True→SUPPORTED,
+    # False→UNSUPPORTED), never PARTIAL.
+    from omnigent.harness_plugins import harness_capabilities
+    from tests.harness_bench.manifest import _declared_from_capabilities
+
+    caps = harness_capabilities()
+    for harness, cap in caps.items():
+        declared = _declared_from_capabilities(harness).get("streaming")
+        if declared is None:
+            continue
+        expected = Verdict.SUPPORTED if cap.streaming else Verdict.UNSUPPORTED
+        assert declared is expected, (
+            f"{harness!r}: streaming={cap.streaming} should declare {expected.name}, "
+            f"got {declared.name}"
+        )
+        assert declared is not Verdict.PARTIAL, f"{harness!r}: PARTIAL is never a declared verdict"
+
+
 def test_reconcile_flags_concrete_mismatch() -> None:
     assert reconcile(Verdict.UNSUPPORTED, Verdict.SUPPORTED) is Verdict.DRIFT
     assert reconcile(Verdict.SUPPORTED, Verdict.UNSUPPORTED) is Verdict.DRIFT
