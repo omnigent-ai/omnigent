@@ -1,4 +1,4 @@
-import { ClockIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import { ClockIcon, PencilIcon, SendHorizontalIcon, Trash2Icon } from "lucide-react";
 
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,12 @@ interface QueuedMessagesStripProps {
   onDelete: (queueId: string) => void;
   /** Pull a queued message back into the composer for editing. */
   onEdit: (queueId: string) => void;
+  /**
+   * Send a queued message now (steer), instead of waiting for the idle flush.
+   * Omitted when the session can't steer mid-turn (e.g. native terminals),
+   * in which case no steer button is shown.
+   */
+  onSteer?: (queueId: string) => void;
   /** Column-width class so the strip lines up with the composer card. */
   widthClassName?: string;
 }
@@ -19,13 +25,14 @@ interface QueuedMessagesStripProps {
  * busy. Peeks above the composer card (`-mb-4` + bottom padding), mirroring
  * `SubagentComposerTray`. Renders nothing when the queue is empty.
  *
- * Each row can be edited (pulled back into the composer) or deleted; steer /
- * reorder land in later changes.
+ * Each row can be steered (sent now), edited (pulled back into the composer),
+ * or deleted; reorder lands in a later change.
  */
 export function QueuedMessagesStrip({
   messages,
   onDelete,
   onEdit,
+  onSteer,
   widthClassName,
 }: QueuedMessagesStripProps) {
   if (messages.length === 0) return null;
@@ -50,6 +57,16 @@ export function QueuedMessagesStrip({
             <span className="shrink-0 text-muted-foreground/70">Queued</span>
             {/* Always visible (not hover-gated) so the actions are
                 discoverable; they brighten on hover/focus. */}
+            {onSteer ? (
+              <button
+                type="button"
+                aria-label="Send queued message now"
+                className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+                onClick={() => onSteer(message.queueId)}
+              >
+                <SendHorizontalIcon className="size-3.5" aria-hidden="true" />
+              </button>
+            ) : null}
             <button
               type="button"
               aria-label="Edit queued message"

@@ -536,6 +536,13 @@ export interface ChatState {
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
+   * Send a queued message NOW instead of waiting for the idle flush (the
+   * strip's per-row steer). Removes it from the queue and POSTs it: on an
+   * SDK harness the server live-injects it into the running turn; the
+   * optimistic bubble promotes on POST. No-op if the id isn't queued.
+   */
+  steerMessage: (queueId: string) => void;
+  /**
    * Drop all queued messages for a conversation. Called when a conversation is
    * deleted so its queue can't linger in memory (it would never flush — you
    * can't be bound to a deleted session).
@@ -858,6 +865,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId),
     }));
+  },
+
+  steerMessage: (queueId) => {
+    const s = get();
+    const target = s.queuedMessages.find((m) => m.queueId === queueId);
+    const agentId = target?.agentId ?? s.boundAgentId;
+    if (target === undefined || agentId === null) return;
+    // Remove BEFORE the POST so a concurrent flush can't also send it.
+    set({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
+    void s.send(target.text, agentId, target.files);
   },
 
   clearQueuedMessages: (conversationId) => {
