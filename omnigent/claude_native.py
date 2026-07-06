@@ -151,14 +151,15 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
 }
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
-# families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface a second
-# Sonnet generation (e.g. Sonnet 4.6) alongside the "sonnet" alias pinned to
-# the newest Sonnet, for workspaces where both are in active use.
+# families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
+# as an opt-in *alongside* the "sonnet" alias, which stays pinned to the
+# workspace's existing default Sonnet (4.6). This keeps the default Sonnet
+# unchanged and adds the newer generation as a separate, explicit choice.
 # See https://code.claude.com/docs/en/model-config#custom-model-options
 _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION"
 _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
-_UCODE_CLAUDE_CUSTOM_TIER = "sonnet_4_6"
-_UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 4.6"
+_UCODE_CLAUDE_CUSTOM_TIER = "sonnet_5"
+_UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",

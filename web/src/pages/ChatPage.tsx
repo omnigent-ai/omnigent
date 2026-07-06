@@ -4995,16 +4995,17 @@ export function shouldShowCodexGoalControl(
  * bound spec ``llmModel`` to its tier alias (e.g.
  * ``"anthropic/claude-opus-4-8"`` matches ``"opus"``).
  *
- * Sonnet 4.6 is special-cased both ways: its concrete id ("...-sonnet-4-6")
+ * Sonnet 5 is special-cased both ways: its concrete id ("...-sonnet-5")
  * would otherwise substring-match the generic "sonnet" row (since "sonnet"
- * is itself a substring), and its own row's id ("sonnet_4_6") never
- * literally appears in a hyphenated concrete id.
+ * is itself a substring), and its own opt-in row id ("sonnet_5") never
+ * literally appears in a hyphenated concrete id. The default "sonnet" row
+ * stays bound to the older Sonnet (4.6), which collapses to it normally.
  */
 export function isModelImplicitlySelected(modelId: string, llmModel: string | null): boolean {
   if (!llmModel) return false;
-  const isSonnet46 = llmModel.includes("sonnet-4-6") || llmModel.includes("sonnet_4_6");
-  if (modelId === "sonnet_4_6") return isSonnet46;
-  if (modelId === "sonnet" && isSonnet46) return false;
+  const isSonnet5 = llmModel.includes("sonnet-5") || llmModel.includes("sonnet_5");
+  if (modelId === "sonnet_5") return isSonnet5;
+  if (modelId === "sonnet" && isSonnet5) return false;
   return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
 }
 

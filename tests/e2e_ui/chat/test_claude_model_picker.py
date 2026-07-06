@@ -7,13 +7,14 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
-# Capability order, most powerful first; "sonnet_4_6" is Claude Code's one
-# custom /model slot pinned to the older Sonnet generation.
+# Capability order, most powerful first. The default "sonnet" alias stays
+# bound to Sonnet 4.6; "sonnet_5" is Claude Code's one custom /model slot,
+# an opt-in for the newer Sonnet offered alongside it.
 _EXPECTED_ROWS = [
     ("fable", "Fable"),
     ("opus", "Opus"),
-    ("sonnet", "Sonnet 5"),
-    ("sonnet_4_6", "Sonnet 4.6"),
+    ("sonnet", "Sonnet 4.6"),
+    ("sonnet_5", "Sonnet 5"),
     ("haiku", "Haiku"),
 ]
 
@@ -25,7 +26,7 @@ def _patch_session_as_claude_native(page: Page, session_id: str) -> list[dict]:
     boot against the real app/server. This route patch changes only ``GET``
     and ``PATCH /v1/sessions/{session_id}`` responses as seen by the browser,
     simulating the snapshot of a claude-native (Claude Code terminal) session
-    bound to a concrete Sonnet 4.6 gateway model.
+    bound to a concrete Sonnet 5 gateway model.
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
@@ -62,9 +63,9 @@ def _patch_session_as_claude_native(page: Page, session_id: str) -> list[dict]:
             "omnigent.wrapper": "claude-code-native-ui",
         }
         payload["harness"] = "claude"
-        # A concrete older-generation id: must light up the "Sonnet 4.6" row,
-        # not the generic "sonnet" row (both ids contain "sonnet").
-        payload["llm_model"] = "databricks-claude-sonnet-4-6"
+        # A concrete newer-generation id: must light up the opt-in "Sonnet 5"
+        # row, not the default "sonnet" row (both ids contain "sonnet").
+        payload["llm_model"] = "databricks-claude-sonnet-5"
         latest_payload = dict(payload)
         route.fulfill(
             status=200,
@@ -80,12 +81,13 @@ def test_claude_native_picker_lists_fable_and_both_sonnets(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The picker offers Fable, Opus, Sonnet 5, Sonnet 4.6, and Haiku.
+    """The picker offers Fable, Opus, Sonnet 4.6, Sonnet 5, and Haiku.
 
-    Covers the user-facing change: Fable returns to the list, and the two
-    Sonnet generations are separate, version-labelled rows. The bound
-    Sonnet 4.6 model must highlight its own row rather than the generic
-    Sonnet row — the substring-disambiguation this change adds.
+    Covers the user-facing change: Fable returns to the list, and the newer
+    Sonnet is added as a separate opt-in row without moving the default
+    "sonnet" alias. The bound Sonnet 5 model must highlight its own opt-in
+    row rather than the default Sonnet row — the substring-disambiguation
+    this change adds.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -108,19 +110,19 @@ def test_claude_native_picker_lists_fable_and_both_sonnets(
         expect(row).to_have_attribute("data-model-id", model_id)
         expect(row).to_contain_text(label)
 
-    # The bound databricks-claude-sonnet-4-6 model implicitly selects its own
-    # row; the generic "sonnet" row (Sonnet 5) must not light up too.
-    sonnet_46_row = page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_4_6"]')
-    expect(sonnet_46_row).to_have_attribute("data-active", "true")
-    sonnet_5_row = page.locator('[data-testid="model-picker-item"][data-model-id="sonnet"]')
-    expect(sonnet_5_row).not_to_have_attribute("data-active", "true")
+    # The bound databricks-claude-sonnet-5 model implicitly selects the opt-in
+    # row; the default "sonnet" row (Sonnet 4.6) must not light up too.
+    sonnet_5_row = page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]')
+    expect(sonnet_5_row).to_have_attribute("data-active", "true")
+    sonnet_default_row = page.locator('[data-testid="model-picker-item"][data-model-id="sonnet"]')
+    expect(sonnet_default_row).not_to_have_attribute("data-active", "true")
 
 
-def test_claude_native_sonnet_4_6_selection_persists(
+def test_claude_native_sonnet_5_selection_persists(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Picking Sonnet 4.6 PATCHes its id and the trigger shows the label.
+    """Picking Sonnet 5 PATCHes its id and the trigger shows the label.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -143,7 +145,7 @@ def test_claude_native_sonnet_4_6_selection_persists(
             and response.status == 200
         )
     ):
-        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_4_6"]').click()
+        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]').click()
 
-    assert patch_bodies[-1] == {"model_override": "sonnet_4_6"}
-    expect(trigger).to_contain_text("Sonnet 4.6")
+    assert patch_bodies[-1] == {"model_override": "sonnet_5"}
+    expect(trigger).to_contain_text("Sonnet 5")
