@@ -53,12 +53,61 @@ function joinSource(src: string | string[] | undefined): string {
 // rendered directly.
 const SAFE_IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+// A data-URI built from malformed base64 (wrong length, stray chars, data after
+// padding) is rejected by the browser with ERR_INVALID_URL — showing a broken
+// image with no explanation. Validate before building the URI so we can fall
+// back to a note instead. Length must be a multiple of 4 with padding only at
+// the end; length % 4 === 1 is never valid base64.
+function isValidBase64(b64: string): boolean {
+  return /^[A-Za-z0-9+/]*={0,2}$/.test(b64) && b64.length % 4 === 0;
+}
+
+// Notebooks in the wild embed raw C0 control characters (most often ANSI escape
+// sequences in traceback/output text) directly inside JSON string literals,
+// which strict JSON.parse rejects ("Bad control character in string literal").
+// Escape any control char that appears *inside* a string to its \uXXXX form,
+// leaving structural whitespace between tokens untouched.
+function escapeControlCharsInStrings(content: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    if (!inString) {
+      out += ch;
+      if (ch === '"') inString = true;
+      continue;
+    }
+    if (escaped) {
+      out += ch;
+      escaped = false;
+    } else if (ch === "\\") {
+      out += ch;
+      escaped = true;
+    } else if (ch === '"') {
+      out += ch;
+      inString = false;
+    } else if (content.charCodeAt(i) < 0x20) {
+      out += `\\u${content.charCodeAt(i).toString(16).padStart(4, "0")}`;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
 function parseNotebook(content: string): { notebook?: Notebook; error?: string } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
-  } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
+  } catch {
+    // Retry once with stray control characters escaped — real notebooks often
+    // contain unescaped ANSI codes in cell output that strict JSON rejects.
+    try {
+      parsed = JSON.parse(escapeControlCharsInStrings(content));
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
   }
   const nb = parsed as Notebook;
   if (!nb || typeof nb !== "object" || !Array.isArray(nb.cells)) {
@@ -68,8 +117,17 @@ function parseNotebook(content: string): { notebook?: Notebook; error?: string }
 }
 
 function AnsiText({ text, className }: { text: string; className?: string }) {
+  // Outputs (tracebacks especially) contain long unbroken runs — separator
+  // rules, file paths — that word-wrapping can't split. Wrap where possible
+  // (overflow-wrap) but let anything unbreakable scroll horizontally within the
+  // cell rather than pushing the whole preview wide.
   return (
-    <pre className={cn("whitespace-pre-wrap break-words font-mono text-xs p-2", className)}>
+    <pre
+      className={cn(
+        "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-xs p-2",
+        className,
+      )}
+    >
       <Ansi>{text}</Ansi>
     </pre>
   );
@@ -93,22 +151,34 @@ function OutputView({ output }: { output: NotebookOutput }) {
   // representation.
   const data = output.data ?? {};
   const imageMime = SAFE_IMAGE_MIMES.find((m) => data[m] !== undefined);
+  let imageError: string | undefined;
   if (imageMime) {
-    const b64 = joinSource(data[imageMime]).replace(/\n/g, "");
-    return (
-      <img
-        src={`data:${imageMime};base64,${b64}`}
-        alt="notebook output"
-        className="max-w-full my-1"
-      />
-    );
+    // Strip *all* whitespace, not just newlines: base64 payloads split across
+    // JSON-array lines can carry CRLF or stray spaces, and a data-URI with any
+    // whitespace in it is rejected by the browser (renders as a broken image).
+    const b64 = joinSource(data[imageMime]).replace(/\s/g, "");
+    if (isValidBase64(b64)) {
+      return (
+        <img
+          src={`data:${imageMime};base64,${b64}`}
+          alt="notebook output"
+          className="max-w-full my-1"
+        />
+      );
+    }
+    // Corrupt payload: don't emit a broken <img> — note it and fall through to
+    // the text/plain repr below (matplotlib etc. usually include one).
+    imageError = `Image output (${imageMime}) could not be decoded.`;
   }
 
   const plain = data["text/plain"] !== undefined ? joinSource(data["text/plain"]) : undefined;
   const suppressedHtml = data["text/html"] !== undefined;
-  if (plain === undefined && !suppressedHtml) return null;
+  if (plain === undefined && !suppressedHtml && imageError === undefined) return null;
   return (
     <div>
+      {imageError && (
+        <div className="text-xs text-muted-foreground italic px-2 pt-1">{imageError}</div>
+      )}
       {suppressedHtml && (
         <div className="text-xs text-muted-foreground italic px-2 pt-1">
           Rich HTML output hidden — showing plain text.

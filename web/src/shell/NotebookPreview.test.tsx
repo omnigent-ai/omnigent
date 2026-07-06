@@ -49,6 +49,59 @@ describe("NotebookPreview — typical notebook", () => {
     expect(img).not.toBeNull();
     expect(img!.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
   });
+
+  it("strips all whitespace from base64 images (CRLF-split payloads stay valid)", () => {
+    // A payload split across array lines with CRLF endings and a stray space —
+    // a data-URI containing any whitespace is rejected by the browser.
+    const nb = JSON.stringify({
+      nbformat: 4,
+      cells: [
+        {
+          cell_type: "code",
+          execution_count: 1,
+          source: [],
+          outputs: [
+            {
+              output_type: "display_data",
+              data: { "image/png": ["iVBORw0K\r\n", "GgoA AAAN\n"] },
+            },
+          ],
+        },
+      ],
+    });
+    const { container } = render(<NotebookPreview content={nb} />);
+    const src = container.querySelector("img")!.getAttribute("src")!;
+    expect(src).toBe("data:image/png;base64,iVBORw0KGgoAAAAN");
+    expect(src).not.toMatch(/\s/);
+  });
+
+  it("falls back to a note (not a broken img) for corrupt base64 images", () => {
+    // length % 4 === 1 is never valid base64 — a browser rejects the data-URI
+    // with ERR_INVALID_URL. Show the text/plain repr with a note instead.
+    const nb = JSON.stringify({
+      nbformat: 4,
+      cells: [
+        {
+          cell_type: "code",
+          execution_count: 1,
+          source: [],
+          outputs: [
+            {
+              output_type: "display_data",
+              data: {
+                "image/png": "not@valid#base64!",
+                "text/plain": "<Figure size 640x480 with 1 Axes>",
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const { container } = render(<NotebookPreview content={nb} />);
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getByText(/could not be decoded/)).toBeInTheDocument();
+    expect(screen.getByText(/Figure size 640x480/)).toBeInTheDocument();
+  });
 });
 
 describe("NotebookPreview — edge cases", () => {
@@ -57,6 +110,10 @@ describe("NotebookPreview — edge cases", () => {
     expect(screen.getAllByText(/ZeroDivisionError/).length).toBeGreaterThan(0);
     // ansi-to-react must consume the escape sequences, not print them.
     expect(container.textContent).not.toContain("[0;31m");
+    // Long unbroken traceback runs (separator rules, paths) must scroll within
+    // the cell, not widen the layout — the output <pre> owns the overflow.
+    const tb = screen.getAllByText(/ZeroDivisionError/)[0].closest("pre");
+    expect(tb!.className).toContain("overflow-x-auto");
   });
 
   it("never executes or injects script from hostile text/html outputs", () => {
@@ -91,5 +148,19 @@ describe("NotebookPreview — invalid input", () => {
   it("rejects valid JSON that is not a notebook", () => {
     render(<NotebookPreview content='{"foo": 1}' />);
     expect(screen.getByText(/missing cells array/)).toBeInTheDocument();
+  });
+
+  it("recovers from raw control characters (unescaped ANSI) in cell output", () => {
+    // A notebook whose stream output carries a bare ESC (0x1B) and newline —
+    // strict JSON.parse rejects these, but the preview escapes and recovers.
+    const nb = `{"nbformat": 4, "cells": [
+      {"cell_type": "code", "execution_count": 1, "source": ["print(x)"],
+       "outputs": [{"output_type": "stream", "name": "stdout",
+         "text": ["\x1b[31mred\x1b[0m line one\nline two"]}]}
+    ]}`;
+    render(<NotebookPreview content={nb} />);
+    // Parse recovered (no error state) and the output text is rendered.
+    expect(screen.queryByText(/Cannot render notebook/)).toBeNull();
+    expect(screen.getByText(/line one/)).toBeInTheDocument();
   });
 });
