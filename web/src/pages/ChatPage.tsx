@@ -3654,7 +3654,6 @@ export function Composer({
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
   const dequeueMessage = useChatStore((s) => s.dequeueMessage);
   const steerMessage = useChatStore((s) => s.steerMessage);
-  const isNativeTerminalSession = useChatStore((s) => s.isNativeTerminalSession);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
   // carries no fresh idle transition) still sends instead of stranding. Hold
@@ -4381,12 +4380,7 @@ export function Composer({
           dequeueMessage(queueId);
           textareaRef.current?.focus();
         }}
-        onSteer={
-          // Steer (send now → server live-injects mid-turn) only where the
-          // harness supports it. Native terminals buffer & drain rather than
-          // inject, so no steer button there until that path lands.
-          isNativeTerminalSession ? undefined : (queueId) => steerMessage(queueId)
-        }
+        onSteer={(queueId) => steerMessage(queueId)}
         widthClassName={CHAT_COLUMN_WIDTH}
       />
       {/* Sub-agent context tray — peeks above the card; reserves its own
