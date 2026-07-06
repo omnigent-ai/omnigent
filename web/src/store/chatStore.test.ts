@@ -7523,6 +7523,24 @@ describe("chatStore — client-side message queue", () => {
     expect(sendSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("steerMessage works on a native-terminal session (harness-agnostic)", () => {
+    // Steer is offered for native sessions too: the runner delivers the POSTed
+    // message via buffer→drain and the native app folds it in. steerMessage
+    // itself doesn't branch on the harness — it just sends now.
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      isNativeTerminalSession: true,
+      send: sendSpy,
+      queuedMessages: [{ queueId: "q_1", text: "steer me", conversationId: "conv_abc" }],
+    });
+    useChatStore.getState().steerMessage("q_1");
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["steer me", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it("maybeFlushQueuedHead flushes the head FIFO, one per idle", async () => {
     // Spy on send so the flush's contract (which head, in what order) is
     // asserted without depending on the full bind→/events network path.
