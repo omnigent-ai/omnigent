@@ -3653,10 +3653,14 @@ export function Composer({
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
-  // carries no fresh idle transition) still sends instead of stranding.
+  // carries no fresh idle transition) still sends instead of stranding. Hold
+  // while unreachable: flushing would POST into a void (no executor / no host
+  // to wake), bypassing onSend's reconnect dialog. The next reachable render
+  // re-fires this effect and drains.
   useEffect(() => {
+    if (unreachable) return;
     maybeFlushQueuedHead();
-  }, [status, sessionStatus, queuedMessages, conversationId, maybeFlushQueuedHead]);
+  }, [status, sessionStatus, queuedMessages, conversationId, unreachable, maybeFlushQueuedHead]);
   const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
     conversationId,
     showCodexGoal,

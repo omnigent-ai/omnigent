@@ -7523,9 +7523,78 @@ describe("chatStore — client-side message queue", () => {
       queuedMessages: [{ queueId: "q_1", text: "elsewhere", conversationId: "conv_other" }],
     });
     useChatStore.getState().maybeFlushQueuedHead();
-    // The head belongs to conv_other, so it stays put.
+    // The only queued message belongs to conv_other, so nothing flushes here.
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["elsewhere"]);
     expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  // Regression: the queue is one flat array across conversations. An undrained
+  // message from another conversation must NOT block the bound conversation's
+  // messages — flush the first message OF THE BOUND CONVERSATION, not the global
+  // array head. A head-only guard stranded the local messages forever.
+  it("flushes past a foreign head to reach the bound conversation's message", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [
+        // Foreign message sits at index 0 (queued in conv_other, never drained).
+        { queueId: "q_1", text: "foreign", conversationId: "conv_other" },
+        { queueId: "q_2", text: "mine-1", conversationId: "conv_abc" },
+        { queueId: "q_3", text: "mine-2", conversationId: "conv_abc" },
+      ],
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    // The bound conversation's FIRST message flushes; the foreign head is left
+    // untouched, and the bound conversation's FIFO order is preserved.
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["mine-1", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "foreign",
+      "mine-2",
+    ]);
+  });
+
+  // Regression: a message flushes to the agent it was COMPOSED for, even if the
+  // binding changed (e.g. a /model switch) between enqueue and drain.
+  it("flushes to the agent captured at enqueue time, not the current binding", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    // Bound to agent_one when queuing.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_one",
+      status: "streaming",
+      sessionStatus: "running",
+      send: sendSpy,
+    });
+    useChatStore.getState().enqueueMessage("composed for one", undefined);
+    expect(useChatStore.getState().queuedMessages[0]!.agentId).toBe("agent_one");
+
+    // Binding changes to agent_two, then the session idles and flushes.
+    useChatStore.setState({ boundAgentId: "agent_two", status: "idle", sessionStatus: "idle" });
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["composed for one", "agent_one"]);
+  });
+
+  it("clearQueuedMessages drops only the given conversation's messages", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "q_1", text: "a1", conversationId: "conv_abc" },
+        { queueId: "q_2", text: "b1", conversationId: "conv_other" },
+        { queueId: "q_3", text: "a2", conversationId: "conv_abc" },
+      ],
+    });
+    useChatStore.getState().clearQueuedMessages("conv_abc");
+    // Only conv_other's message survives.
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["b1"]);
   });
 
   it("does not flush while busy (streaming or running/waiting)", () => {

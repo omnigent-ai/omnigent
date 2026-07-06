@@ -162,6 +162,12 @@ export interface QueuedMessage {
   files?: File[];
   /** Owning conversation, so a switch/idle only flushes its own queue. */
   conversationId: string;
+  /**
+   * Agent bound when the message was queued, so it flushes to the agent it was
+   * composed for even if the binding changed meanwhile (e.g. a `/model` switch).
+   * Falls back to the current `boundAgentId` when absent.
+   */
+  agentId?: string;
 }
 
 /**
@@ -528,6 +534,12 @@ export interface ChatState {
    */
   enqueueMessage: (text: string, files?: File[]) => void;
   /**
+   * Drop all queued messages for a conversation. Called when a conversation is
+   * deleted so its queue can't linger in memory (it would never flush — you
+   * can't be bound to a deleted session).
+   */
+  clearQueuedMessages: (conversationId: string) => void;
+  /**
    * Flush the queue head if the session is idle and ready. Level-triggered:
    * safe to call on any state change (idempotent — no-ops when busy, when the
    * queue is empty, or when the head isn't for the bound conversation). POSTing
@@ -818,14 +830,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
   historyGeneration: 0,
 
   enqueueMessage: (text, files) => {
-    const conversationId = get().conversationId;
+    const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     set((s) => ({
       queuedMessages: [
         ...s.queuedMessages,
-        { queueId, text, conversationId, ...(files && files.length > 0 ? { files } : {}) },
+        {
+          queueId,
+          text,
+          conversationId,
+          ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
+          ...(files && files.length > 0 ? { files } : {}),
+        },
       ],
     }));
     // A message queued while the agent is idle (a race where the send routed
@@ -834,14 +852,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     get().maybeFlushQueuedHead();
   },
 
+  clearQueuedMessages: (conversationId) => {
+    set((s) => {
+      if (!s.queuedMessages.some((m) => m.conversationId === conversationId)) return {};
+      return {
+        queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+      };
+    });
+  },
+
   maybeFlushQueuedHead: () => {
     const s = get();
-    const head = s.queuedMessages[0];
-    // Only when fully idle (both the local send lifecycle AND the server-side
-    // session status), for the bound conversation, with an agent to send to.
+    // Only when fully idle: both the local send lifecycle AND the server-side
+    // session status. No agent → nothing to send to.
     if (
-      head === undefined ||
-      head.conversationId !== s.conversationId ||
+      s.conversationId === null ||
       s.boundAgentId === null ||
       s.status === "streaming" ||
       s.sessionStatus === "running" ||
@@ -849,9 +874,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     ) {
       return;
     }
-    // Remove the head BEFORE the POST so a re-entrant flush can't double-send.
-    set({ queuedMessages: s.queuedMessages.slice(1) });
-    void s.send(head.text, s.boundAgentId, head.files);
+    // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
+    // the global array head. The queue is one flat array across conversations,
+    // so an undrained message from another conversation can sit at index 0; a
+    // head-only guard would let it block this conversation's messages forever.
+    const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
+    if (head === undefined) return;
+    // Remove it BEFORE the POST so a re-entrant flush can't double-send.
+    set({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
   },
 
   send: async (text, agentId, files, opts) => {
