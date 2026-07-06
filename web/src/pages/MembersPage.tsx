@@ -55,6 +55,14 @@ export function MembersPage() {
   // accounts mode — OIDC identities are owned by the IdP, so under OIDC
   // this page is a read-only user list (no action column, no modals).
   const manageable = info !== "loading" && info.accounts_enabled;
+  // Plain header/single-user mode: no auth endpoints exist. server_version
+  // distinguishes a live single-user server from a failed /v1/info probe
+  // (which uses the same accounts_enabled:false / login_url:null sentinel).
+  const isSingleUser =
+    info !== "loading" &&
+    !info.accounts_enabled &&
+    info.login_url === null &&
+    info.server_version !== null;
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
   const [users, setUsers] = useState<AccountListEntry[] | null>(null);
@@ -82,12 +90,11 @@ export function MembersPage() {
     setUsers(list);
   }, []);
 
-  // Initial load: identity probe + members list. The identity probe
-  // gates the UI (non-admins see "no access"); the list is what we
-  // render the table from. Uses the mode-agnostic `/v1/me` identity
-  // (via resolveIdentity) rather than the accounts-only `/auth/me`, so
-  // the page also works under OIDC where `/auth/me` doesn't exist.
+  // Initial load: identity probe + members list. Skipped in single-user
+  // mode since no auth endpoints exist. isSingleUser is a stable boolean
+  // so it is safe as a dep without risking infinite re-renders.
   useEffect(() => {
+    if (isSingleUser) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) {
@@ -101,9 +108,22 @@ export function MembersPage() {
       setMeIsAdmin(isAdmin);
       if (isAdmin) await refresh();
     })();
-  }, [refresh]);
+  }, [refresh, isSingleUser]);
+
+  if (isSingleUser) {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+        <h1 className="mb-2 text-2xl font-semibold">Members</h1>
+        <p className="text-sm text-muted-foreground">
+          Member management is not available in single-user mode.
+        </p>
+      </div>
+    );
+  }
 
   // Pre-admin-check render: blank loading state. min-h-full so the
+  // AppShell's outlet container governs height — we're a child view,
+  // not a full-page replacement. min-h-full so the
   // AppShell's outlet container governs height — we're a child view,
   // not a full-page replacement.
   if (meIsAdmin === null) {

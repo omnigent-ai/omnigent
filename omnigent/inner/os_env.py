@@ -1347,6 +1347,7 @@ def _shell_impl(
         return {
             "stdout": _truncate_output(stdout, "stdout", max_output),
             "stderr": _truncate_output(stderr, "stderr", max_output),
+            "exit_code": None,
             "timed_out": True,
             "error": f"Command timed out after {timeout} seconds",
             "shell": shell_path,

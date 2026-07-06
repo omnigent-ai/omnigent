@@ -32,7 +32,7 @@ from omnigent.policies.builtins.routing import (
     _INTENT_KEY,
     POLICY_REGISTRY,
     deny_trivial_to_expensive_model,
-    intent_gate,
+    intent_based_authorization,
 )
 
 from .helpers import llm_request_event
@@ -495,7 +495,7 @@ def test_registry_entry_well_formed() -> None:
     """
     handlers = {e["handler"] for e in POLICY_REGISTRY}
     assert "omnigent.policies.builtins.routing.deny_trivial_to_expensive_model" in handlers
-    assert "omnigent.policies.builtins.routing.intent_gate" in handlers
+    assert "omnigent.policies.builtins.routing.intent_based_authorization" in handlers
 
     trivial_entry = next(
         e
@@ -510,13 +510,13 @@ def test_registry_entry_well_formed() -> None:
     intent_entry = next(
         e
         for e in POLICY_REGISTRY
-        if e["handler"] == "omnigent.policies.builtins.routing.intent_gate"
+        if e["handler"] == "omnigent.policies.builtins.routing.intent_based_authorization"
     )
     assert intent_entry["kind"] == "factory"
     assert intent_entry["params_schema"]["required"] == []
 
 
-# ── intent_gate ───────────────────────────────────────────────────────────────
+# ── intent_based_authorization ───────────────────────────────────────────────────────────────
 
 
 def _request_event(message: str, *, state: dict | None = None) -> dict[str, Any]:
@@ -555,9 +555,9 @@ def _off_task_response() -> _FakeResponse:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_captures_first_request() -> None:
+async def test_intent_based_authorization_captures_first_request() -> None:
     """First request records intent in session_state."""
-    policy = intent_gate()
+    policy = intent_based_authorization()
     result = await policy(_request_event("fix the login bug"))
     assert result is not None
     assert result["result"] == "ALLOW"
@@ -566,9 +566,9 @@ async def test_intent_gate_captures_first_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_ignores_subsequent_requests() -> None:
+async def test_intent_based_authorization_ignores_subsequent_requests() -> None:
     """Once intent is recorded, further request events are ignored."""
-    policy = intent_gate()
+    policy = intent_based_authorization()
     result = await policy(
         _request_event(
             "now write a poem",
@@ -579,16 +579,16 @@ async def test_intent_gate_ignores_subsequent_requests() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_empty_request_abstains() -> None:
+async def test_intent_based_authorization_empty_request_abstains() -> None:
     """Blank first message abstains — nothing to record."""
-    policy = intent_gate()
+    policy = intent_based_authorization()
     assert await policy(_request_event("   ")) is None
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_non_tool_phases_abstain() -> None:
+async def test_intent_based_authorization_non_tool_phases_abstain() -> None:
     """Non-request, non-tool_call phases are ignored."""
-    policy = intent_gate()
+    policy = intent_based_authorization()
     for phase in ("tool_result", "response", "llm_request", "llm_response"):
         event: dict[str, Any] = {
             "type": phase,
@@ -601,10 +601,10 @@ async def test_intent_gate_non_tool_phases_abstain() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_on_task_allows_and_caches() -> None:
+async def test_intent_based_authorization_on_task_allows_and_caches() -> None:
     """ON_TASK verdict allows and caches in session_state."""
     client = _FakePolicyLLMClient(_on_task_response())
-    policy = intent_gate()
+    policy = intent_based_authorization()
     result = await policy(
         _tool_call_event(
             "read_file",
@@ -621,10 +621,10 @@ async def test_intent_gate_on_task_allows_and_caches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_off_task_denies_and_caches() -> None:
-    """OFF_TASK verdict denies with reason and caches."""
+async def test_intent_based_authorization_off_task_asks_and_caches() -> None:
+    """OFF_TASK verdict asks with reason and caches."""
     client = _FakePolicyLLMClient(_off_task_response())
-    policy = intent_gate()
+    policy = intent_based_authorization()
     result = await policy(
         _tool_call_event(
             "send_email",
@@ -633,7 +633,7 @@ async def test_intent_gate_off_task_denies_and_caches() -> None:
         )
     )
     assert result is not None
-    assert result["result"] == "DENY"
+    assert result["result"] == "ASK"
     assert "send_email" in result["reason"]
     assert "fix the login bug" in result["reason"]
     updates = {u["key"]: u["value"] for u in result["state_updates"]}
@@ -642,10 +642,10 @@ async def test_intent_gate_off_task_denies_and_caches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_cached_on_task_skips_llm() -> None:
+async def test_intent_based_authorization_cached_on_task_skips_llm() -> None:
     """Cached ON_TASK allows without calling the classifier."""
     client = _FakePolicyLLMClient(_off_task_response())
-    policy = intent_gate()
+    policy = intent_based_authorization()
 
     intent = "fix the login bug"
     tool = "read_file"
@@ -665,10 +665,10 @@ async def test_intent_gate_cached_on_task_skips_llm() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_cached_off_task_denies_without_llm() -> None:
-    """Cached OFF_TASK denies without calling the classifier."""
+async def test_intent_based_authorization_cached_off_task_asks_without_llm() -> None:
+    """Cached OFF_TASK asks without calling the classifier."""
     client = _FakePolicyLLMClient(_on_task_response())
-    policy = intent_gate()
+    policy = intent_based_authorization()
 
     intent = "fix the login bug"
     tool = "send_email"
@@ -684,24 +684,24 @@ async def test_intent_gate_cached_off_task_denies_without_llm() -> None:
         )
     )
     assert result is not None
-    assert result["result"] == "DENY"
+    assert result["result"] == "ASK"
     client._mock_create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_no_intent_abstains() -> None:
+async def test_intent_based_authorization_no_intent_abstains() -> None:
     """tool_call without a stored intent abstains (fail-open)."""
     client = _FakePolicyLLMClient(_off_task_response())
-    policy = intent_gate()
+    policy = intent_based_authorization()
     result = await policy(_tool_call_event("send_email", llm_client=client))
     assert result is None
     client._mock_create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_no_llm_client_abstains() -> None:
+async def test_intent_based_authorization_no_llm_client_abstains() -> None:
     """tool_call with no llm_client abstains (fail-open)."""
-    policy = intent_gate()
+    policy = intent_based_authorization()
     result = await policy(
         _tool_call_event(
             "send_email",
@@ -713,11 +713,11 @@ async def test_intent_gate_no_llm_client_abstains() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intent_gate_classifier_failure_abstains() -> None:
+async def test_intent_based_authorization_classifier_failure_abstains() -> None:
     """LLM exception during classification abstains (fail-open)."""
     client = _FakePolicyLLMClient(_on_task_response())
     client._mock_create.side_effect = RuntimeError("timeout")
-    policy = intent_gate()
+    policy = intent_based_authorization()
     result = await policy(
         _tool_call_event(
             "read_file",

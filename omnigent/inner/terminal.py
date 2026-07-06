@@ -55,6 +55,130 @@ logger = logging.getLogger(__name__)
 
 _TMUX_CONFIG_PATH = os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
+
+# Web-terminal attach transports. ``pty`` forks a full ``tmux attach`` client
+# and streams the rendered screen (see terminals/ws_bridge.py); ``control``
+# attaches a ``tmux -C`` control-mode client and streams per-pane ``%output``
+# so the browser xterm owns scrollback + selection (see
+# terminals/control_bridge.py). Both speak the identical browser wire protocol
+# so they are interchangeable per attach.
+TERMINAL_TRANSPORT_PTY = "pty"
+TERMINAL_TRANSPORT_CONTROL = "control"
+_VALID_TERMINAL_TRANSPORTS = frozenset({TERMINAL_TRANSPORT_PTY, TERMINAL_TRANSPORT_CONTROL})
+# Values that select the PTY path in the config file, beyond the canonical
+# ``pty`` name — the common falsy spellings so ``transport: false`` / ``: off``
+# reads as PTY. Any other value (including ``control`` and truthy spellings)
+# falls through to the control default.
+_TRANSPORT_PTY_ALIASES = frozenset({TERMINAL_TRANSPORT_PTY, "0", "false", "no", "off"})
+# Config-file location for the global default (``~/.omnigent/config.yaml``,
+# honoring ``OMNIGENT_CONFIG_HOME`` for test isolation — same resolution the
+# runner and CLI use). The transport lives under the ``terminal:`` table as
+# ``terminal.transport``.
+_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
+_TERMINAL_CONFIG_TABLE = "terminal"
+_TERMINAL_TRANSPORT_CONFIG_KEY = "transport"
+
+
+def _global_config_path() -> Path:
+    """Return the global Omnigent config path visible to this process.
+
+    Mirrors :func:`omnigent.runner._entry._runner_config_path` (kept local to
+    avoid an inner→runner import): honors :envvar:`OMNIGENT_CONFIG_HOME` for
+    test isolation and subprocess consistency, else ``~/.omnigent/config.yaml``.
+
+    :returns: Config path, e.g. ``Path("~/.omnigent/config.yaml")``.
+    """
+    config_home = os.environ.get(_CONFIG_HOME_ENV_VAR)
+    if config_home:
+        return Path(config_home).expanduser() / "config.yaml"
+    return Path.home() / ".omnigent" / "config.yaml"
+
+
+def _global_terminal_transport_default() -> str:
+    """Resolve the process-wide default web-terminal transport from config.
+
+    Reads ``terminal.transport`` from ``~/.omnigent/config.yaml`` at call time
+    (not import time) so a config edit takes effect on the next attach without
+    a restart, and tests can point :envvar:`OMNIGENT_CONFIG_HOME` at a scratch
+    config. Control mode is the default; set ``terminal.transport`` to a PTY
+    alias to opt out. Recognized values (case-insensitive):
+
+    - Missing / ``control`` / ``1`` / ``true`` / ``yes`` / ``on`` → ``control``.
+    - ``pty`` / ``0`` / ``false`` / ``no`` / ``off`` → ``pty``.
+    - Anything else → ``control`` (the default), so a typo can't strand an
+      operator on the legacy path.
+
+    A missing file, unreadable file, malformed YAML, or missing key all fall
+    back to the control default — reading the transport must never crash an
+    attach.
+
+    :returns: ``"control"`` or ``"pty"``.
+    """
+    raw = _read_terminal_transport_config()
+    if raw is not None and raw.strip().lower() in _TRANSPORT_PTY_ALIASES:
+        return TERMINAL_TRANSPORT_PTY
+    return TERMINAL_TRANSPORT_CONTROL
+
+
+def _read_terminal_transport_config() -> str | None:
+    """Read ``terminal.transport`` from the global config, or ``None``.
+
+    Best-effort: any failure (missing/unreadable file, non-mapping YAML,
+    absent table/key, non-string value) returns ``None`` so the caller uses
+    the control default. Never raises.
+
+    :returns: The raw configured transport string, or ``None`` when unset.
+    """
+    import yaml
+
+    path = _global_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    table = raw.get(_TERMINAL_CONFIG_TABLE)
+    if not isinstance(table, dict):
+        return None
+    value = table.get(_TERMINAL_TRANSPORT_CONFIG_KEY)
+    return value if isinstance(value, str) else None
+
+
+def resolve_terminal_transport(
+    *,
+    override: str | None = None,
+    spec_transport: str | None = None,
+) -> str:
+    """Pick the web-terminal attach transport for one attach.
+
+    Resolution order (first match wins):
+
+    1. ``override`` — a per-attach ``?transport=control|pty`` query, letting a
+       dev A/B two open terminals side by side right now.
+    2. ``spec_transport`` — the per-terminal / per-harness
+       :attr:`TerminalEnvSpec.terminal_transport`, the gradual-rollout dial.
+    3. The global default from :func:`_global_terminal_transport_default`
+       — ``control`` unless ``terminal.transport`` in ``~/.omnigent/config.yaml``
+       opts out to ``pty``.
+
+    Unrecognized values at any level are ignored (fall through) so a stray
+    query string can never break an attach.
+
+    :param override: Per-attach transport request, e.g. ``"control"``.
+    :param spec_transport: The terminal spec's declared transport, or ``None``.
+    :returns: ``"control"`` or ``"pty"``.
+    """
+    for candidate in (override, spec_transport):
+        if candidate is not None and candidate.strip().lower() in _VALID_TERMINAL_TRANSPORTS:
+            return candidate.strip().lower()
+    return _global_terminal_transport_default()
+
+
 _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # Each terminal instance lives in a private tmpdir with this prefix
 # (see ``create_terminal_instance``). The owner-pid marker inside it
@@ -784,6 +908,11 @@ class TerminalInstance:
     # Enabled for the claude-native agent terminal so a single inner-CLI exit no
     # longer reaps the server and cascades into ``no server running`` (#540).
     keep_alive_after_exit: bool = False
+    # Preferred web-attach transport for this terminal (``"pty"`` /
+    # ``"control"``), or ``None`` to defer to the global default. Read by the
+    # attach routes via :func:`resolve_terminal_transport`; does not affect how
+    # the tmux server itself is launched.
+    terminal_transport: str | None = None
     running: bool = False
     launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
@@ -1840,6 +1969,7 @@ def create_terminal_instance(
         tmux_allow_passthrough=spec.tmux_allow_passthrough,
         tmux_start_on_attach=spec.tmux_start_on_attach,
         keep_alive_after_exit=spec.keep_alive_after_exit,
+        terminal_transport=spec.terminal_transport,
     )
 
     return TerminalCreateResult(instance=instance, cwd=cwd)
