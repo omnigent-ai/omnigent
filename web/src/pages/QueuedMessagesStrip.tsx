@@ -1,4 +1,4 @@
-import { ClockIcon, PencilIcon, SendHorizontalIcon, Trash2Icon } from "lucide-react";
+import { ClockIcon, CornerDownRightIcon, PencilIcon, Trash2Icon } from "lucide-react";
 
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
@@ -54,17 +54,17 @@ export function QueuedMessagesStrip({
           >
             <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">{message.text}</span>
-            <span className="shrink-0 text-muted-foreground/70">Queued</span>
             {/* Always visible (not hover-gated) so the actions are
                 discoverable; they brighten on hover/focus. */}
             {onSteer ? (
               <button
                 type="button"
                 aria-label="Send queued message now"
-                className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+                className="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
                 onClick={() => onSteer(message.queueId)}
               >
-                <SendHorizontalIcon className="size-3.5" aria-hidden="true" />
+                <CornerDownRightIcon className="size-3.5" aria-hidden="true" />
+                Steer
               </button>
             ) : null}
             <button

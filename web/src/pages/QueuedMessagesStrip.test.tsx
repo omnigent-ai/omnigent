@@ -34,8 +34,6 @@ describe("QueuedMessagesStrip", () => {
     );
     expect(screen.getByText("first")).toBeInTheDocument();
     expect(screen.getByText("second")).toBeInTheDocument();
-    // Each row carries the "Queued" label.
-    expect(screen.getAllByText("Queued")).toHaveLength(2);
   });
 
   it("calls onDelete with the row's queueId when its remove button is clicked", () => {
