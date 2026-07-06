@@ -285,41 +285,39 @@ function assert(name, cond, detail) {
   assert("capped overflow is warned",
     r.warnings.some((w) => /capping push-down/.test(w)), JSON.stringify(r.warnings));
 
-  // 17. LLM ranking overrides load within the candidate pool: dhruv0811 has the
-  //     lowest load (would win on load alone), but the rank prefers dbczumar, an
-  //     inner owner -- so dbczumar is chosen.
+  // 17. Load beats LLM rank: dhruv0811 has the lowest load (0) and wins even
+  //     though the rank prefers dbczumar (rank 0 but load 1).
   r = await run({
     files: ["omnigent/inner/foo.py"],
     load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
     rank: ["dbczumar", "TomeHirata", "SabhyaC26", "dhruv0811"],
   });
-  assert("LLM rank beats load within the area pool",
-    JSON.stringify(r.added) === JSON.stringify(["dbczumar"]), JSON.stringify(r));
+  assert("load beats LLM rank within the area pool",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
 
   // 18. Allowlist enforcement: a rank naming someone who does NOT own the touched
   //     area (PattaraS is a maintainer + pool member, but not an inner owner) is
-  //     ignored for that entry; the ranking only reorders actual candidates, so
-  //     the next ranked inner owner (dbczumar) wins -- never PattaraS.
+  //     ignored; the ranking only reorders actual candidates. Load is primary, so
+  //     dhruv0811 (load 0) wins over dbczumar (load 1) -- never PattaraS.
   r = await run({
     files: ["omnigent/inner/foo.py"],
     load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1, PattaraS: 0 },
     rank: ["PattaraS", "dbczumar", "TomeHirata", "SabhyaC26", "dhruv0811"],
   });
   assert("LLM rank cannot route outside the area owners",
-    JSON.stringify(r.added) === JSON.stringify(["dbczumar"]) && !r.added.includes("PattaraS"),
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]) && !r.added.includes("PattaraS"),
     JSON.stringify(r));
 
-  // 19. Unranked candidates (rank omits them) sort after ranked ones but still by
-  //     load: rank lists only SabhyaC26 (highest load); the rest are unranked, so
-  //     SabhyaC26 -- despite load 5 -- is preferred because a finite rank beats
-  //     Infinity. Confirms the rank-primary / load-secondary ordering.
+  // 19. Load is primary even when only one candidate is ranked: rank lists only
+  //     SabhyaC26 (load 5); dhruv0811 is unranked but has load 0, so dhruv0811
+  //     wins. Confirms the load-primary / rank-secondary ordering.
   r = await run({
     files: ["omnigent/inner/foo.py"],
     load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
     rank: ["SabhyaC26"],
   });
-  assert("a ranked high-load owner beats unranked low-load owners",
-    JSON.stringify(r.added) === JSON.stringify(["SabhyaC26"]), JSON.stringify(r));
+  assert("unranked low-load owner beats ranked high-load owner",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
 
   // 20. Adoption still overrides the LLM rank: a linked-issue maintainer assignee
   //     (TomeHirata) is adopted as reviewer even when the rank prefers someone
