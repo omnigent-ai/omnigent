@@ -5483,6 +5483,71 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it("a stale wrapper response_end does NOT downgrade a newer turn's activeResponse", async () => {
+    // Hermes-native first-turn spinner bug: the runner opens an empty wrapper
+    // response that completes AFTER the forwarder's per-turn id (hermes_turn_1)
+    // has already taken over activeResponse. The wrapper's response_end must be
+    // ignored for lifecycle — otherwise it finalizes the LIVE turn to
+    // "completed", stopping its tool cards streaming (the "no spinner" bug).
+    useChatStore.setState({
+      conversationId: "conv_stale",
+      blocks: [],
+      activeResponse: null,
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_stale",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    // 1) The empty wrapper response opens → activeResponse adopts its id.
+    sink.push(sse("response.created", { id: "resp_wrap", status: "in_progress", output: [] }));
+    await tick();
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "resp_wrap",
+      state: "streaming",
+      error: null,
+    });
+
+    // 2) The forwarder's per-turn running edge takes over activeResponse.
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_stale",
+      status: "running",
+      responseId: "hermes_turn_1",
+    });
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "hermes_turn_1",
+      state: "streaming",
+      error: null,
+    });
+
+    // 3) The stale wrapper completes (empty). Its response_end targets
+    //    resp_wrap, which is no longer the active response, so it must NOT
+    //    touch activeResponse.
+    sink.push(sse("response.completed", { id: "resp_wrap", status: "completed", output: [] }));
+    sink.close();
+    await tick();
+    await tick();
+
+    // The live turn is still streaming — its cards keep their spinner.
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "hermes_turn_1",
+      state: "streaming",
+      error: null,
+    });
+
+    controller.abort();
+  });
+
   it("dedupes a stream block whose itemId already exists (snapshot collision)", async () => {
     // Seed a block as if the snapshot hydrated item "fc_dup" already.
     const seeded: AnyBlock = {

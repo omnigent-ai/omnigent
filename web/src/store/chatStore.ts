@@ -3258,10 +3258,23 @@ export async function pumpStreamEvents(
         // Force-flush buffer + marker before the terminal side effects so
         // the bubble's final content commits with its lifecycle transition.
         flush(block);
+        // Ignore a terminal for a response that is NOT the currently-active
+        // one. A native-terminal harness (e.g. hermes-native) can emit an
+        // empty runner wrapper response that completes AFTER the forwarder's
+        // per-turn id has already taken over `activeResponse`; applying this
+        // stale terminal would downgrade the live turn to "completed" (its
+        // tool cards stop streaming), flip the session to idle, and prune the
+        // in-flight preview — the first-turn "no spinner" bug. On a matching
+        // (or absent) active response this is the normal terminal path.
+        const active = get().activeResponse;
+        const endedId = block.response?.id ?? block.ctx?.responseId ?? "";
+        if (active !== null && active.responseId !== endedId) {
+          continue;
+        }
         // If the active response was already marked cancelled by an
         // earlier `session.interrupted`, keep that. Session events
         // are the authoritative source for user-initiated terminals.
-        if (get().activeResponse?.state !== "cancelled") {
+        if (active?.state !== "cancelled") {
           const errorMsg = block.response?.error?.message ?? null;
           finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
         }
