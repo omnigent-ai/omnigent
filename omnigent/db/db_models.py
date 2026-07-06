@@ -749,6 +749,73 @@ class SqlHost(Base):
     )
 
 
+class SqlPublishedAgent(Base):
+    """
+    SQLAlchemy model for the ``published_agents`` table.
+
+    Represents a community-published agent in the registry. Each row
+    is a distinct ``name@version`` publication — multiple versions of
+    the same agent name co-exist as separate rows.
+
+    :param id: Unique publication identifier, e.g. ``"pa_0f1a2b3c..."``.
+    :param name: Slug-style agent name, e.g. ``"code-reviewer"``.
+        Combined with ``version``, must be unique.
+    :param version: Semver string, e.g. ``"1.2.0"``.
+    :param harness: Executor harness, e.g. ``"claude-sdk"`` or ``"codex"``.
+    :param description: Human-readable description of the agent's purpose.
+    :param category: Optional high-level category, e.g. ``"coding"``,
+        ``"research"``, ``"ops"``.
+    :param tags: JSON-encoded list of searchable tags,
+        e.g. ``'["rag","typescript"]'``.
+    :param prompt_excerpt: First ~200 characters of the system prompt,
+        surfaced on the detail page.
+    :param network_access: Whether the agent makes outbound network
+        requests.
+    :param write_access: Whether the agent writes to the filesystem.
+    :param guardrails: Human-readable summary of restrictions or safety
+        policies applied to this agent, e.g. ``"Read-only; no shell access"``.
+    :param author: Publisher handle or email address.
+    :param source_url: Link to the agent's source repository or raw YAML.
+    :param stars_count: Denormalised cumulative star count for fast
+        browse sorting. Incremented by ``POST /v1/registry/{name}/star``.
+    :param bundle_location: Artifact store key for the downloadable
+        agent bundle, e.g. ``"pa_abc123/a1b2c3d4..."``. ``None`` when
+        no bundle has been uploaded (source-URL-only publication).
+    :param created_at: Unix epoch seconds when the agent was published.
+    :param updated_at: Unix epoch seconds of the last metadata update,
+        or ``None`` if never updated after initial publication.
+    """
+
+    __tablename__ = "published_agents"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256))
+    version: Mapped[str] = mapped_column(String(32))
+    harness: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(Text)
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tags: Mapped[str] = mapped_column(Text, default="[]", server_default=text("'[]'"))
+    prompt_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    network_access: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    write_access: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    guardrails: Mapped[str | None] = mapped_column(Text, nullable=True)
+    author: Mapped[str] = mapped_column(String(256))
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stars_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    bundle_location: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("name", "version", name="uq_published_agents_name_version"),
+        Index("ix_published_agents_name", "name"),
+        Index("ix_published_agents_category", "category"),
+        Index("ix_published_agents_harness", "harness"),
+        Index("ix_published_agents_created_at", "created_at"),
+        Index("ix_published_agents_stars_count", "stars_count"),
+    )
+
+
 class SqlUserDailyCost(Base):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.

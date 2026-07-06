@@ -579,6 +579,16 @@ _ITEM_TYPE_PREFIX: dict[str, str] = {
 }
 
 
+def generate_registry_id() -> str:
+    """
+    Generate a unique registry publication identifier.
+
+    :returns: A string of the form ``"pa_<32-char hex>"``,
+        e.g. ``"pa_0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
+    """
+    return f"pa_{uuid.uuid4().hex}"
+
+
 def generate_agent_id() -> str:
     """
     Generate a unique agent identifier.

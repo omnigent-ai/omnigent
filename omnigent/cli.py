@@ -2988,6 +2988,7 @@ def server(
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.registry_store.sqlalchemy_store import SqlAlchemyRegistryStore
 
     cfg = _load_config(config_path)
 
@@ -3012,6 +3013,7 @@ def server(
     file_store = SqlAlchemyFileStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri)
     comment_store = SqlAlchemyCommentStore(db_uri)
+    registry_store = SqlAlchemyRegistryStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
@@ -3155,6 +3157,7 @@ def server(
         file_store=file_store,
         conversation_store=conversation_store,
         comment_store=comment_store,
+        registry_store=registry_store,
         policy_store=policy_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
