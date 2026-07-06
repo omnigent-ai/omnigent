@@ -411,7 +411,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         # The base class passes "ENV=val omnigent host --server ...", so
         # "omnigent" is never at position 0. Replace it wherever it appears.
         invoke = command.replace("omnigent ", f"{_PYTHON} {_OMNIGENT} ", 1)
-        bg_command = f"{invoke} > {log_path} 2>&1 < /dev/null"
+        bg_command = f"{invoke} > {log_path} 2>&1"
         self._openshell().exec_background(
             sandbox_id, ["bash", "-lc", bg_command], timeout=_FOREGROUND_TIMEOUT_S
         )
