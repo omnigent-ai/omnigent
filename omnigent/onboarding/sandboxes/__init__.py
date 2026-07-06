@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+from collections.abc import Sequence
 
 import click
 
@@ -70,6 +71,7 @@ _LAUNCHERS: dict[str, str] = {
     # On-demand Kubernetes runner Pod via the official kubernetes client (the
     # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
     "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
+    "sbx": "omnigent.onboarding.sandboxes.sbx:SbxSandboxLauncher",
 }
 
 
@@ -94,11 +96,18 @@ def available_providers() -> tuple[str, ...]:
     return tuple(available)
 
 
-def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxLauncher:
+def get_launcher(
+    provider: str,
+    *,
+    workspace_host: str | None = None,
+    kits: Sequence[str] | None = None,
+) -> SandboxLauncher:
     """
     Resolve a provider name to a launcher instance.
 
     :param provider: Provider name, e.g. ``"lakebox"``.
+    :param kits: sbx kit references applied at provision time. Consumed
+        only by the ``sbx`` provider; other providers ignore it.
     :param workspace_host: Databricks workspace fronting the target
         server (derived from ``--server`` via
         :func:`~omnigent.onboarding.sandboxes.bootstrap.derive_workspace`),
@@ -126,6 +135,13 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
         from omnigent.onboarding.sandboxes.lakebox import LakeboxLauncher
 
         return LakeboxLauncher(workspace_host=workspace_host)
+    if provider == "sbx":
+        from omnigent.onboarding.sandboxes.sbx import SbxSandboxLauncher
+
+        # An empty tuple (Click's `--kit` default when unspecified) means
+        # "not passed" — collapse it to None so the OMNIGENT_SBX_KITS
+        # env-var fallback is still consulted.
+        return SbxSandboxLauncher(kits=kits or None)
     module_name, _, class_name = target.partition(":")
     module = importlib.import_module(module_name)
     launcher_cls: type[SandboxLauncher] = getattr(module, class_name)

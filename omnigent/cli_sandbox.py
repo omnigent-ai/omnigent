@@ -176,6 +176,11 @@ def sandbox() -> None:
       islo     Uses the built-in HTTP client. Needs ISLO_API_KEY
                (and optionally ISLO_BASE_URL for non-default API
                endpoints).
+      sbx      Local Docker Sandbox microVM (no cloud account). Needs the
+               `sbx` CLI (https://docs.docker.com/ai/sandboxes/) + `sbx
+               login`. Bind-mounts the current directory; each sandbox has
+               its own Docker daemon for nested dev containers. Apply
+               personal config with `--kit <ref>` (repeatable).
 
     For provider-side sandbox lifecycle (list / status / delete /
     start / stop), use the provider's own CLI or dashboard directly
@@ -205,6 +210,12 @@ def sandbox() -> None:
     "sandbox_name",
     default=None,
     help="Label for the new sandbox.",
+)
+@click.option(
+    "--kit",
+    "kits",
+    multiple=True,
+    help="sbx kit reference to apply at provision (repeatable). Only used by --provider sbx.",
 )
 @click.option(
     "--server",
@@ -241,6 +252,7 @@ def sandbox_create(
     provider: str,
     sandbox_id: str | None,
     sandbox_name: str | None,
+    kits: tuple[str, ...],
     server_url: str,
     repo_root: Path | None,
     skip_auth: bool,
@@ -270,7 +282,9 @@ def sandbox_create(
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
     launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+        provider,
+        workspace_host=workspace.host if workspace is not None else None,
+        kits=kits,
     )
     _require_cli_bootstrap(launcher)
     # The in-sandbox login only exists for providers that can forward
