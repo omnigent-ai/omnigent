@@ -33,6 +33,7 @@ import {
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { coercePolicyParams } from "@/lib/policyParams";
 
 // ---------------------------------------------------------------------------
@@ -350,6 +351,15 @@ function AddDefaultPolicyDialog({
 // ---------------------------------------------------------------------------
 
 export function PoliciesPage() {
+  const info = useServerInfo();
+  // Plain header/single-user mode: no auth endpoints exist. server_version
+  // distinguishes a live single-user server from a failed /v1/info probe
+  // (which uses the same accounts_enabled:false / login_url:null sentinel).
+  const isSingleUser =
+    info !== "loading" &&
+    !info.accounts_enabled &&
+    info.login_url === null &&
+    info.server_version !== null;
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const { data: policies = [], refetch } = useDefaultPolicies();
   const { data: registry = [] } = usePolicyRegistry();
@@ -368,17 +378,18 @@ export function PoliciesPage() {
   }, [refetch]);
 
   // Admin probe via the mode-agnostic `/v1/me` identity (works under OIDC
-  // too, unlike the accounts-only `/auth/me`). resolveIdentity handles the
-  // login redirect when unauthenticated, so we only set the admin flag here.
+  // too, unlike the accounts-only `/auth/me`). Skipped in single-user mode
+  // because no auth endpoints exist and the backend skips admin enforcement.
   useEffect(() => {
+    if (isSingleUser) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
     })();
-  }, []);
+  }, [isSingleUser]);
 
-  if (meIsAdmin === null) {
+  if (!isSingleUser && meIsAdmin === null) {
     return (
       <div className="flex min-h-full items-center justify-center text-sm text-muted-foreground">
         Loading...
@@ -386,7 +397,7 @@ export function PoliciesPage() {
     );
   }
 
-  if (meIsAdmin === false) {
+  if (!isSingleUser && meIsAdmin === false) {
     return (
       <div className="mx-auto w-full max-w-2xl px-6 py-12">
         <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>
