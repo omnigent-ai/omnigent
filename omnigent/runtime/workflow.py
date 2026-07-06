@@ -2388,7 +2388,7 @@ async def compact_conversation_now(
         return CompactionResult(messages=[], summary_metadata=None)
 
     effective_llm_config = _apply_request_model_override(llm_config, model_override)
-    effective_llm_config = _route_databricks_model_for_compaction(effective_llm_config)
+    effective_llm_config = _route_bare_model_for_compaction(effective_llm_config)
     compaction_config = spec.compaction
     if preserve_recent_window is not None:
         # The compaction helper's boundary is inclusive: recent_window=1
@@ -2454,20 +2454,36 @@ async def compact_conversation_now(
     return result
 
 
-def _route_databricks_model_for_compaction(llm_config: LLMConfig) -> LLMConfig:
+def _route_bare_model_for_compaction(llm_config: LLMConfig) -> LLMConfig:
     """
-    Route bare Databricks model ids through the Databricks LLM adapter.
+    Prefix bare model ids so compaction's generic client picks the right provider.
 
-    Normal openai-agents execution handles ``databricks-gpt-*`` via its
-    harness-specific Databricks client. Explicit ``/compact`` uses the
-    generic runtime LLM client; without a provider prefix that client
-    defaults to OpenAI and incorrectly calls api.openai.com.
+    Normal harness execution infers the provider from the harness (e.g.
+    ``claude-sdk`` → Anthropic, ``openai-agents`` → Databricks/OpenAI).
+    Explicit ``/compact`` instead uses the generic runtime LLM client,
+    whose :func:`~omnigent.llms.routing.parse_model_string` defaults any
+    prefix-less id to OpenAI — so a bare ``databricks-*`` or Anthropic
+    ``claude-*`` id gets sent to ``api.openai.com`` and the summarization
+    call fails with a 500 (issue #1950). Already-prefixed ids
+    (``anthropic/…``, ``openai/…``) and bare ``gpt-*`` (correctly OpenAI)
+    are left untouched.
 
     :param llm_config: Effective LLM config for the session.
-    :returns: ``llm_config`` or a copy with ``model='databricks/<id>'``.
+    :returns: ``llm_config`` unchanged, or a copy with a provider-prefixed model.
     """
-    if llm_config.model.startswith("databricks-"):
-        return replace(llm_config, model=f"databricks/{llm_config.model}")
+    model = llm_config.model
+    if "/" in model:
+        # Already provider-prefixed (e.g. "anthropic/claude-…") — trust it.
+        return llm_config
+    if model.startswith("databricks-"):
+        return replace(llm_config, model=f"databricks/{model}")
+    if model.startswith("claude-"):
+        # Bare Anthropic id (e.g. "claude-haiku-4-5-20251001") — route to
+        # Anthropic instead of the prefix-less OpenAI default.
+        return replace(llm_config, model=f"anthropic/{model}")
+    # ponytail: only databricks + anthropic here — the /compact failures seen
+    # in the wild. Other bare non-OpenAI prefixes (deepseek-, moonshot-, …)
+    # would need the same nudge if they ever surface.
     return llm_config
 
 
