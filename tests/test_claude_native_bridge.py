@@ -73,7 +73,11 @@ def subprocess_bridge_root() -> Iterator[Path]:
         ``python -m omnigent.claude_native_bridge`` accepts bridge
         writes without inheriting pytest monkeypatches.
     """
-    production_root = Path("/tmp") / f"omnigent-{os.getuid()}" / "claude-native"
+    production_root = (
+        Path(tempfile.gettempdir())
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+    )
     production_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(production_root.parent, 0o700)
     os.chmod(production_root, 0o700)
@@ -334,6 +338,21 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     # Confirm the bearer token did NOT land in the attacker-controlled
     # directory — the refusal happened before any file write.
     assert not (attacker_dir / "bridge.json").exists()
+
+
+def test_ensure_secure_dir_succeeds_without_getuid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows lacks ``os.getuid()``; bridge dir creation must still work."""
+    monkeypatch.delattr(os, "getuid", raising=False)
+
+    bridge_dir = tmp_path / "bridge-without-getuid"
+
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+
+    assert bridge_dir.is_dir()
 
 
 def test_trusted_parent_accepts_qwen_native_bridge_dir(
@@ -2354,7 +2373,10 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
     Code would refuse to start with that capability advertised under
     org policy, breaking the native wrapper.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -3280,7 +3302,10 @@ async def test_channel_server_relays_active_omnigent_tools(
     This fails if Claude Code can receive web-channel inputs but cannot
     call the Omnigent tools made available to the server-side agent.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_tools", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -3487,7 +3512,10 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     ``-32000: Connection closed``). Without the guard, the decode error kills
     ``_serve_mcp`` and the ``tools/list`` read below times out.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_crash", workspace=tmp_path)
 

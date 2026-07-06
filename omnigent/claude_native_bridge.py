@@ -677,8 +677,10 @@ def _ensure_secure_dir(target: Path) -> None:
     each ancestor from that trusted parent down to ``target``,
     creating new ones with mode 0o700 and rejecting any existing
     ancestor that is a symlink, not a directory, owned by a different
-    uid, or has group/other permission bits set. Wrong-but-repairable
-    modes on dirs we own are reset to 0o700.
+    uid, or has group/other permission bits set where POSIX uid/mode
+    semantics are available. Wrong-but-repairable POSIX modes on dirs we own
+    are reset to 0o700. On Windows, where Python exposes no POSIX uid/mode
+    ownership model, directory protection relies on the OS ACLs instead.
 
     :param target: Final bridge directory path to ensure, e.g.
         ``Path("/tmp/omnigent-501/claude-native/abc")``.
@@ -694,7 +696,8 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
-    my_uid = getattr(os, "getuid", lambda: -1)()
+    getuid = getattr(os, "getuid", None)
+    my_uid = getuid() if getuid is not None else None
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)
@@ -706,12 +709,12 @@ def _ensure_secure_dir(target: Path) -> None:
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
         if not stat.S_ISDIR(st.st_mode):
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if st.st_uid != my_uid:
+        if my_uid is not None and st.st_uid != my_uid:
             raise RuntimeError(
                 f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
                 f"{st.st_uid}, not current user ({my_uid})"
             )
-        if (st.st_mode & 0o077) != 0:
+        if my_uid is not None and (st.st_mode & 0o077) != 0:
             os.chmod(ancestor, 0o700)
 
 

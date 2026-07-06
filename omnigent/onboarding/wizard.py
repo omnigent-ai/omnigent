@@ -26,6 +26,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 
+from omnigent._platform import IS_WINDOWS
+
 console = Console()
 
 # ANSI helpers - used in arrow-menu labels (rendered via sys.stdout.write,
@@ -75,7 +77,22 @@ def _arrow_menu(
 
     # Fall back to number input if not a real terminal.
     if not sys.stdin.isatty():
-        return _arrow_menu_fallback(options, default=default, disabled=disabled, multi=multi)
+        return _arrow_menu_fallback(
+            options,
+            default=default,
+            disabled=disabled,
+            multi=multi,
+            allow_back=allow_back,
+        )
+
+    if IS_WINDOWS:
+        return _arrow_menu_fallback(
+            options,
+            default=default,
+            disabled=disabled,
+            multi=multi,
+            allow_back=allow_back,
+        )
 
     import select as _select
     import termios
@@ -222,18 +239,23 @@ def _arrow_menu_fallback(
     default: int = 0,
     disabled: set[int] | None = None,
     multi: bool = False,
+    allow_back: bool = True,
 ) -> int | list[int]:
     """Non-interactive fallback when stdin is not a tty."""
     disabled = disabled or set()
     for i, label in enumerate(options):
         marker = " [unavailable]" if i in disabled else ""
         console.print(f"  {i + 1}. {label}{marker}")
+    if allow_back:
+        console.print("  q. Go back")
     console.print()
 
     if multi:
         while True:
             available = ",".join(str(i + 1) for i in range(len(options)) if i not in disabled)
             raw = str(click.prompt("Select (comma-separated)", default=available))
+            if allow_back and raw.strip().lower() == "q":
+                raise _GoBack
             try:
                 indices = [int(x.strip()) - 1 for x in raw.split(",")]
                 if all(0 <= i < len(options) and i not in disabled for i in indices) and indices:
@@ -244,6 +266,8 @@ def _arrow_menu_fallback(
     else:
         while True:
             raw = str(click.prompt("Choice", default=str(default + 1)))
+            if allow_back and raw.strip().lower() == "q":
+                raise _GoBack
             try:
                 idx = int(raw) - 1
                 if 0 <= idx < len(options) and idx not in disabled:
@@ -281,6 +305,19 @@ def _text_prompt(
     """
     # Non-tty fallback -- just use click.prompt.
     if not sys.stdin.isatty():
+        raw = str(
+            click.prompt(
+                label,
+                default=default or "",
+                show_default=bool(default),
+                hide_input=hide_input,
+            )
+        )
+        if not raw.strip() and not default:
+            raise _GoBack
+        return raw.strip() or default or ""
+
+    if IS_WINDOWS:
         raw = str(
             click.prompt(
                 label,

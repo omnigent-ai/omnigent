@@ -93,6 +93,19 @@ def test_select_fallback_returns_chosen_index(
     assert "2. beta" in out
 
 
+def test_select_uses_numbered_fallback_on_windows_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TTY selection still works on Windows, where raw-termios menus are unavailable."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(interactive, "IS_WINDOWS", True)
+    _feed(monkeypatch, ["2"])
+
+    result = interactive.select("Pick one", ["alpha", "beta"])
+
+    assert result == 1
+
+
 def test_select_fallback_reprompts_on_invalid_then_accepts(
     non_tty: None,
     monkeypatch: pytest.MonkeyPatch,
