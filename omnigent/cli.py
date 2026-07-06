@@ -2600,8 +2600,8 @@ def _start_cli_runner_process(
         ``~/.omnigent/logs`` location; tests should pass a
         temporary directory to avoid writing to the developer's
         real home.
-    :param prewarm_spec_path: Optional YAML path; the runner spawns
-        its MCPs during the upload window. See designs/RUNNER_MCP.md.
+    :param prewarm_spec_path: Optional YAML path; the runner registers
+        its MCP routing metadata during startup without opening transports.
     :param isolate_session: ``True`` for shared-host runners;
         enables per-session workspace isolation so each
         session gets its own subdirectory. ``False`` (default)
