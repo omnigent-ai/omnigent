@@ -1,4 +1,4 @@
-import { ClockIcon, XIcon } from "lucide-react";
+import { ClockIcon, Trash2Icon } from "lucide-react";
 
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
@@ -52,7 +52,7 @@ export function QueuedMessagesStrip({
               className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
               onClick={() => onDelete(message.queueId)}
             >
-              <XIcon className="size-3.5" aria-hidden="true" />
+              <Trash2Icon className="size-3.5" aria-hidden="true" />
             </button>
           </div>
         ))}
