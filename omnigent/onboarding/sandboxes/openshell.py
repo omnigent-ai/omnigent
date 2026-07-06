@@ -222,7 +222,14 @@ class _OpenShellClient:
             ) from exc
         return exit_code
 
-    def exec_background(self, name: str, command: Sequence[str], *, timeout: int) -> None:
+    def exec_background(
+        self,
+        name: str,
+        command: Sequence[str],
+        *,
+        timeout: int,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
         """
         Start a long-lived foreground command, holding its exec stream open.
 
@@ -245,7 +252,7 @@ class _OpenShellClient:
                     command,
                     timeout_seconds=timeout,
                     workdir=_SANDBOX_HOME,
-                    env={"HOME": _SANDBOX_HOME},
+                    env={"HOME": _SANDBOX_HOME, **(extra_env or {})},
                 ):
                     pass
             except Exception:
@@ -405,15 +412,37 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         to avoid Landlock's execve restriction on shebang scripts under ``/opt``:
         the script path is not in the default exec allowlist, but
         ``/opt/venv/bin/python3`` (an ELF binary) can exec it directly.
+
+        Environment variables are parsed out of the command string and passed
+        via the OpenShell exec RPC env parameter to guarantee they reach the
+        process, rather than relying on bash inline assignment which may not
+        survive login shell profile sourcing.
         """
+        import re
+
+        # Parse leading VAR=value pairs from the command string and extract them
+        # into a separate env dict to pass via the OpenShell exec RPC env parameter.
+        # This guarantees the env vars reach the process regardless of how bash
+        # handles inline assignments in login shells.
+        env_prefix: dict[str, str] = {}
+        remaining = command
+        env_pattern = re.compile(r"^([A-Z_][A-Z0-9_]*)=([^ ]*) ")
+        while True:
+            m = env_pattern.match(remaining)
+            if not m:
+                break
+            env_prefix[m.group(1)] = m.group(2)
+            remaining = remaining[m.end() :]
+
         _PYTHON = "/opt/venv/bin/python3"
         _OMNIGENT = "/opt/venv/bin/omnigent"
-        # The base class passes "ENV=val omnigent host --server ...", so
-        # "omnigent" is never at position 0. Replace it wherever it appears.
-        invoke = command.replace("omnigent ", f"{_PYTHON} {_OMNIGENT} ", 1)
+        invoke = remaining.replace("omnigent ", f"{_PYTHON} {_OMNIGENT} ", 1)
         bg_command = f"{invoke} > {log_path} 2>&1"
         self._openshell().exec_background(
-            sandbox_id, ["bash", "-lc", bg_command], timeout=_FOREGROUND_TIMEOUT_S
+            sandbox_id,
+            ["bash", "-lc", bg_command],
+            timeout=_FOREGROUND_TIMEOUT_S,
+            extra_env=env_prefix,
         )
         return RemoteCommandResult(returncode=0, stdout="launched\n", stderr="")
 
