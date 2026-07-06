@@ -7497,6 +7497,32 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["first", "third"]);
   });
 
+  it("steerMessage sends the chosen message now and removes it from the queue", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      send: sendSpy,
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: "conv_abc" },
+        // A message queued while bound to a different agent still steers to
+        // the agent it was composed for.
+        { queueId: "q_2", text: "second", conversationId: "conv_abc", agentId: "agent_two" },
+      ],
+    });
+
+    // Steer the second (non-head) message: it sends immediately, out of FIFO
+    // order, to the agent captured at enqueue time.
+    useChatStore.getState().steerMessage("q_2");
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["second", "agent_two"]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["first"]);
+
+    // Steering a missing id is a no-op.
+    useChatStore.getState().steerMessage("q_missing");
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("maybeFlushQueuedHead flushes the head FIFO, one per idle", async () => {
     // Spy on send so the flush's contract (which head, in what order) is
     // asserted without depending on the full bind→/events network path.

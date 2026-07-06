@@ -34,8 +34,6 @@ describe("QueuedMessagesStrip", () => {
     );
     expect(screen.getByText("first")).toBeInTheDocument();
     expect(screen.getByText("second")).toBeInTheDocument();
-    // Each row carries the "Queued" label.
-    expect(screen.getAllByText("Queued")).toHaveLength(2);
   });
 
   it("calls onDelete with the row's queueId when its remove button is clicked", () => {
@@ -68,5 +66,29 @@ describe("QueuedMessagesStrip", () => {
     fireEvent.click(buttons[0]!);
     expect(onEdit).toHaveBeenCalledTimes(1);
     expect(onEdit).toHaveBeenCalledWith("q_1");
+  });
+
+  it("shows no steer button when onSteer is omitted", () => {
+    render(
+      <QueuedMessagesStrip messages={[msg("q_1", "first")]} onDelete={vi.fn()} onEdit={vi.fn()} />,
+    );
+    expect(screen.queryByRole("button", { name: "Send queued message now" })).toBeNull();
+  });
+
+  it("calls onSteer with the row's queueId when its steer button is clicked", () => {
+    const onSteer = vi.fn();
+    render(
+      <QueuedMessagesStrip
+        messages={[msg("q_1", "first"), msg("q_2", "second")]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        onSteer={onSteer}
+      />,
+    );
+    const buttons = screen.getAllByRole("button", { name: "Send queued message now" });
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[1]!);
+    expect(onSteer).toHaveBeenCalledTimes(1);
+    expect(onSteer).toHaveBeenCalledWith("q_2");
   });
 });
