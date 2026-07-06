@@ -6033,6 +6033,52 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("does not reopen the stream while the tab is a hidden idle viewer, and reopens on return", async () => {
+    seedSession("conv_hidden", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_hidden", abortController: controller });
+
+    let hidden = false;
+    const ownDesc = Object.getOwnPropertyDescriptor(document, "hidden");
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+    const setHidden = (v: boolean) => {
+      hidden = v;
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    setHidden(false); // known-visible baseline
+
+    try {
+      const loop = startStreamPump("conv_hidden", controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sinks).toHaveLength(1); // foreground → one open stream
+
+      // Hide the tab and let it cross the idle debounce, then drop the
+      // connection (in production the idle flip aborts the live attempt).
+      // The pump must NOT reopen while hidden — the socket stays released.
+      setHidden(true);
+      await vi.advanceTimersByTimeAsync(120_000);
+      sinks[0]!.error();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(1); // gate held: no reopen while hidden
+
+      // Return to the foreground → reopen immediately.
+      setHidden(false);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(sinks).toHaveLength(2);
+
+      // End the loop cleanly via [DONE] (the reopened stream is actively
+      // pumping, so abort alone wouldn't unblock the mock reader).
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(50);
+      await loop;
+    } finally {
+      if (ownDesc) Object.defineProperty(document, "hidden", ownDesc);
+      else delete (document as unknown as { hidden?: boolean }).hidden;
+    }
+  });
+
   it("stops reconnecting (and clears the binding) when aborted after a drop", async () => {
     seedSession("conv_abrt3", []);
     const sinks = routeStreamOpens();

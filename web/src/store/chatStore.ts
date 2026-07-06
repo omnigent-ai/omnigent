@@ -2537,6 +2537,39 @@ if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () =>
     presenceIdle.handleVisibilityChange(document.hidden),
   );
+  // Seed the initial state: a tab opened in the background (session restore,
+  // open-in-new-tab) never fires a `visibilitychange`, so without this its
+  // idle debounce would never arm and it would hold its stream socket
+  // forever — re-exhausting the connection pool the whole point of this fix
+  // frees. Arming it here lets a never-focused tab release its socket too.
+  if (document.hidden) presenceIdle.handleVisibilityChange(true);
+}
+
+/**
+ * Resolve once this tab is visible again (immediately if it already is, or
+ * if `signal` aborts). Lets the stream pump release its HTTP connection
+ * while the tab is a backgrounded idle viewer: each session stream is a
+ * long-lived streaming `fetch`, and one held socket per hidden tab exhausts
+ * the browser's ~6-connections-per-origin cap, which starves new tabs and
+ * page loads (they hang on "loading"). The tab resumes streaming the
+ * instant it returns to the foreground.
+ */
+function waitForVisible(signal: AbortSignal): Promise<void> {
+  if (typeof document === "undefined" || !document.hidden || signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const onVisibility = () => {
+      if (!document.hidden) done();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    signal.addEventListener("abort", done);
+  });
 }
 
 /**
@@ -2578,6 +2611,20 @@ export async function startStreamPump(
   /* eslint-disable no-await-in-loop */
   try {
     while (!controller.signal.aborted && get().conversationId === id) {
+      // Release the socket while this tab is a backgrounded idle viewer.
+      // The idle flip already aborted the live attempt at the debounce; here
+      // we simply don't reopen until the tab is visible again, so a hidden
+      // tab holds zero stream connections instead of one. This is what keeps
+      // many open chat tabs from exhausting the ~6-connections-per-origin
+      // cap. Brief alt-tabs stay under the idle debounce and keep streaming
+      // (no reconnect churn). Trade-off: a long-hidden tab now reports "gone"
+      // (closed stream) rather than the `?idle=true` co-viewer presence flag
+      // — irrelevant on a single-user local install.
+      if (presenceIdle.idleNow()) {
+        await waitForVisible(controller.signal);
+        if (controller.signal.aborted || get().conversationId !== id) break;
+      }
+
       // Back off only between consecutive failed opens. A drop after a
       // healthy connection (the benign ~5-min ingress recycle) leaves
       // failedOpens at 0, so it reconnects instantly with no delay.

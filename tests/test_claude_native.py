@@ -6138,6 +6138,7 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
             "id": "cmp_1",
             "type": "compaction",
             "summary": "compaction summary",
+            "token_count": 4321,
             "compacted_messages": [
                 {
                     "type": "message",
@@ -6183,3 +6184,12 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
         str(r.get("message", {}).get("content", "")) for r in records if r.get("type") == "user"
     ]
     assert any("after compaction" in t for t in user_texts)
+    # The compact_boundary must carry a non-null compactMetadata: Claude
+    # destructures it on every resume-time /compact and auto-compact, and a
+    # missing object crashes compaction ("Cannot destructure property
+    # 'cumulativeDroppedTokens' from null or undefined value").
+    boundaries = [
+        r for r in records if r.get("type") == "system" and r.get("subtype") == "compact_boundary"
+    ]
+    assert len(boundaries) == 1
+    assert boundaries[0]["compactMetadata"]["postTokens"] == 4321

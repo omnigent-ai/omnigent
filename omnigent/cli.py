@@ -2963,7 +2963,10 @@ def server(
                 "(or pass --server <url> to target a different server)."
             )
             return
-        _picked = pick_local_port(port)
+        # No explicit port here (canonical = not port_was_explicit), so let
+        # the pin govern: pinned -> bind it or fail (never wander to a random
+        # port the user didn't bookmark); unpinned -> prefer 6767, else free.
+        _picked = pick_local_port()
         if _picked != port:
             click.echo(
                 f"  ⚠ port {port} is busy — using {_picked} instead.",
