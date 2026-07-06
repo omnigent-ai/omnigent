@@ -239,6 +239,12 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    # pi/cursor/kiro/goose/qwen/kimi/hermes are transcript-mirror natives: their
+    # forwarder posts each COMPLETE assistant message (external_conversation_item),
+    # never token-level external_output_text_delta, so the web UI sees the reply
+    # complete-only, not streamed. streaming=False reflects that (bench-verified
+    # for kiro-native; the others share the same forwarder shape — 0 delta posts).
+    # Contrast claude/codex/antigravity, whose forwarders do post deltas.
     "pi-native": _C(
         _IM.NATIVE_TUI,
         _EL.NONE,
@@ -248,7 +254,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     "cursor-native": _C(
         _IM.NATIVE_TUI,
@@ -259,7 +265,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     "kiro-native": _C(
@@ -271,7 +277,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -293,7 +299,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     "qwen-native": _C(
         _IM.NATIVE_TUI,
@@ -304,7 +310,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -315,7 +321,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -337,7 +343,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
