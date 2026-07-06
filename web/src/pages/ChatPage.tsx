@@ -3652,6 +3652,7 @@ export function Composer({
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
+  const dequeueMessage = useChatStore((s) => s.dequeueMessage);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
   // carries no fresh idle transition) still sends instead of stranding. Hold
@@ -4365,6 +4366,7 @@ export function Composer({
           Scope to this conversation so a queue held elsewhere never leaks in. */}
       <QueuedMessagesStrip
         messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
+        onDelete={dequeueMessage}
         widthClassName={CHAT_COLUMN_WIDTH}
       />
       {/* Sub-agent context tray — peeks above the card; reserves its own

@@ -1,4 +1,4 @@
-import { ClockIcon } from "lucide-react";
+import { ClockIcon, XIcon } from "lucide-react";
 
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
@@ -6,6 +6,8 @@ import { cn } from "@/lib/utils";
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
   messages: QueuedMessage[];
+  /** Remove a queued message by id (per-row delete). */
+  onDelete: (queueId: string) => void;
   /** Column-width class so the strip lines up with the composer card. */
   widthClassName?: string;
 }
@@ -15,10 +17,13 @@ interface QueuedMessagesStripProps {
  * busy. Peeks above the composer card (`-mb-4` + bottom padding), mirroring
  * `SubagentComposerTray`. Renders nothing when the queue is empty.
  *
- * Read-only in this iteration — per-row actions (delete / edit / steer /
- * reorder) land in later changes.
+ * Each row can be deleted; edit / steer / reorder land in later changes.
  */
-export function QueuedMessagesStrip({ messages, widthClassName }: QueuedMessagesStripProps) {
+export function QueuedMessagesStrip({
+  messages,
+  onDelete,
+  widthClassName,
+}: QueuedMessagesStripProps) {
   if (messages.length === 0) return null;
   return (
     <div
@@ -34,11 +39,19 @@ export function QueuedMessagesStrip({ messages, widthClassName }: QueuedMessages
         {messages.map((message) => (
           <div
             key={message.queueId}
-            className="flex items-center gap-1.5 text-xs text-muted-foreground"
+            className="group flex items-center gap-1.5 text-xs text-muted-foreground"
           >
             <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">{message.text}</span>
             <span className="shrink-0 text-muted-foreground/70">Queued</span>
+            <button
+              type="button"
+              aria-label="Remove queued message"
+              className="shrink-0 rounded p-0.5 text-muted-foreground/60 opacity-0 transition hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+              onClick={() => onDelete(message.queueId)}
+            >
+              <XIcon className="size-3.5" aria-hidden="true" />
+            </button>
           </div>
         ))}
       </div>
