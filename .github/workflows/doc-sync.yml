@@ -201,25 +201,30 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      # Derive the per-minor docs staging branch from the runtime version. main
-      # carries X.Y.Z.dev0, so 0.5.0.dev0 → "0.5-docs". All docs for the 0.5 line
-      # (incl. patches) stage on this one branch until release publishes it.
+      # Derive the per-minor docs staging branch and the release version from the
+      # runtime version. main carries X.Y.Z.dev0, so 0.5.0.dev0 → branch "0.5-docs"
+      # and label "v0.5.0". All docs for the 0.5 line (incl. patches) stage on the
+      # one branch until release publishes it; the vX.Y.Z label lets maintainers
+      # filter the staged PRs by the release they'll ship in.
       - name: Resolve docs branch
         id: docsbranch
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         run: |
           set -euo pipefail
-          minor="$(python3 - <<'PYEOF'
-          import pathlib, re
+          python3 - <<'PYEOF'
+          import os, pathlib, re
           text = pathlib.Path("omnigent/version.py").read_text()
-          m = re.search(r'VERSION\s*=\s*["\']([0-9]+)\.([0-9]+)', text)
+          m = re.search(r'VERSION\s*=\s*["\']([0-9]+)\.([0-9]+)\.([0-9]+)', text)
           if not m:
-              raise SystemExit("could not parse X.Y from omnigent/version.py")
-          print(f"{m.group(1)}.{m.group(2)}")
+              raise SystemExit("could not parse X.Y.Z from omnigent/version.py")
+          major, minor, patch = m.groups()
+          branch = f"{major}.{minor}-docs"
+          version = f"v{major}.{minor}.{patch}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"branch={branch}\n")
+              fh.write(f"version={version}\n")
+          print(f"::notice::Docs stage on branch {branch} (release {version})")
           PYEOF
-          )"
-          echo "branch=${minor}-docs" >> "$GITHUB_OUTPUT"
-          echo "::notice::Docs stage on branch ${minor}-docs"
 
       - name: Set up Python
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
@@ -635,6 +640,7 @@ jobs:
           PR_NUMBER: ${{ steps.plan.outputs.pr }}
           REVIEWER: ${{ steps.sitepr.outputs.reviewer }}
           DOCS_BRANCH: ${{ steps.docsbranch.outputs.branch }}
+          VERSION_LABEL: ${{ steps.docsbranch.outputs.version }}
         run: |
           set -euo pipefail
           BRANCH="auto/docs/pr-${PR_NUMBER}"
@@ -685,17 +691,27 @@ jobs:
           # bot commits.
           git push --force "$PUSH_URL" "$BRANCH"
 
+          # The vX.Y.Z label marks which release the staged docs will ship in, so
+          # maintainers can filter the site PRs by release. Ensure it exists (with
+          # automated-docs) before applying it below.
+          gh label create automated-docs --repo "$SITE_REPO_SLUG" --color 0E8A16 \
+            --description "Automated documentation update" 2>/dev/null || true
+          gh label create "$VERSION_LABEL" --repo "$SITE_REPO_SLUG" --color FBCA04 \
+            --description "Docs staged for the ${VERSION_LABEL} release" 2>/dev/null || true
+
           EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
               --json number --jq '.[0].number // empty' 2>/dev/null || true)"
           if [ -n "$EXISTING" ]; then
-            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --body-file /tmp/site_pr_body.md || true
+            # --add-label backfills PRs opened before the label existed; it's a no-op
+            # when already present.
+            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" \
+              --add-label "automated-docs" --add-label "$VERSION_LABEL" \
+              --body-file /tmp/site_pr_body.md || true
             echo "Updated site PR #$EXISTING."
           else
-            gh label create automated-docs --repo "$SITE_REPO_SLUG" --color 0E8A16 \
-              --description "Automated documentation update" 2>/dev/null || true
             if gh pr create --repo "$SITE_REPO_SLUG" --base "$DOCS_BRANCH" --head "$BRANCH" \
                 --title "docs: document ${CODE_REPO}#${PR_NUMBER}" \
-                --label automated-docs --body-file /tmp/site_pr_body.md; then
+                --label automated-docs --label "$VERSION_LABEL" --body-file /tmp/site_pr_body.md; then
               EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
                   --json number --jq '.[0].number // empty' 2>/dev/null || true)"
               echo "Opened site PR for $BRANCH."
@@ -704,13 +720,17 @@ jobs:
             fi
           fi
 
-          # Always attempt the review request, decoupled from PR creation so a
-          # non-addable reviewer can't fail the open. GitHub returns 422 for users it
-          # can't add (non-collaborators / concealed org members); tolerate it — the
-          # reviewer is also @-mentioned in the body as a durable fallback ping.
+          # Always attempt the review request + assignment, decoupled from PR creation
+          # so a non-addable reviewer can't fail the open. GitHub returns 422 for users
+          # it can't add (non-collaborators / concealed org members); tolerate it — the
+          # reviewer is also @-mentioned in the body as a durable fallback ping. The two
+          # calls are independent so one failing doesn't skip the other. Assigning makes
+          # the PR filterable by assignee from the site's PR list.
           if [ -n "${REVIEWER}" ] && [ -n "${EXISTING}" ]; then
             gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --add-reviewer "${REVIEWER}" \
               || echo "::notice::Could not request review from ${REVIEWER} (not addable); they're @-mentioned in the PR body."
+            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --add-assignee "${REVIEWER}" \
+              || echo "::notice::Could not assign ${REVIEWER} (not addable); they're @-mentioned in the PR body."
           fi
 
       - name: Note draft skipped (no site token)

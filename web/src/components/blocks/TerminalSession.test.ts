@@ -333,6 +333,26 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("does not re-send a resize when the fitted size is unchanged", () => {
+    // WHY: the WS-open handler and the ResizeObserver both drive sendResize on
+    // mount, and jsdom's fit() yields a stable size, so without deduping the
+    // control transport would receive a redundant refresh-client -C. Drive the
+    // observer callback (the real re-fit path) after open and assert exactly
+    // one resize frame total.
+    const { socket, session } = makeSession();
+    const observer = FakeResizeObserver.instances[0];
+
+    socket.open(); // first (and only distinct) resize
+    observer.cb(); // same size → must be deduped
+    observer.cb();
+
+    const resizeFrames = socket.sent.filter(
+      (m) => typeof m === "string" && m.includes('"type":"resize"'),
+    );
+    expect(resizeFrames).toHaveLength(1);
+    session.dispose();
+  });
+
   it("surfaces close code + reason and error transitions", () => {
     // WHY: the closed variant carries the WS code so consumers can tell a
     // deliberate close from a transport drop; the error handler maps to

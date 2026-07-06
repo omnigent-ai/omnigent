@@ -6,6 +6,7 @@ import {
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isNotebookPath,
   lineOverlapsSelection,
   openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
@@ -110,6 +111,22 @@ describe("isBinaryPath", () => {
   it("treats extension-less paths as non-binary", () => {
     expect(isBinaryPath("Dockerfile")).toBe(false);
   });
+});
+
+describe("isNotebookPath", () => {
+  it.each(["analysis.ipynb", "dir/Report.IPYNB", "a.b.ipynb"])(
+    "classifies %s as a notebook",
+    (path) => {
+      expect(isNotebookPath(path)).toBe(true);
+    },
+  );
+
+  it.each(["notes.md", "data.json", "ipynb", "nb.ipynb.bak"])(
+    "classifies %s as not a notebook",
+    (path) => {
+      expect(isNotebookPath(path)).toBe(false);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

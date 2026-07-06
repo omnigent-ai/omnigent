@@ -96,6 +96,12 @@ export function isBinaryPath(path: string): boolean {
   return BINARY_EXTENSIONS.has(ext);
 }
 
+/** Jupyter notebooks get a read-only rendered preview (with raw-JSON source as
+ * the escape hatch), so they are previewable like markdown/html. */
+export function isNotebookPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".ipynb");
+}
+
 // Image formats the browser can render directly via an <img> tag. SVG is
 // included but is only ever rendered through a blob URL (never inlined into
 // the DOM), so scripts embedded in it cannot execute.

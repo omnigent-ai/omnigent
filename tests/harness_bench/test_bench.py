@@ -67,6 +67,25 @@ def test_declared_covers_every_p0_dimension(profile: BenchProfile) -> None:
             )
 
 
+def test_streaming_capability_declares_binary_verdict() -> None:
+    # Guards the kiro-native drift: streaming declares binary (True→SUPPORTED,
+    # False→UNSUPPORTED), never PARTIAL.
+    from omnigent.harness_plugins import harness_capabilities
+    from tests.harness_bench.manifest import _declared_from_capabilities
+
+    caps = harness_capabilities()
+    for harness, cap in caps.items():
+        declared = _declared_from_capabilities(harness).get("streaming")
+        if declared is None:
+            continue
+        expected = Verdict.SUPPORTED if cap.streaming else Verdict.UNSUPPORTED
+        assert declared is expected, (
+            f"{harness!r}: streaming={cap.streaming} should declare {expected.name}, "
+            f"got {declared.name}"
+        )
+        assert declared is not Verdict.PARTIAL, f"{harness!r}: PARTIAL is never a declared verdict"
+
+
 def test_reconcile_flags_concrete_mismatch() -> None:
     assert reconcile(Verdict.UNSUPPORTED, Verdict.SUPPORTED) is Verdict.DRIFT
     assert reconcile(Verdict.SUPPORTED, Verdict.UNSUPPORTED) is Verdict.DRIFT
@@ -105,6 +124,17 @@ def test_infra_failure_reason_classifies_auth_and_ignores_capability_gaps() -> N
     assert infra_failure_reason(TurnResult(failed=True, error="model refused the tool")) is None
     # A successful turn is never an infra failure.
     assert infra_failure_reason(TurnResult(completed=True, text="ok")) is None
+
+    # Token-provisioning failures on full-server (codex/pi) are env/auth gaps,
+    # not capability gaps -> must yield a skip reason, never a false UNSUPPORTED
+    # that drifts against a SUPPORTED declaration.
+    for msg in (
+        "inner executor error: provider auth command `sh` produced an empty token",
+        "PiExecutor(gateway=True) could not fetch a gateway token for the workspace host.",
+        "Failed to resolve external API key auth",
+    ):
+        result = TurnResult(failed=True, error={"message": msg})
+        assert infra_failure_reason(result) is not None, msg
 
 
 async def test_offline_render_produces_matrix() -> None:
@@ -204,12 +234,55 @@ async def test_full_server_async_shims_delegate_to_sync(monkeypatch: pytest.Monk
     assert any(c.startswith("tool:") and "True" in c for c in calls)
 
 
+async def test_provisioning_failure_skips_and_tears_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A driver that raises in __aenter__ yields a skip AND is torn down.
+
+    Provisioning spawns a server + daemon before the step that can fail (an
+    own-auth native whose terminal never wires up), so the failure path must
+    call __aexit__ or those subprocesses leak for the rest of a multi-harness
+    run. Asserts both: the harness is a capability-neutral skip, and teardown ran.
+    """
+    torn_down: list[bool] = []
+
+    class _FailingDriver:
+        transport = "stub"
+
+        def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+            pass
+
+        @staticmethod
+        def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
+            return None
+
+        async def __aenter__(self):
+            # Simulates _wire_native_forwarder raising after the server/daemon
+            # are already up.
+            raise RuntimeError("native forwarder did not wire up within 90.0s")
+
+        async def __aexit__(self, *exc: object) -> None:
+            torn_down.append(True)
+
+    profile = BenchProfile(
+        harness="stub-native", model="m", env_prefix="HARNESS_STUB_NATIVE_", marker="X"
+    )
+    monkeypatch.setattr(
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override: _FailingDriver,
+    )
+
+    report = await run_harness(profile, databricks_profile="oss", live=True)
+
+    assert report.skipped_reason is not None and "provisioning failed" in report.skipped_reason
+    assert all(c.observed is Verdict.SKIPPED for c in report.cells)
+    assert torn_down == [True], "provisioning-failure path must tear down the driver"
+
+
 # ── native-tui transport (offline) ──────────────────────────────
 
 
 def test_native_tui_registered_and_gates() -> None:
-    """native-tui is in the registry and gates unwired vendors cleanly."""
-    from tests.harness_bench.native_tui_driver import NativeTuiDriver
+    """native-tui is in the registry and derives any native-tui harness."""
+    from tests.harness_bench.native_tui_driver import NativeTuiDriver, native_vendor
     from tests.harness_bench.transport import driver_registry, resolve_driver_class
 
     assert driver_registry()["native-tui"] is NativeTuiDriver
@@ -220,13 +293,42 @@ def test_native_tui_registered_and_gates() -> None:
     )
     assert resolve_driver_class(claude_native, override="native-tui") is NativeTuiDriver
 
-    # A native harness with no vendor entry (not yet wired) is a clean skip,
-    # never a crash — the walking skeleton only wires claude-native.
-    cursor_native = BenchProfile(
-        harness="cursor-native", model="m", env_prefix="HARNESS_CURSOR_NATIVE_", marker="X"
-    )
-    reason = NativeTuiDriver.unavailable(cursor_native, databricks_profile="oss")
-    assert reason is not None and "cursor-native" in reason
+    # Every native-tui harness derives a vendor from the capability model with
+    # no per-vendor table — an own-auth native (cursor) as much as a shipped
+    # credential one (claude). This is what lets a community-plugin native run
+    # by name with no bench edit.
+    assert native_vendor("claude-native") is not None
+    cursor = native_vendor("cursor-native")
+    assert cursor is not None and cursor.own_auth is True
+
+    # A non-native-tui harness derives no vendor and gates cleanly: an SDK
+    # harness, or a native-server one (opencode-native), is not this driver's.
+    assert native_vendor("claude-sdk") is None
+    codex_sdk = BenchProfile(harness="codex", model="m", env_prefix="X_", marker="X")
+    assert NativeTuiDriver.unavailable(codex_sdk, databricks_profile="oss") is not None
 
     # No profile → the same capability-neutral skip contract as other drivers.
     assert NativeTuiDriver.unavailable(claude_native, databricks_profile=None) is not None
+
+
+def test_full_server_skips_native_with_accurate_message() -> None:
+    """full-server rejects a native profile by naming the native transport.
+
+    A native harness forced onto full-server (via --transport) cannot run
+    there (bundle registration, not host-daemon provisioning). The skip must
+    name native-tui as the answer, not misreport the 'sdk-inproc' driver.
+    """
+    from tests.harness_bench.full_server_driver import FullServerDriver
+
+    # Real native profiles carry transport="native-tui" (set in the manifest);
+    # that is what the full-server gate keys on.
+    claude_native = BenchProfile(
+        harness="claude-native",
+        model="m",
+        env_prefix="HARNESS_CLAUDE_NATIVE_",
+        marker="X",
+        transport="native-tui",
+    )
+    reason = FullServerDriver.unavailable(claude_native, databricks_profile="oss")
+    assert reason is not None
+    assert "native-tui" in reason and "sdk-inproc" not in reason

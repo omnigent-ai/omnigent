@@ -8,6 +8,8 @@ subprocess and gateway load bounded.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -15,6 +17,8 @@ from tests.harness_bench.probes import ALL_PROBES, CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
 from tests.harness_bench.transport import resolve_driver_class
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict, reconcile
+
+_logger = logging.getLogger(__name__)
 
 # A progress sink: the bench calls it with human-readable status lines as it
 # spawns harnesses and runs probes. ``None`` (the default) stays silent, which
@@ -176,7 +180,29 @@ async def run_harness(
         f"(model={profile.model}); first turn may take ~10-30s...",
     )
     cells: list[CellResult] = []
-    async with driver_cls(profile, databricks_profile=databricks_profile) as driver:
+    driver_cm = driver_cls(profile, databricks_profile=databricks_profile)
+    try:
+        entered = await driver_cm.__aenter__()
+    except Exception as exc:
+        # Provisioning failed (e.g. an own-auth native whose vendor CLI is
+        # installed but not logged in, so its terminal never wires up). Report
+        # a capability-neutral skip for this harness rather than aborting the
+        # whole run — a multi-harness run must survive one unrunnable harness.
+        #
+        # __aenter__ may have already spawned the server + daemon and opened a
+        # client before raising, so tear those down here or they leak for the
+        # rest of the run (_teardown null-checks each, so a half-provisioned
+        # driver is safe to tear down). Log the traceback: this branch also
+        # catches genuine driver bugs (e.g. an AssertionError), which must not
+        # vanish silently behind a green-looking skip.
+        _logger.warning("provisioning failed for %s", profile.harness, exc_info=True)
+        with contextlib.suppress(Exception):
+            await driver_cm.__aexit__(type(exc), exc, exc.__traceback__)
+        reason = f"provisioning failed: {exc}"
+        _emit(progress, f"[{profile.harness}] skipped: {reason}")
+        return _uniform_report(profile, probes, ProbeResult.skipped(reason), skipped_reason=reason)
+    try:
+        driver = entered
         prereq_skip: str | None = None
         for probe in probes:
             if not _applicable(probe, profile):
@@ -202,6 +228,8 @@ async def run_harness(
             # they would only re-hit the same failure and pollute the matrix.
             if probe.name == _PREREQ_PROBE and cell.observed is not Verdict.SUPPORTED:
                 prereq_skip = f"prerequisite '{probe.title}' did not pass ({observed.note})"
+    finally:
+        await driver_cm.__aexit__(None, None, None)
     return HarnessReport(profile=profile, cells=cells)
 
 

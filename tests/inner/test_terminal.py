@@ -16,10 +16,63 @@ import pytest
 import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
+    TERMINAL_TRANSPORT_CONTROL,
+    TERMINAL_TRANSPORT_PTY,
     TerminalInstance,
     create_terminal_instance,
+    resolve_terminal_transport,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+
+
+def _write_transport_config(config_home: Path, value: str | None) -> None:
+    """Write ``terminal.transport: <value>`` into a scratch config.yaml.
+
+    :param config_home: Directory used as ``OMNIGENT_CONFIG_HOME``.
+    :param value: Transport value to persist, or ``None`` to write a config
+        with no ``terminal`` table.
+    """
+    body = "" if value is None else f"terminal:\n  transport: {value}\n"
+    (config_home / "config.yaml").write_text(body, encoding="utf-8")
+
+
+def test_resolve_terminal_transport_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Override beats spec, spec beats config, config opts out of the control default."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    # No config file at all → control mode is the default.
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
+
+    # A config with no terminal table → still control.
+    _write_transport_config(tmp_path, None)
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
+
+    # terminal.transport opts OUT to the legacy PTY path.
+    _write_transport_config(tmp_path, "pty")
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_PTY
+    _write_transport_config(tmp_path, "false")
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_PTY
+
+    # A control/ truthy value keeps control mode.
+    _write_transport_config(tmp_path, "control")
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
+
+    # Spec beats config: config opts out globally, but this terminal forces control.
+    _write_transport_config(tmp_path, "pty")
+    assert resolve_terminal_transport(spec_transport="control") == TERMINAL_TRANSPORT_CONTROL
+
+    # Per-attach override beats spec.
+    assert (
+        resolve_terminal_transport(override="pty", spec_transport="control")
+        == TERMINAL_TRANSPORT_PTY
+    )
+    # Unrecognized override values fall through to the spec rather than break.
+    assert (
+        resolve_terminal_transport(override="garbage", spec_transport="pty")
+        == TERMINAL_TRANSPORT_PTY
+    )
 
 
 @dataclass
