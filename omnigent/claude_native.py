@@ -3525,6 +3525,14 @@ def _claude_transcript_records_from_session_items(
                         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                         "uuid": boundary_uuid,
                         "level": "info",
+                        # Claude scans every compact_boundary and destructures
+                        # compactMetadata; a missing object crashes /compact
+                        # (and auto-compact) on resume. token_count is the
+                        # post-compaction summary size.
+                        "compactMetadata": {
+                            "trigger": "auto",
+                            "postTokens": item.get("token_count"),
+                        },
                     }
                 )
                 parent_uuid = boundary_uuid
