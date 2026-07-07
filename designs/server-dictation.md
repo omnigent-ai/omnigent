@@ -1,0 +1,177 @@
+# Server-side streaming dictation
+
+## Problem
+
+The composer mic button (`web/src/components/ComposerMicButton.tsx`) relies on
+the browser Web Speech API. That API is only backed by a real recognizer in
+official Chrome/Safari builds (Google/Apple cloud speech); it is unavailable
+in Electron, Firefox, Chromium, and most self-hosted contexts. Today the
+button renders nothing (or "Dictation unavailable") in those environments —
+`web/electron/README.md` documents the gap and prescribes the fix: capture
+audio in the client and transcribe it on the Omnigent server.
+
+This design adds that path: a streaming speech-to-text WebSocket on the
+server, backed by a local [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
+model (CPU, no cloud, no per-request cost), with the mic button falling back
+to it whenever Web Speech is unavailable.
+
+## Goals
+
+- Dictation works in Electron, Firefox/Chromium, and the iOS/Android wrappers
+  (mic permissions are already wired in all three).
+- Audio never leaves the operator's infrastructure.
+- Live partial transcripts stream into the composer while the user speaks
+  (the Web Speech path today only inserts final utterances).
+- Zero new required dependencies: the STT engine ships as an optional extra
+  (`omnigent[dictation]`), imported lazily, mirroring the `s3`/`modal`/
+  `daytona` extras' posture. Servers without the extra (or without models)
+  report `available: false` and the web UI silently keeps its current
+  behavior.
+
+## Non-goals
+
+- Voice *conversations* (TTS replies, wake words, hands-free turn taking).
+- Replacing the Web Speech path where it works today.
+- Terminal REPL dictation (possible follow-up; shares the engine).
+- Speaker diarization, translation, non-English models beyond whatever
+  sherpa-onnx model the operator installs.
+
+## Server
+
+### Engine — `omnigent/server/dictation.py`
+
+A small engine layer isolates sherpa-onnx behind a protocol so tests (and a
+future alternate backend, e.g. an OpenAI-compatible transcription API) don't
+need the native dependency:
+
+```python
+class DictationStreamHandle(Protocol):
+    def accept_pcm16(self, data: bytes) -> None: ...   # 16 kHz mono s16le
+    def decode(self) -> DictationUpdate | None: ...    # drain pending audio
+    def finish(self) -> str: ...                       # flush tail, final text
+
+@dataclass(frozen=True)
+class DictationUpdate:
+    partial: str          # current in-progress utterance (revisable)
+    finalized: str | None # utterance completed by endpointing, if any
+```
+
+`SherpaDictationEngine` implements it with a process-wide
+`OnlineRecognizer` (streaming transducer: `encoder/decoder/joiner + tokens`)
+shared across connections — the ~650 MB weights load once — plus one
+recognizer *stream* per WebSocket. Endpointing folds completed utterances
+into `finalized` and resets the stream, exactly the loop proven in pi-voice.
+An optional `OnlinePunctuation` model re-punctuates partials/finals
+(lowercase + strip punctuation before re-adding, throttled) so the live
+preview reads like a sentence.
+
+Decode calls are CPU-bound → they run via `asyncio.to_thread`, serialized by
+a per-engine `threading.Lock` (sherpa recognizer streams are not documented
+thread-safe), with a module-level semaphore capping concurrent dictation
+connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
+
+### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `OMNIGENT_DICTATION_MODEL_DIR` | `~/.omnigent/models/dictation/asr` | dir containing `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`, `tokens.txt` |
+| `OMNIGENT_DICTATION_PUNCT_DIR` | `~/.omnigent/models/dictation/punct` | optional online-punctuation model dir (`model*.onnx` + `bpe.vocab`) |
+| `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
+
+`scripts/fetch-dictation-models.sh` downloads a known-good pair (streaming
+Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
+into the default locations. Availability is computed lazily and cached:
+extra installed **and** ASR model dir populated.
+
+### Routes — `omnigent/server/routes/dictation.py`
+
+`create_dictation_router(*, auth_provider=None, engine_factory=None)`,
+registered in `create_app` under `/v1` like every other router. Dictation is
+not session-scoped (the new-chat composer has no session yet), so auth is
+identity-level only: authenticated user required when an auth provider is
+configured, open in single-user/dev mode — the same posture as
+`GET /v1/harnesses`.
+
+- **`GET /v1/dictation`** → `{"available": bool, "reason": str | null}`.
+  The web UI probes this once (cached) to decide whether the server fallback
+  exists. `reason` is a stable machine-readable slug
+  (`"extra_not_installed"`, `"models_missing"`) for diagnostics.
+
+- **`WS /v1/dictation/stream`** — wire protocol (documented in the module
+  docstring, mirroring `terminal_attach.py`):
+  - **Client → server, binary frames**: raw 16 kHz mono s16le PCM.
+  - **Client → server, text frames**: JSON control messages.
+    `{"type": "stop"}` requests a flush; unknown shapes are ignored for
+    forward compatibility.
+  - **Server → client, text frames**: JSON events.
+    - `{"type": "ready"}` — sent once after accept; the client may start
+      streaming audio.
+    - `{"type": "partial", "text": ...}` — revisable in-progress utterance,
+      throttled to ~6 Hz.
+    - `{"type": "final", "text": ...}` — an utterance completed by
+      endpointing; the client appends it and clears the partial region.
+    - `{"type": "stopped", "text": ...}` — response to `stop`: the flushed
+      tail utterance (possibly empty). The server closes after sending it.
+    - `{"type": "error", "message": ...}` — fatal; server closes.
+
+The route holds no session state; a connection is one dictation take.
+
+## Web
+
+### Capture — `web/src/lib/dictation.ts` + `web/src/lib/pcm16-worklet.ts`
+
+`DictationSession` owns the full client pipeline:
+`getUserMedia({audio})` → `AudioContext` → `AudioWorkletNode` (the worklet
+downsamples from the context rate to 16 kHz and converts Float32 → Int16,
+posting ~120 ms chunks) → binary WS frames via
+`resolveWebSocketUrl("/v1/dictation/stream")` (the same host seam the
+terminal-attach and session-updates sockets ride, so embed hosts and the
+Vite dev proxy keep working). Callbacks: `onPartial`, `onFinal`, `onError`;
+`stop()` sends `{"type":"stop"}`, resolves with the flushed tail, and
+releases the mic tracks and audio context.
+
+`fetchDictationAvailability()` probes `GET /v1/dictation` once per page load
+(memoized promise).
+
+### Mic button — `ComposerMicButton.tsx`
+
+Mode selection at mount: **Web Speech when present, otherwise server
+dictation when `GET /v1/dictation` reports available, otherwise render
+nothing** — no behavior change for Chrome/Safari users; Electron, Firefox,
+and Chromium gain a working button.
+
+New optional prop `onInterim?: (text: string) => void`. In server mode the
+button emits `onInterim` for partial frames and the existing
+`onTranscript` for finals. Both composers (`ChatPage`, `NewChatDialog`)
+share a small hook, `useDictationInsert(setValue)`, that appends finals and
+maintains a replaceable trailing interim region in the textarea value, so
+text forms live while speaking. When `onInterim` is absent (Web Speech
+mode), behavior is exactly today's.
+
+## Testing
+
+- **Server (pytest, `tests/server/routes/test_dictation.py`)**: drive the
+  real route with `TestClient.websocket_connect` and a fake engine injected
+  through `engine_factory` — no sherpa dependency in CI. Cases: availability
+  endpoint (missing extra / missing models / available), ready→partial→final
+  →stopped flow, stop-flush, auth rejection with a no-identity provider,
+  stream-cap rejection.
+- **Engine unit tests** skip unless sherpa-onnx and models are present
+  (developer machines), keeping CI hermetic.
+- **Web (Vitest, `ComposerMicButton.test.tsx` + `dictation.test.ts`)**:
+  mode selection, partial/final callback flow against a mocked WebSocket and
+  mocked AudioWorklet capture.
+- **e2e (Playwright, `tests/e2e_ui/`)**: a fake engine selected via env
+  (`OMNIGENT_DICTATION_ENGINE=fake`, emits a scripted transcript) lets the
+  full browser→WS→server→composer loop run headless without a mic:
+  the test grants fake mic permissions, clicks the mic button, and asserts
+  the scripted text lands in the composer.
+
+## Rollout / compatibility
+
+- No schema changes, no migrations, no new required deps.
+- Servers without the extra: `GET /v1/dictation` → `available: false`; the
+  web UI behaves exactly as today.
+- Old web clients against new servers: unaffected (new routes only).
+- New web clients against old servers: the availability probe 404s → treated
+  as unavailable → today's behavior.

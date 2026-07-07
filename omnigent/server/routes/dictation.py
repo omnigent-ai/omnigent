@@ -1,0 +1,215 @@
+"""Streaming dictation routes: availability probe + transcription WebSocket.
+
+This module hosts the server-side speech-to-text surface behind the
+composer mic button (``designs/server-dictation.md``):
+
+- ``GET /v1/dictation`` — capability probe. The web UI calls it once per
+  page load to decide whether the server fallback exists when the
+  browser Web Speech API is unavailable.
+- ``WS /v1/dictation/stream`` — one connection per dictation take.
+
+Wire protocol on the WebSocket
+------------------------------
+
+- **Client → server, binary frames**: raw 16 kHz mono s16le PCM. The
+  browser worklet downsamples from the capture rate before sending.
+- **Client → server, text frames**: JSON control messages.
+  ``{"type": "stop"}`` asks the server to flush trailing audio and
+  finish the take. Unknown shapes are ignored so future control
+  messages don't break older servers.
+- **Server → client, text frames**: JSON events.
+    - ``{"type": "ready"}`` — sent once after the engine is ready;
+      the client may start streaming audio.
+    - ``{"type": "partial", "text": ...}`` — revisable in-progress
+      utterance, throttled server-side.
+    - ``{"type": "final", "text": ...}`` — an utterance completed by
+      endpoint detection (a pause). The client appends it and clears
+      its partial region.
+    - ``{"type": "stopped", "text": ...}`` — reply to ``stop``: the
+      flushed tail utterance (possibly empty). The server closes the
+      socket after sending it.
+    - ``{"type": "error", "message": ...}`` — fatal; the server closes.
+
+Auth
+----
+
+Dictation is not session-scoped — the new-chat composer dictates before
+any session exists — so the check is identity-level only, matching
+``GET /v1/harnesses``: when an auth provider is configured the caller
+must be authenticated (the WebSocket handshake carries identity via the
+ingress/dev proxy exactly like the terminal-attach socket); in
+single-user/dev mode both routes are open.
+
+Capacity
+--------
+
+Decoding is CPU-bound, so concurrent takes are capped (default 2,
+``OMNIGENT_DICTATION_MAX_STREAMS``). Over-cap connections are accepted
+and immediately closed with code 1013 (try again later) so the client
+can distinguish "busy" from "broken".
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import time
+from typing import Any, Callable, Final
+
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, WebSocketException
+from starlette import status
+
+from omnigent.server.auth import AuthProvider
+from omnigent.server.dictation import (
+    DictationEngine,
+    DictationStreamHandle,
+    engine_availability,
+    get_engine,
+    max_streams,
+)
+from omnigent.server.routes._auth_helpers import require_user
+
+_logger = logging.getLogger(__name__)
+
+_WS_CLOSE_TRY_AGAIN_LATER: Final[int] = 1013
+_WS_CLOSE_INTERNAL_ERROR: Final[int] = 1011
+
+#: Minimum interval between partial-transcript pushes. Keeps the socket
+#: chatty enough for live text without a frame per audio chunk.
+_PARTIAL_INTERVAL_S: Final[float] = 0.15
+
+
+def create_dictation_router(
+    *,
+    auth_provider: AuthProvider | None = None,
+    engine_provider: Callable[[], DictationEngine] | None = None,
+) -> APIRouter:
+    """Build the router carrying the dictation probe and stream routes.
+
+    Wired into the FastAPI app under the ``/v1`` prefix in
+    :func:`omnigent.server.app.create_app`.
+
+    :param auth_provider: Optional provider used to authenticate both the
+        HTTP probe and the WebSocket handshake. ``None`` preserves
+        single-user/dev behavior (open).
+    :param engine_provider: Engine factory override for tests. Defaults
+        to :func:`omnigent.server.dictation.get_engine`, which resolves
+        the configured engine and loads models on first use.
+    :returns: An :class:`APIRouter` carrying the two routes.
+    """
+    router = APIRouter()
+    resolve_engine = engine_provider or get_engine
+    # Router-scoped so each app (and each test app) gets its own cap.
+    slots = asyncio.Semaphore(max_streams())
+
+    @router.get("/dictation")
+    async def dictation_availability(request: Request) -> dict[str, Any]:
+        """Report whether the server can transcribe dictation audio."""
+        require_user(request, auth_provider)
+        if engine_provider is not None:
+            return {"available": True, "reason": None}
+        available, reason = engine_availability()
+        return {"available": available, "reason": reason}
+
+    @router.websocket("/dictation/stream")
+    async def dictation_stream(websocket: WebSocket) -> None:
+        """Transcribe one dictation take (see module docstring)."""
+        if auth_provider is not None and auth_provider.get_user_id(websocket) is None:
+            raise WebSocketException(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason="authentication required",
+            )
+        await websocket.accept()
+
+        if slots.locked():
+            await websocket.close(
+                code=_WS_CLOSE_TRY_AGAIN_LATER,
+                reason="dictation is at capacity; try again shortly",
+            )
+            return
+
+        async with slots:
+            # Engine construction loads model weights — seconds on first
+            # use. Run it off-loop; later takes reuse the shared engine.
+            try:
+                engine = await asyncio.to_thread(resolve_engine)
+                handle: DictationStreamHandle = await asyncio.to_thread(
+                    engine.create_stream
+                )
+            except Exception:  # noqa: BLE001
+                _logger.exception("dictation engine failed to initialize")
+                with contextlib.suppress(RuntimeError):
+                    await websocket.send_text(
+                        json.dumps(
+                            {"type": "error", "message": "dictation engine unavailable"}
+                        )
+                    )
+                    await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
+                return
+            await websocket.send_text(json.dumps({"type": "ready"}))
+            await _pump_dictation(websocket, handle)
+
+    return router
+
+
+async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -> None:
+    """Shuttle audio in and transcript events out until stop/disconnect.
+
+    :param websocket: The accepted browser-facing WebSocket.
+    :param handle: The per-connection recognizer stream.
+    """
+    last_partial_sent = ""
+    last_partial_at = 0.0
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+
+            data = message.get("bytes")
+            if data is not None:
+                update = await asyncio.to_thread(handle.feed_pcm16, data)
+                if update.finalized:
+                    text = await asyncio.to_thread(handle.beautify, update.finalized)
+                    await websocket.send_text(
+                        json.dumps({"type": "final", "text": text})
+                    )
+                    last_partial_sent = ""
+                    last_partial_at = 0.0
+                now = time.monotonic()
+                if (
+                    update.partial != last_partial_sent
+                    and now - last_partial_at >= _PARTIAL_INTERVAL_S
+                ):
+                    text = await asyncio.to_thread(handle.beautify, update.partial)
+                    await websocket.send_text(
+                        json.dumps({"type": "partial", "text": text})
+                    )
+                    last_partial_sent = update.partial
+                    last_partial_at = now
+                continue
+
+            text_frame = message.get("text")
+            if text_frame is None:
+                continue
+            try:
+                control = json.loads(text_frame)
+            except ValueError:
+                continue
+            if isinstance(control, dict) and control.get("type") == "stop":
+                tail = await asyncio.to_thread(handle.finish)
+                await websocket.send_text(json.dumps({"type": "stopped", "text": tail}))
+                await websocket.close()
+                return
+            # Unknown control messages are ignored for forward compat.
+    except WebSocketDisconnect:
+        return
+    except Exception:  # noqa: BLE001
+        _logger.exception("dictation stream failed")
+        with contextlib.suppress(RuntimeError):
+            await websocket.send_text(
+                json.dumps({"type": "error", "message": "dictation failed"})
+            )
+            await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)

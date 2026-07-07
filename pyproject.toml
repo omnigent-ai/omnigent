@@ -167,6 +167,12 @@ antigravity = ["google-antigravity>=0.1,<1"]
 # extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
 # why it is not part of the baseline install. Pin major.
 copilot = ["github-copilot-sdk>=1,<2"]
+# Server-side streaming dictation (`WS /v1/dictation/stream`,
+# designs/server-dictation.md). Local CPU speech-to-text via sherpa-onnx;
+# the engine module imports it lazily, so only servers offering dictation
+# need the extra. Models are fetched separately
+# (scripts/fetch-dictation-models.sh).
+dictation = ["sherpa-onnx>=1.12,<2"]
 # Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
 # harness imports the cursor-sdk lazily on first turn, so only `--harness
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
