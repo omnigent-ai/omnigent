@@ -221,10 +221,7 @@ describe("ComposerMicButton (server dictation)", () => {
   });
 
   it("renders nothing when neither Web Speech nor the server can help", () => {
-    const { container } = renderServerMode(
-      {},
-      { ...DICTATION_INFO, dictation_available: false },
-    );
+    const { container } = renderServerMode({}, { ...DICTATION_INFO, dictation_available: false });
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -336,9 +333,7 @@ describe("ComposerMicButton (server dictation)", () => {
 
   it("keeps the plain error path when the server offers no dictation", async () => {
     render(
-      <CapabilitiesContext.Provider
-        value={{ ...DICTATION_INFO, dictation_available: false }}
-      >
+      <CapabilitiesContext.Provider value={{ ...DICTATION_INFO, dictation_available: false }}>
         <ComposerMicButton onTranscript={vi.fn()} />
       </CapabilitiesContext.Provider>,
     );

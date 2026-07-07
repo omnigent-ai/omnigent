@@ -332,9 +332,7 @@ export const ComposerMicButton = ({
       setIsListening(true);
     } catch (startError) {
       setError(
-        isPermissionError(startError)
-          ? "Microphone permission denied"
-          : "Dictation unavailable",
+        isPermissionError(startError) ? "Microphone permission denied" : "Dictation unavailable",
       );
     }
     transitionRef.current = false;

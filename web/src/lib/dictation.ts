@@ -56,9 +56,7 @@ export function parseDictationEvent(raw: string): DictationEvent | null {
     case "stopped":
       return typeof frame.text === "string" ? { type: frame.type, text: frame.text } : null;
     case "error":
-      return typeof frame.message === "string"
-        ? { type: "error", message: frame.message }
-        : null;
+      return typeof frame.message === "string" ? { type: "error", message: frame.message } : null;
     default:
       return null;
   }
