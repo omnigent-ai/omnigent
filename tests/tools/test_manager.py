@@ -1165,3 +1165,49 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+def test_web_search_does_not_emit_web_search_preview_for_claude_sdk_harness() -> None:
+    """
+    When the agent's harness is ``claude-sdk``, the ``web_search`` builtin
+    must NOT emit ``{"type": "web_search_preview"}`` in its schema, even if
+    the model name (e.g. ``claude-opus-4-8``) has no provider prefix (which
+    would otherwise default to OpenAI).
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(type="claude_sdk"),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview", (
+        "web_search emitted web_search_preview schema on claude-sdk harness"
+    )
+
+
+def test_web_search_does_not_emit_web_search_preview_for_omnigent_claude_sdk_harness() -> None:
+    """
+    When the agent's executor is ``omnigent`` with ``harness: claude-sdk``,
+    the ``web_search`` builtin must NOT emit ``{"type": "web_search_preview"}``.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        llm=LLMConfig(model="claude-opus-4-8"),
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
+    )
+    mgr = ToolManager(spec)
+    tool = mgr.get_tool("web_search")
+
+    assert tool is not None, "web_search should be registered"
+    schema = tool.get_schema()
+    assert schema.get("type") != "web_search_preview"

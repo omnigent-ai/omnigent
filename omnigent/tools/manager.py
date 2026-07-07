@@ -356,9 +356,16 @@ class ToolManager:
             # Databricks doesn't support web_search_preview; skip
             # OpenAI provider inference for all databricks-* models.
             if not model.startswith("databricks-"):
-                from omnigent.llms.routing import parse_model_string
+                from omnigent.harness_aliases import canonicalize_harness
+                from omnigent.onboarding.provider_config import _EXECUTOR_TYPE_HARNESS_ALIASES
 
-                llm_provider = parse_model_string(model).provider
+                harness = self._spec.executor.harness_kind
+                canonical = canonicalize_harness(harness) or harness
+                canonical = _EXECUTOR_TYPE_HARNESS_ALIASES.get(canonical, canonical)
+                if canonical in ("openai-agents", "codex"):
+                    from omnigent.llms.routing import parse_model_string
+
+                    llm_provider = parse_model_string(model).provider
         return WebSearchTool(config=config, llm_provider=llm_provider)
 
     def _create_web_fetch(self) -> Tool:

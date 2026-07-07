@@ -2295,9 +2295,16 @@ async def _execute_web_search_tool(
     llm_provider: str | None = None
     model = getattr(getattr(agent_spec, "executor", None), "model", None)
     if model and not model.startswith("databricks-"):
-        from omnigent.llms.routing import parse_model_string
+        harness = getattr(getattr(agent_spec, "executor", None), "harness_kind", None)
+        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.onboarding.provider_config import _EXECUTOR_TYPE_HARNESS_ALIASES
 
-        llm_provider = parse_model_string(model).provider
+        canonical = canonicalize_harness(harness) or harness
+        canonical = _EXECUTOR_TYPE_HARNESS_ALIASES.get(canonical, canonical)
+        if canonical in ("openai-agents", "codex"):
+            from omnigent.llms.routing import parse_model_string
+
+            llm_provider = parse_model_string(model).provider
     tool = WebSearchTool(config=config, llm_provider=llm_provider)
     ctx = ToolContext(
         task_id=task_id or "web_search",
