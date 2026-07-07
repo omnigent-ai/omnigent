@@ -15,6 +15,7 @@ import {
   AlertTriangleIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
+  BanIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
   ChevronRightIcon,
@@ -31,6 +32,7 @@ import {
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
+  PaletteIcon,
   PanelRightOpenIcon,
   PencilIcon,
   PinIcon,
@@ -103,9 +105,16 @@ import {
   PROJECT_LABEL_KEY,
   usePinnedConversationBackfill,
   useRenameConversation,
+  useSetSessionColor,
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
+import {
+  SESSION_COLORS,
+  sessionColorName,
+  sessionColorSwatch,
+  sessionColorTint,
+} from "@/lib/sessionColors";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -1898,6 +1907,7 @@ function ConversationMenuItems({
   onMarkUnread,
   onProjectAssigned,
   moveToProject,
+  setColor,
   stopSession,
   setShareOpen,
   setIsEditing,
@@ -1923,6 +1933,7 @@ function ConversationMenuItems({
   onMarkUnread: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
+  setColor: ReturnType<typeof useSetSessionColor>;
   stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
@@ -1988,6 +1999,53 @@ function ConversationMenuItems({
             You need edit permissions to rename this session
           </TooltipContent>
         </Tooltip>
+      )}
+      {/* Color — tag the session with a palette color, shown as a tint on
+          its sidebar row. A native submenu flyout (like Move to project) so
+          the swatches need no separate popover layer. */}
+      {canEdit && (
+        <C.Sub>
+          <C.SubTrigger data-testid="set-color-conversation" className="whitespace-nowrap">
+            <PaletteIcon className="size-3.5" />
+            Color
+          </C.SubTrigger>
+          <C.SubContent className="w-40 p-1 [&_[role=menuitem]]:text-xs">
+            {SESSION_COLORS.map((color) => (
+              <C.Item
+                key={color.name}
+                data-testid={`color-${color.name}`}
+                onSelect={() => {
+                  setMenuOpen(false);
+                  setColor.mutate({ id: conversation.id, name: color.name });
+                }}
+              >
+                <span
+                  aria-hidden
+                  className="size-3.5 shrink-0 rounded-full border border-border"
+                  style={{ backgroundColor: color.token }}
+                />
+                {color.label}
+                {sessionColorName(conversation) === color.name && (
+                  <CheckIcon className="ml-auto size-3.5" />
+                )}
+              </C.Item>
+            ))}
+            <C.Separator />
+            <C.Item
+              data-testid="color-none"
+              onSelect={() => {
+                setMenuOpen(false);
+                setColor.mutate({ id: conversation.id, name: "" });
+              }}
+            >
+              <BanIcon className="size-3.5" />
+              None
+              {sessionColorName(conversation) === null && (
+                <CheckIcon className="ml-auto size-3.5" />
+              )}
+            </C.Item>
+          </C.SubContent>
+        </C.Sub>
       )}
       {/* Mark as unread — re-lights the row's pink dot so a session can
           be flagged to revisit, including the one you're currently
@@ -2203,6 +2261,7 @@ function ConversationRow({
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
   const moveToProject = useMoveToProject();
+  const setColor = useSetSessionColor();
   // Archive stops the runner first (resource hygiene): a hidden session
   // shouldn't keep a runner alive. This is NOT the user-facing Stop action
   // (the kebab's "Stop session" item below, backed by its own mutation) —
@@ -2248,6 +2307,14 @@ function ConversationRow({
   // The session's current project (reserved label), or null when unfiled —
   // drives the kebab submenu label ("Add to project" vs "Change project").
   const currentProject = conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
+
+  // A user-assigned session color reads at a glance in the list two ways: a
+  // solid left bar showing the TRUE hue (it can't be composited away by the
+  // themed — currently purple — surface), plus a faint whole-row tint for
+  // ambiance. The bar renders above the link so it survives hover/active.
+  const colorName = sessionColorName(conversation);
+  const colorTint = sessionColorTint(colorName);
+  const colorSwatch = sessionColorSwatch(colorName);
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -2440,6 +2507,7 @@ function ConversationRow({
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
+    setColor,
     stopSession,
     setShareOpen,
     setIsEditing,
@@ -2513,8 +2581,21 @@ function ConversationRow({
     <li
       ref={setRowRef}
       {...dragListeners}
-      className={cn("group relative", isDragging && "opacity-40")}
+      className={cn("group relative rounded-md", isDragging && "opacity-40")}
+      style={colorTint ? { backgroundColor: colorTint } : undefined}
+      data-session-color={colorName ?? undefined}
     >
+      {/* Solid left bar — the true swatch color, above the link (z-10) so it
+          stays visible under hover/active; pointer-events-none so it never
+          intercepts the row's click. */}
+      {colorSwatch && (
+        <span
+          aria-hidden
+          data-testid="session-color-bar"
+          className="pointer-events-none absolute inset-y-0 left-0 z-10 w-1 rounded-l-md"
+          style={{ backgroundColor: colorSwatch }}
+        />
+      )}
       {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the

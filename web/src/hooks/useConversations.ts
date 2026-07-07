@@ -33,6 +33,7 @@ import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
+import { SESSION_COLOR_LABEL_KEY } from "@/lib/sessionColors";
 import { stopSession } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
@@ -703,6 +704,37 @@ export function useMoveToProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       // Moving into/out of a project changes both folders' paginated lists.
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+    },
+  });
+}
+
+async function setConversationColor(id: string, name: string): Promise<Conversation> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    // Empty string clears the color (server deletes the label row), mirroring
+    // project removal.
+    body: JSON.stringify({ labels: { [SESSION_COLOR_LABEL_KEY]: name } }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
+/**
+ * Set (or clear, with `name=""`) a session's color — a reserved `omni_color`
+ * label. Mirrors {@link useMoveToProject}: it's a label edit, so on success we
+ * invalidate the conversation lists (sidebar + project sub-lists) to re-render
+ * each row's tint. A color change is cosmetic and never reorders rows, so no
+ * bespoke in-place cache merge is needed.
+ */
+export function useSetSessionColor() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) => setConversationColor(id, name),
+    onSuccess: (updated) => {
+      markConversationSeen(updated.id, updated.updated_at);
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
     },
   });

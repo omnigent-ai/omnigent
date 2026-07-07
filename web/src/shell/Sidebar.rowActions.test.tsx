@@ -17,6 +17,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // vi.mock factory (hoisted above imports) can reference it.
 const mocks = vi.hoisted(() => ({
   rename: { mutate: vi.fn() },
+  setColor: { mutate: vi.fn() },
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -31,6 +32,7 @@ vi.mock("@/hooks/useConversations", () => ({
   }),
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => mocks.rename,
+  useSetSessionColor: () => mocks.setColor,
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
@@ -114,6 +116,7 @@ function renderSidebar(activeId?: string) {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  mocks.setColor.mutate.mockReset();
   useConvMock.mockReset();
   // The read-state mirror is module-level (in-memory), so reset it between
   // tests to avoid a mark-unread leaking into later rows.
@@ -329,5 +332,57 @@ describe("right-click context menu", () => {
     // inline rename input appears.
     fireEvent.click(screen.getByTestId("rename-conversation"));
     expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+  });
+});
+
+describe("session color", () => {
+  it("tints the row and shows the solid color bar for a known color label", () => {
+    mockConversations([{ ...CONV, labels: { omni_color: "green" } }]);
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li");
+    expect(li).toHaveAttribute("data-session-color", "green");
+    // The solid left bar carries the true hue (survives the purple surface).
+    expect(screen.getByTestId("session-color-bar")).toBeInTheDocument();
+  });
+
+  it("renders no color or bar for an unset or unknown color label (self-heals)", () => {
+    mockConversations([{ ...CONV, labels: { omni_color: "chartreuse" } }]);
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li");
+    expect(li).not.toHaveAttribute("data-session-color");
+    expect(screen.queryByTestId("session-color-bar")).toBeNull();
+  });
+
+  it("offers a Color submenu next to Rename in the kebab", () => {
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("set-color-conversation")).toBeInTheDocument();
+  });
+
+  it("sets the session color when a swatch is picked", () => {
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    // Open the color submenu, then pick a swatch.
+    fireEvent.click(screen.getByTestId("set-color-conversation"));
+    fireEvent.click(screen.getByTestId("color-blue"));
+
+    expect(mocks.setColor.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.setColor.mutate).toHaveBeenCalledWith({ id: "conv_1", name: "blue" });
+  });
+
+  it("clears the session color via the None entry", () => {
+    mockConversations([{ ...CONV, labels: { omni_color: "blue" } }]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("set-color-conversation"));
+    fireEvent.click(screen.getByTestId("color-none"));
+
+    // Empty name signals "clear" (server deletes the label row).
+    expect(mocks.setColor.mutate).toHaveBeenCalledWith({ id: "conv_1", name: "" });
   });
 });

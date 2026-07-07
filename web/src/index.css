@@ -67,6 +67,7 @@
   --color-status-green: var(--status-green);
   --color-status-yellow: var(--status-yellow);
   --color-status-red: var(--status-red);
+  --color-status-purple: var(--status-purple);
   --color-status-gray: var(--status-gray);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
@@ -222,6 +223,7 @@
   --status-green: #2ea65c;
   --status-yellow: #d4972a;
   --status-red: #f04858;
+  --status-purple: #8b5cf6;
   --status-gray: #8e99a4;
   --chart-1: #3b8ff5;
   --chart-2: #2272b4;
@@ -296,6 +298,7 @@
   --status-green: #2ea65c;
   --status-yellow: #d4972a;
   --status-red: #f04858;
+  --status-purple: #8b5cf6;
   --status-gray: #8e99a4;
   --border: oklch(0.28 0.005 240);
   --input: oklch(0.28 0.005 240);

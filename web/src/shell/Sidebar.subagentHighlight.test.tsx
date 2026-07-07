@@ -32,6 +32,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
+  useSetSessionColor: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: [] }),
   useProjectSessions: () => ({ data: undefined, isLoading: false, isError: false, error: null }),

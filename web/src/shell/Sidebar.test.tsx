@@ -52,6 +52,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
+  useSetSessionColor: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   // Project feature: the sidebar reads the project list to build project
   // sections, and rows fire useMoveToProject from the kebab menu. Both must
