@@ -46,38 +46,3 @@ fetch "$PUNCT_TARBALL" "$PUNCT_GH" "punct" "punctuation model (~38 MB)"
 
 echo ">> dictation models ready under $DEST"
 ls -d "$DEST"/*/
-
-# aarch64 Linux: the sherpa-onnx wheel does not bundle libonnxruntime.so
-# (x86_64 wheels do). Pair it with the onnxruntime wheel matching the
-# version sherpa-onnx was built against and link it where the binding's
-# $ORIGIN RPATH looks.
-if [ "$(uname -sm)" = "Linux aarch64" ]; then
-  python - <<'EOF' || true
-import glob, os, sys
-try:
-    import sherpa_onnx  # noqa: F401
-    print(">> sherpa-onnx imports cleanly; no fixup needed")
-    sys.exit(0)
-except ImportError:
-    pass
-try:
-    import onnxruntime
-except ImportError:
-    print("!! aarch64: install the onnxruntime wheel matching your sherpa-onnx build")
-    print("   (e.g. `pip install onnxruntime==1.24.4` for sherpa-onnx 1.13.x),")
-    print("   then re-run this script to link libonnxruntime.so for the binding.")
-    sys.exit(0)
-capi = os.path.join(os.path.dirname(onnxruntime.__file__), "capi")
-libs = sorted(glob.glob(os.path.join(capi, "libonnxruntime.so*")))
-spec_dirs = [p for p in sys.path if os.path.isdir(os.path.join(p, "sherpa_onnx", "lib"))]
-if libs and spec_dirs:
-    link = os.path.join(spec_dirs[0], "sherpa_onnx", "lib", "libonnxruntime.so")
-    if not os.path.exists(link):
-        os.symlink(libs[-1], link)
-        print(f">> linked {libs[-1]} -> {link}")
-    import importlib
-    importlib.invalidate_caches()
-    import sherpa_onnx  # noqa: F401
-    print(">> sherpa-onnx imports cleanly after fixup")
-EOF
-fi
