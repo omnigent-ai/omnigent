@@ -182,9 +182,11 @@ Electron, Firefox, and Chromium gain a working button. "Working" cannot be
 detected statically: Electron and plain Chromium expose the
 `SpeechRecognition` constructor but its cloud backend rejects them at
 runtime with a `network` error. So Web Speech stays primary whenever the
-constructor exists, and the first backend-dead error flips the page to
-server mode and retries the take the user already started; with no
-constructor at all (Firefox), server mode is picked directly.
+constructor exists, and a take that dies with `network` falls back to the
+server **for that take** (retried immediately, so the user's click still
+lands); the next take tries Web Speech again, so a transient blip in real
+Chrome never permanently downgrades the page. With no constructor at all
+(Firefox), takes go to the server directly.
 
 New optional prop `onInterim?: (text: string) => void`. In server mode the
 button emits `onInterim` for partial frames and the existing

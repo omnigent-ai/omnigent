@@ -32,11 +32,15 @@ let sessionStopMock: Mock<() => Promise<string>>;
 let sessionCancelMock: Mock<() => void>;
 let sessionEvents: DictationSessionEvents | null;
 
-vi.mock("@/lib/dictation", () => ({
-  DictationSession: {
-    start: (events: DictationSessionEvents) => sessionStartMock(events),
-  },
-}));
+vi.mock("@/lib/dictation", () => {
+  class DictationBusyError extends Error {}
+  return {
+    DictationBusyError,
+    DictationSession: {
+      start: (events: DictationSessionEvents) => sessionStartMock(events),
+    },
+  };
+});
 
 function installDictationSession() {
   sessionEvents = null;
@@ -302,8 +306,8 @@ describe("ComposerMicButton (server dictation)", () => {
   it("falls back to server dictation when Web Speech dies with a network error", async () => {
     // Electron / plain Chromium: the SpeechRecognition constructor exists
     // (so Web Speech is picked first) but its cloud backend rejects the
-    // build at runtime with "network". The button must switch this page to
-    // server dictation and retry the take the user already started.
+    // build at runtime with "network". The take must fall back to server
+    // dictation so the user's click still lands.
     const onInterim = vi.fn();
     render(
       <CapabilitiesContext.Provider value={DICTATION_INFO}>
@@ -324,11 +328,31 @@ describe("ComposerMicButton (server dictation)", () => {
     act(() => sessionEvents?.onPartial("via server"));
     expect(onInterim).toHaveBeenCalledWith("via server");
 
-    // The switch is sticky: later takes go straight to the server.
-    await clickMic(); // stop
-    await clickMic(); // start again
-    expect(sessionStartMock).toHaveBeenCalledTimes(2);
-    expect(startSpy).toHaveBeenCalledTimes(1);
+    // Stale events from the dead recognizer must not clobber the live
+    // server take's state (Chrome fires "end" after a failed start).
+    act(() => handlers.end?.({}));
+    expect(button).toHaveAttribute("aria-pressed", "true");
+
+    // The fallback is per take, not sticky: after stopping, the next
+    // take tries Web Speech again (a transient Chrome blip must not
+    // permanently downgrade the page to the server model).
+    await clickMic(); // stop the server take
+    await clickMic(); // next take
+    expect(startSpy).toHaveBeenCalledTimes(2);
+    expect(sessionStartMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a busy server distinctly from a broken one", async () => {
+    const { DictationBusyError } = await import("@/lib/dictation");
+    sessionStartMock = vi.fn(async () => {
+      throw new DictationBusyError("at capacity");
+    });
+    renderServerMode();
+    await clickMic();
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+      "title",
+      "Dictation is busy — try again shortly",
+    );
   });
 
   it("keeps the plain error path when the server offers no dictation", async () => {

@@ -89,6 +89,20 @@ def test_remote_engine_relays_finalized_utterances(worker_url: str) -> None:
     assert handle.finish() == ""
 
 
+def test_remote_stream_close_releases_worker_slot(worker_url: str) -> None:
+    """close() frees the worker's capacity slot for later takes.
+
+    Three sequential takes against a worker capped at two concurrent
+    streams: without the close, the third handshake would be rejected
+    with the 1013 at-capacity close.
+    """
+    engine = dictation.RemoteDictationEngine(worker_url)
+    for _ in range(3):
+        handle = engine.create_stream()
+        handle.feed_pcm16(_WORD)
+        handle.close()
+
+
 def test_remote_engine_falls_back_when_worker_down() -> None:
     """Unreachable worker + local fallback → the take still serves."""
     engine = dictation.RemoteDictationEngine(
@@ -103,7 +117,7 @@ def test_remote_engine_falls_back_when_worker_down() -> None:
 def test_remote_engine_raises_without_fallback() -> None:
     """Unreachable worker and no local models → the take fails loudly."""
     engine = dictation.RemoteDictationEngine("ws://127.0.0.1:9/v1/dictation/stream")
-    with pytest.raises(Exception):
+    with pytest.raises(OSError):
         engine.create_stream()
 
 

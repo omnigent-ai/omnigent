@@ -135,8 +135,15 @@ def create_dictation_router(
                     )
                     await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
                 return
-            await websocket.send_text(json.dumps({"type": "ready"}))
-            await _pump_dictation(websocket, handle)
+            # The take MUST be closed on every exit — normal stop, abrupt
+            # browser disconnect, or a crash mid-send. An unclosed remote
+            # take would hold a worker capacity slot forever.
+            try:
+                await websocket.send_text(json.dumps({"type": "ready"}))
+                await _pump_dictation(websocket, handle)
+            finally:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(handle.close)
 
     return router
 

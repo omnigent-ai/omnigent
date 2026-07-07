@@ -2,7 +2,7 @@
 
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { DictationSession } from "@/lib/dictation";
+import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -81,26 +81,21 @@ export const ComposerMicButton = ({
   disabled,
   lang = "en-US",
 }: ComposerMicButtonProps) => {
-  // Mode selection: Web Speech when the browser has a working one
-  // (Chrome/Safari, unchanged behavior), server dictation otherwise when
-  // GET /v1/info advertises it. "Working" can't be known statically —
-  // Electron and plain Chromium expose the constructor but its cloud
-  // backend rejects them at runtime (a "network" error) — so Web Speech
-  // is primary whenever the constructor exists, and the first
-  // backend-dead error flips this page to server mode and retries the
-  // take the user already asked for (see handleError).
+  // Web Speech is primary whenever the browser has the constructor
+  // (Chrome/Safari, unchanged behavior); with no constructor at all
+  // (Firefox) takes use server dictation when GET /v1/info advertises it.
+  // A constructor is no guarantee of a backend — Electron and plain
+  // Chromium error at runtime with "network" — so a failed Web Speech
+  // take falls back to the server per take (see handleError). Per-take,
+  // not sticky: a transient blip in real Chrome must not permanently
+  // downgrade the page to the local model.
   const [Ctor] = useState(getRecognitionCtor);
   const serverInfo = useServerInfo();
   const serverAvailable = serverInfo !== "loading" && serverInfo.dictation_available;
-  const [webSpeechBroken, setWebSpeechBroken] = useState(false);
-  const serverDictation = serverAvailable && (Ctor === null || webSpeechBroken);
   // Mirrored into a ref so the mount-time recognition handlers (closed
   // over [Ctor, lang]) see the current probe result.
   const serverAvailableRef = useRef(serverAvailable);
   serverAvailableRef.current = serverAvailable;
-  // Set when a backend-dead Web Speech error should be retried on the
-  // server path the moment the mode flips.
-  const retryOnServerRef = useRef(false);
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -119,6 +114,13 @@ export const ComposerMicButton = ({
   // Prevents rapid double-clicks from calling recognition.start() twice,
   // which throws InvalidStateError in Chrome.
   const transitionRef = useRef(false);
+  // Server-take guard, deliberately separate from transitionRef: a failed
+  // Web Speech attempt fires a late "end" event that resets transitionRef,
+  // which must not unlock a second server take mid-handshake.
+  const serverBusyRef = useRef(false);
+  // Lets the mount-time Web Speech error handler start the fallback take
+  // without closing over toggleServer's identity.
+  const toggleServerRef = useRef<() => Promise<void>>(async () => {});
 
   // Written via .style.transform from rAF — avoids 60Hz React re-renders.
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
@@ -132,26 +134,33 @@ export const ComposerMicButton = ({
     recognition.interimResults = false;
     recognition.lang = lang;
 
+    // A dead recognizer keeps firing start/end/error after the take has
+    // fallen back to the server; those stale events must not clobber the
+    // server session's isListening/transition state.
+    const serverTakeOwnsState = () => sessionRef.current !== null || serverBusyRef.current;
+
     const handleStart = () => {
+      if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       setError(null);
       setIsListening(true);
     };
     const handleEnd = () => {
+      if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       setIsListening(false);
     };
     const handleError = (event: Event) => {
+      if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       const err = (event as SpeechRecognitionErrorEventLike).error;
-      // "network" means the recognizer's cloud backend refused us — the
-      // permanent state of Electron and non-Chrome Chromium builds, not a
-      // transient failure. When the server can transcribe instead, flip
-      // to server dictation and retry the take the user just started.
+      // "network" means the recognizer's cloud backend refused us —
+      // always the case in Electron/plain Chromium, occasionally a
+      // transient blip in real Chrome. Serve THIS take from the server
+      // instead; the next take tries Web Speech again.
       if (err === "network" && serverAvailableRef.current && !disabledRef.current) {
-        retryOnServerRef.current = true;
         setIsListening(false);
-        setWebSpeechBroken(true);
+        void toggleServerRef.current();
         return;
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
@@ -204,6 +213,7 @@ export const ComposerMicButton = ({
       sessionRef.current.cancel();
       sessionRef.current = null;
       setIsListening(false);
+      onInterimRef.current?.("");
       return;
     }
     try {
@@ -295,8 +305,8 @@ export const ComposerMicButton = ({
   // Server-dictation toggle. Start resolves only once the mic + socket
   // handshake are up, so isListening flips exactly when audio flows.
   const toggleServer = useCallback(async () => {
-    if (transitionRef.current) return;
-    transitionRef.current = true;
+    if (serverBusyRef.current) return;
+    serverBusyRef.current = true;
     const session = sessionRef.current;
     if (session) {
       sessionRef.current = null;
@@ -308,7 +318,7 @@ export const ComposerMicButton = ({
         else onInterimRef.current?.("");
       }
       setIsListening(false);
-      transitionRef.current = false;
+      serverBusyRef.current = false;
       return;
     }
     try {
@@ -332,24 +342,27 @@ export const ComposerMicButton = ({
       setIsListening(true);
     } catch (startError) {
       setError(
-        isPermissionError(startError) ? "Microphone permission denied" : "Dictation unavailable",
+        startError instanceof DictationBusyError
+          ? "Dictation is busy — try again shortly"
+          : isPermissionError(startError)
+            ? "Microphone permission denied"
+            : "Dictation unavailable",
       );
+      setIsListening(false);
     }
-    transitionRef.current = false;
+    serverBusyRef.current = false;
   }, []);
-
-  // Complete the Web Speech → server switch: the mode flip re-renders
-  // before the retry can start, so the retry rides an effect keyed on it.
-  useEffect(() => {
-    if (webSpeechBroken && retryOnServerRef.current) {
-      retryOnServerRef.current = false;
-      void toggleServer();
-    }
-  }, [webSpeechBroken, toggleServer]);
+  toggleServerRef.current = toggleServer;
 
   const toggle = useCallback(() => {
-    if (serverDictation) {
+    // An active (or starting) server take is owned by the server path,
+    // whichever mode started it.
+    if (sessionRef.current || serverBusyRef.current) {
       void toggleServer();
+      return;
+    }
+    if (!Ctor) {
+      if (serverAvailable) void toggleServer();
       return;
     }
     // Guard against rapid clicks landing before start/end event fires.
@@ -365,9 +378,9 @@ export const ComposerMicButton = ({
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
     }
-  }, [isListening, serverDictation, toggleServer]);
+  }, [isListening, Ctor, serverAvailable, toggleServer]);
 
-  if (!Ctor && !serverDictation) return null;
+  if (!Ctor && !serverAvailable) return null;
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.

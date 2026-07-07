@@ -1,4 +1,4 @@
-"""Tests for the dictation routes (``GET /v1/dictation`` + stream WS).
+"""Tests for the dictation stream WS and its ``/v1/info`` capability bit.
 
 The WebSocket tests drive the real route against the deterministic
 :class:`FakeDictationEngine` injected through ``engine_provider`` — no
@@ -10,6 +10,7 @@ transcript by the number of PCM bytes they send.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
@@ -110,6 +111,27 @@ def test_stream_ignores_unknown_control_messages() -> None:
             "type": "partial",
             "text": _SCRIPT_WORDS[0],
         }
+
+
+def test_stream_closes_take_on_abrupt_disconnect() -> None:
+    """A vanished client still releases the take (worker-slot safety).
+
+    The remote relay engine holds a worker capacity slot until its
+    handle is closed; the route must close handles on the disconnect
+    path, not just on a clean stop.
+    """
+    engine = FakeDictationEngine()
+    app = _fake_app(engine_provider=lambda: engine)
+    with TestClient(app) as tc:
+        with tc.websocket_connect("/v1/dictation/stream") as ws:
+            assert json.loads(ws.receive_text())["type"] == "ready"
+            ws.send_bytes(_WORD_BYTES)
+            # Exit without stop: an abrupt browser disconnect.
+        assert engine.last_stream is not None
+        deadline = time.monotonic() + 5
+        while not engine.last_stream.closed and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert engine.last_stream.closed
 
 
 def test_stream_rejects_unauthenticated_handshake() -> None:

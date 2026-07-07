@@ -73,10 +73,12 @@ adds native niceties:
   > Electron's bundled Chromium does **not** ship. Electron therefore uses the
   > **server-side dictation fallback** instead: when the connected server has
   > the `dictation` extra and models installed (`GET /v1/info` reports
-  > `dictation_available`), the mic button streams audio to
-  > `WS /v1/dictation/stream` and transcribes on the server — no cloud, no
-  > Chrome dependency. See `designs/server-dictation.md`. Without the server
-  > extra, the button stays hidden (no Web Speech backend to fall back to).
+  > `dictation_available`), a take that fails with Web Speech's `network`
+  > error falls back to streaming audio to `WS /v1/dictation/stream` and
+  > transcribing on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, the button still
+  > renders (the constructor exists) but shows "Dictation unavailable" when
+  > clicked, as before.
 
 ## How it works (zero UI duplication)
 

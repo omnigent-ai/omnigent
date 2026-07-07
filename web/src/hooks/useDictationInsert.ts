@@ -7,12 +7,16 @@
 //     rewritten on every update until an utterance finalizes.
 //
 // Both composers (ChatPage's Composer and NewChatDialog) hold their draft in
-// a plain useState string, so this hook implements the replaceable region as
-// a pure value transform: it tracks how many characters of the current value
-// belong to the pending interim and slices them off before applying the next
-// update. Typing while an interim is pending is the one hazard (the slice
-// could eat typed characters); dictation is a hands-off flow, so the trade
-// is acceptable and matches what the take will overwrite anyway.
+// a plain useState string, so the revisable region is implemented as a value
+// transform: the hook remembers the exact interim text it last inserted and
+// strips it only when the draft still ends with it verbatim. If it doesn't —
+// the user typed after it, sent the message, or edited the draft — the
+// marker is simply dropped and nothing is removed: dictation must never
+// delete text it didn't write.
+//
+// The marker ref is read before and written after each setDraft call, never
+// inside the updater — updaters must stay pure because React StrictMode
+// double-invokes them.
 
 import { useCallback, useRef } from "react";
 
@@ -25,42 +29,38 @@ function joined(base: string, text: string): string {
   return `${base} ${text}`;
 }
 
-// Math.max guards the case where the draft shrank underneath a pending
-// interim (send cleared it, user deleted text): drop the stale region
-// marker instead of slicing into whatever the draft holds now.
-function stripInterim(prev: string, interimLen: number): string {
-  return prev.slice(0, Math.max(0, prev.length - interimLen));
+/**
+ * Remove the tracked interim region, but only if the draft still ends
+ * with it verbatim; also drop the single space separator we added.
+ */
+function stripMarker(prev: string, marker: string): string {
+  if (!marker || !prev.endsWith(marker)) return prev;
+  const base = prev.slice(0, prev.length - marker.length);
+  return base.endsWith(" ") ? base.slice(0, -1) : base;
 }
 
 export function useDictationInsert(setDraft: SetDraft): {
-  /** Append a final utterance, clearing any pending interim region. */
+  /** Append a final utterance, replacing any pending interim region. */
   appendFinal: (text: string) => void;
   /** Replace the pending interim region ("" clears it). */
   replaceInterim: (text: string) => void;
 } {
-  // Length of the interim region currently sitting at the end of the
-  // draft (including the separator we added), 0 when none is pending.
-  const interimLenRef = useRef(0);
+  const interimRef = useRef("");
 
   const replaceInterim = useCallback(
     (text: string) => {
-      setDraft((prev) => {
-        const base = stripInterim(prev, interimLenRef.current);
-        const next = joined(base, text);
-        interimLenRef.current = next.length - base.length;
-        return next;
-      });
+      const marker = interimRef.current;
+      interimRef.current = text;
+      setDraft((prev) => joined(stripMarker(prev, marker), text));
     },
     [setDraft],
   );
 
   const appendFinal = useCallback(
     (text: string) => {
-      setDraft((prev) => {
-        const base = stripInterim(prev, interimLenRef.current);
-        interimLenRef.current = 0;
-        return joined(base, text);
-      });
+      const marker = interimRef.current;
+      interimRef.current = "";
+      setDraft((prev) => joined(stripMarker(prev, marker), text));
     },
     [setDraft],
   );

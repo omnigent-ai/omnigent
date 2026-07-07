@@ -147,6 +147,15 @@ class DictationStreamHandle(Protocol):
         """Flush trailing audio and return the final tail utterance."""
         ...
 
+    def close(self) -> None:
+        """Release the take's resources without flushing (client vanished).
+
+        Idempotent, and safe after :meth:`finish`. Critical for the
+        remote engine, where an unclosed take holds a worker capacity
+        slot forever.
+        """
+        ...
+
 
 class DictationEngine(Protocol):
     """Factory for dictation streams; one engine is shared per process."""
@@ -408,6 +417,9 @@ class _SherpaStream:
             tail = recognizer.get_result(self._stream).strip()
         return self.beautify(tail)
 
+    def close(self) -> None:
+        """No-op: the recognizer stream frees with the handle."""
+
 
 class RemoteDictationEngine:
     """Relays dictation takes to a remote worker over WebSocket.
@@ -518,7 +530,7 @@ class _RemoteStream:
                     elif kind == "error":
                         self._dead = True
                         break
-        except Exception:
+        except Exception:  # noqa: BLE001 - any transport failure kills the take
             with self._lock:
                 self._dead = True
         self._stopped.set()
@@ -543,10 +555,18 @@ class _RemoteStream:
         with contextlib.suppress(Exception):
             self._ws.send(json.dumps({"type": "stop"}))
         self._stopped.wait(timeout=_REMOTE_STOP_TIMEOUT_S)
-        with contextlib.suppress(Exception):
-            self._ws.close()
+        self.close()
         with self._lock:
             return self._tail
+
+    def close(self) -> None:
+        """Close the worker socket, releasing its capacity slot.
+
+        Also unblocks the reader thread's ``recv``. Idempotent — the
+        sync websockets client tolerates repeated ``close`` calls.
+        """
+        with contextlib.suppress(Exception):
+            self._ws.close()
 
 
 #: Scripted transcript the fake engine reveals; asserted verbatim by the
@@ -565,9 +585,14 @@ class FakeDictationEngine:
     (regardless of content), finalizing the sentence when it completes.
     """
 
+    def __init__(self) -> None:
+        #: The most recently opened stream, for cleanup assertions.
+        self.last_stream: _FakeStream | None = None
+
     def create_stream(self) -> _FakeStream:
         """Open a scripted stream."""
-        return _FakeStream()
+        self.last_stream = _FakeStream()
+        return self.last_stream
 
 
 class _FakeStream:
@@ -577,6 +602,7 @@ class _FakeStream:
         self._words = FAKE_SCRIPT.split()
         self._bytes_seen = 0
         self._done = False
+        self.closed = False
 
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         """Reveal script words proportional to audio fed."""
@@ -600,3 +626,7 @@ class _FakeStream:
         revealed = min(self._bytes_seen // _FAKE_BYTES_PER_WORD, len(self._words))
         self._done = True
         return " ".join(self._words[:revealed])
+
+    def close(self) -> None:
+        """Record the close so tests can assert take cleanup."""
+        self.closed = True

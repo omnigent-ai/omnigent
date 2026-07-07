@@ -1,18 +1,25 @@
 // Tests for useDictationInsert — the replaceable trailing interim region
 // that lets server dictation stream live text into a plain-string draft.
+//
+// Invariant under test throughout: dictation must never delete text it
+// didn't write. The interim region is stripped only when the draft still
+// ends with the exact text the hook inserted.
 
 import { act, renderHook } from "@testing-library/react";
-import { useState } from "react";
+import { StrictMode, useState, type ReactNode } from "react";
 import { describe, expect, it } from "vitest";
 import { useDictationInsert } from "./useDictationInsert";
 
 /** Harness pairing the hook with the same useState shape the composers use. */
-function renderDictation(initial = "") {
-  return renderHook(() => {
-    const [value, setValue] = useState(initial);
-    const dictation = useDictationInsert(setValue);
-    return { value, setRaw: (next: string) => setValue(() => next), ...dictation };
-  });
+function renderDictation(initial = "", wrapper?: ({ children }: { children: ReactNode }) => ReactNode) {
+  return renderHook(
+    () => {
+      const [value, setValue] = useState(initial);
+      const dictation = useDictationInsert(setValue);
+      return { value, setRaw: (next: string) => setValue(() => next), ...dictation };
+    },
+    wrapper ? { wrapper } : undefined,
+  );
 }
 
 describe("useDictationInsert", () => {
@@ -66,5 +73,26 @@ describe("useDictationInsert", () => {
     expect(result.current.value).toBe("after");
     act(() => result.current.appendFinal("After."));
     expect(result.current.value).toBe("After.");
+  });
+
+  it("never deletes text the user typed after the interim", () => {
+    const { result } = renderDictation();
+    act(() => result.current.replaceInterim("hello wor"));
+    // The user clicks into the composer and types after the interim.
+    act(() => result.current.setRaw("hello wor, urgent"));
+    // The draft no longer ends with the tracked interim → nothing is
+    // stripped; the update appends instead of slicing typed text away.
+    act(() => result.current.appendFinal("Hello world."));
+    expect(result.current.value).toBe("hello wor, urgent Hello world.");
+  });
+
+  it("is StrictMode-safe (updaters are pure; double-invoke is a no-op)", () => {
+    const strict = ({ children }: { children: ReactNode }) => <StrictMode>{children}</StrictMode>;
+    const { result } = renderDictation("draft", strict);
+    act(() => result.current.replaceInterim("one"));
+    act(() => result.current.replaceInterim("one two"));
+    expect(result.current.value).toBe("draft one two");
+    act(() => result.current.appendFinal("One, two."));
+    expect(result.current.value).toBe("draft One, two.");
   });
 });

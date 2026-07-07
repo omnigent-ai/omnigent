@@ -31,8 +31,7 @@ from typing import Any
 
 from playwright.sync_api import Browser, expect
 
-# Must match omnigent.server.dictation.FAKE_SCRIPT (asserted verbatim).
-_FAKE_SCRIPT = "server dictation smoke test transcript"
+from omnigent.server.dictation import FAKE_SCRIPT as _FAKE_SCRIPT
 
 # The capability probe caches per page load; the worklet chunks audio at
 # 100 ms; CI machines are slow — a generous ceiling keeps this deflaked.
