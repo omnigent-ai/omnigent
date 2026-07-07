@@ -525,12 +525,15 @@ class CopyFilesRequest(BaseModel):
 
     :param source_session_id: Session that owns the source files, e.g.
         ``"conv_parent"``. Must be a strict ancestor of the destination.
-    :param file_ids: Ids of the source-owned files to copy, e.g.
-        ``["file_abc123"]``.
+    :param file_ids: Non-empty, unique ids of the source-owned files to
+        copy, e.g. ``["file_abc123"]``.
     """
 
     source_session_id: str
-    file_ids: list[str]
+    file_ids: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
 
 
 class CopiedFile(BaseModel):

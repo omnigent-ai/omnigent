@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
-from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
 
@@ -1704,6 +1705,32 @@ async def _upload_file(
     return resp.json()["id"]
 
 
+def test_ancestor_session_ids_stops_on_parent_cycle(
+    file_conv_store: _ConversationStore,
+) -> None:
+    """A malformed parent cycle terminates at the first repeated session."""
+    file_conv_store._conversations["conv_cycle_a"] = Conversation(
+        id="conv_cycle_a",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_cycle_a",
+        kind="sub_agent",
+        parent_conversation_id="conv_cycle_b",
+        agent_id="ag_test",
+    )
+    file_conv_store._conversations["conv_cycle_b"] = Conversation(
+        id="conv_cycle_b",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_cycle_a",
+        kind="sub_agent",
+        parent_conversation_id="conv_cycle_a",
+        agent_id="ag_test",
+    )
+
+    assert _ancestor_session_ids(file_conv_store, "conv_cycle_a") == ["conv_cycle_b"]
+
+
 @pytest.mark.asyncio
 async def test_copy_files_from_direct_parent(
     file_client: httpx.AsyncClient,
@@ -1742,6 +1769,46 @@ async def test_copy_files_from_direct_parent(
     )
     assert content.status_code == 200
     assert content.content == b"parent bytes"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_empty_file_ids(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """The request body requires at least one file id."""
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": []},
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_blank_file_id(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Each requested file id must be non-empty."""
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [""]},
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_duplicate_file_ids(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Duplicate source ids are rejected instead of copied twice."""
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": ["file_same", "file_same"]},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
 
 
 @pytest.mark.asyncio
@@ -1889,11 +1956,13 @@ async def test_copy_files_midbatch_write_failure_persists_no_resource_events(
 
     artifact_store.put = _put_then_fail  # type: ignore[assignment]
 
-    with pytest.raises(RuntimeError, match="blob backend down"):
-        await file_client.post(
-            "/v1/sessions/conv_c/resources/files:copy",
-            json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
-        )
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["error"]["code"] == "internal_error"
+    assert "Failed to copy files" in resp.json()["error"]["message"]
 
     # First file's row + blob rolled back: destination unchanged.
     after = file_store.list(session_id="conv_c").data
@@ -1901,6 +1970,100 @@ async def test_copy_files_midbatch_write_failure_persists_no_resource_events(
     # No phantom resource event persisted for the rolled-back first file.
     events = [i for i in file_conv_store.appended_items if i.type == "resource_event"]
     assert events == [], f"rolled-back copy must persist no resource events, got {events}"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rollback_deletes_blobs_when_row_delete_fails(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rollback still attempts blob cleanup if row cleanup fails."""
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+
+    real_put = artifact_store.put
+    calls = {"n": 0}
+
+    def _put_then_fail(key: str, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("blob backend down")
+        real_put(key, data)
+
+    deleted_blobs: list[str] = []
+    real_artifact_delete = artifact_store.delete
+
+    def _record_blob_delete(key: str) -> None:
+        deleted_blobs.append(key)
+        real_artifact_delete(key)
+
+    def _row_delete_fails(file_id: str, *, session_id: str) -> bool:
+        del file_id, session_id
+        raise RuntimeError("row delete down")
+
+    artifact_store.put = _put_then_fail  # type: ignore[assignment]
+    artifact_store.delete = _record_blob_delete  # type: ignore[assignment]
+    monkeypatch.setattr(file_store, "delete", _row_delete_fails)
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+
+    assert resp.status_code == 500, resp.text
+    assert len(deleted_blobs) == 2
+    assert "Failed to delete copied file row during rollback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rollback_logs_blob_delete_failures(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rollback logs blob cleanup failures after deleting rows."""
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+
+    real_put = artifact_store.put
+    calls = {"n": 0}
+
+    def _put_then_fail(key: str, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("blob backend down")
+        real_put(key, data)
+
+    deleted_rows: list[str] = []
+    real_file_delete = file_store.delete
+
+    def _record_row_delete(file_id: str, *, session_id: str) -> bool:
+        deleted_rows.append(file_id)
+        return real_file_delete(file_id, session_id=session_id)
+
+    def _blob_delete_fails(key: str) -> None:
+        del key
+        raise RuntimeError("blob delete down")
+
+    artifact_store.put = _put_then_fail  # type: ignore[assignment]
+    artifact_store.delete = _blob_delete_fails  # type: ignore[assignment]
+    monkeypatch.setattr(file_store, "delete", _record_row_delete)
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+
+    assert resp.status_code == 500, resp.text
+    assert len(deleted_rows) == 2
+    assert "Failed to delete copied file blob during rollback" in caplog.text
 
 
 @pytest.mark.asyncio

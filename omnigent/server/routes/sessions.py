@@ -17796,6 +17796,11 @@ def create_sessions_router(
                 f"Cannot copy {len(body.file_ids)} files: limit is {max_files}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if len(set(body.file_ids)) != len(body.file_ids):
+            raise OmnigentError(
+                "file_ids must not contain duplicates",
+                code=ErrorCode.INVALID_INPUT,
+            )
         sources: list[StoredFile] = []
         total_bytes = 0
         for file_id in body.file_ids:
@@ -17815,8 +17820,7 @@ def create_sessions_router(
 
         # Commit the copies one file at a time (read → create → put) so peak
         # memory is a single blob, not the whole batch. If any step fails
-        # mid-batch, roll back the rows/blobs already created so a partial
-        # copy never persists.
+        # mid-batch, roll back the rows/blobs already created.
         mapping: dict[str, CopiedFile] = {}
         created: list[str] = []
         copied: list[StoredFile] = []
@@ -17839,12 +17843,30 @@ def create_sessions_router(
                     content_type=new.content_type,
                 )
                 copied.append(new)
-        except Exception:
+        except Exception as exc:
             for new_id in created:
-                with contextlib.suppress(Exception):
+                try:
                     file_store.delete(new_id, session_id=session_id)
+                except Exception:  # noqa: BLE001 - rollback cleanup is best effort.
+                    _logger.warning(
+                        "Failed to delete copied file row during rollback: session=%s file_id=%s",
+                        session_id,
+                        new_id,
+                        exc_info=True,
+                    )
+                try:
                     artifact_store.delete(new_id)
-            raise
+                except Exception:  # noqa: BLE001 - rollback cleanup is best effort.
+                    _logger.warning(
+                        "Failed to delete copied file blob during rollback: session=%s file_id=%s",
+                        session_id,
+                        new_id,
+                        exc_info=True,
+                    )
+            raise OmnigentError(
+                "Failed to copy files into destination session",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
 
         # Resource events fire only after every write lands. Publishing them
         # inside the copy loop would emit (and persist as transcript items)

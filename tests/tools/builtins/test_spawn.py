@@ -22,6 +22,13 @@ def _args_schema() -> dict:
     return schema["function"]["parameters"]["properties"]["args"]
 
 
+def _schema_with_subagent() -> dict:
+    """:returns: The schema for a tool with one named sub-agent."""
+    return _build_sys_session_send_schema(
+        {"researcher": AgentSpec(spec_version=1, name="researcher", description="d")}
+    )
+
+
 def _object_branch() -> dict:
     """:returns: The object branch of the ``args`` ``anyOf``."""
     for branch in _args_schema()["anyOf"]:
@@ -42,7 +49,9 @@ def test_file_ids_present_and_optional() -> None:
     branch = _object_branch()
     assert branch["properties"]["file_ids"] == {
         "type": "array",
-        "items": {"type": "string"},
+        "items": {"type": "string", "minLength": 1},
+        "minItems": 1,
+        "uniqueItems": True,
         "description": branch["properties"]["file_ids"]["description"],
     }
     assert "file_ids" not in branch["required"]
@@ -51,10 +60,21 @@ def test_file_ids_present_and_optional() -> None:
 
 
 def test_description_mentions_file_ids() -> None:
-    schema = _build_sys_session_send_schema(
-        {"researcher": AgentSpec(spec_version=1, name="researcher", description="d")}
-    )
+    schema = _schema_with_subagent()
     assert "file_ids" in schema["function"]["description"]
+
+
+def test_file_ids_description_mentions_fresh_named_spawn_only() -> None:
+    schema = _schema_with_subagent()
+    description = schema["function"]["description"]
+    file_ids_description = _object_branch()["properties"]["file_ids"]["description"]
+
+    assert "first named" in description
+    assert "session_id" in description
+    assert "continuing an existing named session" in description
+    assert "first named" in file_ids_description
+    assert "session_id" in file_ids_description
+    assert "continuing an existing named session" in file_ids_description
 
 
 # ── Happy paths ───────────────────────────────────────
@@ -72,16 +92,27 @@ def test_plain_string_args_validate() -> None:
     _validate("just a message")
 
 
-def test_empty_file_ids_validate() -> None:
-    _validate({"input": "go", "file_ids": []})
-
-
 # ── Errors ────────────────────────────────────────────
 
 
 def test_file_ids_string_rejected() -> None:
     with pytest.raises(jsonschema.ValidationError):
         _validate({"input": "go", "file_ids": "file_abc"})
+
+
+def test_empty_file_ids_rejected() -> None:
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({"input": "go", "file_ids": []})
+
+
+def test_duplicate_file_ids_rejected() -> None:
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({"input": "go", "file_ids": ["file_abc", "file_abc"]})
+
+
+def test_empty_file_id_rejected() -> None:
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({"input": "go", "file_ids": [""]})
 
 
 def test_file_ids_non_string_item_rejected() -> None:

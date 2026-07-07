@@ -230,9 +230,12 @@ def _spawn_server_handler(
     events: list[dict[str, Any]],
     copies: list[dict[str, Any]],
     mapping: dict[str, dict[str, Any]],
+    existing_child: dict[str, Any] | None = None,
     copy_status: int = 200,
     copy_error: dict[str, Any] | None = None,
     deletes: list[str] | None = None,
+    delete_status: int = 200,
+    delete_exc: httpx.HTTPError | None = None,
     events_status: int = 202,
     meta_gets: list[str] | None = None,
 ):
@@ -250,8 +253,12 @@ def _spawn_server_handler(
     :param copies: List the handler appends each copy request body to.
     :param mapping: ``{old_id: {new_id, filename, content_type}}`` returned
         by the copy endpoint.
+    :param existing_child: Optional child-session summary returned by the
+        named-child lookup.
     :param copy_status: HTTP status the copy endpoint returns.
     :param copy_error: Error body for a non-2xx copy response.
+    :param delete_status: HTTP status the child-session delete returns.
+    :param delete_exc: Optional HTTP error raised by the delete request.
     :param meta_gets: If provided, the handler records the path of any
         per-file metadata GET here (expected to stay empty).
     """
@@ -259,7 +266,10 @@ def _spawn_server_handler(
     async def _handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if request.method == "GET" and path == f"/v1/sessions/{_PARENT_ID}/child_sessions":
-            return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200,
+                json={"data": [existing_child] if existing_child is not None else []},
+            )
         if request.method == "POST" and path == "/v1/sessions":
             return httpx.Response(201, json={"id": _CHILD_ID})
         if request.method == "POST" and path == f"/v1/sessions/{_CHILD_ID}/resources/files:copy":
@@ -290,7 +300,12 @@ def _spawn_server_handler(
         if request.method == "DELETE" and path == f"/v1/sessions/{_CHILD_ID}":
             if deletes is not None:
                 deletes.append(_CHILD_ID)
-            return httpx.Response(200, json={"id": _CHILD_ID, "deleted": True})
+            if delete_exc is not None:
+                raise delete_exc
+            return httpx.Response(
+                delete_status,
+                json={"id": _CHILD_ID, "deleted": delete_status < 400},
+            )
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -487,6 +502,116 @@ async def test_send_without_file_ids_is_unchanged_and_skips_copy(
 
 
 @pytest.mark.asyncio
+async def test_send_by_session_id_rejects_file_ids_before_server_call() -> None:
+    """By-session-id sends cannot forward files."""
+    from omnigent.runner import app as runner_app
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected server call: {request.method} {request.url}")
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "session_id": _CHILD_ID,
+                        "args": {"input": "continue", "file_ids": ["file_parent"]},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id=_PARENT_ID,
+                agent_spec=_spec_with_subagent(),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop(_PARENT_ID, None)
+
+    assert "file_ids" in output
+    assert "existing session by id" in output
+
+
+@pytest.mark.parametrize(
+    "file_ids",
+    [
+        [],
+        ["file_parent", "file_parent"],
+    ],
+)
+@pytest.mark.asyncio
+async def test_send_rejects_invalid_file_ids_before_server_call(
+    file_ids: list[str],
+) -> None:
+    """Malformed file_ids are rejected before child lookup or copy."""
+    from omnigent.runner import app as runner_app
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected server call: {request.method} {request.url}")
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "task-1",
+                        "args": {"input": "spawn", "file_ids": file_ids},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id=_PARENT_ID,
+                agent_spec=_spec_with_subagent(),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop(_PARENT_ID, None)
+
+    assert output.startswith("Error: sys_session_send invalid 'file_ids':"), output
+
+
+@pytest.mark.asyncio
+async def test_send_named_continuation_rejects_file_ids_before_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Named sends only copy files when they create the child session."""
+    events: list[dict[str, Any]] = []
+    copies: list[dict[str, Any]] = []
+    handler = _spawn_server_handler(
+        events=events,
+        copies=copies,
+        mapping={"file_parent": _copied("file_child", "notes.txt", "text/plain")},
+        existing_child={
+            "id": _CHILD_ID,
+            "title": "worker:task-1",
+            "tool": "worker",
+            "session_name": "task-1",
+            "busy": False,
+            "labels": {},
+        },
+    )
+
+    output = await _run_spawn(
+        monkeypatch,
+        args_payload={"input": "continue", "file_ids": ["file_parent"]},
+        handler=handler,
+    )
+
+    assert "file_ids" in output
+    assert "already exists" in output
+    assert copies == []
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_send_with_bad_file_id_surfaces_copy_error_and_posts_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -523,6 +648,37 @@ async def test_send_with_bad_file_id_surfaces_copy_error_and_posts_nothing(
 
 
 @pytest.mark.asyncio
+async def test_copy_failure_surfaces_child_delete_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed spawn reports when teardown cannot delete the child."""
+    events: list[dict[str, Any]] = []
+    copies: list[dict[str, Any]] = []
+    deletes: list[str] = []
+    handler = _spawn_server_handler(
+        events=events,
+        copies=copies,
+        mapping={},
+        copy_status=404,
+        copy_error={"error": {"message": "File 'file_bogus' not found in source session"}},
+        deletes=deletes,
+        delete_status=500,
+    )
+
+    output = await _run_spawn(
+        monkeypatch,
+        args_payload={"input": "use this", "file_ids": ["file_bogus"]},
+        handler=handler,
+    )
+
+    assert output.startswith("Error: failed to copy files to child:"), output
+    assert "Warning: failed to delete newly-created child session" in output
+    assert "500" in output
+    assert events == []
+    assert deletes == [_CHILD_ID, _CHILD_ID]
+
+
+@pytest.mark.asyncio
 async def test_send_message_failure_after_copy_tears_down_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -556,3 +712,34 @@ async def test_send_message_failure_after_copy_tears_down_child(
     assert len(copies) == 1
     assert len(events) == 1
     assert deletes == [_CHILD_ID], "send failure after copy must delete the child"
+
+
+@pytest.mark.asyncio
+async def test_send_message_failure_surfaces_child_delete_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message-post failure reports teardown transport failures too."""
+    events: list[dict[str, Any]] = []
+    copies: list[dict[str, Any]] = []
+    deletes: list[str] = []
+    handler = _spawn_server_handler(
+        events=events,
+        copies=copies,
+        mapping={"file_parent": _copied("file_child", "notes.txt", "text/plain")},
+        deletes=deletes,
+        delete_exc=httpx.ConnectError("delete failed"),
+        events_status=500,
+    )
+
+    output = await _run_spawn(
+        monkeypatch,
+        args_payload={"input": "use this", "file_ids": ["file_parent"]},
+        handler=handler,
+    )
+
+    assert output.startswith("Error: failed to send message to child:"), output
+    assert "Warning: failed to delete newly-created child session" in output
+    assert "ConnectError: delete failed" in output
+    assert len(copies) == 1
+    assert len(events) == 1
+    assert deletes == [_CHILD_ID, _CHILD_ID]

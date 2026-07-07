@@ -984,12 +984,15 @@
         "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; `source_session_id`\nmust be a STRICT ancestor of the destination up its\n`parent_conversation_id` chain (spawn lineage) \u2014 the destination may\nnot name itself as the source. The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.",
         "properties": {
           "file_ids": {
-            "description": "Ids of the source-owned files to copy, e.g. `[\"file_abc123\"]`.",
+            "description": "Non-empty, unique ids of the source-owned files to copy, e.g. `[\"file_abc123\"]`.",
             "items": {
+              "minLength": 1,
               "type": "string"
             },
+            "minItems": 1,
             "title": "File Ids",
-            "type": "array"
+            "type": "array",
+            "uniqueItems": true
           },
           "source_session_id": {
             "description": "Session that owns the source files, e.g. `\"conv_parent\"`. Must be a strict ancestor of the destination.",

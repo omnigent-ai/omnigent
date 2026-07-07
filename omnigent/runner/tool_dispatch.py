@@ -20,10 +20,10 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import json
 import logging
+import mimetypes
 import os
 import tempfile
 import uuid
@@ -937,8 +937,8 @@ def _subagent_file_ids_from_args(args: dict[str, Any]) -> list[str]:
     :param args: Parsed ``sys_session_send`` arguments, e.g.
         ``{"args": {"input": "review", "file_ids": ["file_abc"]}}``.
     :returns: The requested file ids in order, or ``[]`` when absent.
-    :raises ValueError: If ``file_ids`` is present but is not a list of
-        non-empty strings.
+    :raises ValueError: If ``file_ids`` is present but is not a non-empty
+        list of unique non-empty strings.
     """
     raw_message = args.get("args")
     if not isinstance(raw_message, dict):
@@ -948,6 +948,10 @@ def _subagent_file_ids_from_args(args: dict[str, Any]) -> list[str]:
         return []
     if not isinstance(raw_ids, list) or not all(isinstance(fid, str) and fid for fid in raw_ids):
         raise ValueError("'file_ids' must be a list of non-empty strings when provided")
+    if not raw_ids:
+        raise ValueError("'file_ids' must contain at least one file id when provided")
+    if len(set(raw_ids)) != len(raw_ids):
+        raise ValueError("'file_ids' must not contain duplicate file ids")
     return list(raw_ids)
 
 
@@ -956,7 +960,7 @@ async def _teardown_failed_child(
     child_session_id: str,
     *,
     created_child: bool,
-) -> None:
+) -> str | None:
     """Undo a failed named-send spawn so it leaves no phantom behind.
 
     Unregisters the runner-local child/work mappings and, when this send
@@ -966,14 +970,45 @@ async def _teardown_failed_child(
     (the next send would attach to the phantom instead of spawning clean)
     and orphan the copied file rows. Used on both the copy/content failure
     and the message-post failure paths so they tear down identically.
+
+    :returns: ``None`` when no server cleanup was needed or cleanup
+        succeeded, otherwise a parent-visible warning string.
     """
     from omnigent.runner import app as _runner_app
 
     _runner_app.unregister_child_session(child_session_id)
     _runner_app.unregister_subagent_work(child_session_id)
-    if created_child:
-        with contextlib.suppress(httpx.HTTPError):
-            await server_client.delete(f"/v1/sessions/{child_session_id}", timeout=30.0)
+    if not created_child:
+        return None
+
+    last_error = ""
+    for attempt in range(2):
+        try:
+            resp = await server_client.delete(
+                f"/v1/sessions/{child_session_id}",
+                timeout=30.0,
+            )
+        except httpx.HTTPError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        else:
+            if resp.status_code < 400:
+                return None
+            last_error = f"{resp.status_code} {resp.text[:200]}"
+            if resp.status_code < 500:
+                break
+        if attempt == 0:
+            await asyncio.sleep(0.1)
+
+    _logger.warning(
+        "Failed to delete child session after failed spawn: session=%s error=%s",
+        child_session_id,
+        last_error,
+    )
+    return (
+        "Warning: failed to delete newly-created child session "
+        f"{child_session_id!r}; retrying the same named send may attach "
+        f"to that orphaned session. Delete error: {last_error}"
+    )
 
 
 @dataclass(frozen=True)
@@ -1052,8 +1087,6 @@ async def _build_subagent_message_content(
     mapping = copy_resp.json().get("mapping")
     if not isinstance(mapping, dict):
         return CopyResult(error="Error: file copy response missing 'mapping'")
-
-    import mimetypes
 
     for old_id in file_ids:
         entry = mapping.get(old_id)
@@ -1471,6 +1504,15 @@ async def _execute_subagent_tool(
                 "it, or sys_session_close it first to spawn a fresh "
                 "session on the requested model."
             )
+        if file_ids:
+            return (
+                f"Error: sys_session_send 'file_ids' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} "
+                f"title {session_name!r} already exists as "
+                f"{child_session_id}. Re-send without 'file_ids' to "
+                "continue it, or sys_session_close it first to spawn a "
+                "fresh session with the requested files."
+            )
         if cost_budget is not None:
             return (
                 f"Error: sys_session_send 'cost_budget' applies only when a "
@@ -1710,7 +1752,13 @@ async def _execute_subagent_tool(
         server_client=server_client,
     )
     if copy_result.error is not None:
-        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
+        teardown_warning = await _teardown_failed_child(
+            server_client,
+            child_session_id,
+            created_child=created_child,
+        )
+        if teardown_warning is not None:
+            return f"{copy_result.error}\n{teardown_warning}"
         return copy_result.error
     message_content = copy_result.content
 
@@ -1735,13 +1783,27 @@ async def _execute_subagent_tool(
             timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
     except httpx.HTTPError as exc:
-        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
-        return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
+        teardown_warning = await _teardown_failed_child(
+            server_client,
+            child_session_id,
+            created_child=created_child,
+        )
+        error = f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
+        if teardown_warning is not None:
+            return f"{error}\n{teardown_warning}"
+        return error
     if msg_resp.status_code >= 400:
-        await _teardown_failed_child(server_client, child_session_id, created_child=created_child)
-        return (
+        teardown_warning = await _teardown_failed_child(
+            server_client,
+            child_session_id,
+            created_child=created_child,
+        )
+        error = (
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
+        if teardown_warning is not None:
+            return f"{error}\n{teardown_warning}"
+        return error
 
     # Return the structured handle mirrored from ``spawn.py``. The debug panel
     # parses this to discover child sessions in the sidebar.
