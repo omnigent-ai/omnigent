@@ -77,6 +77,7 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 | `OMNIGENT_DICTATION_MODEL_DIR` | `~/.omnigent/models/dictation/asr` | dir containing `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`, `tokens.txt` |
 | `OMNIGENT_DICTATION_PUNCT_DIR` | `~/.omnigent/models/dictation/punct` | optional online-punctuation model dir (`model*.onnx` + `bpe.vocab`) |
 | `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
+| `OMNIGENT_DICTATION_REMOTE_URL` | unset | relay takes to a dictation worker at this `ws://` URL; local models (if any) become the fallback |
 
 `scripts/fetch-dictation-models.sh` downloads a known-good pair (streaming
 Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
@@ -97,6 +98,32 @@ chunks):
 On N100/N95-class mini-PC servers, use the mid-size zipformer (accuracy held
 up in spot checks; the 20 M model audibly degrades) and consider
 `OMNIGENT_DICTATION_MAX_STREAMS=1`.
+
+### Remote worker
+
+When the main server's CPU can't run the model you want, point
+`OMNIGENT_DICTATION_REMOTE_URL` at a **dictation worker** on a beefier
+LAN box — either another omnigent server or the standalone single-route
+process:
+
+```
+pip install omnigent[dictation] && scripts/fetch-dictation-models.sh
+python -m omnigent.server.dictation_worker --host 0.0.0.0 --port 8100
+```
+
+`RemoteDictationEngine` relays each take over the same wire protocol the
+browser speaks (PCM frames up, transcript events down), so the worker
+needed no new protocol or code path — it is `create_dictation_router`
+served standalone. The browser never talks to the worker; the main
+server authenticates the user on its own route, then relays. The worker
+itself is unauthenticated — bind it to a trusted network only.
+
+Fallback: if local models are also installed on the main server, they
+back the worker up. The fallback engine is built lazily on the first
+take that finds the worker unreachable (so its weights cost no RAM in
+normal operation), and each new take retries the worker first. Example:
+an N95 main server relaying to a workstation running Nemotron 0.6 B,
+falling back to its own mid-size zipformer when the workstation sleeps.
 
 ### Routes — `omnigent/server/routes/dictation.py`
 

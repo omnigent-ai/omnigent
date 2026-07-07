@@ -10,14 +10,18 @@ Engine selection
 ----------------
 
 :func:`engine_availability` / :func:`get_engine` resolve the engine from
-``OMNIGENT_DICTATION_ENGINE``:
+``OMNIGENT_DICTATION_ENGINE`` / ``OMNIGENT_DICTATION_REMOTE_URL``:
 
-- unset (default) — the sherpa-onnx engine. Requires the ``dictation``
-  extra (``pip install omnigent[dictation]``) and a streaming transducer
+- default — the sherpa-onnx engine. Requires the ``dictation`` extra
+  (``pip install omnigent[dictation]``) and a streaming transducer
   model on disk; both are checked lazily so the base install carries no
   new dependencies.
-- ``"fake"`` — a deterministic scripted engine used by tests and the
-  Playwright e2e suite; no native dependency, no models, no microphone.
+- ``OMNIGENT_DICTATION_REMOTE_URL`` set — :class:`RemoteDictationEngine`
+  relays takes to a dictation worker on another machine, with the local
+  sherpa engine (when models are installed) as a lazy fallback.
+- ``OMNIGENT_DICTATION_ENGINE=fake`` — a deterministic scripted engine
+  used by tests and the Playwright e2e suite; no native dependency, no
+  models, no microphone.
 
 sherpa-onnx engine
 ------------------
@@ -56,11 +60,15 @@ the default locations.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import json
 import logging
 import os
 import re
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -71,6 +79,12 @@ ENGINE_ENV = "OMNIGENT_DICTATION_ENGINE"
 MODEL_DIR_ENV = "OMNIGENT_DICTATION_MODEL_DIR"
 PUNCT_DIR_ENV = "OMNIGENT_DICTATION_PUNCT_DIR"
 MAX_STREAMS_ENV = "OMNIGENT_DICTATION_MAX_STREAMS"
+#: When set (``ws://host:port/v1/dictation/stream``), takes are relayed to
+#: that dictation worker — another omnigent server or the standalone
+#: ``python -m omnigent.server.dictation_worker`` — so a small main server
+#: can borrow a beefier box's CPU for recognition. If local models are
+#: also installed, they serve as the fallback when the worker is down.
+REMOTE_URL_ENV = "OMNIGENT_DICTATION_REMOTE_URL"
 
 ENGINE_FAKE = "fake"
 
@@ -78,9 +92,13 @@ ENGINE_FAKE = "fake"
 SAMPLE_RATE = 16000
 _BYTES_PER_SECOND = SAMPLE_RATE * 2
 
-#: Stable machine-readable unavailability reasons for ``GET /v1/dictation``.
+#: Stable machine-readable unavailability reasons.
 REASON_EXTRA_NOT_INSTALLED = "extra_not_installed"
 REASON_MODELS_MISSING = "models_missing"
+
+#: Worker handshake budget: covers a cold model load on the worker side.
+_REMOTE_READY_TIMEOUT_S = 30.0
+_REMOTE_STOP_TIMEOUT_S = 10.0
 
 DEFAULT_MAX_STREAMS = 2
 
@@ -193,14 +211,28 @@ def _punct_files(punct_dir: Path) -> dict[str, Path] | None:
     return {"model": model, "vocab": vocab}
 
 
+def _local_engine_ready() -> bool:
+    """True when the sherpa extra and an ASR model are both installed."""
+    return (
+        importlib.util.find_spec("sherpa_onnx") is not None and _asr_files(_asr_dir()) is not None
+    )
+
+
 def engine_availability() -> tuple[bool, str | None]:
     """Report whether dictation can serve, without loading any model.
+
+    A configured remote worker counts as available without probing it —
+    the worker may be briefly down or still booting, and the stream
+    route degrades cleanly (local fallback, or an error frame) when a
+    take actually starts.
 
     :returns: ``(available, reason)`` where *reason* is ``None`` when
         available, else one of :data:`REASON_EXTRA_NOT_INSTALLED` /
         :data:`REASON_MODELS_MISSING`.
     """
     if os.environ.get(ENGINE_ENV) == ENGINE_FAKE:
+        return True, None
+    if os.environ.get(REMOTE_URL_ENV, "").strip():
         return True, None
     if importlib.util.find_spec("sherpa_onnx") is None:
         return False, REASON_EXTRA_NOT_INSTALLED
@@ -228,8 +260,19 @@ def get_engine() -> DictationEngine:
     with _engine_lock:
         if _engine is not None:
             return _engine
+        remote_url = os.environ.get(REMOTE_URL_ENV, "").strip()
         if os.environ.get(ENGINE_ENV) == ENGINE_FAKE:
             _engine = FakeDictationEngine()
+        elif remote_url:
+            # Local models, when present, back the worker up. The factory
+            # is lazy so the fallback's weights don't cost RAM unless the
+            # worker actually goes down.
+            fallback = (
+                (lambda: SherpaDictationEngine(_asr_dir(), _punct_dir()))
+                if _local_engine_ready()
+                else None
+            )
+            _engine = RemoteDictationEngine(remote_url, fallback_factory=fallback)
         else:
             available, reason = engine_availability()
             if not available:
@@ -364,6 +407,146 @@ class _SherpaStream:
                 recognizer.decode_stream(self._stream)
             tail = recognizer.get_result(self._stream).strip()
         return self.beautify(tail)
+
+
+class RemoteDictationEngine:
+    """Relays dictation takes to a remote worker over WebSocket.
+
+    The worker is anything speaking the ``/v1/dictation/stream`` wire
+    protocol — another omnigent server or the standalone
+    ``python -m omnigent.server.dictation_worker``. Lets a small main
+    server (a mini-PC) borrow a beefier LAN box for recognition.
+
+    Fallback happens per take, at stream creation: if the worker is
+    unreachable, the lazily-built local engine (when models are
+    installed) serves the take instead. A worker dying mid-take fails
+    that take; the next one retries the worker.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        fallback_factory: Callable[[], DictationEngine] | None = None,
+    ) -> None:
+        """
+        :param url: Worker stream URL, e.g.
+            ``ws://venus:8100/v1/dictation/stream``.
+        :param fallback_factory: Builds the local fallback engine on
+            first use (lazy — its model weights cost ~real RAM), or
+            ``None`` when no local model is installed.
+        """
+        self._url = url
+        self._fallback_factory = fallback_factory
+        self._fallback: DictationEngine | None = None
+        self._fallback_lock = threading.Lock()
+
+    def create_stream(self) -> DictationStreamHandle:
+        """Connect a take to the worker, or to the local fallback."""
+        try:
+            return _RemoteStream(self._url)
+        except Exception:
+            if self._fallback_factory is None:
+                raise
+            _logger.warning(
+                "dictation worker unreachable at %s; using local fallback engine",
+                self._url,
+                exc_info=True,
+            )
+            with self._fallback_lock:
+                if self._fallback is None:
+                    self._fallback = self._fallback_factory()
+            return self._fallback.create_stream()
+
+
+class _RemoteStream:
+    """One relayed take: raw PCM up, transcript events down.
+
+    A daemon reader thread folds the worker's ``partial``/``final``
+    events into state that :meth:`feed_pcm16` returns on each call, so
+    the relay presents the same synchronous handle interface the local
+    engines do. The worker already punctuates, so :meth:`beautify` is
+    identity.
+    """
+
+    def __init__(self, url: str) -> None:
+        from websockets.sync.client import connect
+
+        self._ws = connect(url, open_timeout=5)
+        try:
+            deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
+            while True:
+                message = self._ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+                if not isinstance(message, str):
+                    continue
+                event = json.loads(message)
+                if event.get("type") == "ready":
+                    break
+                if event.get("type") == "error":
+                    raise RuntimeError(f"dictation worker error: {event.get('message')}")
+        except BaseException:
+            self._ws.close()
+            raise
+        self._lock = threading.Lock()
+        self._partial = ""
+        self._finals: list[str] = []
+        self._tail = ""
+        self._dead = False
+        self._stopped = threading.Event()
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                message = self._ws.recv()
+                if not isinstance(message, str):
+                    continue
+                try:
+                    event = json.loads(message)
+                except ValueError:
+                    continue
+                kind = event.get("type")
+                with self._lock:
+                    if kind == "partial":
+                        self._partial = str(event.get("text", ""))
+                    elif kind == "final":
+                        self._finals.append(str(event.get("text", "")))
+                        self._partial = ""
+                    elif kind == "stopped":
+                        self._tail = str(event.get("text", ""))
+                        break
+                    elif kind == "error":
+                        self._dead = True
+                        break
+        except Exception:
+            with self._lock:
+                self._dead = True
+        self._stopped.set()
+
+    def feed_pcm16(self, data: bytes) -> DictationUpdate:
+        """Ship a chunk to the worker; return its latest transcript state."""
+        with self._lock:
+            if self._dead:
+                raise RuntimeError("dictation worker connection lost")
+        self._ws.send(data)
+        with self._lock:
+            finalized = " ".join(t for t in self._finals if t).strip() or None
+            self._finals.clear()
+            return DictationUpdate(partial=self._partial, finalized=finalized)
+
+    def beautify(self, text: str) -> str:
+        """Identity — the worker already re-punctuates."""
+        return text
+
+    def finish(self) -> str:
+        """Ask the worker to flush; return its tail utterance."""
+        with contextlib.suppress(Exception):
+            self._ws.send(json.dumps({"type": "stop"}))
+        self._stopped.wait(timeout=_REMOTE_STOP_TIMEOUT_S)
+        with contextlib.suppress(Exception):
+            self._ws.close()
+        with self._lock:
+            return self._tail
 
 
 #: Scripted transcript the fake engine reveals; asserted verbatim by the
