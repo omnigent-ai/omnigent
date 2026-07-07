@@ -619,7 +619,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
-        "openai-agents": "OpenAI Agents SDK",
+        # openai-agents is intentionally omitted from the picker catalog: it
+        # stays a valid harness for YAML specs (and the credential-free
+        # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
     },
     capabilities=_BUILTIN_CAPABILITIES,
