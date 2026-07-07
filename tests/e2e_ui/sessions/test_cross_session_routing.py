@@ -1,19 +1,20 @@
-"""E2E: a message queued in one session never leaks into another.
+"""E2E: a queued message is delivered to its origin session, never another.
 
-Guards the cross-session message-routing regression under the client-side
-queue model:
+Guards cross-session message routing under the client-side queue +
+background-flush model:
 
     Session B is busy (its first message's POST is held open, so B stays
     "streaming"), so a follow-up typed into B is held in B's client-side
-    queue — NOT POSTed. While it waits there, the user switches to a
-    different, idle session A. The queued message MUST stay bound to B: it
-    must never be POSTed to A (the now-active session).
+    queue — NOT POSTed. The user switches to a different, idle session A.
+    Once B's turn settles and B reads idle, **background flush** delivers
+    the queued message to B — its origin — even though A is now active. It
+    must go to B and never leak into A.
 
-The queue is a per-conversation client-side buffer: ``maybeFlushQueuedHead``
-only flushes the head whose ``conversationId`` matches the bound session, so a
-message composed in B cannot be addressed to A. This test pins that no-leak
-guarantee. (The positive path — a queued head flushing to its own session on
-idle, in FIFO order — is covered by the ``chatStore`` unit tests.)
+The queue is a per-conversation client-side buffer keyed by ``conversationId``;
+``flushBackgroundQueues`` POSTs a queued message to its own conversation when
+that conversation is idle in the ``["conversations"]`` cache, regardless of
+which session is being viewed. This test pins both halves: delivered-to-B and
+never-to-A. (The FIFO/idle unit behavior is covered by the ``chatStore`` tests.)
 
 Why async Playwright (not the sync ``page`` fixture): the test inspects the
 body of every ``/events`` POST via a route handler and asserts on which
@@ -174,17 +175,22 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
 
             # Switch to the idle session A via the sidebar link — a client-side
             # navigation that preserves the store (a full reload would drop the
-            # queue). msg2 must NOT flush into A.
+            # queue).
             await page.locator(f'a[href="/c/{session_a}"]').click()
             await page.wait_for_url(re.compile(rf"/c/{re.escape(session_a)}"))
-            # Release B's first POST so the send lifecycle can settle; the queued
-            # msg2 is bound to B, so switching to A must not flush it there.
+            # Release B's first POST so its turn settles and B reads idle in the
+            # conversations cache — the trigger for background flush.
             release_first.set()
-            # Give any errant flush a chance to fire before asserting the
-            # negative (the queue head is bound to B, so nothing should POST).
-            await asyncio.sleep(1.0)
-            assert all(text != _MSG2 for _, text in event_posts), (
-                f"msg2 leaked out of B while A was active: {event_posts}"
+
+            # Background flush now delivers the queued msg2 to B (its origin),
+            # even though A is the active session — the key guarantee. It must
+            # go to B, never to A.
+            await _wait_until(lambda: any(text == _MSG2 for _, text in event_posts))
+            msg2_targets = [sid for sid, text in event_posts if text == _MSG2]
+            assert msg2_targets == [session_b], (
+                f"msg2 was composed in session B ({session_b}) and must be "
+                f"delivered there via background flush, but POST targets were "
+                f"{msg2_targets}."
             )
             assert all(sid != session_a for sid, _ in event_posts), (
                 f"a message leaked into the active session A: {event_posts}"

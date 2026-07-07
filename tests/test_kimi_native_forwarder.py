@@ -50,12 +50,23 @@ class TestRowToItem:
         assert item.text == "This is **Omnigent**."
         assert item.response_id == "kimi:67ce67f7"
 
-    def test_think_part_is_skipped(self) -> None:
+    def test_think_part_is_reasoning(self) -> None:
+        # Reasoning lives in part["think"] (not part["text"]) and is mirrored as a
+        # reasoning item, not skipped — the kimi analogue of codex-native #1254.
         row = {
             "type": "context.append_loop_event",
-            "event": {"type": "content.part", "part": {"type": "think", "think": "reasoning"}},
+            "event": {
+                "type": "content.part",
+                "uuid": "abc123",
+                "part": {"type": "think", "think": "Let me reason about this."},
+            },
         }
-        assert _row_to_item(5, row) is None
+        item = _row_to_item(5, row)
+        assert item is not None
+        assert item.kind == "reasoning"
+        assert item.role == "assistant"
+        assert item.text == "Let me reason about this."
+        assert item.response_id == "kimi:abc123"
 
     def test_tool_call_and_metadata_skipped(self) -> None:
         for row in (
