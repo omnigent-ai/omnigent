@@ -1792,6 +1792,84 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
+    def test_cancelled_turn_evicts_wedged_client(self):
+        """A cancelled turn evicts the cached client so resume can recover (#2109).
+
+        ``asyncio.CancelledError`` is a ``BaseException``, so the idle-watchdog
+        cancel bypasses run_turn's ``except Exception`` boundary and the
+        wedged client used to stay cached.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        created = []
+        wedge_reached = asyncio.Event()
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+                    self.index = len(created)
+                    created.append(self)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    if self.index == 0:
+                        # First client wedges like a stuck tool: no events.
+                        wedge_reached.set()
+                        await asyncio.Event().wait()
+                    yield _ResultMessage("claude-session-a", "recovered")
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+
+                async def _consume():
+                    return [e async for e in executor.run_turn(messages, [], "")]
+
+                turn = asyncio.ensure_future(_consume())
+                await asyncio.wait_for(wedge_reached.wait(), timeout=5)
+                turn.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await turn
+
+                # Evicted without a crash mark so the next turn rebuilds
+                # a fresh client.
+                self.assertEqual(executor._clients, {})
+                self.assertNotIn("session-a", executor._crashed_sessions)
+
+                events = [e async for e in executor.run_turn(messages, [], "")]
+
+            self.assertEqual(len(created), 2)
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(events[-1].response, "recovered")
+
+        _run(_t())
+
     def test_close_session_disconnects_live_client(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 

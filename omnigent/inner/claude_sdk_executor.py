@@ -1223,6 +1223,9 @@ class ClaudeSDKExecutor(Executor):
         self._clients: dict[str, _ClaudeClientState] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
+        # Force-close tasks for clients evicted on turn cancellation, kept
+        # referenced so they are not GC'd mid-close.
+        self._cancel_close_tasks: set[asyncio.Task[None]] = set()
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1469,6 +1472,16 @@ class ClaudeSDKExecutor(Executor):
         # call _force_close_client to flip transport._closed before
         # the loop tears down.
         await self._force_close_client(state.client)
+
+    def _evict_client_on_cancel(self, session_key: str) -> None:
+        state = self._clients.pop(session_key, None)
+        if state is None:
+            return
+        # Close in the background: an await here runs under an in-flight
+        # cancellation and could itself be cancelled, leaking the CLI process.
+        task = asyncio.create_task(self._force_close_client(state.client))
+        self._cancel_close_tasks.add(task)
+        task.add_done_callback(self._cancel_close_tasks.discard)
 
     async def close(self) -> None:
         session_keys = list(self._clients)
@@ -2495,6 +2508,13 @@ class ClaudeSDKExecutor(Executor):
                 if aclose is not None:
                     await aclose()
 
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so a watchdog-cancelled turn
+            # skips the boundary below. Evict the wedged client (no crash
+            # mark) so the next turn rebuilds a fresh one and replays history
+            # instead of reusing it and re-tripping the watchdog (#2109).
+            self._evict_client_on_cancel(session_key)
+            raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
             self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
