@@ -137,6 +137,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
 import {
@@ -1568,10 +1569,10 @@ function MainAgentSurface({
     [onSendSlashCommand, isNativeWrapper],
   );
 
-  // "Working…" is shown when the main session is busy, including after a
-  // reload that hydrates `running` before any bubbles exist locally. Streaming
-  // assistant content and compaction spinners own the in-progress slot once
-  // they have rendered.
+  // "Working…" stays lit for the whole busy turn — through streaming text,
+  // tool runs, and reasoning gaps — including after a reload that hydrates
+  // `running` before any bubbles exist locally. Only a trailing compaction
+  // spinner suppresses it (that bubble owns the slot with its own animation).
   const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
   if (showTerminal && conversationId) {
@@ -1670,10 +1671,11 @@ function MainAgentSurface({
                     </MessageContent>
                   </Message>
                 ))}
-                {/* Working… shimmer between send and first rendered block.
-                    Suppressed when the last bubble is a compaction spinner —
-                    that bubble already owns the "in-progress" slot. aria-hidden:
-                    the pinned pill owns the single aria-live region (see WorkingStatusPin). */}
+                {/* Working… shimmer, lit for the whole busy turn so the user
+                    always sees the session is still going. Suppressed when the
+                    last bubble is a compaction spinner — that bubble already
+                    owns the "in-progress" slot. aria-hidden: the pinned pill
+                    owns the single aria-live region (see WorkingStatusPin). */}
                 {showWorkingIndicator && <WorkingIndicator />}
                 {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
@@ -1830,6 +1832,8 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
  */
 function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
   const { isAtBottom } = useStickToBottomContext();
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const tick = useWorkingLabelTick();
   const visible = show && !isAtBottom && !suppress;
   return (
     <div
@@ -1843,18 +1847,23 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
         visible ? "opacity-100" : "opacity-0",
       )}
     >
+      {/* The single announced string. Held stable at "Working…" so the rotating
+          tab text below never re-announces every few seconds. Present whenever
+          the agent is working, so it announces whether the tab is painted
+          (scrolled up) or collapsed (at the bottom, where the inline shimmer
+          owns the visuals). */}
+      {show && <span className="sr-only">Working…</span>}
       {/* Mirror the conversation content column (mx-auto + px-6 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
       <div className={cn("mx-auto w-full px-6", CHAT_COLUMN_WIDTH)}>
-        {/* Gated on `show` (not `visible`) so the aria-live region always holds
-            the "Working…" text while the agent is working — that's what gets
-            announced. When at the bottom (`!visible`) the inline shimmer owns
-            the visuals, so the pill collapses to sr-only: still announced, but
-            not painted. Scrolled up, it renders as the visible tab. */}
         {show && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
-          // its flat bottom edge merges into the chat box.
+          // its flat bottom edge merges into the chat box. aria-hidden: the
+          // sr-only span above owns the announcement, so the rotating label
+          // here stays silent to screen readers. Collapses to sr-only when at
+          // the bottom (`!visible`) — the inline shimmer paints there instead.
           <div
+            aria-hidden="true"
             className={cn(
               "flex w-fit items-center gap-1.5 rounded-t-lg border border-b-0 border-border bg-card px-3 pt-1 pb-1.5",
               !visible && "sr-only",
@@ -1862,7 +1871,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-xs font-mono" duration={1.5}>
-              Working…
+              {workingIndicatorLabel(bgCount, tick)}
             </Shimmer>
           </div>
         )}
@@ -2301,47 +2310,40 @@ function bubbleKey(bubble: Bubble): string {
 }
 
 /**
- * True when there's an assistant bubble whose stream is still in
- * progress (lifecycle "streaming", at least one item rendered). Used
- * to suppress the "Working…" shimmer once content starts arriving.
+ * Playful labels the idle-but-busy indicator rotates through (one per
+ * `ROTATE_MS`). Index 0 MUST stay "Working…": it's the label a fresh tick
+ * (and every unit test) lands on. Keep each entry a single short word +
+ * ellipsis — `Shimmer` scales its sweep width to the text length, so uniform
+ * lengths keep the animation steady across rotations.
  */
-function hasInProgressAssistantBubble(bubbles: Bubble[]): boolean {
-  return bubbles.some(
-    (b) => b.kind === "assistant" && b.lifecycle === "streaming" && b.items.length > 0,
-  );
-}
+export const WORKING_MESSAGES = [
+  "Working…",
+  "Cooking…",
+  "Crunching…",
+  "Tinkering…",
+  "Pondering…",
+  "Brewing…",
+] as const;
 
 /**
- * Decide whether to render the main chat's "Working…" indicator.
- *
- * A reload can hydrate a custom-agent session as ``running`` before any
- * committed or pending bubble is available locally — keep the indicator
- * visible in that empty-but-busy state.
- *
- * @param showsWorking - True when the session snapshot or local response
- *   state says the main session is still working.
- * @param bubbles - Rendered chat bubbles currently hydrated in the main
- *   session, e.g. assistant, user, or compaction-loading bubbles.
- * @returns True when the standalone working indicator should render; false
- *   when the session is idle, a streaming assistant bubble has rendered at
- *   least one item, or a compaction-loading bubble already represents the
- *   busy state.
- */
-/**
  * The label shown next to the working spinner. When background shells outlive
- * the turn (`bgCount > 0`) it names how many are still running; otherwise it's
- * the plain "Working…" string.
+ * the turn (`bgCount > 0`) it names how many are still running (the tick is
+ * ignored — that count is information, not decoration). Otherwise it rotates
+ * through `WORKING_MESSAGES` by wall-clock `tick`.
  */
-export function workingIndicatorLabel(bgCount: number): string {
-  if (bgCount <= 0) return "Working…";
-  return bgCount === 1
-    ? "1 background task still running"
-    : `${bgCount} background tasks still running`;
+export function workingIndicatorLabel(bgCount: number, tick = 0): string {
+  if (bgCount > 0) {
+    return bgCount === 1
+      ? "1 background task still running"
+      : `${bgCount} background tasks still running`;
+  }
+  return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
 
 function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const label = workingIndicatorLabel(bgCount);
+  const tick = useWorkingLabelTick();
+  const label = workingIndicatorLabel(bgCount, tick);
   return (
     <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
       <MessageContent>
@@ -2356,9 +2358,25 @@ function WorkingIndicator() {
   );
 }
 
+/**
+ * Decide whether to render the main chat's "Working…" indicator.
+ *
+ * Lit for the whole busy turn — through streaming text, tool runs, and
+ * reasoning gaps — so the user always sees the session is still going. A
+ * reload can hydrate a custom-agent session as ``running`` before any bubble
+ * exists locally; the indicator stays visible in that empty-but-busy state
+ * too.
+ *
+ * @param showsWorking - True when the session snapshot or local response
+ *   state says the main session is still working.
+ * @param bubbles - Rendered chat bubbles currently hydrated in the main
+ *   session, e.g. assistant, user, or compaction-loading bubbles.
+ * @returns True when the standalone working indicator should render; false
+ *   when the session is idle, or a compaction-loading bubble is last and
+ *   already represents the busy state with its own animation.
+ */
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
-  if (hasInProgressAssistantBubble(bubbles)) return false;
   return bubbles[bubbles.length - 1]?.kind !== "compaction_loading";
 }
 
