@@ -87,9 +87,7 @@ async def test_expand_host_path_strips_posix_prefix_from_windows_drive(
     monkeypatch.setattr("omnigent.host.connect.os.name", "nt")
 
     assert _expand_host_path("/C:/Users/rccol/.omnigent") == "C:/Users/rccol/.omnigent"
-    assert _expand_host_path("/C:\\Users\\rccol\\.omnigent") == (
-        "C:\\Users\\rccol\\.omnigent"
-    )
+    assert _expand_host_path("/C:\\Users\\rccol\\.omnigent") == ("C:\\Users\\rccol\\.omnigent")
 
 
 async def test_expand_host_path_preserves_posix_absolute_path(

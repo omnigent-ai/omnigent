@@ -108,19 +108,28 @@ class TestIsSubpathOf:
         assert _is_subpath_of("C:/Users/alice/project/src", "C:/Users/alice/project") is True
 
     def test_windows_child_path_backslashes(self) -> None:
-        assert _is_subpath_of(
-            "C:\\Users\\alice\\project\\src",
-            "C:\\Users\\alice\\project",
-        ) is True
+        assert (
+            _is_subpath_of(
+                "C:\\Users\\alice\\project\\src",
+                "C:\\Users\\alice\\project",
+            )
+            is True
+        )
 
     def test_windows_case_insensitive(self) -> None:
-        assert _is_subpath_of(
-            "c:\\users\\alice\\project\\src",
-            "C:\\Users\\Alice\\Project",
-        ) is True
+        assert (
+            _is_subpath_of(
+                "c:\\users\\alice\\project\\src",
+                "C:\\Users\\Alice\\Project",
+            )
+            is True
+        )
 
     def test_windows_prefix_collision(self) -> None:
-        assert _is_subpath_of(
-            "C:\\Users\\alice\\project-other",
-            "C:\\Users\\alice\\project",
-        ) is False
+        assert (
+            _is_subpath_of(
+                "C:\\Users\\alice\\project-other",
+                "C:\\Users\\alice\\project",
+            )
+            is False
+        )
