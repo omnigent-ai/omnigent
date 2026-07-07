@@ -146,13 +146,13 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
-function renderSidebar(open = true, initialEntry = "/") {
+function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => void) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
-          <Sidebar open={open} onClose={vi.fn()} />
+          <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -188,13 +188,24 @@ describe("Sidebar session list", () => {
     expect(useConvMock.mock.calls[0]).toEqual(["", true, { reconcileWhileConnected: true }]);
   });
 
+  it("opens the command palette when the Search button is clicked", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const onOpenSearch = vi.fn();
+    renderSidebar(true, "/", onOpenSearch);
+
+    // Session search moved into the command palette: the sidebar box is now a
+    // button that opens it rather than an inline filter input.
+    fireEvent.click(screen.getByTestId("sidebar-search-button"));
+    expect(onOpenSearch).toHaveBeenCalledTimes(1);
+  });
+
   it("swaps the card content to the settings section nav on /settings", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/settings");
 
     // The same card now shows the settings nav (Back to app + sections),
     // not the conversation search/list.
-    expect(screen.queryByPlaceholderText("Search sessions")).toBeNull();
+    expect(screen.queryByTestId("sidebar-search-button")).toBeNull();
     expect(screen.getByRole("link", { name: /Back to Omnigent/ })).toHaveAttribute("href", "/");
     expect(screen.getByTestId("settings-nav-appearance")).toHaveAttribute(
       "href",

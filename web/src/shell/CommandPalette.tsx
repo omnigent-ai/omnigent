@@ -1,11 +1,16 @@
-// Global command palette (⌘K). Two command groups:
+// Global command palette (⌘K). Two command groups, Sessions first:
 //
-//   • Actions — static app commands (new chat, navigate, toggle panels).
-//     Filtered client-side against the live query.
 //   • Sessions — fuzzy session switching from the SAME server-search source the
 //     sidebar uses (`useConversations(query)` → `GET /v1/sessions?search_query=`),
 //     debounced. Not a static first page: a user with hundreds of sessions must
 //     find any of them, which client-side filtering over one page cannot do.
+//     Listed first: the palette doubles as the sidebar's "Search" entry point,
+//     so finding a session is the primary task; the static actions sit below.
+//     Capped to a few recent sessions while the query is empty (see
+//     IDLE_SESSION_LIMIT) so Actions stays visible without scrolling; typing
+//     lifts the cap.
+//   • Actions — static app commands (new chat, navigate, toggle panels).
+//     Filtered client-side against the live query.
 //
 // cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
 // sessions, and we filter the (tiny, static) action list ourselves so both
@@ -54,6 +59,10 @@ interface ActionCommand {
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
 const SEARCH_DEBOUNCE_MS = 300;
+
+/** How many recent sessions to show before the user types, so the Actions
+    group stays visible without scrolling. Typing lifts the cap. */
+const IDLE_SESSION_LIMIT = 5;
 
 export function CommandPalette({
   open,
@@ -149,8 +158,12 @@ export function CommandPalette({
         });
       }
     }
-    return out;
-  }, [data]);
+    // With no query the palette shows the full session page, which pushes the
+    // Actions group below the fold. Cap the idle list to the few most-recent
+    // sessions so both groups fit without scrolling; once the user types, show
+    // every match (finding a specific session is then the point).
+    return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
+  }, [data, debouncedQuery]);
 
   const runAction = (action: ActionCommand): void => {
     close();
@@ -177,13 +190,31 @@ export function CommandPalette({
           <CommandInput
             value={query}
             onValueChange={setQuery}
-            placeholder="Search commands and sessions…"
+            placeholder="Search sessions or run a command"
             data-testid="command-palette-input"
           />
           <CommandList>
             <CommandEmpty>
               {isFetching && debouncedQuery ? "Searching…" : "No results found"}
             </CommandEmpty>
+            {sessions.length > 0 && (
+              <CommandGroup heading="Sessions">
+                {sessions.map((s) => (
+                  // pl-6 indents the label to line up with the icon-prefixed
+                  // Action rows below (their 16px icon + 8px gap), so the two
+                  // groups read as one aligned column.
+                  <CommandItem
+                    key={s.id}
+                    value={s.id}
+                    onSelect={() => goToSession(s.id)}
+                    className="pl-6"
+                  >
+                    <span className="flex-1 truncate text-left">{s.label}</span>
+                    <span className="ml-2 shrink-0 text-xs text-muted-foreground">{s.agent}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            )}
             {filteredActions.length > 0 && (
               <CommandGroup heading="Actions">
                 {filteredActions.map((a) => {
@@ -195,16 +226,6 @@ export function CommandPalette({
                     </CommandItem>
                   );
                 })}
-              </CommandGroup>
-            )}
-            {sessions.length > 0 && (
-              <CommandGroup heading="Sessions">
-                {sessions.map((s) => (
-                  <CommandItem key={s.id} value={s.id} onSelect={() => goToSession(s.id)}>
-                    <span className="flex-1 truncate text-left">{s.label}</span>
-                    <span className="ml-2 shrink-0 text-xs text-muted-foreground">{s.agent}</span>
-                  </CommandItem>
-                ))}
               </CommandGroup>
             )}
           </CommandList>
