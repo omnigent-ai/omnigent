@@ -7778,6 +7778,68 @@ describe("chatStore — background cross-session flush", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["retry-me"]);
   });
 
+  it("does not re-POST a just-failed conversation within its cooldown", async () => {
+    // Guards the retry-storm case: a persistently-failing idle conversation
+    // must not be hammered when the queue-change effect re-fires immediately.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [{ queueId: "q_1", text: "flaky", conversationId: "conv_bg" }],
+    });
+    let posts = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
+        posts += 1;
+        return mockResponse({}, { ok: false, status: 503 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    // First flush POSTs once and fails → re-queued + cooldown set.
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(posts).toBe(1);
+
+    // Immediate re-triggers (mirroring the effect firing on every re-queue)
+    // must NOT POST again while the conversation is in cooldown.
+    useChatStore.getState().flushBackgroundQueues();
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(posts).toBe(1);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["flaky"]);
+  });
+
+  it("re-queues a failed head ahead of its own successors (FIFO preserved)", async () => {
+    // conv_bg has two queued messages; only the head fails. It must land back
+    // in front of its successor, not behind it.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [
+        { queueId: "q_1", text: "bg-first", conversationId: "conv_bg" },
+        { queueId: "q_2", text: "bg-second", conversationId: "conv_bg" },
+      ],
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
+        return mockResponse({}, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "bg-first",
+      "bg-second",
+    ]);
+  });
+
   it("skips a message with attachments (foreground flush owns those)", async () => {
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
     const file = new File(["x"], "a.txt", { type: "text/plain" });
