@@ -2676,6 +2676,42 @@ describe("chatStore — send (file attachments)", () => {
       { type: "input_text", text: "[Attached: /tmp/diagram.png]\n\ndraw this" },
     ]);
   });
+
+  it("reuses a prior upload when re-sending the same File after a failed post", async () => {
+    // send()'s first attempt uploads then fails at the post; the caller retries
+    // with the same File. The upload must not run twice (which would orphan the
+    // first blob) — the second send reuses the cached file_id.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    let uploads = 0;
+    let failPost = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files")) {
+        uploads += 1;
+        return mockResponse({
+          id: "file_dedupe_send",
+          name: "photo.png",
+          metadata: { filename: "photo.png", bytes: 10, created_at: 0 },
+        });
+      }
+      if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        if (failPost) return mockResponse({}, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const file = new File(["fake-bytes"], "photo.png", { type: "image/png" });
+    await useChatStore.getState().send("look at this", "agent_xyz", [file]);
+    expect(uploads).toBe(1);
+
+    // Retry with the SAME File object → cached upload is reused.
+    failPost = false;
+    await useChatStore.getState().send("look at this", "agent_xyz", [file]);
+    expect(uploads).toBe(1);
+  });
 });
 
 describe("chatStore — stop", () => {
@@ -7930,5 +7966,68 @@ describe("chatStore — background cross-session flush", () => {
     // Upload failed → no message posted, and the item is re-queued to retry.
     expect(events).toBe(0);
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["with-image"]);
+  });
+
+  it("does not re-upload an attachment when a retry follows a post-phase failure", async () => {
+    // Upload succeeds but the post fails → re-queued on cooldown. The retry
+    // must reuse the already-uploaded file_id, not upload the blob again (which
+    // would orphan the first one server-side).
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    let uploads = 0;
+    let failPost = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_bg/resources/files") && init?.method === "POST") {
+        uploads += 1;
+        return mockResponse({
+          id: "file_bg_dedupe",
+          name: "shot.png",
+          metadata: { filename: "shot.png", bytes: 4, created_at: 0 },
+        });
+      }
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
+        if (failPost) return mockResponse({}, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["png!"], "shot.png", { type: "image/png" });
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [
+        { queueId: "q_1", text: "see this", conversationId: "conv_bg", files: [file] },
+      ],
+    });
+
+    // First attempt: upload lands, post fails → re-queued.
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(uploads).toBe(1);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["see this"]);
+
+    // Retry (post now succeeds): the upload must NOT run again. Re-init clears
+    // the post-failure cooldown (same query client → seeded cache persists)
+    // without touching the queue or the File→upload cache.
+    failPost = false;
+    initChatStore(client);
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(uploads).toBe(1);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    // The message that finally posted carries the original uploaded id.
+    const posted = fetchMock.mock.calls
+      .filter(
+        ([u, init]) =>
+          String(u).endsWith("/v1/sessions/conv_bg/events") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      )
+      .map(([, init]) => JSON.parse((init as RequestInit).body as string).data.content)
+      .at(-1);
+    expect(posted).toContainEqual({
+      type: "input_image",
+      file_id: "file_bg_dedupe",
+      filename: "shot.png",
+    });
   });
 });
