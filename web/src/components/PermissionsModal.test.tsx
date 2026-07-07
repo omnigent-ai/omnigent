@@ -64,9 +64,11 @@ describe("PermissionsModal", () => {
       wrapper: createWrapper(),
     });
 
+    // Grant rows render emails split into local part + domain (so long ids
+    // can truncate); the full id is queried via the row label's title.
     await waitFor(() => {
-      expect(screen.getByText("alice@example.com")).toBeInTheDocument();
-      expect(screen.getByText("bob@example.com")).toBeInTheDocument();
+      expect(screen.getByTitle("alice@example.com")).toBeInTheDocument();
+      expect(screen.getByTitle("bob@example.com")).toBeInTheDocument();
     });
     expect(listMock).toHaveBeenCalledWith("conv_abc");
   });
@@ -102,7 +104,7 @@ describe("PermissionsModal", () => {
       wrapper: createWrapper(),
     });
 
-    await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTitle("bob@example.com")).toBeInTheDocument());
 
     const revokeBtn = screen.getByRole("button", { name: /revoke/i });
     fireEvent.click(revokeBtn);
@@ -126,7 +128,7 @@ describe("PermissionsModal", () => {
       wrapper: createWrapper(),
     });
 
-    await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTitle("bob@example.com")).toBeInTheDocument());
 
     // The row's permission dropdown shows the current level ("Read") as a
     // combobox; the grant form's level select also shows "Read", so disambiguate
@@ -153,7 +155,7 @@ describe("PermissionsModal", () => {
       wrapper: createWrapper(),
     });
 
-    await waitFor(() => expect(screen.getByText("owner@example.com")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTitle("owner@example.com")).toBeInTheDocument());
 
     // Owner level is fixed text, not a dropdown, and exposes no revoke button.
     expect(screen.getByText("Owner")).toBeInTheDocument();
@@ -215,7 +217,7 @@ describe("PermissionsModal", () => {
       wrapper: createWrapper(),
     });
 
-    await waitFor(() => expect(screen.getByText("mallory@example.com")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTitle("mallory@example.com")).toBeInTheDocument());
 
     // Exactly two dropdowns exist: bob's row + the add-grant form. If this
     // count is 3, the pre-existing manage grant regressed from a fixed label
@@ -312,11 +314,70 @@ describe("PermissionsModal", () => {
       wrapper: createWrapper(),
     });
 
-    await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTitle("bob@example.com")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /revoke/i }));
 
     await waitFor(() => {
       expect(screen.getByText("cannot revoke last owner")).toBeInTheDocument();
+    });
+  });
+
+  // Overflow regression: DialogContent is a CSS grid, and a long nowrap email
+  // used to set the grants section's min-content, pushing every row past the
+  // dialog edge. jsdom does no layout, so these tests pin the DOM contract the
+  // CSS fix relies on: min-w-0 on the grants grid item, and the email split
+  // into a truncating local part + a pinned, visible domain.
+  describe("long user id rendering", () => {
+    it("caps the grants section's grid min-content (min-w-0)", async () => {
+      listMock.mockResolvedValue([
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      ]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => expect(screen.getByTitle("bob@example.com")).toBeInTheDocument());
+      expect(screen.getByTestId("share-grants")).toHaveClass("min-w-0");
+    });
+
+    it("renders an email grant as a truncating local part plus a pinned domain", async () => {
+      listMock.mockResolvedValue([
+        {
+          user_id: "alice.a-very-long-local-part-that-overflows@example.com",
+          conversation_id: "conv_abc",
+          level: 1,
+        },
+      ]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      // The full id stays reachable via the row label's hover tooltip…
+      const label = await screen.findByTitle(
+        "alice.a-very-long-local-part-that-overflows@example.com",
+      );
+      // …while the visible text is split: the local part carries the ellipsis
+      // (truncate) and the domain span refuses to shrink away.
+      const [local, domain] = Array.from(label.children);
+      expect(local).toHaveTextContent("alice.a-very-long-local-part-that-overflows");
+      expect(local).toHaveClass("truncate");
+      expect(domain).toHaveTextContent("@example.com");
+      expect(domain).toHaveClass("shrink-0");
+    });
+
+    it("renders a non-email grantee as a single truncating span", async () => {
+      listMock.mockResolvedValue([{ user_id: "local", conversation_id: "conv_abc", level: 1 }]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      const label = await screen.findByTitle("local");
+      expect(label.children).toHaveLength(1);
+      expect(label.children[0]).toHaveClass("truncate");
+      expect(label.children[0]).toHaveTextContent("local");
     });
   });
 
