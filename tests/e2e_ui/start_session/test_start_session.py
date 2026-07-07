@@ -66,6 +66,9 @@ _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 # ``…/filesystem/home/e2e/projects``; it never matches the bare
 # ``/v1/hosts`` list (no ``/filesystem`` segment).
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
+# The worktree-list endpoint the branch combobox queries for the picked repo.
+# Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
+_WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
@@ -1727,6 +1730,101 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("git") == {"branch_name": "feature/login", "base_branch": "main"}, body
+        finally:
+            await browser.close()
+
+
+def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
+    """Picking an existing worktree starts in its directory with no git opts.
+
+    The branch chip's input doubles as a combobox: focusing it lists the
+    repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
+    one must (a) point the workspace at that worktree's directory and
+    (b) send NO ``git`` spec on ``POST /v1/sessions`` — the session starts
+    directly in the existing worktree rather than creating a new one.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_select_existing_worktree(base_url, session_id))
+
+
+async def _drive_select_existing_worktree(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_worktrees(route: Route) -> None:
+                # The main tree (is_main) plus one linked worktree. The picker
+                # hides the main tree, so only "feature/x" is offered.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "path": "/work/repo",
+                                    "branch": "main",
+                                    "is_main": True,
+                                    "detached": False,
+                                },
+                                {
+                                    "path": "/work/repo-worktrees/feature-x",
+                                    "branch": "feature/x",
+                                    "is_main": False,
+                                    "detached": False,
+                                },
+                            ],
+                        }
+                    ),
+                )
+
+            # Registered after the common routes so it wins for its URL.
+            await page.route(_WORKTREES_RE, handle_worktrees)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the worktree chip; focusing the branch combobox reveals the
+            # repo's existing (linked) worktrees. The main tree is filtered out,
+            # so only the one linked worktree is offered.
+            await page.get_by_test_id("new-chat-landing-branch-chip").click()
+            await page.get_by_test_id("new-chat-landing-branch-input").focus()
+            option = page.get_by_test_id("new-chat-landing-worktree-option")
+            await expect(option).to_have_count(1)
+            await expect(option).to_contain_text("feature/x")
+            await option.click()
+
+            # The warning confirms the session will start in the existing
+            # worktree (rather than creating a new one).
+            await expect(
+                page.get_by_test_id("new-chat-landing-existing-worktree-warning")
+            ).to_be_visible()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            # Workspace is the worktree dir; NO git spec is sent (starting in an
+            # existing worktree creates nothing).
+            assert body["workspace"] == "/work/repo-worktrees/feature-x", body
+            assert body.get("git") is None, body
         finally:
             await browser.close()
 

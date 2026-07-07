@@ -20,9 +20,18 @@ A kwargs-carrying ``run_turn`` could not bridge these: e.g. streaming is only
 observable on full-server via a separate SSE subscription, so "basic turn"
 and "streaming turn" must be *distinct* calls, not one call with a flag.
 
-Transport selection: each :class:`BenchProfile` declares a default
-``transport``; a ``--transport`` CLI override wins over it globally (see
-:func:`resolve_driver_class`).
+Transport selection (see :func:`resolve_driver_class`). A profile's
+``transport`` field is the harness *family* marker, not the literal driver:
+
+- **SDK-family** harnesses (``sdk-inproc``/``full-server``) default to
+  ``full-server`` — the fullest coverage, the only transport that exercises
+  Tool calling + Policy DENY, and a strict superset of what ``sdk-inproc``
+  observes. ``--fast`` downgrades them to ``sdk-inproc``, trading that
+  coverage for skipping the server boot.
+- **native** harnesses (``native-tui``) have exactly one transport; ``--fast``
+  does not apply to them.
+
+A ``--transport`` override wins over both, for any family.
 """
 
 from __future__ import annotations
@@ -95,19 +104,45 @@ def driver_registry() -> dict[str, type]:
     }
 
 
-def resolve_driver_class(profile: BenchProfile, *, override: str | None) -> type:
-    """Resolve the driver class for *profile*.
+# The SDK harness family: transports that drive an SDK-wrap harness. They
+# observe the same core dimensions; full-server additionally reaches Tool
+# calling + Policy DENY (server-dispatched) and is a strict coverage superset,
+# so it is the default. --fast picks the cheaper sdk-inproc within this family.
+_SDK_FAMILY = frozenset({"sdk-inproc", "full-server"})
+_SDK_DEFAULT = "full-server"
+_SDK_FAST = "sdk-inproc"
 
-    *override* (the ``--transport`` flag) wins over the profile's declared
-    ``transport`` when set. Raises :class:`KeyError` for an unknown transport
-    so a typo fails loud rather than silently falling back.
+
+def resolve_transport_name(profile: BenchProfile, *, override: str | None, fast: bool) -> str:
+    """Resolve the effective transport *name* for *profile* from family + flags.
+
+    Precedence: an explicit ``--transport`` *override* wins over everything.
+    Otherwise the profile's ``transport`` names a family: an SDK-family harness
+    resolves to ``full-server`` (default, fullest coverage) or ``sdk-inproc``
+    (under *fast*); a native harness has a single transport that ``--fast``
+    does not touch.
 
     :param profile: The harness under test.
-    :param override: A transport name from ``--transport``, or ``None`` to use
-        the profile's declared transport.
-    :returns: The driver class to instantiate.
+    :param override: ``--transport`` value, or ``None``.
+    :param fast: The ``--fast`` flag — downgrade the SDK family to sdk-inproc.
+    :returns: The resolved transport name (a key into :func:`driver_registry`).
     """
-    name = override or profile.transport
+    if override is not None:
+        return override
+    if profile.transport in _SDK_FAMILY:
+        return _SDK_FAST if fast else _SDK_DEFAULT
+    return profile.transport
+
+
+def resolve_driver_class(
+    profile: BenchProfile, *, override: str | None = None, fast: bool = False
+) -> type:
+    """Resolve the driver *class* for *profile* (see :func:`resolve_transport_name`).
+
+    Raises :class:`KeyError` for an unknown transport so a typo fails loud
+    rather than silently falling back.
+    """
+    name = resolve_transport_name(profile, override=override, fast=fast)
     registry = driver_registry()
     if name not in registry:
         raise KeyError(
@@ -116,4 +151,4 @@ def resolve_driver_class(profile: BenchProfile, *, override: str | None) -> type
     return registry[name]
 
 
-__all__ = ["Driver", "driver_registry", "resolve_driver_class"]
+__all__ = ["Driver", "driver_registry", "resolve_driver_class", "resolve_transport_name"]

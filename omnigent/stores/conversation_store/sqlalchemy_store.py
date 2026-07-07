@@ -25,11 +25,15 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    AGENT_KIND_SESSION,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
+    SqlComment,
     SqlConversation,
     SqlConversationItem,
     SqlConversationLabel,
+    SqlPolicy,
+    SqlSessionPermission,
     SqlUserDailyCost,
 )
 from omnigent.db.utils import (
@@ -193,7 +197,6 @@ def _new_session_agent_row(
     agent_name: str,
     agent_bundle_location: str,
     agent_description: str | None,
-    conversation_id: str,
     now: int,
 ) -> SqlAgent:
     """
@@ -203,7 +206,6 @@ def _new_session_agent_row(
     :param agent_name: Agent name loaded from the uploaded spec.
     :param agent_bundle_location: Artifact-store key for the bundle.
     :param agent_description: Optional description from the spec.
-    :param conversation_id: Owning conversation id.
     :param now: Unix epoch seconds used for the created field.
     :returns: Unsaved :class:`SqlAgent` row.
     """
@@ -213,8 +215,8 @@ def _new_session_agent_row(
         name=agent_name,
         bundle_location=agent_bundle_location,
         version=1,
+        kind=AGENT_KIND_SESSION,
         description=agent_description,
-        session_id=conversation_id,
     )
 
 
@@ -236,7 +238,7 @@ def _created_session_from_rows(
             conversation_row,
             labels if labels is not None else {},
         ),
-        agent=sql_agent_to_entity(agent_row),
+        agent=sql_agent_to_entity(agent_row, session_id=conversation_row.id),
     )
 
 
@@ -1203,7 +1205,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             or ``None`` when the session has no real (non-public)
             permission grants.
         """
-        from omnigent.db.db_models import SqlSessionPermission
         from omnigent.server.auth import RESERVED_USER_PUBLIC
 
         with self._session() as session:
@@ -1550,8 +1551,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .order_by(SqlConversationLabel.value)
             )
             if accessible_by is not None:
-                from omnigent.db.db_models import SqlSessionPermission
-
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
                     SqlSessionPermission.user_id == accessible_by
                 )
@@ -1680,8 +1679,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # because their agent_id column is NULL.
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if accessible_by is not None:
-                from omnigent.db.db_models import SqlSessionPermission
-
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
                     SqlSessionPermission.user_id == accessible_by
                 )
@@ -2250,7 +2247,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_name=agent_name,
                 agent_bundle_location=agent_bundle_location,
                 agent_description=agent_description,
-                conversation_id=conversation_id,
                 now=now,
             )
             session.add(agent_row)
@@ -2494,9 +2490,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             # Create/bind the fork's session-scoped agent atomically.
             if creating_clone:
-                # Mint the clone here so it's born with session_id set (never
-                # NULL) and rolls back with the fork on failure — never
-                # leaking as a phantom built-in.
+                # Mint the clone atomically with the fork so it rolls back
+                # with the fork on failure — never leaking as a phantom built-in.
                 assert (
                     agent_id is not None
                     and cloned_agent_name is not None
@@ -2508,16 +2503,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         agent_name=cloned_agent_name,
                         agent_bundle_location=cloned_agent_bundle_location,
                         agent_description=cloned_agent_description,
-                        conversation_id=new_conv.id,
                         now=now,
                     )
                 )
                 session.flush()
                 new_conv.agent_id = agent_id
             elif agent_id is not None:
-                agent_row = session.get(SqlAgent, agent_id)
-                if agent_row is not None:
-                    agent_row.session_id = new_conv.id
+                # Binding an existing (template) agent to the fork: the forward
+                # pointer conversations.agent_id is the sole link; no back-pointer
+                # to update.
+                new_conv.agent_id = agent_id
 
             # Copy labels from the source conversation, minus the
             # instance-scoped ones (native bridge ids, context metrics)
@@ -2617,22 +2612,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
 
-            # Replace the session-scoped agent. Ordering matters for two
-            # constraints: (1) ``conversations.agent_id`` → ``agents.id`` is
-            # ON DELETE CASCADE, so deleting the old agent while the row still
-            # references it would cascade-delete the WHOLE conversation; null
-            # the reference first. (2) ``ix_agents_session_id`` is UNIQUE, so
-            # the old agent must be gone before the new one claims
-            # ``session_id``. Hence: null agent_id → delete old → insert new →
-            # repoint agent_id. The delete is guarded on
-            # ``session_id == conversation_id`` so a (mistakenly bound)
-            # built-in agent is never deleted.
+            # Null the forward pointer before deleting the old agent so
+            # SQLAlchemy's identity map doesn't hold a reference to a deleted
+            # row when it flushes. The DB no longer enforces any cascade here,
+            # but the ORM still tracks the relationship. Only delete
+            # session-scoped agents — template/built-in agents are shared.
             old_agent_id = row.agent_id
             row.agent_id = None
             session.flush()
             if old_agent_id is not None:
                 old_agent = session.get(SqlAgent, old_agent_id)
-                if old_agent is not None and old_agent.session_id == conversation_id:
+                if old_agent is not None and old_agent.kind == AGENT_KIND_SESSION:
                     session.delete(old_agent)
                     session.flush()
 
@@ -2641,7 +2631,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_name=new_agent_name,
                 agent_bundle_location=new_agent_bundle_location,
                 agent_description=new_agent_description,
-                conversation_id=conversation_id,
                 now=now,
             )
             session.add(new_agent)
@@ -2702,11 +2691,13 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
-        Delete a conversation, its items, related tasks, and FTS
-        records.
+        Delete a conversation and all of its descendants, cleaning up
+        every related row explicitly (no DB-level CASCADE).
 
-        Deletes in FK-safe order: tasks, FTS records, items,
-        then the conversation itself.
+        Collects the full subtree of conversation IDs (the target plus
+        all direct/indirect children), then deletes their items, labels,
+        comments, policies, and session-permission rows before deleting
+        the conversation rows themselves (children before parent).
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -2717,12 +2708,51 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlConversation, conversation_id)
             if not row:
                 return False
-            # Delete conversation items and FTS before the conversation row
-            # (FK constraints: items reference the conversation).
-            delete_fts_by_conversation(session, conversation_id)
+
+            # Collect all descendant IDs via a recursive CTE so we can
+            # clean up the full subtree in one pass.
+            cte = (
+                select(SqlConversation.id)
+                .where(SqlConversation.id == conversation_id)
+                .cte(name="subtree", recursive=True)
+            )
+            cte = cte.union_all(
+                select(SqlConversation.id).where(
+                    SqlConversation.parent_conversation_id == cte.c.id
+                )
+            )
+            subtree_ids_rows = session.execute(select(cte.c.id)).fetchall()
+            subtree_ids = [r[0] for r in subtree_ids_rows]
+
+            # Delete per-conversation child rows for every conversation in
+            # the subtree before touching the conversation rows themselves.
+            for conv_id in subtree_ids:
+                delete_fts_by_conversation(session, conv_id)
+
             session.execute(
                 delete(SqlConversationItem).where(
-                    SqlConversationItem.conversation_id == conversation_id
+                    SqlConversationItem.conversation_id.in_(subtree_ids)
+                )
+            )
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.conversation_id.in_(subtree_ids)
+                )
+            )
+            session.execute(delete(SqlComment).where(SqlComment.conversation_id.in_(subtree_ids)))
+            session.execute(delete(SqlPolicy).where(SqlPolicy.session_id.in_(subtree_ids)))
+            session.execute(
+                delete(SqlSessionPermission).where(
+                    SqlSessionPermission.conversation_id.in_(subtree_ids)
+                )
+            )
+
+            # Delete conversation rows children-first so any residual
+            # ordering constraints are satisfied.
+            session.execute(
+                delete(SqlConversation).where(
+                    SqlConversation.id.in_(subtree_ids),
+                    SqlConversation.id != conversation_id,
                 )
             )
             session.delete(row)

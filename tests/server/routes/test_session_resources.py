@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
-from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
 
@@ -85,6 +86,33 @@ class _ConversationStore:
                     "omnigent.ui": "terminal",
                     "omnigent.wrapper": "claude-code-native-ui",
                 },
+            ),
+            # A three-level spawn lineage for the file-copy tests:
+            # conv_gp (root) -> conv_p (child) -> conv_c (grandchild).
+            "conv_gp": Conversation(
+                id="conv_gp",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_gp",
+                agent_id="ag_test",
+            ),
+            "conv_p": Conversation(
+                id="conv_p",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_gp",
+                kind="sub_agent",
+                parent_conversation_id="conv_gp",
+                agent_id="ag_test",
+            ),
+            "conv_c": Conversation(
+                id="conv_c",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="conv_gp",
+                kind="sub_agent",
+                parent_conversation_id="conv_p",
+                agent_id="ag_test",
             ),
         }
         self.appended_items: list[Any] = []
@@ -1446,6 +1474,10 @@ class _InMemoryArtifactStore:
         """Remove bytes."""
         self._blobs.pop(key, None)
 
+    def exists(self, key: str) -> bool:
+        """Whether a blob is stored for ``key`` (cheap metadata probe)."""
+        return key in self._blobs
+
 
 @pytest.fixture
 def file_conv_store() -> _ConversationStore:
@@ -1646,6 +1678,533 @@ async def test_delete_session_file(
         f"/v1/sessions/conv_proxy/resources/files/{file_id}",
     )
     assert get_resp.status_code == 404
+
+
+# ── files:copy — lineage-scoped file copy tests ─────────────────
+
+
+async def _upload_file(
+    client: httpx.AsyncClient,
+    session_id: str,
+    name: str,
+    content: bytes,
+) -> str:
+    """Upload a file to a session and return its id.
+
+    :param client: The file-capable test client.
+    :param session_id: Owning session id.
+    :param name: Filename to upload.
+    :param content: Raw file bytes.
+    :returns: The new file id.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": (name, content, "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def test_ancestor_session_ids_stops_on_parent_cycle(
+    file_conv_store: _ConversationStore,
+) -> None:
+    """A malformed parent cycle terminates at the first repeated session."""
+    file_conv_store._conversations["conv_cycle_a"] = Conversation(
+        id="conv_cycle_a",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_cycle_a",
+        kind="sub_agent",
+        parent_conversation_id="conv_cycle_b",
+        agent_id="ag_test",
+    )
+    file_conv_store._conversations["conv_cycle_b"] = Conversation(
+        id="conv_cycle_b",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_cycle_a",
+        kind="sub_agent",
+        parent_conversation_id="conv_cycle_a",
+        agent_id="ag_test",
+    )
+
+    assert _ancestor_session_ids(file_conv_store, "conv_cycle_a") == ["conv_cycle_b"]
+
+
+@pytest.mark.asyncio
+async def test_copy_files_from_direct_parent(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A child copies one parent-owned file into its own namespace."""
+    parent_file = await _upload_file(file_client, "conv_p", "doc.txt", b"parent bytes")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [parent_file]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["object"] == "session.files.copied"
+    assert body["session_id"] == "conv_c"
+    entry = body["mapping"][parent_file]
+    new_id = entry["new_id"]
+    # A copy, not an alias: the new row is distinct from the source.
+    assert new_id != parent_file
+    # The enriched mapping carries the preserved filename + content type so
+    # the caller can attach the copy without a follow-up metadata fetch.
+    assert entry["filename"] == "doc.txt"
+    assert entry["content_type"] == "text/plain"
+
+    # The new row is child-scoped and readable by the child only.
+    copied = file_store.get(new_id, session_id="conv_c")
+    assert copied is not None
+    assert copied.filename == "doc.txt"
+    # The source row is unchanged and still owned by the parent.
+    assert file_store.get(parent_file, session_id="conv_p") is not None
+
+    # The bytes match the source.
+    content = await file_client.get(
+        f"/v1/sessions/conv_c/resources/files/{new_id}/content",
+    )
+    assert content.status_code == 200
+    assert content.content == b"parent bytes"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_empty_file_ids(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """The request body requires at least one file id."""
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": []},
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_blank_file_id(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Each requested file id must be non-empty."""
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [""]},
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_duplicate_file_ids(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Duplicate source ids are rejected instead of copied twice."""
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": ["file_same", "file_same"]},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_multi_file_mapping(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A multi-file copy returns a complete source→new mapping."""
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 200, resp.text
+    mapping = resp.json()["mapping"]
+    assert set(mapping.keys()) == {f1, f2}
+    new_ids = {entry["new_id"] for entry in mapping.values()}
+    assert len(new_ids) == 2
+    for new_id in new_ids:
+        assert file_store.get(new_id, session_id="conv_c") is not None
+
+
+@pytest.mark.asyncio
+async def test_copy_files_from_grandparent_in_chain(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """Copying from a grandparent (two levels up) is authorized."""
+    gp_file = await _upload_file(file_client, "conv_gp", "root.txt", b"grandparent")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_gp", "file_ids": [gp_file]},
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][gp_file]["new_id"]
+    assert file_store.get(new_id, session_id="conv_c") is not None
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_source_outside_lineage(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A source session not in the destination's lineage is forbidden."""
+    # conv_proxy is a top-level session with no link to conv_c's chain.
+    foreign_file = await _upload_file(file_client, "conv_proxy", "x.txt", b"foreign")
+
+    before = file_store.list(session_id="conv_c").data
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_proxy", "file_ids": [foreign_file]},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+
+    # Nothing was copied into the destination.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_missing_source_file_is_all_or_nothing(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A missing source file fails the whole request with no partial copy."""
+    good = await _upload_file(file_client, "conv_p", "good.txt", b"ok")
+
+    before = file_store.list(session_id="conv_c").data
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [good, "file_does_not_exist"]},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+
+    # The valid file in the batch must NOT have been committed: validation
+    # is all-or-nothing, so the destination is unchanged.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_missing_blob_surfaces_before_any_write(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A source row whose blob is gone fails the request before any child write.
+
+    The metadata-only validation probes ``artifact_store.exists`` (a cheap
+    metadata check, not a blob read), so a dangling row — present metadata,
+    absent blob — is caught during validation and copies nothing, preserving
+    the "missing blob surfaces before any child row is created" guarantee.
+    """
+    good = await _upload_file(file_client, "conv_p", "good.txt", b"ok")
+    dangling = await _upload_file(file_client, "conv_p", "gone.txt", b"bye")
+    # Drop the blob but leave the metadata row — a dangling source.
+    artifact_store.delete(dangling)
+    before = file_store.list(session_id="conv_c").data
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [good, dangling]},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "not_found"
+    # The valid file in the batch was NOT committed — validation is all-or-nothing.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_midbatch_write_failure_persists_no_resource_events(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    file_conv_store: _ConversationStore,
+) -> None:
+    """A write that fails mid-batch leaves no rows AND no resource events.
+
+    Resource events fire only after every write lands, so a second-file
+    failure rolls back the first file's row/blob and never persists a
+    ``session.resource.created`` for it — clients must not see a phantom
+    file that was rolled back.
+    """
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+    file_conv_store.appended_items.clear()
+    before = file_store.list(session_id="conv_c").data
+
+    real_put = artifact_store.put
+    calls = {"n": 0}
+
+    def _put_then_fail(key: str, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("blob backend down")
+        real_put(key, data)
+
+    artifact_store.put = _put_then_fail  # type: ignore[assignment]
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["error"]["code"] == "internal_error"
+    assert "Failed to copy files" in resp.json()["error"]["message"]
+
+    # First file's row + blob rolled back: destination unchanged.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+    # No phantom resource event persisted for the rolled-back first file.
+    events = [i for i in file_conv_store.appended_items if i.type == "resource_event"]
+    assert events == [], f"rolled-back copy must persist no resource events, got {events}"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rollback_deletes_blobs_when_row_delete_fails(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rollback still attempts blob cleanup if row cleanup fails."""
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+
+    real_put = artifact_store.put
+    calls = {"n": 0}
+
+    def _put_then_fail(key: str, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("blob backend down")
+        real_put(key, data)
+
+    deleted_blobs: list[str] = []
+    real_artifact_delete = artifact_store.delete
+
+    def _record_blob_delete(key: str) -> None:
+        deleted_blobs.append(key)
+        real_artifact_delete(key)
+
+    def _row_delete_fails(file_id: str, *, session_id: str) -> bool:
+        del file_id, session_id
+        raise RuntimeError("row delete down")
+
+    artifact_store.put = _put_then_fail  # type: ignore[assignment]
+    artifact_store.delete = _record_blob_delete  # type: ignore[assignment]
+    monkeypatch.setattr(file_store, "delete", _row_delete_fails)
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+
+    assert resp.status_code == 500, resp.text
+    assert len(deleted_blobs) == 2
+    assert "Failed to delete copied file row during rollback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rollback_logs_blob_delete_failures(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rollback logs blob cleanup failures after deleting rows."""
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+
+    real_put = artifact_store.put
+    calls = {"n": 0}
+
+    def _put_then_fail(key: str, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("blob backend down")
+        real_put(key, data)
+
+    deleted_rows: list[str] = []
+    real_file_delete = file_store.delete
+
+    def _record_row_delete(file_id: str, *, session_id: str) -> bool:
+        deleted_rows.append(file_id)
+        return real_file_delete(file_id, session_id=session_id)
+
+    def _blob_delete_fails(key: str) -> None:
+        del key
+        raise RuntimeError("blob delete down")
+
+    artifact_store.put = _put_then_fail  # type: ignore[assignment]
+    artifact_store.delete = _blob_delete_fails  # type: ignore[assignment]
+    monkeypatch.setattr(file_store, "delete", _record_row_delete)
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+
+    assert resp.status_code == 500, resp.text
+    assert len(deleted_rows) == 2
+    assert "Failed to delete copied file blob during rollback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_copy_files_self_source_is_rejected(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+) -> None:
+    """A session may not name ITSELF as the source — lineage is ancestors only."""
+    own = await _upload_file(file_client, "conv_c", "self.txt", b"mine")
+    before = file_store.list(session_id="conv_c").data
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_c", "file_ids": [own]},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "forbidden"
+
+    # Nothing copied — the destination is unchanged.
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_over_count_before_any_blob_read(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the file-count limit → 400, with NO blob reads and no copies.
+
+    The cap is enforced from metadata during validation, so a rejected
+    request must not call ``artifact_store.get`` even once — that is the
+    whole point of the bound (a rejected request never buffers a blob).
+    """
+    import omnigent.server.server_config as server_config
+
+    monkeypatch.setattr(server_config, "copy_file_count_limit", lambda: 2)
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"a")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"b")
+    f3 = await _upload_file(file_client, "conv_p", "c.txt", b"c")
+    before = file_store.list(session_id="conv_c").data
+
+    get_calls = {"n": 0}
+    real_get = artifact_store.get
+
+    def _counting_get(key: str) -> bytes:
+        get_calls["n"] += 1
+        return real_get(key)
+
+    artifact_store.get = _counting_get  # type: ignore[assignment]
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2, f3]},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    # No blob was read and nothing was copied.
+    assert get_calls["n"] == 0
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_rejects_over_total_bytes_before_any_blob_read(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the total-bytes limit → 400, with NO blob reads and no copies."""
+    import omnigent.server.server_config as server_config
+
+    monkeypatch.setattr(server_config, "copy_total_bytes_limit", lambda: 5)
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+    before = file_store.list(session_id="conv_c").data
+
+    get_calls = {"n": 0}
+    real_get = artifact_store.get
+
+    def _counting_get(key: str) -> bytes:
+        get_calls["n"] += 1
+        return real_get(key)
+
+    artifact_store.get = _counting_get  # type: ignore[assignment]
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert get_calls["n"] == 0
+    after = file_store.list(session_id="conv_c").data
+    assert len(after) == len(before)
+
+
+@pytest.mark.asyncio
+async def test_copy_files_at_limit_boundary_succeeds(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly at the count and total-bytes limits → succeeds."""
+    import omnigent.server.server_config as server_config
+
+    monkeypatch.setattr(server_config, "copy_file_count_limit", lambda: 2)
+    monkeypatch.setattr(server_config, "copy_total_bytes_limit", lambda: 6)
+    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+
+    resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+    )
+    assert resp.status_code == 200, resp.text
+    mapping = resp.json()["mapping"]
+    assert set(mapping.keys()) == {f1, f2}
+
+
+@pytest.mark.asyncio
+async def test_copy_files_then_download_returns_bytes(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """After copy, the child can download the copied content."""
+    parent_file = await _upload_file(file_client, "conv_p", "payload.bin", b"\x00\x01\x02data")
+
+    copy_resp = await file_client.post(
+        "/v1/sessions/conv_c/resources/files:copy",
+        json={"source_session_id": "conv_p", "file_ids": [parent_file]},
+    )
+    new_id = copy_resp.json()["mapping"][parent_file]["new_id"]
+
+    resp = await file_client.get(
+        f"/v1/sessions/conv_c/resources/files/{new_id}/content",
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"\x00\x01\x02data"
 
 
 # ── Phase 1d: integration hardening tests ────────────────────────

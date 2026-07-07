@@ -168,8 +168,8 @@ def test_check_constraint_allows_host_id_with_workspace(
     constraint expression is wrong and would block all host launches.
     """
     with db_engine.connect() as conn:
-        # host_id is an FK to hosts.host_id (enforced), so the host must
-        # exist before a conversation can reference it.
+        # Insert a host first (no FK enforced, but needed for the join in
+        # online_host_ids queries).
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
@@ -216,10 +216,10 @@ def test_host_id_is_indexed(db_engine: Engine) -> None:
 
 def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
     """
-    Deleting a host SET-NULLs the bound conversation's ``host_id``
-    (FK ``ondelete=SET NULL``) instead of leaving a dangling reference.
-    ``workspace`` is untouched, and ``host_id -> NULL`` keeps the
-    workspace-required check satisfied.
+    After the FK was removed, deleting a host leaves conversations.host_id
+    as a dangling reference — the application is responsible for nulling it.
+    This test documents the current (post-FK-removal) DB-level behavior:
+    host deletion does NOT automatically null conversations.host_id.
     """
     with db_engine.connect() as conn:
         conn.execute(
@@ -247,10 +247,13 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
             sa.text("SELECT host_id, workspace FROM conversations WHERE id = :id"),
             {"id": "conv_fk"},
         ).one()
-        assert row.host_id is None, (
-            f"host deletion should SET NULL conversations.host_id; got {row.host_id!r}."
+        # No FK cascade: host_id is left dangling after host deletion.
+        # The application (host store / disconnect handler) is responsible
+        # for nulling conversations.host_id when a host is removed.
+        assert row.host_id == "host_del", (
+            "Without a DB FK, host deletion must not auto-null conversations.host_id."
         )
-        assert row.workspace == "/ws/foo", "workspace must be untouched by the FK SET NULL."
+        assert row.workspace == "/ws/foo", "workspace must be untouched."
 
 
 def test_check_constraint_allows_cli_session_workspace_no_host(
