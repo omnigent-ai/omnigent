@@ -399,12 +399,11 @@ class HermesExecutor(Executor):
         if proc.returncode == 0:
             return None
 
-        reason = (
+        return (
             stderr_bytes.decode("utf-8", errors="replace").strip()
             or stdout_bytes.decode("utf-8", errors="replace").strip()
             or "denied by ModelGate policy"
         )
-        return reason
 
     def _resolve_effective_model(self, explicit_model: str | None) -> str | None:
         """
