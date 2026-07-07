@@ -7858,20 +7858,77 @@ describe("chatStore — background cross-session flush", () => {
     ]);
   });
 
-  it("skips a message with attachments (foreground flush owns those)", async () => {
+  it("uploads an attachment then posts an image block referencing its file_id", async () => {
+    // Mirrors send()'s two-phase sequence: upload the file → post the message
+    // with the server-assigned file_id, one in-flight guard spanning both.
     seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
-    const file = new File(["x"], "a.txt", { type: "text/plain" });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_bg/resources/files") && init?.method === "POST") {
+        return mockResponse({
+          id: "file_bg_1",
+          name: "shot.png",
+          metadata: { filename: "shot.png", bytes: 4, created_at: 0 },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["png!"], "shot.png", { type: "image/png" });
     useChatStore.setState({
       conversationId: "conv_active",
       queuedMessages: [
-        { queueId: "q_1", text: "has-file", conversationId: "conv_bg", files: [file] },
+        { queueId: "q_1", text: "see this", conversationId: "conv_bg", files: [file] },
       ],
     });
 
     useChatStore.getState().flushBackgroundQueues();
     await tick();
+    await tick();
 
-    expect(eventPosts()).toEqual([]);
-    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["has-file"]);
+    // The /events POST carries the image block (real id) followed by the text.
+    const post = fetchMock.mock.calls.find(
+      ([u, init]) =>
+        String(u).endsWith("/v1/sessions/conv_bg/events") &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(post).toBeDefined();
+    const content = JSON.parse((post![1] as RequestInit).body as string).data.content;
+    expect(content).toEqual([
+      { type: "input_image", file_id: "file_bg_1", filename: "shot.png" },
+      { type: "input_text", text: "see this" },
+    ]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("re-queues the message when the attachment upload fails", async () => {
+    // A failure in the upload phase must re-queue + cool down exactly like a
+    // failed POST — the guard spans upload and post together.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    let events = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_bg/resources/files") && init?.method === "POST") {
+        return mockResponse({}, { ok: false, status: 500 });
+      }
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(url) && init?.method === "POST") {
+        events += 1;
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["x"], "a.png", { type: "image/png" });
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [
+        { queueId: "q_1", text: "with-image", conversationId: "conv_bg", files: [file] },
+      ],
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+
+    // Upload failed → no message posted, and the item is re-queued to retry.
+    expect(events).toBe(0);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["with-image"]);
   });
 });

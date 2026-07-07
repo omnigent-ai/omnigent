@@ -562,9 +562,10 @@ export interface ChatState {
    * status in the `["conversations"]` cache is idle. The active conversation is
    * owned by {@link maybeFlushQueuedHead}; this covers a queue whose session the
    * user has navigated away from (its SSE stream is gone, so it can't drain
-   * itself). POSTs one message per idle conversation per call, via `postEvent`
-   * (no active-session state touched, no optimistic bubble — it re-hydrates on
-   * return). Level-triggered + idempotent; safe to over-fire.
+   * itself). Sends one message per idle conversation per call: uploads any
+   * attachments then posts via `postEvent` — the same two-phase sequence
+   * send() runs (no active-session state touched, no optimistic bubble — it
+   * re-hydrates on return). Level-triggered + idempotent; safe to over-fire.
    */
   flushBackgroundQueues: () => void;
   /**
@@ -974,23 +975,43 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      // Files are left for the foreground flush — background covers text only
-      // (attachments are in-memory and the user is likely still near that chat).
-      if (head === undefined || (head.files && head.files.length > 0)) continue;
+      if (head === undefined) continue;
 
-      // Remove BEFORE the POST so a re-entrant trigger can't double-send.
+      // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
       set((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
+      // Upload any attachments, then post the message referencing their
+      // server-assigned file_ids — the same two-phase sequence send() runs
+      // (no combined endpoint exists: /resources/files stores the blob and
+      // returns an id, /events posts a message that points at that id). Both
+      // awaits sit under the one in-flight guard and the one catch, so a
+      // failure in either phase re-queues and backs off together.
+      //
       // No optimistic bubble — we're not viewing this conversation; it
       // re-hydrates from the snapshot on return. On failure re-queue at the
       // head (preserving this conversation's FIFO order) and set a cooldown so
       // the next trigger backs off instead of hammering a failing runner.
-      void postEvent(conversationId, {
-        type: "message",
-        data: { role: "user", content: [{ type: "input_text", text: head.text }] },
-      })
+      void (async () => {
+        const fileBlocks: ContentBlock[] = [];
+        for (const file of head.files ?? []) {
+          const uploaded = await uploadFile(conversationId, file);
+          fileBlocks.push(
+            file.type.startsWith("image/")
+              ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
+              : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename },
+          );
+        }
+        const content: ContentBlock[] = [
+          ...fileBlocks,
+          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
+        ];
+        await postEvent(conversationId, {
+          type: "message",
+          data: { role: "user", content },
+        });
+      })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
             conversationId,
