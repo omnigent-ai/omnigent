@@ -90,6 +90,7 @@ import {
 } from "@/lib/nativeBridge";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -1758,6 +1759,7 @@ export function NewChatLandingScreen() {
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
+  const dictation = useDictationInsert(setMessage);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
@@ -3071,7 +3073,8 @@ export function NewChatLandingScreen() {
                 </Button>
                 <ComposerMicButton
                   disabled={creating}
-                  onTranscript={(text) => setMessage((prev) => (prev ? `${prev} ${text}` : text))}
+                  onTranscript={dictation.appendFinal}
+                  onInterim={dictation.replaceInterim}
                 />
               </div>
               <div className="flex items-center gap-0.5">

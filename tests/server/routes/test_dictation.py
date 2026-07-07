@@ -77,6 +77,17 @@ async def test_availability_with_fake_engine_env(
     assert resp.json() == {"available": True, "reason": None}
 
 
+async def test_info_carries_dictation_capability(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /v1/info advertises dictation for the web UI capability probe."""
+    monkeypatch.setenv(dictation_engine.ENGINE_ENV, dictation_engine.ENGINE_FAKE)
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["dictation_available"] is True
+
+
 def test_stream_partial_final_stop_flow() -> None:
     """Audio in → ready, partial, final, stopped events out."""
     with TestClient(_fake_app()) as tc, tc.websocket_connect("/v1/dictation/stream") as ws:

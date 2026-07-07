@@ -1777,7 +1777,8 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``), the short sandbox
+        ``managed_sandboxes_enabled``, ``dictation_available``),
+        the short sandbox
         provider name (``sandbox_provider``) the web UI labels the
         new-session sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
@@ -1838,6 +1839,14 @@ def create_app(
             )
         except ImportError:
             smart_routing_enabled = False
+        # dictation_available gates the composer mic button's server
+        # speech-to-text fallback (designs/server-dictation.md). Checks
+        # config presence only (extra installed + models on disk) — no
+        # model is loaded here. GET /v1/dictation additionally reports
+        # the unavailability reason for diagnostics.
+        from omnigent.server.dictation import engine_availability
+
+        dictation_available, _ = engine_availability()
         return {
             "accounts_enabled": accounts_enabled,
             "login_url": login_url,
@@ -1847,6 +1856,7 @@ def create_app(
             "sandbox_provider": sandbox_provider,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "dictation_available": dictation_available,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)

@@ -1,6 +1,8 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { DictationSession } from "@/lib/dictation";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -55,23 +57,47 @@ const BAR_BASELINE = 0.2;
 
 export type ComposerMicButtonProps = {
   onTranscript: (text: string) => void;
+  /**
+   * Streaming partial transcripts (server dictation only): called with the
+   * revisable in-progress utterance as it forms, and with "" when the take
+   * ends without finalizing it. Utterances that do finalize arrive via
+   * onTranscript, which supersedes the pending interim. When absent, the
+   * server path still works but only finals are inserted — the same
+   * behavior the Web Speech path has always had.
+   */
+  onInterim?: (text: string) => void;
   disabled?: boolean;
   lang?: string;
 };
 
+/** getUserMedia permission failures, distinct from transport failures. */
+const isPermissionError = (error: unknown): boolean =>
+  error instanceof DOMException &&
+  (error.name === "NotAllowedError" || error.name === "SecurityError");
+
 export const ComposerMicButton = ({
   onTranscript,
+  onInterim,
   disabled,
   lang = "en-US",
 }: ComposerMicButtonProps) => {
-  // null Ctor → no Web Speech support → render nothing (no server fallback).
+  // Mode selection: Web Speech when the browser has it (Chrome/Safari,
+  // unchanged behavior), else server dictation when GET /v1/info advertises
+  // it (Electron, Firefox/Chromium against a server with the dictation
+  // extra), else render nothing.
   const [Ctor] = useState(getRecognitionCtor);
+  const serverInfo = useServerInfo();
+  const serverDictation =
+    Ctor === null && serverInfo !== "loading" && serverInfo.dictation_available;
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  // Ref so the result handler isn't re-attached on every parent re-render.
+  const sessionRef = useRef<DictationSession | null>(null);
+  // Refs so handlers aren't re-attached on every parent re-render.
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
+  const onInterimRef = useRef(onInterim);
+  onInterimRef.current = onInterim;
   // Synced prop ref so the recognition result handler (closure over the
   // mount-time effect) can drop late events when the composer goes
   // disabled mid-utterance.
@@ -147,9 +173,17 @@ export const ComposerMicButton = ({
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
-  // events still queued before the end event fires.
+  // events still queued before the end event fires. A server session is
+  // cancelled outright (no tail flush) — the take is moot once the
+  // composer can't accept text.
   useEffect(() => {
     if (!(disabled && isListening)) return;
+    if (sessionRef.current) {
+      sessionRef.current.cancel();
+      sessionRef.current = null;
+      setIsListening(false);
+      return;
+    }
     try {
       recognitionRef.current?.stop();
     } catch {
@@ -157,6 +191,16 @@ export const ComposerMicButton = ({
       // browsers; safe to ignore — the end event will reconcile state.
     }
   }, [disabled, isListening]);
+
+  // Release the mic if the component unmounts mid-take (e.g. the
+  // new-chat dialog closes while dictating).
+  useEffect(
+    () => () => {
+      sessionRef.current?.cancel();
+      sessionRef.current = null;
+    },
+    [],
+  );
 
   // Second getUserMedia stream just for visualization — Web Speech API
   // hides its audio buffer. Chrome batches the permission to one prompt.
@@ -226,7 +270,59 @@ export const ComposerMicButton = ({
     };
   }, [isListening]);
 
+  // Server-dictation toggle. Start resolves only once the mic + socket
+  // handshake are up, so isListening flips exactly when audio flows.
+  const toggleServer = useCallback(async () => {
+    if (transitionRef.current) return;
+    transitionRef.current = true;
+    const session = sessionRef.current;
+    if (session) {
+      sessionRef.current = null;
+      const tail = (await session.stop()).trim();
+      if (!disabledRef.current) {
+        // A non-empty tail supersedes the pending interim via
+        // onTranscript; an empty one just clears the interim region.
+        if (tail) onTranscriptRef.current(tail);
+        else onInterimRef.current?.("");
+      }
+      setIsListening(false);
+      transitionRef.current = false;
+      return;
+    }
+    try {
+      const next = await DictationSession.start({
+        onPartial: (text) => {
+          if (!disabledRef.current) onInterimRef.current?.(text);
+        },
+        onFinal: (text) => {
+          const trimmed = text.trim();
+          if (trimmed && !disabledRef.current) onTranscriptRef.current(trimmed);
+        },
+        onError: () => {
+          sessionRef.current = null;
+          setError("Dictation unavailable");
+          setIsListening(false);
+          onInterimRef.current?.("");
+        },
+      });
+      sessionRef.current = next;
+      setError(null);
+      setIsListening(true);
+    } catch (startError) {
+      setError(
+        isPermissionError(startError)
+          ? "Microphone permission denied"
+          : "Dictation unavailable",
+      );
+    }
+    transitionRef.current = false;
+  }, []);
+
   const toggle = useCallback(() => {
+    if (serverDictation) {
+      void toggleServer();
+      return;
+    }
     // Guard against rapid clicks landing before start/end event fires.
     if (transitionRef.current) return;
     const recognition = recognitionRef.current;
@@ -240,9 +336,9 @@ export const ComposerMicButton = ({
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
     }
-  }, [isListening]);
+  }, [isListening, serverDictation, toggleServer]);
 
-  if (!Ctor) return null;
+  if (!Ctor && !serverDictation) return null;
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.

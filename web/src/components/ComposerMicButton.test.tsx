@@ -1,16 +1,42 @@
-// Tests for ComposerMicButton — Web Speech API voice dictation.
+// Tests for ComposerMicButton — Web Speech API voice dictation plus the
+// server-dictation fallback.
 //
-// The button toggles a SpeechRecognition session; final transcripts are
-// emitted via onTranscript. It renders nothing when the browser has no
-// SpeechRecognition constructor. None of this is e2e-testable (CI has no real
-// mic / Web Speech engine), so it's pinned here by stubbing the global
-// SpeechRecognition constructor with a fake whose addEventListener captures the
-// handlers the test then fires. getUserMedia (used only for the visualizer) is
-// stubbed to reject so no AudioContext is constructed in jsdom.
+// Web Speech mode: the button toggles a SpeechRecognition session; final
+// transcripts are emitted via onTranscript. It renders nothing when the
+// browser has no SpeechRecognition constructor AND the server offers no
+// dictation. None of this is e2e-testable (CI has no real mic / Web Speech
+// engine), so it's pinned here by stubbing the global SpeechRecognition
+// constructor with a fake whose addEventListener captures the handlers the
+// test then fires. getUserMedia (used only for the visualizer) is stubbed to
+// reject so no AudioContext is constructed in jsdom.
+//
+// Server mode: when there is no SpeechRecognition constructor but the
+// /v1/info capability probe reports dictation_available, the button drives a
+// DictationSession instead (mocked here — the real transport needs a mic,
+// an AudioWorklet, and a WebSocket; the full loop runs in the Playwright
+// e2e test against the server's fake engine).
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
+import type { DictationSessionEvents } from "@/lib/dictation";
 import { ComposerMicButton } from "./ComposerMicButton";
+
+// Controllable DictationSession stand-in for the server-mode tests. The
+// factory reads the mutable spies at call time, so each test installs its
+// own behavior in beforeEach.
+type SessionStub = { stop: () => Promise<string>; cancel: () => void };
+let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionStub>>;
+let sessionStopMock: Mock<() => Promise<string>>;
+let sessionCancelMock: Mock<() => void>;
+let sessionEvents: DictationSessionEvents | null;
+
+vi.mock("@/lib/dictation", () => ({
+  DictationSession: {
+    start: (events: DictationSessionEvents) => sessionStartMock(events),
+  },
+}));
 
 /** Captured event handlers keyed by event type, fed by the fake recognition. */
 let handlers: Record<string, (event: unknown) => void>;
@@ -140,5 +166,150 @@ describe("ComposerMicButton", () => {
 
     act(() => handlers.error?.({ error: "no-speech" }));
     expect(button).toHaveAttribute("title", "Voice dictation");
+  });
+});
+
+/** ServerInfo with dictation on; the other capabilities are irrelevant here. */
+const DICTATION_INFO: ServerInfo = {
+  accounts_enabled: false,
+  login_url: null,
+  needs_setup: false,
+  databricks_features: false,
+  managed_sandboxes_enabled: false,
+  sandbox_provider: null,
+  server_version: "test",
+  smart_routing_enabled: false,
+  dictation_available: true,
+};
+
+function renderServerMode(
+  props: Partial<React.ComponentProps<typeof ComposerMicButton>> = {},
+  info: ServerInfo = DICTATION_INFO,
+) {
+  // No SpeechRecognition constructor → the component must pick server mode.
+  vi.stubGlobal("SpeechRecognition", undefined);
+  vi.stubGlobal("webkitSpeechRecognition", undefined);
+  return render(
+    <CapabilitiesContext.Provider value={info}>
+      <ComposerMicButton onTranscript={vi.fn()} {...props} />
+    </CapabilitiesContext.Provider>,
+  );
+}
+
+async function clickMic() {
+  // toggle() kicks off the async DictationSession.start; flush it inside act.
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+  });
+}
+
+describe("ComposerMicButton (server dictation)", () => {
+  beforeEach(() => {
+    sessionEvents = null;
+    sessionStopMock = vi.fn(async () => "");
+    sessionCancelMock = vi.fn();
+    sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
+      sessionEvents = events;
+      return { stop: sessionStopMock, cancel: sessionCancelMock };
+    });
+  });
+
+  it("renders the button when the server advertises dictation", () => {
+    renderServerMode();
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toBeInTheDocument();
+  });
+
+  it("renders nothing when neither Web Speech nor the server can help", () => {
+    const { container } = renderServerMode(
+      {},
+      { ...DICTATION_INFO, dictation_available: false },
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("starts a session on click and reflects the recording state", async () => {
+    renderServerMode();
+    await clickMic();
+    expect(sessionStartMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("routes partials to onInterim and finals to onTranscript", async () => {
+    const onTranscript = vi.fn();
+    const onInterim = vi.fn();
+    renderServerMode({ onTranscript, onInterim });
+    await clickMic();
+
+    act(() => sessionEvents?.onPartial("hello wor"));
+    expect(onInterim).toHaveBeenCalledWith("hello wor");
+    expect(onTranscript).not.toHaveBeenCalled();
+
+    act(() => sessionEvents?.onFinal("Hello, world."));
+    expect(onTranscript).toHaveBeenCalledWith("Hello, world.");
+  });
+
+  it("stop click flushes the tail into onTranscript", async () => {
+    const onTranscript = vi.fn();
+    sessionStopMock = vi.fn(async () => "tail words");
+    renderServerMode({ onTranscript });
+    await clickMic();
+    await clickMic();
+
+    expect(sessionStopMock).toHaveBeenCalledTimes(1);
+    expect(onTranscript).toHaveBeenCalledWith("tail words");
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("stop with an empty tail clears the interim region instead", async () => {
+    const onTranscript = vi.fn();
+    const onInterim = vi.fn();
+    renderServerMode({ onTranscript, onInterim });
+    await clickMic();
+    await clickMic();
+
+    expect(onTranscript).not.toHaveBeenCalled();
+    expect(onInterim).toHaveBeenCalledWith("");
+  });
+
+  it("surfaces mic permission denial in the tooltip", async () => {
+    sessionStartMock = vi.fn(async () => {
+      throw new DOMException("denied", "NotAllowedError");
+    });
+    renderServerMode();
+    await clickMic();
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+      "title",
+      "Microphone permission denied",
+    );
+  });
+
+  it("a mid-take transport error resets state and reports unavailable", async () => {
+    const onInterim = vi.fn();
+    renderServerMode({ onInterim });
+    await clickMic();
+
+    act(() => sessionEvents?.onError("dictation failed"));
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(button).toHaveAttribute("title", "Dictation unavailable");
+    expect(onInterim).toHaveBeenCalledWith("");
+  });
+
+  it("cancels the session when the composer goes disabled mid-take", async () => {
+    const { rerender } = renderServerMode();
+    await clickMic();
+
+    rerender(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} disabled />
+      </CapabilitiesContext.Provider>,
+    );
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
   });
 });

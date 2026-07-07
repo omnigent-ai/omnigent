@@ -84,6 +84,7 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           sandbox_provider: null,
           server_version: null,
           smart_routing_enabled: false,
+          dictation_available: false,
         }),
       1500,
     ),
