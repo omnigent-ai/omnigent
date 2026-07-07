@@ -270,6 +270,84 @@ def test_parse_expand_env_false_keeps_var_references(
     assert spec.llm.connection == {"api_key": "${MY_API_KEY}"}
 
 
+def test_parse_builtin_tool_config_expands_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``${VAR}`` references in builtin tool config values are expanded."""
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-redacted-test-key")
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    builtin = spec.tools.builtins[0]
+    assert builtin.name == "web_search"
+    assert builtin.config == {
+        "search_provider": "perplexity",
+        "api_key": "pplx-redacted-test-key",
+    }
+
+
+def test_parse_builtin_tool_config_expand_env_false_keeps_literals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``expand_env=False`` keeps builtin tool ``${VAR}`` config literal."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path, expand_env=False)
+
+    assert spec.tools.builtins[0].config == {
+        "search_provider": "perplexity",
+        "api_key": "${PERPLEXITY_API_KEY}",
+    }
+
+
+def test_parse_builtin_tool_config_unresolved_var_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolved ``${VAR}`` in builtin tool config raises clearly."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {"name": "web_search", "api_key": "${PERPLEXITY_API_KEY}"},
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
+        parse(tmp_path)
+
+
 def test_parse_instructions_multiline_inline(tmp_path: Path) -> None:
     """Multiline inline instructions are not treated as file paths."""
     config = {
