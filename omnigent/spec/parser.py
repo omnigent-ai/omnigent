@@ -151,7 +151,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     raw_tools = raw.get("tools")
     llm = _parse_llm(raw_llm, expand_env=expand_env)
     interaction = _parse_interaction(raw.get("interaction"))
-    tools_config = _parse_tools_config(raw_tools)
+    tools_config = _parse_tools_config(raw_tools, expand_env=expand_env)
     executor = _parse_executor(raw_executor, expand_env=expand_env)
     # ── Consolidate llm: → executor ────────────────────────────────
     # ``executor.model`` and ``executor.connection`` are the primary
@@ -346,6 +346,8 @@ def _parse_interaction(
 
 def _parse_tools_config(
     raw: dict[str, Any] | None,
+    *,
+    expand_env: bool = True,
 ) -> ToolsConfig:
     """
     Parse the ``tools:`` block from config.yaml into a
@@ -355,6 +357,8 @@ def _parse_tools_config(
         ``None`` if the block was absent. Example:
         ``{"agents": ["summarizer", "code-reviewer"],
         "timeout": 60}``.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        builtin tool config values. ``False`` keeps literals as-is.
     :returns: A populated :class:`ToolsConfig`. Returns defaults
         when *raw* is ``None``.
     """
@@ -362,7 +366,7 @@ def _parse_tools_config(
         return ToolsConfig()
     timeout = int(raw["timeout"]) if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
-    builtins = _parse_builtin_tools(raw.get("builtins", []))
+    builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
         agents=raw.get("agents", []),
@@ -408,6 +412,8 @@ def _parse_sandbox_config(
 
 def _parse_builtin_tools(
     raw: list[str | dict[str, Any]],
+    *,
+    expand_env: bool = True,
 ) -> list[BuiltinToolConfig]:
     """
     Parse the ``tools.builtins`` list into
@@ -423,6 +429,8 @@ def _parse_builtin_tools(
             engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
 
     :param raw: The raw ``builtins`` list from config.yaml.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        config values. ``False`` keeps literals as-is (scaffolding).
     :returns: A list of :class:`BuiltinToolConfig` instances.
     :raises OmnigentError: If a dict entry is missing ``name``.
     """
@@ -439,6 +447,8 @@ def _parse_builtin_tools(
                 )
             # Everything except 'name' is tool-specific config.
             config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            if expand_env:
+                config = expand_env_vars(config)
             result.append(
                 BuiltinToolConfig(
                     name=str(name),

@@ -2099,6 +2099,78 @@ def test_parse_builtins_dict_missing_name(tmp_path: Path) -> None:
         parse(tmp_path)
 
 
+def test_parse_builtins_env_var_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``${VAR}`` references in tools.builtins config values are expanded."""
+    monkeypatch.setenv("SERPAPI_KEY", "sk-serp-secret")
+    monkeypatch.setenv("SEARCH_ENGINE_ID", "eng-42")
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "api_key": "${SERPAPI_KEY}",
+                    "engine_id": "${SEARCH_ENGINE_ID}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert len(spec.tools.builtins) == 1
+    entry = spec.tools.builtins[0]
+    assert entry.config == {"api_key": "sk-serp-secret", "engine_id": "eng-42"}
+
+
+def test_parse_builtins_env_var_unresolved_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolved ``${VAR}`` in tools.builtins config raises OmnigentError."""
+    monkeypatch.delenv("SERPAPI_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "api_key": "${SERPAPI_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
+        parse(tmp_path)
+
+
+def test_parse_builtins_env_var_expand_env_false_keeps_literal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``expand_env=False`` leaves ``${VAR}`` references as-is in builtins config."""
+    monkeypatch.delenv("SERPAPI_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "api_key": "${SERPAPI_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path, expand_env=False)
+
+    assert spec.tools.builtins[0].config == {"api_key": "${SERPAPI_KEY}"}
+
+
 def test_parse_executor_config(tmp_path: Path) -> None:
     """Executor block with explicit timeout and max_iterations."""
     config = {
