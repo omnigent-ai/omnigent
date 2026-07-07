@@ -6,6 +6,12 @@ available", "is steering possible", "does policy DENY actually block a call" —
 instead of a human hand-maintaining a spreadsheet and hoping it still reflects
 reality.
 
+> **Status:** shipped and in use. The MVP plus most of phase-2 is on `main` —
+> three transport drivers, the six P0 probes, and a capability-derived matrix
+> that has already caught and corrected real declaration drift. See
+> [Current state](#current-state-shipped) for what is live vs. still open. The
+> sections before it describe the design and the decisions behind it.
+
 ## Motivation
 
 We maintain a capability matrix by hand (the native + SDK support
@@ -58,6 +64,13 @@ pain tracked in #899, whose proposed fix was per-harness self-registration.
 This constraint is what shapes the coupling decision below. It is *not* a limit
 on what the bench can probe: the probes are harness-agnostic. It is only a limit
 on how a harness gets *discovered*.
+
+> **Update since this was written:** entry-point plugin discovery now exists —
+> `harness_capabilities()` merges contributions from the
+> `omnigent.community.harness` entry-point group, and the bench derives
+> everything from it. So the bench side of option B is realized: a plugin's
+> harness flows in with no bench edit. The remaining hardcoded seam is *not*
+> here — it is the server's native-agent seeding (see "Plugin seamlessness").
 
 ## Decision: option B (registry-indexed now, profile-driven from day one)
 
@@ -234,27 +247,65 @@ class StreamingProbe(CapabilityProbe):
 
 ## Transport drivers: the real ceiling on "all dimensions"
 
-Behavioral probes run through a **transport driver** keyed by transport class
-(SDK in-proc HTTP, tmux TUI, app-server, HTTP/SSE). A harness that reuses an
-existing transport class is fully covered. A harness that invents a novel
-transport degrades its transport-dependent probes to `SKIPPED`/`UNKNOWN` until a
-driver for that class exists — but model-agnostic dimensions (streaming, MCP,
-policy, cost) stay covered regardless.
+Behavioral probes run through a **transport driver** selected per run
+(`--transport`) or from each profile's declared transport. A probe calls
+*semantic* methods on the driver (`run_basic_turn`, `run_streaming_turn`,
+`run_tool_turn(deny=...)`, `run_interrupt_turn`); the driver owns the
+*mechanism* and the probe owns the *interpretation*, so one probe runs across
+transports that reach the same capability by different means.
 
-This is why "run the bench, see all verdicts, zero code" is true *for any
-harness reusing a known transport class*, and honest about the one case where it
-is not.
+Three drivers exist today (see "Current state" above): `sdk-inproc`,
+`full-server`, `native-tui`. Two consequences fall out of this design:
 
-## Phasing
+- A dimension is only observable where a driver exercises it. Tool calling and
+  Policy DENY need `full-server`; on `sdk-inproc`/`native-tui` they report `·`.
+  A `·` therefore often means "this transport can't exercise it here," not "the
+  harness lacks it" (see "Which transport exercises which dimension").
+- A harness that invents a *novel* transport (neither wrap-subprocess, full
+  server, nor native tmux) would degrade its transport-dependent probes to
+  `SKIPPED`/`UNKNOWN` until a driver for that class exists.
 
-- **MVP (P0).** Layer 0 profile/manifest + Layer 1 offline conformance + Layer 2
-  P0 probes (basic turn, streaming, MCP/tool-calling, interrupt, policy DENY,
-  model override) + the **SDK in-proc transport driver** + report with `DRIFT`
-  column. Wire the SDK harnesses already in `HARNESS_PROBES` (claude-sdk, codex,
-  pi, openai-agents).
-- **P1.** Steering, live-queue, resume/fork, elicitation ASK, reasoning, images,
-  cost, compaction; the tmux / app-server / HTTP-SSE transport drivers; the
-  remaining SDK + all native harness profiles.
+So "run the bench, see all verdicts, zero code" is true *for any harness
+reusing a known transport class*, and honest about the cases where a dimension
+or a transport is not yet wired.
+
+## Current state (shipped)
+
+The MVP and most of phase-2 are landed. What exists on `main` today:
+
+- **Layer 0/1/2** — profile/manifest, offline conformance (runs in CI via the
+  `misc` pytest group), and the six P0 live probes (basic turn, streaming,
+  tool calling, policy DENY, model override, interrupt) with the `DRIFT`
+  column.
+- **Three transport drivers**, selectable via `--transport`:
+  - `sdk-inproc` — drives a harness wrap subprocess directly (the four P0 SDK
+    harnesses: claude-sdk, codex, pi, openai-agents).
+  - `full-server` — a real server + runner; the only transport that exercises
+    **Tool calling** and **Policy DENY** as server-dispatched, policy-gated
+    calls (SDK harnesses only — it registers via an agent bundle).
+  - `native-tui` — a resident vendor CLI in a runner-owned tmux pane, driven
+    over the session HTTP surface via a host daemon.
+- **Capability-derived matrix** — descriptive columns and declared verdicts
+  come from `harness_capabilities()` (the seam; see
+  `designs/harness-capabilities-bench-seam.md`), so a harness added to the
+  registry — in-repo *or* a community plugin — flows into the bench with no
+  bench edit.
+- **Native harnesses auto-derived** — every `NATIVE_TUI` harness is registered
+  and drivable by name; `native_vendor()` derives what the driver needs from
+  capabilities, with no per-vendor table.
+
+### Not yet wired
+
+- **Tool calling / Policy DENY on `native-tui`** — native tool calls are the
+  vendor's own and a native deny is a vendor permission decision, not a
+  server-dispatched `function_call_output`; observing them needs new driver
+  work. (SDK harnesses have these via `full-server`.)
+- **P1 dimensions** — steering, live-queue, resume/fork, elicitation ASK,
+  reasoning, images, cost, compaction. Probes not written yet (report
+  `UNKNOWN`).
+- **Server-side native-agent seeding is a hardcoded list** — see the
+  plugin-seamlessness note below; this is the main gap between "the bench is
+  plugin-ready" and "a plugged-in native harness just works end to end".
 
 ## CI integration
 
@@ -306,10 +357,17 @@ a harness either forwards token-level deltas (`SUPPORTED`) or it does not
 returns it for the ambiguous coalesced-single-delta case against a `SUPPORTED`
 declaration. It is **never a declared value**. Declaring a non-streaming
 harness as `PARTIAL` drifts against reality, because the probe reports zero
-deltas as `UNSUPPORTED`, not `PARTIAL`. This bit the transcript-mirror natives
-(kiro/goose/qwen/hermes/cursor/kimi/pi), which deliver each complete assistant
-message rather than streaming deltas: they declare `streaming=False` →
-`UNSUPPORTED`, matching what the probe observes.
+deltas as `UNSUPPORTED`, not `PARTIAL`.
+
+**Declare `streaming=False` only from a live observation of 0 deltas** — a
+static "the forwarder posts no delta" grep is *not* sufficient. That grep once
+flipped seven natives to `False` in one batch; a live run then showed
+pi-native streams (7 deltas) despite having no delta-posting forwarder, so the
+flip was reverted. Only three natives are declared non-streaming today, each
+live-verified at 0 deltas: **kiro-native, cursor-native, qwen-native**. The
+rest default to `streaming=True` (the honest default: if one turns out not to
+stream, the bench flags a real drift on the next run, rather than a false
+`False` that silently drifts the moment the harness *does* stream).
 
 ## Which transport exercises which dimension
 
@@ -344,20 +402,73 @@ provisioning the `native-tui` driver owns. So Tool calling / Policy DENY for
 native harnesses remain genuinely unwired (a follow-up), distinct from the
 sdk-inproc `·` which is a transport limitation with `full-server` as the answer.
 
+## Plugin seamlessness: where it is and isn't
+
+The original goal (option B) was that a *community* harness ships a
+`BenchProfile` and runs with `--harness <name>` and no bench edits. For the
+**bench itself, that holds**: profile resolution, capability derivation, and
+`native_vendor()` all read `harness_capabilities()`, which discovers community
+plugins via entry points. A plugged-in harness needs zero bench code to be
+recognized.
+
+The seam is **one level down, in the omnigent server**. A native harness is
+only drivable once the server has seeded a built-in `<harness>-native-ui`
+agent, and that seeding is a **hardcoded list** in
+`server/app.py:_ensure_default_agents` — one `_ensure_default_<harness>_agent()`
+call per harness. goose-native and hermes-native were in the capability
+registry but omitted from that list, so the bench (correctly) reported them
+`not auto-registered on the server` until the seeders were added.
+
+So: **the bench is plugin-seamless; the server's native-agent seeding is not,
+and the bench inherits that seam.** A community native plugin today resolves in
+the bench, then fails at registration because nothing seeds its UI agent. The
+clean fix is to make `_ensure_default_agents` iterate `native_agents()` from
+the registry (which already includes plugins) instead of a hardcoded call list
+— then native harnesses and plugins register automatically. This is the highest
+-leverage remaining item: it is the difference between "the bench is plugin-
+ready" and "a plugged-in native harness works end to end".
+
+## The self-enforcing table in practice (drift case studies)
+
+`reconcile()` turns a false capability declaration into a `DRIFT`. This is not
+theoretical — the bench caught several real declaration errors this way, each
+resolved by correcting the *source* (the capability model), not the bench:
+
+- **kiro-native / streaming.** Declared `SUPPORTED`, observed 0 deltas
+  (`!!✓>✗`). kiro mirrors each complete assistant message rather than streaming
+  tokens. Corrected to `streaming=False`.
+- **pi-native / streaming (a fixed over-correction).** A static grep had flipped
+  pi to `False`; a live run showed it streams 7 deltas (`!!✗>✓`) despite having
+  no delta-posting forwarder. Reverted to `True`. This is why the rule is
+  "declare `False` only from a live 0-delta observation" — the grep lied.
+- **cursor-native / streaming + provisioning.** cursor could not provision at
+  all until the `lazy_chat` fix (its `external_session_id` is created by the
+  first message, not at launch, so gating on it pre-turn deadlocked). Once
+  runnable, it observed 0 deltas → `streaming=False`.
+- **qwen-native / streaming.** Observed 0 deltas → `streaming=False`.
+
+The pattern each time: the bench detects the mismatch, a live probe pins which
+side is wrong, and the capability model is corrected — not the bench massaged to
+agree with it.
+
 ## Open items
 
+- **Registry-driven native-agent seeding** (highest leverage) — replace the
+  hardcoded `_ensure_default_*_agent()` list in `server/app.py` with a loop over
+  `native_agents()`, so any native harness (in-repo or plugin) registers
+  automatically. This is the fix for the plugin-seamlessness seam above.
+- **Tool calling / Policy DENY on `native-tui`** — unwired; native tool calls
+  are the vendor's own and a native deny is a vendor permission decision, not a
+  server-dispatched `function_call_output`. Needs new driver work. (SDK
+  harnesses have these via `full-server`.)
+- **Per-harness native provisioning gaps** the bench has surfaced but not yet
+  resolved: goose-native returns a 500 on the terminal-ensure endpoint;
+  hermes-native's forwarder does not wire up (a lazy-chat / first-turn gate to
+  confirm); kimi-native and own-auth natives need a vendor provider setup the
+  bench cannot provision (kimi in particular has no gateway path — it routes
+  via `kimi provider add`, out of band).
+- **P1 dimensions + their probes** — steering, live-queue, resume/fork,
+  elicitation ASK, reasoning, images, cost, compaction.
 - Exact `BenchProfile` field set and whether it subsumes `HarnessProbe` or wraps
-  it.
-- Whether the manifest fully retires the spreadsheet, or the bench diffs against
-  an exported CSV so the sheet stays canonical during transition.
-- Native transport drivers are the larger half of the work; sequence them by
-  which harnesses matter most for the matrix.
-- `full-server` cannot yet provision codex / pi gateway auth (their basic turn
-  fails with an empty/absent gateway token), so Tool calling / Policy DENY are
-  only live-proven on `claude-sdk` today; wiring codex/pi full-server auth would
-  extend that coverage. (The token-provisioning failure is classified as a SKIP,
-  not a false capability drift.)
-- Tool calling / Policy DENY on the `native-tui` transport are unwired — native
-  tool calls are the vendor's own and a native deny is a vendor permission
-  decision, not a server-dispatched `function_call_output`; observing them needs
-  new driver work.
+  it; whether the manifest fully retires the spreadsheet or diffs against an
+  exported CSV during transition.
