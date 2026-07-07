@@ -297,8 +297,7 @@ class PolicyEngine:
            b. Skip if the policy's ``condition`` label-gate
               does not match the current hot-cache snapshot.
            c. Dispatch to ``policy.evaluate``.
-           d. Action-list validation and the classifier-only
-              carve-out for FunctionPolicy and PromptPolicy.
+           d. Accumulate any policy result.
            e. Accumulate ``set_labels`` writes.
            f. If the policy returned ``data``, feed it back
               as ``ctx.content`` so the next policy transforms
@@ -972,16 +971,10 @@ async def _dispatch_policy(
     """
     Run a single policy's ``evaluate`` with full safety net.
 
-    Applies the POLICIES.md §4 / §13 contract:
+    Applies the POLICIES.md §4 contract:
 
     - Any exception raised by the policy is converted to a
-      result via :func:`_fail_closed`: DENY by default,
-      ALLOW for classifier-only specs (``action: [allow]``),
-      ASK for approval-gate specs (``action`` list includes
-      ASK but not DENY, e.g. ``[ask]``, ``[allow, ask]``).
-    - Returned actions are validated against the spec's
-      declared ``action`` list (when present). Mismatch →
-      same fail-closed path.
+      fail-closed DENY result.
     - ``set_labels`` from a failing evaluation are dropped;
       a partial/broken policy does not get to write labels.
 
@@ -994,90 +987,12 @@ async def _dispatch_policy(
     try:
         result = await policy.evaluate(ctx, context)
     except Exception as exc:
-        return _fail_closed(policy.spec, reason=f"policy {policy.spec.name!r} failed: {exc}")
-    if _action_permitted(policy.spec, result.action):
-        return result
-    return _fail_closed(
-        policy.spec,
-        reason=(
-            f"policy {policy.spec.name!r} returned {result.action.value!r} "
-            f"which is not in its declared action list"
-        ),
-    )
-
-
-def _action_permitted(spec: PolicySpec, action: PolicyAction) -> bool:
-    """
-    Check whether *action* is allowed by *spec*'s declared
-    action whitelist.
-
-    Specs with no declared whitelist (FunctionPolicySpec.action
-    may be ``None``) accept any action. Specs that declare a
-    list restrict to that list.
-
-    :param spec: The policy's spec.
-    :param action: The action the policy returned.
-    :returns: ``True`` if the action is permitted.
-    """
-    declared = getattr(spec, "action", None)
-    if not isinstance(declared, list):
-        # FunctionPolicySpec may be None = accept any.
-        return True
-    return action in declared
-
-
-def _fail_closed(spec: PolicySpec, *, reason: str) -> PolicyResult:
-    """
-    Build the fail-closed result for a broken policy.
-
-    Three branches:
-
-    1. **Classifier-only** (``action: [allow]``): substitute ALLOW.
-       Inventing a DENY violates the author's declared "this policy
-       never blocks" intent (POLICIES.md §13).
-    2. **Approval-gate** (``action`` list includes ASK but not DENY,
-       e.g. ``[ask]``, ``[allow, ask]``): substitute ASK so the
-       engine parks for user approval.  Substituting ALLOW would
-       bypass the gate; substituting DENY invents an action the
-       author never declared.
-    3. **All other policies** (no declared list, or list includes
-       DENY): fail-closed DENY.
-
-    :param spec: The policy's spec — used to inspect the declared
-        action whitelist.
-    :param reason: Human-readable explanation attached to the
-        result; discarded on the ALLOW substitution path since
-        ALLOW results carry no reason.
-    :returns: A :class:`PolicyResult` safe for composition.
-    """
-    declared = getattr(spec, "action", None)
-    if isinstance(declared, list):
-        # Classifier-only = advisory policies that never block (e.g. [allow]).
-        # Approval-gate policies ([ask], [allow, ask]) must NOT fail open —
-        # an evaluator exception must park-for-approval or deny, never
-        # substitute ALLOW.  See POLICIES.md §4.
-        has_deny = PolicyAction.DENY in declared
-        has_ask = PolicyAction.ASK in declared
-        if not has_deny and not has_ask:
-            # Classifier-only: honour the "never blocks" intent.
-            return PolicyResult(
-                action=PolicyAction.ALLOW,
-                reason=None,
-                set_labels=None,
-            )
-        if has_ask and not has_deny:
-            # Approval-gate: park for user confirmation.
-            return PolicyResult(
-                action=PolicyAction.ASK,
-                reason=reason,
-                set_labels=None,
-            )
-    # Default: fail-closed DENY.
-    return PolicyResult(
-        action=PolicyAction.DENY,
-        reason=reason,
-        set_labels=None,
-    )
+        return PolicyResult(
+            action=PolicyAction.DENY,
+            reason=f"policy {policy.spec.name!r} failed: {exc}",
+            set_labels=None,
+        )
+    return result
 
 
 def _filter_writable_labels(

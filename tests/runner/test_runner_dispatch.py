@@ -2248,6 +2248,9 @@ class _StubTerminalInstance:
         self.os_env = None
         self.socket_path = Path("/tmp/omnigent-test-tmux.sock")
         self.tmux_target = "main"
+        # ``terminal_resource_view`` reads this to project the effective
+        # web-attach transport into metadata; ``None`` => the global default.
+        self.terminal_transport = None
         # Records on_activity callbacks the dispatch wires up so a fresh
         # launch's pane-activity watcher start is observable (and so the
         # call doesn't AttributeError against this stub).
@@ -3622,7 +3625,9 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     # The curated claude aliases survive the claude-family filter — the
     # exact ids an orchestrator may pass back as args.model.
     assert [m["id"] for m in worker["models"]] == [
+        "claude-fable-5",
         "claude-opus-4-8",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
     ]

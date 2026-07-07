@@ -233,11 +233,14 @@ _DAEMON_RECONNECT_GRACE_S = 5.0
 _DAEMON_REUSE_MIN_AGE_S = 6.0
 
 # How long uvicorn waits for active connections (WebSocket, SSE) after
-# SIGTERM before force-closing them.  30 s gives in-flight responses time
-# to drain while still guaranteeing the port is released promptly.
+# SIGTERM before force-closing them.  SSE streams signal themselves via
+# session_stream.shutdown_all() in _ShutdownSignalingServer.shutdown(),
+# so the main remaining consumers of this window are WebSocket tunnels
+# that need a moment to drain.  5 s is enough for a clean tunnel teardown
+# while keeping Ctrl-C feeling instant.
 # Overridable via OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S for deployments that
 # need a longer drain window (e.g. large file uploads).
-_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT = 30
+_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT = 5
 _SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S = int(
     os.environ.get(
         "OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S",
@@ -1196,6 +1199,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "qwen",
         "resume",
         "run",
+        "session",
         "sandbox",
         "server",
         "setup",
@@ -2597,8 +2601,8 @@ def _start_cli_runner_process(
         ``~/.omnigent/logs`` location; tests should pass a
         temporary directory to avoid writing to the developer's
         real home.
-    :param prewarm_spec_path: Optional YAML path; the runner spawns
-        its MCPs during the upload window. See designs/RUNNER_MCP.md.
+    :param prewarm_spec_path: Optional YAML path; the runner registers
+        its MCP routing metadata during startup without opening transports.
     :param isolate_session: ``True`` for shared-host runners;
         enables per-session workspace isolation so each
         session gets its own subdirectory. ``False`` (default)
@@ -2972,6 +2976,7 @@ def server(
         port = _picked
 
     import uvicorn
+    import uvicorn.server
 
     from omnigent.runner.transports.ws_tunnel.limits import (
         RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
@@ -3220,34 +3225,71 @@ def server(
         # this foreground server instead of tearing it down on a spurious
         # sig mismatch.
         register_local_server(port)
+
+    class _ShutdownSignalingServer(uvicorn.server.Server):
+        """uvicorn.Server that signals active SSE subscribers before the
+        graceful-shutdown wait starts.
+
+        uvicorn calls ``Server.shutdown()`` in this order:
+          1. close listening sockets / call connection.shutdown()
+          2. ``asyncio.wait_for(_wait_tasks_to_complete(), timeout=…)``
+          3. force-cancel remaining tasks on timeout
+          4. run the ASGI lifespan shutdown handler
+
+        The ASGI lifespan ``finally`` block runs at step 4 — too late. SSE
+        generators waiting on a heartbeat tick are already force-cancelled by
+        step 3, which produces spurious ``CancelledError`` tracebacks.
+        Overriding here lets us drain SSE streams before step 2 so they exit
+        cleanly within the graceful window.
+        """
+
+        async def shutdown(self, sockets=None) -> None:  # type: ignore[override]
+            import asyncio as _asyncio
+
+            from omnigent.runtime import session_stream as _session_stream
+
+            _session_stream.shutdown_all()
+            # Yield to the event loop so generators can consume _DONE,
+            # flush their final "data: [DONE]\n\n" chunk, and exit before
+            # super().shutdown() calls connection.shutdown() / transport.close().
+            # Without this pause the generators write to an already-closing
+            # transport, leaving connections open past the graceful window.
+            await _asyncio.sleep(0)
+            await super().shutdown(sockets)
+
+    _config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_config=_server_uvicorn_log_config(),
+        ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        # Server side of the runner/host tunnels' protocol keepalive, aligned
+        # to the 90 s app-level budget instead of uvicorn's 20 s default that
+        # drops a busy-but-healthy tunnel with 1011 — issue #1116.
+        #
+        # uvicorn's ws_ping_* is server-global (no per-route override), so this
+        # 30 s/90 s budget also applies to the app's other WebSocket routes —
+        # /v1/sessions/updates (browser stream) and .../terminals/{id}/attach.
+        # Deliberate and acceptable: for an IDLE such socket the protocol
+        # PING/PONG is the only half-open detector (the sessions-updates
+        # heartbeat is a server->client send, and an idle terminal has no
+        # traffic), so widening it means a dead idle browser/terminal socket is
+        # reaped at worst ~120 s (30 s interval + 90 s timeout) instead of
+        # ~40 s — a slightly later half-open cleanup (e.g. the out-of-process
+        # terminal-attach proxy holds its runner socket + tmux child ~80 s
+        # longer), bounded and eventually reaped, not a leak or correctness
+        # change. The tunnels are the sockets that actually need the looser
+        # budget (issue #1116).
+        ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+        ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+        timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+    )
     try:
-        uvicorn.run(
-            app,
-            host=host,
-            port=port,
-            log_config=_server_uvicorn_log_config(),
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-            # Server side of the runner/host tunnels' protocol keepalive, aligned
-            # to the 90 s app-level budget instead of uvicorn's 20 s default that
-            # drops a busy-but-healthy tunnel with 1011 — issue #1116.
-            #
-            # uvicorn's ws_ping_* is server-global (no per-route override), so this
-            # 30 s/90 s budget also applies to the app's other WebSocket routes —
-            # /v1/sessions/updates (browser stream) and .../terminals/{id}/attach.
-            # Deliberate and acceptable: for an IDLE such socket the protocol
-            # PING/PONG is the only half-open detector (the sessions-updates
-            # heartbeat is a server->client send, and an idle terminal has no
-            # traffic), so widening it means a dead idle browser/terminal socket is
-            # reaped at worst ~120 s (30 s interval + 90 s timeout) instead of
-            # ~40 s — a slightly later half-open cleanup (e.g. the out-of-process
-            # terminal-attach proxy holds its runner socket + tmux child ~80 s
-            # longer), bounded and eventually reaped, not a leak or correctness
-            # change. The tunnels are the sockets that actually need the looser
-            # budget (issue #1116).
-            ws_ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-            ws_ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-            timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-        )
+        _ShutdownSignalingServer(_config).run()
+    except KeyboardInterrupt:
+        # uvicorn.run() swallows KeyboardInterrupt; match that behaviour so
+        # a Ctrl-C exit doesn't print Click's "Aborted!" or exit non-zero.
+        pass
     finally:
         if _is_canonical_local_server:
             clear_local_server_record()
@@ -5499,6 +5541,112 @@ def resume(
         target=target,
         server=_resolve_server_url(server) if server else server,
     )
+
+
+@cli.group("session", invoke_without_command=True)
+@click.pass_context
+def session(ctx: click.Context) -> None:
+    """Manage Omnigent sessions.
+
+    \b
+    Examples:
+      omnigent session export --id conv_abc123
+      omnigent session export --id conv_abc123 --output transcript.jsonl
+      omnigent session export --id conv_abc123 --server https://myserver.com
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@session.command("export")
+@click.option(
+    "--id",
+    "session_id",
+    required=True,
+    metavar="SESSION_ID",
+    help="Session ID to export, e.g. conv_abc123.",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output",
+    default=None,
+    metavar="FILE",
+    help="Output file path.  Defaults to <SESSION_ID>.jsonl in the current directory.",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+def session_export(session_id: str, output: str | None, server: str | None) -> None:
+    """Export a session transcript to a portable JSONL file.
+
+    Each line of the output is a JSON object.  The first line carries
+    the session metadata (``"record_type": "session_meta"``); every
+    subsequent line is one conversation item
+    (``"record_type": "item"``).  The file preserves full turn order
+    and can be re-imported with a future ``omnigent session import``.
+
+    \b
+    Examples:
+      omnigent session export --id conv_abc123
+      omnigent session export --id conv_abc123 --output my_session.jsonl
+      omnigent session export --id conv_abc123 --server https://myserver.com
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        startup = ensure_local_omnigent_server()
+        base_url = startup.url
+
+    base_url = base_url.rstrip("/")
+    out_path = Path(output) if output else Path(f"{session_id}.jsonl")
+
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=30.0
+    ) as client:
+        # Fetch session metadata (items fetched separately via pagination).
+        resp = client.get(
+            f"/v1/sessions/{session_id}",
+            params={"include_items": "false", "include_liveness": "false"},
+        )
+        if resp.status_code == 404:
+            raise click.ClickException(f"Session {session_id!r} not found.")
+        resp.raise_for_status()
+        session_data = resp.json()
+
+        n_items = 0
+        with out_path.open("w", encoding="utf-8") as fh:
+            # First line: session metadata.
+            meta_record = {"record_type": "session_meta", **session_data}
+            fh.write(json.dumps(meta_record) + "\n")
+
+            # Remaining lines: items in ascending order, paginated.
+            after: str | None = None
+            while True:
+                params: dict[str, str | int] = {"limit": 500, "order": "asc"}
+                if after:
+                    params["after"] = after
+                items_resp = client.get(f"/v1/sessions/{session_id}/items", params=params)
+                items_resp.raise_for_status()
+                page = items_resp.json()
+                for item in page["data"]:
+                    item_record = {"record_type": "item", **item}
+                    fh.write(json.dumps(item_record) + "\n")
+                    n_items += 1
+                if not page.get("has_more"):
+                    break
+                after = page.get("last_id")
+
+    click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
 
 # Shared option help for ``run`` and the harness commands. These are the same
@@ -9371,13 +9519,11 @@ def _prompt_install_cursor() -> str | None:
     """
     from rich.markup import escape as _rich_escape
 
-    from omnigent.onboarding.cursor_auth import (
-        CURSOR_EXTRA_INSTALL_COMMAND,
-        install_cursor_sdk,
-    )
+    from omnigent.onboarding.cursor_auth import CURSOR_EXTRA, install_cursor_sdk
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.interactive import console, select
 
-    cmd = CURSOR_EXTRA_INSTALL_COMMAND
+    cmd = extra_install_display(CURSOR_EXTRA)
     # ``select`` renders text through Rich markup; escape the literal
     # ``[cursor]`` so it renders verbatim.
     cmd_markup = _rich_escape(cmd)
@@ -9389,7 +9535,7 @@ def _prompt_install_cursor() -> str | None:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            f"Runs `{cmd_markup}`, then continues.",
             "Skip the install — store the key now; the SDK can be added later.",
             "Print the command so you can install it yourself, then continue.",
         ],
@@ -9546,13 +9692,11 @@ def _prompt_install_antigravity() -> str | None:
     """
     from rich.markup import escape as _rich_escape
 
-    from omnigent.onboarding.antigravity_auth import (
-        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
-        install_antigravity_sdk,
-    )
+    from omnigent.onboarding.antigravity_auth import ANTIGRAVITY_EXTRA, install_antigravity_sdk
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.interactive import console, select
 
-    cmd = ANTIGRAVITY_EXTRA_INSTALL_COMMAND
+    cmd = extra_install_display(ANTIGRAVITY_EXTRA)
     # ``select`` renders through Rich markup, so escape the literal ``[antigravity]``.
     cmd_markup = _rich_escape(cmd)
     choice = select(
@@ -9563,7 +9707,7 @@ def _prompt_install_antigravity() -> str | None:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            f"Runs `{cmd_markup}`, then continues.",
             "Skip the install — store the key now; the SDK can be added later.",
             "Print the command so you can install it yourself, then continue.",
         ],
@@ -10228,13 +10372,11 @@ def _prompt_install_copilot() -> str | None:
     """
     from rich.markup import escape as _rich_escape
 
-    from omnigent.onboarding.copilot_auth import (
-        COPILOT_EXTRA_INSTALL_COMMAND,
-        install_copilot_sdk,
-    )
+    from omnigent.onboarding.copilot_auth import COPILOT_EXTRA, install_copilot_sdk
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.interactive import console, select
 
-    cmd = COPILOT_EXTRA_INSTALL_COMMAND
+    cmd = extra_install_display(COPILOT_EXTRA)
     # ``select`` renders text through Rich markup; escape the literal
     # ``[copilot]`` so it renders verbatim.
     cmd_markup = _rich_escape(cmd)
@@ -10246,7 +10388,7 @@ def _prompt_install_copilot() -> str | None:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd_markup}` (uses uv when available), then continues.",
+            f"Runs `{cmd_markup}`, then continues.",
             "Skip the install — store the token now; the SDK can be added later.",
             "Print the command so you can install it yourself, then continue.",
         ],
@@ -10921,22 +11063,23 @@ def _run_configure_harnesses_interactive() -> None:
 
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_ENV_VARS,
-        ANTIGRAVITY_EXTRA_INSTALL_COMMAND,
+        ANTIGRAVITY_EXTRA,
         antigravity_api_key_configured,
         antigravity_sdk_installed,
     )
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.copilot_auth import (
-        COPILOT_EXTRA_INSTALL_COMMAND,
+        COPILOT_EXTRA,
         COPILOT_TOKEN_ENV_VARS,
         copilot_github_token_configured,
         copilot_sdk_installed,
     )
     from omnigent.onboarding.cursor_auth import (
-        CURSOR_EXTRA_INSTALL_COMMAND,
+        CURSOR_EXTRA,
         cursor_api_key_configured,
         cursor_sdk_installed,
     )
+    from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
         COPILOT_KEY,
@@ -11082,7 +11225,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "Cursor",
                     "Not installed",
                     "missing",
-                    _install_hint(CURSOR_EXTRA_INSTALL_COMMAND),
+                    _install_hint(extra_install_display(CURSOR_EXTRA)),
                 ),
             )
         else:
@@ -11166,7 +11309,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "Antigravity",
                     "Not installed",
                     "missing",
-                    _install_hint(ANTIGRAVITY_EXTRA_INSTALL_COMMAND),
+                    _install_hint(extra_install_display(ANTIGRAVITY_EXTRA)),
                 ),
             )
         else:
@@ -11235,7 +11378,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "Copilot",
                     "Not installed",
                     "missing",
-                    _install_hint(COPILOT_EXTRA_INSTALL_COMMAND),
+                    _install_hint(extra_install_display(COPILOT_EXTRA)),
                 ),
             )
         else:

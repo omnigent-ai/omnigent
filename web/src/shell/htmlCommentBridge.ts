@@ -147,16 +147,60 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Whitespace run matching the in-frame `normWs` (which treats every code point
+// <= U+0020 as whitespace). Using `\s` here would additionally fold U+00A0 and
+// other Unicode spaces, so the parent's occurrence count could diverge from the
+// bridge's for text containing non-breaking spaces.
+const WS_RUN = "[\\u0000-\\u0020]+";
+const WS_SPLIT = new RegExp(WS_RUN);
+
+/** Whitespace-tolerant regex source for `anchor` (already trimmed). */
+function anchorPattern(trimmed: string): string {
+  return trimmed.split(WS_SPLIT).map(escapeRegExp).join(WS_RUN);
+}
+
+/**
+ * Half-open [start, end) ranges of `source` that are NOT rendered as visible
+ * text: tag markup (so attribute values are excluded), HTML comments, and the
+ * contents of `<script>`/`<style>`/`<title>`/`<noscript>`. Occurrence counting
+ * skips these so the source's Nth match lines up with the Nth *rendered* match
+ * the in-frame bridge counts (which walks only body text nodes).
+ */
+function nonRenderedRanges(source: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const collect = (re: RegExp) => {
+    for (const m of source.matchAll(re)) {
+      if (m.index !== undefined) ranges.push([m.index, m.index + m[0].length]);
+    }
+  };
+  collect(/<!--[\s\S]*?-->/g);
+  collect(/<(script|style|title|noscript)\b[\s\S]*?<\/\1\s*>/gi);
+  collect(/<[^>]*>/g);
+  ranges.sort((a, b) => a[0] - b[0]);
+  return ranges;
+}
+
+/** Whether `index` falls inside any (sorted) non-rendered range. */
+function inNonRendered(index: number, ranges: Array<[number, number]>): boolean {
+  for (const [start, end] of ranges) {
+    if (index < start) break;
+    if (index < end) return true;
+  }
+  return false;
+}
+
 /**
  * Locate `anchor` (text selected in the *rendered* HTML) within the raw HTML
  * `source`, returning absolute character offsets so the comment anchors to the
  * source the agent actually edits — consistent with how Markdown/code comments
  * store offsets.
  *
- * Rendered prose is almost always a verbatim substring of the source, so an
- * exact match succeeds in the common case. When the browser has collapsed or
- * altered whitespace (e.g. text wrapping across source lines), we fall back to a
- * whitespace-tolerant match that maps back to raw source indices.
+ * Rendered prose may collapse whitespace the source spells out (newlines,
+ * indentation between tags), so matching is always whitespace-tolerant — never
+ * a plain `indexOf`. `occurrence` picks which copy (document order, counting
+ * only *rendered* regions) the caller selected; matches inside non-rendered
+ * source (tags/attributes, comments, `<script>`/`<style>`/`<title>`) are skipped
+ * so this Nth match lines up with the Nth match the in-frame bridge counts.
  *
  * Returns `null` when the anchor can't be located at all; callers should still
  * keep `anchor_content`, which is the agent's primary locator (offsets are a
@@ -170,23 +214,13 @@ export function findAnchorInSource(
   const trimmed = anchor.trim();
   if (!trimmed) return null;
 
-  // Fast path: for the first occurrence, an exact substring match is the common
-  // case (rendered prose is usually verbatim in the source).
-  if (occurrence === 0) {
-    const exact = source.indexOf(trimmed);
-    if (exact !== -1) return { start_index: exact, end_index: exact + trimmed.length };
-  }
-
-  // Whitespace-tolerant match, walking to the requested occurrence. Rendered
-  // selection text may collapse runs of whitespace that the source spells out
-  // (newlines, indentation between tags), and the same text can repeat, so the
-  // caller passes which copy (document order) was selected.
-  const pattern = trimmed.split(/\s+/).map(escapeRegExp).join("\\s+");
+  const skip = nonRenderedRanges(source);
   try {
-    const re = new RegExp(pattern, "g");
+    const re = new RegExp(anchorPattern(trimmed), "g");
     let i = 0;
     for (const m of source.matchAll(re)) {
       if (m.index === undefined) break;
+      if (inNonRendered(m.index, skip)) continue;
       if (i === occurrence) {
         return { start_index: m.index, end_index: m.index + m[0].length };
       }
@@ -205,23 +239,24 @@ export function findAnchorInSource(
  * match, so without this it would light up every copy. Counting the matches
  * before `startIndex` disambiguates to the one the user actually selected.
  *
- * Uses the same whitespace-tolerant match as `findAnchorInSource` so a wrapped
- * source occurrence still counts. Returns 0 when the anchor is empty or the
- * pattern is pathological (the bridge then falls back to matching all copies).
+ * Matches non-rendered source regions are skipped so the count aligns with the
+ * in-frame bridge (which sees only rendered text). Returns 0 when the anchor is
+ * empty or the pattern is pathological (the bridge then falls back to all copies).
  */
 export function anchorOccurrence(source: string, anchor: string, startIndex: number): number {
   const trimmed = anchor.trim();
   if (!trimmed) return 0;
-  const pattern = trimmed.split(/\s+/).map(escapeRegExp).join("\\s+");
   let re: RegExp;
   try {
-    re = new RegExp(pattern, "g");
+    re = new RegExp(anchorPattern(trimmed), "g");
   } catch {
     return 0;
   }
+  const skip = nonRenderedRanges(source);
   let count = 0;
   for (const m of source.matchAll(re)) {
     if (m.index === undefined || m.index >= startIndex) break;
+    if (inNonRendered(m.index, skip)) continue;
     count += 1;
   }
   return count;
@@ -317,12 +352,12 @@ const BRIDGE_SCRIPT_BODY = `(function () {
   // (whitespace collapsed) but the haystack is raw text-node data that preserves
   // the source's newlines/indentation, so match on the normalized view and map
   // normalized offsets back to raw node positions — mirroring the parent's
-  // whitespace-tolerant findAnchorInSource.
-  function anchorRanges(index, anchor) {
+  // whitespace-tolerant findAnchorInSource. H (the normalized view of
+  // index.text) is passed in so repaint builds it once for all comments.
+  function anchorRanges(index, H, anchor) {
     var out = [];
     var raw = (anchor || "").trim();
     if (!raw) return out;
-    var H = normWs(index.text);
     var needle = normWs(raw).norm.trim();
     if (!needle) return out;
     var from = 0;
@@ -401,12 +436,15 @@ const BRIDGE_SCRIPT_BODY = `(function () {
     var supported = typeof CSS !== "undefined" && CSS.highlights && typeof Highlight !== "undefined";
     if (!supported) return; // highlights degrade gracefully; commenting still works
     var index = buildIndex();
+    // Normalize the document text once and reuse it for every comment, rather
+    // than rebuilding the whitespace map per comment inside anchorRanges.
+    var H = normWs(index.text);
     ranges = [];
     var base = [];
     var activeHi = [];
     for (var i = 0; i < comments.length; i++) {
       var c = comments[i];
-      var rs = anchorRanges(index, c.anchor_content);
+      var rs = anchorRanges(index, H, c.anchor_content);
       // Anchor text can repeat (e.g. a title and a body paragraph). The parent
       // sends the occurrence index (document order) the comment belongs to, so
       // highlight only that one. When occ is missing or out of range (stale

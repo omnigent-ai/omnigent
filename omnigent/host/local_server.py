@@ -708,6 +708,11 @@ def pick_local_port(preferred: int = _DEFAULT_LOCAL_PORT) -> int:
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # SO_REUSEADDR mirrors what uvicorn sets when it binds.  Without
+        # it, a fast server restart sees EADDRINUSE on macOS/BSD because
+        # recently closed connections are still in TIME_WAIT even though
+        # the listening socket is gone and uvicorn could successfully bind.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", preferred))
         except OSError:

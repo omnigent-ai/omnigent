@@ -11,6 +11,9 @@ import pytest
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins import get_builtin_tool
 from omnigent.tools.builtins.web_search import WebSearchTool
+from omnigent.tools.builtins.web_search_keenable import (
+    _resolve_max_results as _resolve_max_results_keenable,
+)
 from omnigent.tools.builtins.web_search_nimble import _resolve_max_results
 from omnigent.tools.builtins.web_search_tavily import (
     _resolve_max_results as _resolve_max_results_tavily,
@@ -553,19 +556,189 @@ def test_tavily_max_results_clamped() -> None:
 # ── No search_provider set ───────────────────────────
 
 
-def test_no_search_provider_returns_help_message(tool_ctx: ToolContext) -> None:
+def test_no_search_provider_fails_loudly(
+    tool_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    Without search_provider in config, the tool returns a message
-    explaining how to configure it. Lists all supported backends.
+    Without ``search_provider``, web_search returns a loud, helpful error
+    naming the available engines rather than silently picking one — so it is
+    always explicit which engine ran (per maintainer review). The DDG backend
+    must not be invoked.
     """
-    tool = WebSearchTool(llm_provider="anthropic")
-    result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+    import omnigent.tools.builtins.web_search_duckduckgo as ddg
 
-    assert "search_provider" in result, f"Should tell user to set search_provider. Got: {result}"
+    monkeypatch.setattr(
+        ddg, "_search_duckduckgo", lambda q, c: pytest.fail("must not auto-run DDG")
+    )
+    tool = WebSearchTool(llm_provider="anthropic")
+    result = tool.invoke(json.dumps({"query": "test query"}), tool_ctx)
+
+    assert result.startswith("web_search error: no search_provider")
+    # The error names every available engine so the choice is explicit.
+    assert "duckduckgo" in result.lower()
     assert "google" in result.lower()
     assert "perplexity" in result.lower()
     assert "nimble" in result.lower()
     assert "tavily" in result.lower()
+    assert "keenable" in result.lower()
+
+
+# ── search_provider: keenable ────────────────────────
+
+
+def test_keenable_backend_via_spec_config(tool_ctx: ToolContext) -> None:
+    """
+    With search_provider=keenable, the tool delegates to Keenable web
+    search and the result list flows through the unified pipeline.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "results": [
+            {
+                "title": "Keenable Docs",
+                "url": "https://docs.keenable.ai",
+                "description": "Web search API for AI agents.",
+            },
+        ],
+    }
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "keenable"}), tool_ctx)
+
+    assert "1. Keenable Docs" in result
+    assert "https://docs.keenable.ai" in result
+    assert "Web search API for AI agents." in result
+
+
+def test_keenable_keyless_by_default(tool_ctx: ToolContext) -> None:
+    """
+    Without api_key, Keenable hits the keyless public endpoint and sends
+    no auth header — it must NOT error like the other backends do.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    url = mock_post.call_args.args[0]
+    headers = mock_post.call_args.kwargs["headers"]
+    assert url.endswith("/v1/search/public"), f"Expected keyless endpoint, got {url!r}"
+    assert "X-API-Key" not in headers
+    assert "api_key" not in result  # no "missing api_key" error
+
+
+def test_keenable_keyed_uses_x_api_key_and_authed_endpoint(tool_ctx: ToolContext) -> None:
+    """With an api_key, Keenable uses /v1/search and the X-API-Key header."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable", "api_key": "spec-keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    url = mock_post.call_args.args[0]
+    headers = mock_post.call_args.kwargs["headers"]
+    body = mock_post.call_args.kwargs["json"]
+    assert url.endswith("/v1/search"), f"Expected authed endpoint, got {url!r}"
+    assert headers["X-API-Key"] == "spec-keenable"
+    assert body["query"] == "test"
+    assert body["mode"] == "pro"
+
+
+def test_keenable_sends_x_keenable_title_header(tool_ctx: ToolContext) -> None:
+    """Keenable tags traffic with the ``X-Keenable-Title`` attribution header."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    headers = mock_post.call_args.kwargs["headers"]
+    assert headers["X-Keenable-Title"] == "Omnigent"
+
+
+def test_keenable_http_error_returns_error_string(tool_ctx: ToolContext) -> None:
+    """An HTTP error from Keenable is returned as a readable string, not raised."""
+    fake_response = MagicMock()
+    fake_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=MagicMock(status_code=500)
+    )
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert "Keenable search error" in result
+
+
+def test_keenable_empty_results_returns_no_results(tool_ctx: ToolContext) -> None:
+    """An empty result list yields the 'No results found.' message."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert result == "No results found."
+
+
+def test_keenable_max_results_slices_output(tool_ctx: ToolContext) -> None:
+    """``max_results`` limits how many results are rendered."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "results": [
+            {"title": f"R{i}", "url": f"https://e.com/{i}", "description": "d"} for i in range(10)
+        ],
+    }
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable", "max_results": "2"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert "1. R0" in result
+    assert "2. R1" in result
+    assert "R2" not in result
+
+
+def test_keenable_max_results_clamped() -> None:
+    """``max_results`` is coerced + clamped to a 1-20 range; junk → default."""
+    assert _resolve_max_results_keenable({}) == 5  # missing → default
+    assert _resolve_max_results_keenable({"max_results": "0"}) == 1  # below min → clamped up
+    assert _resolve_max_results_keenable({"max_results": "500"}) == 20  # above max → clamped down
+    assert _resolve_max_results_keenable({"max_results": "abc"}) == 5  # non-numeric → default
 
 
 # ── Spec config passed through ───────────────────────

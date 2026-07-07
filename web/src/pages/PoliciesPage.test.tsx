@@ -15,6 +15,20 @@ import * as identity from "@/lib/identity";
 import * as defaultPolicies from "@/hooks/useDefaultPolicies";
 import * as policies from "@/hooks/usePolicies";
 
+const serverInfoMocks = vi.hoisted(() => ({
+  accountsEnabled: true,
+  loginUrl: null as string | null,
+  serverVersion: "0.3.0.dev0" as string | null,
+}));
+
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({
+    accounts_enabled: serverInfoMocks.accountsEnabled,
+    login_url: serverInfoMocks.loginUrl,
+    server_version: serverInfoMocks.serverVersion,
+  }),
+}));
+
 const addMutate = vi.fn();
 const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
@@ -73,6 +87,9 @@ function renderPage() {
 }
 
 beforeEach(() => {
+  serverInfoMocks.accountsEnabled = true;
+  serverInfoMocks.loginUrl = null;
+  serverInfoMocks.serverVersion = "0.3.0.dev0";
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   setPolicies([]);
@@ -192,5 +209,29 @@ describe("PoliciesPage actions", () => {
       { name: "block_canada", type: "python", handler: "omnigent.policies.block_canada" },
       expect.anything(),
     );
+  });
+});
+
+describe("PoliciesPage single-user mode", () => {
+  beforeEach(() => {
+    serverInfoMocks.accountsEnabled = false;
+    serverInfoMocks.loginUrl = null;
+    serverInfoMocks.serverVersion = "0.3.0.dev0";
+  });
+
+  it("shows the full page without the admin gate (empty state)", async () => {
+    renderPage();
+    expect(await screen.findByText(/No global policies configured/)).toBeInTheDocument();
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("You don't have permission to manage global policies."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows policies list directly without probing identity", async () => {
+    setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
+    renderPage();
+    expect(await screen.findByText("block_canada")).toBeInTheDocument();
+    expect(identity.resolveIdentity).not.toHaveBeenCalled();
   });
 });

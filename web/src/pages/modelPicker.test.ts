@@ -45,15 +45,25 @@ describe("CLAUDE_NATIVE_MODELS", () => {
     // the installed version supports, so the list never drifts. Guard
     // against a regression back to version-numbered IDs.
     const ids = CLAUDE_NATIVE_MODELS.map((m) => m.id);
-    // Capability order, most powerful first. Fable is temporarily withheld.
-    expect(ids).toEqual(["opus", "sonnet", "haiku"]);
+    // Capability order, most powerful first. "sonnet_5" is the one
+    // exception: Claude Code's single custom /model slot, an opt-in for the
+    // newer Sonnet offered alongside the default "sonnet" alias (which stays
+    // bound to 4.6). The default alias is unchanged.
+    expect(ids).toEqual(["fable", "opus", "sonnet", "sonnet_5", "haiku"]);
     for (const id of ids) {
+      if (id === "sonnet_5") continue;
       expect(id).not.toMatch(/\d/); // an alias carries no version digits
     }
   });
 
   it("labels each alias by tier", () => {
-    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual(["Opus", "Sonnet", "Haiku"]);
+    expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual([
+      "Fable",
+      "Opus",
+      "Sonnet 4.6",
+      "Sonnet 5",
+      "Haiku",
+    ]);
   });
 });
 
@@ -88,6 +98,7 @@ describe("isModelImplicitlySelected", () => {
     // version (4.7) must not break matching — both resolve to the tier.
     expect(isModelImplicitlySelected("opus", "anthropic/claude-opus-4-8")).toBe(true);
     expect(isModelImplicitlySelected("opus", "anthropic/claude-opus-4-7")).toBe(true);
+    // The default "sonnet" row is bound to 4.6, so a 4.6 pin lights it up.
     expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet-4-6")).toBe(true);
     // Fable's concrete id (claude-fable-5) must light up the "fable" row.
     expect(isModelImplicitlySelected("fable", "anthropic/claude-fable-5")).toBe(true);
@@ -98,6 +109,17 @@ describe("isModelImplicitlySelected", () => {
 
   it("matches when llmModel is already the bare alias", () => {
     expect(isModelImplicitlySelected("opus", "opus")).toBe(true);
+  });
+
+  it("routes Sonnet 5 to its own opt-in row instead of the default Sonnet row", () => {
+    // Both ids happen to contain the substring "sonnet", so the default
+    // "sonnet" row (4.6) must not also light up for a Sonnet 5 pin.
+    expect(isModelImplicitlySelected("sonnet_5", "anthropic/claude-sonnet-5")).toBe(true);
+    expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet-5")).toBe(false);
+    expect(isModelImplicitlySelected("sonnet_5", "databricks-claude-sonnet-5")).toBe(true);
+    // The default 4.6 lights the generic "sonnet" row, never the opt-in row.
+    expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet-4-6")).toBe(true);
+    expect(isModelImplicitlySelected("sonnet_5", "anthropic/claude-sonnet-4-6")).toBe(false);
   });
 
   it("does not cross-match a different tier", () => {

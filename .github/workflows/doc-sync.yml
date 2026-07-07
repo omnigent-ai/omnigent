@@ -3,6 +3,13 @@
 # docs — draft an omnigent-site PR tagging the merging maintainer. Plan → classify
 # (doc-classifier) → label → draft (doc-drafter) → open site PR.
 #
+# Docs staging: main always carries the NEXT unreleased version (X.Y.Z.dev0), so
+# the docs drafted here describe the next release, not what's live. Targeting
+# omnigent-site `main` would deploy in-progress docs on merge — so instead the PR
+# targets a per-minor staging branch `X.Y-docs` (derived from omnigent/version.py,
+# created off site `main` on the first doc PR of the cycle). At release,
+# publish-changelog opens `X.Y-docs → main` to publish the whole batch at once.
+#
 # Why push:[main], not pull_request_target: a fork PR's `closed` event is gated by
 # GitHub's fork-workflow rules and doesn't fire; a push to main always does, for
 # fork and internal PRs alike. It also only runs already-merged, trusted code (no
@@ -194,6 +201,31 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      # Derive the per-minor docs staging branch and the release version from the
+      # runtime version. main carries X.Y.Z.dev0, so 0.5.0.dev0 → branch "0.5-docs"
+      # and label "v0.5.0". All docs for the 0.5 line (incl. patches) stage on the
+      # one branch until release publishes it; the vX.Y.Z label lets maintainers
+      # filter the staged PRs by the release they'll ship in.
+      - name: Resolve docs branch
+        id: docsbranch
+        if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import os, pathlib, re
+          text = pathlib.Path("omnigent/version.py").read_text()
+          m = re.search(r'VERSION\s*=\s*["\']([0-9]+)\.([0-9]+)\.([0-9]+)', text)
+          if not m:
+              raise SystemExit("could not parse X.Y.Z from omnigent/version.py")
+          major, minor, patch = m.groups()
+          branch = f"{major}.{minor}-docs"
+          version = f"v{major}.{minor}.{patch}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"branch={branch}\n")
+              fh.write(f"version={version}\n")
+          print(f"::notice::Docs stage on branch {branch} (release {version})")
+          PYEOF
+
       - name: Set up Python
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -371,6 +403,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.plan.outputs.pr }}
           LABEL: ${{ steps.decide.outputs.label }}
+          DOCS_BRANCH: ${{ steps.docsbranch.outputs.branch }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
@@ -387,7 +420,7 @@ jobs:
             echo "$REASON"
             if [ "$LABEL" = "needs-doc-update" ]; then
               echo ""
-              echo "Drafting a docs PR to \`omnigent-ai/omnigent-site\`…"
+              echo "Drafting a docs PR to \`omnigent-ai/omnigent-site\` (staged on \`${DOCS_BRANCH}\` until release)…"
             fi
             echo ""
             echo "<sub>Auto-classified on merge. Set the label manually before merging to override. · [run](${RUN_URL})</sub>"
@@ -423,6 +456,28 @@ jobs:
           path: omnigent-site
           token: ${{ github.token }}
           persist-credentials: false
+
+      # Point the working tree at the docs staging branch BEFORE the drafter runs,
+      # so it sees docs already accumulated this cycle and re-drafts merge cleanly.
+      # Reads need no auth (omnigent-site is public); no creds are persisted, so
+      # the unsandboxed drafter can't read a token from .git/config. If the branch
+      # doesn't exist on the remote yet, create it locally off the default branch —
+      # the first push (with the App token, later) publishes it.
+      - name: Switch site checkout to docs branch
+        if: steps.decide.outputs.draft == 'true'
+        working-directory: omnigent-site
+        env:
+          DOCS_BRANCH: ${{ steps.docsbranch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "$DOCS_BRANCH" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "$DOCS_BRANCH"
+            git checkout -B "$DOCS_BRANCH" FETCH_HEAD
+            echo "::notice::Drafting against existing ${DOCS_BRANCH}."
+          else
+            git checkout -B "$DOCS_BRANCH"
+            echo "::notice::${DOCS_BRANCH} does not exist yet — will be created off the default branch."
+          fi
 
       - name: Build drafter prompt
         if: steps.decide.outputs.draft == 'true'
@@ -584,6 +639,8 @@ jobs:
           SITE_TOKEN: ${{ steps.site-token.outputs.token }}
           PR_NUMBER: ${{ steps.plan.outputs.pr }}
           REVIEWER: ${{ steps.sitepr.outputs.reviewer }}
+          DOCS_BRANCH: ${{ steps.docsbranch.outputs.branch }}
+          VERSION_LABEL: ${{ steps.docsbranch.outputs.version }}
         run: |
           set -euo pipefail
           BRANCH="auto/docs/pr-${PR_NUMBER}"
@@ -595,6 +652,16 @@ jobs:
           # secret, so it's redacted from logs. Reads (ls-remote/fetch) need no auth —
           # omnigent-site is public.
           PUSH_URL="https://x-access-token:${SITE_TOKEN}@github.com/${SITE_REPO_SLUG}.git"
+
+          # Ensure the docs staging branch exists on the remote — it's the PR base.
+          # When fresh, the local $DOCS_BRANCH ref points at the default branch's tip
+          # (the "Switch" step created it from the default-branch checkout), so push
+          # that as the branch's starting point. Idempotent: if a concurrent run beat
+          # us to it, the non-force push is rejected and we carry on (base exists).
+          if ! git ls-remote --exit-code --heads origin "$DOCS_BRANCH" >/dev/null 2>&1; then
+            git push "$PUSH_URL" "$(git rev-parse "$DOCS_BRANCH"):refs/heads/${DOCS_BRANCH}" \
+              || echo "::notice::${DOCS_BRANCH} already created by a concurrent run — reusing it."
+          fi
 
           # Don't clobber human edits: if the rolling branch already exists, only
           # force-push when we can POSITIVELY confirm its HEAD is the bot's. This
@@ -624,17 +691,27 @@ jobs:
           # bot commits.
           git push --force "$PUSH_URL" "$BRANCH"
 
+          # The vX.Y.Z label marks which release the staged docs will ship in, so
+          # maintainers can filter the site PRs by release. Ensure it exists (with
+          # automated-docs) before applying it below.
+          gh label create automated-docs --repo "$SITE_REPO_SLUG" --color 0E8A16 \
+            --description "Automated documentation update" 2>/dev/null || true
+          gh label create "$VERSION_LABEL" --repo "$SITE_REPO_SLUG" --color FBCA04 \
+            --description "Docs staged for the ${VERSION_LABEL} release" 2>/dev/null || true
+
           EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
               --json number --jq '.[0].number // empty' 2>/dev/null || true)"
           if [ -n "$EXISTING" ]; then
-            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --body-file /tmp/site_pr_body.md || true
+            # --add-label backfills PRs opened before the label existed; it's a no-op
+            # when already present.
+            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" \
+              --add-label "automated-docs" --add-label "$VERSION_LABEL" \
+              --body-file /tmp/site_pr_body.md || true
             echo "Updated site PR #$EXISTING."
           else
-            gh label create automated-docs --repo "$SITE_REPO_SLUG" --color 0E8A16 \
-              --description "Automated documentation update" 2>/dev/null || true
-            if gh pr create --repo "$SITE_REPO_SLUG" --base main --head "$BRANCH" \
+            if gh pr create --repo "$SITE_REPO_SLUG" --base "$DOCS_BRANCH" --head "$BRANCH" \
                 --title "docs: document ${CODE_REPO}#${PR_NUMBER}" \
-                --label automated-docs --body-file /tmp/site_pr_body.md; then
+                --label automated-docs --label "$VERSION_LABEL" --body-file /tmp/site_pr_body.md; then
               EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
                   --json number --jq '.[0].number // empty' 2>/dev/null || true)"
               echo "Opened site PR for $BRANCH."
@@ -643,13 +720,17 @@ jobs:
             fi
           fi
 
-          # Always attempt the review request, decoupled from PR creation so a
-          # non-addable reviewer can't fail the open. GitHub returns 422 for users it
-          # can't add (non-collaborators / concealed org members); tolerate it — the
-          # reviewer is also @-mentioned in the body as a durable fallback ping.
+          # Always attempt the review request + assignment, decoupled from PR creation
+          # so a non-addable reviewer can't fail the open. GitHub returns 422 for users
+          # it can't add (non-collaborators / concealed org members); tolerate it — the
+          # reviewer is also @-mentioned in the body as a durable fallback ping. The two
+          # calls are independent so one failing doesn't skip the other. Assigning makes
+          # the PR filterable by assignee from the site's PR list.
           if [ -n "${REVIEWER}" ] && [ -n "${EXISTING}" ]; then
             gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --add-reviewer "${REVIEWER}" \
               || echo "::notice::Could not request review from ${REVIEWER} (not addable); they're @-mentioned in the PR body."
+            gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" --add-assignee "${REVIEWER}" \
+              || echo "::notice::Could not assign ${REVIEWER} (not addable); they're @-mentioned in the PR body."
           fi
 
       - name: Note draft skipped (no site token)

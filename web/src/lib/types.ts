@@ -432,6 +432,16 @@ export interface Session {
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;
+  /**
+   * Response id of the turn currently in flight, or `null`/absent when
+   * the session is idle. Sourced from the server's
+   * `_session_active_response_cache` at snapshot build time so a client
+   * reconnecting mid-turn can reopen a streaming `activeResponse` (the
+   * SSE stream is snapshot + live tail with no replay, so the turn-start
+   * `running` edge that carried this id is not re-sent). Today only
+   * native-terminal sessions (claude-native) populate it.
+   */
+  activeResponseId?: string | null;
 }
 
 /**

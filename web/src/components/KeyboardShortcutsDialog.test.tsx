@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { KeyboardShortcutsDialog, openKeyboardShortcuts } from "./KeyboardShortcutsDialog";
 
-// The pinned-session row is desktop-only. Default to browser (false).
+// The pinned-session row shows in both shells; only its chord differs (Alt in
+// the browser). Default the mock to browser (false); flip per-test for native.
 const isNativeShell = vi.fn(() => false);
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
@@ -31,6 +32,7 @@ describe("KeyboardShortcutsDialog", () => {
 
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
+    expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
@@ -55,16 +57,23 @@ describe("KeyboardShortcutsDialog", () => {
     expect(await screen.findByText("Send message")).toBeTruthy();
   });
 
-  it("hides the pinned-session shortcut in a plain browser", () => {
+  it("shows the pinned-session shortcut with the Alt chord in a plain browser", () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    expect(screen.queryByText("Jump to pinned session (1–10)")).toBeNull();
+    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
+    expect(row).toBeTruthy();
+    // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…0 chip.
+    expect(within(row!).getByText("Alt")).toBeTruthy();
+    expect(within(row!).getByText("1…0")).toBeTruthy();
   });
 
-  it("shows the pinned-session shortcut in the Electron shell", () => {
+  it("shows the pinned-session shortcut without Alt in the Electron shell", () => {
     isNativeShell.mockReturnValue(true);
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    expect(screen.getByText("Jump to pinned session (1–10)")).toBeTruthy();
+    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
+    expect(row).toBeTruthy();
+    expect(within(row!).queryByText("Alt")).toBeNull();
+    expect(within(row!).getByText("1…0")).toBeTruthy();
   });
 });

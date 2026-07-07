@@ -1,32 +1,294 @@
+require "fileutils"
+require "net/http"
+require "socket"
+require "tmpdir"
+require "shellwords"
+
+def omnigent_available_port
+  loop do
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    server.close
+    return port unless port == 6767
+  end
+end
+
+def omnigent_start_process(label, env, command, chdir:, log_path:)
+  FileUtils.mkdir_p(File.dirname(log_path))
+  UI.message("Starting #{label} on a dedicated screenshot port")
+  pid = Process.spawn(
+    env,
+    *command,
+    chdir: chdir,
+    out: [log_path, "w"],
+    err: [:child, :out],
+    pgroup: true
+  )
+  Process.detach(pid)
+  pid
+end
+
+def omnigent_run_command(label, command, chdir:)
+  UI.message(label)
+  UI.command(command.join(" "))
+  success = system(*command, chdir: chdir)
+  UI.user_error!("#{label} failed") unless success
+end
+
+def omnigent_fetch_env(*names)
+  names.each do |name|
+    value = ENV[name]
+    return value unless value.to_s.strip.empty?
+  end
+
+  UI.user_error!("Set one of: #{names.join(", ")}")
+end
+
+def omnigent_stop_process(pid)
+  return if pid.nil?
+
+  Process.kill("TERM", -pid)
+  deadline = Time.now + 10
+  while Time.now < deadline
+    begin
+      Process.kill(0, pid)
+    rescue Errno::ESRCH
+      return
+    end
+    sleep 0.2
+  end
+  Process.kill("KILL", -pid)
+rescue Errno::ESRCH
+  nil
+end
+
+def omnigent_wait_for_http(url, timeout_seconds:, log_path:)
+  uri = URI(url)
+  deadline = Time.now + timeout_seconds
+  last_error = nil
+
+  while Time.now < deadline
+    begin
+      response = Net::HTTP.start(uri.host, uri.port, open_timeout: 2, read_timeout: 2) do |http|
+        http.get(uri.request_uri)
+      end
+      return if response.code.to_i < 500
+    rescue StandardError => e
+      last_error = e
+    end
+    sleep 1
+  end
+
+  if File.exist?(log_path)
+    UI.error("Last server log lines:\n#{File.readlines(log_path).last(80).join}")
+  end
+  UI.user_error!("Timed out waiting for #{url}: #{last_error}")
+end
+
 default_platform(:ios)
 
 # Builds are signed with the team's distribution cert via Xcode automatic
 # signing (-allowProvisioningUpdates). Upload + provisioning use an App Store
 # Connect API key supplied through env vars — see fastlane/.env.example.
 
+# Two distributions ship from the same target and sources. Each is a distinct
+# app record (distinct bundle ID) with its own TestFlight build counter, so both
+# can be installed side by side. The bundle ID and display name are injected as
+# xcodebuild setting overrides at archive time — nothing in the repo changes.
+#   - public:   the App Store app.
+#   - internal: a private (custom/unlisted App Store) build for Databricks.
+FLAVORS = {
+  public: {
+    bundle_id: "ai.omnigent.ios",
+    display_name: "Omnigent",
+  },
+  internal: {
+    bundle_id: "ai.omnigent.ios.internal",
+    display_name: "Omnigent (Databricks)",
+  },
+}.freeze
+
 platform :ios do
   desc "Run the OmnigentTests unit tests"
   lane :tests do
-    run_tests(scheme: "Omnigent")
+    run_tests(
+      scheme: "Omnigent",
+      configuration: "Debug",
+      destination: "platform=iOS Simulator,name=iPhone 17 Pro Max,OS=26.5",
+      skip_detect_devices: true,
+      skip_testing: ["OmnigentUITests"]
+    )
   end
 
-  desc "Build a signed Release .ipa and upload it to TestFlight"
+  desc "Generate App Store screenshots with fastlane snapshot"
+  lane :screenshots do
+    repo_root = File.expand_path("../../..", __dir__)
+    web_dir = File.join(repo_root, "web")
+    static_index = File.join(repo_root, "omnigent/server/static/web-ui/index.html")
+    unless File.executable?(File.join(web_dir, "node_modules/.bin/tsc"))
+      omnigent_run_command(
+        "Installing web UI dependencies",
+        ["npm", "--prefix", web_dir, "install", "--package-lock=false", "--no-audit", "--no-fund"],
+        chdir: repo_root
+      )
+    end
+    omnigent_run_command(
+      "Building current web UI for screenshots",
+      ["npm", "--prefix", web_dir, "run", "build"],
+      chdir: repo_root
+    )
+    UI.user_error!("Web UI build did not produce #{static_index}") unless File.file?(static_index)
+
+    port = ENV.fetch("OMNIGENT_SCREENSHOT_SERVER_PORT", omnigent_available_port.to_s)
+    UI.user_error!("OMNIGENT_SCREENSHOT_SERVER_PORT must not be 6767") if port.to_s == "6767"
+
+    screenshot_root = File.join(Dir.tmpdir, "omnigent-ios-screenshots-#{port}")
+    data_dir = File.join(screenshot_root, "data")
+    home_dir = File.join(screenshot_root, "home")
+    log_dir = File.join(screenshot_root, "logs")
+    server_log = File.join(log_dir, "omnigent-server.log")
+    server_url = "http://127.0.0.1:#{port}"
+    agent_path = File.join(repo_root, "examples/kimi_hello.yaml")
+    snapshot_cache = File.expand_path("~/Library/Caches/tools.fastlane/screenshots")
+
+    FileUtils.mkdir_p([data_dir, home_dir, log_dir])
+    command = [
+      "uv",
+      "run",
+      "--frozen",
+      "--no-sync",
+      "--project",
+      repo_root,
+      "omnigent",
+      "server",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      port.to_s,
+      "--database-uri",
+      "sqlite:///#{File.join(data_dir, "chat.db")}",
+      "--artifact-location",
+      File.join(data_dir, "artifacts"),
+      "--no-open",
+    ]
+    command += ["--agent", agent_path] if File.file?(agent_path)
+
+    server_pid = nil
+    begin
+      server_pid = omnigent_start_process(
+        "Omnigent server",
+        {
+          "HOME" => home_dir,
+          "OMNIGENT_DATA_DIR" => data_dir,
+          "OMNIGENT_NO_UPDATE_CHECK" => "1",
+        },
+        command,
+        chdir: repo_root,
+        log_path: server_log
+      )
+      omnigent_wait_for_http("#{server_url}/", timeout_seconds: 60, log_path: server_log)
+      FileUtils.rm_rf(snapshot_cache)
+      ENV["OMNIGENT_SCREENSHOT_APP_URL"] = server_url
+      capture_ios_screenshots(
+        only_testing: ["OmnigentUITests/OmnigentUITests/testLocalServerSnapshot"],
+        launch_arguments: ["--omnigent-server-url #{server_url}"],
+        test_target_name: "Omnigent",
+        result_bundle: true,
+        number_of_retries: 0,
+        stop_after_first_error: true,
+        xcodebuild_formatter: ""
+      )
+    ensure
+      omnigent_stop_process(server_pid)
+    end
+  end
+
+  desc "Build the public app and upload it to TestFlight"
   lane :beta do
-    load_asc_api_key
-    build(build_number: next_build_number)
-    upload_to_testflight(skip_waiting_for_build_processing: true)
+    beta_flavor(flavor: :public)
   end
 
-  desc "Build a signed Release .ipa and upload it to App Store Connect (no submission)"
+  desc "Build the internal (Databricks) app and upload it to TestFlight"
+  lane :beta_internal do
+    beta_flavor(flavor: :internal)
+  end
+
+  desc "Build the public app and upload it to App Store Connect (no submission)"
   lane :release do
+    release_flavor(flavor: :public)
+  end
+
+  desc "Build the internal (Databricks) app and upload it to App Store Connect (no submission)"
+  lane :release_internal do
+    release_flavor(flavor: :internal)
+  end
+
+  desc "Prepare the public App Store version using an already-uploaded build"
+  lane :prod do
+    prod_flavor(flavor: :public)
+  end
+
+  desc "Prepare the internal (Databricks) App Store version using an already-uploaded build"
+  lane :prod_internal do
+    prod_flavor(flavor: :internal)
+  end
+
+  # --- helpers ---
+
+  desc "Upload screenshots + metadata for a flavor against an already-uploaded build"
+  private_lane :prod_flavor do |options|
+    flavor = FLAVORS.fetch(options[:flavor])
+    load_asc_api_key
+    bundle_id = flavor[:bundle_id]
+    build_number = ENV["OMNIGENT_PROD_BUILD_NUMBER"] ||
+      latest_testflight_build_number(app_identifier: bundle_id, initial_build_number: 0).to_s
+    screenshots_path = File.join(Dir.tmpdir, "omnigent-ios-app-store-screenshots")
+    screenshots_locale_path = File.join(screenshots_path, "en-US")
+    screenshot_files = Dir[File.join(__dir__, "screenshots/en-US", "*.png")]
+    UI.user_error!("Generate screenshots first: bundle exec fastlane screenshots") if screenshot_files.empty?
+
+    FileUtils.rm_rf(screenshots_path)
+    FileUtils.mkdir_p(screenshots_locale_path)
+    FileUtils.cp(screenshot_files, screenshots_locale_path)
+
+    upload_to_app_store(
+      app_identifier: bundle_id,
+      app_version: ENV.fetch("OMNIGENT_PROD_APP_VERSION", "0.1.0"),
+      build_number: build_number,
+      skip_binary_upload: true,
+      skip_metadata: false,
+      screenshots_path: screenshots_path,
+      overwrite_screenshots: true,
+      submit_for_review: false,
+      automatic_release: false,
+      force: true,
+      precheck_include_in_app_purchases: false
+    )
+  end
+
+  desc "Archive a flavor and upload it to TestFlight"
+  private_lane :beta_flavor do |options|
+    flavor = FLAVORS.fetch(options[:flavor])
+    load_asc_api_key
+    build(flavor: flavor, build_number: next_build_number(bundle_id: flavor[:bundle_id]))
+    upload_to_testflight(
+      app_identifier: flavor[:bundle_id],
+      skip_waiting_for_build_processing: true
+    )
+  end
+
+  desc "Archive a flavor and upload it to App Store Connect (no submission)"
+  private_lane :release_flavor do |options|
     # NB: this uploads a fresh, uniquely-numbered binary. The more common App
     # Store flow is to *promote* an already-tested TestFlight build instead of
     # uploading a new one — if you adopt that, replace the build/upload below
     # with a submission of the chosen TestFlight build. App Store metadata and
     # screenshots are still a follow-up; this lane uploads but does not submit.
+    flavor = FLAVORS.fetch(options[:flavor])
     load_asc_api_key
-    build(build_number: next_build_number)
+    build(flavor: flavor, build_number: next_build_number(bundle_id: flavor[:bundle_id]))
     upload_to_app_store(
+      app_identifier: flavor[:bundle_id],
       submit_for_review: false,
       skip_metadata: true,
       skip_screenshots: true,
@@ -34,16 +296,21 @@ platform :ios do
     )
   end
 
-  # --- helpers ---
-
-  desc "Archive the Release configuration into ./build"
+  desc "Archive the Release configuration into ./build for the given flavor"
   private_lane :build do |options|
     # Inject the build number as an xcodebuild setting override rather than
     # mutating tracked files. CFBundleVersion is $(CURRENT_PROJECT_VERSION) in
     # the Info.plists, so overriding CURRENT_PROJECT_VERSION here flows into the
     # archived binary — and nothing in the repo changes (no agvtool, no churn).
+    # The bundle ID and display name are overridden the same way, so each flavor
+    # comes out of the one target without a second Xcode configuration.
+    flavor = options[:flavor]
     xcargs = ["-allowProvisioningUpdates"]
     xcargs << "CURRENT_PROJECT_VERSION=#{options[:build_number]}" if options[:build_number]
+    if flavor
+      xcargs << "PRODUCT_BUNDLE_IDENTIFIER=#{flavor[:bundle_id].shellescape}"
+      xcargs << "APP_DISPLAY_NAME=#{flavor[:display_name].shellescape}"
+    end
     build_app(
       scheme: "Omnigent",
       configuration: "Release",
@@ -55,19 +322,26 @@ platform :ios do
   end
 
   desc "Next build number: one past the highest already on App Store Connect"
-  private_lane :next_build_number do
+  private_lane :next_build_number do |options|
     # TestFlight sees every build (App Store builds pass through it too), so the
     # latest TestFlight build number is a monotonic counter for the whole app.
-    # Requires the ASC API key to be loaded first.
-    latest_testflight_build_number(initial_build_number: 0) + 1
+    # Each flavor is a separate app record, so pass its bundle ID to count the
+    # right one. Requires the ASC API key to be loaded first.
+    latest_testflight_build_number(
+      app_identifier: options[:bundle_id],
+      initial_build_number: 0
+    ) + 1
   end
 
   desc "Load the App Store Connect API key from env vars into the session"
   private_lane :load_asc_api_key do
+    key_filepath = File.expand_path(omnigent_fetch_env("ASC_KEY_PATH", "APPLE_API_KEY"))
+    UI.user_error!("App Store Connect API key file not found: #{key_filepath}") unless File.file?(key_filepath)
+
     app_store_connect_api_key(
-      key_id: ENV.fetch("ASC_KEY_ID"),
-      issuer_id: ENV.fetch("ASC_ISSUER_ID"),
-      key_filepath: ENV.fetch("ASC_KEY_PATH"),
+      key_id: omnigent_fetch_env("ASC_KEY_ID", "APPLE_API_KEY_ID"),
+      issuer_id: omnigent_fetch_env("ASC_ISSUER_ID", "APPLE_API_ISSUER"),
+      key_filepath: key_filepath,
       in_house: false
     )
   end

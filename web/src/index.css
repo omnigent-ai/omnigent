@@ -55,6 +55,10 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-info: var(--info);
+  /* Dedicated blue for the sub-agent "session active / idle-alive" states
+     * (launching/idle/done) — distinct from the shared amber --warning (still
+     * used by the "Needs response" badge). */
+  --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
   /* Named status hues — success/warning/info are repointed to the
@@ -99,6 +103,17 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
+  /* User-controlled UI font size, as a unitless multiplier on the root
+   * font-size (see Appearance settings / lib/uiFontPreferences.ts). 1 = the
+   * browser default; the root `html` rules multiply it into their font-size so
+   * the whole rem-based UI scales. Overridden at runtime on documentElement. */
+  --ui-font-scale: 1;
+
+  /* User-controlled UI font family (see Appearance settings /
+   * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
+   * `var(--ui-font-family, var(--font-sans))` falls back to the system stack;
+   * the Appearance setting sets it at runtime on documentElement. */
+
   /* ---- Inset system -------------------------------------------------------
    * Single source of truth for how far content must stay clear of screen
    * chrome. The SAME bundle runs in a browser, in Electron, and inside the
@@ -188,6 +203,10 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* Session active / idle-alive blue — a deeper, saturated azure
+     * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
+     * with strong contrast on the white card surface. */
+  --session-active: #2f7fd4;
   --border: #e8ecf0;
   /* Stronger divider/outline + a dedicated neutral button border. */
   --border-strong: #a3b1bf;
@@ -265,6 +284,10 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* Session active / idle-alive blue, lightened for the dark glass card so
+     * the small dot keeps adequate contrast against the dark canvas (the
+     * light-mode #2f7fd4 reads too dim here). */
+  --session-active: #5ca4f5;
   /* Brand pink + named status hues (same values as light — the brand
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
@@ -704,7 +727,25 @@
     overflow: hidden;
   }
   html {
-    @apply font-sans;
+    /* Font family for the whole inherited UI. Can't `@apply font-sans`: Tailwind
+     * v4's `@theme inline` inlines the literal stack, so a runtime `--font-sans`
+     * override is a no-op. Read a dedicated `--ui-font-family` (set on
+     * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
+     * with the system stack as the fallback when it's unset. */
+    font-family: var(--ui-font-family, var(--font-sans));
+    /* Root size for the whole rem-based UI. `1em` resolves against the
+     * browser default so a customized default is preserved; --ui-font-scale
+     * layers the user's Appearance choice on top. */
+    font-size: calc(1em * var(--ui-font-scale));
+  }
+  /* Code surfaces stay on the mono stack, immune to the UI --ui-font-family
+   * override above. The Appearance font-family setting is UI chrome only; the
+   * Monaco editor and xterm terminals are code fonts, owned by a separate
+   * (future) code-font setting. Monaco/xterm already pin their own font, so this
+   * is a guard against inheritance leaking in through any unpinned descendant. */
+  .monaco-editor,
+  .xterm {
+    font-family: var(--font-mono);
   }
   /* Text selection — brand pink highlight. Light: gentle wash + dark pink
    * text. Dark: solid brand pink background + white text. */
@@ -724,14 +765,15 @@
  * Tailwind's `md` breakpoint. Tailwind v4 sizes typography AND spacing in
  * `rem`, so the whole UI scales up ~12.5% uniformly — easier to read at
  * arm's length and slightly more forgiving touch targets. Desktop is
- * untouched.
+ * untouched. `--ui-font-scale` (the user's Appearance choice) multiplies in
+ * here too, so the bump composes with the setting instead of being lost.
  *
  * Note that `rem` in `@media` queries always refers to the user-agent's
  * default (16px) per the CSS spec — so `48rem` here is the same 768px
  * Tailwind uses for `md:*` utilities, regardless of our root override. */
 @media (width < 48rem) {
   html {
-    font-size: 18px;
+    font-size: calc(1.125em * var(--ui-font-scale));
   }
 }
 
@@ -1219,6 +1261,93 @@
 .dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] {
   --md-alert-color: #f85149;
 }
+
+/* ── Rendered Markdown preview (read-only CodeViewer surface) ──────────────
+   The preview renders via react-markdown into a .prose container. Two GitHub
+   parity fixes live here (the rich-text editor handles the same cases above
+   through TipTap, so this is the preview's equivalent). */
+
+/* Honor explicit <img width/height>. Tailwind Preflight sets `img { height:
+   auto }`, which overrides the width/height *attributes* (presentational hints
+   lose to author CSS); a custom <img> renderer forwards them as inline styles,
+   which win. Keep max-width so oversized images still can't overflow, and use
+   inline-block so logos/badges flow within text like on GitHub. */
+.markdown-preview.prose img {
+  max-width: 100%;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* GitHub alerts. rehype-github-alerts emits GitHub's own markup
+   (<div class="markdown-alert markdown-alert-note"> + a
+   <p class="markdown-alert-title">Note</p> header). We drop its inline octicon
+   in sanitize and redraw it here as a CSS mask, reusing the exact GitHub icons
+   and hues from the editor block above so both surfaces match. */
+.markdown-preview .markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 1rem;
+  color: inherit;
+  border-left: 0.25em solid var(--md-alert-color);
+}
+.markdown-preview .markdown-alert > :first-child {
+  margin-top: 0;
+}
+.markdown-preview .markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+.markdown-preview .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--md-alert-color);
+}
+/* The icon: a mask over a colored box so it inherits --md-alert-color. */
+.markdown-preview .markdown-alert-title::before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  margin-right: 0.5rem;
+  background-color: var(--md-alert-color);
+  mask: var(--md-alert-icon) no-repeat center / contain;
+  -webkit-mask: var(--md-alert-icon) no-repeat center / contain;
+}
+.markdown-preview .markdown-alert-note {
+  --md-alert-color: #0969da;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-tip {
+  --md-alert-color: #1a7f37;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5Zm.75 3.75a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-important {
+  --md-alert-color: #8250df;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0 1 14.25 13H8.06l-2.573 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25Zm7 2.25v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 9a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-warning {
+  --md-alert-color: #9a6700;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-caution {
+  --md-alert-color: #cf222e;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25a.749.749 0 0 1-.53.22H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+/* GitHub's dark-palette hues for the same five types. */
+.dark .markdown-preview .markdown-alert-note {
+  --md-alert-color: #4493f8;
+}
+.dark .markdown-preview .markdown-alert-tip {
+  --md-alert-color: #3fb950;
+}
+.dark .markdown-preview .markdown-alert-important {
+  --md-alert-color: #ab7df8;
+}
+.dark .markdown-preview .markdown-alert-warning {
+  --md-alert-color: #d29922;
+}
+.dark .markdown-preview .markdown-alert-caution {
+  --md-alert-color: #f85149;
+}
 .tiptap-md-content .ProseMirror code {
   font-family: var(--font-mono);
   font-size: 0.85em;
@@ -1259,10 +1388,12 @@
   font-weight: 500;
   margin: 0.75em 0 0.25em;
 }
-/* GitHub-style images: never overflow the editor column. No `height: auto` —
-   it would override explicit height="" attributes from HTML <img> tags.
-   inline-block overrides Tailwind preflight's `img { display: block }` so
-   images flow within headings/paragraphs (logos, badges) like on GitHub. */
+/* GitHub-style images: never overflow the editor column. Explicit <img
+   width/height> are applied as inline styles by the node view (see
+   TipTapWorkspaceImage), which beat Preflight's `img { height: auto }` — an
+   attribute-based size would not. inline-block overrides Preflight's
+   `img { display: block }` so images flow within headings/paragraphs (logos,
+   badges) like on GitHub. */
 .tiptap-md-content .ProseMirror img {
   max-width: 100%;
   display: inline-block;

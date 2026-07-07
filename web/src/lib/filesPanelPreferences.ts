@@ -20,8 +20,6 @@ export interface FilesPanelPreferences {
   changedOnly: boolean;
   /** Sort order for the changed-files flat list. */
   sort: ChangedSort;
-  /** true = the panel header is collapsed (content hidden). */
-  collapsed: boolean;
 }
 
 const STORAGE_KEY = "omnigent:files-panel-preferences";
@@ -31,7 +29,6 @@ const STORAGE_KEY = "omnigent:files-panel-preferences";
 export const DEFAULT_FILES_PANEL_PREFERENCES: FilesPanelPreferences = {
   changedOnly: false,
   sort: "recent",
-  collapsed: false,
 };
 
 /**
@@ -58,8 +55,6 @@ export function readFilesPanelPreferences(): FilesPanelPreferences {
         typeof p.sort === "string" && isValidSort(p.sort)
           ? p.sort
           : DEFAULT_FILES_PANEL_PREFERENCES.sort,
-      collapsed:
-        typeof p.collapsed === "boolean" ? p.collapsed : DEFAULT_FILES_PANEL_PREFERENCES.collapsed,
     };
   } catch {
     return DEFAULT_FILES_PANEL_PREFERENCES;

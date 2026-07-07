@@ -8,16 +8,11 @@ long reply; one that honors it terminates with far less output.
 
 from __future__ import annotations
 
-from tests.harness_bench.driver import SdkInprocDriver, infra_failure_reason
+from tests.harness_bench.driver import infra_failure_reason
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict
-
-# A prompt whose natural completion is long, so an honored interrupt
-# produces visibly less output than letting it run.
-_LONG_PROMPT = (
-    "Write a detailed 400-word essay about the history of computing. Use full paragraphs."
-)
 
 
 class InterruptProbe(CapabilityProbe):
@@ -26,12 +21,8 @@ class InterruptProbe(CapabilityProbe):
     priority = Priority.P0
     applies_to = Applicability.BOTH
 
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
-        result = await driver.run_turn(
-            _LONG_PROMPT,
-            interrupt_on_first_delta=True,
-            timeout=120.0,
-        )
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
+        result = await driver.run_interrupt_turn()
         detail = {
             "chars": len(result.text),
             "completed": result.completed,
@@ -39,23 +30,34 @@ class InterruptProbe(CapabilityProbe):
             "failed": result.failed,
             "timed_out": result.timed_out,
         }
-        # The probe posts the interrupt on the FIRST text delta, so a real
-        # interrupt must have streamed at least some text before stopping.
-        # A turn that emitted no text and then errored did not exercise the
-        # interrupt path at all — treat that as unmeasurable, not success.
-        if result.text_delta_count == 0:
-            infra = infra_failure_reason(result)
-            note = infra or "turn produced no text before terminating; interrupt not exercised"
-            return ProbeResult(Verdict.SKIPPED, note=note, detail=detail)
-
-        # The clearest signal: the harness emitted response.cancelled, i.e. it
-        # explicitly honored the interrupt.
+        # The clearest signal: the transport confirmed a cancellation (an SSE
+        # response.cancelled, or the server's cancellation marker). This is
+        # checked first because a confirmed cancel proves the interrupt was
+        # honored regardless of how the transport surfaces streamed text — the
+        # full-server driver confirms via the marker, not a delta count.
         if result.cancelled:
             return ProbeResult(
                 Verdict.SUPPORTED,
                 note=f"turn cancelled after interrupt ({len(result.text)} chars streamed)",
                 detail=detail,
             )
+
+        # No confirmed cancel. The wrap path posts the interrupt on the FIRST
+        # text delta, so a turn that emitted no text and then terminated did
+        # not exercise the interrupt at all — unmeasurable, not a failure.
+        #
+        # Measurement gap: the full-server driver confirms an interrupt via the
+        # cancellation marker (handled above) and never populates
+        # text_delta_count, so a full-server harness that *ignores* an
+        # interrupt can only be caught as UNSUPPORTED via timed_out below —
+        # otherwise it settles here as SKIPPED (unmeasurable), not a negative
+        # result. Honored interrupts (the probe's goal) are measured on both
+        # transports; a full-server negative needs a delta signal on that
+        # transport to become UNSUPPORTED rather than SKIPPED.
+        if result.text_delta_count == 0:
+            infra = infra_failure_reason(result)
+            note = infra or "turn produced no text before terminating; interrupt not exercised"
+            return ProbeResult(Verdict.SKIPPED, note=note, detail=detail)
         if result.timed_out:
             return ProbeResult(
                 Verdict.UNSUPPORTED,

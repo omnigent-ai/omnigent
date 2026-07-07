@@ -2775,7 +2775,7 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.3.0.dev0"
+version = "0.5.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -2977,7 +2977,7 @@ provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "verte
 
 [[package]]
 name = "omnigent-client"
-version = "0.3.0.dev0"
+version = "0.5.0.dev0"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
@@ -2994,7 +2994,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.3.0.dev0"
+version = "0.5.0.dev0"
 source = { editable = "sdks/ui" }
 dependencies = [
     { name = "omnigent-client" },
@@ -3005,7 +3005,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omnigent-client", specifier = "==0.3.0.dev0" },
+    { name = "omnigent-client", specifier = "==0.5.0.dev0" },
     { name = "prompt-toolkit", specifier = ">=3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13" },

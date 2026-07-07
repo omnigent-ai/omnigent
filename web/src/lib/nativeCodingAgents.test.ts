@@ -16,6 +16,12 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("opencode-native")?.key).toBe("opencode");
   });
 
+  it("folds the reversed native-opencode alias to the opencode-native spec", () => {
+    expect(nativeCodingAgentForHarness("native-opencode")).toBe(
+      nativeCodingAgentForHarness("opencode-native"),
+    );
+  });
+
   it("resolves the canonical qwen-native harness", () => {
     const agent = nativeCodingAgentForHarness("qwen-native");
     expect(agent?.key).toBe("qwen");

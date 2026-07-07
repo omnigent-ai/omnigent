@@ -65,6 +65,16 @@ interface TerminalViewProps {
   onResume?: () => void | Promise<void>;
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
+  /**
+   * Web-attach transport for this terminal (``"control"`` / ``"pty"``),
+   * from the terminal resource's ``metadata.terminal_transport``. Control
+   * mode gives the browser xterm native scrollback + selection, so the
+   * mouse/selection workarounds and the hint bar are dropped. ``undefined``
+   * (or ``"pty"``) keeps the legacy PTY behavior. When set, it is also
+   * forwarded to the server as ``?transport=`` so the attach matches the
+   * behavior the UI renders for.
+   */
+  transport?: "control" | "pty";
 }
 
 export function TerminalView({
@@ -76,7 +86,11 @@ export function TerminalView({
   onInput,
   onResume,
   resumePending = false,
+  transport,
 }: TerminalViewProps) {
+  // Control mode: xterm owns the buffer + mouse, so plain drag selects and
+  // the normal copy gesture works — no forced-selection modifier, no hint bar.
+  const controlMode = transport === "control";
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -167,11 +181,12 @@ export function TerminalView({
         if (cancelled) return;
         terminalSession = new TerminalSession(
           node,
-          buildAttachUrl(sessionId, terminalId, readOnly),
+          buildAttachUrl(sessionId, terminalId, readOnly, transport),
           notifyState,
           isDarkRef.current,
           notifyActivity,
           notifyInput,
+          controlMode,
         );
         sessionRef.current = terminalSession;
       });
@@ -182,7 +197,16 @@ export function TerminalView({
         onStateChangeRef.current?.(null);
       };
     },
-    [sessionId, terminalId, readOnly, notifyState, notifyActivity, notifyInput],
+    [
+      sessionId,
+      terminalId,
+      readOnly,
+      transport,
+      controlMode,
+      notifyState,
+      notifyActivity,
+      notifyInput,
+    ],
   );
 
   // Push theme changes into the live session without remounting.
@@ -263,18 +287,20 @@ export function TerminalView({
       <div className="min-h-0 flex-1 overflow-hidden p-1">
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
       </div>
-      {/* The attached tmux session runs with `mouse on`, so a plain
-          click-drag is captured by tmux (copy-mode) instead of making a
-          browser selection — the user can't select-and-copy without a
-          modifier. The modifier and copy key are
-          platform-specific, and there's no other discoverable cue, so
-          surface it as a persistent hint. */}
-      <div
-        data-testid="terminal-selection-hint"
-        className="shrink-0 select-none px-2 py-1 text-[10px] text-muted-foreground/70"
-      >
-        {selectionHintText(isMacPlatform())}
-      </div>
+      {/* PTY transport only: the attached tmux session runs with `mouse on`,
+          so a plain click-drag is captured by tmux (copy-mode) instead of
+          making a browser selection — the user can't select-and-copy without a
+          platform-specific modifier, and there's no other discoverable cue, so
+          surface it as a persistent hint. Control mode gives xterm native
+          selection, so the hint is unnecessary and omitted. */}
+      {!controlMode && (
+        <div
+          data-testid="terminal-selection-hint"
+          className="shrink-0 select-none px-2 py-1 text-[10px] text-muted-foreground/70"
+        >
+          {selectionHintText(isMacPlatform())}
+        </div>
+      )}
       {state.kind !== "connected" && (
         <StatusOverlay
           state={state}
@@ -411,18 +437,29 @@ function resumeErrorText(error: unknown): string {
  *     e.g. ``"terminal_bash_s1"``.
  * :param readOnly: If true, requests a read-only attach. Forwarded
  *     to the server as ``?read_only=true``.
+ * :param transport: Optional per-attach transport override
+ *     (``"control"`` / ``"pty"``), forwarded as ``?transport=``. Lets a
+ *     terminal be A/B'd against the other mode side by side; ``undefined``
+ *     lets the server pick from the terminal spec / global default.
  * :returns: The path-and-query portion of the WS URL, e.g.
  *     ``"/v1/sessions/.../resources/terminals/.../attach"``.
  */
-export function buildAttachPath(sessionId: string, terminalId: string, readOnly: boolean): string {
+export function buildAttachPath(
+  sessionId: string,
+  terminalId: string,
+  readOnly: boolean,
+  transport?: string,
+): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
     `/resources/terminals/${encodeURIComponent(terminalId)}/attach`;
-  // Only emit the query param when set — the server defaults to
-  // false, so the common case keeps URLs short and stable for
-  // anything that greps the access log.
-  const qs = readOnly ? "?read_only=true" : "";
-  return `${path}${qs}`;
+  // Only emit query params when set — the server defaults keep the common
+  // case's URLs short and stable for anything that greps the access log.
+  const params = new URLSearchParams();
+  if (readOnly) params.set("read_only", "true");
+  if (transport) params.set("transport", transport);
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
 }
 
 /**
@@ -435,10 +472,16 @@ export function buildAttachPath(sessionId: string, terminalId: string, readOnly:
  * :param sessionId: Session/conversation identifier.
  * :param terminalId: Opaque terminal resource id.
  * :param readOnly: If true, requests a read-only attach.
+ * :param transport: Optional per-attach transport override.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
-function buildAttachUrl(sessionId: string, terminalId: string, readOnly: boolean): string {
+function buildAttachUrl(
+  sessionId: string,
+  terminalId: string,
+  readOnly: boolean,
+  transport?: string,
+): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, transport));
 }

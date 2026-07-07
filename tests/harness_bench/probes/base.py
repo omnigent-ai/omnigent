@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import abc
 
-from tests.harness_bench.driver import SdkInprocDriver
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult
 
 
@@ -36,7 +36,7 @@ class CapabilityProbe(abc.ABC):
     applies_to: Applicability = Applicability.BOTH
 
     @abc.abstractmethod
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
         """Exercise the dimension and return the observed verdict.
 
         :param driver: A live driver already bound to *profile*'s harness.

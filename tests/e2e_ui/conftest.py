@@ -53,7 +53,7 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
@@ -90,6 +90,23 @@ def open_right_rail(page: Page) -> None:
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+
+
+def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
+    """Switch a markdown FileViewer to Preview / Edit / Source via the toolbar.
+
+    Markdown files default to the rendered Preview pane; the three modes live
+    behind a single "View mode" dropdown in the toolbar. Open that dropdown and
+    pick the option. The menu renders in a portal (outside ``file_viewer``), so
+    the menuitem is queried off ``page``, not the viewer locator.
+
+    :param page: Playwright page with the file viewer open.
+    :param file_viewer: The visible ``[data-testid="file-viewer"]`` locator.
+    :param mode: One of ``"Preview"``, ``"Edit"``, ``"Source"``.
+    :returns: None.
+    """
+    file_viewer.get_by_role("button", name=re.compile(r"^View mode")).first.click()
+    page.get_by_role("menuitem", name=mode, exact=True).click()
 
 
 # Populated by ``live_server`` so test-scoped fixtures can access the

@@ -10,12 +10,14 @@ idempotent high-water cursor.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from omnigent import hermes_native_forwarder as f
+from omnigent import hermes_native_status as hstatus
 
 _SCHEMA = """
 CREATE TABLE sessions (
@@ -470,6 +472,94 @@ async def _noop() -> None:
     return None
 
 
+async def test_forward_loop_rebases_idle_count_on_compaction_repin(tmp_path, monkeypatch) -> None:
+    """Compaction re-pin rebases the idle posted-count to the child's count.
+
+    Regression: the completed-turn count is per hermes_session_id, but the idle
+    dedup baseline (posted_count) is per bridge dir. A parent that accrued N idle
+    posts leaves posted_count=N; the child's count restarts near 0, so without a
+    rebase the guard ``completed_turns > posted_count`` stays False until the
+    child exceeds N terminal turns — suppressing the child's early idle posts and
+    hanging the orchestrator. On re-pin the baseline must drop to the child's
+    current completed-turn count so the child's next completion still wakes the
+    parent.
+    """
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.executemany(
+        "INSERT INTO sessions(id, source, cwd, started_at, parent_session_id) VALUES (?,?,?,?,?)",
+        [
+            ("parent_1", "cli", workspace, 1000.0, None),
+            ("child_1", "cli", workspace, 1005.0, "parent_1"),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO messages(session_id, role, content, tool_calls, active, compacted) "
+        "VALUES (?,?,?,?,?,?)",
+        [
+            # Parent: two completed turns (terminal assistant rows) + a compaction.
+            ("parent_1", "assistant", "done 1", None, 1, 0),
+            ("parent_1", "assistant", "done 2", None, 1, 0),
+            ("parent_1", "assistant", "compacted summary", None, 1, 1),
+            # Child: one completed turn so far.
+            ("child_1", "user", "child hi", None, 1, 0),
+            ("child_1", "assistant", "child done", None, 1, 0),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Pin the parent; posted_count reflects the parent's two completed turns.
+    f._write_state(bridge_dir, f._ForwardState(hermes_session_id="parent_1", last_id=3))
+    hstatus.write_posted_count(bridge_dir, 2)
+
+    async def _fake_post(_client, *, session_id, item):
+        return None
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fake_post)
+    monkeypatch.setattr(f, "_persist_hermes_compaction_item", lambda *a, **k: _noop())
+
+    idle_posts: list[str] = []
+
+    async def _fake_idle(_client, *, session_id, status):
+        idle_posts.append(status)
+
+    monkeypatch.setattr(f, "_post_external_session_status", _fake_idle)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # Re-pinned to the child, and the baseline dropped from the parent's 2 to the
+    # child's 1 completed turn — so the child's already-present completion is not
+    # suppressed. Without the rebase, posted_count would stay 2 and the guard
+    # (1 > 2) would suppress the child's idle.
+    assert f._read_state(bridge_dir).hermes_session_id == "child_1"
+    assert hstatus.read_posted_count(bridge_dir) == 1
+    assert idle_posts == []  # child's single completed turn == baseline, no double-post
+
+
 # --- Usage tracker tests ---------------------------------------------------
 
 
@@ -664,3 +754,227 @@ async def test_persist_hermes_compaction_item_empty_db(tmp_path: Path) -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"].startswith("compact_boundary_")
     assert "compacted_messages" not in body["data"]
+
+
+# --- turn-completion ("idle") parent-wake path --------------------------------
+#
+# Hermes has no per-turn stop hook (only a ``pre_tool_call`` policy hook), so the
+# forwarder derives turn completion from the message log itself: an ``assistant``
+# row with no ``tool_calls`` is the agentic loop's terminal step. It POSTs
+# ``external_session_status: idle`` once per completed turn — the edge that wakes
+# the parent orchestrator — deduped against a persisted posted-count.
+
+
+def _seed_turns(path: Path, *, cwd: str, started_at: float, session_id: str, n_turns: int) -> None:
+    """Seed *n_turns* completed turns: each is user + assistant(final, no tool_calls)."""
+    con = sqlite3.connect(path)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        (session_id, "cli", cwd, started_at),
+    )
+    rows = []
+    for i in range(n_turns):
+        rows.append((session_id, "user", f"ask {i}", None, None, None, 1))
+        rows.append((session_id, "assistant", f"answer {i}", None, None, None, 1))
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+
+
+def test_assistant_row_has_tool_calls() -> None:
+    assert f._assistant_row_has_tool_calls(None) is False
+    assert f._assistant_row_has_tool_calls("") is False
+    assert f._assistant_row_has_tool_calls("[]") is False
+    assert f._assistant_row_has_tool_calls("not json") is False
+    assert f._assistant_row_has_tool_calls(json.dumps([{"id": "c1"}])) is True
+
+
+def test_count_completed_turns_counts_no_tool_call_assistant_rows(tmp_path: Path) -> None:
+    """A turn ends on an assistant row with no tool_calls; tool-call steps don't count."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", str(tmp_path), 1000.0),
+    )
+    tc = json.dumps([{"id": "c1", "call_id": "c1", "function": {"name": "f", "arguments": "{}"}}])
+    rows = [
+        ("s1", "user", "go", None, None, None, 1),
+        ("s1", "assistant", "", None, tc, None, 1),  # tool-call step -> not terminal
+        ("s1", "tool", "result", "c1", None, "f", 1),
+        ("s1", "assistant", "final answer", None, None, None, 1),  # terminal -> +1
+    ]
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+    assert f._count_completed_turns(db, "s1") == 1
+
+
+def test_count_completed_turns_counts_regardless_of_active(tmp_path: Path) -> None:
+    """Soft-deleted (compacted, active=0) terminal rows still count, keeping it monotonic."""
+    db = tmp_path / "state.db"
+    _seed_turns(db, cwd=str(tmp_path), started_at=1000.0, session_id="s1", n_turns=2)
+    con = sqlite3.connect(db)
+    con.execute("UPDATE messages SET active = 0 WHERE role = 'assistant'")
+    con.commit()
+    con.close()
+    assert f._count_completed_turns(db, "s1") == 2
+
+
+def test_hermes_status_posted_count_roundtrip_and_clear(tmp_path: Path) -> None:
+    bridge = tmp_path / "b"
+    assert hstatus.read_posted_count(bridge) == 0
+    hstatus.write_posted_count(bridge, 4)
+    assert hstatus.read_posted_count(bridge) == 4
+    hstatus.clear_hermes_status_state(bridge)
+    assert hstatus.read_posted_count(bridge) == 0
+
+
+async def _run_hermes_loop(
+    monkeypatch,
+    *,
+    db: Path,
+    bridge_dir: Path,
+    workspace: str,
+    statuses: list[str],
+    stop_after_iterations: int,
+) -> None:
+    """Drive the real hermes forward loop with HTTP stubbed; record idle statuses."""
+
+    async def _noop_item(_client, *, session_id, item):
+        pass
+
+    async def _record_status(_client, *, session_id, status):
+        statuses.append(status)
+
+    monkeypatch.setattr(f, "_post_conversation_item", _noop_item)
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= stop_after_iterations:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_idle",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+
+async def test_forward_loop_posts_idle_once_per_turn(tmp_path, monkeypatch) -> None:
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_turns(db, cwd=workspace, started_at=1000.0, session_id="s1", n_turns=1)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    statuses: list[str] = []
+    await _run_hermes_loop(
+        monkeypatch,
+        db=db,
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        statuses=statuses,
+        stop_after_iterations=2,  # discover+mirror+idle in iter 1, then stop
+    )
+    assert statuses == ["idle"]
+    assert hstatus.read_posted_count(bridge_dir) == 1
+
+
+async def test_forward_loop_idle_restart_safe(tmp_path, monkeypatch) -> None:
+    """A restart whose posted-count already covers the completed turn posts no idle."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_turns(db, cwd=workspace, started_at=1000.0, session_id="s1", n_turns=1)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    hstatus.write_posted_count(bridge_dir, 1)  # already reported before the "restart"
+    statuses: list[str] = []
+    await _run_hermes_loop(
+        monkeypatch,
+        db=db,
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        statuses=statuses,
+        stop_after_iterations=3,
+    )
+    assert statuses == []
+    assert hstatus.read_posted_count(bridge_dir) == 1
+
+
+async def test_forward_loop_idle_dedupes_and_posts_per_new_turn(tmp_path, monkeypatch) -> None:
+    """No duplicate idle while quiescent; a turn that lands later posts exactly one more."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    _seed_turns(db, cwd=workspace, started_at=1000.0, session_id="s1", n_turns=1)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    statuses: list[str] = []
+
+    async def _noop_item(_client, *, session_id, item):
+        pass
+
+    async def _record_status(_client, *, session_id, status):
+        statuses.append(status)
+
+    monkeypatch.setattr(f, "_post_conversation_item", _noop_item)
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        # After the first turn has been reported, append a second completed turn
+        # so the next poll observes a strictly higher count and posts once more.
+        if iteration["n"] == 3:
+            con = sqlite3.connect(db)
+            con.execute(
+                "INSERT INTO messages"
+                "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+                " VALUES (?,?,?,?,?,?,?)",
+                ("s1", "assistant", "answer 2", None, None, None, 1),
+            )
+            con.commit()
+            con.close()
+        if iteration["n"] >= 6:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_idle",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+    # One idle for the seeded turn, one for the turn appended mid-run — never
+    # one-per-poll across the six iterations.
+    assert statuses == ["idle", "idle"]
+    assert hstatus.read_posted_count(bridge_dir) == 2

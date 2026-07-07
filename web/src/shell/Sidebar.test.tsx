@@ -2,7 +2,7 @@
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
 // archived sessions included, rendering the non-archived ones as grouped
-// sections (Pinned / Projects / Chats / Shared with me). Archived sessions
+// sections (Pinned / Projects / Sessions / Shared with me). Archived sessions
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -252,29 +252,29 @@ describe("Sidebar session list", () => {
     // chats are surfaced on /settings, reached via the footer Settings row.
     expect(screen.queryByRole("button", { name: "Archived" })).toBeNull();
     expect(screen.queryByText("conv_archived")).toBeNull();
-    // Active sessions still render in Chats.
-    const recentSection = screen.getByText("Chats").closest("section")!;
+    // Active sessions still render in the Sessions list.
+    const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
     // The footer Settings link points at the settings page.
     expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
   });
 
-  it("renders sessions in one flat list with no connection grouping and no Sessions subheader", () => {
+  it("renders sessions in one flat list with no connection grouping", () => {
     // Liveness grouping is gone: sessions are no longer split into
-    // Connected / Disconnected sections. They all land in one flat list with
-    // NO "Sessions" subheader (it's the sidebar's baseline list, so the label
-    // is redundant). The per-row lifecycle badge still shows for a running
-    // session (the badge no longer reflects runner connection state).
+    // Connected / Disconnected sections. They all land in one flat list under
+    // the baseline "Sessions" header. The per-row lifecycle badge still shows
+    // for a running session (the badge no longer reflects runner connection
+    // state).
     const online = conv("conv_online", "Codex", { status: "running" });
     const offline = conv("conv_offline", "Claude Code", { status: "running" });
     mockConversations([online, offline]);
 
     renderSidebar();
 
-    // No connection-grouping headings, and no redundant "Sessions" subheader.
+    // No connection-grouping headings; the flat list keeps its "Sessions" header.
     expect(screen.queryByRole("heading", { name: "Connected" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Disconnected" })).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Sessions" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Sessions" })).toBeInTheDocument();
 
     // Both rows render in the flat list, and the online running session shows
     // its lifecycle badge (in the row's time-marker slot, outside the link).
@@ -326,12 +326,12 @@ describe("Sidebar session list", () => {
   });
 });
 
-// Sidebar grouping: Pinned / Chats / Shared with me are distinguished by
+// Sidebar grouping: Pinned / Sessions / Shared with me are distinguished by
 // muted micro-headers + whitespace only (the pink divider rules are gone).
 // "Shared with me" = sessions where the caller's permission_level says
 // non-owner (< 4); null/4+ are the viewer's own sessions.
 describe("Sidebar sections", () => {
-  it("splits owned and shared sessions under Chats / Shared with me", () => {
+  it("splits owned and shared sessions under Sessions / Shared with me", () => {
     mockConversations([
       conv("conv_mine_legacy", "Claude Code"), // permission_level null = owner
       conv("conv_mine_acl", "Claude Code", { permission_level: 4 }),
@@ -340,10 +340,10 @@ describe("Sidebar sections", () => {
     renderSidebar();
 
     // Both headers render because both groups are non-empty.
-    const recentHeader = screen.getByText("Chats");
+    const recentHeader = screen.getByText("Sessions");
     const sharedHeader = screen.getByText("Shared with me");
     // Each row lands in the right <section>: a mis-split would either leak
-    // a shared session into Chats (viewer thinks they own it) or hide an
+    // a shared session into Sessions (viewer thinks they own it) or hide an
     // owned one under Shared with me.
     const recentSection = recentHeader.closest("section")!;
     const sharedSection = sharedHeader.closest("section")!;
@@ -353,13 +353,13 @@ describe("Sidebar sections", () => {
     expect(within(sharedSection).getByText("conv_shared")).toBeInTheDocument();
   });
 
-  it("titles the baseline list Chats even with no sibling group", () => {
+  it("titles the baseline list Sessions even with no sibling group", () => {
     mockConversations([conv("conv_only_mine", "Claude Code")]);
     renderSidebar();
-    // "Chats" always renders so the list is labeled (and collapsible)
+    // "Sessions" always renders so the list is labeled (and collapsible)
     // from the first session; empty sibling groups stay hidden.
     expect(screen.getByText("conv_only_mine")).toBeInTheDocument();
-    expect(screen.getByText("Chats")).toBeInTheDocument();
+    expect(screen.getByText("Sessions")).toBeInTheDocument();
     expect(screen.queryByText("Shared with me")).toBeNull();
   });
 });
@@ -394,10 +394,10 @@ describe("Sidebar collapsible sections", () => {
   });
 });
 
-// Pagination belongs to the Chats list: collapsing Chats must take the
+// Pagination belongs to the Sessions list: collapsing it must take the
 // "Load more" button with it, or the button floats under nothing.
-describe("Sidebar load-more vs collapsed Chats", () => {
-  it("hides Load more while Chats is collapsed and restores it on expand", () => {
+describe("Sidebar load-more vs collapsed Sessions", () => {
+  it("hides Load more while Sessions is collapsed and restores it on expand", () => {
     const rows = [conv("conv_mine", "Claude Code")];
     useConvMock.mockImplementation(
       () =>
@@ -417,11 +417,11 @@ describe("Sidebar load-more vs collapsed Chats", () => {
     renderSidebar();
 
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Chats" }));
-    // Collapsed Chats hides its rows AND the pagination affordance.
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    // Collapsed Sessions hides its rows AND the pagination affordance.
     expect(screen.queryByText("conv_mine")).toBeNull();
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Chats" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
   });
 
@@ -478,11 +478,11 @@ describe("Sidebar load-more vs collapsed Chats", () => {
   });
 });
 
-// Project feature: sessions carrying a project label are peeled out of
-// "Chats" into a folder under the "Projects" group (rendered between Pinned and
-// Chats). The project list comes from useProjects() (mocked here).
+// Project feature: sessions carrying a project label are peeled out of the
+// "Sessions" list into a folder under the "Projects" group (rendered between
+// Pinned and Sessions). The project list comes from useProjects() (mocked here).
 describe("Sidebar project sections", () => {
-  it("groups sessions by their project label, separate from Chats", () => {
+  it("groups sessions by their project label, separate from Sessions", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_unfiled", "Claude Code"),
@@ -491,8 +491,8 @@ describe("Sidebar project sections", () => {
     renderSidebar();
 
     // projects default collapsed, so the row is hidden until the header is
-    // clicked. The unfiled session stays visible in Chats regardless.
-    const recentSection = screen.getByText("Chats").closest("section")!;
+    // clicked. The unfiled session stays visible in Sessions regardless.
+    const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_unfiled")).toBeInTheDocument();
     expect(within(recentSection).queryByText("conv_filed")).toBeNull();
     expect(screen.queryByText("conv_filed")).toBeNull();
@@ -633,12 +633,12 @@ describe("Sidebar project sections", () => {
 
   it("does not render a project section when useProjects returns nothing", () => {
     // A session with a stale project label but no matching project entry stays
-    // in Chats — projects are driven by the project list, not the labels alone.
+    // in Sessions — projects are driven by the project list, not the labels alone.
     mockConversations([conv("conv_filed", "Claude Code", { labels: { omni_project: "Ghost" } })]);
     renderSidebar();
 
     expect(screen.queryByText("Ghost")).toBeNull();
-    const recentSection = screen.getByText("Chats").closest("section")!;
+    const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_filed")).toBeInTheDocument();
   });
 
@@ -809,21 +809,29 @@ describe("Sidebar collapsed project marker", () => {
 // Every section is expanded by default, but a collapse the user makes
 // persists across reloads.
 describe("Sidebar default section collapse", () => {
-  it("expands Pinned and Chats by default when there is no stored preference", () => {
+  it("expands Pinned and Sessions by default when there is no stored preference", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
     mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
     expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: /Chats/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /Sessions/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
   });
 
-  it("honors a persisted collapse of Chats across remount", () => {
+  it("honors a persisted collapse of the Sessions list across remount", () => {
+    // "Chats" is the persisted collapse key (kept stable across the label
+    // rename); the header it collapses now reads "Sessions".
     localStorage.setItem("omnigent:collapsed-sidebar-sections", JSON.stringify(["Chats"]));
     mockConversations([conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
-    expect(screen.getByRole("button", { name: /Chats/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: /Sessions/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
     expect(screen.queryByText("conv_recent")).toBeNull();
   });
 });

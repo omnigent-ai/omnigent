@@ -73,6 +73,7 @@ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
 import {
   terminalInfoFromResource,
@@ -141,6 +142,33 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+}
+
+/**
+ * A message the user submitted while the agent was busy. It is held
+ * client-side — NOT yet POSTed — and shown in the docked queue strip above
+ * the composer until the agent goes idle, when the head is flushed FIFO (one
+ * per turn). This is the opposite of {@link PendingUserMessage}, which is
+ * already POSTed and renders as an optimistic bubble in the transcript.
+ *
+ * In-memory only: a hard reload clears the queue, so `files` can be held
+ * directly (no serialization concern).
+ */
+export interface QueuedMessage {
+  /** Client-only id, e.g. `q_1`. */
+  queueId: string;
+  /** Fully-assembled message text (mentions/quotes already applied). */
+  text: string;
+  /** Attachments to send with the message. */
+  files?: File[];
+  /** Owning conversation, so a switch/idle only flushes its own queue. */
+  conversationId: string;
+  /**
+   * Agent bound when the message was queued, so it flushes to the agent it was
+   * composed for even if the binding changed meanwhile (e.g. a `/model` switch).
+   * Falls back to the current `boundAgentId` when absent.
+   */
+  agentId?: string;
 }
 
 /**
@@ -222,6 +250,12 @@ export interface ChatState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * Messages submitted while the agent is busy, held client-side (not yet
+   * POSTed) and shown in the composer's queue strip. The head is flushed
+   * FIFO — one per turn — when the session goes idle. In-memory only.
+   */
+  queuedMessages: QueuedMessage[];
   /**
    * In-flight optimistic bubbles stashed per conversation so they survive
    * in-app navigation (`switchTo`), keyed by conversation id.
@@ -495,6 +529,45 @@ export interface ChatState {
   // Actions.
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
   /**
+   * Queue a message client-side instead of POSTing it now, for a send made
+   * while the agent is busy. The head is flushed automatically (FIFO, one per
+   * turn) when the session next goes idle — see the `session_status` handler.
+   */
+  enqueueMessage: (text: string, files?: File[]) => void;
+  /** Remove a queued message by id (the strip's per-row delete). */
+  dequeueMessage: (queueId: string) => void;
+  /**
+   * Send a queued message NOW instead of waiting for the idle flush (the
+   * strip's per-row steer). Removes it from the queue and POSTs it: on an
+   * SDK harness the server live-injects it into the running turn; the
+   * optimistic bubble promotes on POST. No-op if the id isn't queued.
+   */
+  steerMessage: (queueId: string) => void;
+  /**
+   * Drop all queued messages for a conversation. Called when a conversation is
+   * deleted so its queue can't linger in memory (it would never flush — you
+   * can't be bound to a deleted session).
+   */
+  clearQueuedMessages: (conversationId: string) => void;
+  /**
+   * Flush the queue head if the session is idle and ready. Level-triggered:
+   * safe to call on any state change (idempotent — no-ops when busy, when the
+   * queue is empty, or when the head isn't for the bound conversation). POSTing
+   * the head starts a turn → the session goes busy → this no-ops until the next
+   * idle, so the queue drains FIFO one per turn.
+   */
+  maybeFlushQueuedHead: () => void;
+  /**
+   * Flush queued messages for conversations OTHER than the active one, whose
+   * status in the `["conversations"]` cache is idle. The active conversation is
+   * owned by {@link maybeFlushQueuedHead}; this covers a queue whose session the
+   * user has navigated away from (its SSE stream is gone, so it can't drain
+   * itself). POSTs one message per idle conversation per call, via `postEvent`
+   * (no active-session state touched, no optimistic bubble — it re-hydrates on
+   * return). Level-triggered + idempotent; safe to over-fire.
+   */
+  flushBackgroundQueues: () => void;
+  /**
    * Invoke a skill by posting a ``slash_command`` event — the same wire
    * shape the REPL sends. The server resolves the skill, persists the
    * visible receipt + hidden ``<skill>`` meta message, and forwards the
@@ -573,6 +646,7 @@ export interface ChatState {
 
 let queryClient: QueryClient | null = null;
 let pendingSeq = 0;
+let queueSeq = 0;
 // Tail of the send chain. Each `send` waits on the previous send's network
 // work before issuing its own POST, so rapid-fire messages reach the server
 // in submission order. Concurrent `fetch` POSTs have no ordering guarantee,
@@ -581,6 +655,16 @@ let pendingSeq = 0;
 let sendChain: Promise<void> = Promise.resolve();
 let flashTimer: ReturnType<typeof setTimeout> | null = null;
 const workspaceInvalidationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// Background-flush throttle, kept OUT of store state so it can't re-trigger the
+// queue effect. A conversation currently mid-POST (inFlight) or in its
+// post-failure cooldown is skipped, so `flushBackgroundQueues` can't spin into
+// a tight retry loop against a persistently-failing idle conversation — a
+// failed POST leaves it idle in the cache, which would otherwise re-fire on
+// every re-queue. Cooldown paces retries to roughly the sidebar poll cadence.
+const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
+const backgroundFlushInFlight = new Set<string>();
+const backgroundFlushCooldownUntil = new Map<string, number>();
 
 // Must match the @keyframes user-msg-flash duration in index.css.
 const FLASH_DURATION_MS = 800;
@@ -627,6 +711,8 @@ export function initChatStore(client: QueryClient): void {
     clearTimeout(timer);
   }
   workspaceInvalidationTimers.clear();
+  backgroundFlushInFlight.clear();
+  backgroundFlushCooldownUntil.clear();
   queryClient = client;
 }
 
@@ -735,6 +821,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  queuedMessages: [],
   pendingByConversation: {},
   activeResponse: null,
   interruptedResponseIds: [],
@@ -773,6 +860,159 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sandboxStatus: null,
   abortController: null,
   historyGeneration: 0,
+
+  enqueueMessage: (text, files) => {
+    const { conversationId, boundAgentId } = get();
+    if (conversationId === null) return;
+    queueSeq += 1;
+    const queueId = `q_${queueSeq}`;
+    set((s) => ({
+      queuedMessages: [
+        ...s.queuedMessages,
+        {
+          queueId,
+          text,
+          conversationId,
+          ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
+          ...(files && files.length > 0 ? { files } : {}),
+        },
+      ],
+    }));
+    // A message queued while the agent is idle (a race where the send routed
+    // to the queue but the turn had already ended) would otherwise wait for an
+    // idle edge that never comes — flush now.
+    get().maybeFlushQueuedHead();
+  },
+
+  dequeueMessage: (queueId) => {
+    set((s) => ({
+      queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId),
+    }));
+  },
+
+  steerMessage: (queueId) => {
+    const s = get();
+    const target = s.queuedMessages.find((m) => m.queueId === queueId);
+    const agentId = target?.agentId ?? s.boundAgentId;
+    if (target === undefined || agentId === null) return;
+    // Remove BEFORE the POST so a concurrent flush can't also send it.
+    set({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
+    void s.send(target.text, agentId, target.files);
+  },
+
+  clearQueuedMessages: (conversationId) => {
+    set((s) => {
+      if (!s.queuedMessages.some((m) => m.conversationId === conversationId)) return {};
+      return {
+        queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+      };
+    });
+  },
+
+  maybeFlushQueuedHead: () => {
+    const s = get();
+    // Only when fully idle: both the local send lifecycle AND the server-side
+    // session status. No agent → nothing to send to.
+    if (
+      s.conversationId === null ||
+      s.boundAgentId === null ||
+      s.status === "streaming" ||
+      s.sessionStatus === "running" ||
+      s.sessionStatus === "waiting"
+    ) {
+      return;
+    }
+    // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
+    // the global array head. The queue is one flat array across conversations,
+    // so an undrained message from another conversation can sit at index 0; a
+    // head-only guard would let it block this conversation's messages forever.
+    const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
+    if (head === undefined) return;
+    // Remove it BEFORE the POST so a re-entrant flush can't double-send.
+    set({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+  },
+
+  flushBackgroundQueues: () => {
+    const s = get();
+    if (queryClient === null || s.queuedMessages.length === 0) return;
+
+    // Conversations (other than the active one) that have a queued message.
+    // The active conversation is owned by maybeFlushQueuedHead.
+    const candidateIds = new Set(
+      s.queuedMessages.map((m) => m.conversationId).filter((id) => id !== s.conversationId),
+    );
+    if (candidateIds.size === 0) return;
+
+    // Per-conversation status from the sidebar cache (kept live by the WS
+    // /v1/sessions/updates overlay + poll), so we can tell whether a
+    // navigated-away conversation is idle without its SSE stream. A conversation
+    // scrolled past the loaded pages has no row here → treated as not-idle and
+    // left for the foreground flush when the user navigates back to it.
+    const statusById = new Map<string, string | undefined>();
+    for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["conversations"],
+    })) {
+      for (const page of data?.pages ?? []) {
+        for (const row of page.data) {
+          if (candidateIds.has(row.id) && !statusById.has(row.id)) {
+            statusById.set(row.id, row.status);
+          }
+        }
+      }
+    }
+
+    // One message per idle conversation per call: POSTing makes it busy, so the
+    // next idle (via WS/poll) triggers this again for the next message (FIFO).
+    const now = Date.now();
+    for (const conversationId of candidateIds) {
+      if (statusById.get(conversationId) !== "idle") continue;
+      // Skip a conversation mid-POST or in its post-failure cooldown so a
+      // persistent failure can't spin this into a tight retry loop (the effect
+      // re-fires on every re-queue, and a failed POST leaves the row idle).
+      if (backgroundFlushInFlight.has(conversationId)) continue;
+      const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
+      if (cooldownUntil !== undefined && cooldownUntil > now) continue;
+      const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
+      // Files are left for the foreground flush — background covers text only
+      // (attachments are in-memory and the user is likely still near that chat).
+      if (head === undefined || (head.files && head.files.length > 0)) continue;
+
+      // Remove BEFORE the POST so a re-entrant trigger can't double-send.
+      backgroundFlushInFlight.add(conversationId);
+      set((st) => ({
+        queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
+      }));
+      // No optimistic bubble — we're not viewing this conversation; it
+      // re-hydrates from the snapshot on return. On failure re-queue at the
+      // head (preserving this conversation's FIFO order) and set a cooldown so
+      // the next trigger backs off instead of hammering a failing runner.
+      void postEvent(conversationId, {
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text: head.text }] },
+      })
+        .catch(() => {
+          backgroundFlushCooldownUntil.set(
+            conversationId,
+            Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
+          );
+          set((st) => {
+            const idx = st.queuedMessages.findIndex((m) => m.conversationId === conversationId);
+            const at = idx === -1 ? st.queuedMessages.length : idx;
+            return {
+              queuedMessages: [
+                ...st.queuedMessages.slice(0, at),
+                head,
+                ...st.queuedMessages.slice(at),
+              ],
+            };
+          });
+        })
+        .finally(() => {
+          backgroundFlushInFlight.delete(conversationId);
+        });
+    }
+  },
 
   send: async (text, agentId, files, opts) => {
     if (!agentId) {
@@ -2175,6 +2415,14 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  * token/context/cost counters, and — when the turn ended during the gap —
  * the terminal `activeResponse` transition the missed `session.status`
  * event would have applied, so "Working…" clears.
+ *
+ * The inverse also matters: when the snapshot shows a turn STILL running and
+ * carries its in-flight `activeResponseId`, reopen the streaming
+ * `activeResponse`. The SSE stream is snapshot + live tail with no replay, so
+ * the turn-start `running` edge that originally opened it is never re-sent —
+ * without this, a client connecting mid-turn (reconnect, or first open of an
+ * already-running native session) would leave the turn's bubble non-streaming
+ * and its tool cards static for the rest of the turn.
  */
 function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState> {
   const patch: Partial<ChatState> = { sessionStatus: session.status };
@@ -2195,6 +2443,20 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
       error: null,
     };
     patch.status = "idle";
+  } else if (
+    (session.status === "running" || session.status === "waiting") &&
+    session.activeResponseId != null &&
+    s.activeResponse?.responseId !== session.activeResponseId
+  ) {
+    // Mid-turn (re)connect: reopen the streaming lifecycle from the snapshot.
+    // Guarded on a differing responseId so we never downgrade a live
+    // activeResponse that already matches (e.g. one cancelled in this tab).
+    patch.activeResponse = {
+      responseId: session.activeResponseId,
+      state: "streaming",
+      error: null,
+    };
+    patch.status = "streaming";
   }
   return patch;
 }
@@ -3719,6 +3981,11 @@ export function handleSessionEvent(event: StreamEvent): void {
           });
         }
       }
+      // Draining the queue is level-triggered (a React effect calls
+      // maybeFlushQueuedHead on every status/queue change), NOT edge-triggered
+      // here — a single "flush on the idle event" is fragile: a message queued
+      // just after the idle edge, or an SSE reconnect that replays state
+      // without a fresh transition, would strand the queue forever.
       return;
     }
     case "session_input_consumed":

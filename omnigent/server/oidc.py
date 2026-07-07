@@ -47,6 +47,39 @@ def derive_code_challenge(code_verifier: str) -> str:
 # ── Session cookie helpers ───────────────────────────────────────
 
 
+def mint_session_token(
+    user_id: str,
+    cookie_secret: bytes,
+    ttl_seconds: int,
+    provider: str,
+) -> str:
+    """
+    Mint a signed session JWT with a second-granularity lifetime.
+
+    The seconds-based core behind :func:`mint_session_cookie`. A managed
+    runner needs a short-lived (sub-hour) owner token, which the hours-only
+    cookie helper cannot express; both share this HS256 claim shape so the
+    same validator (:meth:`UnifiedAuthProvider._check_cookie`) accepts
+    either.
+
+    :param user_id: The authenticated user's email, e.g.
+        ``"alice@example.com"``.
+    :param cookie_secret: HMAC key for HS256 signing.
+    :param ttl_seconds: Token lifetime in seconds.
+    :param provider: Identity provider name, e.g. ``"google"`` or
+        ``"accounts"``. Stored as an informational claim.
+    :returns: An HS256-signed JWT string.
+    """
+    now = int(time.time())
+    payload = {
+        "sub": user_id,
+        "iat": now,
+        "exp": now + ttl_seconds,
+        "provider": provider,
+    }
+    return jwt.encode(payload, cookie_secret, algorithm="HS256")
+
+
 def mint_session_cookie(
     user_id: str,
     cookie_secret: bytes,
@@ -63,14 +96,7 @@ def mint_session_cookie(
         or ``"github"``. Stored as an informational claim.
     :returns: An HS256-signed JWT string.
     """
-    now = int(time.time())
-    payload = {
-        "sub": user_id,
-        "iat": now,
-        "exp": now + (ttl_hours * 3600),
-        "provider": provider,
-    }
-    return jwt.encode(payload, cookie_secret, algorithm="HS256")
+    return mint_session_token(user_id, cookie_secret, ttl_hours * 3600, provider)
 
 
 def hmac_digest(token: str, secret: bytes) -> str:

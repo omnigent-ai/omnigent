@@ -15,14 +15,11 @@ SUPPORTED, "never streams" to PARTIAL.
 
 from __future__ import annotations
 
-from tests.harness_bench.driver import SdkInprocDriver, TurnResult, infra_failure_reason
+from tests.harness_bench.driver import TurnResult, infra_failure_reason
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict
-
-# Long enough that a genuinely streaming harness emits many deltas and a
-# one-chunk flush is clearly complete-only rather than just a short reply.
-_PROMPT = "Count from 1 to 30 in words, one number per line, and add a short note after each."
 
 
 class StreamingProbe(CapabilityProbe):
@@ -31,7 +28,7 @@ class StreamingProbe(CapabilityProbe):
     priority = Priority.P0
     applies_to = Applicability.BOTH
 
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
         result = await self._measure(driver)
         skipped = self._skip_reason(result)
         if skipped is not None:
@@ -74,8 +71,8 @@ class StreamingProbe(CapabilityProbe):
             detail={"text_delta_count": n, "retry_delta_count": m},
         )
 
-    async def _measure(self, driver: SdkInprocDriver) -> TurnResult:
-        return await driver.run_turn(_PROMPT)
+    async def _measure(self, driver: Driver) -> TurnResult:
+        return await driver.run_streaming_turn()
 
     @staticmethod
     def _skip_reason(result: TurnResult) -> str | None:
