@@ -180,6 +180,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-qwen": "qwen-native",
   "native-kimi": "kimi-native",
   "native-hermes": "hermes-native",
+  "native-opencode": "opencode-native",
 };
 
 export function nativeCodingAgentForAgentName(

@@ -173,16 +173,29 @@ class FullServerDriver:
     @staticmethod
     def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
         """Return a skip reason if this driver cannot run *profile*, else ``None``."""
+        # full-server registers the harness via an agent bundle (the SDK-wrap
+        # path); a native harness needs the host-daemon/tmux provisioning only
+        # the native-tui driver does, so it cannot run here even under an
+        # explicit --transport full-server override.
+        if profile.transport == "native-tui":
+            return (
+                f"{profile.harness!r} is a native-tui harness; the full-server transport "
+                "registers via an agent bundle and cannot drive it (use --transport native-tui)"
+            )
         if not databricks_profile:
             return "no --profile / databricks profile provided; full-server needs a gateway route"
         if lookup_databricks_host(databricks_profile) is None:
             return (
                 f"databricks profile {databricks_profile!r} missing/hostless in ~/.databrickscfg"
             )
-        # Reuse the wrap driver's CLI gate (same binary requirement).
-        from tests.harness_bench.driver import SdkInprocDriver
+        # Same CLI gate as the wrap driver (same binary requirement), but skip
+        # its transport check — that is sdk-inproc-specific and would misreport
+        # the driver name; the native case is already handled above.
+        from tests.e2e._harness_probes import cli_unavailable_reason
 
-        return SdkInprocDriver.unavailable(profile, databricks_profile=databricks_profile)
+        if profile.cli_binary is not None:
+            return cli_unavailable_reason(profile.cli_binary)
+        return None
 
     def __enter__(self) -> FullServerDriver:
         self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)

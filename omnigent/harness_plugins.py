@@ -239,12 +239,12 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
-    # pi/cursor/kiro/goose/qwen/kimi/hermes are transcript-mirror natives: their
-    # forwarder posts each COMPLETE assistant message (external_conversation_item),
-    # never token-level external_output_text_delta, so the web UI sees the reply
-    # complete-only, not streamed. streaming=False reflects that (bench-verified
-    # for kiro-native; the others share the same forwarder shape — 0 delta posts).
-    # Contrast claude/codex/antigravity, whose forwarders do post deltas.
+    # streaming is declared True unless a live bench run proves a harness does
+    # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
+    # a full SSE capture); a static "forwarder posts no external_output_text_delta"
+    # grep is NOT sufficient — pi-native has no such delta-posting forwarder yet
+    # streams 7 deltas live (by what path was not traced), so the grep-based
+    # flip was wrong for it. The rest stay True until live-verified.
     "pi-native": _C(
         _IM.NATIVE_TUI,
         _EL.NONE,
@@ -254,8 +254,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
         interrupt=True,
-        streaming=False,
+        streaming=True,
     ),
+    # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -268,6 +269,8 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=False,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
+    # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
+    # deltas; the whole reply arrives as one response.output_item.done.
     "kiro-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -299,8 +302,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=False,
+        streaming=True,
     ),
+    # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -321,7 +325,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.SESSION_SCOPED_CONFIG,
         subagents=False,
         interrupt=True,
-        streaming=False,
+        streaming=True,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -343,7 +347,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=False,
+        streaming=True,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.

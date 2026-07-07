@@ -69,25 +69,35 @@ consume-timing dependency entirely.
 
 Steer always POSTs immediately; how it lands depends on the harness:
 
+Steer always POSTs immediately (client-side, no runner change); how it lands
+depends on the harness. The steer button is shown for **all** native sessions —
+the runner delivers uniformly (POST → buffer → drain → hand to app, all natives'
+`run_turn` return right after delivery), and the app decides what to do with a
+message that arrives mid-response:
+
 | Harness | Steer delivery | Mid-turn? |
 |---------|----------------|-----------|
 | claude-sdk / codex-sdk / pi-sdk | runner **live injection** (`_live_response_id` gate) | ✅ deterministic |
 | cursor-sdk / copilot-sdk | buffer & drain | ❌ next turn |
-| **codex-native** | explicit **`turn/steer`** RPC when a turn is active | ✅ deterministic |
-| **claude-native** (and paste-based natives) | runner drains → `send-keys` into the **live pane**; the app treats the paste as a steer | ⚠️ best-effort (drain-vs-response race) |
+| **codex-native** | explicit **`turn/steer`** RPC when a turn is active | ✅ deterministic *(verified)* |
+| **claude-native** | `send-keys` into the **live pane**; the TUI folds the paste into the response | ✅ verified (best-effort timing) |
+| cursor-native / pi-native / hermes-native | paste / inbox-queue into the app | ⚠️ app-defined — **not yet verified live** |
+| opencode-native | HTTP prompt; the native server has **no steer endpoint** → queued as a new prompt | ❌ next turn (verified) |
+| qwen / goose / kimi / kiro / antigravity -native | paste / file / RPC into the app | ⚠️ app-defined — not yet verified live |
 
-> **TODO:** sanity-check the remaining harnesses (cursor-native, pi-native,
-> qwen-native, opencode-native, goose-native, hermes-native, kimi-native,
-> antigravity-native, kiro-native, …) — confirm whether each is deterministic
-> (`turn/steer`-style RPC) or best-effort (paste into live pane) before relying on
-> steer behavior.
+> **TODO:** verify live-steer behavior for cursor-native, pi-native,
+> hermes-native, opencode-native (and the remaining natives). The steer button
+> is already shown for them — the mechanism works uniformly — but whether the
+> app folds the message in mid-response vs. at the next turn is confirmed only
+> for claude-native + codex-native so far.
 
-**No runner change is required for native steer** — native `run_turn` clears the
-turn right after the paste, so the drain fires the next message quickly and it
-lands in the live pane, where the native app does its own steering. Frame the UX
+**No runner change is required for native steer** — every native `run_turn`
+returns right after delivering the input (decoupled from the response), so the
+drain fires the next message quickly and it reaches the app while the prior
+response is likely still running; the app does its own steering. Frame the UX
 honestly: *"send now; the agent folds it into current work if it can"* — which is
 exactly how native type-ahead already feels. Do **not** promise deterministic
-mid-turn for paste-based natives.
+mid-turn for the unverified natives.
 
 **Steer is not interrupt.** In every case above, steer *does not cancel* the
 running turn — the message is folded in at the agent's next natural breakpoint

@@ -13,15 +13,21 @@ adds native niceties:
   transitions this client observes do. On a turn-end the notification body
   shows the **first few lines of the agent's final message** when they can be
   fetched (one best-effort `GET /items` call), falling back to a generic
-  "Agent finished and is ready for your input."
+  "Agent finished and is ready for your input." On macOS each notification can
+  also **play a sound** — a system sound you pick in the **Notifications** menu
+  (see below). It's **off by default (opt-in)**: a fresh install stays silent
+  until you turn it on, so the sound never surprises you.
 - **A foreground attention cue.** macOS (and Windows) suppress the notification
-  _banner_ for the **frontmost** app — the notification still lands in
-  Notification Center, but no toast pops, which reads as "notifications only
-  work when the app is in the background." Because the web layer already only
-  notifies for sessions you are _not_ actively viewing, the shell adds an
-  OS-level cue the frontmost app _can_ show: it **bounces the macOS dock icon**
-  (or flashes the taskbar frame on Windows/Linux) so an unopened session's
-  turn-end is noticeable even with Omnigent in front.
+  _banner_ for the **frontmost** app — and macOS suppresses its **sound** too —
+  so the notification still lands in Notification Center, but no toast pops (and
+  on macOS no sound plays), which reads as "notifications only work when the app
+  is in the background." Because the web layer already only notifies for
+  sessions you are _not_ actively viewing, the shell adds OS-level cues the
+  frontmost app _can_ produce: it **bounces the macOS dock icon** (or flashes
+  the taskbar frame on Windows/Linux), and on macOS it **plays the chosen sound
+  itself** (via `afplay`) instead of the suppressed notification sound. Because
+  the shell plays it, the alert is audible **whether Omnigent is backgrounded or
+  in front** — and the toast's own sound is muted so the cue never doubles.
 - **Multiple windows** (**Server → New Window**, `Cmd/Ctrl+N`). Each window is
   an independent view, opening on the current window's URL so you can then
   navigate it to a different conversation and watch two side by side. A
@@ -38,7 +44,12 @@ adds native niceties:
   Electron's menu roles, so the usual text-editing shortcuts — Cmd/Ctrl-A,
   C, V, X, Z — work inside the webview's text fields. Our custom actions —
   **New Window**, **New Window on Different Server…**, and
-  **Change Server…** — live in a dedicated **Server** submenu.
+  **Change Server…** — live in a dedicated **Server** submenu. On macOS a
+  **Notifications** submenu turns the notification sound on/off (**Play
+  Notification Sound**, **off by default** — the user opts in) and picks which
+  macOS system sound to play (**Sound ▸** — Glass, Ping, Hero, …); choosing one
+  previews it, and the choice persists in `settings.json` and applies to the
+  next notification.
 - **Browser-style file drag-and-drop** works out of the box: Electron does
   not intercept file drops the way Tauri does by default, so dropping an
   image onto a text field reaches the web app's HTML5 drop handler with no

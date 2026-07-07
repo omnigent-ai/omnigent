@@ -3429,12 +3429,21 @@ def test_model_alias_for_collapses_concrete_id_to_tier_alias() -> None:
     """
     assert forwarder._model_alias_for("claude-opus-4-8") == "opus"
     assert forwarder._model_alias_for("anthropic/claude-opus-4-7") == "opus"
+    # The default Sonnet (4.6) collapses to the generic "sonnet" alias — the
+    # row it is bound to.
     assert forwarder._model_alias_for("databricks-claude-sonnet-4-6") == "sonnet"
+    assert forwarder._model_alias_for("claude-sonnet-4-6") == "sonnet"
     assert forwarder._model_alias_for("claude-haiku-4-5") == "haiku"
     # Fable (the tier above Opus) collapses to its own alias — a miss
     # here means a TUI switch to claude-fable-5 never reaches the picker.
     assert forwarder._model_alias_for("claude-fable-5") == "fable"
     assert forwarder._model_alias_for("databricks-claude-fable-5") == "fable"
+    # Sonnet 5 routes to its own opt-in picker slot, not the generic "sonnet"
+    # row — both ids contain the substring "sonnet", so a miss here means
+    # a TUI switch to the newer Sonnet generation would wrongly light up
+    # the default-Sonnet row instead.
+    assert forwarder._model_alias_for("anthropic/claude-sonnet-5") == "sonnet_5"
+    assert forwarder._model_alias_for("databricks-claude-sonnet-5") == "sonnet_5"
     # Unknown family or empty → None (don't surface an unrenderable id).
     assert forwarder._model_alias_for("gpt-5-4-mini") is None
     assert forwarder._model_alias_for("") is None
@@ -3515,7 +3524,7 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
 
         # User switches model inside the terminal.
         with transcript_path.open("a", encoding="utf-8") as fh:
-            fh.write(_assistant("a2", "claude-sonnet-4-6", "switched") + "\n")
+            fh.write(_assistant("a2", "claude-sonnet-5", "switched") + "\n")
         requests.clear()
         await forwarder._forward_available_items(
             client=client,
@@ -3529,8 +3538,8 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
 
     model_posts = [r for r in requests if r["type"] == "external_model_change"]
     assert len(model_posts) == 1
-    assert model_posts[0]["data"] == {"model": "sonnet"}
-    assert dedupe.posted_model == "sonnet"
+    assert model_posts[0]["data"] == {"model": "sonnet_5"}
+    assert dedupe.posted_model == "sonnet_5"
 
 
 @pytest.mark.asyncio
@@ -3609,20 +3618,20 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
         assert model_posts == []
         assert dedupe.posted_model == "opus"
 
-        # Poll 2: user switches to sonnet; the POST fails transiently.
+        # Poll 2: user switches to Sonnet 5; the POST fails transiently.
         with transcript_path.open("a", encoding="utf-8") as fh:
-            fh.write(_assistant("a2", "claude-sonnet-4-6") + "\n")
+            fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet"}]  # attempted once
+        assert model_posts == [{"model": "sonnet_5"}]  # attempted once
         assert dedupe.posted_model == "opus"  # NOT advanced — POST failed
-        assert dedupe.observed_model == "sonnet"  # but remembered
+        assert dedupe.observed_model == "sonnet_5"  # but remembered
 
         # Poll 3: a plain user turn (no message.model) still retries.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_user("u1") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet"}, {"model": "sonnet"}]  # retried
-        assert dedupe.posted_model == "sonnet"  # now committed
+        assert model_posts == [{"model": "sonnet_5"}, {"model": "sonnet_5"}]  # retried
+        assert dedupe.posted_model == "sonnet_5"  # now committed
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(
