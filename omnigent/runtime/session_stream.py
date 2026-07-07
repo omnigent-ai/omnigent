@@ -31,7 +31,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
-from omnigent.runtime import inflight_text, pending_elicitations
+from omnigent.runtime import activity_stream, inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
 
@@ -100,6 +100,14 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
     # type is a single dict lookup and a return. A suppressed event is
     # always a text delta, never an elicitation, so this still runs.
     pending_elicitations.record_publish(conversation_id, event)
+    try:
+        activity_stream.record_session_event(conversation_id, event)
+    except Exception:
+        _logger.debug(
+            "activity_stream observer failed for %s",
+            conversation_id,
+            exc_info=True,
+        )
     if suppress_live:
         return
     with _lock:
