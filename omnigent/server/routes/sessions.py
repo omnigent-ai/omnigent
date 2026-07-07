@@ -1486,6 +1486,21 @@ async def _publish_and_wait_for_harness_elicitation(
     settled = False
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
+        if (
+            tombstone is None
+            and conversation_store is not None
+            and elicitation_id in _harness_pre_resolved_elicitations
+        ):
+            # The card mirrors into ancestor streams, so a gap verdict posted
+            # against an ancestor is tombstoned under that ancestor's id.
+            # Ancestors share the child's access chain, so honoring one here
+            # widens nothing.
+            for ancestor_id in await asyncio.to_thread(
+                _ancestor_session_ids, conversation_store, session_id
+            ):
+                tombstone = _consume_pre_resolved_harness_elicitation(ancestor_id, elicitation_id)
+                if tombstone is not None:
+                    break
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
             return tombstone.result
@@ -1547,6 +1562,16 @@ async def _publish_and_wait_for_harness_elicitation(
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
+        if not settled and future.done() and not future.cancelled() and future.exception() is None:
+            # A verdict landing in the wait's unwind window is deliberately not
+            # honored by this request (the ``future in done`` check), but the
+            # resolver was already acked — tombstone it for the re-park.
+            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+                session_id=session_id,
+                created_at=time.time(),
+                result=future.result(),
+            )
+            _prune_pre_resolved_harness_elicitations()
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
         if _harness_elicitation_registry.get(elicitation_id) is future:
