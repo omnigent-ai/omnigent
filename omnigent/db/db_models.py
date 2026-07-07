@@ -24,6 +24,10 @@ class Base(DeclarativeBase):
     """Shared declarative base for all omnigent tables."""
 
 
+AGENT_KIND_TEMPLATE = "template"
+AGENT_KIND_SESSION = "session"
+
+
 class SqlAgent(Base):
     """
     SQLAlchemy model for the ``agents`` table.
@@ -40,13 +44,12 @@ class SqlAgent(Base):
         ``"ag_abc123/a1b2c3d4e5f6..."``.
     :param version: Monotonic version counter. Starts at 1, incremented
         on each update via ``PUT /api/agents/{id}``.
+    :param kind: ``"template"`` for server-wide registered agents;
+        ``"session"`` for per-conversation copies.
     :param description: Optional free-text description of the agent's
         purpose. ``None`` when not provided.
     :param updated_at: Unix epoch seconds of the last update, or
         ``None`` if the agent has never been updated.
-    :param session_id: Owning conversation/session id for a
-        session-scoped agent. ``None`` for template agents uploaded
-        through ``POST /api/agents``.
     """
 
     __tablename__ = "agents"
@@ -56,24 +59,22 @@ class SqlAgent(Base):
     name: Mapped[str] = mapped_column(String(256))
     bundle_location: Mapped[str] = mapped_column(String(512))
     version: Mapped[int] = mapped_column(Integer, default=1)
+    kind: Mapped[str] = mapped_column(String(16))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    session_id: Mapped[str | None] = mapped_column(
-        String(64),
-        ForeignKey("conversations.id", ondelete="CASCADE"),
-        nullable=True,
-    )
 
     __table_args__ = (
         Index("ix_agents_created_at", "created_at"),
+        # Template agents have unique names; session-scoped agents (kind='session')
+        # may reuse the same name across conversations. The partial index enforces
+        # uniqueness only within the template set.
         Index(
             "ix_agents_template_name",
             "name",
             unique=True,
-            sqlite_where=text("session_id IS NULL"),
-            postgresql_where=text("session_id IS NULL"),
+            sqlite_where=text("kind = 'template'"),
+            postgresql_where=text("kind = 'template'"),
         ),
-        Index("ix_agents_session_id", "session_id", unique=True),
     )
 
 
@@ -421,6 +422,8 @@ class SqlConversation(Base):
         # Reconnect reconciliation queries conversations by host_id on
         # every host reconnect; index it to avoid a full scan.
         Index("ix_conversations_host_id", "host_id"),
+        # Agent lookups: find the conversation(s) that own a given agent.
+        Index("ix_conversations_agent_id", "agent_id"),
         Index("ix_conversations_root_conversation_id", "root_conversation_id"),
         # Phase 4: partial unique index on (parent_conversation_id,
         # title) prevents two same-named children under the same

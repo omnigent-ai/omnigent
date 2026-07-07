@@ -3306,8 +3306,8 @@ def test_fork_clone_agent_is_session_scoped(
 ) -> None:
     """A fork that clones an agent creates a session-scoped row, not a built-in.
 
-    The clone must be born with ``session_id`` set so it never appears in
-    the built-in agent list (``session_id IS NULL``) that backs the fork
+    The clone must be born with ``kind='session'`` so it never appears in
+    the built-in agent list (``kind='template'``) that backs the fork
     picker — the regression that surfaced as duplicate "Claude Code" /
     "Codex" entries in the fork dialog.
     """

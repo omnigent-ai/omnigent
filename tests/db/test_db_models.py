@@ -38,7 +38,7 @@ def _now() -> int:
 def _make_agent(
     id: str = "ag_test1",
     name: str = "test-agent",
-    session_id: str | None = None,
+    kind: str = "template",
 ) -> SqlAgent:
     return SqlAgent(
         id=id,
@@ -46,7 +46,7 @@ def _make_agent(
         name=name,
         bundle_location="ag_test1/abc123",
         version=1,
-        session_id=session_id,
+        kind=kind,
     )
 
 
@@ -107,7 +107,7 @@ class TestSqlAgent:
             assert loaded.version == 1
             assert loaded.description is None
             assert loaded.updated_at is None
-            assert loaded.session_id is None
+            assert loaded.kind == "template"
 
     def test_nullable_columns(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -125,38 +125,31 @@ class TestSqlAgent:
             assert loaded.description == "A test agent"
             assert loaded.updated_at is not None
 
-    def test_session_scoped_agent_fk(self, db_uri: str) -> None:
-        """session_id FK to conversations must be valid."""
+    def test_session_scoped_agent_kind(self, db_uri: str) -> None:
+        """A session-scoped agent is stored with kind='session'."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        conv = _make_conversation()
-        with managed() as session:
-            session.add(conv)
-
-        agent = _make_agent(session_id="conv_test1")
+        agent = _make_agent(kind="session")
         with managed() as session:
             session.add(agent)
 
         with managed() as session:
             loaded = session.get(SqlAgent, "ag_test1")
             assert loaded is not None
-            assert loaded.session_id == "conv_test1"
+            assert loaded.kind == "session"
 
-    def test_unique_session_id_index(self, db_uri: str) -> None:
-        """ix_agents_session_id is unique -- two agents cannot share the same session_id."""
+    def test_multiple_session_agents_allowed(self, db_uri: str) -> None:
+        """Multiple session-scoped agents are permitted (no unique constraint on kind)."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        conv = _make_conversation()
-        a1 = _make_agent(id="ag_1", name="agent-1", session_id="conv_test1")
-        a2 = _make_agent(id="ag_2", name="agent-2", session_id="conv_test1")
+        a1 = _make_agent(id="ag_1", name="agent-1", kind="session")
+        a2 = _make_agent(id="ag_2", name="agent-2", kind="session")
 
-        with pytest.raises(IntegrityError):
-            with managed() as session:
-                session.add(conv)
-                session.add(a1)
-                session.add(a2)
+        with managed() as session:
+            session.add(a1)
+            session.add(a2)
 
 
 # ── SqlFile ───────────────────────────────────────────
