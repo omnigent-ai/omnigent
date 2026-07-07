@@ -87,6 +87,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
@@ -385,6 +386,22 @@ export function normalizeWorkspacePath(path: string): string | null {
   const stripped = trimmed.replace(/\/+$/, "");
   // All-slashes input (e.g. "///") collapses to the root.
   return stripped === "" ? "/" : stripped;
+}
+
+/**
+ * Shorten an absolute path to its last two segments with a leading
+ * ellipsis, so worktree rows show the disambiguating tail (e.g.
+ * ``"…/myrepo-worktrees/feature-x"``) instead of a shared prefix that
+ * truncates to the same string for every entry.
+ *
+ * @param path Absolute path, e.g. ``"/Users/me/myrepo-worktrees/feature-x"``.
+ * @returns The tail, prefixed with ``"…/"`` when segments were dropped;
+ *   the original path when it already has two or fewer segments.
+ */
+export function worktreePathTail(path: string): string {
+  const segments = path.replace(/\/+$/, "").split("/").filter(Boolean);
+  if (segments.length <= 2) return path;
+  return `…/${segments.slice(-2).join("/")}`;
 }
 
 /**
@@ -1669,6 +1686,7 @@ type LandingDraft = {
   workspace: string;
   branchName: string;
   baseBranch: string;
+  prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
@@ -1836,6 +1854,13 @@ export function NewChatLandingScreen() {
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   const [baseBranch, setBaseBranch] = useState<string>(() => landingDraft?.baseBranch ?? "");
+  // Branch prefilled from the existing worktree the current workspace points
+  // at. When `branchName` still equals this, the session starts directly in
+  // that worktree (no git opts). Editing the field away from it means the user
+  // wants a *new* worktree off that name.
+  const [prefilledBranch, setPrefilledBranch] = useState<string>(
+    () => landingDraft?.prefilledBranch ?? "",
+  );
   // Project to file the new session under (an implicit collection stored as a
   // conversation_labels row). Empty = unfiled. Applied right after create.
   // Pre-filled from a `?project=` query param so the sidebar's per-project
@@ -1907,6 +1932,8 @@ export function NewChatLandingScreen() {
   }, []);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
+  // Controlled so selecting an existing worktree can close the popover.
+  const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
@@ -1929,6 +1956,7 @@ export function NewChatLandingScreen() {
     workspace,
     branchName,
     baseBranch,
+    prefilledBranch,
     permissionMode,
     approvalMode,
     bypassSandbox,
@@ -2153,6 +2181,67 @@ export function NewChatLandingScreen() {
     return counts;
   }, [conflictCandidates, runnerHealth]);
 
+  // Existing git worktrees of the picked directory's repo, for the
+  // worktree picker. Skipped for sandbox sessions (server-managed) and
+  // when no directory is picked. A non-git path resolves to [].
+  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const { data: hostWorktrees } = useHostWorktrees(
+    worktreesEnabled ? selectedHostId : null,
+    worktreesEnabled ? workspaceTrimmed : null,
+  );
+  // Linked worktrees (exclude the main work tree — "starting in the main
+  // repo" is just picking that directory, not selecting a worktree).
+  const linkedWorktrees = useMemo(
+    () => (hostWorktrees ?? []).filter((w) => !w.is_main),
+    [hostWorktrees],
+  );
+  // The worktree the picked directory currently points at, if any. Set when
+  // the user navigated the picker straight into a worktree folder, or clicked
+  // one in the list below.
+  const activeWorktree = useMemo(() => {
+    const target = normalizeWorkspacePath(workspaceTrimmed);
+    if (target === null) return null;
+    return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
+  }, [linkedWorktrees, workspaceTrimmed]);
+  // When the workspace lands on an existing worktree, prefill the branch
+  // field with its branch and remember it as the prefill. Leaving the
+  // worktree clears the prefill (but not a name the user typed themselves).
+  useEffect(() => {
+    const branch = activeWorktree?.branch ?? "";
+    if (branch !== "") {
+      setPrefilledBranch(branch);
+      setBranchName(branch);
+    } else {
+      setPrefilledBranch((prev) => {
+        // Only clear the field if it still holds the previous prefill —
+        // don't wipe a branch name the user typed for a new worktree.
+        setBranchName((cur) => (cur === prev ? "" : cur));
+        return "";
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeWorktree?.path]);
+  // True when the session should start directly in the existing worktree:
+  // the workspace is a worktree and the branch field still holds its
+  // prefilled branch (the user hasn't edited it to request a new worktree).
+  const startInExistingWorktree =
+    activeWorktree !== null && prefilledBranch !== "" && branchName.trim() === prefilledBranch;
+  // A new, isolated worktree is created only when a branch is named and the
+  // workspace isn't already sitting on that existing worktree.
+  const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  // The branch input doubles as a combobox: focusing it reveals existing
+  // worktrees, and what the user types filters them (match on branch or path
+  // substring, case-insensitive). Typing a name that matches none = a new
+  // worktree; picking a match = start in that existing worktree.
+  const [branchInputFocused, setBranchInputFocused] = useState(false);
+  const filteredWorktrees = useMemo(() => {
+    const q = branchName.trim().toLowerCase();
+    if (q === "") return linkedWorktrees;
+    return linkedWorktrees.filter(
+      (w) => (w.branch ?? "").toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
+    );
+  }, [linkedWorktrees, branchName]);
+
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
   const sandboxRepoValid =
@@ -2333,6 +2422,8 @@ export function NewChatLandingScreen() {
     : sandboxSelected
       ? sandboxLabel
       : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
+  // The chip shows just the branch (the "(existing)" distinction lives in the
+  // popover's warning; appending it here only gets clipped by the chip's cap).
   const worktreeLabel = branchName.trim() || "No worktree";
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
@@ -2428,6 +2519,11 @@ export function NewChatLandingScreen() {
     setCreateError(null);
     try {
       const trimmedBranch = branchName.trim();
+      // `shouldCreateWorktree` (component scope): true only when a branch is
+      // named and the workspace isn't already an existing worktree. Starting
+      // in an existing worktree sends no git opts — the workspace is bound
+      // straight to that dir, which also sidesteps the "branch already
+      // exists" guard.
       const agent = agentList.find((a) => a.id === effectiveAgentId);
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
@@ -2452,7 +2548,7 @@ export function NewChatLandingScreen() {
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
-          const gitOpts = trimmedBranch
+          const gitOpts = shouldCreateWorktree
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
             : undefined;
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
@@ -2474,7 +2570,7 @@ export function NewChatLandingScreen() {
               : {
                   host_id: selectedHostId,
                   workspace: workspaceTrimmed,
-                  git: trimmedBranch
+                  git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
                     : undefined,
                 }),
@@ -3229,11 +3325,12 @@ export function NewChatLandingScreen() {
                         }
                         onNavigate={setWorkspace}
                         // Warn when browsing into a directory other live agents
-                        // occupy. Suppressed once a git branch is named — that
-                        // starts an isolated worktree, so there's no shared-dir
-                        // conflict regardless of the picked directory.
+                        // occupy. Suppressed only when a NEW isolated worktree
+                        // will be created (no shared-dir conflict then). When
+                        // starting directly in an existing worktree the branch
+                        // is prefilled but the dir IS shared, so keep warning.
                         occupancyForPath={
-                          branchName.trim() === ""
+                          !shouldCreateWorktree
                             ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
                             : undefined
                         }
@@ -3248,7 +3345,7 @@ export function NewChatLandingScreen() {
               {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}
               {!sandboxSelected && (
-                <Popover>
+                <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                   <PopoverTrigger asChild>
                     <button
                       type="button"
@@ -3264,7 +3361,14 @@ export function NewChatLandingScreen() {
                       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
-                  <PopoverContent align="start" className="w-[min(20rem,calc(100vw-2rem))] p-3">
+                  <PopoverContent
+                    align="start"
+                    collisionPadding={16}
+                    // No overflow clip here — the worktree dropdown floats as an
+                    // absolute overlay (below) and must be able to escape the
+                    // popover's padding box.
+                    className="w-[min(20rem,calc(100vw-2rem))] p-3"
+                  >
                     <div className="flex flex-col gap-2">
                       <label
                         htmlFor="landing-branch-name"
@@ -3272,30 +3376,119 @@ export function NewChatLandingScreen() {
                       >
                         Git worktree branch (optional)
                       </label>
-                      <input
-                        id="landing-branch-name"
-                        type="text"
-                        value={branchName}
-                        onChange={(e) => setBranchName(e.target.value)}
-                        placeholder="feature/my-branch"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
-                        data-testid="new-chat-landing-branch-input"
-                      />
-                      {branchName.trim() !== "" && (
+                      {/* Help text sits above the field. The warning for a picked
+                        existing worktree stays below the input (contextual to the
+                        selection). */}
+                      <p className="text-xs text-muted-foreground">
+                        New branch name, or pick an existing worktree. Leave blank to start directly
+                        in the working directory.
+                      </p>
+                      {/* The branch field is a combobox: focusing it reveals the
+                        repo's existing worktrees, and typing filters them.
+                        Picking one starts in that worktree; a name matching none
+                        creates a new worktree. */}
+                      <div className="relative flex flex-col">
+                        <input
+                          id="landing-branch-name"
+                          type="text"
+                          value={branchName}
+                          onChange={(e) => setBranchName(e.target.value)}
+                          onFocus={() => setBranchInputFocused(true)}
+                          // Delay so a click on a dropdown option registers
+                          // before the list unmounts on blur.
+                          onBlur={() => setTimeout(() => setBranchInputFocused(false), 120)}
+                          placeholder="feature/my-branch"
+                          role="combobox"
+                          aria-expanded={branchInputFocused && filteredWorktrees.length > 0}
+                          aria-autocomplete="list"
+                          // Suppress the browser's native autofill dropdown so it
+                          // doesn't overlay our worktree combobox. `off` alone is
+                          // ignored by some browsers, so also disable spellcheck /
+                          // autocorrect and give it an unrecognized name.
+                          autoComplete="off"
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          spellCheck={false}
+                          name="omnigent-worktree-branch"
+                          className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                          data-testid="new-chat-landing-branch-input"
+                        />
+                        {branchInputFocused && filteredWorktrees.length > 0 && (
+                          <div
+                            // Floats over the popover as a combobox popup, so it
+                            // doesn't stretch the box. Bounded height + internal
+                            // scroll keep it from running off the viewport.
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
+                            data-testid="new-chat-landing-worktree-dropdown"
+                          >
+                            <span className="px-2 pt-1 pb-0.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+                              Existing worktrees
+                            </span>
+                            <ul className="flex flex-col gap-0.5">
+                              {filteredWorktrees.map((w) => {
+                                const selected =
+                                  normalizeWorkspacePath(w.path) ===
+                                  normalizeWorkspacePath(workspaceTrimmed);
+                                return (
+                                  <li key={w.path}>
+                                    <button
+                                      type="button"
+                                      // onMouseDown (not onClick): fires before the
+                                      // input's blur, so the selection lands even
+                                      // though blur is about to hide the list.
+                                      onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        setWorkspace(w.path);
+                                        setBranchInputFocused(false);
+                                        setWorktreePopoverOpen(false);
+                                      }}
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent ${
+                                        selected ? "bg-accent" : ""
+                                      }`}
+                                      data-testid="new-chat-landing-worktree-option"
+                                    >
+                                      <span className="font-medium text-foreground">
+                                        {w.branch ?? "(detached)"}
+                                      </span>
+                                      {/* Tail-truncated so the disambiguating
+                                      folder shows, not a shared prefix; full
+                                      path on hover. */}
+                                      <span
+                                        className="w-full truncate text-muted-foreground"
+                                        title={w.path}
+                                      >
+                                        {worktreePathTail(w.path)}
+                                      </span>
+                                    </button>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                      {/* Base branch only matters when creating a NEW worktree
+                        — hidden once the workspace points at an existing one
+                        (no worktree is created, so there's nothing to base). */}
+                      {branchName.trim() !== "" && !startInExistingWorktree && (
                         <input
                           type="text"
                           value={baseBranch}
                           onChange={(e) => setBaseBranch(e.target.value)}
-                          placeholder="Base branch (defaults to current branch)"
+                          placeholder="Base branch (defaults to current)"
                           aria-label="Base branch"
                           className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-base-branch-input"
                         />
                       )}
-                      <p className="text-xs text-muted-foreground">
-                        Creates an isolated git worktree for a new branch. Leave blank to start
-                        directly in the working directory.
-                      </p>
+                      {startInExistingWorktree && (
+                        <p
+                          className="text-xs text-amber-600 dark:text-amber-500"
+                          data-testid="new-chat-landing-existing-worktree-warning"
+                        >
+                          Starts in existing worktree, edit the name to create a new one.
+                        </p>
+                      )}
                     </div>
                   </PopoverContent>
                 </Popover>

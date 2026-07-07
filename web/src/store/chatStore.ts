@@ -537,6 +537,15 @@ export interface ChatState {
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
+   * Reorder a queued message within its own conversation (the strip's
+   * drag-to-reorder). Moves `queueId` so it sits before `beforeQueueId`, or to
+   * the end of its conversation's run when `beforeQueueId` is null. Only
+   * reorders among the same conversation's messages — the flat `queuedMessages`
+   * array interleaves conversations, so other conversations' entries keep their
+   * absolute positions. No-op if the id isn't queued or the move is a no-op.
+   */
+  reorderQueuedMessage: (queueId: string, beforeQueueId: string | null) => void;
+  /**
    * Send a queued message NOW instead of waiting for the idle flush (the
    * strip's per-row steer). Removes it from the queue and POSTs it: on an
    * SDK harness the server live-injects it into the running turn; the
@@ -562,9 +571,10 @@ export interface ChatState {
    * status in the `["conversations"]` cache is idle. The active conversation is
    * owned by {@link maybeFlushQueuedHead}; this covers a queue whose session the
    * user has navigated away from (its SSE stream is gone, so it can't drain
-   * itself). POSTs one message per idle conversation per call, via `postEvent`
-   * (no active-session state touched, no optimistic bubble — it re-hydrates on
-   * return). Level-triggered + idempotent; safe to over-fire.
+   * itself). Sends one message per idle conversation per call: uploads any
+   * attachments then posts via `postEvent` — the same two-phase sequence
+   * send() runs (no active-session state touched, no optimistic bubble — it
+   * re-hydrates on return). Level-triggered + idempotent; safe to over-fire.
    */
   flushBackgroundQueues: () => void;
   /**
@@ -665,6 +675,37 @@ const workspaceInvalidationTimers = new Map<string, ReturnType<typeof setTimeout
 const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
 const backgroundFlushInFlight = new Set<string>();
 const backgroundFlushCooldownUntil = new Map<string, number>();
+
+// Remembers each File's successful upload so a retry reuses the server-assigned
+// file_id instead of re-uploading the blob (which would orphan the prior one).
+// Retries re-send the same File objects — background flush re-queues them on a
+// cooldown, and any send whose post fails after an upload succeeded — so keying
+// by File identity dedupes across attempts. Keyed by session too, since a File
+// could be sent to more than one. WeakMap so entries vanish when the File is
+// dropped from the queue/pending state.
+const uploadedFileBlockCache = new WeakMap<File, Map<string, ContentBlock>>();
+
+/**
+ * Upload a file to a session and return its content block, reusing a prior
+ * successful upload of the same File to the same session. Deduping here means
+ * a failed post (or a later file's upload failing) doesn't re-upload files
+ * that already landed when the message is retried.
+ */
+async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBlock> {
+  const cached = uploadedFileBlockCache.get(file)?.get(sessionId);
+  if (cached !== undefined) return cached;
+  const uploaded = await uploadFile(sessionId, file);
+  const block: ContentBlock = file.type.startsWith("image/")
+    ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
+    : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
+  let bySession = uploadedFileBlockCache.get(file);
+  if (bySession === undefined) {
+    bySession = new Map<string, ContentBlock>();
+    uploadedFileBlockCache.set(file, bySession);
+  }
+  bySession.set(sessionId, block);
+  return block;
+}
 
 // Must match the @keyframes user-msg-flash duration in index.css.
 const FLASH_DURATION_MS = 800;
@@ -890,6 +931,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
   },
 
+  reorderQueuedMessage: (queueId, beforeQueueId) => {
+    set((s) => {
+      const moved = s.queuedMessages.find((m) => m.queueId === queueId);
+      if (moved === undefined || queueId === beforeQueueId) return {};
+      const conversationId = moved.conversationId;
+
+      // Reorder only within this conversation's messages, in their current
+      // relative order, then drop `moved` before its target (or at the end).
+      const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
+      const without = own.filter((m) => m.queueId !== queueId);
+      const at =
+        beforeQueueId === null
+          ? without.length
+          : without.findIndex((m) => m.queueId === beforeQueueId);
+      if (at === -1) return {}; // target isn't in this conversation — no-op
+      const reordered = [...without.slice(0, at), moved, ...without.slice(at)];
+      if (reordered.every((m, i) => m.queueId === own[i]?.queueId)) return {}; // unchanged
+
+      // Refill this conversation's slots (their absolute positions in the flat
+      // array) with the reordered run; other conversations' entries stay put.
+      let next = 0;
+      return {
+        queuedMessages: s.queuedMessages.map((m) =>
+          m.conversationId === conversationId ? reordered[next++]! : m,
+        ),
+      };
+    });
+  },
+
   steerMessage: (queueId) => {
     const s = get();
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
@@ -974,23 +1044,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      // Files are left for the foreground flush — background covers text only
-      // (attachments are in-memory and the user is likely still near that chat).
-      if (head === undefined || (head.files && head.files.length > 0)) continue;
+      if (head === undefined) continue;
 
-      // Remove BEFORE the POST so a re-entrant trigger can't double-send.
+      // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
       set((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
+      // Upload any attachments, then post the message referencing their
+      // server-assigned file_ids — the same two-phase sequence send() runs
+      // (no combined endpoint exists: /resources/files stores the blob and
+      // returns an id, /events posts a message that points at that id). Both
+      // awaits sit under the one in-flight guard and the one catch, so a
+      // failure in either phase re-queues and backs off together.
+      //
       // No optimistic bubble — we're not viewing this conversation; it
       // re-hydrates from the snapshot on return. On failure re-queue at the
       // head (preserving this conversation's FIFO order) and set a cooldown so
       // the next trigger backs off instead of hammering a failing runner.
-      void postEvent(conversationId, {
-        type: "message",
-        data: { role: "user", content: [{ type: "input_text", text: head.text }] },
-      })
+      void (async () => {
+        const fileBlocks: ContentBlock[] = [];
+        for (const file of head.files ?? []) {
+          // Reuse a prior successful upload so the cooldown-paced retry doesn't
+          // re-upload files that already landed (orphaning the earlier blobs).
+          fileBlocks.push(await uploadFileBlock(conversationId, file));
+        }
+        const content: ContentBlock[] = [
+          ...fileBlocks,
+          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
+        ];
+        await postEvent(conversationId, {
+          type: "message",
+          data: { role: "user", content },
+        });
+      })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
             conversationId,
@@ -1085,25 +1172,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       postedSessionId = sessionId;
 
       // Upload any attached files and build the real content blocks with
-      // server-assigned file_ids. For images use input_image; for all
-      // other types use input_file. Plain text (if any) appended last.
+      // server-assigned file_ids (input_image for images, input_file
+      // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
+      // a prior successful upload of the same File so a retry after a
+      // post-phase failure doesn't re-upload — and orphan — blobs that landed.
       const fileBlocks: ContentBlock[] = [];
       if (files && files.length > 0) {
         for (const file of files) {
-          const uploaded = await uploadFile(sessionId, file);
-          if (file.type.startsWith("image/")) {
-            fileBlocks.push({
-              type: "input_image",
-              file_id: uploaded.id,
-              filename: uploaded.filename,
-            });
-          } else {
-            fileBlocks.push({
-              type: "input_file",
-              file_id: uploaded.id,
-              filename: uploaded.filename,
-            });
-          }
+          fileBlocks.push(await uploadFileBlock(sessionId, file));
         }
       }
       const serverContent: ContentBlock[] = [

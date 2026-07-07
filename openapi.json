@@ -6544,6 +6544,62 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/worktrees": {
+      "get": {
+        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
+        "operationId": "list_host_worktrees_v1_hosts__host_id__worktrees_get",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Absolute path inside the repo on the host to list worktrees for, e.g. `\"/Users/alice/myrepo\"`.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Host Worktrees V1 Hosts  Host Id  Worktrees Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Host Worktrees",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/info": {
       "get": {
         "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`), the short sandbox\nprovider name (`sandbox_provider`) the web UI labels the\nnew-session sandbox option with, and the installed\n`server_version` (already public via `/api/version`).",

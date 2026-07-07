@@ -128,6 +128,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
+import { MOD_KEY } from "@/components/KeyboardShortcutsDialog";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
   type ActiveChatOverride,
@@ -169,6 +170,13 @@ interface SidebarProps {
    * letting the CSS transition animate to the resting state.
    */
   dragProgress?: number | null;
+  /**
+   * Open the global command palette (⌘K). The sidebar's "Search" button routes
+   * here rather than filtering inline: session search (title + chat content)
+   * lives in the palette, which the box now doubles as an entry point for.
+   * Optional (defaults to a no-op) so the sidebar renders standalone in tests.
+   */
+  onOpenSearch?: () => void;
 }
 
 /**
@@ -240,9 +248,7 @@ function showArchivedToast() {
   showToast(<ArchivedToast />);
 }
 
-export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
-  const [searchQuery, setSearchQuery] = useState("");
-  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -285,18 +291,13 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
     lastSelectedIdRef.current = null;
   }, []);
 
-  // Debounce search input so we don't fire a server request on every
-  // keystroke. 300 ms is fast enough to feel responsive.
-  useEffect(() => {
-    const timer = setTimeout(() => setDebouncedSearchQuery(searchQuery), 300);
-    return () => clearTimeout(timer);
-  }, [searchQuery]);
-
   // One paginated session list — sessions are no longer split by
   // connection state, so the sidebar fetches a single undifferentiated
   // list. Archived sessions are included (`includeArchived: true`) and
   // peeled into their own "Archived" section at the bottom of the list.
-  const conversationsQuery = useConversations(debouncedSearchQuery, true, {
+  // Session search now lives in the command palette (the "Search" button
+  // below), so the sidebar list itself is unfiltered.
+  const conversationsQuery = useConversations("", true, {
     reconcileWhileConnected: true,
   });
 
@@ -537,17 +538,25 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               />
             ) : (
               <div className="relative mt-3 flex items-center gap-1.5">
-                <div className="relative flex-1">
-                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-                  <input
-                    type="search"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    aria-label="Search sessions"
-                    placeholder="Search sessions"
-                    className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1 md:select-text"
-                  />
-                </div>
+                {/* "Search" opens the command palette (⌘K), which searches both
+                    session titles and chat content. It replaces the old inline
+                    filter box — the palette is the single search surface now.
+                    The `group` scope reveals the ⌘K badge on hover/focus. */}
+                <button
+                  type="button"
+                  onClick={() => onOpenSearch?.()}
+                  aria-label="Search"
+                  data-testid="sidebar-search-button"
+                  className="group relative flex min-h-8 flex-1 items-center rounded-full border border-input pr-2 pl-8 text-left text-sm text-muted-foreground transition hover:bg-muted focus-visible:outline-1"
+                >
+                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5" />
+                  <span className="flex-1 truncate">Search</span>
+                  {/* ⌘K hint — hidden until the button is hovered / focused,
+                      mirroring the sidebar's other hover-revealed affordances. */}
+                  <kbd className="ml-2 hidden shrink-0 items-center rounded-md border border-border bg-muted px-1.5 py-0.5 font-sans text-[10px] font-medium text-muted-foreground transition-opacity group-hover:inline-flex group-focus-visible:inline-flex">
+                    {MOD_KEY}K
+                  </kbd>
+                </button>
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
@@ -579,7 +588,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
               conversationsQuery={conversationsQuery}
               scrollContainerRef={scrollContainerRef}
               onRowClick={onNavClick}
-              searchQuery={debouncedSearchQuery}
+              searchQuery=""
               pinnedConversationIds={pinnedConversationIds}
               onPinnedConversationIdsChange={setPinnedConversationIds}
               onTogglePinned={togglePinnedConversation}

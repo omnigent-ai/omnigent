@@ -1088,6 +1088,7 @@ export function AppShell() {
               open={sidebarOpen}
               dragProgress={sidebarDragProgress}
               onClose={() => setSidebarOpen(false)}
+              onOpenSearch={() => setCommandPaletteOpen(true)}
             />
 
             {/* Content region (everything right of the sidebar): a relative
@@ -1343,16 +1344,16 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
-          {/* Global command palette (⌘K). Ungated so it works on every route;
-              the hotkey itself is disabled in embedded mode. */}
-          {!isEmbedded && (
-            <CommandPalette
-              open={commandPaletteOpen}
-              onOpenChange={setCommandPaletteOpen}
-              onToggleLeftSidebar={() => setSidebarOpen((prev) => !prev)}
-              onToggleRightSidebar={toggleRightPanel}
-            />
-          )}
+          {/* Global command palette (⌘K). Ungated so it works on every route
+              and in embedded mode — the sidebar's "Search" button opens it
+              there even though the ⌘K hotkey is disabled (it belongs to the
+              host page). */}
+          <CommandPalette
+            open={commandPaletteOpen}
+            onOpenChange={setCommandPaletteOpen}
+            onToggleLeftSidebar={() => setSidebarOpen((prev) => !prev)}
+            onToggleRightSidebar={toggleRightPanel}
+          />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}
           <Toaster />

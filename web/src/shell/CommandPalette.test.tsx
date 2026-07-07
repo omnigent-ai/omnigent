@@ -89,6 +89,43 @@ describe("CommandPalette — sessions", () => {
     }
   });
 
+  it("renders the Sessions group above Actions", () => {
+    setSessions([conv("c1", "Fix the parser")]);
+    renderPalette();
+
+    // Group order matters: the palette doubles as the sidebar's session-search
+    // entry point, so Sessions must come before the static Actions.
+    const headings = screen.getAllByText(/^(Sessions|Actions)$/).map((el) => el.textContent);
+    expect(headings).toEqual(["Sessions", "Actions"]);
+  });
+
+  it("caps the session list to 5 while the query is empty, lifting it on type", () => {
+    vi.useFakeTimers();
+    try {
+      const many = Array.from({ length: 8 }, (_, i) => conv(`c${i}`, `Session ${i}`, "agent"));
+      setSessions(many);
+      renderPalette();
+
+      // Empty query: only the first 5 recent sessions show, so the Actions
+      // group below stays visible without scrolling.
+      expect(screen.getByText("Session 0")).toBeTruthy();
+      expect(screen.getByText("Session 4")).toBeTruthy();
+      expect(screen.queryByText("Session 5")).toBeNull();
+
+      // Typing lifts the cap — finding a specific session is now the point.
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "session" },
+      });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(screen.getByText("Session 5")).toBeTruthy();
+      expect(screen.getByText("Session 7")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("dedupes sessions that appear on overlapping pages", () => {
     useConversations.mockReturnValue({
       data: {
@@ -100,6 +137,25 @@ describe("CommandPalette — sessions", () => {
 
     expect(screen.getAllByText("One")).toHaveLength(1);
     expect(screen.getByText("Two")).toBeTruthy();
+  });
+
+  it("indents session rows so their label aligns with the icon-prefixed actions", () => {
+    setSessions([conv("c1", "Fix the parser")]);
+    renderPalette();
+
+    // Session items carry no leading icon, so they're padded to line up with
+    // the Action rows' icon + gap. Assert the class so the alignment can't
+    // silently regress.
+    const item = screen.getByText("Fix the parser").closest("[data-slot=command-item]");
+    expect(item?.className).toContain("pl-6");
+  });
+});
+
+describe("CommandPalette — input", () => {
+  it("uses the sessions-first placeholder", () => {
+    renderPalette();
+
+    expect(screen.getByPlaceholderText("Search sessions or run a command")).toBeTruthy();
   });
 });
 
