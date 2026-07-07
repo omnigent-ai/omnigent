@@ -39,7 +39,7 @@ def _stored_family(page: Page) -> str | None:
 def _open_appearance(page: Page, base_url: str) -> None:
     """Navigate to the Settings Appearance section and wait for the control."""
     page.goto(f"{base_url}/settings/appearance")
-    expect(page.get_by_role("group", name="Font family")).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("group", name="Font family", exact=True)).to_be_visible(timeout=30_000)
 
 
 def test_ui_font_family_applies_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
@@ -70,7 +70,7 @@ def test_ui_font_family_applies_and_persists(page: Page, seeded_session: tuple[s
 
     # The choice survives a full reload (persisted + re-applied before paint).
     page.reload()
-    expect(page.get_by_role("group", name="Font family")).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("group", name="Font family", exact=True)).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("ui-font-family-input")).to_have_value("Georgia")
     assert _ui_font_family(page).startswith("Georgia"), "family was not restored after reload"
 

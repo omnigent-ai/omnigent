@@ -1005,8 +1005,9 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             # Polly auto-selects (ranked ahead of Debby); its brain-harness
             # override radios live in the picker's per-entry config submenu.
             await _open_entry_config(page, "ag_polly_e2e")
-            # All four brain harnesses render as radio rows, in registry order.
-            for harness in ("claude-sdk", "openai-agents", "codex", "pi"):
+            # The built-in brain harnesses render as radio rows, in registry
+            # order (openai-agents is intentionally not offered in the picker).
+            for harness in ("claude-sdk", "codex", "pi"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
                 ).to_be_visible()
