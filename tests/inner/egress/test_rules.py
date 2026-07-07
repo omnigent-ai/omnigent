@@ -51,6 +51,19 @@ from omnigent.inner.egress.rules import (
             "api.example.com",
             "/v1/items/*",
         ),
+        (
+            "* */**",
+            frozenset({"*"}),
+            "*",
+            "/**",
+        ),
+        # Wildcard host with no path defaults to /**
+        (
+            "* *",
+            frozenset({"*"}),
+            "*",
+            "/**",
+        ),
     ],
 )
 def test_parse_rule_valid(
@@ -91,15 +104,11 @@ def test_parse_rule_invalid(rule_str: str, expected_fragment: str) -> None:
 
 
 def test_parse_rules_list() -> None:
-    rules = parse_rules(
-        [
-            "GET api.github.com/repos/**",
-            "* pypi.org/**",
-        ]
-    )
-    assert len(rules) == 2
+    rules = parse_rules(["GET api.github.com/repos/**", "* pypi.org/**", "* */**"])
+    assert len(rules) == 3
     assert rules[0].host_pattern == "api.github.com"
     assert rules[1].host_pattern == "pypi.org"
+    assert rules[2].host_pattern == "*"
 
 
 def test_parse_rules_fails_on_first_invalid() -> None:
@@ -124,6 +133,19 @@ def test_matches_exact_host_and_path() -> None:
     assert rule.matches("GET", "github.com", "/repos/myorg/repo1") is False
     # Denied: wrong path prefix
     assert rule.matches("GET", "api.github.com", "/users/myorg") is False
+
+
+def test_matches_wildcard_host_and_wildcard_path() -> None:
+    rule = parse_rule("* */**")
+    assert rule.matches("GET", "api.example.com", path="/") is True
+    assert rule.matches("GET", "api.example.com", path="/v1") is True
+    assert rule.matches("GET", "api.example.com", path="/v1/item123") is True
+
+
+def test_matches_wildcard_host_and_exact_path() -> None:
+    rule = parse_rule("* */v1/item123")
+    assert rule.matches("GET", "api.example.com", path="/v1/item123") is True
+    assert rule.matches("GET", "api.example.com", path="/v1") is False
 
 
 def test_matches_wildcard_subdomain() -> None:
@@ -188,6 +210,14 @@ def test_check_host_fast_reject() -> None:
     assert check_host(rules, "evil.com") is False
 
 
+@pytest.mark.parametrize(
+    "rule_str,legitimate_host",
+    [
+        ("* *.allowed.com/**", "api.allowed.com"),
+        ("* */**", "api.allowed.com"),
+        ("* *", "api.allowed.com"),
+    ],
+)
 @pytest.mark.parametrize(
     "smuggled_host,why",
     [
@@ -268,7 +298,9 @@ def test_check_host_fast_reject() -> None:
         pytest.param("", "empty host", id="empty"),
     ],
 )
-def test_unsafe_host_never_matches_any_rule(smuggled_host: str, why: str) -> None:
+def test_unsafe_host_never_matches_any_rule(
+    rule_str: str, legitimate_host: str, smuggled_host: str, why: str
+) -> None:
     """A host carrying any byte outside the DNS grammar ``[A-Za-z0-9.-]``
     must not match any rule, even one whose wildcard would otherwise
     apply under ``str.endswith`` semantics.
@@ -279,9 +311,9 @@ def test_unsafe_host_never_matches_any_rule(smuggled_host: str, why: str) -> Non
     guard so any future caller of ``check_host`` / ``check_request``
     that bypasses the entry points still fails closed.
     """
-    rules = parse_rules(["* *.allowed.com/**"])
+    rules = parse_rules([rule_str])
     # Sanity: the legitimate host matches.
-    assert check_host(rules, "api.allowed.com") is True
+    assert check_host(rules, legitimate_host) is True
     # The unsafe host must NOT match, regardless of suffix.
     assert check_host(rules, smuggled_host) is False, (
         f"{why}: {smuggled_host!r} should be rejected by the rule layer"

@@ -193,7 +193,7 @@ os_env:
     #
     # Rule DSL: ``METHODS host/path/pattern``
     # - Methods: comma-separated HTTP verbs, or ``*`` for any.
-    # - Host: exact match, or ``*.domain`` for wildcard subdomains.
+    # - Host: exact match, ``*.domain`` for wildcard subdomains, or ``*`` for any host.
     # - Path: glob — ``*`` matches one segment, ``**`` any depth.
     # - Default deny: requests not matching any rule get HTTP 403.
     #
@@ -207,6 +207,7 @@ os_env:
     #   - "GET api.github.com/repos/myorg/**"
     #   - "GET,POST pypi.org/**"
     #   - "* *.amazonaws.com/**"
+    #   - "* *"  # allow all methods/hosts/paths; trusted agents only
     egress_rules:
       - "GET httpbin.org/get"
       - "GET httpbin.org/status/*"

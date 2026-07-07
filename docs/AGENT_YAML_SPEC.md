@@ -193,9 +193,25 @@ not pass secrets through the environment unless the tool genuinely needs them.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS), so the
-same YAML works across platforms. For the full set of sandbox options, how to
-share one policy across `sys_os_*` and terminals, and how to set up network
-egress rules, see the `sandbox:` examples below and the sandbox source under `omnigent/inner/`.
+same YAML works across platforms.
+
+Use `egress_rules` for proxy-enforced HTTP(S) allowlists. Rules use
+`METHODS host/path`, where methods can be comma-separated verbs or `*`, hosts
+can be exact names, `*.domain` wildcard subdomains, or `*`, and paths are globs:
+
+```yaml
+os_env:
+  sandbox:
+    type: linux_bwrap
+    egress_rules:
+      - "GET api.github.com/repos/myorg/**"
+      - "* *.pypi.org/**"
+      - "* *"  # allow all methods/hosts/paths; trusted agents only
+```
+
+For the full set of sandbox options, how to share one policy across `sys_os_*`
+and terminals, and more egress examples, see the `sandbox:` examples below and
+the sandbox source under `omnigent/inner/`.
 
 ## Tools
 

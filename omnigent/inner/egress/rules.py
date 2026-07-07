@@ -8,9 +8,11 @@ Examples::
     "GET,POST api.github.com/repos/myorg/**"  # Multiple methods
     "* pypi.org/**"                           # Any method
     "GET *.github.com/**"                     # Wildcard subdomain
+    "* *"                                     # Any method, host, and path
+    "* */**"                                  # Explicit any-host/any-path
 
 - **Methods**: comma-separated HTTP verbs, or ``*`` for any.
-- **Host**: exact match, or ``*.domain`` for wildcard subdomains.
+- **Host**: exact match, ``*.domain`` for wildcard subdomains, or ``*`` for any host.
 - **Path**: glob — ``*`` matches one segment, ``**`` matches any depth.
 - Default deny: requests not matching any rule are blocked.
 """
@@ -72,7 +74,8 @@ class EgressRule:
     :param methods: Allowed HTTP methods as upper-case strings, or
         ``{"*"}`` for any method.
     :param host_pattern: Host match pattern, e.g. ``"api.github.com"``
-        or ``"*.github.com"`` for wildcard subdomains.
+        or ``"*.github.com"`` for wildcard subdomains,
+        or ``"*"`` for any host.
     :param path_pattern: Path glob, e.g. ``"/repos/myorg/**"``.
     """
 
@@ -110,6 +113,8 @@ class EgressRule:
             return False
         host = host.lower()
         pattern = self.host_pattern.lower()
+        if pattern == "*":
+            return True
         if pattern.startswith("*."):
             suffix = pattern[1:]  # e.g. ".github.com"
             return host.endswith(suffix) or host == pattern[2:]

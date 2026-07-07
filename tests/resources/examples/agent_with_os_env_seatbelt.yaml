@@ -180,6 +180,7 @@ os_env:
     #   - "GET api.github.com/repos/myorg/**"
     #   - "GET,POST pypi.org/**"
     #   - "* *.amazonaws.com/**"
+    #   - "* *"  # allow all methods/hosts/paths; trusted agents only
     egress_rules:
       - "GET httpbin.org/get"
       - "GET httpbin.org/status/*"
