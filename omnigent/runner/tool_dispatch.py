@@ -5853,7 +5853,7 @@ def _spawn_async_tool(
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
             )
-            done, _pending = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 [
                     asyncio.ensure_future(exec_coro),
                     asyncio.ensure_future(cancel_event.wait()),
@@ -5861,6 +5861,11 @@ def _spawn_async_tool(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if cancel_event.is_set():
+                # Drop the losing future (the tool coro). This cancels the
+                # task/coroutine but cannot interrupt an underlying
+                # asyncio.to_thread, so that thread may run to completion.
+                for fut in pending:
+                    fut.cancel()
                 session_inbox.put_nowait(
                     {
                         "handle_id": handle_id,
@@ -5870,6 +5875,10 @@ def _spawn_async_tool(
                     }
                 )
                 return ""
+            # Drop the losing future (cancel_event.wait()) so it doesn't
+            # linger as a pending task for the life of the session.
+            for fut in pending:
+                fut.cancel()
             result = next(iter(done)).result()
             session_inbox.put_nowait(
                 {
