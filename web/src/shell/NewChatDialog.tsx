@@ -25,6 +25,7 @@ import {
   PaperclipIcon,
   PlusIcon,
   SearchIcon,
+  ShuffleIcon,
   TagIcon,
   TriangleAlertIcon,
   XIcon,
@@ -2241,6 +2242,14 @@ export function NewChatLandingScreen() {
       (w) => (w.branch ?? "").toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
     );
   }, [linkedWorktrees, branchName]);
+  // Fill the branch field with a unique auto-generated name so the user can
+  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
+  // available in every browser the app targets; the short prefix keeps the
+  // dir/branch readable (worktree-1a2b3c4d).
+  const generateBranchName = useCallback(() => {
+    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    setBranchName(`worktree-${suffix}`);
+  }, []);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
@@ -3410,9 +3419,28 @@ export function NewChatLandingScreen() {
                           autoCapitalize="off"
                           spellCheck={false}
                           name="omnigent-worktree-branch"
-                          className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                          // pr-9 leaves room for the generate button overlaid at
+                          // the right edge.
+                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-xs outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-branch-input"
                         />
+                        {/* Fill a unique branch name for a throwaway worktree.
+                          onMouseDown so it fires before the input's blur closes
+                          the combobox and preventDefault keeps focus on the
+                          input. */}
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            generateBranchName();
+                          }}
+                          title="Generate a unique branch name"
+                          aria-label="Generate a unique branch name"
+                          className="absolute top-0 right-0 flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+                          data-testid="new-chat-landing-branch-generate"
+                        >
+                          <ShuffleIcon className="size-4" />
+                        </button>
                         {branchInputFocused && filteredWorktrees.length > 0 && (
                           <div
                             // Floats over the popover as a combobox popup, so it
