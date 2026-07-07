@@ -50,6 +50,21 @@ def _make_parent_spec(
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_sandbox_binary_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the seed-time sandbox probe host-independent for the suite.
+
+    ``build_researcher_spec`` now calls ``shutil.which`` against the real
+    host PATH for a no-``os_env`` parent (see
+    ``_ensure_default_sandbox_runnable``). Unit tests must not depend on
+    bubblewrap / ``sandbox-exec`` being installed on the runner, so default
+    the probe to "binary present". The probe-specific tests below override
+    this with their own ``monkeypatch.setattr(shutil, "which", ...)``.
+    """
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+
+
 # ── Schema ───────────────────────────────────────────
 
 
