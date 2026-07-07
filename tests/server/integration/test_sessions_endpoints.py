@@ -1256,6 +1256,9 @@ async def test_external_meta_user_message_persists_without_live_input_event(
     meta = next(item for item in items if item["type"] == "message")
     assert meta["is_meta"] is True
     assert meta["content"][0]["text"] == "<skill>hidden</skill>"
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["title"] is None
     assert published == []
 
 

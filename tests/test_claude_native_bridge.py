@@ -602,6 +602,45 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
     assert current_response_id == tool_call.response_id
 
 
+def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Path) -> None:
+    task_notification = (
+        "<task-notification>\n"
+        "<task-id>a815d170defd74675</task-id>\n"
+        "<tool-use-id>toolu_bdrk_01Uz3yFPSUrsqovLfRN4uhyt</tool-use-id>\n"
+        "<output-file>/tmp/tasks/a815d170defd74675.output</output-file>\n"
+        "<status>completed</status>\n"
+        '<summary>Agent "Explore spec" finished</summary>\n'
+        "<result>final report</result>\n"
+        "</task-notification>"
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "task-notification-1",
+                "message": {"role": "user", "content": task_notification},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert current_response_id is None
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": task_notification}],
+    }
+
+
 @pytest.mark.parametrize(
     "raw_text",
     [
