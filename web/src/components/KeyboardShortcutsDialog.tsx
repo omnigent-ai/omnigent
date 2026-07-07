@@ -65,7 +65,10 @@ interface ShortcutGroup {
 const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
-    items: [{ label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] }],
+    items: [
+      { label: "Open command palette", keys: [MOD_KEY, "K"] },
+      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
+    ],
   },
   {
     title: "In chats",

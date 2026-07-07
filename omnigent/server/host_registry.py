@@ -212,6 +212,9 @@ class HostConnection:
     pending_remove_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_list_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )

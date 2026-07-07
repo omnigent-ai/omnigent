@@ -2839,6 +2839,31 @@ async def _ensure_state_for_transcript(
     return state
 
 
+def _turn_has_assistant_output(items: list[ClaudeTranscriptItem], response_id: str) -> bool:
+    """
+    Whether ``response_id`` has assistant-generated output among ``items``.
+
+    The turn-start ``running`` edge should open a streaming turn only for an id
+    that a later ``Stop``/``StopFailure`` hook will close — i.e. one produced by
+    an actual LLM turn. Assistant text (``message`` with ``role=assistant``) and
+    tool calls (``function_call``) qualify; a ``slash_command`` (``/model``,
+    ``/effort``) or ``terminal_command`` (``!cmd``) item opens an id with no LLM
+    turn behind it, so it must not.
+
+    :param items: Transcript items read this poll.
+    :param response_id: The current turn's response id.
+    :returns: ``True`` when an assistant-output item carries ``response_id``.
+    """
+    for item in items:
+        if item.response_id != response_id:
+            continue
+        if item.item_type == "function_call":
+            return True
+        if item.item_type == "message" and item.data.get("role") == "assistant":
+            return True
+    return False
+
+
 async def _forward_available_items(
     *,
     client: httpx.AsyncClient,
@@ -2902,9 +2927,19 @@ async def _forward_available_items(
     # status post must not abort item forwarding (the items below are the
     # primary payload); the turn-end idle/failed edge still carries the id to
     # close the lifecycle, and the badge is unaffected either way.
+    #
+    # Only open the streaming turn for an id that has ASSISTANT output in this
+    # poll's items. A surfaced CLI built-in (``/model``, ``/effort``) or a
+    # ``!cmd`` becomes a slash_command / terminal_command item that opens its
+    # own response id but runs no LLM turn, so no ``Stop`` hook ever fires to
+    # close it — a ``running`` opened for it would strand the web composer in
+    # its "Stop"/busy state until the next real message. A skill that DOES
+    # trigger an LLM turn shares its id with the assistant text it produces, so
+    # ``running`` still fires — one poll later, when that output appears.
     if (
         current_response_id is not None
         and dedupe.posted_running_response_id != current_response_id
+        and _turn_has_assistant_output(items, current_response_id)
     ):
         try:
             await post_external_session_status(
@@ -3611,22 +3646,29 @@ def _model_alias_for(model: str | None) -> str | None:
     Collapse a concrete Claude model id to the picker's tier alias.
 
     The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``); the
+    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
+    extra concrete-id slot ``"sonnet_5"`` (see
+    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the newer
+    Sonnet generation offered alongside the default ``"sonnet"`` tier; the
     transcript records the resolved concrete id (e.g.
-    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``).
+    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-5"``).
     Mapping to the tier keeps the mirrored value in the picker's
-    vocabulary and makes a web→TUI round-trip a no-op.
+    vocabulary and makes a web→TUI round-trip a no-op. The older Sonnet
+    (``sonnet-4-6``) collapses to the generic ``"sonnet"`` alias — it is the
+    default that row is bound to.
 
     :param model: Concrete model id from the transcript, e.g.
         ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``
-        when the id carries a known tier token, else ``None`` (the
-        caller skips the post rather than surface an id the picker
+    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_5"`` /
+        ``"haiku"`` when the id carries a known tier token, else ``None``
+        (the caller skips the post rather than surface an id the picker
         can't render).
     """
     if not model:
         return None
     lowered = model.lower()
+    if "sonnet-5" in lowered or "sonnet_5" in lowered:
+        return "sonnet_5"
     for tier in ("fable", "opus", "sonnet", "haiku"):
         if tier in lowered:
             return tier

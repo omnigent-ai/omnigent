@@ -1007,7 +1007,7 @@ def create_app(
     )
 
     async def _start_pm() -> None:
-        """Start harness process manager; kick off MCP prewarm if requested."""
+        """Start harness process manager; register MCP prewarm metadata if requested."""
         await pm.start()
         prewarm_path = os.environ.get(_RUNNER_PREWARM_SPEC_PATH_ENV_VAR)
         if prewarm_path and mcp_manager is not None:
@@ -1021,7 +1021,7 @@ def create_app(
                 prewarm_spec = _load_spec(Path(prewarm_path), expand_env=True)
                 await mcp_manager.prewarm(prewarm_spec)
                 _logger.info(
-                    "runner MCP prewarm scheduled for %s (servers=%d)",
+                    "runner MCP prewarm registered for %s (servers=%d)",
                     prewarm_path,
                     len(prewarm_spec.mcp_servers or []),
                 )

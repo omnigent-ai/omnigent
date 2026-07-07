@@ -111,16 +111,23 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: stable
-      # Pin the toolchain for a stable cache fingerprint, key on the sidecar
-      # Cargo.lock. A warm hit reuses every dep and only relinks the workspace
-      # crate (~40s); a cold miss is the full ~7min compile (rare -- the lock
-      # is near-static). Same key as ci.yml's codex-parity job, so they share.
-      - name: Cache Rust build
+      - name: Capture Rust version
+        id: rustc
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      # The sidecar source is frozen and its deps are rev-pinned, so the binary
+      # is a pure function of sidecar/** + the toolchain. Cache the built binary
+      # (not the 1.6 GB target dir) and skip the ~7 min compile below on a hit;
+      # the key self-invalidates when the source, Cargo.lock, or rustc changes.
+      # Same key as ci.yml's codex-parity job -- ci.yml runs on push to main and
+      # populates the main-scoped cache that this PR-only workflow restores from.
+      - name: Cache parity sidecar binary
+        id: sidecar-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
-          path: .tmp-codex-parity-target
-          key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
+          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
+          key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
       - name: Build parity sidecar
+        if: steps.sidecar-cache.outputs.cache-hit != 'true'
         run: |
           cargo build \
             --manifest-path tests/codex_parity/sidecar/Cargo.toml \

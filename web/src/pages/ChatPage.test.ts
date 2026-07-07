@@ -25,6 +25,7 @@ import {
   splitSlashCommand,
   stripPendingElicitations,
   subAgentComposerLabel,
+  WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
 
@@ -677,7 +678,10 @@ describe("shouldShowWorkingIndicator", () => {
     expect(shouldShowWorkingIndicator(false, [])).toBe(false);
   });
 
-  it("suppresses Working once a streaming assistant bubble is rendering content", () => {
+  it("keeps Working visible while a streaming assistant bubble renders (always-on)", () => {
+    // Always-on: the indicator no longer hides when content starts arriving.
+    // It stays lit for the whole turn so a long tool run or reasoning gap
+    // never looks stalled.
     const bubbles: Bubble[] = [
       {
         kind: "assistant",
@@ -689,23 +693,6 @@ describe("shouldShowWorkingIndicator", () => {
       },
     ];
 
-    expect(shouldShowWorkingIndicator(true, bubbles)).toBe(false);
-  });
-
-  it("lets an empty streaming assistant bubble keep the Working indicator visible", () => {
-    const bubbles: Bubble[] = [
-      {
-        kind: "assistant",
-        responseId: "resp_live",
-        stableId: "resp_live",
-        lifecycle: "streaming",
-        error: null,
-        items: [],
-      },
-    ];
-
-    // Empty assistant shells do not yet prove content is rendering; hiding
-    // Working here would recreate the blank gap this helper avoids.
     expect(shouldShowWorkingIndicator(true, bubbles)).toBe(true);
   });
 
@@ -715,6 +702,24 @@ describe("shouldShowWorkingIndicator", () => {
     expect(
       shouldShowWorkingIndicator(true, [{ kind: "compaction_loading", itemId: "cmp_1" }]),
     ).toBe(false);
+  });
+
+  it("suppresses Working only when compaction is the LAST bubble", () => {
+    // The compaction guard is trailing-bubble-only: a streaming assistant
+    // after an earlier compaction spinner keeps Working lit.
+    const bubbles: Bubble[] = [
+      { kind: "compaction_loading", itemId: "cmp_1" },
+      {
+        kind: "assistant",
+        responseId: "resp_live",
+        stableId: "resp_live",
+        lifecycle: "streaming",
+        error: null,
+        items: [{ kind: "text", itemId: null, text: "partial", final: false }],
+      },
+    ];
+
+    expect(shouldShowWorkingIndicator(true, bubbles)).toBe(true);
   });
 });
 
@@ -737,6 +742,28 @@ describe("workingIndicatorLabel", () => {
 
   it("pluralizes the noun for more than one background task", () => {
     expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
+  });
+
+  it("pins the first rotation message to 'Working…'", () => {
+    // A fresh tick and the default arg both land on index 0, so this label
+    // must stay "Working…" — the invariant the (0) / (-1) cases rely on.
+    expect(WORKING_MESSAGES[0]).toBe("Working…");
+    expect(workingIndicatorLabel(0, 0)).toBe("Working…");
+  });
+
+  it("rotates through the message pool by tick", () => {
+    expect(workingIndicatorLabel(0, 1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(0, 2)).toBe(WORKING_MESSAGES[2]);
+  });
+
+  it("wraps the rotation modulo the pool length", () => {
+    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length)).toBe("Working…");
+    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
+  });
+
+  it("ignores the tick while background tasks remain", () => {
+    // The count is information, not decoration — it must not rotate away.
+    expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
   });
 });
 

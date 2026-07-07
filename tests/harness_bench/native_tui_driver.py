@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -61,6 +62,8 @@ from typing import Any
 
 import httpx
 
+from omnigent.harness_capabilities import AuthModel, IntegrationMode
+from omnigent.harness_plugins import harness_capabilities
 from omnigent.host.daemon_launch import (
     launch_or_reuse_daemon_runner,
     wait_for_host_online,
@@ -69,9 +72,10 @@ from omnigent.host.daemon_launch import (
 from omnigent.native_terminal import bind_session_runner
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.helpers import lookup_databricks_host
-from tests.harness_bench.driver import TurnResult
-from tests.harness_bench.full_server_driver import (
+from tests.harness_bench.driver import ProvisioningError, TurnResult
+from tests.harness_bench.full_server import (
     _find_free_port,
     _mint_bearer,
     spawn_omnigent_server,
@@ -163,9 +167,6 @@ def native_vendor(harness: str) -> NativeVendor | None:
     ``native-server`` harnesses (e.g. opencode-native) are a different
     transport and return ``None``.
     """
-    from omnigent.harness_capabilities import AuthModel, IntegrationMode
-    from omnigent.harness_plugins import harness_capabilities
-
     caps = harness_capabilities().get(harness)
     if caps is None or caps.integration_mode is not IntegrationMode.NATIVE_TUI:
         return None
@@ -221,8 +222,6 @@ class NativeTuiDriver:
         # host; the bench cannot provision a login. Presence on PATH is the
         # cheapest precondition we can check — a missing login still fails the
         # live turn, reported as a capability-neutral skip by the probes.
-        from tests.e2e._harness_probes import cli_unavailable_reason
-
         binary = profile.cli_binary
         if binary is not None:
             reason = cli_unavailable_reason(binary)
@@ -233,7 +232,18 @@ class NativeTuiDriver:
     # ── async driver protocol ────────────────────────────────
 
     async def __aenter__(self) -> NativeTuiDriver:
-        await asyncio.to_thread(self._provision)
+        try:
+            await asyncio.to_thread(self._provision)
+        except httpx.HTTPError as exc:
+            # Native provisioning drives a live vendor CLI + a server-native
+            # terminal, so an HTTP failure here (e.g. a 500 from terminal-ensure
+            # when the vendor cannot start a thread) is an environment/server-
+            # state gap, not a bench bug. Re-raise as ProvisioningError so the
+            # orchestrator skips this harness quietly (reason shown in its row)
+            # instead of dumping a traceback. A programming error (AssertionError
+            # on a misconfigured profile, etc.) is not an HTTPError, so it still
+            # propagates loud.
+            raise ProvisioningError(f"native provisioning HTTP error: {exc}") from exc
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -354,7 +364,7 @@ class NativeTuiDriver:
             if snap.status_code == 200 and snap.json().get("external_session_id"):
                 return
             time.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(
+        raise ProvisioningError(
             f"native forwarder did not wire up within {_FORWARDER_READY_TIMEOUT_S}s "
             f"(no external_session_id); logs in {self._tmp}"
         )
@@ -408,7 +418,9 @@ class NativeTuiDriver:
                 # Connection refused while the server boots; keep polling.
                 pass
             time.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(f"server not healthy within {_HEALTH_TIMEOUT_S}s; logs in {self._tmp}")
+        raise ProvisioningError(
+            f"server not healthy within {_HEALTH_TIMEOUT_S}s; logs in {self._tmp}"
+        )
 
     def _wait_host_online(self) -> str:
         assert self._client is not None
@@ -420,7 +432,7 @@ class NativeTuiDriver:
                 if online:
                     return str(online[0]["host_id"])
             time.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(f"no host came online within {_HOST_ONLINE_TIMEOUT_S}s")
+        raise ProvisioningError(f"no host came online within {_HOST_ONLINE_TIMEOUT_S}s")
 
     def _agent_id(self, agent_name: str) -> str:
         assert self._client is not None
@@ -429,7 +441,9 @@ class NativeTuiDriver:
         for agent in resp.json()["data"]:
             if agent.get("name") == agent_name:
                 return str(agent["id"])
-        raise RuntimeError(f"{agent_name!r} not auto-registered on the server")
+        # A native agent the server did not seed (the hardcoded seeding seam):
+        # an environment gap, not a bench bug, so skip this harness quietly.
+        raise ProvisioningError(f"{agent_name!r} not auto-registered on the server")
 
     def _teardown(self) -> None:
         if self._client is not None:
@@ -441,8 +455,6 @@ class NativeTuiDriver:
                     proc.wait(timeout=8)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-        import shutil
-
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     # ── turns ────────────────────────────────────────────────

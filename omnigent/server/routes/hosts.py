@@ -917,4 +917,69 @@ def create_hosts_router(
             "path": result.get("path"),
         }
 
+    @router.get("/hosts/{host_id}/worktrees")
+    async def list_host_worktrees(
+        request: Request,
+        host_id: str,
+        path: str = Query(...),
+    ) -> dict[str, Any]:
+        """
+        List the git worktrees of a repository on a host.
+
+        Used by the Web UI's new-session worktree picker to show the
+        worktrees a session can start in directly. Owner-scoped exactly
+        like the filesystem browse endpoints; NOT scoped to a session.
+        A path that is not a git repository is reported as 400 so the
+        picker can quietly fall back to "no worktrees".
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param path: Absolute path inside the repo on the host to list
+            worktrees for, e.g. ``"/Users/alice/myrepo"``.
+        :returns: ``{"object": "list", "data": [{path, branch,
+            is_main, detached}, ...]}`` (main first).
+        :raises HTTPException: 404 if host not found, 403 if not owned
+            by caller, 409 if host is offline/unresponsive, 400 on path
+            validation or a non-git path.
+        """
+        from omnigent.server.routes._host_worktree import (
+            WorktreeHostUnavailableError,
+            WorktreeProxyError,
+            list_worktrees_on_host,
+        )
+
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner check below as None.
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.owner != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        if not path.strip():
+            raise HTTPException(status_code=400, detail="path must not be empty")
+        if "\x00" in path:
+            raise HTTPException(status_code=400, detail="path must not contain NUL bytes")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        try:
+            worktrees = await list_worktrees_on_host(
+                host_registry=host_registry,
+                host_conn=conn,
+                repo_path=path,
+            )
+        except WorktreeHostUnavailableError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except WorktreeProxyError as exc:
+            # Not a git repo / git failure — user-correctable; the picker
+            # treats this as "no worktrees here".
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+
+        return {"object": "list", "data": worktrees}
+
     return router

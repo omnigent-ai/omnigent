@@ -29,6 +29,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -43,6 +44,7 @@ from omnigent.runtime.harnesses.process_manager import (
     NoLiveHarnessError,
     _pid_alive,
     _pids_holding_socket,
+    _SubprocessEntry,
 )
 
 _TEST_HARNESS_NAME = "test"
@@ -594,11 +596,11 @@ async def test_idle_reaper_survives_release_error(
         real_release = fast.release
         calls = {"n": 0}
 
-        async def flaky_release(conversation_id: str) -> None:
+        async def flaky_release(conversation_id: str, **kw: object) -> None:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("simulated close failure")
-            await real_release(conversation_id)
+            await real_release(conversation_id, **kw)  # type: ignore[arg-type]
 
         monkeypatch.setattr(fast, "release", flaky_release)
 
@@ -666,6 +668,100 @@ async def test_idle_reaper_skips_in_flight_turn(
         assert not socket_path.exists()
     finally:
         await fast.shutdown()
+
+
+class _FakeReapProc:
+    """Minimal process stand-in recording whether the reaper killed it."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+        self._done = asyncio.Event()
+
+    def send_signal(self, sig: int) -> None:
+        self.killed = True
+        self.returncode = -15
+        self._done.set()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._done.set()
+
+    async def wait(self) -> int | None:
+        await self._done.wait()
+        return self.returncode
+
+
+class _SlowCloseClient:
+    """httpx-client stand-in whose aclose() stalls, holding the reaper pass open."""
+
+    def __init__(self, delay_s: float) -> None:
+        self._delay_s = delay_s
+
+    async def aclose(self) -> None:
+        await asyncio.sleep(self._delay_s)
+
+
+class _FakeEndpoint:
+    def cleanup(self) -> None:
+        pass
+
+
+async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> None:
+    """A turn that starts while an earlier stale entry tears down is not reaped.
+
+    The reaper snapshots its stale list under the registry lock, then releases
+    each entry outside it; a single teardown can hold the pass open for seconds
+    (graceful-SIGTERM wait). A turn that starts on a later-listed conversation
+    during that window refreshes ``last_used_at`` and marks itself in flight —
+    but the snapshot has already been taken, and ``release`` used to tear the
+    entry down without re-checking, SIGTERMing the subprocess mid-turn
+    ("Harness stream connection error" seconds after messaging an idle
+    session). ``only_if_idle_cutoff`` re-checks idleness atomically with the
+    unregister, so the now-active entry is spared; the genuinely idle entry in
+    the same pass is still reaped, and the spared one is reclaimed by a later
+    pass once it goes idle again.
+    """
+    mgr = HarnessProcessManager(idle_timeout_s=0.5, reaper_interval_s=0.2, tmp_parent=tmp_path)
+    e1 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.6), _FakeEndpoint(), "h")  # type: ignore[arg-type]
+    e2 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.0), _FakeEndpoint(), "h")  # type: ignore[arg-type]
+    e1.last_used_at = time.monotonic() - 100.0
+    e2.last_used_at = time.monotonic() - 100.0
+    mgr._entries = {"conv1": e1, "conv2": e2}
+
+    reaper = asyncio.create_task(mgr._idle_reaper_loop())
+    try:
+        # Wait for the pass to claim conv1 and enter its slow teardown.
+        deadline = time.monotonic() + 3.0
+        while "conv1" in mgr._entries:
+            assert time.monotonic() < deadline, "reaper never started a pass"
+            await asyncio.sleep(0.01)
+
+        # While conv1 tears down, a new turn arrives for conv2: get_client
+        # refreshes last_used_at and the runner marks the response in flight.
+        e2.last_used_at = time.monotonic()
+        mgr.mark_in_flight("conv2", "resp_live")
+
+        await asyncio.sleep(1.0)
+        assert e1.process.killed, "the genuinely idle entry must still be reaped"
+        assert not e2.process.killed, (
+            "reaper SIGTERMed a subprocess whose turn started during the pass"
+        )
+        assert "conv2" in mgr._entries
+
+        # Once the turn ends and the entry goes idle again, a later pass
+        # reclaims it — sparing is a deferral, not an exemption.
+        mgr.clear_in_flight("conv2")
+        e2.last_used_at = time.monotonic() - 100.0
+        deadline = time.monotonic() + 3.0
+        while not e2.process.killed:
+            assert time.monotonic() < deadline, "spared entry never reaped later"
+            await asyncio.sleep(0.05)
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
 
 
 async def test_idle_reaper_disabled_when_timeout_zero(
@@ -791,6 +887,21 @@ async def test_pids_holding_socket_returns_empty_for_missing(
     """
     nonexistent = short_tmp_parent / "no-such.sock"
     pids = await _pids_holding_socket(nonexistent)
+    assert pids == []
+
+
+async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    short_tmp_parent: Path,
+) -> None:
+    """Missing ``lsof`` is best-effort cleanup noise, not a boot failure."""
+
+    async def missing_lsof(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file or directory", "lsof")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_lsof)
+
+    pids = await _pids_holding_socket(short_tmp_parent / "conv-stale.sock")
     assert pids == []
 
 
