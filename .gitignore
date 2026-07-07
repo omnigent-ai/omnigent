@@ -51,6 +51,10 @@ run-omnigents.sh
 artifacts/
 .tmp-codex-parity-target/
 
+# omnidev (dev pod supervisor) Rust build output. Pod state lives outside the
+# repo under ~/.cache/omnidev/, so only the build dir needs ignoring.
+dev/omnidev/target/
+
 # Playwright test run output (screenshots, traces, videos).
 test-results/
 
