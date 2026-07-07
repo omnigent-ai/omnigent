@@ -65,6 +65,32 @@ KITS_ENV_VAR: str = "OMNIGENT_SBX_KITS"
 """Environment variable naming (comma- or whitespace-separated) sbx kit
 references applied at provision time (``sbx create --kit``)."""
 
+_CLAUDE_AUTH_DOMAINS: str = "console.anthropic.com:443,platform.claude.ai:443,claude.ai:443"
+"""Claude Code subscription-auth endpoints (OAuth authorize + token
+refresh). sbx's default-deny network policy blocks them, which makes a
+token refresh fail — and on a failed refresh Claude Code wipes the
+stored ``~/.claude/.credentials.json`` tokens. Allowed per-sandbox at
+provision time so subscription (Pro/Max) auth keeps working."""
+
+_PROXY_MANAGED_SENTINEL: str = "proxy-managed"
+"""Literal value Docker Sandboxes injects for its built-in provider key
+placeholders (``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``, …) in every
+exec session. Secrets actually registered with ``sbx secret`` get
+distinct ``sbx-cs-*`` placeholders instead, so this exact value always
+means "no real key behind it" — the gateway never substitutes anything
+and harnesses that prefer env keys over their own login (Claude Code)
+fail with an invalid-key error."""
+
+# Unsets every env var still holding the unbacked placeholder sentinel
+# before the host process starts, so it can't shadow real harness
+# credentials (subscription login, apiKeyHelper, `-e`-forwarded keys —
+# the latter survive because their values are real, not the sentinel).
+_STRIP_PROXY_MANAGED_SNIPPET: str = (
+    "while IFS='=' read -r n v; do "
+    f'[ "$v" = "{_PROXY_MANAGED_SENTINEL}" ] && unset "$n"; '
+    "done < <(env);"
+)
+
 _VENV_DIR: str = "$HOME/.omnigent-venv"
 """In-sandbox venv omnigent is installed into (remote shell syntax, not
 a Python path — expanded by the sandbox's own shell). A real venv, not
@@ -205,6 +231,21 @@ class SbxSandboxLauncher(SandboxLauncher):
                 )
             raise click.ClickException(f"sbx sandbox creation failed: {detail}")
 
+        # Best-effort: without these rules subscription auth still works
+        # until the first token refresh, and API-key users don't need
+        # them at all — so an sbx build lacking `--sandbox` scoping must
+        # not fail the provision.
+        policy = self._run_sbx(
+            ["policy", "allow", "network", "--sandbox", name, _CLAUDE_AUTH_DOMAINS]
+        )
+        if policy.returncode != 0:
+            click.echo(
+                "  → warning: could not allow Claude auth domains "
+                f"({policy.stderr.strip() or policy.stdout.strip()}); "
+                "subscription token refresh may be blocked — run "
+                f"`sbx policy allow network --sandbox {name} {_CLAUDE_AUTH_DOMAINS}`"
+            )
+
         click.echo("  → installing host runtime dependencies")
         setup = self._run_sbx(["exec", "-u", "root", name, "bash", "-lc", _SETUP_COMMAND])
         if setup.returncode != 0:
@@ -314,7 +355,9 @@ class SbxSandboxLauncher(SandboxLauncher):
         inherited from the local terminal, returning its exit code.
 
         Passthrough env (resolved from :meth:`_resolve_env`) is injected
-        with ``-e``; ``TERM`` is forced (native harnesses spawn tmux,
+        with ``-e``; Docker's unbacked ``proxy-managed`` placeholder keys
+        are unset first (see :data:`_PROXY_MANAGED_SENTINEL`); ``TERM``
+        is forced (native harnesses spawn tmux,
         which refuses a dumb/unset TERM); ``exec`` replaces the shell so
         the returned code is the command's own. The ``sbx`` process is a
         local child, so Ctrl-C reaches it directly — no remote-kill dance.
@@ -327,7 +370,12 @@ class SbxSandboxLauncher(SandboxLauncher):
         argv = [self._sbx_binary(), "exec", "-it"]
         for name, value in self._resolve_env().items():
             argv += ["-e", f"{name}={value}"]
-        argv += [sandbox_id, "bash", "-lc", f"TERM=xterm-256color exec {command}"]
+        argv += [
+            sandbox_id,
+            "bash",
+            "-lc",
+            f"{_STRIP_PROXY_MANAGED_SNIPPET} TERM=xterm-256color exec {command}",
+        ]
         try:
             result = subprocess.run(argv, check=False)
         except KeyboardInterrupt:
