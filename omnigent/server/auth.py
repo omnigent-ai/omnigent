@@ -27,6 +27,7 @@ and closed over by route factories — no per-request import cost.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import time
@@ -72,6 +73,16 @@ _DEFAULT_AUTH_HEADER = "X-Forwarded-Email"
 # email used everywhere else. Unset (the default) strips nothing. See
 # :func:`resolve_auth_header_strip_prefix`.
 _AUTH_HEADER_STRIP_PREFIX_ENV = "OMNIGENT_AUTH_HEADER_STRIP_PREFIX"
+
+# Optional proof header required before a header-auth identity is trusted.
+# When OMNIGENT_AUTH_PROXY_PROOF_VALUE is unset, header auth behaves exactly
+# as before. When set, any request that carries the configured identity header
+# must also carry this proof header with the exact configured value. This lets
+# a deployed server validate that X-Forwarded-Email came through a trusted
+# local proxy/injector instead of relying solely on a host firewall.
+_AUTH_PROXY_PROOF_HEADER_ENV = "OMNIGENT_AUTH_PROXY_PROOF_HEADER"
+_DEFAULT_AUTH_PROXY_PROOF_HEADER = "X-Omnigent-Proxy-Proof"
+_AUTH_PROXY_PROOF_VALUE_ENV = "OMNIGENT_AUTH_PROXY_PROOF_VALUE"
 
 LEVEL_READ = 1
 LEVEL_EDIT = 2
@@ -151,6 +162,32 @@ def resolve_auth_header_strip_prefix() -> str:
     :returns: The prefix to strip, or ``""`` to strip nothing.
     """
     return os.environ.get(_AUTH_HEADER_STRIP_PREFIX_ENV, "").strip()
+
+
+def resolve_auth_proxy_proof_header() -> str:
+    """Resolve the trusted-proxy proof header name for header-auth mode.
+
+    Reads ``OMNIGENT_AUTH_PROXY_PROOF_HEADER`` and falls back to
+    ``X-Omnigent-Proxy-Proof`` when unset or empty. Only consulted when
+    ``OMNIGENT_AUTH_PROXY_PROOF_VALUE`` is set.
+
+    :returns: The proof header name.
+    """
+    raw = os.environ.get(_AUTH_PROXY_PROOF_HEADER_ENV, "").strip()
+    return raw or _DEFAULT_AUTH_PROXY_PROOF_HEADER
+
+
+def resolve_auth_proxy_proof_value() -> str:
+    """Resolve the trusted-proxy proof value for header-auth mode.
+
+    Unset or whitespace-only values disable proof enforcement, preserving
+    existing header-auth deployments. A non-empty value makes header-auth
+    reject identity headers unless the request carries the configured proof
+    header with the exact value.
+
+    :returns: The configured proof value, or ``""`` when disabled.
+    """
+    return os.environ.get(_AUTH_PROXY_PROOF_VALUE_ENV, "").strip()
 
 
 _auth_enabled_deprecation_warned = False
@@ -305,6 +342,12 @@ class UnifiedAuthProvider(AuthProvider):
         back to ``""`` (strip nothing; see
         :func:`resolve_auth_header_strip_prefix`). Only consulted in
         header mode. Tests pass an explicit prefix.
+    :param header_proxy_proof_header: Proof header name used when
+        ``header_proxy_proof_value`` is configured. ``None`` resolves
+        from ``OMNIGENT_AUTH_PROXY_PROOF_HEADER``.
+    :param header_proxy_proof_value: Optional trusted-proxy proof value.
+        ``None`` resolves from ``OMNIGENT_AUTH_PROXY_PROOF_VALUE``.
+        Empty means proof enforcement is disabled.
     """
 
     def __init__(
@@ -315,6 +358,8 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
+        header_proxy_proof_header: str | None = None,
+        header_proxy_proof_value: str | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -327,6 +372,16 @@ class UnifiedAuthProvider(AuthProvider):
             header_strip_prefix
             if header_strip_prefix is not None
             else resolve_auth_header_strip_prefix()
+        )
+        self._header_proxy_proof_header = (
+            header_proxy_proof_header
+            if header_proxy_proof_header is not None
+            else resolve_auth_proxy_proof_header()
+        )
+        self._header_proxy_proof_value = (
+            header_proxy_proof_value
+            if header_proxy_proof_value is not None
+            else resolve_auth_proxy_proof_value()
         )
         self._cookie_cache: dict[str, tuple[str, float]] = {}
 
@@ -501,6 +556,8 @@ class UnifiedAuthProvider(AuthProvider):
         """
         email = request.headers.get(self._header_name)
         if email:
+            if not self._check_header_proxy_proof(request):
+                return None
             if self._header_strip_prefix:
                 email = email.removeprefix(self._header_strip_prefix)
             if not email or email in _RESERVED_USERS:
@@ -509,6 +566,23 @@ class UnifiedAuthProvider(AuthProvider):
         if self._local_single_user:
             return RESERVED_USER_LOCAL
         return None
+
+    def _check_header_proxy_proof(self, request: HTTPConnection) -> bool:
+        """Return whether the request satisfies the optional proxy proof.
+
+        The proof is disabled unless ``_header_proxy_proof_value`` is
+        non-empty. When enabled, compare the request's configured proof
+        header using constant-time comparison before trusting the identity
+        header.
+
+        :param request: The incoming HTTP request or WebSocket.
+        :returns: ``True`` when proof is disabled or valid.
+        """
+        expected = self._header_proxy_proof_value
+        if not expected:
+            return True
+        actual = request.headers.get(self._header_proxy_proof_header, "")
+        return hmac.compare_digest(actual, expected)
 
 
 def create_auth_provider() -> AuthProvider:

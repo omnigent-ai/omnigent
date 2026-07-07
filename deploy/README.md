@@ -476,6 +476,21 @@ forwarding, anyone can impersonate anyone by sending the header themselves.
 Getting this wrong exposes every user's sessions, conversation history, tool
 output, and files to every other caller.
 
+For defense in depth, header mode can also require a trusted-proxy proof
+header before it accepts the identity header:
+
+```dotenv
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_PROXY_PROOF_VALUE=<shared-secret>
+# Optional; defaults to X-Omnigent-Proxy-Proof
+OMNIGENT_AUTH_PROXY_PROOF_HEADER=X-Omnigent-Proxy-Proof
+```
+
+When `OMNIGENT_AUTH_PROXY_PROOF_VALUE` is unset, header mode behaves as
+before. When it is set, requests that carry the identity header are rejected
+unless the configured proof header has the exact configured value. The proxy
+must strip any client-supplied proof header before injecting its own.
+
 **For almost everyone, use built-in `accounts` (the default in these
 deploys) or `oidc`**; both authenticate users at the server with no proxy to
 get right. Only choose `header` when you already operate a proxy you trust

@@ -227,6 +227,8 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_PROVIDER` | unset | Escape hatch to pin a mode explicitly: `header` / `accounts` / `oidc`. Overrides the `AUTH_ENABLED` auto-selection. |
 | `OMNIGENT_AUTH_HEADER` | `X-Forwarded-Email` | Header-mode only: name of the trusted identity header. Set for proxies that use another name, e.g. `Cf-Access-Authenticated-User-Email` (Cloudflare Access). |
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
+| `OMNIGENT_AUTH_PROXY_PROOF_VALUE` | unset | Header-mode only: optional proof value required before the server trusts the identity header. Unset preserves existing behavior. |
+| `OMNIGENT_AUTH_PROXY_PROOF_HEADER` | `X-Omnigent-Proxy-Proof` | Header-mode only: proof header name used when `OMNIGENT_AUTH_PROXY_PROOF_VALUE` is set. The proxy must strip client-supplied copies before injecting its own. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 

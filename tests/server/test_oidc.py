@@ -19,6 +19,8 @@ from omnigent.server.auth import (
     create_auth_provider,
     resolve_auth_header,
     resolve_auth_header_strip_prefix,
+    resolve_auth_proxy_proof_header,
+    resolve_auth_proxy_proof_value,
 )
 from omnigent.server.oidc import (
     OIDCConfig,
@@ -211,6 +213,85 @@ def test_header_source_returns_email_from_header() -> None:
     assert provider.get_user_id(request) == "alice@example.com"
 
 
+def test_header_source_proxy_proof_unset_keeps_existing_behavior() -> None:
+    """Header-auth remains backwards-compatible when no proof is configured."""
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_proxy_proof_value="",
+    )
+    request = _mock_request(headers={"X-Forwarded-Email": "alice@example.com"})
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_header_source_requires_proxy_proof_when_configured() -> None:
+    """Configured proof makes a spoofed identity header fail closed."""
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_proxy_proof_value="secret-proof",
+        local_single_user=False,
+    )
+    request = _mock_request(headers={"X-Forwarded-Email": "attacker@example.com"})
+    assert provider.get_user_id(request) is None
+
+
+def test_header_source_accepts_matching_proxy_proof() -> None:
+    """A trusted proxy can authenticate by sending identity plus proof."""
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_proxy_proof_value="secret-proof",
+    )
+    request = _mock_request(
+        headers={
+            "X-Forwarded-Email": "alice@example.com",
+            "X-Omnigent-Proxy-Proof": "secret-proof",
+        }
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_header_source_rejects_wrong_proxy_proof() -> None:
+    """Proof comparison must be exact; wrong proof is unauthenticated."""
+    provider = UnifiedAuthProvider(
+        source="header",
+        header_proxy_proof_value="secret-proof",
+        local_single_user=False,
+    )
+    request = _mock_request(
+        headers={
+            "X-Forwarded-Email": "attacker@example.com",
+            "X-Omnigent-Proxy-Proof": "wrong-proof",
+        }
+    )
+    assert provider.get_user_id(request) is None
+
+
+def test_header_source_custom_proxy_proof_header_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deploys can rename the proof header while keeping exact proof semantics."""
+    monkeypatch.setenv("OMNIGENT_AUTH_PROXY_PROOF_HEADER", "X-Ergon-Proxy-Proof")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROXY_PROOF_VALUE", "secret-proof")
+    provider = UnifiedAuthProvider(source="header")
+    request = _mock_request(
+        headers={
+            "X-Forwarded-Email": "alice@example.com",
+            "X-Ergon-Proxy-Proof": "secret-proof",
+        }
+    )
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_header_source_proxy_proof_does_not_block_local_fallback() -> None:
+    """The proof gates proxy identity headers, not local single-user mode."""
+    provider = UnifiedAuthProvider(
+        source="header",
+        local_single_user=True,
+        header_proxy_proof_value="secret-proof",
+    )
+    request = _mock_request()
+    assert provider.get_user_id(request) == RESERVED_USER_LOCAL
+
+
 def test_header_source_rejects_missing_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -359,6 +440,20 @@ def test_resolve_auth_header_defaults_to_x_forwarded_email(
     assert resolve_auth_header() == "X-Forwarded-Email"
     monkeypatch.setenv("OMNIGENT_AUTH_HEADER", "   ")
     assert resolve_auth_header() == "X-Forwarded-Email"
+
+
+def test_resolve_auth_proxy_proof_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proof is disabled by default but the default header name is stable."""
+    monkeypatch.delenv("OMNIGENT_AUTH_PROXY_PROOF_HEADER", raising=False)
+    monkeypatch.delenv("OMNIGENT_AUTH_PROXY_PROOF_VALUE", raising=False)
+    assert resolve_auth_proxy_proof_header() == "X-Omnigent-Proxy-Proof"
+    assert resolve_auth_proxy_proof_value() == ""
+    monkeypatch.setenv("OMNIGENT_AUTH_PROXY_PROOF_HEADER", "   ")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROXY_PROOF_VALUE", "   ")
+    assert resolve_auth_proxy_proof_header() == "X-Omnigent-Proxy-Proof"
+    assert resolve_auth_proxy_proof_value() == ""
 
 
 # ── UnifiedAuthProvider (header source: Google IAP prefix strip) ──
