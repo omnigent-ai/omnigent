@@ -254,6 +254,11 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
+# Priority 5f.1d: nimble_agent — Nimble Web Search Agent (WSA) → structured JSON.
+# Runner-local so a non-OpenAI model's nimble_agent call resolves to
+# NimbleAgentTool.invoke (POST /v1/agent), the same posture as web_search.
+_NIMBLE_AGENT_TOOLS = frozenset({"nimble_agent"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -461,6 +466,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _NIMBLE_AGENT_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -2307,6 +2313,64 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _nimble_agent_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``nimble_agent`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_web_search_config_from_spec`: scans ``spec.tools.builtins``
+    for the entry named ``"nimble_agent"`` and returns its ``config`` (credentials
+    + optional ``agent`` template). Empty dict when the builtin is a bare string
+    or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The nimble_agent config dict, e.g.
+        ``{"api_key": "...", "agent": "google_search"}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "nimble_agent":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_nimble_agent_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``nimble_agent`` tool call to Nimble's Web Search Agent endpoint.
+
+    Builds ``NimbleAgentTool`` from the spec's ``nimble_agent`` builtin config and
+    runs its synchronous ``invoke`` off the event loop (the backend makes a
+    blocking HTTP call), mirroring :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``query`` (required).
+    :param agent_spec: Parent agent's spec; carries the nimble_agent config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The structured JSON, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.nimble_agent import NimbleAgentTool
+
+    config = _nimble_agent_config_from_spec(agent_spec)
+    tool = NimbleAgentTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "nimble_agent",
+        agent_id=agent_id or "nimble_agent",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _has_subagent(
     sub_agent_name: str,
     agent_spec: Any | None,
@@ -4123,6 +4187,14 @@ async def execute_tool(
             )
         elif tool_name in _WEB_SEARCH_TOOLS:
             output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _NIMBLE_AGENT_TOOLS:
+            output = await _execute_nimble_agent_tool(
                 args,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,

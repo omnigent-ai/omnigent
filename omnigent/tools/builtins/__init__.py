@@ -44,6 +44,7 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_meta_text,
     list_skill_resources,
 )
+from omnigent.tools.builtins.nimble_agent import NimbleAgentTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "NimbleAgentTool",
     "ReadSkillFileTool",
     "SysAdviseModelsTool",
     "SysAgentDownloadTool",
@@ -185,6 +187,7 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "nimble_agent": lambda config: NimbleAgentTool(config=config),
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,
