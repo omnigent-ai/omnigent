@@ -204,14 +204,43 @@ function AppearanceSection() {
  * per-device readability pref that doesn't conflict with host theming.
  */
 function UiFontSizeControl() {
+  // `px` is the committed value: clamped, persisted, and applied to the UI.
+  // `draft` is the raw text in the box, kept separate so mid-edit states the
+  // committed value can't hold — a transient out-of-range number (e.g. "1" on
+  // the way to "18") or an empty field while retyping — don't get clamped on
+  // every keystroke. We only commit while typing when the draft is already a
+  // valid in-range size; blur/Enter clamps and re-syncs the text.
   const [px, setPx] = useState(() => readUiFontSizePx());
+  const [draft, setDraft] = useState(() => String(px));
 
-  const update = useCallback((next: number) => {
+  const commit = useCallback((next: number) => {
     const clamped = clampUiFontSizePx(next);
     setPx(clamped);
+    setDraft(String(clamped));
     writeUiFontSizePx(clamped);
     applyUiFontScale(clamped);
   }, []);
+
+  const onDraftChange = useCallback((text: string) => {
+    setDraft(text);
+    // Apply live only once the field holds a valid, in-range whole number;
+    // leave partial/out-of-range/empty drafts untouched until blur.
+    if (/^\d+$/.test(text)) {
+      const value = Number(text);
+      if (value >= UI_FONT_SIZE_MIN && value <= UI_FONT_SIZE_MAX) {
+        setPx(value);
+        writeUiFontSizePx(value);
+        applyUiFontScale(value);
+      }
+    }
+  }, []);
+
+  // Clamp and re-sync the text to the committed value. An empty or invalid
+  // draft reverts to the last committed size rather than a bogus one.
+  const commitDraft = useCallback(() => {
+    const value = Number(draft);
+    commit(Number.isFinite(value) && draft.trim() !== "" ? value : px);
+  }, [commit, draft, px]);
 
   const atMin = px <= UI_FONT_SIZE_MIN;
   const atMax = px >= UI_FONT_SIZE_MAX;
@@ -238,7 +267,7 @@ function UiFontSizeControl() {
           label="Decrease font size"
           testId="ui-font-size-dec"
           disabled={atMin}
-          onClick={() => update(px - UI_FONT_SIZE_STEP)}
+          onClick={() => commit(px - UI_FONT_SIZE_STEP)}
         >
           <MinusIcon className="size-4" />
         </StepperButton>
@@ -252,10 +281,11 @@ function UiFontSizeControl() {
             aria-label="Font size in pixels"
             data-testid="ui-font-size-input"
             className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-            value={px}
-            onChange={(e) => {
-              const next = Number(e.target.value);
-              if (Number.isFinite(next)) update(next);
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onBlur={commitDraft}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
             }}
           />
         </div>
@@ -263,7 +293,7 @@ function UiFontSizeControl() {
           label="Increase font size"
           testId="ui-font-size-inc"
           disabled={atMax}
-          onClick={() => update(px + UI_FONT_SIZE_STEP)}
+          onClick={() => commit(px + UI_FONT_SIZE_STEP)}
         >
           <PlusIcon className="size-4" />
         </StepperButton>
