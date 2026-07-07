@@ -99,6 +99,19 @@ On N100/N95-class mini-PC servers, use the mid-size zipformer (accuracy held
 up in spot checks; the 20 M model audibly degrades) and consider
 `OMNIGENT_DICTATION_MAX_STREAMS=1`.
 
+**Other languages.** The engine is language-agnostic — dictation speaks
+whatever language the installed model was trained on. The
+[sherpa-onnx streaming-model catalog](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/index.html)
+includes Chinese, Chinese/English bilingual
+(`sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20`), French
+(`sherpa-onnx-streaming-zipformer-fr-2023-04-14`), Korean, and more; point
+`OMNIGENT_DICTATION_MODEL_DIR` at any of them. Two caveats: the fetch
+script's punctuation model is English-only, so leave
+`OMNIGENT_DICTATION_PUNCT_DIR` unpopulated for other languages (raw
+recognizer output is emitted as-is), and the mic button's `lang` prop only
+affects the Web Speech path — the server path's language is decided by the
+operator's model choice.
+
 ### Remote worker
 
 When the main server's CPU can't run the model you want, point
