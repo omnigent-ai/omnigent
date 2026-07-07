@@ -335,9 +335,7 @@ class _SherpaStream:
         usable = len(data) - (len(data) % 2)
         if usable <= 0:
             return DictationUpdate(partial="")
-        samples = (
-            np.frombuffer(data[:usable], dtype=np.int16).astype(np.float32) / 32768.0
-        )
+        samples = np.frombuffer(data[:usable], dtype=np.int16).astype(np.float32) / 32768.0
         engine = self._engine
         recognizer = engine._recognizer
         with engine._lock:
@@ -366,9 +364,7 @@ class _SherpaStream:
         with engine._lock:
             # One second of silence pushes trailing speech past the
             # feature window so the last words decode.
-            self._stream.accept_waveform(
-                SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.float32)
-            )
+            self._stream.accept_waveform(SAMPLE_RATE, np.zeros(SAMPLE_RATE, dtype=np.float32))
             self._stream.input_finished()
             while recognizer.is_ready(self._stream):
                 recognizer.decode_stream(self._stream)

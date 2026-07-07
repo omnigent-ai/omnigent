@@ -56,7 +56,8 @@ import contextlib
 import json
 import logging
 import time
-from typing import Any, Callable, Final
+from collections.abc import Callable
+from typing import Any, Final
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
@@ -135,16 +136,12 @@ def create_dictation_router(
             # use. Run it off-loop; later takes reuse the shared engine.
             try:
                 engine = await asyncio.to_thread(resolve_engine)
-                handle: DictationStreamHandle = await asyncio.to_thread(
-                    engine.create_stream
-                )
-            except Exception:  # noqa: BLE001
+                handle: DictationStreamHandle = await asyncio.to_thread(engine.create_stream)
+            except Exception:
                 _logger.exception("dictation engine failed to initialize")
                 with contextlib.suppress(RuntimeError):
                     await websocket.send_text(
-                        json.dumps(
-                            {"type": "error", "message": "dictation engine unavailable"}
-                        )
+                        json.dumps({"type": "error", "message": "dictation engine unavailable"})
                     )
                     await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
                 return
@@ -173,9 +170,7 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
                 update = await asyncio.to_thread(handle.feed_pcm16, data)
                 if update.finalized:
                     text = await asyncio.to_thread(handle.beautify, update.finalized)
-                    await websocket.send_text(
-                        json.dumps({"type": "final", "text": text})
-                    )
+                    await websocket.send_text(json.dumps({"type": "final", "text": text}))
                     last_partial_sent = ""
                     last_partial_at = 0.0
                 now = time.monotonic()
@@ -184,9 +179,7 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
                     and now - last_partial_at >= _PARTIAL_INTERVAL_S
                 ):
                     text = await asyncio.to_thread(handle.beautify, update.partial)
-                    await websocket.send_text(
-                        json.dumps({"type": "partial", "text": text})
-                    )
+                    await websocket.send_text(json.dumps({"type": "partial", "text": text}))
                     last_partial_sent = update.partial
                     last_partial_at = now
                 continue
@@ -206,10 +199,8 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             # Unknown control messages are ignored for forward compat.
     except WebSocketDisconnect:
         return
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.exception("dictation stream failed")
         with contextlib.suppress(RuntimeError):
-            await websocket.send_text(
-                json.dumps({"type": "error", "message": "dictation failed"})
-            )
+            await websocket.send_text(json.dumps({"type": "error", "message": "dictation failed"}))
             await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)

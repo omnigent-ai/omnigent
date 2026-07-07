@@ -36,22 +36,16 @@ def test_availability_fake_engine(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_availability_extra_not_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without the sherpa-onnx package the probe says extra_not_installed."""
-    monkeypatch.setattr(
-        dictation.importlib.util, "find_spec", lambda name: None
-    )
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: None)
     assert dictation.engine_availability() == (
         False,
         dictation.REASON_EXTRA_NOT_INSTALLED,
     )
 
 
-def test_availability_models_missing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_availability_models_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """With the package but an empty model dir the probe says models_missing."""
-    monkeypatch.setattr(
-        dictation.importlib.util, "find_spec", lambda name: object()
-    )
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
     monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
     assert dictation.engine_availability() == (
         False,
@@ -59,13 +53,9 @@ def test_availability_models_missing(
     )
 
 
-def test_availability_with_models(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_availability_with_models(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A populated model dir plus the package reports available."""
-    monkeypatch.setattr(
-        dictation.importlib.util, "find_spec", lambda name: object()
-    )
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
     _touch_asr_files(tmp_path)
     monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
     assert dictation.engine_availability() == (True, None)

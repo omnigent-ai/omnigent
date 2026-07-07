@@ -81,14 +81,26 @@ export const ComposerMicButton = ({
   disabled,
   lang = "en-US",
 }: ComposerMicButtonProps) => {
-  // Mode selection: Web Speech when the browser has it (Chrome/Safari,
-  // unchanged behavior), else server dictation when GET /v1/info advertises
-  // it (Electron, Firefox/Chromium against a server with the dictation
-  // extra), else render nothing.
+  // Mode selection: Web Speech when the browser has a working one
+  // (Chrome/Safari, unchanged behavior), server dictation otherwise when
+  // GET /v1/info advertises it. "Working" can't be known statically —
+  // Electron and plain Chromium expose the constructor but its cloud
+  // backend rejects them at runtime (a "network" error) — so Web Speech
+  // is primary whenever the constructor exists, and the first
+  // backend-dead error flips this page to server mode and retries the
+  // take the user already asked for (see handleError).
   const [Ctor] = useState(getRecognitionCtor);
   const serverInfo = useServerInfo();
-  const serverDictation =
-    Ctor === null && serverInfo !== "loading" && serverInfo.dictation_available;
+  const serverAvailable = serverInfo !== "loading" && serverInfo.dictation_available;
+  const [webSpeechBroken, setWebSpeechBroken] = useState(false);
+  const serverDictation = serverAvailable && (Ctor === null || webSpeechBroken);
+  // Mirrored into a ref so the mount-time recognition handlers (closed
+  // over [Ctor, lang]) see the current probe result.
+  const serverAvailableRef = useRef(serverAvailable);
+  serverAvailableRef.current = serverAvailable;
+  // Set when a backend-dead Web Speech error should be retried on the
+  // server path the moment the mode flips.
+  const retryOnServerRef = useRef(false);
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -132,6 +144,16 @@ export const ComposerMicButton = ({
     const handleError = (event: Event) => {
       transitionRef.current = false;
       const err = (event as SpeechRecognitionErrorEventLike).error;
+      // "network" means the recognizer's cloud backend refused us — the
+      // permanent state of Electron and non-Chrome Chromium builds, not a
+      // transient failure. When the server can transcribe instead, flip
+      // to server dictation and retry the take the user just started.
+      if (err === "network" && serverAvailableRef.current && !disabledRef.current) {
+        retryOnServerRef.current = true;
+        setIsListening(false);
+        setWebSpeechBroken(true);
+        return;
+      }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
       if (err === "not-allowed" || err === "service-not-allowed") {
         setError("Microphone permission denied");
@@ -317,6 +339,15 @@ export const ComposerMicButton = ({
     }
     transitionRef.current = false;
   }, []);
+
+  // Complete the Web Speech → server switch: the mode flip re-renders
+  // before the retry can start, so the retry rides an effect keyed on it.
+  useEffect(() => {
+    if (webSpeechBroken && retryOnServerRef.current) {
+      retryOnServerRef.current = false;
+      void toggleServer();
+    }
+  }, [webSpeechBroken, toggleServer]);
 
   const toggle = useCallback(() => {
     if (serverDictation) {

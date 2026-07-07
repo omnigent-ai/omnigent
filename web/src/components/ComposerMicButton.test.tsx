@@ -38,6 +38,16 @@ vi.mock("@/lib/dictation", () => ({
   },
 }));
 
+function installDictationSession() {
+  sessionEvents = null;
+  sessionStopMock = vi.fn(async () => "");
+  sessionCancelMock = vi.fn();
+  sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
+    sessionEvents = events;
+    return { stop: sessionStopMock, cancel: sessionCancelMock };
+  });
+}
+
 /** Captured event handlers keyed by event type, fed by the fake recognition. */
 let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
@@ -75,6 +85,7 @@ function resultEvent(transcript: string) {
 
 beforeEach(() => {
   installSpeechRecognition();
+  installDictationSession();
   // The visualizer's getUserMedia is best-effort; reject so no AudioContext
   // (unavailable in jsdom) is ever constructed. Capture the original descriptor
   // first so afterEach can restore it — otherwise this navigator stub leaks.
@@ -204,16 +215,6 @@ async function clickMic() {
 }
 
 describe("ComposerMicButton (server dictation)", () => {
-  beforeEach(() => {
-    sessionEvents = null;
-    sessionStopMock = vi.fn(async () => "");
-    sessionCancelMock = vi.fn();
-    sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
-      sessionEvents = events;
-      return { stop: sessionStopMock, cancel: sessionCancelMock };
-    });
-  });
-
   it("renders the button when the server advertises dictation", () => {
     renderServerMode();
     expect(screen.getByRole("button", { name: "Voice dictation" })).toBeInTheDocument();
@@ -299,6 +300,53 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(button).toHaveAttribute("aria-pressed", "false");
     expect(button).toHaveAttribute("title", "Dictation unavailable");
     expect(onInterim).toHaveBeenCalledWith("");
+  });
+
+  it("falls back to server dictation when Web Speech dies with a network error", async () => {
+    // Electron / plain Chromium: the SpeechRecognition constructor exists
+    // (so Web Speech is picked first) but its cloud backend rejects the
+    // build at runtime with "network". The button must switch this page to
+    // server dictation and retry the take the user already started.
+    const onInterim = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} onInterim={onInterim} />
+      </CapabilitiesContext.Provider>,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+
+    fireEvent.click(button);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    // The take restarted on the server path, with no error tooltip for
+    // the silent switch, and partials flow.
+    expect(sessionStartMock).toHaveBeenCalledTimes(1);
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveAttribute("title", "Voice dictation");
+    act(() => sessionEvents?.onPartial("via server"));
+    expect(onInterim).toHaveBeenCalledWith("via server");
+
+    // The switch is sticky: later takes go straight to the server.
+    await clickMic(); // stop
+    await clickMic(); // start again
+    expect(sessionStartMock).toHaveBeenCalledTimes(2);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the plain error path when the server offers no dictation", async () => {
+    render(
+      <CapabilitiesContext.Provider
+        value={{ ...DICTATION_INFO, dictation_available: false }}
+      >
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
+    await act(async () => handlers.error?.({ error: "network" }));
+    expect(sessionStartMock).not.toHaveBeenCalled();
+    expect(button).toHaveAttribute("title", "Dictation unavailable");
   });
 
   it("cancels the session when the composer goes disabled mid-take", async () => {
