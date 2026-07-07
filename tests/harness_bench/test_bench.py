@@ -148,9 +148,305 @@ async def test_offline_render_produces_matrix() -> None:
     assert "Harness capability matrix" in md
     for profile in _OFFICIAL:
         assert profile.harness in md
-    # JSON is well-formed and carries every harness.
+    # The harness column is labelled with the *resolved* transport: an SDK
+    # harness shows its full-server default (not the sdk-inproc family marker),
+    # a native shows the short `native` label.
+    assert "`claude-sdk [full-server]`" in md
+    assert "`claude-native [native]`" in md
+    # JSON is well-formed and carries every harness, plus the resolved transport.
     payload = json.loads(render_json(matrix))
     assert {h["harness"] for h in payload["harnesses"]} == {p.harness for p in _OFFICIAL}
+    by_harness = {h["harness"]: h for h in payload["harnesses"]}
+    assert by_harness["claude-sdk"]["resolved_transport"] == "full-server"
+    assert by_harness["claude-native"]["resolved_transport"] == "native-tui"
+
+
+def test_grid_already_shown_only_for_grid_drawing_sink() -> None:
+    """_grid_already_shown is True only for a sink that painted the grid."""
+    from tests.harness_bench.__main__ import _grid_already_shown
+    from tests.harness_bench.events import LineSink
+
+    assert _grid_already_shown(None) is False
+    assert _grid_already_shown(LineSink(lambda _m: None)) is False
+
+    class _GridSink:
+        drew_grid = True
+
+    assert _grid_already_shown(_GridSink()) is True
+
+
+async def test_render_table_grid_false_drops_grid_keeps_footer() -> None:
+    """grid=False omits the heading + glyph rows but keeps the legend/notes.
+
+    This is what the CLI emits when the rich live table already painted the grid
+    on the same terminal: the report should add the per-cell explanations, not
+    reprint the grid.
+    """
+    from tests.harness_bench.report import render_table
+
+    matrix = await run_bench(_OFFICIAL, live=False)
+    full = render_table(matrix, declared=True, grid=True)
+    footer = render_table(matrix, declared=True, grid=False)
+
+    # The full render has the heading + a harness row; the footer-only render
+    # has neither, but both carry the legend.
+    assert "Harness capability matrix" in full
+    assert "claude-sdk" in full
+    assert "Harness capability matrix" not in footer
+    assert "claude-sdk" not in footer
+    assert "Legend:" in footer
+    # The offline note is suppressed, so a declared render's footer is just the
+    # legend -- no dangling "Notes:" header.
+    assert footer.strip().startswith("Legend:")
+
+
+# ── Progress events / rich / parallel / report (offline) ─────────
+
+
+async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None:
+    """run_harness emits typed events; a bare-callable progress adapts to LineSink.
+
+    Uses a fake driver so no creds/subprocess are needed: a basic turn passes,
+    which lets every probe run and produce a ProbeFinished.
+    """
+    from tests.harness_bench.driver import TurnResult
+    from tests.harness_bench.events import (
+        HarnessFinished,
+        HarnessStarted,
+        ProbeFinished,
+        ProbeStarted,
+        ProgressSink,
+    )
+
+    class _CaptureSink:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def emit(self, event) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            pass
+
+    assert isinstance(_CaptureSink(), ProgressSink)  # structural conformance
+
+    class _OKDriver:
+        transport = "sdk-inproc"
+
+        def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+            pass
+
+        @staticmethod
+        def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            pass
+
+        async def run_basic_turn(self, marker: str) -> TurnResult:
+            return TurnResult(completed=True, text=marker)
+
+        async def run_streaming_turn(self) -> TurnResult:
+            return TurnResult(completed=True, text_delta_count=5)
+
+        async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+            return TurnResult(completed=True)
+
+        async def run_interrupt_turn(self) -> TurnResult:
+            return TurnResult(cancelled=True)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _OKDriver,
+    )
+    try:
+        profile = BenchProfile(
+            harness="fake-sdk", model="m", env_prefix="HARNESS_FAKE_SDK_", marker="FAKE_OK"
+        )
+        sink = _CaptureSink()
+        await run_harness(profile, databricks_profile="oss", live=True, progress=sink)
+    finally:
+        monkeypatch.undo()
+
+    kinds = [type(e).__name__ for e in sink.events]
+    assert kinds[0] == "HarnessStarted"
+    assert isinstance(sink.events[0], HarnessStarted)
+    assert kinds[-1] == "HarnessFinished"
+    assert isinstance(sink.events[-1], HarnessFinished)
+    # Every probe that ran emits a started+finished pair.
+    assert any(isinstance(e, ProbeStarted) for e in sink.events)
+    finished = [e for e in sink.events if isinstance(e, ProbeFinished)]
+    assert {e.probe for e in finished} >= {"basic_turn", "streaming"}
+
+    # A bare callable is adapted to a LineSink (structured events → lines).
+    lines: list[str] = []
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _OKDriver,
+    )
+    try:
+        await run_harness(profile, databricks_profile="oss", live=True, progress=lines.append)
+    finally:
+        monkeypatch.undo()
+    assert any("Basic turn" in ln for ln in lines)
+
+
+async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--jobs > 1 runs harnesses concurrently but keeps report order == input order."""
+    import asyncio as _asyncio
+
+    from tests.harness_bench.driver import TurnResult
+
+    class _SlowDriver:
+        transport = "sdk-inproc"
+
+        def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+            self._h = profile.harness
+
+        @staticmethod
+        def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
+            return None
+
+        async def __aenter__(self):
+            # Reverse-stagger the delay so, without order preservation, finish
+            # order would differ from input order.
+            await _asyncio.sleep(0.02 if self._h.endswith("1") else 0.01)
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            pass
+
+        async def run_basic_turn(self, marker: str) -> TurnResult:
+            return TurnResult(completed=True, text=marker)
+
+        async def run_streaming_turn(self) -> TurnResult:
+            return TurnResult(completed=True, text_delta_count=3)
+
+        async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+            return TurnResult(completed=True)
+
+        async def run_interrupt_turn(self) -> TurnResult:
+            return TurnResult(cancelled=True)
+
+    monkeypatch.setattr(
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _SlowDriver,
+    )
+    profiles = [
+        BenchProfile(harness=f"fake-{i}", model="m", env_prefix=f"HARNESS_F{i}_", marker="X")
+        for i in range(3)
+    ]
+    matrix = await run_bench(profiles, databricks_profile="oss", live=True, jobs=3)
+    assert [r.profile.harness for r in matrix.reports] == ["fake-0", "fake-1", "fake-2"]
+
+
+async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A parallel full-server run builds ONE shared server, reused by every harness.
+
+    Verifies the shared-server optimization: instead of N server+runner boots,
+    one SharedFullServer is entered once and each harness registers its own
+    agent+session on it.
+    """
+    from tests.harness_bench.driver import TurnResult
+
+    built: list[object] = []
+
+    class _FakeShared:
+        def __init__(self, db_profile: str) -> None:
+            built.append(self)
+            self.registered: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+        def register_agent(self, profile, *, deny: bool) -> str:
+            self.registered.append(profile.harness)
+            return f"bench-{profile.harness}"
+
+        def create_session(self, agent_name: str) -> str:
+            return f"sess-{agent_name}"
+
+    # A full-server driver that records which shared server it was handed.
+    class _FSDriver:
+        transport = "full-server"
+
+        def __init__(self, profile, *, databricks_profile: str, shared=None) -> None:
+            self._profile = profile
+            self._shared = shared
+
+        @staticmethod
+        def unavailable(profile, *, databricks_profile):
+            return None
+
+        async def __aenter__(self):
+            assert self._shared is not None  # parallel run injected the shared server
+            self._shared.register_agent(self._profile, deny=False)
+            self._shared.create_session(f"bench-{self._profile.harness}")
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            pass
+
+        async def run_basic_turn(self, marker: str) -> TurnResult:
+            return TurnResult(completed=True, text=marker)
+
+        async def run_streaming_turn(self) -> TurnResult:
+            return TurnResult(completed=True, text_delta_count=3)
+
+        async def run_tool_turn(self, *, deny: bool) -> TurnResult:
+            return TurnResult(completed=True, tool_call_denied=deny)
+
+        async def run_interrupt_turn(self) -> TurnResult:
+            return TurnResult(cancelled=True)
+
+    # bench imports SharedFullServer into its own namespace, so patch it there.
+    monkeypatch.setattr("tests.harness_bench.bench.SharedFullServer", _FakeShared)
+    monkeypatch.setattr(
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _FSDriver,
+    )
+
+    profiles = [
+        BenchProfile(
+            harness=f"fs-{i}",
+            model="m",
+            env_prefix=f"HARNESS_FS{i}_",
+            marker="X",
+            transport="full-server",
+        )
+        for i in range(3)
+    ]
+    matrix = await run_bench(
+        profiles, databricks_profile="oss", live=True, jobs=3, transport="full-server"
+    )
+    # Exactly one shared server, and all three harnesses registered on it.
+    assert len(built) == 1
+    assert sorted(built[0].registered) == ["fs-0", "fs-1", "fs-2"]
+    assert [r.profile.harness for r in matrix.reports] == ["fs-0", "fs-1", "fs-2"]
+
+
+def test_cli_writes_report_file(tmp_path) -> None:
+    """`--report PATH` writes the matrix; format follows the extension."""
+    from tests.harness_bench.__main__ import main
+
+    md = tmp_path / "matrix.md"
+    rc = main(["--no-live", "--report", str(md)])
+    assert rc == 0
+    text = md.read_text()
+    assert "Harness capability matrix" in text and "| Harness |" in text
+
+    js = tmp_path / "matrix.json"
+    main(["--no-live", "--report", str(js)])
+    payload = json.loads(js.read_text())
+    assert payload.get("harnesses")
 
 
 # ── Live layer (gated) ──────────────────────────────────────────
@@ -267,7 +563,7 @@ async def test_provisioning_failure_skips_and_tears_down(monkeypatch: pytest.Mon
     )
     monkeypatch.setattr(
         "tests.harness_bench.bench.resolve_driver_class",
-        lambda p, *, override: _FailingDriver,
+        lambda p, *, override=None, fast=False: _FailingDriver,
     )
 
     report = await run_harness(profile, databricks_profile="oss", live=True)
@@ -275,6 +571,68 @@ async def test_provisioning_failure_skips_and_tears_down(monkeypatch: pytest.Mon
     assert report.skipped_reason is not None and "provisioning failed" in report.skipped_reason
     assert all(c.observed is Verdict.SKIPPED for c in report.cells)
     assert torn_down == [True], "provisioning-failure path must tear down the driver"
+
+
+async def test_expected_provisioning_error_logged_quietly(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """A ProvisioningError skips at INFO (no traceback); a generic error warns.
+
+    The branch split keeps the matrix readable: a known-unrunnable environment
+    (own-auth native not logged in) logs only its reason, while an unexpected
+    exception keeps its full stack so a genuine driver bug can't hide behind a
+    green-looking skip.
+    """
+    import logging
+
+    from tests.harness_bench.driver import ProvisioningError
+
+    def _driver_raising(exc: Exception):
+        class _D:
+            transport = "stub"
+
+            def __init__(self, profile, *, databricks_profile: str) -> None:
+                pass
+
+            @staticmethod
+            def unavailable(profile, *, databricks_profile):
+                return None
+
+            async def __aenter__(self):
+                raise exc
+
+            async def __aexit__(self, *e: object) -> None:
+                pass
+
+        return _D
+
+    profile = BenchProfile(harness="stub", model="m", env_prefix="HARNESS_STUB_", marker="X")
+
+    # Expected failure → a single INFO record, no exception/traceback attached.
+    monkeypatch.setattr(
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _driver_raising(
+            ProvisioningError("cli not logged in")
+        ),
+    )
+    with caplog.at_level(logging.INFO, logger="tests.harness_bench.bench"):
+        await run_harness(profile, databricks_profile="oss", live=True)
+    provisioning_logs = [r for r in caplog.records if "stub" in r.getMessage()]
+    assert provisioning_logs, "expected a log line for the skip"
+    assert all(r.levelno == logging.INFO and r.exc_info is None for r in provisioning_logs)
+
+    # Unexpected failure → WARNING with the traceback attached.
+    caplog.clear()
+    monkeypatch.setattr(
+        "tests.harness_bench.bench.resolve_driver_class",
+        lambda p, *, override=None, fast=False: _driver_raising(RuntimeError("boom")),
+    )
+    with caplog.at_level(logging.INFO, logger="tests.harness_bench.bench"):
+        await run_harness(profile, databricks_profile="oss", live=True)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings and any(r.exc_info is not None for r in warnings), (
+        "an unexpected provisioning failure must keep its traceback"
+    )
 
 
 # ── native-tui transport (offline) ──────────────────────────────
@@ -309,6 +667,71 @@ def test_native_tui_registered_and_gates() -> None:
 
     # No profile → the same capability-neutral skip contract as other drivers.
     assert NativeTuiDriver.unavailable(claude_native, databricks_profile=None) is not None
+
+
+def test_transport_resolution_family_default_and_fast() -> None:
+    """SDK family defaults to full-server; --fast downgrades it; natives unaffected.
+
+    This is the core of the "full-server by default, --fast to opt out" model:
+    the profile's transport is a family marker, and the effective driver comes
+    from family + flags (see resolve_transport_name).
+    """
+    from tests.harness_bench.transport import resolve_transport_name
+
+    sdk = BenchProfile(
+        harness="codex", model="m", env_prefix="X_", marker="X", transport="sdk-inproc"
+    )
+    native = BenchProfile(
+        harness="claude-native", model="m", env_prefix="X_", marker="X", transport="native-tui"
+    )
+
+    # SDK family: full-server by default, sdk-inproc under --fast.
+    assert resolve_transport_name(sdk, override=None, fast=False) == "full-server"
+    assert resolve_transport_name(sdk, override=None, fast=True) == "sdk-inproc"
+
+    # native: a single transport --fast does not touch.
+    assert resolve_transport_name(native, override=None, fast=False) == "native-tui"
+    assert resolve_transport_name(native, override=None, fast=True) == "native-tui"
+
+    # An explicit --transport wins over both the default and --fast, for any
+    # family (the caller validates the name against the registry separately).
+    assert resolve_transport_name(sdk, override="sdk-inproc", fast=False) == "sdk-inproc"
+    assert resolve_transport_name(sdk, override="native-tui", fast=True) == "native-tui"
+
+
+async def test_native_provisioning_http_error_becomes_provisioning_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An HTTP failure in native provisioning surfaces as a ProvisioningError.
+
+    goose-native's terminal-ensure can 500 (the vendor cannot start a thread) —
+    an environment/server-state gap, not a bench bug. __aenter__ must convert
+    the raw httpx error into a ProvisioningError so run_harness logs it quietly
+    (one INFO line) instead of dumping a traceback.
+    """
+    import httpx
+
+    from tests.harness_bench.driver import ProvisioningError
+    from tests.harness_bench.native_tui_driver import NativeTuiDriver
+
+    profile = BenchProfile(
+        harness="claude-native",
+        model="m",
+        env_prefix="HARNESS_CLAUDE_NATIVE_",
+        marker="X",
+        transport="native-tui",
+    )
+    driver = NativeTuiDriver(profile, databricks_profile="oss")
+
+    def _boom() -> None:
+        request = httpx.Request("POST", "http://localhost/resources/terminals")
+        response = httpx.Response(500, request=request)
+        raise httpx.HTTPStatusError("500", request=request, response=response)
+
+    monkeypatch.setattr(driver, "_provision", _boom)
+    with pytest.raises(ProvisioningError) as exc_info:
+        await driver.__aenter__()
+    assert "500" in str(exc_info.value)
 
 
 def test_full_server_skips_native_with_accurate_message() -> None:
