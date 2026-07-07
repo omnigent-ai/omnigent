@@ -1205,6 +1205,36 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-worktree-option")).toBeNull();
   });
 
+  it("generates a unique worktree branch name and sends it on create", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    // Clicking the generate button fills a "worktree-<hex>" name.
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-branch-generate"));
+    const branchInput = screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement;
+    expect(branchInput.value).toMatch(/^worktree-[0-9a-f]{8}$/);
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "spin up a scratch worktree" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      git?: { branch_name: string };
+    };
+    // The generated name rides through as a new-worktree create.
+    expect(body.git?.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
   it("shows no conflict banner when no live session shares the directory", async () => {
     // Default setup: no other directory sessions → nothing to warn about.
     renderLanding();
