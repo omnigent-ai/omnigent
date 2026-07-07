@@ -346,7 +346,7 @@ class HermesExecutor(Executor):
         """
         return True
 
-    async def _check_modelgate(self, *, purpose: str, model: str | None) -> str | None:
+    async def _check_modelgate(self, *, purpose: str, model: str) -> str | None:
         """
         Run the ModelGate B1 policy check before spawning a Hermes turn.
 
@@ -356,14 +356,16 @@ class HermesExecutor(Executor):
         interactive ``hermes-admin``/``hermes-agent`` CLI launch, instead of
         re-implementing the policy logic in-process.
 
-        Only called when ``AI_RUN_PURPOSE`` is explicitly set (see
-        :meth:`run_turn`); fails closed (denies) if the check binary is
-        missing or errors, since an explicit purpose tag is a deliberate
-        request for enforcement — silently skipping it would defeat the
-        point.
+        Only called when ``AI_RUN_PURPOSE`` is explicitly present in the
+        environment (see :meth:`run_turn`); fails closed (denies) if the
+        check binary is missing or errors, since an explicit purpose tag is
+        a deliberate request for enforcement — silently skipping it would
+        defeat the point.
 
         :param purpose: The ``AI_RUN_PURPOSE`` value driving this dispatch.
-        :param model: Resolved model identifier, if any.
+        :param model: The model that will actually be in effect for the
+            spawned Hermes process — resolved by :meth:`_resolve_effective_model`,
+            never the possibly-``None`` config/instance override directly.
         :returns: A human-readable denial message if the gate blocks this
             launch, or ``None`` if the launch is allowed.
         """
@@ -404,6 +406,32 @@ class HermesExecutor(Executor):
         )
         return reason
 
+    def _resolve_effective_model(self, explicit_model: str | None) -> str | None:
+        """
+        Resolve the model that will actually be in effect for the Hermes
+        process about to be spawned.
+
+        An explicit override (``config.model`` / ``self._model``, threaded
+        through to the CLI as ``-m``) always wins. Absent one, Hermes falls
+        back to its own ``~/.hermes/config.yaml`` (``model.default``) — the
+        same source :func:`_populate_hermes_home` merges into the
+        per-session ``HERMES_HOME``, so reading it here mirrors what the
+        spawned process will actually resolve instead of guessing "no
+        override" means "no model check needed".
+
+        :param explicit_model: The ``-m``-equivalent override, if any.
+        :returns: The model that will actually be in effect, or ``None`` if
+            it cannot be determined (no override and no configured default).
+        """
+        if explicit_model:
+            return explicit_model
+        model_cfg = _load_user_hermes_config().get("model")
+        if isinstance(model_cfg, dict):
+            default = model_cfg.get("default")
+            if isinstance(default, str) and default:
+                return default
+        return None
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -439,11 +467,27 @@ class HermesExecutor(Executor):
         model = (config.model if config else None) or self._model
 
         # ModelGate B1 gate (opt-in — see module docstring). Only runs when
-        # AI_RUN_PURPOSE is explicitly set; absent that, this is a no-op and
-        # behavior is identical to before this gate existed.
-        purpose = os.environ.get("AI_RUN_PURPOSE")
-        if purpose:
-            gate_denial = await self._check_modelgate(purpose=purpose, model=model)
+        # AI_RUN_PURPOSE is explicitly present in the environment (checked by
+        # key, not truthiness — an explicitly empty value must still gate);
+        # absent the key entirely, this is a no-op and behavior is identical
+        # to before this gate existed.
+        if "AI_RUN_PURPOSE" in os.environ:
+            purpose = os.environ["AI_RUN_PURPOSE"]
+            effective_model = self._resolve_effective_model(model)
+            if effective_model is None:
+                # Fail closed: an explicit purpose tag is a deliberate request
+                # for enforcement. Spawning with an unresolved model would let
+                # Hermes fall through to whatever its own config.yaml default
+                # is without the gate ever having seen it.
+                gate_denial = (
+                    "ModelGate check requires a resolved model, but no explicit "
+                    "model override was given and no default model could be "
+                    "read from ~/.hermes/config.yaml; refusing to launch Hermes "
+                    f"with explicit AI_RUN_PURPOSE={purpose!r} against an "
+                    "unknown effective model."
+                )
+            else:
+                gate_denial = await self._check_modelgate(purpose=purpose, model=effective_model)
             if gate_denial is not None:
                 _logger.warning("Hermes launch blocked by ModelGate: %s", gate_denial)
                 yield ExecutorError(message=gate_denial, retryable=False)
