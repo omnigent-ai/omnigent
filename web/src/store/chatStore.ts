@@ -73,6 +73,7 @@ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
 import {
   terminalInfoFromResource,
@@ -557,6 +558,16 @@ export interface ChatState {
    */
   maybeFlushQueuedHead: () => void;
   /**
+   * Flush queued messages for conversations OTHER than the active one, whose
+   * status in the `["conversations"]` cache is idle. The active conversation is
+   * owned by {@link maybeFlushQueuedHead}; this covers a queue whose session the
+   * user has navigated away from (its SSE stream is gone, so it can't drain
+   * itself). POSTs one message per idle conversation per call, via `postEvent`
+   * (no active-session state touched, no optimistic bubble — it re-hydrates on
+   * return). Level-triggered + idempotent; safe to over-fire.
+   */
+  flushBackgroundQueues: () => void;
+  /**
    * Invoke a skill by posting a ``slash_command`` event — the same wire
    * shape the REPL sends. The server resolves the skill, persists the
    * visible receipt + hidden ``<skill>`` meta message, and forwards the
@@ -645,6 +656,16 @@ let sendChain: Promise<void> = Promise.resolve();
 let flashTimer: ReturnType<typeof setTimeout> | null = null;
 const workspaceInvalidationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+// Background-flush throttle, kept OUT of store state so it can't re-trigger the
+// queue effect. A conversation currently mid-POST (inFlight) or in its
+// post-failure cooldown is skipped, so `flushBackgroundQueues` can't spin into
+// a tight retry loop against a persistently-failing idle conversation — a
+// failed POST leaves it idle in the cache, which would otherwise re-fire on
+// every re-queue. Cooldown paces retries to roughly the sidebar poll cadence.
+const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
+const backgroundFlushInFlight = new Set<string>();
+const backgroundFlushCooldownUntil = new Map<string, number>();
+
 // Must match the @keyframes user-msg-flash duration in index.css.
 const FLASH_DURATION_MS = 800;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
@@ -690,6 +711,8 @@ export function initChatStore(client: QueryClient): void {
     clearTimeout(timer);
   }
   workspaceInvalidationTimers.clear();
+  backgroundFlushInFlight.clear();
+  backgroundFlushCooldownUntil.clear();
   queryClient = client;
 }
 
@@ -908,6 +931,87 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     set({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+  },
+
+  flushBackgroundQueues: () => {
+    const s = get();
+    if (queryClient === null || s.queuedMessages.length === 0) return;
+
+    // Conversations (other than the active one) that have a queued message.
+    // The active conversation is owned by maybeFlushQueuedHead.
+    const candidateIds = new Set(
+      s.queuedMessages.map((m) => m.conversationId).filter((id) => id !== s.conversationId),
+    );
+    if (candidateIds.size === 0) return;
+
+    // Per-conversation status from the sidebar cache (kept live by the WS
+    // /v1/sessions/updates overlay + poll), so we can tell whether a
+    // navigated-away conversation is idle without its SSE stream. A conversation
+    // scrolled past the loaded pages has no row here → treated as not-idle and
+    // left for the foreground flush when the user navigates back to it.
+    const statusById = new Map<string, string | undefined>();
+    for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["conversations"],
+    })) {
+      for (const page of data?.pages ?? []) {
+        for (const row of page.data) {
+          if (candidateIds.has(row.id) && !statusById.has(row.id)) {
+            statusById.set(row.id, row.status);
+          }
+        }
+      }
+    }
+
+    // One message per idle conversation per call: POSTing makes it busy, so the
+    // next idle (via WS/poll) triggers this again for the next message (FIFO).
+    const now = Date.now();
+    for (const conversationId of candidateIds) {
+      if (statusById.get(conversationId) !== "idle") continue;
+      // Skip a conversation mid-POST or in its post-failure cooldown so a
+      // persistent failure can't spin this into a tight retry loop (the effect
+      // re-fires on every re-queue, and a failed POST leaves the row idle).
+      if (backgroundFlushInFlight.has(conversationId)) continue;
+      const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
+      if (cooldownUntil !== undefined && cooldownUntil > now) continue;
+      const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
+      // Files are left for the foreground flush — background covers text only
+      // (attachments are in-memory and the user is likely still near that chat).
+      if (head === undefined || (head.files && head.files.length > 0)) continue;
+
+      // Remove BEFORE the POST so a re-entrant trigger can't double-send.
+      backgroundFlushInFlight.add(conversationId);
+      set((st) => ({
+        queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
+      }));
+      // No optimistic bubble — we're not viewing this conversation; it
+      // re-hydrates from the snapshot on return. On failure re-queue at the
+      // head (preserving this conversation's FIFO order) and set a cooldown so
+      // the next trigger backs off instead of hammering a failing runner.
+      void postEvent(conversationId, {
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text: head.text }] },
+      })
+        .catch(() => {
+          backgroundFlushCooldownUntil.set(
+            conversationId,
+            Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
+          );
+          set((st) => {
+            const idx = st.queuedMessages.findIndex((m) => m.conversationId === conversationId);
+            const at = idx === -1 ? st.queuedMessages.length : idx;
+            return {
+              queuedMessages: [
+                ...st.queuedMessages.slice(0, at),
+                head,
+                ...st.queuedMessages.slice(at),
+              ],
+            };
+          });
+        })
+        .finally(() => {
+          backgroundFlushInFlight.delete(conversationId);
+        });
+    }
   },
 
   send: async (text, agentId, files, opts) => {
