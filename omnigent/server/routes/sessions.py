@@ -202,6 +202,9 @@ from omnigent.server.schemas import (
     ChildSessionSummary,
     CompletedEvent,
     ConversationDeleted,
+    CopiedFile,
+    CopyFilesRequest,
+    CopyFilesResponse,
     CreatedSessionResponse,
     ElicitationRequestEvent,
     ElicitationRequestParams,
@@ -17868,6 +17871,173 @@ def create_sessions_router(
             "object": "session.resource.deleted",
             "deleted": True,
         }
+
+    @router.post(
+        "/sessions/{session_id}/resources/files:copy",
+        response_model=None,
+    )
+    async def copy_session_files(
+        request: Request,
+        session_id: str,
+        body: CopyFilesRequest,
+    ) -> dict[str, Any]:
+        """
+        Copy lineage-owned files into this (destination) session.
+
+        Authorizes by spawn lineage: ``body.source_session_id`` must be a
+        STRICT ancestor of this session up the ``parent_conversation_id``
+        chain — the session may not name itself as the source. Each source
+        file is read and re-stored as a new child-scoped row owned by
+        ``session_id`` — this preserves the session-scoping invariant (the
+        child reads its OWN copy; no cross-session read grant is created).
+        Validation is all-or-nothing: an unauthorized source, a missing
+        file, or a request past the copy limits copies nothing.
+
+        The request is bounded before any blob is read: the file count and
+        the summed ``StoredFile.bytes`` are checked against the copy limits
+        during metadata validation, so an over-limit request is rejected
+        without buffering a single blob. Within the limits, files are copied
+        one at a time (read → create → put) so peak memory is a single blob,
+        not the whole batch.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Destination (child) session/conversation id.
+        :param body: Source session id plus the file ids to copy.
+        :returns: A ``session.files.copied`` object carrying the
+            ``{source_file_id: new_file_id}`` mapping.
+        """
+        from omnigent.server.server_config import (
+            copy_file_count_limit,
+            copy_total_bytes_limit,
+        )
+
+        await _validate_session(session_id, request, LEVEL_EDIT)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+
+        # Lineage authorization: the source must be a STRICT ancestor up
+        # the parent_conversation_id chain. A session may not name itself
+        # as the source — the contract is "copy files down from a parent",
+        # and a top-level session has no lineage to copy from.
+        if body.source_session_id not in set(
+            _ancestor_session_ids(conversation_store, session_id)
+        ):
+            raise OmnigentError(
+                "Source session is not an ancestor of this session",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+        # Validate every source file WITHOUT reading a blob, enforcing the copy
+        # limits before any blob is read. Summing StoredFile.bytes here means
+        # an over-count or over-size request is rejected without buffering a
+        # single blob — a rejected request never spikes memory. artifact_store
+        # .exists() is a cheap metadata probe (S3 HEAD / local stat / DB row),
+        # NOT a blob read, so checking it here preserves the original
+        # "missing blob surfaces before any child row is created" guarantee
+        # without reintroducing the batch prefetch. The blobs themselves are
+        # fetched one at a time in the write loop below.
+        max_files = copy_file_count_limit()
+        max_total_bytes = copy_total_bytes_limit()
+        if len(body.file_ids) > max_files:
+            raise OmnigentError(
+                f"Cannot copy {len(body.file_ids)} files: limit is {max_files}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if len(set(body.file_ids)) != len(body.file_ids):
+            raise OmnigentError(
+                "file_ids must not contain duplicates",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sources: list[StoredFile] = []
+        total_bytes = 0
+        for file_id in body.file_ids:
+            stored = file_store.get(file_id, session_id=body.source_session_id)
+            if stored is None or not artifact_store.exists(stored.id):
+                raise OmnigentError(
+                    f"File '{file_id}' not found in source session",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            total_bytes += stored.bytes
+            if total_bytes > max_total_bytes:
+                raise OmnigentError(
+                    f"Cannot copy files: total size exceeds limit of {max_total_bytes} bytes",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            sources.append(stored)
+
+        # Commit the copies one file at a time (read → create → put) so peak
+        # memory is a single blob, not the whole batch. If any step fails
+        # mid-batch, roll back the rows/blobs already created.
+        mapping: dict[str, CopiedFile] = {}
+        created: list[str] = []
+        copied: list[StoredFile] = []
+        try:
+            for stored in sources:
+                content = artifact_store.get(stored.id)
+                new = file_store.create(
+                    session_id=session_id,
+                    filename=stored.filename,
+                    bytes=stored.bytes,
+                    content_type=stored.content_type,
+                )
+                created.append(new.id)
+                artifact_store.put(new.id, content)
+                # Carry the preserved filename + content_type back so the
+                # caller can attach the copy without a follow-up metadata GET.
+                mapping[stored.id] = CopiedFile(
+                    new_id=new.id,
+                    filename=new.filename,
+                    content_type=new.content_type,
+                )
+                copied.append(new)
+        except Exception as exc:
+            for new_id in created:
+                try:
+                    file_store.delete(new_id, session_id=session_id)
+                except Exception:  # noqa: BLE001 - rollback cleanup is best effort.
+                    _logger.warning(
+                        "Failed to delete copied file row during rollback: session=%s file_id=%s",
+                        session_id,
+                        new_id,
+                        exc_info=True,
+                    )
+                try:
+                    artifact_store.delete(new_id)
+                except Exception:  # noqa: BLE001 - rollback cleanup is best effort.
+                    _logger.warning(
+                        "Failed to delete copied file blob during rollback: session=%s file_id=%s",
+                        session_id,
+                        new_id,
+                        exc_info=True,
+                    )
+            raise OmnigentError(
+                "Failed to copy files into destination session",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
+
+        # Resource events fire only after every write lands. Publishing them
+        # inside the copy loop would emit (and persist as transcript items)
+        # ``session.resource.created`` for early files, then a later write
+        # failure would roll back the file rows/blobs without compensating
+        # those events — clients would see phantom files that no longer
+        # exist. Keep the create + event all-or-nothing together.
+        for new in copied:
+            _publish_and_persist_resource_event(
+                session_id,
+                "session.resource.created",
+                resource_id=new.id,
+                resource_type="file",
+                conversation_store=conversation_store,
+                resource=_stored_file_to_resource(session_id, new),
+            )
+
+        return CopyFilesResponse(
+            session_id=session_id,
+            mapping=mapping,
+        ).model_dump()
 
     # ── Phase 3: environment filesystem proxy endpoints ──────────
 

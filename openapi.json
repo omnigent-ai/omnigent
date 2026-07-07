@@ -980,6 +980,33 @@
         "title": "ConversationRef",
         "type": "object"
       },
+      "CopyFilesRequest": {
+        "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; `source_session_id`\nmust be a STRICT ancestor of the destination up its\n`parent_conversation_id` chain (spawn lineage) \u2014 the destination may\nnot name itself as the source. The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.",
+        "properties": {
+          "file_ids": {
+            "description": "Non-empty, unique ids of the source-owned files to copy, e.g. `[\"file_abc123\"]`.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "File Ids",
+            "type": "array",
+            "uniqueItems": true
+          },
+          "source_session_id": {
+            "description": "Session that owns the source files, e.g. `\"conv_parent\"`. Must be a strict ancestor of the destination.",
+            "title": "Source Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_session_id",
+          "file_ids"
+        ],
+        "title": "CopyFilesRequest",
+        "type": "object"
+      },
       "CreateDefaultPolicyRequest": {
         "description": "Request body for `POST /v1/policies`.",
         "properties": {
@@ -10157,6 +10184,58 @@
           }
         },
         "summary": "Get Session File Content",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/files:copy": {
+      "post": {
+        "description": "Copy lineage-owned files into this (destination) session.\n\nAuthorizes by spawn lineage: `body.source_session_id` must be a\nSTRICT ancestor of this session up the `parent_conversation_id`\nchain \u2014 the session may not name itself as the source. Each source\nfile is read and re-stored as a new child-scoped row owned by\n`session_id` \u2014 this preserves the session-scoping invariant (the\nchild reads its OWN copy; no cross-session read grant is created).\nValidation is all-or-nothing: an unauthorized source, a missing\nfile, or a request past the copy limits copies nothing.\n\nThe request is bounded before any blob is read: the file count and\nthe summed `StoredFile.bytes` are checked against the copy limits\nduring metadata validation, so an over-limit request is rejected\nwithout buffering a single blob. Within the limits, files are copied\none at a time (read \u2192 create \u2192 put) so peak memory is a single blob,\nnot the whole batch.\n\n**Parameters**\n\n- `body` \u2014 Source session id plus the file ids to copy.\n\n**Returns:** A `session.files.copied` object carrying the `{source_file_id: new_file_id}` mapping.",
+        "operationId": "copy_session_files_v1_sessions__session_id__resources_files_copy_post",
+        "parameters": [
+          {
+            "description": "Destination (child) session/conversation id.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CopyFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Copy Session Files",
         "tags": [
           "session_resources"
         ]
