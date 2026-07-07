@@ -3425,44 +3425,44 @@ export function NewChatLandingScreen() {
                               Existing worktrees
                             </span>
                             <ul className="flex flex-col gap-0.5">
-                            {filteredWorktrees.map((w) => {
-                              const selected =
-                                normalizeWorkspacePath(w.path) ===
-                                normalizeWorkspacePath(workspaceTrimmed);
-                              return (
-                                <li key={w.path}>
-                                  <button
-                                    type="button"
-                                    // onMouseDown (not onClick): fires before the
-                                    // input's blur, so the selection lands even
-                                    // though blur is about to hide the list.
-                                    onMouseDown={(e) => {
-                                      e.preventDefault();
-                                      setWorkspace(w.path);
-                                      setBranchInputFocused(false);
-                                      setWorktreePopoverOpen(false);
-                                    }}
-                                    className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent ${
-                                      selected ? "bg-accent" : ""
-                                    }`}
-                                    data-testid="new-chat-landing-worktree-option"
-                                  >
-                                    <span className="font-medium text-foreground">
-                                      {w.branch ?? "(detached)"}
-                                    </span>
-                                    {/* Tail-truncated so the disambiguating
+                              {filteredWorktrees.map((w) => {
+                                const selected =
+                                  normalizeWorkspacePath(w.path) ===
+                                  normalizeWorkspacePath(workspaceTrimmed);
+                                return (
+                                  <li key={w.path}>
+                                    <button
+                                      type="button"
+                                      // onMouseDown (not onClick): fires before the
+                                      // input's blur, so the selection lands even
+                                      // though blur is about to hide the list.
+                                      onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        setWorkspace(w.path);
+                                        setBranchInputFocused(false);
+                                        setWorktreePopoverOpen(false);
+                                      }}
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent ${
+                                        selected ? "bg-accent" : ""
+                                      }`}
+                                      data-testid="new-chat-landing-worktree-option"
+                                    >
+                                      <span className="font-medium text-foreground">
+                                        {w.branch ?? "(detached)"}
+                                      </span>
+                                      {/* Tail-truncated so the disambiguating
                                       folder shows, not a shared prefix; full
                                       path on hover. */}
-                                    <span
-                                      className="w-full truncate text-muted-foreground"
-                                      title={w.path}
-                                    >
-                                      {worktreePathTail(w.path)}
-                                    </span>
-                                  </button>
-                                </li>
-                              );
-                            })}
+                                      <span
+                                        className="w-full truncate text-muted-foreground"
+                                        title={w.path}
+                                      >
+                                        {worktreePathTail(w.path)}
+                                      </span>
+                                    </button>
+                                  </li>
+                                );
+                              })}
                             </ul>
                           </div>
                         )}

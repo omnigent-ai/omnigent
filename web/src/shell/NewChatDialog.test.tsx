@@ -1087,9 +1087,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.mouseDown(options[0]);
 
     // Selecting a worktree auto-closes the popover.
-    await waitFor(() =>
-      expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull(),
-    );
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
 
     // Reopen the chip: the warning shows and the branch field is prefilled with
     // the selected worktree's branch.
@@ -1137,9 +1135,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
     fireEvent.mouseDown(screen.getByTestId("new-chat-landing-worktree-option"));
     // Selection auto-closes the popover — reopen to edit the prefilled branch.
-    await waitFor(() =>
-      expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull(),
-    );
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
     fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
     await screen.findByTestId("new-chat-landing-existing-worktree-warning");
 
