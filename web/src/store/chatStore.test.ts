@@ -4999,6 +4999,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     labels?: Record<string, string>;
     reasoning_effort?: string | null;
     model_override?: string | null;
+    cost_control_mode_override?: "on" | "off" | null;
     parent_session_id?: string | null;
     model_options?: Array<Record<string, unknown>>;
   }
@@ -5018,6 +5019,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
           labels: overrides.labels ?? {},
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
+          cost_control_mode_override: overrides.cost_control_mode_override ?? null,
           parent_session_id: overrides.parent_session_id ?? null,
           model_options: overrides.model_options ?? [],
         });
@@ -5062,6 +5064,28 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     const state = useChatStore.getState();
     expect(state.selectedModel).toBe("claude-opus-4-7");
     expect(state.selectedEffort).toBe("high");
+  });
+
+  it("does NOT apply a sticky model to a routing-enabled session", async () => {
+    // Intelligent routing owns model selection: the bind-time sticky handoff
+    // must NOT silently re-pin the last-used model, or the server's
+    // `model_override is None` routing guard would skip and the judge would
+    // never run. (This is the claude-native repro: new chat + routing on.)
+    seedSession("conv_routing", []);
+    withSnapshot("conv_routing", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      cost_control_mode_override: "on",
+      model_override: null,
+    });
+
+    useChatStore.setState({ selectedModel: "claude-opus-4-7" });
+    await useChatStore.getState().switchTo("conv_routing");
+
+    // No model_override PATCH fired (contrast the handoff test above).
+    const patches = patchCallsFor("conv_routing");
+    expect(patches.some((p) => "model_override" in p)).toBe(false);
+    // …and the session is not mislabeled as pinned to the sticky model.
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
   });
 
   it("PATCHes sticky model and effort onto a codex-native session with no overrides", async () => {
@@ -7069,6 +7093,56 @@ describe("chatStore — setCostControlMode", () => {
     expect(body).toEqual({ cost_control_mode_override: "on" });
     // Settled state is the server echo, proving the canonical refresh ran.
     expect(useChatStore.getState().costControlModeOverride).toBe("on");
+  });
+
+  it("clears the pinned model when routing is turned on (mutual exclusion)", async () => {
+    // A session pinned to a model (e.g. Opus from the picker) must drop that
+    // pin when routing is enabled — otherwise `model_override` wins and the
+    // judge never runs. The clear rides in the SAME PATCH as the toggle.
+    seedSession("conv_cc_model", []);
+    await useChatStore.getState().switchTo("conv_cc_model");
+    useChatStore.setState({ sessionModelOverride: "claude-opus-4-7" });
+
+    // The optimistic clear is visible before the PATCH resolves.
+    const settled = useChatStore.getState().setCostControlMode("on");
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    await settled;
+
+    const patchCall = fetchMock.mock.calls.find(([u, init]) => {
+      const url = typeof u === "string" ? u : (u as URL | Request).toString();
+      return (
+        url === "/v1/sessions/conv_cc_model" &&
+        (init as RequestInit | undefined)?.method === "PATCH"
+      );
+    });
+    expect(patchCall).toBeDefined();
+    // One PATCH carries BOTH the toggle and the model clear ("default" alias).
+    expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
+      cost_control_mode_override: "on",
+      model_override: "default",
+    });
+  });
+
+  it("does NOT clear the model when routing is turned on but nothing is pinned", async () => {
+    // A model-less session (e.g. SDK) must not emit a spurious model clear —
+    // that would fire a redundant model_change and a bogus "changed to none".
+    seedSession("conv_cc_nomodel", []);
+    await useChatStore.getState().switchTo("conv_cc_nomodel");
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+
+    await useChatStore.getState().setCostControlMode("on");
+
+    const patchCall = fetchMock.mock.calls.find(([u, init]) => {
+      const url = typeof u === "string" ? u : (u as URL | Request).toString();
+      return (
+        url === "/v1/sessions/conv_cc_nomodel" &&
+        (init as RequestInit | undefined)?.method === "PATCH"
+      );
+    });
+    expect(patchCall).toBeDefined();
+    expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
+      cost_control_mode_override: "on",
+    });
   });
 
   it("sends an explicit null on clear and settles back to unset", async () => {
