@@ -1842,8 +1842,7 @@ def create_app(
         # dictation_available gates the composer mic button's server
         # speech-to-text fallback (designs/server-dictation.md). Checks
         # config presence only (extra installed + models on disk) — no
-        # model is loaded here. GET /v1/dictation additionally reports
-        # the unavailability reason for diagnostics.
+        # model is loaded here.
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()

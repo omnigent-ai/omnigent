@@ -1,12 +1,13 @@
-"""Streaming dictation routes: availability probe + transcription WebSocket.
+"""Streaming dictation route: the transcription WebSocket.
 
 This module hosts the server-side speech-to-text surface behind the
 composer mic button (``designs/server-dictation.md``):
 
-- ``GET /v1/dictation`` — capability probe. The web UI calls it once per
-  page load to decide whether the server fallback exists when the
-  browser Web Speech API is unavailable.
 - ``WS /v1/dictation/stream`` — one connection per dictation take.
+
+Availability is advertised as ``dictation_available`` on ``GET /v1/info``
+(the web UI's boot-time capability probe); there is no separate probe
+endpoint.
 
 Wire protocol on the WebSocket
 ------------------------------
@@ -38,7 +39,7 @@ any session exists — so the check is identity-level only, matching
 ``GET /v1/harnesses``: when an auth provider is configured the caller
 must be authenticated (the WebSocket handshake carries identity via the
 ingress/dev proxy exactly like the terminal-attach socket); in
-single-user/dev mode both routes are open.
+single-user/dev mode the route is open.
 
 Capacity
 --------
@@ -57,20 +58,18 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from typing import Any, Final
+from typing import Final
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, WebSocketException
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
 from omnigent.server.auth import AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,
     DictationStreamHandle,
-    engine_availability,
     get_engine,
     max_streams,
 )
-from omnigent.server.routes._auth_helpers import require_user
 
 _logger = logging.getLogger(__name__)
 
@@ -87,32 +86,23 @@ def create_dictation_router(
     auth_provider: AuthProvider | None = None,
     engine_provider: Callable[[], DictationEngine] | None = None,
 ) -> APIRouter:
-    """Build the router carrying the dictation probe and stream routes.
+    """Build the router carrying the dictation stream route.
 
     Wired into the FastAPI app under the ``/v1`` prefix in
     :func:`omnigent.server.app.create_app`.
 
-    :param auth_provider: Optional provider used to authenticate both the
-        HTTP probe and the WebSocket handshake. ``None`` preserves
-        single-user/dev behavior (open).
+    :param auth_provider: Optional provider used to authenticate the
+        WebSocket handshake. ``None`` preserves single-user/dev
+        behavior (open).
     :param engine_provider: Engine factory override for tests. Defaults
         to :func:`omnigent.server.dictation.get_engine`, which resolves
         the configured engine and loads models on first use.
-    :returns: An :class:`APIRouter` carrying the two routes.
+    :returns: An :class:`APIRouter` carrying the stream route.
     """
     router = APIRouter()
     resolve_engine = engine_provider or get_engine
     # Router-scoped so each app (and each test app) gets its own cap.
     slots = asyncio.Semaphore(max_streams())
-
-    @router.get("/dictation")
-    async def dictation_availability(request: Request) -> dict[str, Any]:
-        """Report whether the server can transcribe dictation audio."""
-        require_user(request, auth_provider)
-        if engine_provider is not None:
-            return {"available": True, "reason": None}
-        available, reason = engine_availability()
-        return {"available": available, "reason": reason}
 
     @router.websocket("/dictation/stream")
     async def dictation_stream(websocket: WebSocket) -> None:

@@ -80,16 +80,22 @@ def test_max_streams_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dictation.max_streams() == dictation.DEFAULT_MAX_STREAMS
 
 
-def test_get_engine_rebuilds_on_config_change(
-    monkeypatch: pytest.MonkeyPatch,
+def test_get_engine_is_a_singleton_and_failure_caches_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The engine singleton is keyed on configuration, not cached forever."""
+    """One engine per process; a failed load leaves the slot empty for retry."""
+    monkeypatch.setattr(dictation, "_engine", None)
+    # Unavailable (empty model dir) → raises and caches nothing.
+    monkeypatch.setattr(dictation.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setenv(dictation.MODEL_DIR_ENV, str(tmp_path))
+    with pytest.raises(RuntimeError):
+        dictation.get_engine()
+    assert dictation._engine is None
+    # Becomes available (fake engine) → loads once, then reuses.
     monkeypatch.setenv(dictation.ENGINE_ENV, dictation.ENGINE_FAKE)
     first = dictation.get_engine()
     assert isinstance(first, dictation.FakeDictationEngine)
-    assert dictation.get_engine() is first  # same config → same engine
-    monkeypatch.setenv(dictation.MODEL_DIR_ENV, "/elsewhere")
-    assert dictation.get_engine() is not first  # config changed → rebuilt
+    assert dictation.get_engine() is first
 
 
 def test_fake_stream_reveals_script_by_bytes() -> None:

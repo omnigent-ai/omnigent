@@ -6202,30 +6202,6 @@
         ]
       }
     },
-    "/v1/dictation": {
-      "get": {
-        "description": "Report whether the server can transcribe dictation audio.",
-        "operationId": "dictation_availability_v1_dictation_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Dictation Availability V1 Dictation Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Dictation Availability",
-        "tags": [
-          "dictation"
-        ]
-      }
-    },
     "/v1/harnesses": {
       "get": {
         "operationId": "list_harnesses_v1_harnesses_get",

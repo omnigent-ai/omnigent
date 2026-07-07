@@ -18,13 +18,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.server import dictation as dictation_engine
-from omnigent.server.dictation import (
-    FAKE_SCRIPT,
-    MAX_STREAMS_ENV,
-    REASON_EXTRA_NOT_INSTALLED,
-    REASON_MODELS_MISSING,
-    FakeDictationEngine,
-)
+from omnigent.server.dictation import FAKE_SCRIPT, MAX_STREAMS_ENV, FakeDictationEngine
 from omnigent.server.routes.dictation import create_dictation_router
 
 # One fake-engine "word" of audio: 100 ms of 16 kHz mono s16le.
@@ -49,34 +43,6 @@ def _fake_app(**router_kwargs: object) -> FastAPI:
     return app
 
 
-async def test_availability_reports_reason(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: object,
-) -> None:
-    """GET /v1/dictation reports models_missing against an empty model dir."""
-    monkeypatch.setenv(dictation_engine.MODEL_DIR_ENV, str(tmp_path))
-    monkeypatch.delenv(dictation_engine.ENGINE_ENV, raising=False)
-    resp = await client.get("/v1/dictation")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["available"] is False
-    # extra_not_installed on CI (no sherpa wheel); models_missing on dev
-    # machines that have the extra but point at the empty tmp dir.
-    assert body["reason"] in {REASON_EXTRA_NOT_INSTALLED, REASON_MODELS_MISSING}
-
-
-async def test_availability_with_fake_engine_env(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """OMNIGENT_DICTATION_ENGINE=fake makes the probe report available."""
-    monkeypatch.setenv(dictation_engine.ENGINE_ENV, dictation_engine.ENGINE_FAKE)
-    resp = await client.get("/v1/dictation")
-    assert resp.status_code == 200
-    assert resp.json() == {"available": True, "reason": None}
-
-
 async def test_info_carries_dictation_capability(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -86,6 +52,19 @@ async def test_info_carries_dictation_capability(
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     assert resp.json()["dictation_available"] is True
+
+
+async def test_info_reports_dictation_unavailable(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
+) -> None:
+    """Without an engine (no extra or no models) /v1/info advertises false."""
+    monkeypatch.setenv(dictation_engine.MODEL_DIR_ENV, str(tmp_path))
+    monkeypatch.delenv(dictation_engine.ENGINE_ENV, raising=False)
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["dictation_available"] is False
 
 
 def test_stream_partial_final_stop_flow() -> None:

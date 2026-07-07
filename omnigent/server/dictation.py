@@ -211,27 +211,22 @@ def engine_availability() -> tuple[bool, str | None]:
 
 _engine_lock = threading.Lock()
 _engine: DictationEngine | None = None
-_engine_key: tuple[str, ...] | None = None
 
 
 def get_engine() -> DictationEngine:
     """Return the process-wide engine, loading models on first use.
 
-    The engine is keyed on the resolved configuration so tests that
-    flip env vars (fake ↔ sherpa, different model dirs) get a fresh
-    engine instead of a stale singleton.
+    Config (env vars) is read once, on the first successful load — a
+    failed load caches nothing, so a server that gains models later
+    serves the next take without a restart. Tests never hit this: they
+    inject an engine through the router's ``engine_provider``.
 
     :raises RuntimeError: When dictation is unavailable (check
         :func:`engine_availability` first) or the model fails to load.
     """
-    global _engine, _engine_key
-    key = (
-        os.environ.get(ENGINE_ENV, ""),
-        str(_asr_dir()),
-        str(_punct_dir()),
-    )
+    global _engine
     with _engine_lock:
-        if _engine is not None and _engine_key == key:
+        if _engine is not None:
             return _engine
         if os.environ.get(ENGINE_ENV) == ENGINE_FAKE:
             _engine = FakeDictationEngine()
@@ -240,7 +235,6 @@ def get_engine() -> DictationEngine:
             if not available:
                 raise RuntimeError(f"dictation unavailable: {reason}")
             _engine = SherpaDictationEngine(_asr_dir(), _punct_dir())
-        _engine_key = key
         return _engine
 
 

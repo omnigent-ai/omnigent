@@ -85,17 +85,16 @@ extra installed **and** ASR model dir populated.
 
 ### Routes — `omnigent/server/routes/dictation.py`
 
-`create_dictation_router(*, auth_provider=None, engine_factory=None)`,
+`create_dictation_router(*, auth_provider=None, engine_provider=None)`,
 registered in `create_app` under `/v1` like every other router. Dictation is
 not session-scoped (the new-chat composer has no session yet), so auth is
 identity-level only: authenticated user required when an auth provider is
 configured, open in single-user/dev mode — the same posture as
 `GET /v1/harnesses`.
 
-- **`GET /v1/dictation`** → `{"available": bool, "reason": str | null}`.
-  The web UI probes this once (cached) to decide whether the server fallback
-  exists. `reason` is a stable machine-readable slug
-  (`"extra_not_installed"`, `"models_missing"`) for diagnostics.
+Availability rides the existing boot-time capability probe —
+`dictation_available` on **`GET /v1/info`** — rather than a dedicated
+endpoint; the UI needs one boolean, once per page load.
 
 - **`WS /v1/dictation/stream`** — wire protocol (documented in the module
   docstring, mirroring `terminal_attach.py`):
@@ -118,27 +117,32 @@ The route holds no session state; a connection is one dictation take.
 
 ## Web
 
-### Capture — `web/src/lib/dictation.ts` + `web/src/lib/pcm16-worklet.ts`
+### Capture — `web/src/lib/dictation.ts`
 
 `DictationSession` owns the full client pipeline:
-`getUserMedia({audio})` → `AudioContext` → `AudioWorkletNode` (the worklet
-downsamples from the context rate to 16 kHz and converts Float32 → Int16,
-posting ~120 ms chunks) → binary WS frames via
+`getUserMedia({audio})` → `AudioContext` → `AudioWorkletNode` (the worklet,
+inlined as a Blob module, downsamples from the context rate to 16 kHz and
+converts Float32 → Int16, posting 100 ms chunks) → binary WS frames via
 `resolveWebSocketUrl("/v1/dictation/stream")` (the same host seam the
 terminal-attach and session-updates sockets ride, so embed hosts and the
 Vite dev proxy keep working). Callbacks: `onPartial`, `onFinal`, `onError`;
 `stop()` sends `{"type":"stop"}`, resolves with the flushed tail, and
 releases the mic tracks and audio context.
 
-`fetchDictationAvailability()` probes `GET /v1/dictation` once per page load
-(memoized promise).
+Availability comes from the existing `/v1/info` capability context
+(`useServerInfo().dictation_available`) — no extra request.
 
 ### Mic button — `ComposerMicButton.tsx`
 
-Mode selection at mount: **Web Speech when present, otherwise server
-dictation when `GET /v1/dictation` reports available, otherwise render
-nothing** — no behavior change for Chrome/Safari users; Electron, Firefox,
-and Chromium gain a working button.
+Mode selection: **Web Speech when the browser has a working one, server
+dictation otherwise** — no behavior change for Chrome/Safari users;
+Electron, Firefox, and Chromium gain a working button. "Working" cannot be
+detected statically: Electron and plain Chromium expose the
+`SpeechRecognition` constructor but its cloud backend rejects them at
+runtime with a `network` error. So Web Speech stays primary whenever the
+constructor exists, and the first backend-dead error flips the page to
+server mode and retries the take the user already started; with no
+constructor at all (Firefox), server mode is picked directly.
 
 New optional prop `onInterim?: (text: string) => void`. In server mode the
 button emits `onInterim` for partial frames and the existing
@@ -152,8 +156,8 @@ mode), behavior is exactly today's.
 
 - **Server (pytest, `tests/server/routes/test_dictation.py`)**: drive the
   real route with `TestClient.websocket_connect` and a fake engine injected
-  through `engine_factory` — no sherpa dependency in CI. Cases: availability
-  endpoint (missing extra / missing models / available), ready→partial→final
+  through `engine_provider` — no sherpa dependency in CI. Cases:
+  `/v1/info` availability (with and without an engine), ready→partial→final
   →stopped flow, stop-flush, auth rejection with a no-identity provider,
   stream-cap rejection.
 - **Engine unit tests** skip unless sherpa-onnx and models are present
@@ -170,8 +174,9 @@ mode), behavior is exactly today's.
 ## Rollout / compatibility
 
 - No schema changes, no migrations, no new required deps.
-- Servers without the extra: `GET /v1/dictation` → `available: false`; the
-  web UI behaves exactly as today.
-- Old web clients against new servers: unaffected (new routes only).
-- New web clients against old servers: the availability probe 404s → treated
+- Servers without the extra: `/v1/info` reports `dictation_available: false`;
+  the web UI behaves exactly as today.
+- Old web clients against new servers: unaffected (new route + one new
+  `/v1/info` field only).
+- New web clients against old servers: `/v1/info` lacks the field → treated
   as unavailable → today's behavior.
