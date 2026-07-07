@@ -61,6 +61,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.web_map import WebMapTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
@@ -87,6 +88,7 @@ __all__ = [
     "SysTimerCancelTool",
     "SysTimerSetTool",
     "UpdateCommentTool",
+    "WebMapTool",
     "WebSearchTool",
     "any_skill_has_resources",
     "find_skill_by_name",
@@ -185,6 +187,7 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "web_map": lambda config: WebMapTool(config=config),
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,

@@ -254,6 +254,11 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
+# Priority 5f.1c: web_map — website URL discovery via Nimble's Map endpoint.
+# Runner-local so a non-OpenAI model's web_map call resolves to WebMapTool.invoke
+# (POST /v1/map), the same posture as web_search.
+_WEB_MAP_TOOLS = frozenset({"web_map"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -461,6 +466,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _WEB_MAP_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -2307,6 +2313,62 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _web_map_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``web_map`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_web_search_config_from_spec`: scans ``spec.tools.builtins``
+    for the entry named ``"web_map"`` and returns its ``config`` (credentials +
+    optional ``limit``). Empty dict when the builtin is a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The web_map config dict, e.g. ``{"api_key": "...", "limit": "50"}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "web_map":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_web_map_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``web_map`` tool call to Nimble's Map endpoint.
+
+    Builds ``WebMapTool`` from the spec's ``web_map`` builtin config and runs its
+    synchronous ``invoke`` off the event loop (the backend makes a blocking HTTP
+    call), mirroring :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``url`` (required).
+    :param agent_spec: Parent agent's spec; carries the web_map config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The formatted link list, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.web_map import WebMapTool
+
+    config = _web_map_config_from_spec(agent_spec)
+    tool = WebMapTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "web_map",
+        agent_id=agent_id or "web_map",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _has_subagent(
     sub_agent_name: str,
     agent_spec: Any | None,
@@ -4123,6 +4185,14 @@ async def execute_tool(
             )
         elif tool_name in _WEB_SEARCH_TOOLS:
             output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _WEB_MAP_TOOLS:
+            output = await _execute_web_map_tool(
                 args,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
