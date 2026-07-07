@@ -33,7 +33,7 @@ import time
 from sqlalchemy import and_, delete, exists, select, update
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import SqlAccountToken, SqlUser
+from omnigent.db.db_models import SqlAccountToken, SqlSessionPermission, SqlUser
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -195,15 +195,17 @@ class SqlAlchemyAccountStore:
             return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
 
     def delete_user(self, user_id: str) -> bool:
-        """Delete a user row and cascade their permission grants.
+        """Delete a user row and their permission grants.
 
-        Cascade is via the existing ``ON DELETE CASCADE`` foreign
-        key on ``session_permissions`` (set up by the original
-        permissions migration).
+        Explicitly deletes all ``session_permissions`` rows for the user
+        before removing the user row — the DB no longer cascades this.
 
-        :returns: ``True`` if a row was deleted, ``False`` otherwise.
+        :returns: ``True`` if a user row was deleted, ``False`` otherwise.
         """
         with self._session() as session:
+            session.execute(
+                delete(SqlSessionPermission).where(SqlSessionPermission.user_id == user_id)
+            )
             result = session.execute(delete(SqlUser).where(SqlUser.id == user_id))
             return result.rowcount > 0
 

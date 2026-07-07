@@ -28,9 +28,12 @@ from omnigent.db.db_models import (
     AGENT_KIND_SESSION,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
+    SqlComment,
     SqlConversation,
     SqlConversationItem,
     SqlConversationLabel,
+    SqlPolicy,
+    SqlSessionPermission,
     SqlUserDailyCost,
 )
 from omnigent.db.utils import (
@@ -1202,7 +1205,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             or ``None`` when the session has no real (non-public)
             permission grants.
         """
-        from omnigent.db.db_models import SqlSessionPermission
         from omnigent.server.auth import RESERVED_USER_PUBLIC
 
         with self._session() as session:
@@ -1549,8 +1551,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .order_by(SqlConversationLabel.value)
             )
             if accessible_by is not None:
-                from omnigent.db.db_models import SqlSessionPermission
-
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
                     SqlSessionPermission.user_id == accessible_by
                 )
@@ -1679,8 +1679,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # because their agent_id column is NULL.
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if accessible_by is not None:
-                from omnigent.db.db_models import SqlSessionPermission
-
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
                     SqlSessionPermission.user_id == accessible_by
                 )
@@ -2614,12 +2612,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
 
-            # Replace the session-scoped agent. Null the forward pointer first:
-            # conversations.agent_id is ON DELETE CASCADE, so deleting the old
-            # agent row while it is still referenced would cascade-delete the
-            # whole conversation. Only delete the old agent if it is
-            # session-scoped (kind='session') — template/built-in agents are
-            # shared and must never be deleted here.
+            # Null the forward pointer before deleting the old agent so
+            # SQLAlchemy's identity map doesn't hold a reference to a deleted
+            # row when it flushes. The DB no longer enforces any cascade here,
+            # but the ORM still tracks the relationship. Only delete
+            # session-scoped agents — template/built-in agents are shared.
             old_agent_id = row.agent_id
             row.agent_id = None
             session.flush()
@@ -2694,11 +2691,13 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
-        Delete a conversation, its items, related tasks, and FTS
-        records.
+        Delete a conversation and all of its descendants, cleaning up
+        every related row explicitly (no DB-level CASCADE).
 
-        Deletes in FK-safe order: tasks, FTS records, items,
-        then the conversation itself.
+        Collects the full subtree of conversation IDs (the target plus
+        all direct/indirect children), then deletes their items, labels,
+        comments, policies, and session-permission rows before deleting
+        the conversation rows themselves (children before parent).
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -2709,12 +2708,51 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlConversation, conversation_id)
             if not row:
                 return False
-            # Delete conversation items and FTS before the conversation row
-            # (FK constraints: items reference the conversation).
-            delete_fts_by_conversation(session, conversation_id)
+
+            # Collect all descendant IDs via a recursive CTE so we can
+            # clean up the full subtree in one pass.
+            cte = (
+                select(SqlConversation.id)
+                .where(SqlConversation.id == conversation_id)
+                .cte(name="subtree", recursive=True)
+            )
+            cte = cte.union_all(
+                select(SqlConversation.id).where(
+                    SqlConversation.parent_conversation_id == cte.c.id
+                )
+            )
+            subtree_ids_rows = session.execute(select(cte.c.id)).fetchall()
+            subtree_ids = [r[0] for r in subtree_ids_rows]
+
+            # Delete per-conversation child rows for every conversation in
+            # the subtree before touching the conversation rows themselves.
+            for conv_id in subtree_ids:
+                delete_fts_by_conversation(session, conv_id)
+
             session.execute(
                 delete(SqlConversationItem).where(
-                    SqlConversationItem.conversation_id == conversation_id
+                    SqlConversationItem.conversation_id.in_(subtree_ids)
+                )
+            )
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.conversation_id.in_(subtree_ids)
+                )
+            )
+            session.execute(delete(SqlComment).where(SqlComment.conversation_id.in_(subtree_ids)))
+            session.execute(delete(SqlPolicy).where(SqlPolicy.session_id.in_(subtree_ids)))
+            session.execute(
+                delete(SqlSessionPermission).where(
+                    SqlSessionPermission.conversation_id.in_(subtree_ids)
+                )
+            )
+
+            # Delete conversation rows children-first so any residual
+            # ordering constraints are satisfied.
+            session.execute(
+                delete(SqlConversation).where(
+                    SqlConversation.id.in_(subtree_ids),
+                    SqlConversation.id != conversation_id,
                 )
             )
             session.delete(row)

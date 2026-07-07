@@ -120,17 +120,23 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
 
 
 def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None:
-    """conversations.agent_id FK rejects a reference to a nonexistent agent."""
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "INSERT INTO conversations"
-                    " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                    " VALUES (:id, :ts, :ts, :id, 'default', :agent_id)"
-                ),
-                {"id": "conv_missing", "ts": 1700000002, "agent_id": "ag_nonexistent"},
-            )
+    """Without DB FK, conversations.agent_id accepts any value including nonexistent agents.
+
+    Referential integrity is now the application's responsibility.
+    """
+    # No IntegrityError expected — FK has been removed.
+    with db_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversations"
+                " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
+                " VALUES (:id, :ts, :ts, :id, 'default', :agent_id)"
+            ),
+            {"id": "conv_missing", "ts": 1700000002, "agent_id": "ag_nonexistent"},
+        )
+    # Clean up
+    with db_engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM conversations WHERE id = 'conv_missing'"))
 
 
 def test_agents_template_name_unique_index_rejects_duplicate_template(

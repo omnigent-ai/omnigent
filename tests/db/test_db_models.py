@@ -384,8 +384,12 @@ class TestSqlConversation:
             assert loaded.parent_conversation_id == "conv_parent"
             assert loaded.root_conversation_id == "conv_parent"
 
-    def test_cascade_delete_removes_children(self, db_uri: str) -> None:
-        """Deleting a parent conversation cascades to child conversations."""
+    def test_delete_parent_leaves_children_without_fk(self, db_uri: str) -> None:
+        """Without DB-level FK cascade, deleting a parent leaves child rows intact.
+
+        The application (delete_conversation) is responsible for cleaning
+        up the subtree explicitly.
+        """
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
@@ -406,8 +410,9 @@ class TestSqlConversation:
             assert p is not None
             session.delete(p)
 
+        # Without FK cascade the child is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversation, "conv_child2") is None
+            assert session.get(SqlConversation, "conv_child2") is not None
 
 
 # ── SqlConversationItem ───────────────────────────────
@@ -448,8 +453,12 @@ class TestSqlConversationItem:
                 session.add(item1)
                 session.add(item2)
 
-    def test_cascade_delete_with_conversation(self, db_uri: str) -> None:
-        """Deleting a conversation cascades to its items."""
+    def test_delete_conversation_via_orm_leaves_items_without_fk(self, db_uri: str) -> None:
+        """Without DB-level FK cascade, deleting a conversation leaves its items intact.
+
+        The application (delete_conversation) is responsible for deleting
+        items explicitly before or after deleting the conversation row.
+        """
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
@@ -464,8 +473,9 @@ class TestSqlConversationItem:
             assert c is not None
             session.delete(c)
 
+        # Without FK cascade the item is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversationItem, "msg_del") is None
+            assert session.get(SqlConversationItem, "msg_del") is not None
 
     def test_multiple_items_ordered_by_position(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)

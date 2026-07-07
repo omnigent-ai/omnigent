@@ -7,7 +7,6 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Float,
-    ForeignKey,
     Index,
     Integer,
     String,
@@ -218,12 +217,10 @@ class SqlSessionPermission(Base):
 
     user_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
     )
     conversation_id: Mapped[str] = mapped_column(
         String(64),
-        ForeignKey("conversations.id", ondelete="CASCADE"),
         primary_key=True,
     )
     level: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -320,29 +317,23 @@ class SqlConversation(Base):
     kind: Mapped[str] = mapped_column(String(32), default="default")
     parent_conversation_id: Mapped[str | None] = mapped_column(
         String(64),
-        ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=True,
     )
     root_conversation_id: Mapped[str] = mapped_column(
         String(64),
-        ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
     )
     agent_id: Mapped[str | None] = mapped_column(
         String(64),
-        ForeignKey("agents.id", ondelete="CASCADE"),
         nullable=True,
     )
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Host that launched (or should launch) the runner for this
     # session. Set when a session is created via the Web UI on a
-    # specific host. FK to hosts.host_id (a unique column); ON DELETE
-    # SET NULL so removing a host clears the binding rather than
-    # orphaning it — and host_id -> NULL keeps the
-    # workspace-required CHECK below satisfied.
+    # specific host. No FK: host records are managed outside this
+    # table; deletion is handled explicitly by the application.
     host_id: Mapped[str | None] = mapped_column(
         String(64),
-        ForeignKey("hosts.host_id", ondelete="SET NULL"),
         nullable=True,
     )
     # Per-session reasoning-effort hint, e.g. "high". Nullable;
@@ -485,7 +476,7 @@ class SqlConversationItem(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     conversation_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("conversations.id", ondelete="CASCADE")
+        String(64),
     )
     response_id: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[int] = mapped_column(Integer)
@@ -547,7 +538,6 @@ class SqlConversationLabel(Base):
 
     conversation_id: Mapped[str] = mapped_column(
         String(64),
-        ForeignKey("conversations.id", ondelete="CASCADE"),
         primary_key=True,
     )
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -654,7 +644,6 @@ class SqlPolicy(Base):
     # Nullable: NULL for server-wide default policies.
     session_id: Mapped[str | None] = mapped_column(
         String(64),
-        ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=True,
     )
     created_at: Mapped[int] = mapped_column(Integer)
