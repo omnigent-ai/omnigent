@@ -77,6 +77,14 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
 import type { RightRailTab } from "./railTabs";
 
+const CODEX_ACTIVITY_PANE_AGENT_NAMES = new Set(["glitchy-codex", "polly-codex"]);
+
+function isCodexActivityPaneAgentName(name: string | null | undefined): boolean {
+  return CODEX_ACTIVITY_PANE_AGENT_NAMES.has(
+    name?.trim().toLowerCase().replace(/[\s_]+/g, "-") ?? "",
+  );
+}
+
 /**
  * Top-level layout. The sidebar and right panels are responsive:
  *
@@ -314,7 +322,12 @@ export function AppShell() {
   // this merge an added claude-native agent loses its terminal-first
   // toggle. Snapshot wins on conflict; spreading undefined is a no-op.
   const sessionLabels = { ...activeConv?.labels, ...activeSession?.labels };
-  const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
+  const activeAgentName = activeSession?.agentName ?? activeConv?.agent_name ?? null;
+  const agentNameImpliesTerminalFirst =
+    (activeConv != null || (activeSession != null && activeSession.parentSessionId == null)) &&
+    isCodexActivityPaneAgentName(activeAgentName);
+  const terminalFirst =
+    sessionLabels["omnigent.ui"] === "terminal" || agentNameImpliesTerminalFirst;
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
   // Native-CLI wrapper of either family. Keys harness behavior gates
   // (composer slash commands, `/model`); terminal-first SDK sessions
@@ -844,8 +857,8 @@ export function AppShell() {
         return next;
       });
     },
-    [setSearchParams],
-  ); // eslint-disable-line react-hooks/exhaustive-deps
+    [clearFileViewerUrl, setSearchParams],
+  );
 
   // Switch the workspace rail's tab. The side effect (closing any open
   // file + its comments + URL) lives here, not in WorkspacePanel, so the
