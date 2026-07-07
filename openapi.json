@@ -7885,6 +7885,40 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "When set, only return children whose title starts with this agent type (the segment before the `\":\"`). Combined with `session_name` to form the exact title `\"{tool}:{session_name}\"` for server-side filtering.",
+            "in": "query",
+            "name": "tool",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tool"
+            }
+          },
+          {
+            "description": "When set alongside `tool`, only return children whose title matches `\"{tool}:{session_name}\"` exactly.",
+            "in": "query",
+            "name": "session_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Name"
+            }
           }
         ],
         "responses": {

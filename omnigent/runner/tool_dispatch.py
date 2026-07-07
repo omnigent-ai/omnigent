@@ -812,6 +812,8 @@ async def _list_child_sessions(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     limit: int = 100,
+    tool: str | None = None,
+    session_name: str | None = None,
 ) -> list[dict[str, Any]] | str:
     """
     Fetch child-session summaries for a parent session.
@@ -819,11 +821,19 @@ async def _list_child_sessions(
     :param server_client: Omnigent server client.
     :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
     :param limit: Maximum child rows to request, e.g. ``100``.
+    :param tool: When set alongside ``session_name``, filter to
+        children whose title is ``"{tool}:{session_name}"``
+        server-side.
+    :param session_name: See ``tool``.
     :returns: List of child summary dicts, or an error string.
     """
+    params: dict[str, Any] = {"limit": limit, "order": "desc"}
+    if tool and session_name:
+        params["tool"] = tool
+        params["session_name"] = session_name
     resp = await server_client.get(
         f"/v1/sessions/{conversation_id}/child_sessions",
-        params={"limit": limit, "order": "desc"},
+        params=params,
         timeout=30.0,
     )
     if resp.status_code >= 400:
@@ -849,9 +859,7 @@ async def _find_existing_child_session(
     pair continue the existing child. The runner must therefore look
     up the row before trying to create a new one; otherwise the
     server's unique child-title constraint turns a continuation into
-    a duplicate-create failure. This currently fetches up to 1000
-    children and scans locally because the child-session endpoint does
-    not provide a ``(tool, session_name)`` filter yet.
+    a duplicate-create failure.
 
     :param server_client: Omnigent server client.
     :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
@@ -863,16 +871,16 @@ async def _find_existing_child_session(
     children = await _list_child_sessions(
         server_client=server_client,
         conversation_id=conversation_id,
-        limit=1000,
+        limit=1,
+        tool=agent,
+        session_name=title,
     )
     if isinstance(children, str):
         return children
     for child in children:
         if is_session_closed(child.get("labels"), child.get("title")):
             continue
-        label = _subagent_label(child)
-        if label.agent == agent and label.title == title:
-            return child
+        return child
     return None
 
 
