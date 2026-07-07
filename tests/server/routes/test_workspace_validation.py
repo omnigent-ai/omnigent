@@ -244,6 +244,54 @@ async def test_workspace_must_be_directory(
     assert "not a directory" in exc_info.value.message
 
 
+async def test_windows_drive_workspace_is_accepted(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """
+    Verify Windows drive-absolute workspaces pass validation.
+
+    Regression coverage for Windows hosts: ``C:/...`` is absolute on the host
+    even though it does not start with POSIX ``/`` on the server.
+    """
+    registry, _, _ = host_setup
+    workspace = "C:/Users/rccol/project"
+    _set_stat(registry, workspace, canonical=workspace)
+
+    result = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace=workspace,
+        spec_cwd=".",
+    )
+
+    assert result == workspace
+
+
+async def test_windows_backslash_workspace_boundary(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """
+    Verify Windows backslash canonical paths use Windows containment rules.
+
+    The server may run on Linux while the host returns ``C:\\...`` realpaths;
+    boundary checks must not assume POSIX ``/`` separators.
+    """
+    registry, _, _ = host_setup
+    boundary = "C:\\Users\\rccol\\project"
+    workspace = "C:\\Users\\rccol\\project\\subdir"
+    _set_stat(registry, workspace, canonical=workspace)
+    _set_stat(registry, boundary, canonical=boundary)
+
+    result = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace=workspace,
+        spec_cwd=boundary,
+    )
+
+    assert result == workspace
+
+
 async def test_relative_cwd_skips_boundary_check(
     host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
 ) -> None:

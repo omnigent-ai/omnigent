@@ -41,6 +41,7 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
+from omnigent.server.routes._host_paths import normalize_host_filesystem_route_path
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
@@ -738,11 +739,10 @@ def create_hosts_router(
             (not owner), 409 (offline), 400 (path validation),
             504 (timeout), 502 (host I/O).
         """
-        # FastAPI's :path converter strips the leading slash from
-        # the URL match. Re-add it unless the path is tilde-prefixed
-        # (~/foo stays tilde-prefixed; /Users/x becomes Users/x → /Users/x).
-        if not path.startswith("~"):
-            path = "/" + path
+        # FastAPI's :path converter strips the leading POSIX slash from
+        # the URL match. Re-add it for POSIX paths while preserving Windows
+        # drive-absolute paths such as C:/Users/... and C:\Users\....
+        path = normalize_host_filesystem_route_path(path)
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,

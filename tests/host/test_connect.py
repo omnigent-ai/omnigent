@@ -18,6 +18,7 @@ from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     _build_runner_env,
+    _expand_host_path,
     _RunnerHandle,
     run_host_process,
 )
@@ -77,6 +78,27 @@ def _cleanup_host(host: HostProcess) -> None:
     host._cleanup_runners()
     for task in host._watcher_tasks:
         task.cancel()
+
+
+async def test_expand_host_path_strips_posix_prefix_from_windows_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows hosts repair older server frames that sent ``/C:/...``."""
+    monkeypatch.setattr("omnigent.host.connect.os.name", "nt")
+
+    assert _expand_host_path("/C:/Users/rccol/.omnigent") == "C:/Users/rccol/.omnigent"
+    assert _expand_host_path("/C:\\Users\\rccol\\.omnigent") == (
+        "C:\\Users\\rccol\\.omnigent"
+    )
+
+
+async def test_expand_host_path_preserves_posix_absolute_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX hosts keep absolute paths unchanged."""
+    monkeypatch.setattr("omnigent.host.connect.os.name", "posix")
+
+    assert _expand_host_path("/Users/rccol/.omnigent") == "/Users/rccol/.omnigent"
 
 
 async def test_handle_launch_spawns_subprocess(

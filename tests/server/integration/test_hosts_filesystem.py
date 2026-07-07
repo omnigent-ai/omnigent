@@ -346,6 +346,101 @@ async def test_list_filesystem_tilde_path_forwards_unchanged(
     assert resp.json()["data"][0]["name"] == "myapp"
 
 
+async def test_list_filesystem_windows_drive_path_forwards_unchanged(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """Verify raw ``C:/...`` paths are not prefixed as ``/C:/...``."""
+    from omnigent.host.frames import HostListDirEntry
+
+    app, _reg, _comm, replies, _drain = fs_setup
+    windows_path = "C:/Users/rccol/.omnigent"
+    replies[windows_path] = {
+        "entries": [
+            HostListDirEntry(
+                name="config.yaml",
+                path="C:/Users/rccol/.omnigent/config.yaml",
+                type="file",
+                bytes=5,
+                modified_at=1779980400,
+            ),
+        ],
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/C:/Users/rccol/.omnigent")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0]["name"] == "config.yaml"
+
+
+async def test_list_filesystem_encoded_windows_drive_colon_forwards_unchanged(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """Verify URL-encoded drive colons still reach the host as ``C:/...``."""
+    from omnigent.host.frames import HostListDirEntry
+
+    app, _reg, _comm, replies, _drain = fs_setup
+    windows_path = "C:/Users/rccol/.omnigent"
+    replies[windows_path] = {
+        "entries": [
+            HostListDirEntry(
+                name="logs",
+                path="C:/Users/rccol/.omnigent/logs",
+                type="directory",
+                bytes=None,
+                modified_at=1779980500,
+            ),
+        ],
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/C%3A/Users/rccol/.omnigent")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0]["name"] == "logs"
+
+
+async def test_list_filesystem_encoded_windows_backslash_path_forwards_unchanged(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """Verify encoded ``C:\\...`` paths are not converted to ``/C:\\...``."""
+    from omnigent.host.frames import HostListDirEntry
+
+    app, _reg, _comm, replies, _drain = fs_setup
+    windows_path = "C:\\Users\\rccol\\.omnigent"
+    replies[windows_path] = {
+        "entries": [
+            HostListDirEntry(
+                name="state.db",
+                path="C:\\Users\\rccol\\.omnigent\\state.db",
+                type="file",
+                bytes=10,
+                modified_at=1779980600,
+            ),
+        ],
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/filesystem/C%3A%5CUsers%5Crccol%5C.omnigent"
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"][0]["name"] == "state.db"
+
+
 # ── Error paths ─────────────────────────────────────────
 
 

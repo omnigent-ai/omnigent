@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping
@@ -122,6 +123,7 @@ _LOG_TAIL_MAX_LINES = 15
 # client's online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
+_WINDOWS_DRIVE_PATH_WITH_POSIX_ROOT_RE = re.compile(r"^/[A-Za-z]:[/\\]")
 
 # Cadence of the orphan-reaper sweep. The host installs itself as a child
 # subreaper (Linux — see :func:`_install_child_subreaper`), so a harness's
@@ -211,6 +213,19 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
         message += "\n--- runner log tail ---\n" + "\n".join(lines)
     return message
+
+
+def _expand_host_path(path: str) -> str:
+    """Expand a host path and repair POSIX-prefixed Windows drive paths.
+
+    Older route code converted ``C:/Users/...`` to ``/C:/Users/...`` before
+    sending it to Windows hosts. Strip that accidental leading slash on
+    Windows so stat/list/create/launch keep working across server skew.
+    """
+    expanded = os.path.expanduser(path)
+    if os.name == "nt" and _WINDOWS_DRIVE_PATH_WITH_POSIX_ROOT_RE.match(expanded):
+        return expanded[1:]
+    return expanded
 
 
 def _url_is_loopback(url: str) -> bool:
@@ -1022,7 +1037,7 @@ class HostProcess:
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
 
-        workspace = Path(frame.workspace).expanduser()
+        workspace = Path(_expand_host_path(frame.workspace))
         if not workspace.is_dir():
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1213,7 +1228,7 @@ class HostProcess:
             ``canonical_path`` populated when the path is reachable.
         """
         try:
-            expanded = os.path.expanduser(frame.path)
+            expanded = _expand_host_path(frame.path)
         except (TypeError, ValueError) as exc:
             # Defensive: expanduser shouldn't raise on str inputs,
             # but a malformed path could in principle. Fail loud
@@ -1289,7 +1304,7 @@ class HostProcess:
             name plus a ``has_more`` flag for the page.
         """
         try:
-            expanded = os.path.expanduser(frame.path)
+            expanded = _expand_host_path(frame.path)
         except (TypeError, ValueError) as exc:
             return HostListDirResultFrame(
                 request_id=frame.request_id,
@@ -1386,7 +1401,7 @@ class HostProcess:
             success, or an ``error`` describing why it was not created.
         """
         try:
-            expanded = os.path.expanduser(frame.path)
+            expanded = _expand_host_path(frame.path)
         except (TypeError, ValueError) as exc:
             return HostCreateDirResultFrame(
                 request_id=frame.request_id,

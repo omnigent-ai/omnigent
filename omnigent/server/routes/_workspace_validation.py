@@ -31,6 +31,7 @@ from typing import Any
 
 from omnigent.host.frames import HostStatFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.routes._host_paths import is_host_absolute_path, is_host_subpath
 
 _logger = logging.getLogger(__name__)
 
@@ -166,16 +167,7 @@ def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     :returns: ``True`` when the workspace is the boundary or
         nested under it.
     """
-    if canonical_workspace == canonical_boundary:
-        return True
-    # Add a trailing separator so ``/a/foo`` is not treated as a
-    # subpath of ``/a/fo`` (prefix collision). ``/`` is the only
-    # separator the host stat returns since ``canonical_path`` is
-    # always absolute.
-    boundary_with_sep = (
-        canonical_boundary if canonical_boundary.endswith("/") else canonical_boundary + "/"
-    )
-    return canonical_workspace.startswith(boundary_with_sep)
+    return is_host_subpath(canonical_workspace, canonical_boundary)
 
 
 async def validate_workspace(
@@ -214,11 +206,11 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
-    if not workspace.startswith("/"):
+    if not is_host_absolute_path(workspace):
         # Belt-and-suspenders. The Pydantic schema layer also
         # rejects this; pin it here so direct callers (tests,
         # other server-internal paths) can't bypass.
-        raise WorkspaceValidationError("workspace must be an absolute path starting with /")
+        raise WorkspaceValidationError("workspace must be an absolute path")
 
     display_host = host_name_for_errors or host_id
 
