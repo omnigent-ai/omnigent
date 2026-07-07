@@ -8,7 +8,7 @@ Covers the two hook changes end to end:
 - ``useSidebarToggleHotkeys`` — ``Ctrl/Cmd+Alt+[`` toggles the left sidebar
   (exercising the handler, AltGraph guard included, on a real keydown). The
   sidebar collapses to an icon rail rather than unmounting, so the assertion
-  is on the search input's rendered width, not its visibility.
+  is on the Search button's rendered width, not its visibility.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ _PINNED_KEY = "omnigent:pinned-conversation-ids"
 
 _SEARCH_WIDTH_JS = """
 () => {
-  const el = document.querySelector('input[placeholder="Search sessions"]');
+  const el = document.querySelector('[data-testid="sidebar-search-button"]');
   return el ? el.getBoundingClientRect().width : -1;
 }
 """
@@ -48,7 +48,7 @@ def test_numeric_chord_jumps_to_pinned_session(
 
 def test_bracket_chord_toggles_left_sidebar(page: Page, live_server: str) -> None:
     page.goto(live_server)
-    expect(page.get_by_placeholder("Search sessions")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("sidebar-search-button")).to_be_visible(timeout=30_000)
     expanded_width = page.evaluate(_SEARCH_WIDTH_JS)
     assert expanded_width > 100, f"sidebar unexpectedly narrow at start ({expanded_width}px)"
 
