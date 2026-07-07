@@ -83,6 +83,21 @@ Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
 into the default locations. Availability is computed lazily and cached:
 extra installed **and** ASR model dir populated.
 
+**Hardware sizing.** Any sherpa-onnx streaming transducer directory works —
+point `OMNIGENT_DICTATION_MODEL_DIR` at it. Streaming dictation needs ≥1×
+realtime decode; measured with this engine loop (int8, 4 threads, 100 ms
+chunks):
+
+| Model | Apple M-series | Intel N95 (4 E-cores, loaded box) | RAM |
+|---|---|---|---|
+| Nemotron 0.6 B (fetch-script default) | ~9× realtime | 0.6–0.7× — **too slow** | ~1.0 GB |
+| `streaming-zipformer-en-2023-06-26` | — | 1.4–2.3× realtime | ~190 MB |
+| `streaming-zipformer-en-20M` | — | 3.6–4.9× realtime | ~130 MB |
+
+On N100/N95-class mini-PC servers, use the mid-size zipformer (accuracy held
+up in spot checks; the 20 M model audibly degrades) and consider
+`OMNIGENT_DICTATION_MAX_STREAMS=1`.
+
 ### Routes — `omnigent/server/routes/dictation.py`
 
 `create_dictation_router(*, auth_provider=None, engine_provider=None)`,
