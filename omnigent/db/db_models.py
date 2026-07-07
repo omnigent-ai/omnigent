@@ -26,6 +26,9 @@ class Base(DeclarativeBase):
 AGENT_KIND_TEMPLATE = "template"
 AGENT_KIND_SESSION = "session"
 
+POLICY_SCOPE_DEFAULT = "default"
+POLICY_SCOPE_SESSION = "session"
+
 
 class SqlAgent(Base):
     """
@@ -632,6 +635,10 @@ class SqlPolicy(Base):
         the handler is a direct callable or for ``type="url"``.
     :param enabled: Whether the engine consults this row.
         Defaults to true.
+    :param scope: ``"default"`` for server-wide policies;
+        ``"session"`` for session-scoped policies. Explicit
+        discriminator so queries filter by column value instead
+        of checking ``session_id IS NULL``.
     :param created_by: User ID of the admin who created this
         policy. ``None`` in single-user mode or for
         session-scoped policies.
@@ -658,12 +665,26 @@ class SqlPolicy(Base):
     # FunctionRef.arguments pattern.
     factory_params: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, server_default=true())
+    # "default" for server-wide policies; "session" for per-conversation
+    # copies. Mirrors the agents.kind pattern so queries filter by column
+    # value rather than session_id IS NULL.
+    scope: Mapped[str] = mapped_column(String(16))
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         Index("ix_policies_created_at", "created_at"),
         Index("ix_policies_session_id", "session_id"),
         UniqueConstraint("session_id", "name", name="uq_policies_session_id_name"),
+        # Default policies must have unique names; session-scoped policies
+        # may reuse the same name across conversations. Mirrors
+        # ix_agents_template_name scoping to the 'default' set.
+        Index(
+            "ix_policies_default_name",
+            "name",
+            unique=True,
+            sqlite_where=text("scope = 'default'"),
+            postgresql_where=text("scope = 'default'"),
+        ),
     )
 
 

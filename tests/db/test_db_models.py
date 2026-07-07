@@ -668,6 +668,7 @@ class TestSqlPolicy:
         policy = SqlPolicy(
             id="pol_test1",
             name="cost-guard",
+            scope="default",
             created_at=_now(),
             type="python",
             handler="omnigent.policies.cost_guard:handler",
@@ -694,6 +695,7 @@ class TestSqlPolicy:
             id="pol_1",
             name="guard",
             session_id="conv_test1",
+            scope="session",
             created_at=_now(),
             type="python",
             handler="mod:fn",
@@ -702,6 +704,7 @@ class TestSqlPolicy:
             id="pol_2",
             name="guard",
             session_id="conv_test1",
+            scope="session",
             created_at=_now(),
             type="python",
             handler="mod:fn2",
