@@ -35,10 +35,9 @@ from omnigent.tools.base import Tool
 
 _logger = logging.getLogger(__name__)
 
-# ``ExecutorSpec.type`` defaults to this. It is the executor *type*, never a
+# ``ExecutorSpec.type`` defaults to this. It is an executor type, never a
 # registered harness, so a spec whose ``harness_kind`` resolves to it cannot be
-# spawned — the runner aborts with ``unknown harness 'omnigent'`` (see
-# ``omnigent/runtime/harnesses/process_manager.py::_resolve_module_path``).
+# spawned — the runner aborts with ``unknown harness 'omnigent'``.
 _UNBOOTABLE_DEFAULT_HARNESS: str = "omnigent"
 
 # Internal sub-agent name. Double-underscore prefix prevents
@@ -135,13 +134,8 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
 
     :param parent_spec: The parent agent's parsed spec.
     :returns: A complete AgentSpec for the web researcher sub-agent.
-    :raises OmnigentError: If the parent leg declares no bootable harness
-        (``executor.type == "omnigent"`` with no ``executor.config["harness"]``).
-        The researcher would otherwise spawn the unspawnable literal harness
-        ``"omnigent"``; failing here names the parent leg instead of surfacing
-        the cryptic runner-side ``unknown harness 'omnigent'`` crash. See the
-        guard at the end of this function for why the resolved harness is not
-        recoverable at this call site.
+    :raises OmnigentError: If the parent declares no bootable harness, so the
+        researcher would spawn the unspawnable literal harness ``"omnigent"``.
     """
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -158,30 +152,14 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         sandbox=parent_os_env.sandbox if parent_os_env is not None else None,
     )
 
-    # Inherit the parent leg's executor so the researcher runs on the SAME
-    # harness with the SAME credentials and model. The prior code copied only
-    # ``llm`` and built a bare ``ExecutorSpec(max_iterations=5)`` — defaulting
-    # ``type`` to ``"omnigent"`` with an empty ``config``. Two failures:
-    #   Layer 1: ``harness_kind`` (``config["harness"] or type``) resolves to
-    #     the literal ``"omnigent"``, so the runner aborts the spawn with
-    #     ``unknown harness 'omnigent'`` before any model routing.
-    #   Layer 2: with the parent's harness/auth gone, a gateway model like
-    #     ``z-ai/glm-5.2`` falls to the in-process native router
-    #     (``Unknown provider 'z-ai'``) and codex/claude lose their credentials.
-    # Inherit the routing-relevant executor fields: ``config["harness"]``
-    # (selection; runner/app.py:8691, 18601), ``model`` (``_resolve_spec_model``;
-    # workflow.py:1115), ``auth`` (``_resolve_provider_for_build``;
-    # workflow.py:1040), and ``connection`` (executor-level endpoint/credential
-    # overrides — carried so a parent whose routing depends on it, e.g. a
-    # programmatic spec where ``llm.connection`` and ``executor.connection`` are
-    # not parser-synced, is not silently re-routed). ``type`` is the executor
-    # discriminator — keep it so the fail-loud guard below stays correct for
-    # non-"omnigent" executors.
-    #
-    # Dropped: ``context_window`` (auto-detected from the model), ``profile``
-    # (deprecated Databricks path, subsumed by ``auth``), and the ``os_env`` key
-    # inside ``config`` (an inline-sub-spec artifact superseded by the explicit
-    # ``os_env`` above) — none are routing inputs on the harness legs.
+    # Inherit the parent leg's routing-relevant executor fields (harness, model,
+    # auth, connection, type) so the researcher runs on the SAME harness with the
+    # SAME credentials and model. The prior code built a bare
+    # ``ExecutorSpec(max_iterations=5)``, which defaults to the unspawnable
+    # ``type="omnigent"`` harness and strips the parent's provider. Drop
+    # ``context_window`` (auto-detected), ``profile`` (deprecated, subsumed by
+    # ``auth``), and the inline ``config["os_env"]`` (superseded by ``os_env``
+    # below) — none are routing inputs.
     parent_executor = parent_spec.executor
     child_executor_config = {
         key: value for key, value in parent_executor.config.items() if key != "os_env"
@@ -196,16 +174,10 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
     )
 
     # Fail loud if the inherited executor still has no bootable harness. The
-    # child session is created WITHOUT a per-session ``harness_override``
-    # (``_execute_web_fetch_tool`` passes only a prompt), so the runner resolves
-    # the child's harness SOLELY from this spec. A parent whose real harness
-    # lives only in resolved session state (e.g. an API ``harness_override`` on a
-    # spec with no ``executor.config["harness"]``) is not visible here — both
-    # call sites (``WebFetchTool.__init__`` and the ``_find_spec_by_name``
-    # resolve-miss in ``runtime/workflow.py``) hand us only the static
-    # ``AgentSpec`` — so it cannot be recovered to inherit. Fail at build time
-    # with an actionable error naming the parent, rather than emit a child that
-    # the runner later aborts with the cryptic ``unknown harness 'omnigent'``.
+    # child is spawned solely from this static spec (no per-session
+    # ``harness_override`` is threaded here), so a harness that lives only in
+    # resolved session state can't be recovered — better an actionable
+    # build-time error naming the parent than a cryptic runner-side crash.
     if child_executor.harness_kind == _UNBOOTABLE_DEFAULT_HARNESS:
         raise OmnigentError(
             f"web_fetch cannot build its {RESEARCHER_NAME} sub-agent: parent agent "
