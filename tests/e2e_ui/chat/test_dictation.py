@@ -27,6 +27,7 @@ A failure here means one of:
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from playwright.sync_api import Browser, expect
 
@@ -40,11 +41,14 @@ _TRANSCRIPT_TIMEOUT_MS = 20_000
 
 def test_dictation_streams_transcript_into_composer(
     browser: Browser,
+    browser_context_args: dict[str, Any],
     seeded_session: tuple[str, str],
 ) -> None:
     """Click the mic, speak (fake device), watch the transcript form."""
     base_url, session_id = seeded_session
-    context = browser.new_context(permissions=["microphone"])
+    # Spread the plugin's context args so --video/--tracing keep working
+    # even though this test builds its own context for the mic permission.
+    context = browser.new_context(**browser_context_args, permissions=["microphone"])
     try:
         page = context.new_page()
         # Force server mode deterministically: without Web Speech
