@@ -1199,6 +1199,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "qwen",
         "resume",
         "run",
+        "session",
         "sandbox",
         "server",
         "setup",
@@ -5540,6 +5541,112 @@ def resume(
         target=target,
         server=_resolve_server_url(server) if server else server,
     )
+
+
+@cli.group("session", invoke_without_command=True)
+@click.pass_context
+def session(ctx: click.Context) -> None:
+    """Manage Omnigent sessions.
+
+    \b
+    Examples:
+      omnigent session export --id conv_abc123
+      omnigent session export --id conv_abc123 --output transcript.jsonl
+      omnigent session export --id conv_abc123 --server https://myserver.com
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@session.command("export")
+@click.option(
+    "--id",
+    "session_id",
+    required=True,
+    metavar="SESSION_ID",
+    help="Session ID to export, e.g. conv_abc123.",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output",
+    default=None,
+    metavar="FILE",
+    help="Output file path.  Defaults to <SESSION_ID>.jsonl in the current directory.",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+def session_export(session_id: str, output: str | None, server: str | None) -> None:
+    """Export a session transcript to a portable JSONL file.
+
+    Each line of the output is a JSON object.  The first line carries
+    the session metadata (``"record_type": "session_meta"``); every
+    subsequent line is one conversation item
+    (``"record_type": "item"``).  The file preserves full turn order
+    and can be re-imported with a future ``omnigent session import``.
+
+    \b
+    Examples:
+      omnigent session export --id conv_abc123
+      omnigent session export --id conv_abc123 --output my_session.jsonl
+      omnigent session export --id conv_abc123 --server https://myserver.com
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        startup = ensure_local_omnigent_server()
+        base_url = startup.url
+
+    base_url = base_url.rstrip("/")
+    out_path = Path(output) if output else Path(f"{session_id}.jsonl")
+
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=30.0
+    ) as client:
+        # Fetch session metadata (items fetched separately via pagination).
+        resp = client.get(
+            f"/v1/sessions/{session_id}",
+            params={"include_items": "false", "include_liveness": "false"},
+        )
+        if resp.status_code == 404:
+            raise click.ClickException(f"Session {session_id!r} not found.")
+        resp.raise_for_status()
+        session_data = resp.json()
+
+        n_items = 0
+        with out_path.open("w", encoding="utf-8") as fh:
+            # First line: session metadata.
+            meta_record = {"record_type": "session_meta", **session_data}
+            fh.write(json.dumps(meta_record) + "\n")
+
+            # Remaining lines: items in ascending order, paginated.
+            after: str | None = None
+            while True:
+                params: dict[str, str | int] = {"limit": 500, "order": "asc"}
+                if after:
+                    params["after"] = after
+                items_resp = client.get(f"/v1/sessions/{session_id}/items", params=params)
+                items_resp.raise_for_status()
+                page = items_resp.json()
+                for item in page["data"]:
+                    item_record = {"record_type": "item", **item}
+                    fh.write(json.dumps(item_record) + "\n")
+                    n_items += 1
+                if not page.get("has_more"):
+                    break
+                after = page.get("last_id")
+
+    click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
 
 # Shared option help for ``run`` and the harness commands. These are the same
