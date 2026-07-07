@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
+import sys
+
+import pytest
+
+from omnigent.errors import OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -159,6 +165,72 @@ def test_researcher_os_env_without_parent_sandbox() -> None:
     researcher = build_researcher_spec(parent)
     assert researcher.os_env is not None
     assert researcher.os_env.sandbox is None
+
+
+def test_no_os_env_parent_fails_at_build_when_bwrap_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A no-os_env parent's researcher inherits the platform-default
+    ``linux_bwrap`` sandbox, so a missing ``bwrap`` binary must fail
+    at spec-build time pointing at the host dependency.
+
+    Regression (#2068): the probe only ran at spawn time, deep in the
+    run, and the error told the user to set ``os_env.sandbox.type`` —
+    unreachable for a spawn-only parent, which cannot add an
+    ``os_env`` block without also registering OS tools on itself.
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    parent = _make_parent_spec()
+    assert parent.os_env is None
+    with pytest.raises(OmnigentError, match="bubblewrap") as excinfo:
+        build_researcher_spec(parent)
+    assert "sandbox.type" not in str(excinfo.value)
+
+
+def test_no_os_env_parent_builds_when_bwrap_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``bwrap`` on PATH the no-os_env spec builds as before."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/bwrap")
+    researcher = build_researcher_spec(_make_parent_spec())
+    assert researcher.os_env is not None
+
+
+def test_parent_with_os_env_skips_bwrap_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A parent that declares its own ``os_env`` keeps the inherit-
+    verbatim path: its sandbox posture is its own to configure, so the
+    probe must not second-guess it.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    parent = AgentSpec(
+        spec_version=1,
+        name="test-parent",
+        llm=LLMConfig(model="openai/gpt-5.4"),
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
+    )
+    researcher = build_researcher_spec(parent)
+    assert researcher.os_env is not None
+    assert researcher.os_env.sandbox is not None
+    assert researcher.os_env.sandbox.type == "none"
+
+
+def test_non_linux_platform_skips_bwrap_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe is Linux-only — other platforms don't default to bwrap."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    researcher = build_researcher_spec(_make_parent_spec())
+    assert researcher.os_env is not None
 
 
 def test_researcher_name_is_internal() -> None:
