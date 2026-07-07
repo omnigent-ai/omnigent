@@ -95,7 +95,13 @@ beforeEach(() => {
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // Reset the font-size preference + applied scale so the Appearance tests
+  // don't leak persisted state or the --ui-font-scale variable into each other.
+  localStorage.clear();
+  document.documentElement.style.removeProperty("--ui-font-scale");
+});
 
 describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
@@ -135,6 +141,90 @@ describe("SettingsPage", () => {
     // At the 12px min, only the decrease button is disabled.
     expect(screen.getByTestId("ui-font-size-dec")).toBeDisabled();
     expect(screen.getByTestId("ui-font-size-inc")).not.toBeDisabled();
+  });
+
+  it("shows the empty font family default and applies + persists a typed name", () => {
+    localStorage.clear();
+    document.documentElement.style.removeProperty("--ui-font-family");
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
+    // No stored preference → empty input, System-default placeholder, no override.
+    expect(input.value).toBe("");
+    expect(input.placeholder).toBe("System default");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
+    // Reset has nothing to do at the default.
+    expect(screen.getByTestId("ui-font-family-reset")).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "Inter" } });
+    expect(input.value).toBe("Inter");
+    // The choice is persisted so it survives a refresh...
+    expect(localStorage.getItem("omnigent:ui-font-family")).toBe(JSON.stringify("Inter"));
+    // ...and applied live to the document root, with the system stack appended
+    // so an uninstalled/partial name degrades to the default sans, not serif.
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
+      "Inter, var(--font-sans)",
+    );
+    expect(screen.getByTestId("ui-font-family-reset")).not.toBeDisabled();
+  });
+
+  it("reset restores the system default font family", () => {
+    localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Georgia"));
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-family-input") as HTMLInputElement;
+    // The control reflects the stored preference on mount.
+    expect(input.value).toBe("Georgia");
+
+    fireEvent.click(screen.getByTestId("ui-font-family-reset"));
+    // Reset clears the field, the applied property, and the stored key.
+    expect(input.value).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
+    expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
+  });
+
+  it("lets you clear and retype the font size without clamping mid-edit", () => {
+    localStorage.setItem("omnigent:ui-font-size", "13");
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
+    expect(input.value).toBe("13");
+
+    // Deleting a digit leaves "1" — below the 12px min. The box must SHOW "1"
+    // (free editing) without snapping to 12 or persisting the transient value.
+    fireEvent.change(input, { target: { value: "1" } });
+    expect(input.value).toBe("1");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("13");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("");
+
+    // Finishing the number to a valid size applies it live and persists it.
+    fireEvent.change(input, { target: { value: "18" } });
+    expect(input.value).toBe("18");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
+    // 18 / 16 base = 1.125.
+    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1.125");
+  });
+
+  it("clamps a below-min entry to the minimum on blur", () => {
+    localStorage.setItem("omnigent:ui-font-size", "16");
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
+
+    fireEvent.change(input, { target: { value: "1" } });
+    fireEvent.blur(input);
+    // On blur the draft settles to the clamped minimum.
+    expect(input.value).toBe("12");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("12");
+  });
+
+  it("reverts an empty entry to the committed size on blur", () => {
+    localStorage.setItem("omnigent:ui-font-size", "15");
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
+
+    fireEvent.change(input, { target: { value: "" } });
+    expect(input.value).toBe("");
+    fireEvent.blur(input);
+    // An empty field restores the last committed value rather than a bogus one.
+    expect(input.value).toBe("15");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
   });
 
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {

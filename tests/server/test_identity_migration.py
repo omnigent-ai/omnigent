@@ -124,6 +124,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
                 id="pol_1",
                 name="p",
                 session_id=None,
+                scope="default",
                 created_at=1,
                 type="python",
                 handler="x.y",

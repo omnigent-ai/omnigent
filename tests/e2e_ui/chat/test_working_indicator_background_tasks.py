@@ -18,10 +18,26 @@ locally is covered by the chatStore unit tests.
 
 from __future__ import annotations
 
+import re
+
 import httpx
 from playwright.sync_api import Page, expect
 
 _WORKING = '[data-testid="working-indicator"]'
+
+# Rotating labels the working indicator cycles through — mirror of
+# WORKING_MESSAGES in web/src/pages/ChatPage.tsx. The running-turn label is
+# whichever entry the wall-clock bucket lands on, so the test accepts any of
+# them. Keep this list in sync if that pool changes.
+_WORKING_LABELS = (
+    "Working…",
+    "Cooking…",
+    "Crunching…",
+    "Tinkering…",
+    "Pondering…",
+    "Brewing…",
+)
+_WORKING_LABEL_RE = re.compile("|".join(re.escape(label) for label in _WORKING_LABELS))
 
 
 def _publish_status(
@@ -75,9 +91,11 @@ def test_background_task_indicator_label_lifecycle(
 
     # 2. A new turn starts (the `running` edge a composer send produces): the
     #    fresh turn supersedes the tally, so the label flips from the
-    #    background-task count to the plain "Working…".
+    #    background-task count to a rotating working label (e.g. "Working…",
+    #    "Cooking…"). Accept any label in the pool — which one shows depends on
+    #    the wall-clock bucket the turn lands on.
     _publish_status(base_url, session_id, "running")
-    expect(working).to_contain_text("Working", timeout=15_000)
+    expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
     expect(working).not_to_contain_text("background task", timeout=15_000)
 
     # 3. The turn ends with the background shell finished: an authoritative

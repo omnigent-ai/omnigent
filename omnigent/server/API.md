@@ -570,7 +570,7 @@ Request parts:
 
 The server stores the bundle, then creates the `conversations` row
 and the session-scoped `agents` row in one database transaction. The
-new agent row has `agents.session_id` set to the new conversation id,
+new agent row has `agents.kind` set to `'session'`,
 and `conversations.agent_id` points at that agent. If the database
 agent write fails, the conversation row rolls back. If multipart or
 bundle parsing fails, no database row is written.

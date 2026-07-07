@@ -109,6 +109,11 @@
    * the whole rem-based UI scales. Overridden at runtime on documentElement. */
   --ui-font-scale: 1;
 
+  /* User-controlled UI font family (see Appearance settings /
+   * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
+   * `var(--ui-font-family, var(--font-sans))` falls back to the system stack;
+   * the Appearance setting sets it at runtime on documentElement. */
+
   /* ---- Inset system -------------------------------------------------------
    * Single source of truth for how far content must stay clear of screen
    * chrome. The SAME bundle runs in a browser, in Electron, and inside the
@@ -722,11 +727,25 @@
     overflow: hidden;
   }
   html {
-    @apply font-sans;
+    /* Font family for the whole inherited UI. Can't `@apply font-sans`: Tailwind
+     * v4's `@theme inline` inlines the literal stack, so a runtime `--font-sans`
+     * override is a no-op. Read a dedicated `--ui-font-family` (set on
+     * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
+     * with the system stack as the fallback when it's unset. */
+    font-family: var(--ui-font-family, var(--font-sans));
     /* Root size for the whole rem-based UI. `1em` resolves against the
      * browser default so a customized default is preserved; --ui-font-scale
      * layers the user's Appearance choice on top. */
     font-size: calc(1em * var(--ui-font-scale));
+  }
+  /* Code surfaces stay on the mono stack, immune to the UI --ui-font-family
+   * override above. The Appearance font-family setting is UI chrome only; the
+   * Monaco editor and xterm terminals are code fonts, owned by a separate
+   * (future) code-font setting. Monaco/xterm already pin their own font, so this
+   * is a guard against inheritance leaking in through any unpinned descendant. */
+  .monaco-editor,
+  .xterm {
+    font-family: var(--font-mono);
   }
   /* Text selection — brand pink highlight. Light: gentle wash + dark pink
    * text. Dark: solid brand pink background + white text. */

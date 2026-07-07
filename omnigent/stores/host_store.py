@@ -252,11 +252,12 @@ class HostStore:
                     # was regenerated after a fresh install or a wiped
                     # ~/.omnigent. host_id is a UNIQUE column that
                     # conversations.host_id references via
-                    # fk_conversations_host_id_hosts (ON DELETE SET NULL, NO
-                    # ON UPDATE CASCADE). Renaming it in place while child
-                    # conversations still point at the old value raises a
-                    # ForeignKeyViolation on Postgres, which crashes the host
-                    # tunnel handler — the host then reconnect-loops forever
+                    # conversations.host_id references it as a plain column
+                    # (no FK). Renaming it in place while child conversations
+                    # still point at the old value is harmless at the DB level,
+                    # but the application nulls host_id on those sessions first.
+                    # On Postgres with an FK this used to raise ForeignKeyViolation
+                    # which crashed the host tunnel handler — no longer applies.
                     # and never registers (no host shows in the UI). SQLite
                     # dev doesn't enforce FKs by default, so this only bites
                     # on the hosted Postgres/Lakebase deploy.
@@ -641,15 +642,19 @@ class HostStore:
 
         Managed-host teardown: removes the host from the picker AND
         revokes its launch token in one operation (the row IS the
-        credential). ``conversations.host_id`` references this row with
-        ``ON DELETE SET NULL``, so any remaining session bindings are
-        nulled rather than blocking the delete. No-op when the row does
-        not exist — deletion is invoked from best-effort cleanup paths
-        that may race.
+        credential). Explicitly nulls ``conversations.host_id`` for any
+        sessions still bound to this host — the DB no longer cascades
+        this via FK. No-op when the row does not exist — deletion is
+        invoked from best-effort cleanup paths that may race.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
         with self._session() as session:
+            session.execute(
+                update(SqlConversation)
+                .where(SqlConversation.host_id == host_id)
+                .values(host_id=None)
+            )
             session.execute(sql_delete(SqlHost).where(SqlHost.host_id == host_id))
 
     def revoke_launch_token(self, host_id: str) -> None:

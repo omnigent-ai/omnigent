@@ -29,40 +29,23 @@ bench's probes run through this driver, not just its gated tests.
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import signal
-import subprocess
 import threading
 import time
-import uuid
-from pathlib import Path
 from typing import Any
 
 import httpx
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
-from tests._helpers.compat import (
-    apply_runner_env,
-    apply_server_env,
-    compat_runner_cwd,
-    compat_server_cwd,
-    runner_executable,
-    server_executable,
-)
+from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.helpers import lookup_databricks_host
 from tests.harness_bench.driver import TurnResult
+from tests.harness_bench.full_server import (
+    _DENY_REASON,
+    _POLL_INTERVAL_S,
+    _TOOL_NAME,
+    SharedFullServer,
+)
 from tests.harness_bench.profile import BenchProfile
 
-_REPO_ROOT = str(Path(__file__).resolve().parents[2])
-_HEALTH_TIMEOUT_S = 90.0
-_POLL_INTERVAL_S = 0.2
-
-# The builtin the tool/policy probes drive: read-only, zero setup, server-
-# dispatched, and gated at the tool_call phase. Its denial output carries
-# _DENY_REASON so a blocked call is unambiguous.
-_TOOL_NAME = "list_files"
-_DENY_REASON = "bench-policy-deny"
 _TOOL_PROMPT = f"List the files using the {_TOOL_NAME} tool, then tell me how many there are."
 
 # The server persists an interrupted turn as a synthetic user message whose
@@ -79,69 +62,6 @@ _STREAM_PROMPT = (
 _TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response.cancelled"})
 
 
-def _find_free_port() -> int:
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _mint_bearer(profile: str) -> str:
-    """Mint a Databricks bearer for *profile* via the CLI (isolated from ambient token env).
-
-    ``env -u DATABRICKS_TOKEN -u DATABRICKS_BEARER`` guards against a stale
-    ambient credential shadowing profile auth (see omnigent issue #1781).
-    """
-    proc = subprocess.run(
-        ["databricks", "auth", "token", "--profile", profile, "--output", "json"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
-        env={
-            k: v
-            for k, v in os.environ.items()
-            if k not in ("DATABRICKS_TOKEN", "DATABRICKS_BEARER")
-        },
-    )
-    return str(json.loads(proc.stdout)["access_token"])
-
-
-def spawn_omnigent_server(
-    tmp: Path, port: int, base_env: dict[str, str], binding_token: str
-) -> subprocess.Popen[bytes]:
-    """Spawn an ``omnigent server`` subprocess writing state under *tmp*.
-
-    Shared by the full-server and native-tui drivers (both need the same
-    server; only what connects to it differs — a bare runner vs a host
-    daemon). Writes ``server.log`` / ``bench.db`` / ``artifacts`` under *tmp*.
-    """
-    db_path = tmp / "bench.db"
-    artifact_dir = tmp / "artifacts"
-    artifact_dir.mkdir(exist_ok=True)
-    log = tmp / "server.log"
-    args = [
-        server_executable(),
-        "-m",
-        "omnigent.cli",
-        "server",
-        "--port",
-        str(port),
-        "--database-uri",
-        f"sqlite:///{db_path}",
-        "--artifact-location",
-        str(artifact_dir),
-    ]
-    return subprocess.Popen(
-        args,
-        env={**base_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-        cwd=compat_server_cwd(),
-        stdout=log.open("wb"),
-        stderr=subprocess.STDOUT,
-    )
-
-
 class FullServerDriver:
     """Drive turns through a live Omnigent server + runner.
 
@@ -153,22 +73,31 @@ class FullServerDriver:
 
     transport = "full-server"
 
-    def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+    def __init__(
+        self,
+        profile: BenchProfile,
+        *,
+        databricks_profile: str,
+        shared: SharedFullServer | None = None,
+    ) -> None:
         self._profile = profile
         self._db_profile = databricks_profile
-        self._proc: subprocess.Popen[bytes] | None = None
-        self._runner: subprocess.Popen[bytes] | None = None
-        self._logs: list[Path] = []
-        self._client: httpx.Client | None = None
-        self._session_id: str | None = None
+        # When *shared* is given (a parallel run), this driver registers its
+        # agent + session on that one server+runner and spawns nothing itself.
+        # When None (a solo / --jobs 1 run), it owns a private SharedFullServer
+        # for back-compat with the original one-server-per-harness behavior.
+        self._shared = shared
+        self._owns_shared = shared is None
         # A second agent+session whose spec bakes a tool_call deny policy,
         # created lazily for the policy probe (the REST policy endpoint's
         # handler allowlist excludes make_fixed_action_callable, so the deny
         # must ride in the agent spec instead).
         self._deny_session_id: str | None = None
-        self._runner_id = ""
-        self._base_url = ""
-        self._tmp = Path("/tmp") / f"omni-bench-fs-{uuid.uuid4().hex[:8]}"
+        self._session_id: str | None = None
+
+    @property
+    def _client(self) -> httpx.Client | None:
+        return self._shared.client if self._shared is not None else None
 
     @staticmethod
     def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
@@ -191,58 +120,23 @@ class FullServerDriver:
         # Same CLI gate as the wrap driver (same binary requirement), but skip
         # its transport check — that is sdk-inproc-specific and would misreport
         # the driver name; the native case is already handled above.
-        from tests.e2e._harness_probes import cli_unavailable_reason
-
         if profile.cli_binary is not None:
             return cli_unavailable_reason(profile.cli_binary)
         return None
 
     def __enter__(self) -> FullServerDriver:
-        self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
-        host = lookup_databricks_host(self._db_profile)
-        assert host is not None  # guaranteed by unavailable()
-        bearer = _mint_bearer(self._db_profile)
-        port = _find_free_port()
-        self._base_url = f"http://localhost:{port}"
-
-        binding_token = uuid.uuid4().hex
-        runner_id = token_bound_runner_id(binding_token)
-
-        base_env = {
-            **os.environ,
-            "OPENAI_API_KEY": bearer,
-            "OPENAI_BASE_URL": f"{host}/serving-endpoints",
-            "DATABRICKS_CONFIG_PROFILE": self._db_profile,
-        }
-        apply_server_env(base_env, _REPO_ROOT)
-
-        self._proc = self._spawn_server(port, base_env, binding_token)
-        self._runner = self._spawn_runner(base_env, runner_id, binding_token)
-        self._wait_ready(runner_id)
-
-        self._client = httpx.Client(
-            base_url=self._base_url,
-            timeout=300.0,
-            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
-        )
-        self._runner_id = runner_id
-        agent_name = self._register_agent(deny=False)
-        self._session_id = self._create_session(agent_name, runner_id)
+        if self._shared is None:
+            self._shared = SharedFullServer(self._db_profile)
+            self._shared.__enter__()
+        agent_name = self._shared.register_agent(self._profile, deny=False)
+        self._session_id = self._shared.create_session(agent_name)
         return self
 
     def __exit__(self, *exc: object) -> None:
-        if self._client is not None:
-            self._client.close()
-        for proc in (self._runner, self._proc):
-            if proc is not None and proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        import shutil
-
-        shutil.rmtree(self._tmp, ignore_errors=True)
+        # Only tear down the server we own; an injected shared server is the
+        # orchestrator's to close after all harnesses finish.
+        if self._owns_shared and self._shared is not None:
+            self._shared.__exit__(*exc)
 
     # ── async driver protocol ────────────────────────────────
     # This driver's provisioning and turns are synchronous (subprocess spawn,
@@ -269,137 +163,17 @@ class FullServerDriver:
     async def run_interrupt_turn(self) -> TurnResult:
         return await asyncio.to_thread(self.interrupt_probe_turn)
 
-    # ── spawn ────────────────────────────────────────────────
-
-    def _spawn_server(
-        self, port: int, base_env: dict[str, str], binding_token: str
-    ) -> subprocess.Popen[bytes]:
-        proc = spawn_omnigent_server(self._tmp, port, base_env, binding_token)
-        self._logs.append(self._tmp / "server.log")
-        return proc
-
-    def _spawn_runner(
-        self, base_env: dict[str, str], runner_id: str, binding_token: str
-    ) -> subprocess.Popen[bytes]:
-        log = self._tmp / "runner.log"
-        self._logs.append(log)
-        runner_env = apply_runner_env(
-            {
-                **base_env,
-                "OMNIGENT_RUNNER_ID": runner_id,
-                "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                "RUNNER_SERVER_URL": self._base_url,
-            }
-        )
-        return subprocess.Popen(
-            [runner_executable(), "-m", "omnigent.runner._entry"],
-            env=runner_env,
-            cwd=compat_runner_cwd(),
-            stdout=log.open("wb"),
-            stderr=subprocess.STDOUT,
-        )
-
-    def _wait_ready(self, runner_id: str) -> None:
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        while time.monotonic() < deadline:
-            try:
-                health = httpx.get(f"{self._base_url}/health", timeout=2)
-                status = httpx.get(f"{self._base_url}/v1/runners/{runner_id}/status", timeout=2)
-                if (
-                    health.status_code == 200
-                    and status.status_code == 200
-                    and status.json().get("online") is True
-                ):
-                    return
-            except httpx.HTTPError:
-                # Connection refused / read errors are expected while the
-                # server and runner are still coming up; keep polling until
-                # they answer or the timeout below fires.
-                pass
-            time.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(
-            f"server+runner not ready within {_HEALTH_TIMEOUT_S}s; logs in {self._tmp}"
-        )
-
     # ── agent + session ──────────────────────────────────────
-
-    def _register_agent(self, *, deny: bool) -> str:
-        import io
-        import tarfile
-
-        import yaml
-
-        assert self._client is not None
-        name = f"bench-{self._profile.harness}" + ("-deny" if deny else "")
-        config: dict[str, Any] = {
-            "spec_version": 1,
-            "name": name,
-            "prompt": "You are a helpful assistant used for capability testing.",
-            "executor": {
-                "type": "omnigent",
-                "model": self._profile.model,
-                "profile": self._db_profile,
-                "config": {"harness": self._profile.harness},
-            },
-            # A read-only builtin the server dispatches (and gates at the
-            # tool_call phase). The tool/policy probes drive a call to it;
-            # it is harmless for basic turns (the model just won't call it).
-            "tools": {"builtins": [_TOOL_NAME]},
-        }
-        if deny:
-            # Bake a tool_call-phase deny on the builtin so the server blocks
-            # the call the way production policy enforcement does.
-            config["guardrails"] = {
-                "policies": {
-                    "deny_tool": {
-                        "type": "function",
-                        "function": {
-                            "path": "omnigent.policies.function.make_fixed_action_callable",
-                            "arguments": {
-                                "action": "deny",
-                                "reason": _DENY_REASON,
-                                "on_phases": ["tool_call"],
-                                "on_tools": [_TOOL_NAME],
-                            },
-                        },
-                    }
-                }
-            }
-        # spec_version bundles load via the directory spec loader, which
-        # recognizes tools.builtins and expects the member named config.yaml.
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            payload = yaml.safe_dump(config).encode()
-            info = tarfile.TarInfo("config.yaml")
-            info.size = len(payload)
-            tar.addfile(info, io.BytesIO(payload))
-        resp = self._client.post(
-            "/v1/sessions",
-            data={"metadata": json.dumps({})},
-            files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        )
-        if resp.status_code not in (200, 201, 409):
-            raise RuntimeError(f"agent register failed: {resp.status_code} {resp.text[:400]}")
-        return name
-
-    def _create_session(self, agent_name: str, runner_id: str) -> str:
-        assert self._client is not None
-        listing = self._client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
-        listing.raise_for_status()
-        agent_id = str(listing.json()["data"][0]["agent_id"])
-        created = self._client.post("/v1/sessions", json={"agent_id": agent_id})
-        created.raise_for_status()
-        session_id = str(created.json()["id"])
-        bound = self._client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
-        bound.raise_for_status()
-        return session_id
+    # The server/runner lifecycle and agent/session registration live on
+    # SharedFullServer now; this driver delegates so a solo run and a parallel
+    # (shared-server) run go through the same path.
 
     def _ensure_deny_session(self) -> str:
         """Lazily register the deny agent and its session; return the session id."""
+        assert self._shared is not None
         if self._deny_session_id is None:
-            name = self._register_agent(deny=True)
-            self._deny_session_id = self._create_session(name, self._runner_id)
+            name = self._shared.register_agent(self._profile, deny=True)
+            self._deny_session_id = self._shared.create_session(name)
         return self._deny_session_id
 
     # ── tool / policy probe ──────────────────────────────────
