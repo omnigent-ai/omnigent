@@ -72,6 +72,17 @@ import {
   writeUiFontFamily,
   writeUiFontSizePx,
 } from "@/lib/uiFontPreferences";
+import {
+  clampCodeFontSizePx,
+  CODE_FONT_FAMILY_DEFAULT,
+  CODE_FONT_SIZE_MAX,
+  CODE_FONT_SIZE_MIN,
+  CODE_FONT_SIZE_STEP,
+  readCodeFontFamily,
+  readCodeFontSizePx,
+  writeCodeFontFamily,
+  writeCodeFontSizePx,
+} from "@/lib/codeFontPreferences";
 import { useIsEmbedded } from "@/lib/embedded";
 import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -198,6 +209,14 @@ function AppearanceSection() {
         <UiFontSizeControl />
 
         <UiFontFamilyControl />
+
+        {/* Code font (Monaco + xterm) sits as its own two rows — labelled in full
+            ("Code font size" / "Code font family") rather than under a shared
+            heading — so each control reads unambiguously next to the UI-font rows
+            above and it's clear these don't scale the surrounding chrome. */}
+        <UiCodeFontSizeControl />
+
+        <UiCodeFontFamilyControl />
       </div>
     </Section>
   );
@@ -358,6 +377,164 @@ function UiFontFamilyControl() {
           aria-label="UI font family"
           data-testid="ui-font-family-input"
           placeholder="System default"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          className="h-9 w-56"
+          value={family}
+          onChange={(e) => update(e.target.value)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Code font size stepper. Sizes the code editor (Monaco) and terminal (xterm)
+ * — fixed-pixel widgets that can't ride the chrome's --ui-font-scale variable,
+ * so writing the pref emits to already-mounted editors/terminals (see
+ * lib/codeFontPreferences.ts). Same free-editing draft/commit + blur-clamp
+ * behavior as UiFontSizeControl; only the bounds and storage differ.
+ */
+function UiCodeFontSizeControl() {
+  // `px` is the committed value; `draft` is the raw text in the box, kept
+  // separate so a transient out-of-range/empty mid-edit state isn't clamped or
+  // persisted on every keystroke. We only commit while typing when the draft is
+  // already a valid in-range size; blur/Enter clamps and re-syncs the text.
+  const [px, setPx] = useState(() => readCodeFontSizePx());
+  const [draft, setDraft] = useState(() => String(px));
+
+  const commit = useCallback((next: number) => {
+    const clamped = clampCodeFontSizePx(next);
+    setPx(clamped);
+    setDraft(String(clamped));
+    writeCodeFontSizePx(clamped);
+  }, []);
+
+  const onDraftChange = useCallback((text: string) => {
+    setDraft(text);
+    // Apply live only once the field holds a valid, in-range whole number;
+    // leave partial/out-of-range/empty drafts untouched until blur.
+    if (/^\d+$/.test(text)) {
+      const value = Number(text);
+      if (value >= CODE_FONT_SIZE_MIN && value <= CODE_FONT_SIZE_MAX) {
+        setPx(value);
+        writeCodeFontSizePx(value);
+      }
+    }
+  }, []);
+
+  // Clamp and re-sync the text to the committed value. An empty or invalid
+  // draft reverts to the last committed size rather than a bogus one.
+  const commitDraft = useCallback(() => {
+    const value = Number(draft);
+    commit(Number.isFinite(value) && draft.trim() !== "" ? value : px);
+  }, [commit, draft, px]);
+
+  const atMin = px <= CODE_FONT_SIZE_MIN;
+  const atMax = px >= CODE_FONT_SIZE_MAX;
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="flex flex-col">
+        <span className="text-sm font-medium">Code font size</span>
+        <span className="text-sm text-muted-foreground">
+          Size of code in the editor and terminal.
+        </span>
+      </div>
+      {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
+          font-size control. */}
+      <div
+        role="group"
+        aria-label="Code font size"
+        className={cn(
+          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
+        )}
+      >
+        <StepperButton
+          label="Decrease code font size"
+          testId="code-font-size-dec"
+          disabled={atMin}
+          onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
+        >
+          <MinusIcon className="size-4" />
+        </StepperButton>
+        <div className="flex items-center border-x border-input px-2 tabular-nums">
+          <input
+            type="number"
+            inputMode="numeric"
+            min={CODE_FONT_SIZE_MIN}
+            max={CODE_FONT_SIZE_MAX}
+            step={CODE_FONT_SIZE_STEP}
+            aria-label="Code font size in pixels"
+            data-testid="code-font-size-input"
+            className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onBlur={commitDraft}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+            }}
+          />
+        </div>
+        <StepperButton
+          label="Increase code font size"
+          testId="code-font-size-inc"
+          disabled={atMax}
+          onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
+        >
+          <PlusIcon className="size-4" />
+        </StepperButton>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Code font family picker. Free-text (Cursor-style): type any monospace font
+ * installed on this device; blank means the editor/terminal default (the shared
+ * mono stack). Applies live and persists on every change via the code-font
+ * pub/sub (see lib/codeFontPreferences.ts). Mirrors UiFontFamilyControl.
+ */
+function UiCodeFontFamilyControl() {
+  const [family, setFamily] = useState(() => readCodeFontFamily());
+
+  const update = useCallback((next: string) => {
+    setFamily(next);
+    writeCodeFontFamily(next);
+  }, []);
+
+  const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Code font family</span>
+        <span className="text-sm text-muted-foreground">
+          Font for the code editor and terminal. Leave blank for the default.
+        </span>
+      </div>
+      {/* Reset sits left of the input so the input's right edge lines up flush
+          with the size stepper above. `invisible` (not removed) at the default
+          keeps the row from shifting. */}
+      <div role="group" aria-label="Code font family" className="flex shrink-0 items-center gap-2">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          data-testid="code-font-family-reset"
+          disabled={isDefault}
+          className={cn("h-9", isDefault && "invisible")}
+          onClick={() => update(CODE_FONT_FAMILY_DEFAULT)}
+        >
+          Reset
+        </Button>
+        <Input
+          type="text"
+          aria-label="Code font family"
+          data-testid="code-font-family-input"
+          placeholder="Editor default"
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"

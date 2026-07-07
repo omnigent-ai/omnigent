@@ -14,6 +14,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -336,13 +337,14 @@ export class TerminalSession {
     onInput?: TerminalInputListener,
     nativeSelection = false,
   ) {
+    // Read the user's code-font preference (Settings → Appearance) at
+    // construction; a mid-session change is applied live via setFont(). The
+    // xterm.js defaults (15px, no theme) feel out of place inside the app
+    // chrome, so an unset family falls back to the shared mono stack.
+    const { sizePx, family } = readCodeFont();
     this.term = new Terminal({
-      // Match the system mono stack at the configured base size. The
-      // xterm.js defaults (15px, no theme) feel out of place inside the
-      // app chrome.
-      fontFamily:
-        "'Geist Mono Variable', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace",
-      fontSize: 13,
+      fontFamily: codeFontFamilyForEditor(family),
+      fontSize: sizePx,
       scrollback: 20000,
       cursorBlink: true,
       theme: terminalTheme(isDark),
@@ -496,6 +498,21 @@ export class TerminalSession {
    */
   setTheme(isDark: boolean): void {
     this.term.options.theme = terminalTheme(isDark);
+  }
+
+  /**
+   * Update the terminal's code font (size + family) without reconnecting —
+   * mirrors {@link setTheme}, mutating options in place. A new glyph size
+   * changes the character-cell dimensions, so this re-fits the grid to the
+   * container and pushes the resulting cols×rows to tmux via {@link sendResize}
+   * (which no-ops the send while the socket is down; the reconnect re-fits on
+   * open). An empty family falls back to the shared mono stack. Safe to call at
+   * any point after construction.
+   */
+  setFont(sizePx: number, family: string): void {
+    this.term.options.fontFamily = codeFontFamilyForEditor(family);
+    this.term.options.fontSize = sizePx;
+    this.sendResize();
   }
 
   /**
