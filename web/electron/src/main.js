@@ -33,6 +33,7 @@ const { pathToFileURL } = require("node:url");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { registerSessionExpiryReload } = require("./session-expiry");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -383,6 +384,39 @@ function isLocalhostTrustedOrigin(origin) {
  */
 function registerLocalhostAccess() {
   registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin);
+}
+
+// Per-window timestamp of the last expired-session reload, so a host whose SSO
+// stays expired doesn't reload-loop. An expired session redirects EVERY API
+// call to the login page (many redirects per second — and the reload itself
+// triggers fresh API calls), so a "once until next navigation" guard would
+// clear on its own reload and loop. A minimum interval caps reloads to one per
+// window per interval regardless: enough to re-run the host's auth challenge,
+// never a tight loop. In the normal case the gate full-page-redirects the
+// reload's top-level navigation to its login page, so no further API calls
+// (hence no further redirects) fire anyway.
+const _lastExpiryReloadAt = new WeakMap();
+const _EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
+
+/**
+ * Recover the desktop window when the workspace SSO session expires.
+ *
+ * When the auth gate redirects a connected server's API call to its login
+ * page, reload every window pinned to that origin so the gate can re-challenge
+ * — see session-expiry.js. A desktop user has no address bar to refresh out of
+ * the resulting "Failed to load" state manually, so the shell does it.
+ */
+function registerSessionExpiryAccess() {
+  registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
+    const now = Date.now();
+    for (const [win, state] of windows) {
+      if (state.origin !== origin) continue;
+      const last = _lastExpiryReloadAt.get(win) ?? 0;
+      if (now - last < _EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
+      _lastExpiryReloadAt.set(win, now);
+      win.webContents.reload();
+    }
+  });
 }
 
 /**
@@ -1956,6 +1990,7 @@ if (!gotLock) {
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();
+    registerSessionExpiryAccess();
     registerWebAuthn();
     registerIpc();
     buildMenu();
