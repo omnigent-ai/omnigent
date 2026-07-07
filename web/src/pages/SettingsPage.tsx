@@ -60,12 +60,16 @@ import { absoluteTime } from "@/lib/relativeTime";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { type ThemeMode, normalizeThemeMode } from "@/components/theme/themeMode";
 import {
+  applyUiFontFamily,
   applyUiFontScale,
   clampUiFontSizePx,
+  readUiFontFamily,
   readUiFontSizePx,
+  UI_FONT_FAMILY_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
   UI_FONT_SIZE_STEP,
+  writeUiFontFamily,
   writeUiFontSizePx,
 } from "@/lib/uiFontPreferences";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -192,6 +196,8 @@ function AppearanceSection() {
         </div>
 
         <UiFontSizeControl />
+
+        <UiFontFamilyControl />
       </div>
     </Section>
   );
@@ -297,6 +303,68 @@ function UiFontSizeControl() {
         >
           <PlusIcon className="size-4" />
         </StepperButton>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * UI font family picker. Free-text (Cursor-style): type any font installed on
+ * this device; blank means "System default", which falls back to the existing
+ * --font-sans stack. Applies live and persists on every change via the
+ * --ui-font-family variable (see lib/uiFontPreferences.ts). Like the size
+ * control it stays visible when embedded — a per-device readability pref that
+ * doesn't conflict with host theming.
+ */
+function UiFontFamilyControl() {
+  const [family, setFamily] = useState(() => readUiFontFamily());
+
+  const update = useCallback((next: string) => {
+    setFamily(next);
+    writeUiFontFamily(next);
+    applyUiFontFamily(next);
+  }, []);
+
+  const isDefault = family.trim() === UI_FONT_FAMILY_DEFAULT;
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      {/* Take the remaining width (and let the longer description wrap within
+          this column) so the input stays inline instead of dropping to its own
+          row — matches the font-size row's alignment. */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Font family</span>
+        <span className="text-sm text-muted-foreground">
+          Use any font installed on this device. Leave blank for the system default.
+        </span>
+      </div>
+      {/* Reset sits left of the input so the input is the rightmost element and
+          its right edge lines up flush with the font-size stepper above.
+          `invisible` (not removed) at the default keeps the row from shifting. */}
+      <div role="group" aria-label="Font family" className="flex shrink-0 items-center gap-2">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          data-testid="ui-font-family-reset"
+          disabled={isDefault}
+          className={cn("h-9", isDefault && "invisible")}
+          onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
+        >
+          Reset
+        </Button>
+        <Input
+          type="text"
+          aria-label="UI font family"
+          data-testid="ui-font-family-input"
+          placeholder="System default"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          className="h-9 w-56"
+          value={family}
+          onChange={(e) => update(e.target.value)}
+        />
       </div>
     </div>
   );
