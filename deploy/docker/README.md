@@ -151,6 +151,14 @@ OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
 OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
 ```
 
+> [!NOTE]
+> **Microsoft Entra ID:** the server requires a verified email claim
+> (`email_verified`) on OIDC sign-ins, and Entra ID tokens do not include
+> that claim by default, so native OIDC sign-in is rejected. The working
+> path for Entra today is an SSO proxy in header mode; see the oauth2-proxy
+> walkthrough under
+> [Header-proxy mode](#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy).
+
 ### HTTPS for the callback URL
 
 Most IdPs require HTTPS for non-localhost redirect URIs, and the
@@ -215,6 +223,54 @@ OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:
 stripping any inbound copy of the identity header from the client
 request — otherwise any visitor can spoof an identity. The server
 trusts whatever value reaches it.
+
+### Walkthrough: oauth2-proxy with Microsoft Entra ID
+
+oauth2-proxy in front of the server is the classic header-mode layout.
+With Microsoft Entra ID it is also currently the working sign-in path
+(native OIDC mode rejects Entra tokens; see the note in the OIDC
+section above).
+
+1. **Register the app** in Entra ID (App registrations, single tenant,
+   Web platform): redirect URI `https://<your-host>/oauth2/callback`,
+   the standard `openid`, `email`, and `profile` scopes, and a client
+   secret. To restrict who can sign in, enable "Assignment required" on
+   the corresponding enterprise application and assign the users or
+   groups you want.
+
+2. **Run oauth2-proxy in front of the server:**
+
+   ```bash
+   OAUTH2_PROXY_PROVIDER=oidc
+   OAUTH2_PROXY_OIDC_ISSUER_URL=https://login.microsoftonline.com/<tenant-id>/v2.0
+   OAUTH2_PROXY_CLIENT_ID=<app-client-id>
+   OAUTH2_PROXY_CLIENT_SECRET=<app-client-secret>
+   OAUTH2_PROXY_COOKIE_SECRET=<32-byte-base64-secret>
+   OAUTH2_PROXY_REDIRECT_URL=https://<your-host>/oauth2/callback
+   OAUTH2_PROXY_EMAIL_DOMAINS=example.com
+   OAUTH2_PROXY_OIDC_EMAIL_CLAIM=preferred_username
+   OAUTH2_PROXY_UPSTREAMS=http://omnigent:8000
+   ```
+
+   The one non-obvious line is
+   `OAUTH2_PROXY_OIDC_EMAIL_CLAIM=preferred_username`: Entra ID tokens
+   frequently omit the `email` claim, while `preferred_username` carries
+   the sign-in email (the UPN) for regular member accounts. Without it,
+   oauth2-proxy fails the login with an empty email. Guest (B2B)
+   accounts carry a mangled UPN rather than their email, so restrict
+   sign-in to member accounts via "Assignment required" above.
+
+3. **Point the server at the proxy's identity header:**
+
+   ```bash
+   OMNIGENT_AUTH_PROVIDER=header
+   ```
+
+   oauth2-proxy injects `X-Forwarded-Email` (the server's default
+   header name) on every proxied request and overwrites any
+   client-supplied copy, which is the strip behavior header mode
+   requires. Route all traffic through the proxy; any path that
+   bypasses oauth2-proxy bypasses authentication.
 
 ## Environment variables
 
