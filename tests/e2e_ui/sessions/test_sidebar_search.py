@@ -61,18 +61,22 @@ def test_search_lists_matching_sessions_in_palette(
     expect(search_button).to_be_visible(timeout=30_000)
     search_button.click()
 
+    # Scope all result assertions to the palette dialog: the session's title
+    # also renders in the chat header (we're on /c/{id}), so a page-wide text
+    # match would never reach zero.
+    dialog = page.get_by_role("dialog")
     palette_input = page.get_by_test_id("command-palette-input")
     expect(palette_input).to_be_visible()
 
     # A query that matches nothing lists no session (debounce + server round
-    # trip resolve within the default expect timeout) and shows the empty
-    # state. "Actions" can still match static commands, so assert on the
-    # session row + empty-state copy rather than the whole list being blank.
+    # trip resolve within the default expect timeout). "Actions" can still
+    # match static commands, so assert the session title is absent from the
+    # dialog rather than the whole list being blank.
     no_match = f"zzz-no-match-{uuid.uuid4().hex[:12]}"
     palette_input.fill(no_match)
-    expect(page.get_by_text(title)).to_have_count(0)
+    expect(dialog.get_by_text(title)).to_have_count(0)
 
     # A query matching the title lists the session — proving the palette
     # searches server-side on the title, not just filters a static page.
     palette_input.fill(marker)
-    expect(page.get_by_text(title)).to_be_visible()
+    expect(dialog.get_by_text(title)).to_be_visible()
