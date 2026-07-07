@@ -198,8 +198,8 @@ def _default_tmp_parent() -> Path:
     length limits, and a short path such as ``.tmp/oa`` is useful
     for local worktrees whose absolute path is long.
 
-    :returns: Configured parent path, or the default
-        ``/tmp/omnigent``.
+    :returns: Configured parent path, or the per-uid default
+        ``/tmp/omnigent-<uid>`` on POSIX.
     """
     configured = os.environ.get(_TMP_PARENT_ENV_VAR)
     if configured:
