@@ -282,6 +282,15 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # executor.profile propagated into the daemon's env).
         "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_CONFIG_FILE",
+        # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
+        # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
+        # Without it a runner falls back to the ~/.databrickscfg [__settings__]
+        # auth_storage default and can resolve a DIFFERENT token store than the
+        # host/daemon (which inherits it via the daemon env's DATABRICKS_ prefix
+        # in cli.py). That mismatch makes the runner read an empty/stale store
+        # and fail to mint a token — the runner tunnel is rejected with HTTP 401
+        # even though the host authenticated fine.
+        "DATABRICKS_AUTH_STORAGE",
         # Runtime config/data-dir selection. These are filesystem PATHS, not
         # secrets, so they're safe to propagate to the host owner's own
         # daemon/runner subprocesses. They MUST propagate so the whole local
