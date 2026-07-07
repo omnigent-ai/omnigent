@@ -16923,6 +16923,8 @@ def create_sessions_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        tool: str | None = Query(default=None),
+        session_name: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -16949,6 +16951,14 @@ def create_sessions_router(
         :param before: Cursor — return children before this one.
         :param order: Sort direction, ``"desc"`` (newest-first,
             default) or ``"asc"``. Sort column is ``created_at``.
+        :param tool: When set, only return children whose title
+            starts with this agent type (the segment before the
+            ``":"``). Combined with ``session_name`` to form the
+            exact title ``"{tool}:{session_name}"`` for server-side
+            filtering.
+        :param session_name: When set alongside ``tool``, only
+            return children whose title matches
+            ``"{tool}:{session_name}"`` exactly.
         :returns: A :class:`PaginatedList` of
             :class:`ChildSessionSummary` objects.
         :raises OmnigentError: 403 if the caller lacks READ on
@@ -16967,6 +16977,9 @@ def create_sessions_router(
                 "Session not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        title_filter: str | None = None
+        if tool and session_name:
+            title_filter = f"{tool}:{session_name}"
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -16976,6 +16989,7 @@ def create_sessions_router(
             parent_conversation_id=session_id,
             order=order,
             sort_by="created_at",
+            title=title_filter,
         )
         data = await _child_session_summaries_from_conversations(
             page.data,
