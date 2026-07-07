@@ -4878,6 +4878,36 @@ def test_claude_prompt_rendered_sees_prompt_above_running_turn_footer() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_above_subagent_fanout_footer() -> None:
+    """
+    The readiness scan reaches the prompt above an unbounded subagent footer.
+
+    A subagent fan-out renders one ``○ Explore …`` row per concurrent
+    subagent, so the running-turn footer height is unbounded. Here five
+    subagents plus the model/auto-mode/branch rows push the live ``❯`` row
+    to the 12th non-empty line from the bottom — far past any fixed scan
+    window. The box rule below ``❯`` (the input box's closing frame) is
+    what admits it, so the scan must reach the glyph at this depth and the
+    web UI must NOT render a spurious "did not become ready" card.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ Press up to edit queued messages",  # the live prompt row
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | thinking medium | 398.1k/1M (39%)",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  main",
+            "  ○ Explore  Angle A: line-by-line diff scan   1m 35s",
+            "  ○ Explore  Angle C: cross-file tracer         56s",
+            "  ○ Explore  Angle D: reuse                      46s",
+            "  ○ Explore  Angle F: efficiency                 31s",
+            "  ○ Explore  Angle G: altitude                   21s",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
 def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
     """
     A glyph in the wider window without a box rule below is not trusted.

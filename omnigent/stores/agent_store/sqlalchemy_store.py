@@ -5,7 +5,12 @@ from __future__ import annotations
 from sqlalchemy import and_, asc, desc, or_, select
 
 from omnigent.db.converters import sql_agent_to_entity
-from omnigent.db.db_models import SqlAgent
+from omnigent.db.db_models import (
+    AGENT_KIND_SESSION,
+    AGENT_KIND_TEMPLATE,
+    SqlAgent,
+    SqlConversation,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_managed_session_maker,
@@ -45,7 +50,7 @@ class SqlAlchemyAgentStore(AgentStore):
         description: str | None = None,
     ) -> Agent:
         """
-        Register a new agent in the database.
+        Register a new template agent in the database.
 
         :param agent_id: Pre-generated unique agent identifier,
             e.g. ``"ag_0f1a2b3c..."``.
@@ -62,6 +67,7 @@ class SqlAlchemyAgentStore(AgentStore):
             name=name,
             bundle_location=bundle_location,
             version=1,
+            kind=AGENT_KIND_TEMPLATE,
             description=description,
         )
         with self._session() as session:
@@ -78,11 +84,23 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         with self._session() as session:
             row = session.get(SqlAgent, agent_id)
-            return sql_agent_to_entity(row) if row else None
+            if row is None:
+                return None
+            # For session-scoped agents, derive the owning conversation id
+            # from the forward pointer so callers can use agent.session_id.
+            session_id: str | None = None
+            if row.kind == AGENT_KIND_SESSION:
+                session_id = session.execute(
+                    select(SqlConversation.id).where(SqlConversation.agent_id == agent_id).limit(1)
+                ).scalar_one_or_none()
+            return sql_agent_to_entity(row, session_id=session_id)
 
     def get_by_name(self, name: str) -> Agent | None:
         """
         Look up a registered template agent by its unique name.
+
+        Only agents with ``kind = 'template'`` are returned; session-scoped
+        copies bound to a specific conversation are excluded.
 
         :param name: The template agent's unique name,
             e.g. ``"code-assistant"``.
@@ -92,7 +110,7 @@ class SqlAlchemyAgentStore(AgentStore):
             row = session.execute(
                 select(SqlAgent).where(
                     SqlAgent.name == name,
-                    SqlAgent.session_id.is_(None),
+                    SqlAgent.kind == AGENT_KIND_TEMPLATE,
                 )
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
@@ -107,6 +125,9 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         List registered template agents with cursor-based pagination.
 
+        Only agents with ``kind = 'template'`` are returned; session-scoped
+        copies are excluded.
+
         :param limit: Maximum number of agents to return.
         :param after: Cursor agent ID; return agents appearing
             after this agent in sort order,
@@ -119,25 +140,23 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            template_agent = SqlAgent.session_id.is_(None)
-            stmt = select(SqlAgent).where(template_agent)
+            is_template = SqlAgent.kind == AGENT_KIND_TEMPLATE
+            stmt = select(SqlAgent).where(is_template)
             if after:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == after, template_agent)
+                    .where(SqlAgent.id == after, is_template)
                     .scalar_subquery()
                 )
-                # "after" = further in sort direction
                 ts_cmp = SqlAgent.created_at < sub if is_desc else SqlAgent.created_at > sub
                 id_cmp = SqlAgent.id < after if is_desc else SqlAgent.id > after
                 stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
             if before:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == before, template_agent)
+                    .where(SqlAgent.id == before, is_template)
                     .scalar_subquery()
                 )
-                # "before" = opposite of sort direction
                 ts_cmp = SqlAgent.created_at > sub if is_desc else SqlAgent.created_at < sub
                 id_cmp = SqlAgent.id > before if is_desc else SqlAgent.id < before
                 stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
@@ -199,7 +218,12 @@ class SqlAlchemyAgentStore(AgentStore):
             row.bundle_location = bundle_location
             row.version = row.version + 1
             row.updated_at = now_epoch()
-            return sql_agent_to_entity(row)
+            session_id: str | None = None
+            if row.kind == AGENT_KIND_SESSION:
+                session_id = session.execute(
+                    select(SqlConversation.id).where(SqlConversation.agent_id == agent_id).limit(1)
+                ).scalar_one_or_none()
+            return sql_agent_to_entity(row, session_id=session_id)
 
     def delete(self, agent_id: str) -> bool:
         """

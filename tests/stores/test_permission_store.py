@@ -551,14 +551,13 @@ def test_has_any_grants_false_after_revoke(store: SqlAlchemyPermissionStore, db_
 # ── cascade delete ───────────────────────────────────────────────────────────
 
 
-def test_cascade_delete_removes_permissions_when_conversation_deleted(
+def test_permissions_not_auto_deleted_when_conversation_deleted(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """When a conversation row is deleted, FK CASCADE removes permission rows.
+    """Without DB FK cascade, deleting a conversation leaves its permission rows intact.
 
-    The session_permissions table has ``ON DELETE CASCADE`` on
-    ``conversation_id``. Deleting the conversation must clean up all
-    associated grants without explicit permission-store calls.
+    The application (delete_conversation) is responsible for explicitly
+    deleting session_permissions rows when a conversation is removed.
     """
     _ensure_user(store, "alice@test.com")
     _ensure_user(store, "bob@test.com")
@@ -567,10 +566,9 @@ def test_cascade_delete_removes_permissions_when_conversation_deleted(
     store.grant("alice@test.com", conv_id, level=2)
     store.grant("bob@test.com", conv_id, level=1)
 
-    # Verify grants exist before delete.
     assert store.has_any_grants(conv_id) is True, "Pre-condition: grants must exist"
 
-    # Delete the conversation directly via SQLAlchemy to trigger FK CASCADE.
+    # Delete the conversation directly — no FK cascade fires.
     from sqlalchemy import delete as sa_delete
 
     from omnigent.db.db_models import SqlConversation
@@ -581,13 +579,9 @@ def test_cascade_delete_removes_permissions_when_conversation_deleted(
     with session_maker() as session:
         session.execute(sa_delete(SqlConversation).where(SqlConversation.id == conv_id))
 
-    # All grants on the deleted conversation must be gone.
-    assert store.has_any_grants(conv_id) is False, (
-        "Expected no grants after conversation CASCADE delete, but "
-        "grants still exist. The FK ON DELETE CASCADE is not working."
-    )
-    assert store.list_for_session(conv_id) == [], (
-        "Expected [] after CASCADE delete, but grants remain."
+    # Grants remain — the application must clean them up explicitly.
+    assert store.has_any_grants(conv_id) is True, (
+        "Without FK cascade, permission rows must persist after conversation deletion."
     )
 
 

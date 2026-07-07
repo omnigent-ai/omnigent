@@ -513,6 +513,61 @@ class FileObject(BaseModel):
     created_at: int
 
 
+class CopyFilesRequest(BaseModel):
+    """
+    Request to copy files from a lineage ancestor into a session.
+
+    The destination session is the path parameter; ``source_session_id``
+    must be a STRICT ancestor of the destination up its
+    ``parent_conversation_id`` chain (spawn lineage) — the destination may
+    not name itself as the source. The copy creates new child-scoped rows —
+    it does not grant cross-session read access.
+
+    :param source_session_id: Session that owns the source files, e.g.
+        ``"conv_parent"``. Must be a strict ancestor of the destination.
+    :param file_ids: Non-empty, unique ids of the source-owned files to
+        copy, e.g. ``["file_abc123"]``.
+    """
+
+    source_session_id: str
+    file_ids: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+
+
+class CopiedFile(BaseModel):
+    """
+    A single copied file's new identity and preserved metadata.
+
+    :param new_id: The new child-scoped file id, e.g. ``"file_def456"``.
+    :param filename: The copied file's name, carried over from the source.
+    :param content_type: The copied file's MIME type, preserved from the
+        source row so the caller need not re-fetch it or guess from the
+        filename. ``None`` when the source row had no recorded type.
+    """
+
+    new_id: str
+    filename: str
+    content_type: str | None = None
+
+
+class CopyFilesResponse(BaseModel):
+    """
+    Result of a lineage-scoped file copy.
+
+    :param object: Fixed type, always ``"session.files.copied"``.
+    :param session_id: Destination session that now owns the copies.
+    :param mapping: Map of source ``file_id`` to the copied file's new
+        identity and preserved metadata (id, filename, content type), so a
+        caller can attach the copy without a follow-up metadata fetch.
+    """
+
+    object: str = "session.files.copied"
+    session_id: str
+    mapping: dict[str, CopiedFile]
+
+
 # ── Session Resources ───────────────────────────────────────────
 
 

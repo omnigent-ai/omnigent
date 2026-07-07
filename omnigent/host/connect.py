@@ -36,6 +36,8 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListWorktreesFrame,
+    HostListWorktreesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -49,6 +51,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
+    list_worktrees,
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
@@ -1522,6 +1525,47 @@ class HostProcess:
             status="ok",
         )
 
+    async def _handle_list_worktrees(
+        self,
+        frame: HostListWorktreesFrame,
+    ) -> HostListWorktreesResultFrame:
+        """Handle a ``host.list_worktrees`` request from the server.
+
+        Runs the blocking git work in a worker thread so the tunnel
+        loop keeps servicing pings.
+
+        :param frame: The list-worktrees request frame.
+        :returns: Result frame with the worktrees on success, or
+            ``status: "failed"`` with an error message.
+        """
+        try:
+            # Pause the orphan reaper while git runs — see
+            # _handle_create_worktree above and _reap_orphans_once.
+            with self._host_subprocess_op():
+                worktrees = await asyncio.to_thread(
+                    list_worktrees,
+                    repo_path=frame.repo_path,
+                )
+        except WorktreeError as exc:
+            return HostListWorktreesResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        return HostListWorktreesResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            worktrees=[
+                {
+                    "path": wt.path,
+                    "branch": wt.branch,
+                    "is_main": wt.is_main,
+                    "detached": wt.detached,
+                }
+                for wt in worktrees
+            ],
+        )
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -1858,6 +1902,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
+        elif isinstance(frame, HostListWorktreesFrame):
+            await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
 
 
 def run_host_process(

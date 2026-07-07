@@ -102,3 +102,44 @@ def test_ui_font_size_steppers_clamp_at_bounds(
     expect(value).to_have_value("12")
     expect(decrease).to_be_disabled()
     expect(increase).to_be_enabled()
+
+
+def test_ui_font_size_input_allows_free_editing(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Typing in the box doesn't clamp mid-edit; blur settles the final value.
+
+    Regression guard: the box binds to a free-form draft, so backspacing "13"
+    down to "1" (below the 12px min) must SHOW "1" without snapping to 12 or
+    persisting the transient value. Retyping a valid size applies it live, and
+    blurring a still-out-of-range draft clamps to the minimum.
+    """
+    base_url, _session_id = seeded_session
+
+    # Seed a two-digit size so deleting a digit lands on a below-min "1".
+    page.goto(base_url)
+    page.evaluate(f"() => window.localStorage.setItem('{STORAGE_KEY}', '13')")
+    _open_appearance(page, base_url)
+
+    value = page.get_by_test_id("ui-font-size-input")
+    expect(value).to_have_value("13")
+
+    # Backspace to "1": the box holds the partial value; nothing clamps or
+    # re-persists while the draft is out of range.
+    value.click()
+    value.press("End")
+    value.press("Backspace")
+    expect(value).to_have_value("1")
+    assert _stored_size(page) == "13", "a mid-edit below-min draft must not persist"
+
+    # Finish typing a valid size — it applies live and persists.
+    value.press("8")
+    expect(value).to_have_value("18")
+    assert _stored_size(page) == "18"
+    assert _ui_font_scale(page) == "1.125"
+
+    # A still-out-of-range draft clamps to the minimum on blur.
+    value.fill("1")
+    value.blur()
+    expect(value).to_have_value("12")
+    assert _stored_size(page) == "12"
