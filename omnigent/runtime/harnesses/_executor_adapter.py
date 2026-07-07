@@ -37,6 +37,7 @@ import contextlib
 import json
 import logging
 import secrets
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -51,6 +52,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorProgress,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -67,11 +69,13 @@ from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
     InjectionConsumedEvent,
+    InProgressEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    ResponseObject,
 )
 
 _logger = logging.getLogger(__name__)
@@ -843,7 +847,19 @@ class ExecutorAdapter(HarnessApp):
         :param ctx: The per-turn context; events are pushed onto
             its queue.
         """
-        if isinstance(event, TextChunk):
+        if isinstance(event, ExecutorProgress):
+            ctx.emit(
+                InProgressEvent(
+                    type="response.in_progress",
+                    response=ResponseObject(
+                        id=ctx.response_id,
+                        status="in_progress",
+                        model=self._current_agent or "unknown",
+                        created_at=int(time.time()),
+                    ),
+                )
+            )
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",

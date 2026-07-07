@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omnigent.inner import hermes_executor as hermes_executor_module
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
@@ -33,6 +34,10 @@ from omnigent.inner.hermes_executor import (
     _populate_hermes_home,
     _strip_hermes_metadata,
 )
+from omnigent.runtime.harnesses import _scaffold
+from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+from omnigent.runtime.harnesses._scaffold import TurnContext
+from omnigent.server.schemas import CreateResponseRequest
 
 # ---------------------------------------------------------------------------
 # Helper function tests
@@ -492,4 +497,52 @@ async def test_run_turn_passes_hermes_home_env(
 
         _, call_kwargs = mock_create.call_args
         assert "env" in call_kwargs
-        assert call_kwargs["env"]["HERMES_HOME"] == str(executor._hermes_home)
+    assert call_kwargs["env"]["HERMES_HOME"] == str(executor._hermes_home)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_long_subprocess_progress_keeps_scaffold_watchdog_alive(
+    executor: HermesExecutor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long Hermes subprocess must not look idle to the scaffold watchdog."""
+
+    class _SlowHermesProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.sleep(0.12)
+            return b"session_id: 20260705_slow_progress\n", b""
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(hermes_executor_module, "_HERMES_TURN_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(
+        hermes_executor_module,
+        "_HERMES_SUBPROCESS_PROGRESS_INTERVAL_S",
+        0.02,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_SlowHermesProcess()),
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, harness_label="Hermes")
+    ctx = TurnContext(
+        response_id="resp_hermes_slow_progress",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    request = CreateResponseRequest(model="hermes-test", input="Hi")
+
+    await adapter._guarded_run_turn(request, ctx)  # type: ignore[attr-defined]
+
+    event_types: list[str | None] = []
+    while not ctx._event_queue.empty():
+        event = ctx._event_queue.get_nowait()
+        event_types.append(getattr(event, "type", None))
+
+    assert "response.in_progress" in event_types
+    assert "response.output_text.delta" not in event_types
