@@ -2208,6 +2208,18 @@ async def _execute_web_fetch_tool(
     if not query:
         return "Error: 'query' parameter is required."
     url = args.get("url")
+
+    # Nimble Extract-backed path: when the spec selects ``fetch_provider: nimble``
+    # and a URL is provided, fetch it directly via Nimble Extract (JavaScript
+    # render + anti-bot + geo-targeting) instead of spawning the shell-based
+    # ``__web_researcher`` sub-agent. Without a URL there is nothing to extract,
+    # so fall through to the researcher (which searches, then fetches).
+    fetch_config = _web_fetch_config_from_spec(agent_spec)
+    if fetch_config.get("fetch_provider") == "nimble" and url:
+        from omnigent.tools.builtins.web_fetch_nimble import _fetch_nimble
+
+        return await asyncio.to_thread(_fetch_nimble, str(url), fetch_config)
+
     prompt = build_web_fetch_prompt(str(query), str(url) if url else None)
 
     # Embed task_id so each web_fetch from the same parent gets a
@@ -2228,6 +2240,29 @@ async def _execute_web_fetch_tool(
         publish_event=publish_event,
         session_inbox=session_inbox,
     )
+
+
+def _web_fetch_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``web_fetch`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_web_search_config_from_spec`: scans ``spec.tools.builtins``
+    for the entry named ``"web_fetch"`` and returns its ``config``
+    (``fetch_provider`` + credentials). Empty dict when the builtin is declared
+    as a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The web_fetch config dict, e.g.
+        ``{"fetch_provider": "nimble", "api_key": "..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "web_fetch":
+            return getattr(entry, "config", None) or {}
+    return {}
 
 
 def _web_search_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
