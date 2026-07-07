@@ -279,20 +279,15 @@ def _waiting_step_at(
     step_index: int,
 ) -> PendingInteraction | None:
     """
-    Return the WAITING interaction at an EXACT ``(trajectory_id, step_index)``.
+    Return the WAITING interaction at an exact ``(trajectory_id, step_index)``.
 
-    Used to PIN delivery to the step the elicitation was surfaced for: when that
-    step is still WAITING at verdict time, the verdict must go to IT — never to a
-    *different*, higher-index gate that appeared meanwhile (which
-    :func:`_freshest_waiting` would wrongly pick, mis-delivering verdict-A to
-    gate-B). Returns ``None`` when that exact step is no longer WAITING — it timed
-    out (→ ERROR) or was answered — so the caller falls back to the freshest
-    WAITING, which is agy's genuine same-gate timeout-retry at a higher index
-    (§2.1). agy gates sequentially today (one WAITING step of a kind at a time), so
-    this only ever differs from ``_freshest_waiting`` if agy were to expose two
-    distinct same-kind gates at once; the pin makes delivery correct even then.
+    Pins verdict delivery to the step the elicitation was surfaced for rather than
+    the freshest WAITING step (which could be a different gate that appeared
+    meanwhile). Returns ``None`` when that step is no longer WAITING (timed out or
+    answered), letting the caller fall back to ``_freshest_waiting`` for agy's
+    same-gate timeout-retry.
 
-    :param steps: A trajectory steps snapshot (from ``get_steps``).
+    :param steps: Trajectory steps snapshot.
     :param trajectory_id: The surfaced step's trajectory id.
     :param step_index: The surfaced step's index.
     :returns: The matching WAITING :class:`PendingInteraction`, or ``None``.
