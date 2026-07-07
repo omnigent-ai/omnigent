@@ -2305,7 +2305,6 @@ function bubbleKey(bubble: Bubble): string {
  */
 export const WORKING_MESSAGES = [
   "Working…",
-  "Thinking…",
   "Cooking…",
   "Crunching…",
   "Tinkering…",

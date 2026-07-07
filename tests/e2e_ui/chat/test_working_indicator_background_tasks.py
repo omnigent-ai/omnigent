@@ -75,9 +75,12 @@ def test_background_task_indicator_label_lifecycle(
 
     # 2. A new turn starts (the `running` edge a composer send produces): the
     #    fresh turn supersedes the tally, so the label flips from the
-    #    background-task count to the plain "Working…".
+    #    background-task count to a rotating working label (e.g. "Working…",
+    #    "Cooking…"). Assert on the trailing ellipsis every rotating label
+    #    shares — the background-task text has none — so the test is robust to
+    #    which pool entry the wall-clock bucket lands on.
     _publish_status(base_url, session_id, "running")
-    expect(working).to_contain_text("Working", timeout=15_000)
+    expect(working).to_contain_text("…", timeout=15_000)
     expect(working).not_to_contain_text("background task", timeout=15_000)
 
     # 3. The turn ends with the background shell finished: an authoritative
