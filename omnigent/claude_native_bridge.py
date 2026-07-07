@@ -135,12 +135,6 @@ _BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
 # people's statuslines run ~3 lines — so the ``❯`` row isn't the last
 # non-empty line.
 _PROMPT_SCAN_TAIL_LINES = 5
-# Injecting a message mid-turn grows the footer with running-state rows
-# (a ``○ Explore …`` subagent line, extra spinners) that push ``❯`` above
-# the window above. We trust a glyph this deep only when it's framed by a
-# box rule (the live input box), so this wider window can't false-match a
-# bare ``❯`` echoed into scrollback output.
-_PROMPT_SCAN_TAIL_LINES_FRAMED = 8
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -2843,11 +2837,11 @@ def _claude_prompt_rendered(pane: str) -> bool:
 
     A mid-turn injection grows the footer with running-state rows (a
     ``○ Explore …`` subagent line, extra spinners) that can push ``❯``
-    past that window. To reach it without also matching a scrollback
-    echo, a glyph in the wider :data:`_PROMPT_SCAN_TAIL_LINES_FRAMED`
-    window counts only when it's framed by a box rule — the ``────``
-    closing line the live input box always renders below ``❯`` but a
-    bare echoed prompt never has.
+    past that window — arbitrarily far, since a subagent fan-out adds one
+    row per concurrent subagent. To reach it at any depth without also
+    matching a scrollback echo, a glyph above the window counts only when
+    it's framed by a box rule — the ``────`` closing line the live input
+    box always renders below ``❯`` but a bare echoed prompt never has.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the input box appears mounted.
@@ -2855,11 +2849,16 @@ def _claude_prompt_rendered(pane: str) -> bool:
     non_empty = [line for line in pane.splitlines() if line.strip()]
     if any(_CLAUDE_PROMPT_GLYPH in line for line in non_empty[-_PROMPT_SCAN_TAIL_LINES:]):
         return True
-    # Deeper in the tail, trust the glyph only when a box rule sits below
+    # Above that window, trust the glyph only when a box rule sits below
     # it — the live input box's closing frame, absent from scrollback.
-    tail = non_empty[-_PROMPT_SCAN_TAIL_LINES_FRAMED:]
-    for idx, line in enumerate(tail):
-        if _CLAUDE_PROMPT_GLYPH in line and any(_is_box_rule(rule) for rule in tail[idx + 1 :]):
+    # The footer height scales with concurrent subagents (a fan-out of
+    # ``○ Explore …`` rows), so no fixed window can bound it; the box rule
+    # is a reliable structural signal at any depth, and `capture-pane -p`
+    # returns only the visible pane, so this stays within one screen.
+    for idx, line in enumerate(non_empty):
+        if _CLAUDE_PROMPT_GLYPH not in line:
+            continue
+        if any(_is_box_rule(rule) for rule in non_empty[idx + 1 :]):
             return True
     return False
 
