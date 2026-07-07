@@ -159,7 +159,7 @@ def test_provision_create_argv_and_setup(
     sandbox_id = SbxSandboxLauncher().provision("omnigent-host")
 
     assert sandbox_id == "omnigent-host"
-    create, setup = fake_sbx.calls
+    create, _policy, setup = fake_sbx.calls
     assert create.args[1:] == [
         "create",
         "--name",
@@ -197,6 +197,42 @@ def test_provision_includes_kits_and_template(
         "shell",
         str(tmp_path),
     ]
+
+
+def test_provision_allows_claude_auth_domains(
+    fake_sbx: _FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Discovery finding: sbx's default-deny network policy blocks Claude
+    Code's OAuth endpoints (console.anthropic.com / platform.claude.ai),
+    so a subscription token refresh fails and Claude Code wipes the
+    stored credentials. provision adds a sandbox-scoped allow rule for
+    those domains so subscription auth keeps working.
+    """
+    monkeypatch.chdir(tmp_path)
+    SbxSandboxLauncher().provision("box")
+
+    policy = next(c for c in fake_sbx.calls if c.args[1] == "policy")
+    assert policy.args[1:6] == ["policy", "allow", "network", "--sandbox", "box"]
+    domains = policy.args[6]
+    assert "console.anthropic.com:443" in domains
+    assert "platform.claude.ai:443" in domains
+    assert "claude.ai:443" in domains
+
+
+def test_provision_survives_policy_allow_failure(
+    fake_sbx: _FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An sbx build without `policy allow --sandbox` must not break
+    provisioning — the rule is a best-effort enabler for subscription
+    auth, and API-key users don't need it.
+    """
+    monkeypatch.chdir(tmp_path)
+    fake_sbx.responses["policy"] = _FakeCompleted(
+        args=[], returncode=1, stderr="unknown flag: --sandbox"
+    )
+    assert SbxSandboxLauncher().provision("box") == "box"
 
 
 def test_provision_wraps_create_failure(
@@ -360,9 +396,29 @@ def test_exec_foreground_argv_and_env(fake_sbx: _FakeSbx, monkeypatch: pytest.Mo
     assert call.args[4] == "ANTHROPIC_API_KEY=sk-test"
     assert call.args[5] == "box"
     assert call.args[6:8] == ["bash", "-lc"]
-    assert call.args[8] == "TERM=xterm-256color exec omnigent host --server u"
+    assert call.args[8].endswith("TERM=xterm-256color exec omnigent host --server u")
     # Foreground inherits the terminal — output is NOT captured.
     assert call.capture is False
+
+
+def test_exec_foreground_strips_proxy_managed_placeholders(fake_sbx: _FakeSbx) -> None:
+    """
+    Discovery finding: Docker Sandboxes injects placeholder provider
+    keys (ANTHROPIC_API_KEY=proxy-managed, …) into every exec session.
+    Unless a real key is registered with sbx, the gateway never
+    substitutes a value, so harnesses that prefer env keys over their
+    own login (Claude Code) fail with "Invalid API key". The remote
+    command must unset any var still holding the literal sentinel
+    before the host starts; explicitly passed `-e` values are real and
+    survive the value check.
+    """
+    SbxSandboxLauncher(env=[]).exec_foreground("box", "omnigent host --server u")
+    [call] = fake_sbx.calls
+    remote = call.args[-1]
+    assert '"proxy-managed"' in remote
+    assert "unset" in remote
+    # The strip runs before the host process replaces the shell.
+    assert remote.index("unset") < remote.index("exec omnigent host")
 
 
 def test_exec_foreground_reraises_keyboard_interrupt(fake_sbx: _FakeSbx) -> None:
