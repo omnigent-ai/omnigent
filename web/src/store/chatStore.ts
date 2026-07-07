@@ -537,6 +537,15 @@ export interface ChatState {
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
+   * Reorder a queued message within its own conversation (the strip's
+   * drag-to-reorder). Moves `queueId` so it sits before `beforeQueueId`, or to
+   * the end of its conversation's run when `beforeQueueId` is null. Only
+   * reorders among the same conversation's messages — the flat `queuedMessages`
+   * array interleaves conversations, so other conversations' entries keep their
+   * absolute positions. No-op if the id isn't queued or the move is a no-op.
+   */
+  reorderQueuedMessage: (queueId: string, beforeQueueId: string | null) => void;
+  /**
    * Send a queued message NOW instead of waiting for the idle flush (the
    * strip's per-row steer). Removes it from the queue and POSTs it: on an
    * SDK harness the server live-injects it into the running turn; the
@@ -920,6 +929,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId),
     }));
+  },
+
+  reorderQueuedMessage: (queueId, beforeQueueId) => {
+    set((s) => {
+      const moved = s.queuedMessages.find((m) => m.queueId === queueId);
+      if (moved === undefined || queueId === beforeQueueId) return {};
+      const conversationId = moved.conversationId;
+
+      // Reorder only within this conversation's messages, in their current
+      // relative order, then drop `moved` before its target (or at the end).
+      const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
+      const without = own.filter((m) => m.queueId !== queueId);
+      const at =
+        beforeQueueId === null
+          ? without.length
+          : without.findIndex((m) => m.queueId === beforeQueueId);
+      if (at === -1) return {}; // target isn't in this conversation — no-op
+      const reordered = [...without.slice(0, at), moved, ...without.slice(at)];
+      if (reordered.every((m, i) => m.queueId === own[i]?.queueId)) return {}; // unchanged
+
+      // Refill this conversation's slots (their absolute positions in the flat
+      // array) with the reordered run; other conversations' entries stay put.
+      let next = 0;
+      return {
+        queuedMessages: s.queuedMessages.map((m) =>
+          m.conversationId === conversationId ? reordered[next++]! : m,
+        ),
+      };
+    });
   },
 
   steerMessage: (queueId) => {

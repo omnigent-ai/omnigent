@@ -7533,6 +7533,89 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["first", "third"]);
   });
 
+  it("reorderQueuedMessage moves a message before another within its conversation", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "q_1", text: "first", conversationId: "conv_abc" },
+        { queueId: "q_2", text: "second", conversationId: "conv_abc" },
+        { queueId: "q_3", text: "third", conversationId: "conv_abc" },
+      ],
+    });
+
+    // Move the last message ahead of the first.
+    useChatStore.getState().reorderQueuedMessage("q_3", "q_1");
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "third",
+      "first",
+      "second",
+    ]);
+
+    // beforeQueueId=null moves it to the end.
+    useChatStore.getState().reorderQueuedMessage("third", "q_missing"); // (no such row)
+    useChatStore.getState().reorderQueuedMessage("q_3", null);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+  });
+
+  it("reorderQueuedMessage no-ops for a missing id or a self move", () => {
+    const initial = [
+      { queueId: "q_1", text: "first", conversationId: "conv_abc" },
+      { queueId: "q_2", text: "second", conversationId: "conv_abc" },
+    ];
+    useChatStore.setState({ conversationId: "conv_abc", queuedMessages: initial });
+
+    useChatStore.getState().reorderQueuedMessage("q_missing", "q_1");
+    useChatStore.getState().reorderQueuedMessage("q_1", "q_1"); // before itself
+    // Reference identity preserved — no state churn on a no-op.
+    expect(useChatStore.getState().queuedMessages).toBe(initial);
+  });
+
+  it("reorderQueuedMessage only touches its own conversation's slots (interleaved queue)", () => {
+    // The flat queue interleaves conversations; reordering conv_abc must leave
+    // conv_other's entries at their absolute positions.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "a1", text: "a-first", conversationId: "conv_abc" },
+        { queueId: "o1", text: "other-1", conversationId: "conv_other" },
+        { queueId: "a2", text: "a-second", conversationId: "conv_abc" },
+        { queueId: "o2", text: "other-2", conversationId: "conv_other" },
+        { queueId: "a3", text: "a-third", conversationId: "conv_abc" },
+      ],
+    });
+
+    // Move a-third to the front of conv_abc's run.
+    useChatStore.getState().reorderQueuedMessage("a3", "a1");
+
+    // conv_abc reordered (a3, a1, a2); conv_other's o1/o2 keep their slots
+    // (indices 1 and 3), so the flat array interleaves as below.
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual([
+      "a3",
+      "o1",
+      "a1",
+      "o2",
+      "a2",
+    ]);
+  });
+
+  it("reorderQueuedMessage won't move a message across conversations", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      queuedMessages: [
+        { queueId: "a1", text: "a-first", conversationId: "conv_abc" },
+        { queueId: "o1", text: "other-1", conversationId: "conv_other" },
+      ],
+    });
+
+    // Target belongs to a different conversation → no-op.
+    useChatStore.getState().reorderQueuedMessage("a1", "o1");
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["a1", "o1"]);
+  });
+
   it("steerMessage sends the chosen message now and removes it from the queue", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
