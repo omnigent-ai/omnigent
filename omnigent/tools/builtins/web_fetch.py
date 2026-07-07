@@ -109,15 +109,19 @@ def _ensure_default_sandbox_runnable() -> None:
     researcher would inherit cannot run on this host.
 
     A parent with no ``os_env`` leaves the researcher's ``sandbox``
-    unset, which resolves to ``linux_bwrap`` on Linux (see
+    unset, which resolves to the platform default (see
     ``omnigent.inner.sandbox._default_sandbox_for_platform``) without
-    probing for the binary. The spawn then failed mid-run with a hint
+    probing for its binary. The spawn then failed mid-run with a hint
     to set ``os_env.sandbox.type`` — unreachable for a spawn-only
     parent, which cannot add an ``os_env`` block without also
     registering OS tools on itself. Probe here and point at the actual
     remediation: the missing host dependency.
 
-    :raises OmnigentError: On Linux when ``bwrap`` is not on ``PATH``.
+    Windows needs no probe: ``windows_jobobject`` drives kernel Job
+    Objects through ``ctypes`` with no external binary.
+
+    :raises OmnigentError: On Linux when ``bwrap`` is not on ``PATH``,
+        or on macOS when ``sandbox-exec`` is not on ``PATH``.
     """
     if sys.platform.startswith("linux") and shutil.which("bwrap") is None:
         raise OmnigentError(
@@ -125,6 +129,14 @@ def _ensure_default_sandbox_runnable() -> None:
             "platform-default linux_bwrap sandbox, which requires the "
             "'bwrap' binary on PATH. Install bubblewrap on this host "
             "(e.g. `apt install bubblewrap` or `dnf install bubblewrap`).",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if sys.platform == "darwin" and shutil.which("sandbox-exec") is None:
+        raise OmnigentError(
+            "web_fetch's __web_researcher sub-agent runs under the "
+            "platform-default darwin_seatbelt sandbox, which requires "
+            "the 'sandbox-exec' binary on PATH. It ships with macOS at "
+            "/usr/bin/sandbox-exec; verify your PATH includes /usr/bin.",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -165,7 +177,8 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
     :raises OmnigentError: If the parent declares no bootable harness, so the
         researcher would spawn the unspawnable literal harness ``"omnigent"``;
         or when the parent declares no ``os_env`` and the platform-default
-        sandbox cannot run on this host (missing ``bwrap`` on Linux).
+        sandbox cannot run on this host (missing ``bwrap`` on Linux,
+        ``sandbox-exec`` on macOS).
     """
     from omnigent.inner.datamodel import OSEnvSpec
 

@@ -215,6 +215,7 @@ def test_parent_with_os_env_skips_bwrap_probe(
         spec_version=1,
         name="test-parent",
         llm=LLMConfig(model="openai/gpt-5.4"),
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
         os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
     )
     researcher = build_researcher_spec(parent)
@@ -223,10 +224,34 @@ def test_parent_with_os_env_skips_bwrap_probe(
     assert researcher.os_env.sandbox.type == "none"
 
 
-def test_non_linux_platform_skips_bwrap_probe(
+def test_no_os_env_parent_fails_at_build_when_sandbox_exec_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The probe is Linux-only — other platforms don't default to bwrap."""
+    """The same seed-time probe covers the macOS default sandbox."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    with pytest.raises(OmnigentError, match="sandbox-exec") as excinfo:
+        build_researcher_spec(_make_parent_spec())
+    assert "sandbox.type" not in str(excinfo.value)
+
+
+def test_no_os_env_parent_builds_when_sandbox_exec_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``sandbox-exec`` on PATH the no-os_env spec builds on macOS."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/sandbox-exec")
+    researcher = build_researcher_spec(_make_parent_spec())
+    assert researcher.os_env is not None
+
+
+def test_windows_platform_skips_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``windows_jobobject`` drives kernel Job Objects through ``ctypes``
+    with no external binary, so there is nothing to probe on Windows.
+    """
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(shutil, "which", lambda cmd: None)
     researcher = build_researcher_spec(_make_parent_spec())
