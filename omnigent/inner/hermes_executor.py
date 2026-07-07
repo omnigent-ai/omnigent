@@ -34,6 +34,20 @@ Env vars read at construction:
 - ``HARNESS_HERMES_BUNDLE_DIR`` — absolute path to the agent bundle's
   extracted root.  Unset for agents without a bundled-skills directory.
 - ``HARNESS_HERMES_AGENT_NAME`` — agent display name (reserved for future use).
+
+ModelGate B1 gate (opt-in, off by default):
+
+- ``AI_RUN_PURPOSE`` — when set, ``run_turn`` shells out to the ModelGate
+  check binary (``ops/modelgate/modelgate.py``'s ``resolve_llm_policy``,
+  the same policy ``/opt/bin/ai-run`` enforces for interactive
+  ``hermes-admin``/``hermes-agent`` launches) before spawning the Hermes
+  subprocess. A DENY verdict short-circuits the turn with an
+  :class:`ExecutorError` instead of spawning. When unset (the default for
+  every existing headless dispatch path today), no check runs and behavior
+  is unchanged from before this gate existed.
+- ``HERMES_MODELGATE_CHECK_BIN`` — override path to the check binary.
+  Defaults to ``/opt/bin/modelgate-check`` (installed by
+  ``scripts/deploy-modelgate.sh`` in the ``omnigent-polly-dev-repo``).
 """
 
 from __future__ import annotations
@@ -66,6 +80,10 @@ _logger = logging.getLogger(__name__)
 # Maximum seconds to wait for a Hermes subprocess to complete a single turn.
 # Complex tasks (multi-tool-calling loops) may take several minutes.
 _HERMES_TURN_TIMEOUT_S = 600.0
+
+# ModelGate B1 (opt-in): see module docstring's "ModelGate B1 gate" section.
+_DEFAULT_MODELGATE_CHECK_BIN = "/opt/bin/modelgate-check"
+_MODELGATE_CHECK_TIMEOUT_S = 10.0
 
 # Regex to extract the session_id from Hermes' quiet-mode output line.
 # Matches lines like ``session_id: 20260620_142506_c51451``.
@@ -328,6 +346,64 @@ class HermesExecutor(Executor):
         """
         return True
 
+    async def _check_modelgate(self, *, purpose: str, model: str | None) -> str | None:
+        """
+        Run the ModelGate B1 policy check before spawning a Hermes turn.
+
+        Mirrors ``/opt/bin/ai-run``'s pre-launch gate: shells out to the
+        same check binary so this headless dispatch path honors the
+        identical tier policy (``ops/modelgate/modelgate.py``) as an
+        interactive ``hermes-admin``/``hermes-agent`` CLI launch, instead of
+        re-implementing the policy logic in-process.
+
+        Only called when ``AI_RUN_PURPOSE`` is explicitly set (see
+        :meth:`run_turn`); fails closed (denies) if the check binary is
+        missing or errors, since an explicit purpose tag is a deliberate
+        request for enforcement — silently skipping it would defeat the
+        point.
+
+        :param purpose: The ``AI_RUN_PURPOSE`` value driving this dispatch.
+        :param model: Resolved model identifier, if any.
+        :returns: A human-readable denial message if the gate blocks this
+            launch, or ``None`` if the launch is allowed.
+        """
+        check_bin = os.environ.get("HERMES_MODELGATE_CHECK_BIN", _DEFAULT_MODELGATE_CHECK_BIN)
+        if not os.path.exists(check_bin):
+            return (
+                f"ModelGate check binary not found at {check_bin!r}; refusing to "
+                f"launch Hermes with an explicit AI_RUN_PURPOSE={purpose!r} unverified. "
+                "Unset AI_RUN_PURPOSE, or install ModelGate "
+                "(scripts/deploy-modelgate.sh), to proceed."
+            )
+
+        argv = [check_bin, "hermes"]
+        if model:
+            argv += ["-m", model]
+        gate_env = {**os.environ, "AI_RUN_PURPOSE": purpose}
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=gate_env,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=_MODELGATE_CHECK_TIMEOUT_S
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            return f"ModelGate check failed to run ({exc}); refusing to launch Hermes."
+
+        if proc.returncode == 0:
+            return None
+
+        reason = (
+            stderr_bytes.decode("utf-8", errors="replace").strip()
+            or stdout_bytes.decode("utf-8", errors="replace").strip()
+            or "denied by ModelGate policy"
+        )
+        return reason
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -361,6 +437,17 @@ class HermesExecutor(Executor):
 
         # Resolve model from config override, then instance default
         model = (config.model if config else None) or self._model
+
+        # ModelGate B1 gate (opt-in — see module docstring). Only runs when
+        # AI_RUN_PURPOSE is explicitly set; absent that, this is a no-op and
+        # behavior is identical to before this gate existed.
+        purpose = os.environ.get("AI_RUN_PURPOSE")
+        if purpose:
+            gate_denial = await self._check_modelgate(purpose=purpose, model=model)
+            if gate_denial is not None:
+                _logger.warning("Hermes launch blocked by ModelGate: %s", gate_denial)
+                yield ExecutorError(message=gate_denial, retryable=False)
+                return
 
         # Determine session key for this conversation
         session_key = self._session_key(messages)
