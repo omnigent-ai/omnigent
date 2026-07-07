@@ -32,6 +32,7 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import type { ReactNode } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -72,6 +73,112 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
   const enumValues = (answer as Record<string, unknown>).enum;
   if (!Array.isArray(enumValues)) return [];
   return enumValues.filter((v): v is string => typeof v === "string" && v.length > 0);
+}
+
+/**
+ * Parse a policy-ASK tool-call preview into a renderable structure —
+ * the generic path for EVERY policy-gated tool (Jira transitions, M365
+ * sends, future consumers), with no tool-name branching:
+ *
+ * - ``context`` — the platform ``approval_context`` convention: a tool
+ *   may accept an optional ``approval_context`` string argument that an
+ *   agent fills with its human-facing summary/recommendation. When
+ *   present it is promoted to prose at the top of the card and omitted
+ *   from the argument block.
+ * - ``args`` — the remaining call arguments, rendered as a labeled
+ *   field block (see ``ToolArgEntries``) instead of a raw JSON dump.
+ * - ``name`` — the gated tool's name (shown as the block caption).
+ *
+ * Handles the three producer shapes ``previewFormat.ts`` documents:
+ * the ``{name, arguments}`` envelope, the bare arguments object the
+ * runner policy gate emits, and the ``ToolName({...})`` permission-hook
+ * form. Returns ``null`` for anything unparseable — including previews
+ * cut mid-token by the server-side 1024-char ``content_preview`` cap —
+ * and the card then falls back to the raw-preview render unchanged.
+ */
+function parseToolCallPreview(
+  raw: string,
+): { name: string | null; context: string | null; args: Record<string, unknown> } | null {
+  // Shape 2: ``ToolName({...})`` — the native permission-hook preview.
+  let name: string | null = null;
+  let jsonText = raw;
+  const hookMatch = raw.trim().match(/^([A-Za-z0-9_.:-]+)\((\{[\s\S]*\})\)$/);
+  if (hookMatch) {
+    name = hookMatch[1];
+    jsonText = hookMatch[2];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  // Shape 1: the ``{name, arguments}`` envelope (MCP-style tool call).
+  // Shape 3: a bare arguments object (the runner policy-ASK preview).
+  let args: Record<string, unknown>;
+  if (
+    record.arguments &&
+    typeof record.arguments === "object" &&
+    !Array.isArray(record.arguments)
+  ) {
+    args = { ...(record.arguments as Record<string, unknown>) };
+    if (typeof record.name === "string" && record.name) name = record.name;
+  } else {
+    args = { ...record };
+  }
+  if (Object.keys(args).length === 0) return null;
+  const rawContext = args.approval_context;
+  const context = typeof rawContext === "string" && rawContext.trim() ? rawContext.trim() : null;
+  delete args.approval_context;
+  return { name, context, args };
+}
+
+/**
+ * Labeled, type-aware render of a gated tool call's arguments —
+ * derived from the argument values themselves (schema-agnostic; if the
+ * card ever gains access to the tool's input JSON Schema, titles and
+ * descriptions slot in here). Scalars render inline; long or multiline
+ * strings (message bodies, justifications) render pre-wrapped;
+ * objects/arrays render as compact pretty JSON.
+ */
+function ToolArgEntries({ args }: { args: Record<string, unknown> }) {
+  const entries = Object.entries(args);
+  if (entries.length === 0) return null;
+  return (
+    <dl className="flex flex-col gap-1" data-testid="approval-args">
+      {entries.map(([key, value]) => {
+        let rendered: ReactNode;
+        if (typeof value === "string") {
+          rendered =
+            value.length > 100 || value.includes("\n") ? (
+              <pre className="max-h-40 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
+                {value}
+              </pre>
+            ) : (
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">{value}</code>
+            );
+        } else if (value === null || typeof value === "number" || typeof value === "boolean") {
+          rendered = (
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">{String(value)}</code>
+          );
+        } else {
+          rendered = (
+            <pre className="max-h-40 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
+              {JSON.stringify(value, null, 2)}
+            </pre>
+          );
+        }
+        return (
+          <div key={key} className="flex flex-col gap-0.5">
+            <dt className="text-muted-foreground text-xs">{key}</dt>
+            <dd className="m-0">{rendered}</dd>
+          </div>
+        );
+      })}
+    </dl>
+  );
 }
 
 /**
@@ -254,13 +361,21 @@ export function ApprovalCard({
           ? "Cursor has questions"
           : "Claude has questions";
 
+  // Generic tool-call render for policy-ASK cards: labeled argument
+  // block + promoted approval_context prose (platform convention), with
+  // the raw preview demoted to a collapsed details block. Falls back to
+  // the raw preview when the preview isn't a parseable tool call.
+  const toolCall =
+    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
+      ? null
+      : parseToolCallPreview(contentPreview);
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
   // button mode (the buttons render the choices). Codex command
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval
+    isAskUserQuestion || isExitPlanMode || isMultiChoice || isCodexCommandApproval || toolCall
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -517,6 +632,27 @@ export function ApprovalCard({
         ) : (
           <>
             <span>{message}</span>
+            {toolCall?.context && (
+              <span className="text-foreground whitespace-pre-wrap" data-testid="approval-context">
+                {toolCall.context}
+              </span>
+            )}
+            {toolCall && (
+              <>
+                {toolCall.name && (
+                  <span className="text-muted-foreground font-mono text-xs">{toolCall.name}</span>
+                )}
+                <ToolArgEntries args={toolCall.args} />
+                <details>
+                  <summary className="cursor-pointer text-xs text-muted-foreground select-none">
+                    Raw call
+                  </summary>
+                  <pre className="mt-1 max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
+                    {formatPreview(contentPreview)}
+                  </pre>
+                </details>
+              </>
+            )}
             {formattedPreview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
                 {formattedPreview}

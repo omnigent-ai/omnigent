@@ -7,6 +7,167 @@ afterEach(() => {
   cleanup();
 });
 
+describe("ApprovalCard — approval_context prose", () => {
+  const preview = JSON.stringify({
+    name: "mcp_omnigent_atlassian_server__transitionJiraIssue",
+    arguments: {
+      issueIdOrKey: "AM-4773",
+      transition: { id: "71", name: "resp area approval" },
+      approval_context: "Routine termination; precedent AM-4772. Recommend approve.",
+    },
+  });
+
+  it("lifts approval_context out of the JSON and renders it as prose", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_ctx"
+        message="Jira workflow transition — Robert must approve."
+        phase="tool_call"
+        policyName="jira_approval_gate"
+        contentPreview={preview}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    // The justification renders as prose…
+    expect(screen.getByTestId("approval-context").textContent).toBe(
+      "Routine termination; precedent AM-4772. Recommend approve.",
+    );
+    // …the remaining arguments render as a labeled block (keys as
+    // labels, no approval_context row, no raw JSON braces)…
+    const argsBlock = screen.getByTestId("approval-args");
+    expect(argsBlock.textContent).toContain("issueIdOrKey");
+    expect(argsBlock.textContent).toContain("AM-4773");
+    expect(argsBlock.textContent).not.toContain("approval_context");
+    // …and the verbatim preview survives in the collapsed raw block.
+    const details = document.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(details!.textContent).toContain("Raw call");
+  });
+
+  it("renders a labeled argument block for any parseable tool call (no approval_context)", () => {
+    // The generic path: every policy-gated tool gets the labeled render,
+    // not just ones opting into the approval_context convention.
+    render(
+      <ApprovalCard
+        elicitationId="elic_generic"
+        message="M365 send requires approval."
+        phase="tool_call"
+        policyName="m365_send_gate"
+        contentPreview={JSON.stringify({
+          name: "mcp_omnigent_mso__mail_send_commit",
+          arguments: {
+            to: "someone@example.com",
+            subject: "Quarterly report",
+            body: "A".repeat(150),
+          },
+        })}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-context")).toBeNull();
+    const argsBlock = screen.getByTestId("approval-args");
+    expect(argsBlock.textContent).toContain("subject");
+    expect(argsBlock.textContent).toContain("Quarterly report");
+    // Long string values (message bodies) render pre-wrapped.
+    expect(argsBlock.querySelector("pre")).not.toBeNull();
+    // Tool name is shown as the block caption.
+    expect(screen.getByText("mcp_omnigent_mso__mail_send_commit")).toBeDefined();
+  });
+
+  it("falls back to the raw preview when the JSON is truncated mid-token", () => {
+    // The server caps content_preview at 1024 chars, so a long
+    // approval_context can arrive cut off. The parse fails and the
+    // card must render exactly as before this feature.
+    const truncated = preview.slice(0, 80);
+    render(
+      <ApprovalCard
+        elicitationId="elic_cut"
+        message="Jira workflow transition — Robert must approve."
+        phase="tool_call"
+        policyName="jira_approval_gate"
+        contentPreview={truncated}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-context")).toBeNull();
+    expect(screen.queryByTestId("approval-args")).toBeNull();
+    expect(document.querySelector("details")).toBeNull();
+    expect(document.querySelector("pre")).not.toBeNull();
+  });
+
+  it("renders the bare-arguments policy-ASK shape as labeled args", () => {
+    // The runner policy gate previews the raw arguments object with no
+    // {name, arguments} envelope.
+    render(
+      <ApprovalCard
+        elicitationId="elic_bare"
+        message="blast_radius: command is recoverable but outward."
+        phase="tool_call"
+        policyName="blast_radius"
+        contentPreview={JSON.stringify({ command: "git push origin main" })}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    const argsBlock = screen.getByTestId("approval-args");
+    expect(argsBlock.textContent).toContain("command");
+    expect(argsBlock.textContent).toContain("git push origin main");
+  });
+
+  it("renders the ToolName({...}) permission-hook shape with the tool caption", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_hook"
+        message="Claude wants to use **WebFetch**"
+        phase="tool_call"
+        policyName="claude_sdk_permission"
+        contentPreview={'WebFetch({"url": "https://example.com", "prompt": "summarize"})'}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    expect(screen.getByText("WebFetch")).toBeDefined();
+    const argsBlock = screen.getByTestId("approval-args");
+    expect(argsBlock.textContent).toContain("url");
+    expect(argsBlock.textContent).toContain("https://example.com");
+  });
+
+  it("ignores non-string or empty approval_context", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_empty"
+        message="Approve?"
+        phase="tool_call"
+        policyName="jira_approval_gate"
+        contentPreview={JSON.stringify({
+          name: "tool",
+          arguments: { approval_context: "   " },
+        })}
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-context")).toBeNull();
+    // The empty-context field is dropped from the labeled block too.
+    expect(screen.queryByTestId("approval-args")).toBeNull();
+  });
+});
+
 describe("ApprovalCard — binary approve/reject", () => {
   it("renders Approve and Reject buttons when requestedSchema has no enum", () => {
     // Policy-ASK and PermissionRequest cards arrive with an empty
