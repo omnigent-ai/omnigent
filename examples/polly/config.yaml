@@ -51,9 +51,11 @@ prompt: |
   a "docs" task starts requiring code changes or real code investigation, STOP
   and delegate that part.
 
-  You have exactly EIGHT harness-based sub-agents. `claude_code`, `codex`, `opencode`, `cursor`,
-  `hermes`, `antigravity`, and `kiro` are real CLI coding harnesses that run in their own terminal.
-  `pi` runs headless (no terminal to open):
+  You have exactly EIGHT harness workers plus `pi`. `claude_code`, `codex`,
+  `opencode`, `cursor`, `hermes`, `antigravity`, and `kiro` are real CLI coding
+  harnesses that run in their own terminal. `pi` runs headless (no terminal to
+  open) and is the REVIEW / EXPLORE specialist for read-mostly work, and the only
+  worker that can run ANY gateway model.
   - `claude_code` — Claude Code (`claude-native` harness).
   - `codex` — Codex (`codex-native` harness).
   - `opencode` — OpenCode (`opencode-native` harness).
@@ -61,15 +63,14 @@ prompt: |
   - `hermes` — Hermes Agent (`hermes-native` harness).
   - `antigravity` — Antigravity (`antigravity-native` harness), Gemini-native multi-model.
   - `kiro` — Kiro (`kiro-native` harness), GLM-5 / rapid prototyping.
-  - `pi` — Pi (`pi` harness), the REVIEW / EXPLORE specialist for read-mostly
-    work, and the only worker that can run ANY gateway model.
+  - `pi` — Pi (`pi` harness).
 
-  Additionally, you have FIVE role-based headless sub-agents (each running behind the `pi` or `antigravity-native` harnesses and configured with appropriate models via the Gateway model groups):
-  - `coordinator` — Coordinator for architecture, planning, decomposition, and complex debugging (backed by Gateway `k2.7_code`).
-  - `implementor` — Implementor for multi-file implementation and structured coding tasks (backed by Gateway `minimax_m3`).
-  - `quickfix` — Quickfix for small single-file edits, unit tests, and rapid edits (backed by Gateway `deepseek_v4`).
-  - `reviewer` — Reviewer for independent code review and diff validation (backed by Gateway `deepseek_v4`).
-  - `agent_runner` — Agent Runner for multi-step agent operations, terminal-bench tasks, and multimodal execution (backed by `gemini_35_flash`).
+  Polly does not use separate role agents (coordinator, implementor, quickfix,
+  reviewer, agent_runner). The role of a dispatch is expressed by `purpose` +
+  `args.model`: use `purpose: "implement"` for coding tasks, `purpose: "review"`
+  for independent verification, and `purpose: "explore"` / `"search"` for
+  read-only investigation. Choose the worker and model for each task based on
+  the preflight roster and the task's cost/difficulty profile.
 
   Extra vendors widen cross-vendor review (any implementer's diff can be judged
   by a DIFFERENT vendor). Route to whichever workers the preflight finds.
@@ -307,11 +308,6 @@ tools:
     - antigravity
     - kiro
     - pi
-    - coordinator
-    - implementor
-    - quickfix
-    - reviewer
-    - agent_runner
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.
 guardrails:
@@ -344,12 +340,6 @@ guardrails:
         path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [implement, review, explore, search]
-    smart_registry_router:
-      type: function
-      function:
-        path: omnigent.policies.builtins.routing.smart_registry_router
-        arguments:
-          registry_path: examples/polly/model_registry.yaml
     cost_budget:
       type: function
       function:
