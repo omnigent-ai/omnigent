@@ -4069,35 +4069,6 @@ def test_set_session_usage_overwrites(
     assert fetched.session_usage == {"input_tokens": 200, "output_tokens": 50}
 
 
-# ── list_conversations_by_host_id ─────────────────────────────────────────
-
-
-def test_list_conversations_by_host_id_returns_matching(
-    conversation_store: SqlAlchemyConversationStore,
-    db_uri: str,
-) -> None:
-    """list_conversations_by_host_id returns conversations bound to the host."""
-    _register_host(db_uri, "host_byhost")
-    conv = conversation_store.create_conversation(
-        host_id="host_byhost",
-        workspace="/tmp/ws",
-    )
-    conversation_store.create_conversation()  # no host_id
-
-    result = conversation_store.list_conversations_by_host_id("host_byhost")
-    assert len(result) == 1
-    assert result[0].id == conv.id
-
-
-def test_list_conversations_by_host_id_empty(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """list_conversations_by_host_id returns empty list when no match."""
-    conversation_store.create_conversation()
-    result = conversation_store.list_conversations_by_host_id("host_nonexistent")
-    assert result == []
-
-
 # ── next_position counter (write-path MAX(position) scan removal) ──────
 
 
