@@ -19119,8 +19119,13 @@ def _build_spawn_env_from_spec(
         env var here.)
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
+    # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
+    # dispatch, model-key lookup, and logging below all key off the base harness;
+    # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    harness = canonicalize_harness(harness) or harness
     try:
         from omnigent.runtime.workflow import (
+            _build_acp_spawn_env,
             _build_antigravity_spawn_env,
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
@@ -19151,6 +19156,8 @@ def _build_spawn_env_from_spec(
             env = _build_qwen_spawn_env(spec, workdir=workdir)
         elif harness == "goose":
             env = _build_goose_spawn_env(spec, workdir=workdir)
+        elif harness == "acp":
+            env = _build_acp_spawn_env(spec, workdir=workdir)
         elif harness == "copilot":
             env = _build_copilot_spawn_env(spec, workdir=workdir)
         else:
