@@ -52,20 +52,8 @@ import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
-import { RestartWithModelDialog } from "@/shell/RestartWithModelDialog";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
-
-/**
- * Whether a harness id is in the codex (GPT) family — the only harness the
- * "Restart with model…" affordance is offered for. Both the canonical and
- * reversed native spellings count, mirroring the server's
- * ``_CODEX_FAMILY_HARNESSES``. ``null`` / undefined (harness not loaded) is
- * not codex, so the affordance stays hidden until the harness is known.
- */
-function isCodexHarness(harness: string | null | undefined): boolean {
-  return harness === "codex" || harness === "codex-native" || harness === "native-codex";
-}
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -1152,12 +1140,6 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   // which case the row is omitted rather than showing a placeholder.
   const { data: owner } = useSessionOwner(sessionId ?? null);
   const viewerId = getCurrentUserId();
-  // The session's current model override, prefilled into the restart dialog.
-  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
-  // "Restart with model…" is codex-only: codex applies its model at launch
-  // (no mid-turn switch), so a model change is a fork that carries history.
-  const showRestartWithModel = isCodexHarness(agent?.harness) && !!sessionId;
-  const [restartOpen, setRestartOpen] = useState(false);
   // Only surface the owner once the session is actually shared — a private
   // solo session has no "owner" worth showing. A non-owner viewer already
   // implies a share; the owner needs the grant list (manage-only, readable by
@@ -1258,27 +1240,6 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
             )}
           </div>
         )}
-      {showRestartWithModel && sessionId && (
-        <div className="flex flex-col gap-1.5 py-3">
-          <SectionLabel>Model</SectionLabel>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            data-testid="restart-with-model-trigger"
-            onClick={() => setRestartOpen(true)}
-            className="justify-start text-xs"
-          >
-            Restart with model…
-          </Button>
-          <RestartWithModelDialog
-            sessionId={sessionId}
-            currentModel={sessionModelOverride}
-            open={restartOpen}
-            onOpenChange={setRestartOpen}
-          />
-        </div>
-      )}
       <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
       {versionFooter && (
