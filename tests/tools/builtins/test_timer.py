@@ -226,7 +226,7 @@ def test_validate_timer_set_args_rejects_bad_shapes(
     Each malformed shape yields an error message (a ``str``), not a
     tuple — the same messages both timer surfaces return to the LLM.
     """
-    result = validate_timer_set_args(args)  # type: ignore[arg-type]
+    result = validate_timer_set_args(args)
     assert isinstance(result, str)
     assert expected_error_substring in result
 
