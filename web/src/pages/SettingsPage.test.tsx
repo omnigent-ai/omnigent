@@ -113,6 +113,36 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
+  it("renders the Terminal theme radiogroup with auto selected by default", () => {
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("radiogroup", { name: "Terminal theme" })).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBeNull();
+  });
+
+  it("persists dark and light terminal theme choices on card click", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(screen.getByTestId("terminal-theme-light"));
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBe("light");
+    expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("reflects a stored light terminal theme on mount", () => {
+    localStorage.setItem("omnigent:terminal-theme", "light");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
+  });
+
   it("shows the default UI font size and steps it up, persisting the choice", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
