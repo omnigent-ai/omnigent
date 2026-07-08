@@ -201,16 +201,18 @@ def test_check_constraint_allows_host_id_with_workspace(
         assert result.workspace == "/Users/corey/universe/src/foo"
 
 
-def test_host_id_is_indexed(db_engine: Engine) -> None:
+def test_host_id_index_dropped(db_engine: Engine) -> None:
     """
-    Verify ``ix_conversations_host_id`` exists.
+    Verify ``ix_conversations_host_id`` no longer exists at head.
 
-    Reconnect reconciliation queries conversations by ``host_id`` on
-    every host reconnect; without the index that's a full table scan.
+    The index served only ``list_conversations_by_host_id``, which had no
+    callers and was removed along with the index (migration
+    ``z1a2b3c4d5e6``). This locks in the removal so the write-only index
+    isn't accidentally reintroduced.
     """
     index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("conversations")}
-    assert "ix_conversations_host_id" in index_names, (
-        f"Expected ix_conversations_host_id on conversations; got {sorted(index_names)}."
+    assert "ix_conversations_host_id" not in index_names, (
+        f"ix_conversations_host_id should have been dropped; got {sorted(index_names)}."
     )
 
 

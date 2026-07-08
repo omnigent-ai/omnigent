@@ -1021,24 +1021,6 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def list_conversations_by_host_id(
-        self,
-        host_id: str,
-    ) -> list[Conversation]:
-        """
-        Return all conversations with the given ``host_id``.
-
-        Used by reconnect reconciliation to find sessions that
-        need their runner relaunched on a specific host.
-
-        :param host_id: Host identifier, e.g.
-            ``"host_a1b2c3d4..."``.
-        :returns: List of :class:`Conversation` entities with
-            ``host_id`` matching the given value.
-        """
-        ...
-
-    @abstractmethod
     def list_conversations_by_runner_id(
         self,
         runner_id: str,
