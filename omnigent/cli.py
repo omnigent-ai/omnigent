@@ -258,6 +258,7 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
         "COHERE_API_KEY",
+        "CURSOR_API_KEY",
         "DEEPSEEK_API_KEY",
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",

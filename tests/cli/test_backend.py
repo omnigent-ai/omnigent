@@ -252,6 +252,25 @@ def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
 
 
+def test_build_host_daemon_env_local_forwards_cursor_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CURSOR_API_KEY reaches the local daemon env.
+
+    The cursor harness's ambient-key fallback (``_build_cursor_spawn_env``)
+    reads ``CURSOR_API_KEY`` from the daemon's own environment when the spec
+    declares no explicit auth. Without it in the allowlist, an
+    ``omnigent setup``-free ``CURSOR_API_KEY`` export never reaches the
+    harness and every cursor session falls back to demanding an explicit key.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["CURSOR_API_KEY"] == "crsr_test_key"
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
