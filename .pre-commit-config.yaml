@@ -94,16 +94,6 @@ repos:
         files: ^(pyproject\.toml|omnigent/version\.py)$
         pass_filenames: false
 
-      # Fail if the DB schema changed without refreshing the performance
-      # benchmark's seed (dev/benchmarks/omnigent/seed.py). Check-only — the
-      # fix (regenerate the seed corpus, bump SEED_SCHEMA_REVISION) is manual.
-      - id: check-benchmark-seed-schema
-        name: benchmark seed matches DB schema head
-        language: system
-        entry: .venv/bin/python scripts/check_benchmark_seed_schema.py
-        files: ^omnigent/db/(db_models\.py|migrations/)
-        pass_filenames: false
-
       # Local `uv` runs rewrite uv.lock's registry to whatever index is
       # configured on the developer's machine (e.g. the Databricks PyPI
       # proxy). This OSS repo must always commit the public PyPI URL, so

@@ -1002,20 +1002,14 @@ async def set_fallback(request: Request) -> dict[str, object]:
     valid response even when per-test resets clear the regular queue
     (e.g. the server-level policy-classifier LLM queue).
 
-    Body: ``{"key": "<key>", "text": "<response-text>", "stream": false}``
-
-    ``stream`` (optional, default false): when true the fallback emits
-    ``response.output_text.delta`` events (one per word) before the completed
-    event — so a caller that subscribes to a streaming response sees
-    incremental deltas from the fallback, not just a single completed body.
+    Body: ``{"key": "<key>", "text": "<response-text>"}``
     """
     body = await request.json()
     key = body.get("key", _DEFAULT_KEY)
     text = body.get("text", "Mock LLM response")
-    stream = bool(body.get("stream", False))
     async with _state._lock:
         queue = _state.get_queue(key)
-        queue.fallback = QueuedResponse(text=text, stream=stream)
+        queue.fallback = QueuedResponse(text=text)
     return {"fallback_set": True, "key": key}
 
 
