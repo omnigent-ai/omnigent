@@ -54,6 +54,13 @@ def main() -> None:
     tool_name = payload.get("tool_name") or "unknown"
     tool_input = payload.get("tool_input") or {}
 
+    # Omnigent relay tools are already gated when the relay dispatches them back
+    # through the server's tool path; gating them here too parks a duplicate approval
+    # card whose long-poll hangs. Hermes' own tools lack the prefix and stay gated.
+    if tool_name.startswith(("mcp_omnigent_", "mcp__omnigent__")):
+        json.dump({}, sys.stdout)
+        return
+
     # Build the evaluation request matching the server's EvaluationRequest
     # schema.
     eval_body: dict[str, object] = {
