@@ -85,7 +85,22 @@ def upgrade() -> None:
     if sqlite:
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))
 
+    is_mysql = op.get_bind().dialect.name == "mysql"
     for table, pk_cols in _TABLE_PKS.items():
+        if is_mysql:
+            # Use raw DDL on MySQL to avoid batch_alter_table reading ORM
+            # metadata and trying to apply server_defaults (e.g. '' on title)
+            # that MySQL rejects on TEXT/BLOB columns.
+            pk_col_list = ", ".join(f"`{c}`" for c in ["workspace_id", *pk_cols])
+            op.execute(
+                sa.text(
+                    f"ALTER TABLE `{table}` "
+                    f"ADD COLUMN workspace_id BIGINT NOT NULL DEFAULT 0 FIRST, "
+                    f"DROP PRIMARY KEY, "
+                    f"ADD CONSTRAINT `pk_{table}` PRIMARY KEY ({pk_col_list})"
+                )
+            )
+            continue
         # On PostgreSQL the current PK must be dropped before a wider one
         # can be added; on SQLite the batch rebuild overrides it in place.
         old_pk_name = None if sqlite else _existing_pk_name(table)
@@ -110,7 +125,19 @@ def downgrade() -> None:
     if sqlite:
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))
 
+    is_mysql = op.get_bind().dialect.name == "mysql"
     for table, pk_cols in _TABLE_PKS.items():
+        if is_mysql:
+            pk_col_list = ", ".join(f"`{c}`" for c in pk_cols)
+            op.execute(
+                sa.text(
+                    f"ALTER TABLE `{table}` "
+                    f"DROP PRIMARY KEY, "
+                    f"DROP COLUMN workspace_id, "
+                    f"ADD CONSTRAINT `pk_{table}` PRIMARY KEY ({pk_col_list})"
+                )
+            )
+            continue
         old_pk_name = None if sqlite else _existing_pk_name(table)
         with (
             _quiet_pk_override(),

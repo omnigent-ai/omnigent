@@ -419,7 +419,7 @@ class SqlConversation(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
-    title: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # CONVERSATION_KIND: default=1, sub_agent=2). The store converts to/from
     # the string name at the row↔entity boundary.
@@ -538,6 +538,7 @@ class SqlConversation(Base):
             unique=True,
             sqlite_where=text("parent_conversation_id IS NOT NULL"),
             postgresql_where=text("parent_conversation_id IS NOT NULL"),
+            mysql_length={"title": 512},
         ),
         # Partial composite index for child-session listing
         # (list_conversations(kind="sub_agent", parent_conversation_id=...)).
