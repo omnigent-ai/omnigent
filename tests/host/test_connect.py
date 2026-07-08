@@ -397,6 +397,7 @@ async def test_handle_launch_prints_exact_runner_log_path(
         request_id="req_log",
         binding_token="tok_log",
         workspace=str(workspace),
+        session_id="conv_log",
     )
 
     original_popen = subprocess.Popen
@@ -426,6 +427,7 @@ async def test_handle_launch_prints_exact_runner_log_path(
     assert "↑ Runner started:" in out
     # The exact file path is printed, home-collapsed to ``~`` for readability.
     assert f"log: ~/.omnigent/logs/host-runner/{log_files[0].name}" in out
+    assert "session: conv_log" in out
 
     _cleanup_host(host)
 
