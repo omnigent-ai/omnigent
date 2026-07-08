@@ -69,15 +69,19 @@ _SETTLE_STABLE_POLLS = 3
 # i-th queued web message), scrambling EVERY later message's reconciliation.
 #
 # The settle heuristic cannot tell "static banner" from "ready prompt", so we
-# confirm delivery against Hermes' OWN store instead: an accepted turn writes a
-# new ``messages`` row (Hermes flushes a row per agentic step), so a new row
-# appearing is the authoritative "message accepted" signal. If none appears we
-# re-deliver ONCE — safe against double-delivery precisely because the store
-# confirmed nothing landed — and otherwise raise so the turn fails cleanly (its
-# optimistic bubble rolls back) rather than silently desyncing the FIFO.
+# confirm delivery against Hermes' OWN store instead: Hermes records an accepted
+# injected message as a new ``user`` row, so a new user row (scoped to this
+# terminal's session when the forwarder has discovered it) is the authoritative
+# "message accepted" signal. The store also gains ``assistant``/``tool`` rows for
+# every agentic step of an in-flight turn — those must NOT count as the ack, or a
+# paste dropped mid-turn (steering) is falsely confirmed by the agent's own work
+# log and the loss goes undetected. If no user row appears we re-deliver ONCE —
+# safe against double-delivery precisely because the store confirmed nothing
+# landed — and otherwise raise so the turn fails cleanly (its optimistic bubble
+# rolls back) rather than silently desyncing the FIFO.
 _RETRY_SETTLE_S = 10.0
-# How long to wait for Hermes to persist a new ``messages`` row confirming it
-# accepted the injected turn. Generous: assistant rows stream within seconds of
+# How long to wait for Hermes to persist the new ``user`` row confirming it
+# accepted the injected turn. Generous: the row lands within seconds of
 # acceptance, so a confirmation this slow means the keystrokes were dropped.
 _DELIVERY_CONFIRM_TIMEOUT_S = 12.0
 _DELIVERY_POLL_INTERVAL_S = 0.3
@@ -632,20 +636,29 @@ def _state_db_path(bridge_dir: Path) -> Path | None:
     return None
 
 
-def _max_message_id(db_path: Path) -> int:
-    """Return ``MAX(messages.id)`` in the Hermes ``state.db``, or ``0`` on error.
+def _last_user_row_id(db_path: Path, hermes_session_id: str | None = None) -> int:
+    """Return the highest ``user`` row id in the Hermes ``state.db``, or ``0`` on error.
 
-    A missing file, a not-yet-created ``messages`` table, or a transient
-    mid-checkpoint read error all collapse to ``0`` — the delivery check only
-    needs a monotonically-increasing high-water mark, and a freshly-created
-    session legitimately starts at ``0``.
+    Only ``role = 'user'`` rows count: an in-flight turn appends
+    ``assistant``/``tool`` rows for every agentic step, and on a shared store a
+    sibling session appends rows of its own — neither is evidence that THIS
+    terminal accepted an injected message. With *hermes_session_id* the count is
+    further scoped to that session's rows. A missing file, a not-yet-created
+    ``messages`` table, or a transient mid-checkpoint read error all collapse to
+    ``0`` — the delivery check only needs a monotonically-increasing high-water
+    mark, and a freshly-created session legitimately starts at ``0``.
     """
+    query = "SELECT MAX(id) FROM messages WHERE role = 'user'"
+    params: tuple[str, ...] = ()
+    if hermes_session_id is not None:
+        query += " AND session_id = ?"
+        params = (hermes_session_id,)
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     except sqlite3.Error:
         return 0
     try:
-        row = con.execute("SELECT MAX(id) FROM messages").fetchone()
+        row = con.execute(query, params).fetchone()
         return int(row[0]) if row and row[0] is not None else 0
     except sqlite3.Error:
         return 0
@@ -653,17 +666,37 @@ def _max_message_id(db_path: Path) -> int:
         con.close()
 
 
-def _await_new_message(db_path: Path, baseline_id: int, timeout_s: float) -> bool:
-    """Poll until ``MAX(messages.id) > baseline_id`` or *timeout_s* elapses.
+def _forwarder_session_id(bridge_dir: Path) -> str | None:
+    """Best-effort read of the Hermes session id the forwarder has bound.
 
-    A new ``messages`` row is Hermes' own record that it accepted the injected
-    turn (it flushes a row per agentic step), so this is the authoritative
-    "message landed" signal — far more reliable than scraping the pane. Always
-    checks at least once, even with a zero timeout.
+    The forwarder persists its discovery in the bridge dir; before it has bound
+    (e.g. the very first message of a fresh terminal) this is ``None`` and the
+    delivery check falls back to role-only scoping.
+    """
+    try:
+        from omnigent.hermes_native_forwarder import _read_state
+
+        return _read_state(bridge_dir).hermes_session_id
+    except Exception:  # noqa: BLE001 — confirmation must degrade, never block injection
+        return None
+
+
+def _await_new_message(
+    db_path: Path,
+    baseline_id: int,
+    timeout_s: float,
+    hermes_session_id: str | None = None,
+) -> bool:
+    """Poll until a ``user`` row with id > *baseline_id* appears or *timeout_s* elapses.
+
+    A new user row (scoped to *hermes_session_id* when known) is Hermes' own
+    record that it accepted the injected turn — far more reliable than scraping
+    the pane, and immune to the agent's own step rows landing mid-confirmation.
+    Always checks at least once, even with a zero timeout.
     """
     deadline = time.monotonic() + timeout_s
     while True:
-        if _max_message_id(db_path) > baseline_id:
+        if _last_user_row_id(db_path, hermes_session_id) > baseline_id:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -740,9 +773,13 @@ def inject_user_message(
     the first paste can be silently dropped — and a dropped first message
     permanently off-by-ones the server's pending-input FIFO, scrambling every
     later turn. To prevent that, when Hermes' ``state.db`` is readable we confirm
-    the turn landed (a new ``messages`` row appears); if it didn't we re-deliver
-    ONCE (safe — the store proved nothing landed, so this can't double-submit) and
-    otherwise raise so the turn fails cleanly instead of desyncing the FIFO.
+    the turn landed: a new ``user`` row appears, scoped to this terminal's
+    session when the forwarder has bound one. Only user rows count — a paste can
+    also be dropped mid-turn (steering), and the in-flight turn's own
+    assistant/tool step rows must not masquerade as the ack. If no user row
+    appears we re-deliver ONCE (safe — the store proved nothing landed, so this
+    can't double-submit) and otherwise raise so the turn fails cleanly instead
+    of desyncing the FIFO.
 
     :param bridge_dir: The hermes-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
@@ -762,10 +799,12 @@ def inject_user_message(
             "hermes terminal is no longer running (the TUI exited); restart the session"
         )
     needle = _submit_needle(content)
-    # Snapshot the store high-water mark BEFORE delivery so a new row afterwards
-    # is unambiguous proof Hermes accepted this turn.
+    # Snapshot the user-row high-water mark BEFORE delivery so a newer user row
+    # afterwards is unambiguous proof Hermes accepted this turn. Baseline and
+    # confirmation must use the same scoping or the check defeats itself.
     db_path = _state_db_path(bridge_dir)
-    baseline_id = _max_message_id(db_path) if db_path is not None else None
+    hermes_session_id = _forwarder_session_id(bridge_dir) if db_path is not None else None
+    baseline_id = _last_user_row_id(db_path, hermes_session_id) if db_path is not None else None
 
     _deliver_once(
         socket_path, tmux_target, content, bridge_dir, needle, settle_timeout_s=timeout_s
@@ -775,15 +814,20 @@ def inject_user_message(
         # No readable store to confirm against — best-effort single delivery,
         # preserving prior behavior for setups without a per-session HERMES_HOME.
         return
-    if _await_new_message(db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S):
+    if _await_new_message(
+        db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S, hermes_session_id
+    ):
         return
     # The first delivery did not land (the TUI was still initializing). Re-deliver
-    # once — the store confirmed no row was written, so there is no double-submit
-    # risk — giving the pane a longer settle to let MCP startup finish.
+    # once — the store confirmed no user row was written, so there is no
+    # double-submit risk — giving the pane a longer settle to let MCP startup
+    # finish.
     _deliver_once(
         socket_path, tmux_target, content, bridge_dir, needle, settle_timeout_s=_RETRY_SETTLE_S
     )
-    if _await_new_message(db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S):
+    if _await_new_message(
+        db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S, hermes_session_id
+    ):
         return
     raise RuntimeError(
         "hermes did not accept the message (the TUI may still be initializing); "

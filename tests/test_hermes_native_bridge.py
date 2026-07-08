@@ -95,9 +95,9 @@ def test_inject_user_message_single_delivery_when_store_confirms(tmp_path, monke
     calls: list[tuple[str, ...]] = []
     _patch_inject_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
-    # Baseline 0, then a new row (id=1) confirms delivery on the first check.
+    # Baseline 0, then a new user row (id=1) confirms delivery on the first check.
     ids = iter([0, 1])
-    monkeypatch.setattr(b, "_max_message_id", lambda _p: next(ids))
+    monkeypatch.setattr(b, "_last_user_row_id", lambda _p, _s=None: next(ids))
 
     b.inject_user_message(tmp_path, content="do something now")
 
@@ -115,7 +115,7 @@ def test_inject_user_message_retries_once_when_first_not_confirmed(tmp_path, mon
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
     # baseline=0 → confirm#1 sees 0 (fail) → confirm#2 sees 1 (success after retry).
     seq = iter([0, 0, 1])
-    monkeypatch.setattr(b, "_max_message_id", lambda _p: next(seq))
+    monkeypatch.setattr(b, "_last_user_row_id", lambda _p, _s=None: next(seq))
 
     b.inject_user_message(tmp_path, content="do something now")
 
@@ -131,7 +131,7 @@ def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) 
     _patch_inject_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
-    monkeypatch.setattr(b, "_max_message_id", lambda _p: 0)  # never advances
+    monkeypatch.setattr(b, "_last_user_row_id", lambda _p, _s=None: 0)  # never advances
 
     with pytest.raises(RuntimeError, match="did not accept"):
         b.inject_user_message(tmp_path, content="do something now")
@@ -156,30 +156,38 @@ def test_state_db_path_prefers_per_session_home(tmp_path, monkeypatch) -> None:
     assert b._state_db_path(tmp_path) == home / "state.db"
 
 
-def test_max_message_id_reads_high_water_mark(tmp_path) -> None:
+def test_last_user_row_id_counts_only_user_rows(tmp_path) -> None:
     db = tmp_path / "state.db"
     # Missing file → 0.
-    assert b._max_message_id(db) == 0
+    assert b._last_user_row_id(db) == 0
     con = sqlite3.connect(str(db))
     con.executescript(b._MESSAGES_DDL)
     # Empty table → 0.
-    assert b._max_message_id(db) == 0
-    con.execute(
+    assert b._last_user_row_id(db) == 0
+    con.executemany(
         "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?,?,?,?,?)",
-        (7, "s1", "user", "hi", 0.0),
+        [
+            (7, "s1", "user", "hi", 0.0),
+            (8, "s1", "assistant", "step", 0.0),  # agent step — not an ack
+            (9, "s2", "user", "other convo", 0.0),
+        ],
     )
     con.commit()
     con.close()
-    assert b._max_message_id(db) == 7
+    # Unscoped: highest user row anywhere (agent step at id=8 never counts).
+    assert b._last_user_row_id(db) == 9
+    # Scoped: only this session's user rows.
+    assert b._last_user_row_id(db, "s1") == 7
+    assert b._last_user_row_id(db, "s3") == 0
 
 
 def test_await_new_message_checks_at_least_once(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(b.time, "sleep", lambda *_a, **_k: None)
     # Even with a zero timeout, one check runs: baseline 5, current 6 → True.
-    monkeypatch.setattr(b, "_max_message_id", lambda _p: 6)
+    monkeypatch.setattr(b, "_last_user_row_id", lambda _p, _s=None: 6)
     assert b._await_new_message(tmp_path / "state.db", 5, 0.0) is True
     # No advance → False.
-    monkeypatch.setattr(b, "_max_message_id", lambda _p: 5)
+    monkeypatch.setattr(b, "_last_user_row_id", lambda _p, _s=None: 5)
     assert b._await_new_message(tmp_path / "state.db", 5, 0.0) is False
 
 
@@ -480,3 +488,121 @@ def test_mint_hermes_session_id_returns_uuid() -> None:
     # Should be a valid UUID4 string.
     parsed = uuid.UUID(sid, version=4)
     assert str(parsed) == sid
+
+
+_CONFIRM_SCHEMA = """
+CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, cwd TEXT, started_at REAL);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    active INTEGER NOT NULL DEFAULT 1
+);
+"""
+
+
+def _seed_confirm_store(db: Path, session_id: str = "s1") -> None:
+    """A mid-turn store: one earlier user turn plus the agent's step so far."""
+    con = sqlite3.connect(db)
+    con.executescript(_CONFIRM_SCHEMA)
+    con.execute("INSERT INTO sessions VALUES (?,?,?,?)", (session_id, "cli", "/w", 1000.0))
+    con.execute(
+        "INSERT INTO messages(session_id, role, content) VALUES (?,?,?)",
+        (session_id, "user", "earlier ask"),
+    )
+    con.execute(
+        "INSERT INTO messages(session_id, role, content) VALUES (?,?,?)",
+        (session_id, "assistant", "working on it"),
+    )
+    con.commit()
+    con.close()
+
+
+def _insert_row(db: Path, session_id: str, role: str, content: str) -> None:
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO messages(session_id, role, content) VALUES (?,?,?)",
+        (session_id, role, content),
+    )
+    con.commit()
+    con.close()
+
+
+def _bind_forwarder_session(bridge_dir: Path, session_id: str) -> None:
+    from omnigent import hermes_native_forwarder as fwd
+
+    fwd._write_state(
+        bridge_dir,
+        fwd._ForwardState(hermes_session_id=session_id, last_id=0, launch_epoch_s=0.0),
+    )
+
+
+def test_confirm_rejects_agent_step_rows(tmp_path, monkeypatch) -> None:
+    """A dropped paste must not be acked by the agent's own mid-turn step row.
+
+    Steering injects while a turn is running, so the store gains assistant/tool
+    rows every few seconds; only a new *user* row is Hermes' record that it
+    accepted the injected message."""
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    db = tmp_path / "state.db"
+    _seed_confirm_store(db)
+    _bind_forwarder_session(tmp_path, "s1")
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.05)
+    deliveries: list[int] = []
+
+    def _swallowed_paste_while_agent_works(*_a, **_k):
+        deliveries.append(1)
+        # The paste is dropped; the in-flight turn's next step lands instead.
+        _insert_row(db, "s1", "assistant", "next agentic step")
+
+    monkeypatch.setattr(b, "_deliver_once", _swallowed_paste_while_agent_works)
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        b.inject_user_message(tmp_path, content="STOP - change of plan")
+    assert len(deliveries) == 2, "retry must fire; the agent row is not an ack"
+
+
+def test_confirm_rejects_other_sessions_user_rows(tmp_path, monkeypatch) -> None:
+    """On a shared state.db another session's user row must not ack our paste."""
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    db = tmp_path / "state.db"
+    _seed_confirm_store(db, session_id="s1")
+    _bind_forwarder_session(tmp_path, "s1")
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.05)
+    deliveries: list[int] = []
+
+    def _swallowed_paste_while_sibling_writes(*_a, **_k):
+        deliveries.append(1)
+        _insert_row(db, "s2", "user", "a different conversation's message")
+
+    monkeypatch.setattr(b, "_deliver_once", _swallowed_paste_while_sibling_writes)
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        b.inject_user_message(tmp_path, content="hello")
+    assert len(deliveries) == 2
+
+
+def test_confirm_accepts_own_user_row(tmp_path, monkeypatch) -> None:
+    """The true ack — our message's own user row — confirms on the first try."""
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    db = tmp_path / "state.db"
+    _seed_confirm_store(db)
+    _bind_forwarder_session(tmp_path, "s1")
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.05)
+    deliveries: list[int] = []
+
+    def _accepted_paste(*_a, **_k):
+        deliveries.append(1)
+        _insert_row(db, "s1", "user", "hello")
+
+    monkeypatch.setattr(b, "_deliver_once", _accepted_paste)
+
+    b.inject_user_message(tmp_path, content="hello")
+    assert len(deliveries) == 1
