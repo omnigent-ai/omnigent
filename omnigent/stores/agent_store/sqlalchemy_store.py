@@ -10,6 +10,7 @@ from omnigent.db.db_models import (
     AGENT_KIND_TEMPLATE,
     SqlAgent,
     SqlConversation,
+    current_workspace_id,
 )
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -83,7 +84,7 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
         with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if row is None:
                 return None
             # For session-scoped agents, derive the owning conversation id
@@ -91,7 +92,12 @@ class SqlAlchemyAgentStore(AgentStore):
             session_id: str | None = None
             if row.kind == AGENT_KIND_SESSION:
                 session_id = session.execute(
-                    select(SqlConversation.id).where(SqlConversation.agent_id == agent_id).limit(1)
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.agent_id == agent_id,
+                    )
+                    .limit(1)
                 ).scalar_one_or_none()
             return sql_agent_to_entity(row, session_id=session_id)
 
@@ -109,6 +115,7 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session() as session:
             row = session.execute(
                 select(SqlAgent).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
                     SqlAgent.name == name,
                     SqlAgent.kind == AGENT_KIND_TEMPLATE,
                 )
@@ -141,11 +148,12 @@ class SqlAlchemyAgentStore(AgentStore):
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
             is_template = SqlAgent.kind == AGENT_KIND_TEMPLATE
-            stmt = select(SqlAgent).where(is_template)
+            in_workspace = SqlAgent.workspace_id == current_workspace_id()
+            stmt = select(SqlAgent).where(in_workspace, is_template)
             if after:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == after, is_template)
+                    .where(in_workspace, SqlAgent.id == after, is_template)
                     .scalar_subquery()
                 )
                 ts_cmp = SqlAgent.created_at < sub if is_desc else SqlAgent.created_at > sub
@@ -154,7 +162,7 @@ class SqlAlchemyAgentStore(AgentStore):
             if before:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == before, is_template)
+                    .where(in_workspace, SqlAgent.id == before, is_template)
                     .scalar_subquery()
                 )
                 ts_cmp = SqlAgent.created_at > sub if is_desc else SqlAgent.created_at < sub
@@ -191,7 +199,10 @@ class SqlAlchemyAgentStore(AgentStore):
             return {}
         with self._session() as session:
             rows = session.execute(
-                select(SqlAgent.id, SqlAgent.name).where(SqlAgent.id.in_(agent_ids))
+                select(SqlAgent.id, SqlAgent.name).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.id.in_(agent_ids),
+                )
             ).all()
             return {row.id: row.name for row in rows}
 
@@ -212,7 +223,7 @@ class SqlAlchemyAgentStore(AgentStore):
             found.
         """
         with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return None
             row.bundle_location = bundle_location
@@ -221,7 +232,12 @@ class SqlAlchemyAgentStore(AgentStore):
             session_id: str | None = None
             if row.kind == AGENT_KIND_SESSION:
                 session_id = session.execute(
-                    select(SqlConversation.id).where(SqlConversation.agent_id == agent_id).limit(1)
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.agent_id == agent_id,
+                    )
+                    .limit(1)
                 ).scalar_one_or_none()
             return sql_agent_to_entity(row, session_id=session_id)
 
@@ -235,7 +251,7 @@ class SqlAlchemyAgentStore(AgentStore):
             it did not exist.
         """
         with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return False
             session.delete(row)

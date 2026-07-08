@@ -13,12 +13,13 @@ import { authenticatedFetch } from "@/lib/identity";
  * are canonical server harness ids, values are picker labels. Native
  * terminal wrappers (claude-native / codex-native) are deliberately
  * absent: an agent whose declared harness isn't in this map gets no
- * harness options or pill suffix at all.
+ * harness options or pill suffix at all. ``openai-agents`` is likewise
+ * omitted — it stays a valid harness for YAML specs (the server
+ * ``harness_labels`` catalog drops it too), but is not offered as a pick.
  */
 export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   // Insertion order IS the fly-out's menu order.
   "claude-sdk": "Claude SDK",
-  "openai-agents": "OpenAI Agents SDK",
   codex: "Codex",
   cursor: "Cursor",
   pi: "Pi",

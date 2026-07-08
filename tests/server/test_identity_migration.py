@@ -156,9 +156,9 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
     remap_identities(engine, {"alice": "alice@example.com"}, dry_run=False)
 
     with Session(engine) as s:
-        assert s.get(SqlComment, "cmt_1").created_by == "alice@example.com"
-        assert s.get(SqlPolicy, "pol_1").created_by == "alice@example.com"
-        assert s.get(SqlAccountToken, "tok_1").created_by == "alice@example.com"
+        assert s.get(SqlComment, (0, "cmt_1")).created_by == "alice@example.com"
+        assert s.get(SqlPolicy, (0, "pol_1")).created_by == "alice@example.com"
+        assert s.get(SqlAccountToken, (0, "tok_1")).created_by == "alice@example.com"
         host_owners = s.execute(select(SqlHost.owner)).scalars().all()
         assert host_owners == ["alice@example.com"]
 

@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { resolveWebSocketUrl } from "@/lib/host";
+import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -213,6 +214,18 @@ export function TerminalView({
   useEffect(() => {
     sessionRef.current?.setTheme(isDark);
   }, [isDark]);
+
+  // Push code-font changes (Settings → Appearance) into the live session the
+  // same way — xterm is a fixed-pixel widget, so it can't follow a CSS variable
+  // like the chrome font and must be told imperatively. The subscription
+  // outlives individual re-dials (sessionRef is swapped in place), and a fresh
+  // session reads the current pref at construction, so a change made while
+  // disconnected still lands on reconnect.
+  useEffect(() => {
+    return subscribeCodeFont((font) => {
+      sessionRef.current?.setFont(font.sizePx, font.family);
+    });
+  }, []);
 
   // Auto-reconnect on transport-level drops (background-tab freezes,
   // server restarts — see isUnexpectedTerminalClose). Deliberate
