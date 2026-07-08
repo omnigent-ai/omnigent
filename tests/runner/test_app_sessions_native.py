@@ -6611,7 +6611,12 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
             },
         )
         assert resp.status_code == 202
-        await _aio.wait_for(_hc.post_seen.wait(), timeout=15.0)
+        # Await these events / the interrupt task directly rather than through
+        # asyncio.wait_for: a wall-clock timeout races task completion when the
+        # loaded misc shard starves the event loop — the interrupt could return
+        # 204 yet still raise TimeoutError because the timer fired first. pytest's
+        # global --timeout guards against a genuine hang.
+        await _hc.post_seen.wait()
 
         # The interrupt route must block on the (still-blocked) harness forward —
         # forward-first awaits it before cancelling. If it completes here, the
@@ -6623,12 +6628,12 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         # Wait until the route is actually blocked on fwd_gate — deterministic
         # proof the forward is in-flight. This replaces a flaky 0.5 s sleep that
         # could race on loaded CI machines.
-        await _aio.wait_for(_hc.fwd_seen.wait(), timeout=5.0)
+        await _hc.fwd_seen.wait()
         assert not int_task.done(), "interrupt must await the harness forward (forward-first)"
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.
         fwd_gate.set()
-        int_resp = await _aio.wait_for(int_task, timeout=15.0)
+        int_resp = await int_task
         assert int_resp.status_code == 204, int_resp.text
         markers = _interrupt_markers(list(_session_histories_ref.get(conv_id, [])))
 
