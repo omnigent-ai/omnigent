@@ -6199,6 +6199,7 @@ async def _launch_runner_on_host(
             request_id=request_id,
             binding_token=binding_token,
             workspace=conv.workspace,
+            session_id=conv.id,
             # Canonical harness (see _resolve_harness) so the host runs the
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
@@ -14212,6 +14213,7 @@ def create_sessions_router(
                         request_id=request_id,
                         binding_token=binding_token,
                         workspace=resp.workspace,
+                        session_id=resp.id,
                         # Already canonical (see _resolve_harness); lets
                         # the host refuse an unconfigured harness before
                         # spawning. None (agent not resolvable) skips the

@@ -1100,9 +1100,11 @@ class HostProcess:
         # Print the exact runner log file (not just the dir): a foreground
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
+        session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
         print(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
-            f"    log: {_display_log_path(log_path)}",
+            f"    log: {_display_log_path(log_path)}"
+            f"{session_line}",
             flush=True,
         )
         return HostLaunchRunnerResultFrame(
