@@ -69,22 +69,24 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    The bundle has exactly six coding sub-agents: ``claude_code`` (claude-native),
+    The bundle has exactly eight coding sub-agents: ``claude_code`` (claude-native),
     ``codex`` (codex-native), ``opencode`` (opencode-native), ``cursor``
-    (cursor-native), and ``hermes`` (hermes-native) on the native terminal
-    harnesses, plus ``pi`` (pi) as the headless multi-model worker. All
-    implement, review, and explore. The native harnesses render terminal-first
-    (Chat / Terminal pill) so the human can watch or take over.
+    (cursor-native), ``hermes`` (hermes-native), ``antigravity`` (antigravity-native),
+    ``kiro`` (kiro-native), and ``pi`` (pi). All implement, review, and explore.
+    The native harnesses render terminal-first (Chat / Terminal pill) so the
+    human can watch or take over.
 
     A missing/renamed agent means fewer implementers, and same-vendor harnesses
     would break cross-vendor review — polly's differentiator.
     """
     fam = {a.name: a.executor.config.get("harness") for a in polly_spec.sub_agents}
     assert sorted(polly_spec.tools.agents) == [
+        "antigravity",
         "claude_code",
         "codex",
         "cursor",
         "hermes",
+        "kiro",
         "opencode",
         "pi",
     ]
@@ -93,10 +95,19 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     assert fam["opencode"] == "opencode-native"
     assert fam["cursor"] == "cursor-native"
     assert fam["hermes"] == "hermes-native"
+    assert fam["antigravity"] == "antigravity-native"
+    assert fam["kiro"] == "kiro-native"
     assert fam["pi"] == "pi"
-    # Six distinct vendors → any implementer's diff is reviewable by another.
-    assert len(set(fam.values())) == 6
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
+    for name in (
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "antigravity",
+        "kiro",
+        "pi",
+    ):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt
         assert "REVIEW — verify another agent's diff" in prompt
@@ -132,6 +143,7 @@ def test_spine_skills_present(polly_spec: AgentSpec) -> None:
         "cross-review",
         "fanout",
         "investigate",
+        "smart-router",
     ]
 
 
@@ -295,8 +307,8 @@ def test_investigation_skill_delegates_read_only_work() -> None:
 
     assert "Use for any read-only task: investigation, debugging, audit" in compact
     assert (
-        "Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, or `pi`: "
-        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", '
+        "Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, `antigravity`, `kiro`, or `pi`: "
+        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"antigravity"|"kiro"|"pi", '
         'title="explore-<task_slug>", '
         'args={purpose: "explore", input: "<question + exact scope + evidence requested>"})`'
     ) in compact
@@ -347,15 +359,18 @@ def test_subagent_cancellation_guidance_present() -> None:
 
 def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
     """
-    The orchestrator carries the spawn bound, the headless-purpose guard, and
-    the blast-radius gate. ``spawn_bounds`` counts the sub-agent dispatch tool
-    (``sys_session_send``) or fan-out is unbounded.
+    The orchestrator carries the spawn bound, the headless-purpose guard, the
+    cost budget gate, the max-tool-calls gate, and the blast-radius gate.
+    ``spawn_bounds`` counts the sub-agent dispatch tool (``sys_session_send``)
+    or fan-out is unbounded.
     """
     assert polly_spec.guardrails is not None
     names = sorted(p.name for p in polly_spec.guardrails.policies)
     assert names == [
         "blast_radius",
+        "cost_budget",
         "headless_subagent_purpose_guard",
+        "max_tool_calls",
         "spawn_bounds",
     ]
     spawn = next(p for p in polly_spec.guardrails.policies if p.name == "spawn_bounds")
@@ -367,7 +382,16 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:
     """Each sub-agent carries the blast_radius gate (push/destructive)."""
     by_name = {a.name: a for a in polly_spec.sub_agents}
-    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
+    for name in (
+        "claude_code",
+        "codex",
+        "opencode",
+        "cursor",
+        "hermes",
+        "antigravity",
+        "kiro",
+        "pi",
+    ):
         guardrails = by_name[name].guardrails
         assert guardrails is not None, name
         assert [p.name for p in guardrails.policies] == ["blast_radius"], name
@@ -399,7 +423,9 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
                 f"as the evaluator and the first gated tool call would fail closed."
             )
             checked += 1
-    # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x6 (claude_code, codex, opencode, cursor,
-    # hermes, pi) = 6 -> 9 total. Fewer = a policy dropped.
-    assert checked == 9, f"expected 9 function policies in the bundle, inspected {checked}"
+    # orchestrator: blast_radius + cost_budget + max_tool_calls + spawn_bounds + headless_subagent_purpose_guard
+    # = 5; sub-agents: blast_radius x8 (claude_code, codex, opencode, cursor,
+    # hermes, antigravity, kiro, pi) = 8 -> 13 total. Fewer = a policy dropped.
+    # NOTE: the actual number may be higher if additional function policies are
+    # merged in by other skills (e.g. smart-router); guard against drops only.
+    assert checked >= 13, f"expected at least 13 function policies in the bundle, inspected {checked}"

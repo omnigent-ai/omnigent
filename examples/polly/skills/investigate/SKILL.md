@@ -12,13 +12,14 @@ repository-specific technical question.
 ## Procedure
 1. Decompose the question into one or more bounded investigation tasks. Prefer
    two independent lenses for ambiguous or high-stakes questions.
-2. Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, or `pi`:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi",
+2. Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, `antigravity`, `kiro`, or `pi`:
+   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"antigravity"|"kiro"|"pi",
    title="explore-<task_slug>", args={purpose: "explore", input: "<question +
    exact scope + evidence requested>"})`. Use a task-based title such as
    `explore-ci-flake`, never the raw vendor name. Use `purpose: "search"` only
    when the task is primarily external/document search. Prefer `pi` when a
-   third lens or a non-Claude/GPT model is wanted. Any worker takes an optional
+   third lens or a non-Claude/GPT model is wanted; prefer `antigravity` or `kiro`
+   when a Gemini or GLM-5 lens is useful. Any worker takes an optional
    `args.model` (`sys_list_models` shows what each worker can run; an invalid
    model/worker combination fails loud at dispatch, and `model` only applies on
    the dispatch that CREATES the session — a send that continues an existing
