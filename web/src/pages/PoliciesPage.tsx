@@ -117,7 +117,18 @@ function AddDefaultPolicyDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        // Reset to the policy list on close so reopening never lands mid-config.
+        if (!next) {
+          setSelected("");
+          setFactoryParams({});
+          setParamError(null);
+        }
+        onOpenChange(next);
+      }}
+    >
       <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Add Global Policy</DialogTitle>
@@ -326,7 +337,17 @@ function AddDefaultPolicyDialog({
           <div className="flex justify-end gap-2 pt-1">
             <button
               type="button"
-              onClick={() => onOpenChange(false)}
+              onClick={() => {
+                // With a policy selected, Cancel steps back to the list so the
+                // user can pick another; only close the dialog from the list.
+                if (selected) {
+                  setSelected("");
+                  setFactoryParams({});
+                  setParamError(null);
+                } else {
+                  onOpenChange(false);
+                }
+              }}
               className="rounded px-3 py-1.5 text-xs hover:bg-muted"
             >
               Cancel
