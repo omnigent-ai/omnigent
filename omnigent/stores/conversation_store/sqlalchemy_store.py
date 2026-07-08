@@ -100,7 +100,7 @@ def _to_conversation(
         id=row.id,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        title=row.title,
+        title=row.title or None,  # empty string → None at entity layer
         kind=row.kind,
         parent_conversation_id=row.parent_conversation_id,
         root_conversation_id=row.root_conversation_id,
@@ -171,11 +171,15 @@ def _new_session_conversation_row(
         the column NULL.
     :returns: Unsaved :class:`SqlConversation` row.
     """
+    # Sub-agent children must have a unique title per parent.
+    # Fall back to the conversation id to guarantee uniqueness.
+    if parent_conversation_id and not title:
+        title = f"untitled:{conversation_id}"
     return SqlConversation(
         id=conversation_id,
         created_at=now,
         updated_at=now,
-        title=title,
+        title=title or "",  # None → '' for top-level conversations
         kind="sub_agent" if parent_conversation_id else "default",
         parent_conversation_id=parent_conversation_id,
         # Top-level row: ``root_conversation_id`` mirrors the
@@ -656,11 +660,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # ``root_conversation_id`` is NOT NULL (see migration
                     # d8e2f3b4c910), so the parent always has one.
                     root_id = parent_row.root_conversation_id
+                # Sub-agent children must have a unique title per parent because
+                # of ix_conversations_parent_title_unique. Production paths
+                # always supply a derived title (e.g. "agent_type:session_id").
+                # Fall back to the conversation id to guarantee uniqueness.
+                if parent_conversation_id is not None and not title:
+                    title = f"untitled:{new_id}"
                 row = SqlConversation(
                     id=new_id,
                     created_at=now,
                     updated_at=now,
-                    title=title,
+                    title=title or "",  # None → '' for top-level conversations
                     kind=kind,
                     parent_conversation_id=parent_conversation_id,
                     root_conversation_id=root_id,
@@ -1962,7 +1972,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return None
             changed = False
             if title is not None:
-                row.title = title
+                row.title = title or ""  # None/'' → empty string at DB layer
                 changed = True
             if archived is not None:
                 row.archived = archived
@@ -2492,7 +2502,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 id=new_conv_id,
                 created_at=now,
                 updated_at=now,
-                title=fork_title,
+                title=fork_title or "",  # None → empty string at DB layer
                 kind="default",
                 # A fork is a fresh top-level conversation, so its
                 # root mirrors its own id (matches the

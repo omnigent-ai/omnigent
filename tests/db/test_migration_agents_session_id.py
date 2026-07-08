@@ -246,42 +246,59 @@ def test_upgrade_does_not_cascade_delete_conversations(tmp_path: Path) -> None:
 
 
 def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
-    """Downgrade restores session_id from conversations.agent_id and drops kind."""
+    """Downgrade restores session_id from conversations.agent_id and drops kind.
+
+    Uses a raw engine (no auto-migration) to avoid SQLite FK enforcement issues:
+    the o1a2b3c4d5e6 downgrade re-adds fk_agents_session_id (ON DELETE CASCADE),
+    and subsequent batch_alter_table calls on conversations would cascade-delete
+    agents if PRAGMA foreign_keys is ON. A raw engine keeps FK enforcement off.
+    """
     db_path = tmp_path / "downgrade.db"
     uri = f"sqlite:///{db_path}"
-    engine = get_or_create_engine(uri)
+
+    # Use a raw engine (no auto-migration) so PRAGMA foreign_keys stays OFF,
+    # avoiding cascade issues from the re-added fk_agents_session_id FK.
+    raw_engine = sa.create_engine(uri)
+
+    # Migrate to current head first.
+    config = _build_alembic_config(uri)
+    with raw_engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, "head")
 
     # Seed data on the upgraded schema: one template, one session-scoped agent.
-    with engine.begin() as conn:
+    with raw_engine.begin() as conn:
         conn.execute(
             sa.text(
-                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                " VALUES ('ag_tmpl', 1, 'my-template', 'ag_tmpl/b', 1, 'template'),"
-                "        ('ag_sess', 2, 'my-session', 'ag_sess/b', 1, 'session')"
+                "INSERT INTO agents"
+                " (workspace_id, id, created_at, name, bundle_location, version, kind)"
+                " VALUES (0, 'ag_tmpl', 1, 'my-template', 'ag_tmpl/b', 1, 'template'),"
+                "        (0, 'ag_sess', 2, 'my-session', 'ag_sess/b', 1, 'session')"
             )
         )
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES ('conv_1', 3, 3, 'conv_1', 'default', 'ag_sess')"
+                " (workspace_id, id, created_at, updated_at, root_conversation_id,"
+                "  kind, agent_id, title)"
+                " VALUES (0, 'conv_1', 3, 3, 'conv_1', 'default', 'ag_sess', '')"
             )
         )
 
-    # Run the downgrade.
-    config = _build_alembic_config(uri)
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.downgrade(config, "n1a2b3c4d5e6")
+    # Downgrade to n1a2b3c4d5e6 (runs o1a2b3c4d5e6 downgrade which restores session_id).
+    config2 = _build_alembic_config(uri)
+    with raw_engine.begin() as conn:
+        config2.attributes["connection"] = conn
+        command.downgrade(config2, "n1a2b3c4d5e6")
 
     # kind must be gone, session_id must be back.
-    columns = {c["name"] for c in sa.inspect(engine).get_columns("agents")}
+    columns = {c["name"] for c in sa.inspect(raw_engine).get_columns("agents")}
     assert "kind" not in columns
     assert "session_id" in columns
 
     # The session-scoped agent should have session_id back-populated from
     # conversations.agent_id; the template agent should have NULL.
-    with engine.begin() as conn:
+    with raw_engine.begin() as conn:
         rows = {
             row[0]: row[1]
             for row in conn.execute(sa.text("SELECT id, session_id FROM agents ORDER BY id"))
@@ -289,5 +306,5 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
     assert rows["ag_tmpl"] is None
     assert rows["ag_sess"] == "conv_1"
 
-    engine.dispose()
+    raw_engine.dispose()
     clear_engine_cache()

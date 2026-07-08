@@ -335,8 +335,7 @@ class SqlConversation(Base):
         created.
     :param updated_at: Unix epoch seconds when the conversation was
         last updated (item append, title change, etc.).
-    :param title: Optional human-readable title for the conversation.
-        ``None`` when not provided.
+    :param title: Human-readable title; empty string when untitled.
     :param kind: Conversation type. ``"default"`` for user-initiated,
         ``"sub_agent"`` for sub-agent execution conversations.
     :param parent_conversation_id: For Phase 4 named sub-agents,
@@ -412,7 +411,7 @@ class SqlConversation(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
-    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     kind: Mapped[str] = mapped_column(String(32), default="default")
     parent_conversation_id: Mapped[str | None] = mapped_column(
         String(64),
