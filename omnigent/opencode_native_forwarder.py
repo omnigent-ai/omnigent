@@ -181,6 +181,16 @@ class OpenCodeNativeForwarder:
         # the cumulative reasoning text on each ``part.updated``; we forward only
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
+        # Active turn's response_id (assistant messageID). ``None`` before the
+        # first ``message.updated`` with role=="assistant". Set when a turn
+        # begins, cleared when it ends. Used to stamp ``response_id`` on
+        # ``running`` / ``idle`` status edges so the web UI can match them to
+        # live tool-call cards (the function_call items already carry this id).
+        self._current_turn_response_id: str | None = None
+        # Whether the current ``response_id`` has already been posted on a
+        # ``running`` edge, so we don't spam repeated running edges for the
+        # same turn (codex-native reference pattern).
+        self._posted_running_response_id: str | None = None
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -419,24 +429,46 @@ class OpenCodeNativeForwarder:
             },
         )
 
-    async def _begin_turn_if_needed(self) -> None:
-        """Post a single ``running`` status at the start of a turn."""
+    async def _begin_turn_if_needed(self, *, response_id: str | None = None) -> None:
+        """Post a single ``running`` status at the start of a turn.
+
+        When *response_id* is provided and differs from the last posted
+        ``response_id``, the status edge carries the id so the web UI can
+        match it to live tool-call cards.
+        """
+        if response_id is not None:
+            self._current_turn_response_id = response_id
         if not self.state.turn_active:
             self.state.turn_active = True
-            await self._post_status(_STATUS_RUNNING)
+            extra: dict[str, str] | None = None
+            rid = self._current_turn_response_id
+            if rid is not None and rid != self._posted_running_response_id:
+                self._posted_running_response_id = rid
+                extra = {"response_id": rid}
+            await self._post_status(_STATUS_RUNNING, extra=extra)
 
     async def _end_turn(
         self, *, status: str = _STATUS_IDLE, extra: Mapping[str, Any] | None = None
     ) -> None:
-        """Post the terminal status (idle by default) and clear active state."""
+        """Post the terminal status (idle by default) and clear active state.
+
+        The current turn's ``response_id`` (if known) is stamped on the
+        terminal edge so the web UI can reconcile live tool-call cards.
+        """
         self.state.turn_active = False
         # Reasoning deltas are per-turn; drop the per-part offsets so the map
         # can't grow across a long-lived session (the next turn's reasoning
         # parts carry fresh ids anyway).
         self._reasoning_posted.clear()
+        combined = dict(extra) if extra else {}
+        rid = self._current_turn_response_id
+        if rid is not None and "response_id" not in combined:
+            combined["response_id"] = rid
+        self._current_turn_response_id = None
+        self._posted_running_response_id = None
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
-        await self._post_status(status, extra=extra)
+        await self._post_status(status, extra=combined if combined else None)
 
     # --- per-event handlers ----------------------------------------------
 
@@ -457,7 +489,7 @@ class OpenCodeNativeForwarder:
         if role == "assistant":
             if self._bridge_dir is not None:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
-            await self._begin_turn_if_needed()
+            await self._begin_turn_if_needed(response_id=self._response_id(message_id))
             self._record_assistant_usage(message_id, info)
             await self._post_session_usage()
 
