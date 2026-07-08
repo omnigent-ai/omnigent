@@ -115,6 +115,7 @@ def test_builtin_names_size_matches_registry() -> None:
             {
                 # Instantiable
                 "web_search",
+                "web_map",
                 "upload_file",
                 "list_files",
                 "download_file",
