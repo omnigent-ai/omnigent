@@ -92,6 +92,17 @@ vi.mock("@/hooks/useConversations", () => ({
 // test scoped to the conversation list + funnel.
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
+// The "Shared with me" tab only renders on a multi-user (non-local) server.
+// jsdom's default origin is loopback, which would read as single-user and hide
+// the tabs; force multi-user so the tab-based tests exercise the split. The
+// single-user case (tabs hidden) is covered explicitly below.
+const isServerLocalMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock("@/lib/serverOrigin", () => ({
+  isCurrentServerLocal: isServerLocalMock,
+  isLocalServerOrigin: (origin: string) =>
+    ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"].includes(new URL(origin).hostname),
+}));
+
 import { useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
 
@@ -159,6 +170,13 @@ function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => voi
   );
 }
 
+// "Shared with me" sessions live on their own sidebar tab now; click it to
+// reveal the flat shared list (the default tab is "My sessions").
+function showSharedTab() {
+  // Radix Tabs triggers activate on mousedown (primary button), not click.
+  fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+}
+
 beforeEach(() => {
   useConvMock.mockReset();
   localStorage.clear();
@@ -168,6 +186,8 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockReset();
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
+  // Default to a multi-user server so the tab-based tests see the tabs.
+  isServerLocalMock.mockReturnValue(false);
 });
 afterEach(cleanup);
 
@@ -337,12 +357,12 @@ describe("Sidebar session list", () => {
   });
 });
 
-// Sidebar grouping: Pinned / Sessions / Shared with me are distinguished by
-// muted micro-headers + whitespace only (the pink divider rules are gone).
-// "Shared with me" = sessions where the caller's permission_level says
-// non-owner (< 4); null/4+ are the viewer's own sessions.
+// Sidebar grouping: the viewer's own sessions ("My sessions" tab) keep the
+// Pinned / Projects / Sessions structure; sessions shared with the viewer live
+// on a separate "Shared with me" tab. "Shared" = sessions where the caller's
+// permission_level says non-owner (< 4); null/4+ are the viewer's own.
 describe("Sidebar sections", () => {
-  it("splits owned and shared sessions under Sessions / Shared with me", () => {
+  it("splits owned and shared sessions across the My sessions / Shared with me tabs", () => {
     mockConversations([
       conv("conv_mine_legacy", "Claude Code"), // permission_level null = owner
       conv("conv_mine_acl", "Claude Code", { permission_level: 4 }),
@@ -350,28 +370,89 @@ describe("Sidebar sections", () => {
     ]);
     renderSidebar();
 
-    // Both headers render because both groups are non-empty.
-    const recentHeader = screen.getByText("Sessions");
-    const sharedHeader = screen.getByText("Shared with me");
-    // Each row lands in the right <section>: a mis-split would either leak
-    // a shared session into Sessions (viewer thinks they own it) or hide an
-    // owned one under Shared with me.
-    const recentSection = recentHeader.closest("section")!;
-    const sharedSection = sharedHeader.closest("section")!;
+    // Default ("My sessions") tab: owned sessions under Sessions, no shared one
+    // leaking in (which would make the viewer think they own it).
+    const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_mine_legacy")).toBeInTheDocument();
     expect(within(recentSection).getByText("conv_mine_acl")).toBeInTheDocument();
-    expect(within(recentSection).queryByText("conv_shared")).toBeNull();
-    expect(within(sharedSection).getByText("conv_shared")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+
+    // Shared tab: only the shared session, and the owned ones are hidden.
+    showSharedTab();
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+    expect(screen.queryByText("conv_mine_legacy")).toBeNull();
+    expect(screen.queryByText("conv_mine_acl")).toBeNull();
   });
 
   it("titles the baseline list Sessions even with no sibling group", () => {
     mockConversations([conv("conv_only_mine", "Claude Code")]);
     renderSidebar();
     // "Sessions" always renders so the list is labeled (and collapsible)
-    // from the first session; empty sibling groups stay hidden.
+    // from the first session; the project group stays hidden when empty.
     expect(screen.getByText("conv_only_mine")).toBeInTheDocument();
     expect(screen.getByText("Sessions")).toBeInTheDocument();
-    expect(screen.queryByText("Shared with me")).toBeNull();
+    // With no shared sessions, the Shared tab shows its empty state rather
+    // than any session rows.
+    showSharedTab();
+    expect(screen.getByText("No sessions shared with you")).toBeInTheDocument();
+    expect(screen.queryByText("conv_only_mine")).toBeNull();
+  });
+});
+
+// The sidebar splits sessions across two tabs: "My sessions" (owned, with the
+// full Pinned / Projects / Chats structure) and "Shared with me" (a flat list).
+describe("Sidebar tabs", () => {
+  it("keeps New session visible on both tabs and snaps back to My sessions when used", () => {
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+    ]);
+    renderSidebar();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+
+    // New session always creates a session the viewer owns, so it stays
+    // reachable on the Shared tab too (not hidden).
+    showSharedTab();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+
+    // Using it flips back to "My sessions": the shared row hides and the owned
+    // one returns.
+    fireEvent.click(screen.getByTestId("new-chat-button"));
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+  });
+
+  it("does not render project folders on the Shared with me tab", () => {
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+    ]);
+    renderSidebar();
+    // My sessions tab carries the Projects group.
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+
+    // Shared tab is a flat list — projects are a "My sessions"-only tool.
+    showSharedTab();
+    expect(screen.queryByText("Projects")).toBeNull();
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+  });
+
+  it("hides the tabs on a single-user (local) server and shows only owned sessions", () => {
+    // A loopback-only server can't share sessions with anyone, so the tab
+    // split is meaningless — collapse to the plain owned-session list.
+    isServerLocalMock.mockReturnValue(true);
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+    ]);
+    renderSidebar();
+    expect(screen.queryByTestId("sidebar-tab-mine")).toBeNull();
+    expect(screen.queryByTestId("sidebar-tab-shared")).toBeNull();
+    // Falls back to the owned list; the shared row never appears.
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
   });
 });
 
@@ -379,29 +460,25 @@ describe("Sidebar sections", () => {
 // the preference survives reloads (same contract as pins).
 describe("Sidebar collapsible sections", () => {
   it("collapses a section on header click and persists across remount", () => {
-    mockConversations([
-      conv("conv_mine", "Claude Code"),
-      conv("conv_shared", "Claude Code", { permission_level: 2 }),
-    ]);
+    mockConversations([conv("conv_mine", "Claude Code"), conv("conv_mine_two", "Claude Code")]);
     renderSidebar();
 
-    // Collapse hides the section's rows but keeps the header (and the
-    // other section untouched) — a vanished header would strand the user
-    // with no way to expand again.
-    fireEvent.click(screen.getByRole("button", { name: "Shared with me" }));
-    expect(screen.queryByText("conv_shared")).toBeNull();
-    expect(screen.getByRole("button", { name: "Shared with me" })).toBeInTheDocument();
-    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    // Collapse hides the section's rows but keeps the header — a vanished
+    // header would strand the user with no way to expand again.
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    expect(screen.queryByText("conv_mine")).toBeNull();
+    expect(screen.queryByText("conv_mine_two")).toBeNull();
+    expect(screen.getByRole("button", { name: "Sessions" })).toBeInTheDocument();
 
     // Fresh mount re-reads localStorage: still collapsed. If this fails,
     // the toggle wrote state only to memory and reloads lose it.
     cleanup();
     renderSidebar();
-    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(screen.queryByText("conv_mine")).toBeNull();
 
     // Expanding brings the rows back.
-    fireEvent.click(screen.getByRole("button", { name: "Shared with me" }));
-    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
   });
 });
 
