@@ -454,6 +454,97 @@ describe("Sidebar tabs", () => {
     expect(screen.getByText("conv_mine")).toBeInTheDocument();
     expect(screen.queryByText("conv_shared")).toBeNull();
   });
+
+  it("keeps a pinned shared session on the Shared tab only, not under Pinned", () => {
+    // Pinning is a My-sessions-only tool: a pinned shared session must not leak
+    // into the owned tab's Pinned section (which would show it in two places).
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+    ]);
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_shared"]));
+    renderSidebar();
+
+    // My sessions tab: no Pinned section leaking the shared row in.
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+
+    // The shared session lives only on the Shared tab.
+    showSharedTab();
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+  });
+
+  it("keeps a project-filed shared session on the Shared tab only, not under Projects", () => {
+    // Filing into a project is a My-sessions-only tool: an editable shared
+    // session filed into a project must not render under a project folder.
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", {
+        permission_level: 2,
+        labels: { omni_project: "Alpha" },
+      }),
+    ]);
+    renderSidebar();
+
+    // My sessions tab: the Alpha folder renders but doesn't hold the shared row.
+    expect(screen.getByText("Alpha")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+
+    // The shared session lives only on the Shared tab.
+    showSharedTab();
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+  });
+
+  it("keeps paginating when the shared tab is empty on the loaded page but more exist", () => {
+    // The list is one paginated stream (owned + shared mixed, updated_at desc),
+    // so page 1 can be all-owned while shared sessions live on a later page.
+    // The Shared tab must keep its pagination sentinel mounted rather than
+    // stranding the user on a false "empty" state.
+    let observerCallback: IntersectionObserverCallback | undefined;
+    class TestObserver {
+      constructor(cb: IntersectionObserverCallback) {
+        observerCallback = cb;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+      takeRecords = () => [];
+      root = null;
+      rootMargin = "";
+      thresholds = [];
+    }
+    vi.stubGlobal("IntersectionObserver", TestObserver);
+
+    const fetchNextPage = vi.fn();
+    const rows = [conv("conv_mine", "Claude Code")]; // owned only on this page
+    useConvMock.mockImplementation(
+      () =>
+        ({
+          data: {
+            pages: [{ data: rows, first_id: rows[0]!.id, last_id: rows[0]!.id, has_more: true }],
+            pageParams: [undefined],
+          },
+          isLoading: false,
+          isError: false,
+          error: null,
+          fetchNextPage,
+          hasNextPage: true,
+          isFetchingNextPage: false,
+        }) as unknown as ReturnType<typeof useConversations>,
+    );
+    renderSidebar();
+
+    showSharedTab();
+    // False-empty on the loaded window, but the sentinel is still mounted.
+    expect(screen.getByText("No sessions shared with you")).toBeInTheDocument();
+    observerCallback?.(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+    expect(fetchNextPage).toHaveBeenCalled();
+  });
 });
 
 // Section headers double as collapse toggles, persisted to localStorage so

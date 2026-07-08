@@ -953,13 +953,20 @@ function ConversationList({
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
     const notArchived = allWithBackfill.filter((c) => c.archived !== true);
+    // Pinning and projects are "My sessions"-only organizational tools, so they
+    // draw from owned sessions alone. Otherwise a shared session the viewer can
+    // pin (localStorage is ownership-agnostic) or file into a project (editable
+    // shared session) would render under Pinned / a project folder on My
+    // sessions AND on the Shared tab. Building both from owned-only keeps the
+    // non-owned sessions on the Shared tab exclusively.
+    const ownedNotArchived = notArchived.filter(isOwnedByViewer);
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
     // strictly by when they were pinned (newest pin at the bottom), not by
     // `updated_at`, so a pinned session doesn't jump when it gets a new message.
     const pinned = orderByPinnedSequence(
-      notArchived.filter((c) => pinnedSet.has(c.id)),
+      ownedNotArchived.filter((c) => pinnedSet.has(c.id)),
       pinnedConversationIds,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
@@ -970,7 +977,7 @@ function ConversationList({
     const filedIds = new Set<string>();
     const projectGroups: { name: string; conversations: Conversation[] }[] = projectNames.map(
       (name) => {
-        const inProject = notArchived.filter(
+        const inProject = ownedNotArchived.filter(
           (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
         );
         inProject.forEach((c) => filedIds.add(c.id));
@@ -1379,7 +1386,22 @@ function ConversationList({
           <UngroupDropZone />
         )}
         {totalVisible === 0 ? (
-          <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+          <>
+            <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+            {/* The list is one paginated stream ordered by updated_at across
+              owned + shared sessions, so the current tab can be empty on the
+              loaded window while its sessions live on a later page. Keep the
+              sentinel mounted so pagination continues instead of stranding the
+              user on a false "empty" state. */}
+            {hasMorePages && (
+              <InfiniteScrollSentinel
+                hasMore={hasMorePages}
+                isFetching={isFetchingNextPage}
+                fetchMore={fetchNextPage}
+                scrollRoot={scrollContainerRef}
+              />
+            )}
+          </>
         ) : showShared ? (
           <>
             {/* Shared tab: a flat, headerless list of sessions others shared
