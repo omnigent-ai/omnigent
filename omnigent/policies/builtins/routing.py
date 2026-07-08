@@ -467,6 +467,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
     {
         "handler": "omnigent.policies.builtins.routing.deny_trivial_to_expensive_model",
         "kind": "factory",
+        "llm_backed": True,
         "name": "Deny Trivial Tasks on Expensive Models",
         "description": (
             "Classifies the user's message as TRIVIAL or COMPLEX using "
@@ -499,6 +500,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
     {
         "handler": "omnigent.policies.builtins.routing.intent_based_authorization",
         "kind": "factory",
+        "llm_backed": True,
         "name": "Intent Based Authorization",
         "description": (
             "Enforces intent-based permissioning: records the user's first message "

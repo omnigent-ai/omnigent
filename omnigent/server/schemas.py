@@ -157,6 +157,38 @@ class SkillSummary(BaseModel):
     description: str
 
 
+class SkillCapability(BaseModel):
+    """
+    A discovered skill enriched with provenance and policy state.
+
+    The Capabilities panel's richer view of :class:`SkillSummary`: on top
+    of ``name`` + ``description`` it carries where the skill came from
+    (``source``), whether the agent's ``skills_filter`` admits it
+    (``in_scope``), and whether a session policy would deny loading it by
+    name (``blocked``). The full skill ``content`` is still omitted.
+
+    :param name: Skill identifier, e.g. ``"code-review"`` (host plugin
+        skills are namespaced ``"<plugin>:<skill>"``).
+    :param description: One-line summary from the SKILL.md frontmatter.
+    :param source: Provenance label — one of ``"bundle"`` (shipped with
+        the agent), ``"workspace"`` (project ``.claude`` / ``.agents``),
+        ``"user"`` (``~/.claude`` / ``~/.agents``), ``"plugin"`` (a Claude
+        plugin), ``"codex"`` / ``"cursor"`` (host-specific), or
+        ``"unknown"``.
+    :param in_scope: Whether the agent can actually load this skill given
+        its ``skills_filter``. Bundled skills are always in scope; a
+        host/plugin skill is in scope iff it passes the filter.
+    :param blocked: Whether a session ``block_skills`` (or equivalent)
+        policy would DENY loading this skill by name.
+    """
+
+    name: str
+    description: str
+    source: str = "unknown"
+    in_scope: bool = True
+    blocked: bool = False
+
+
 class PolicySummary(BaseModel):
     """
     Safe subset of a policy's spec for API exposure.
@@ -335,8 +367,10 @@ class SessionCapabilities(BaseModel):
         sub-agent is identified by ``sub_agent_name``).
     :param sub_agent_name: The dispatched sub-agent name when the
         session is a named sub-agent child, else ``None``.
-    :param skills: The merged (bundled + host-discovered) skill list,
-        from the same runner-owned source as the session snapshot.
+    :param skills: The full (bundled + host-discovered) skill list from the
+        runner, each enriched with ``source`` provenance, an ``in_scope``
+        flag (whether ``skills_filter`` admits it), and a ``blocked`` flag
+        (whether a session policy would deny loading it).
     :param mcp_servers: The agent's MCP server config (secret fields
         omitted). Each carries a deferred, empty ``tools`` list.
     :param local_tools: The agent's effective local/builtin function
@@ -348,7 +382,7 @@ class SessionCapabilities(BaseModel):
     session_id: str
     agent_id: str
     sub_agent_name: str | None = None
-    skills: list[SkillSummary] = Field(default_factory=list)
+    skills: list[SkillCapability] = Field(default_factory=list)
     mcp_servers: list[SessionCapabilityMCPServer] = Field(default_factory=list)
     local_tools: list[SessionCapabilityTool] = Field(default_factory=list)
     sub_agents: list[SubAgentCapability] = Field(default_factory=list)

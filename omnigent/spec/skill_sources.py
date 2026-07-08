@@ -78,6 +78,62 @@ class SkillSourceContext:
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
 
 
+def _is_under(path: Path, root: Path) -> bool:
+    """Return whether *path* is *root* or nested beneath it."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def classify_skill_source(spec: SkillSpec, *, home: Path) -> str:
+    """
+    Classify where a **host** skill was collected from.
+
+    Bundled skills are not passed here — the caller already knows them
+    by construction and labels them ``"bundle"``. This classifies the
+    extra skills a harness surfaces (from ``resolve_harness_skills``):
+
+    * ``"plugin"`` — a namespaced ``<plugin>:<skill>`` (Claude plugins
+      always namespace) or a skill under ``~/.claude/plugins``.
+    * ``"codex"`` / ``"cursor"`` — under ``~/.codex`` / ``~/.cursor``.
+    * ``"user"`` — user-global ``~/.claude`` / ``~/.agents``.
+    * ``"workspace"`` — a project ``.claude`` / ``.agents`` up-tree from
+      the session workspace (the else branch — anything on disk not under
+      the user home).
+    * ``"unknown"`` — no ``skill_dir`` and not namespaced (defensive).
+
+    :param spec: A discovered host skill.
+    :param home: The user home dir (``Path.home()``), injected for tests.
+    :returns: A short source label.
+    """
+    if ":" in spec.name:
+        return "plugin"
+    if spec.skill_dir is None:
+        return "unknown"
+    skill_dir = spec.skill_dir.resolve()
+
+    def under(*parts: str) -> bool:
+        # Resolve the comparison root the SAME way as skill_dir. skill_dir is
+        # fully resolved, so a home dotdir that is itself a symlink (dotfile
+        # managers, container volume mounts, macOS /var -> /private/var) must be
+        # resolved too — otherwise we'd compare a resolved path against a root
+        # whose symlinked tail was appended lexically, and every user/plugin
+        # skill would fall through to "workspace".
+        return _is_under(skill_dir, home.joinpath(*parts).resolve())
+
+    if under(".claude", "plugins"):
+        return "plugin"
+    if under(".codex"):
+        return "codex"
+    if under(".cursor"):
+        return "cursor"
+    if under(".claude") or under(".agents"):
+        return "user"
+    return "workspace"
+
+
 def _dedup(specs: list[SkillSpec]) -> list[SkillSpec]:
     """Return *specs* with later same-name entries dropped (first wins)."""
     seen: set[str] = set()

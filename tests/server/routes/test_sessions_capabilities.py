@@ -20,9 +20,17 @@ from omnigent.entities import Agent, Conversation, ResolvedAccess
 from omnigent.errors import OmnigentError
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes.sessions import create_sessions_router
-from omnigent.server.schemas import SkillSummary
+from omnigent.server.schemas import SkillCapability
 from omnigent.spec import AgentSpec, ExecutorSpec
-from omnigent.spec.types import MCPServerConfig, SkillSpec
+from omnigent.spec.types import (
+    FunctionPolicySpec,
+    FunctionRef,
+    GuardrailsSpec,
+    MCPServerConfig,
+    Phase,
+    PhaseSelector,
+    SkillSpec,
+)
 
 # ── Specs ────────────────────────────────────────────────────────
 
@@ -218,21 +226,45 @@ def _build_app(
     return app
 
 
-async def _fake_runner_skills(
+async def _fake_runner_skill_capabilities(
     runner_client: Any,
     session_id: str,
-) -> list[SkillSummary]:
-    """Stand in for the runner-owned merged-skills fetch."""
+) -> list[SkillCapability]:
+    """Stand in for the runner-owned enriched-skills fetch."""
     del runner_client, session_id
-    return [SkillSummary(name="merged-skill", description="from runner")]
+    return [
+        SkillCapability(
+            name="merged-skill",
+            description="from runner",
+            source="workspace",
+            in_scope=True,
+        )
+    ]
+
+
+async def _no_blocked_skills(
+    spec: Any,
+    session_id: str,
+    conversation_store: Any,
+    skill_names: list[str],
+    *,
+    user_id: str | None,
+) -> dict[str, bool]:
+    """Stand in for the policy would-block check (nothing blocked)."""
+    del spec, session_id, conversation_store, skill_names, user_id
+    return {}
 
 
 @pytest.fixture()
 def _patched(monkeypatch: pytest.MonkeyPatch) -> None:
     """Point the spec loader at the in-memory specs and stub the
-    runner-owned skills source (no runner in these unit tests)."""
+    runner-owned skills source + policy block check (no runner / policy
+    infra in these unit tests)."""
     monkeypatch.setattr(sessions_mod, "get_agent_cache", lambda: _AgentCacheStub({"ag_top": _TOP}))
-    monkeypatch.setattr(sessions_mod, "_fetch_runner_skills", _fake_runner_skills)
+    monkeypatch.setattr(
+        sessions_mod, "_fetch_runner_skill_capabilities", _fake_runner_skill_capabilities
+    )
+    monkeypatch.setattr(sessions_mod, "_compute_blocked_skills", _no_blocked_skills)
 
 
 # ── Tests ────────────────────────────────────────────────────────
@@ -254,8 +286,17 @@ def test_top_agent_capabilities_all_four_groups(_patched: None) -> None:
     assert body["agent_id"] == "ag_top"
     assert body["sub_agent_name"] is None
 
-    # 1) merged skills come from the runner-owned source.
-    assert body["skills"] == [{"name": "merged-skill", "description": "from runner"}]
+    # 1) merged skills come from the runner-owned source, enriched with
+    #    provenance (source), an in_scope flag, and a policy blocked flag.
+    assert body["skills"] == [
+        {
+            "name": "merged-skill",
+            "description": "from runner",
+            "source": "workspace",
+            "in_scope": True,
+            "blocked": False,
+        }
+    ]
 
     # 2) mcp config is the top agent's server (secret-free shape).
     assert [s["name"] for s in body["mcp_servers"]] == ["github"]
@@ -355,3 +396,367 @@ def test_level_read_enforced(_patched: None) -> None:
 
     unauthenticated = client.get("/v1/sessions/conv_top/capabilities")
     assert unauthenticated.status_code == 401, unauthenticated.text
+
+
+def test_skills_degrade_to_empty_when_runner_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing/unreachable runner yields an empty skills list, not a 500."""
+    monkeypatch.setattr(sessions_mod, "get_agent_cache", lambda: _AgentCacheStub({"ag_top": _TOP}))
+    monkeypatch.setattr(sessions_mod, "_compute_blocked_skills", _no_blocked_skills)
+
+    async def _no_skills(runner_client: Any, session_id: str) -> list[SkillCapability]:
+        del runner_client, session_id
+        return []
+
+    monkeypatch.setattr(sessions_mod, "_fetch_runner_skill_capabilities", _no_skills)
+
+    conv_store = _ConversationStore({"conv_top": _conv("conv_top")})
+    agent_store = _AgentStore({"ag_top": _agent()})
+    client = TestClient(_build_app(conv_store, agent_store))
+
+    resp = client.get("/v1/sessions/conv_top/capabilities")
+
+    assert resp.status_code == 200, resp.text
+    # Graceful degrade: skills empty, but the other groups still resolve.
+    assert resp.json()["skills"] == []
+    assert [s["name"] for s in resp.json()["mcp_servers"]] == ["github"]
+
+
+@pytest.mark.asyncio
+async def test_compute_blocked_skills_flags_denied_names(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skill denied by a session ``block_skills`` policy is flagged
+    ``blocked=True``; a non-denied one is ``blocked=False``.
+
+    Exercises the real read-only would-block path: a policy engine built
+    from a spec carrying a ``block_skills`` guardrail, evaluated against a
+    synthetic native ``Skill`` tool-call per name (``read_only=True`` — no
+    persistence, no ASK gate).
+    """
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    spec = AgentSpec(
+        spec_version=1,
+        name="guarded",
+        description="Has a block_skills policy",
+        executor=ExecutorSpec(type="claude_sdk"),
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="block",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.safety.block_skills",
+                        arguments={"blocked": ["blocked-skill"]},
+                    ),
+                )
+            ]
+        ),
+    )
+    # Bypass get_caps()/get_policy_store(): build the engine straight from
+    # the spec so the test needs no server-cap wiring.
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        lambda sp, sid, cs: build_policy_engine(
+            spec=sp, conversation_id=sid, conversation_store=cs
+        ),
+    )
+
+    blocked = await sessions_mod._compute_blocked_skills(
+        spec,
+        "conv_guarded",
+        store,  # type: ignore[arg-type]
+        ["blocked-skill", "ok-skill"],
+        user_id="alice",
+    )
+
+    assert blocked == {"blocked-skill": True, "ok-skill": False}
+
+
+@pytest.mark.asyncio
+async def test_compute_blocked_skills_never_runs_llm_prompt_policy(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``blocked`` preview consults only cheap, name-based deny rules:
+    an LLM-backed prompt-classifier policy is NEVER invoked, even with many
+    discovered skills, and ``blocked`` still reflects the name-based
+    ``block_skills`` deny.
+
+    Without this guard, a session config with a ``prompt_policy`` on
+    ``tool_call`` fires one LLM classifier call per skill name — ~100+
+    sequential LLM calls on a single read-only Capabilities panel open.
+    """
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+
+    class _RecordingLLM:
+        """Spy LLM client: a prompt policy that ran would call ``create``."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self.calls += 1
+            raise AssertionError("prompt-policy LLM must not run in blocked preview")
+
+    spy = _RecordingLLM()
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="classified",
+        description="Has an LLM prompt policy plus a name-based block",
+        executor=ExecutorSpec(type="claude_sdk"),
+        guardrails=GuardrailsSpec(
+            policies=[
+                # LLM-backed prompt classifier on every tool_call.
+                FunctionPolicySpec(
+                    name="classify",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.prompt.prompt_policy",
+                        arguments={"prompt": "Deny risky skills."},
+                    ),
+                ),
+                # Cheap name-based deny — must still be reflected.
+                FunctionPolicySpec(
+                    name="block",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.safety.block_skills",
+                        arguments={"blocked": ["blocked-skill"]},
+                    ),
+                ),
+            ]
+        ),
+    )
+
+    def _build(sp: Any, sid: str, cs: Any) -> Any:
+        engine = build_policy_engine(spec=sp, conversation_id=sid, conversation_store=cs)
+        # Inject a live LLM client so the prompt policy WOULD call it if it
+        # were left in the probe engine — the fix must filter it out first.
+        engine._llm_client = spy
+        return engine
+
+    monkeypatch.setattr(sessions_mod, "_build_policy_engine_from_spec", _build)
+
+    names = [f"skill-{i}" for i in range(50)] + ["blocked-skill"]
+    blocked = await sessions_mod._compute_blocked_skills(
+        spec,
+        "conv_classified",
+        store,  # type: ignore[arg-type]
+        names,
+        user_id="alice",
+    )
+
+    # Zero LLM/prompt-policy calls despite 51 skills.
+    assert spy.calls == 0
+    # Name-based deny still reflected; everything else not blocked.
+    assert blocked["blocked-skill"] is True
+    assert all(v is False for k, v in blocked.items() if k != "blocked-skill")
+    assert len(blocked) == len(names)
+
+
+@pytest.mark.asyncio
+async def test_compute_blocked_skills_never_runs_intent_authorization_llm(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generalized guard: an LLM-backed router other than the prompt
+    classifier is also excluded from the blocked preview.
+
+    ``intent_based_authorization`` fires on ``tool_call`` and, once a
+    session intent is captured, calls the LLM to classify every tool
+    invocation. The synthetic per-skill ``Skill`` tool-call probe would
+    otherwise fire one classifier call per discovered skill. The registry
+    ``llm_backed`` flag must exclude it before the per-skill loop.
+
+    Fails without the generalized fix: the old ``PROMPT_POLICY_HANDLER``
+    string check does not match this factory, so it stays in the probe
+    engine and the spy LLM is invoked.
+    """
+    from omnigent.policies.builtins.routing import _INTENT_KEY
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+
+    class _RecordingLLM:
+        """Spy LLM client: an intent check that ran would call ``create``."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self.calls += 1
+            raise AssertionError("intent-authorization LLM must not run in blocked preview")
+
+    spy = _RecordingLLM()
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="intent-gated",
+        description="Has an LLM-gated intent router plus a name-based block",
+        executor=ExecutorSpec(type="claude_sdk"),
+        guardrails=GuardrailsSpec(
+            policies=[
+                # LLM-backed router on every tool_call — NOT the prompt policy.
+                FunctionPolicySpec(
+                    name="intent",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.routing.intent_based_authorization",
+                        arguments={},
+                    ),
+                ),
+                # Cheap name-based deny — must still be reflected.
+                FunctionPolicySpec(
+                    name="block",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.safety.block_skills",
+                        arguments={"blocked": ["blocked-skill"]},
+                    ),
+                ),
+            ]
+        ),
+    )
+
+    def _build(sp: Any, sid: str, cs: Any) -> Any:
+        engine = build_policy_engine(spec=sp, conversation_id=sid, conversation_store=cs)
+        engine._llm_client = spy
+        # Pre-seed a captured intent so the tool_call phase would reach the
+        # classification LLM call if the router were left in the probe engine.
+        engine._session_state = {_INTENT_KEY: "Summarize the quarterly report."}
+        return engine
+
+    monkeypatch.setattr(sessions_mod, "_build_policy_engine_from_spec", _build)
+
+    names = [f"skill-{i}" for i in range(50)] + ["blocked-skill"]
+    blocked = await sessions_mod._compute_blocked_skills(
+        spec,
+        "conv_intent",
+        store,  # type: ignore[arg-type]
+        names,
+        user_id="alice",
+    )
+
+    # Zero LLM calls despite 51 skills and a captured intent.
+    assert spy.calls == 0
+    # Name-based deny still reflected; everything else not blocked.
+    assert blocked["blocked-skill"] is True
+    assert all(v is False for k, v in blocked.items() if k != "blocked-skill")
+    assert len(blocked) == len(names)
+
+
+@pytest.mark.asyncio
+async def test_compute_blocked_skills_only_llm_policy_short_circuits(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the ONLY deny policy is LLM-backed, the preview short-circuits to
+    all-not-blocked without invoking the classifier."""
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+
+    class _RecordingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self.calls += 1
+            raise AssertionError("prompt-policy LLM must not run in blocked preview")
+
+    spy = _RecordingLLM()
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="llm-only",
+        description="Only an LLM prompt policy",
+        executor=ExecutorSpec(type="claude_sdk"),
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="classify",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.prompt.prompt_policy",
+                        arguments={"prompt": "Deny risky skills."},
+                    ),
+                ),
+            ]
+        ),
+    )
+
+    def _build(sp: Any, sid: str, cs: Any) -> Any:
+        engine = build_policy_engine(spec=sp, conversation_id=sid, conversation_store=cs)
+        engine._llm_client = spy
+        # Isolate the LLM policy: drop the always-appended sys_add_policy
+        # guard so that after the preview filters out the LLM policy, ZERO
+        # name-based policies remain — exercising the short-circuit branch.
+        engine.policies = [p for p in engine.policies if sessions_mod._is_llm_backed_policy(p)]
+        assert engine.policies, "expected the prompt policy to be present"
+        return engine
+
+    monkeypatch.setattr(sessions_mod, "_build_policy_engine_from_spec", _build)
+
+    blocked = await sessions_mod._compute_blocked_skills(
+        spec,
+        "conv_llm_only",
+        store,  # type: ignore[arg-type]
+        ["a", "b", "c"],
+        user_id=None,
+    )
+
+    assert spy.calls == 0
+    assert blocked == {"a": False, "b": False, "c": False}
+
+
+@pytest.mark.asyncio
+async def test_compute_blocked_skills_empty_without_policies(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no guardrails, nothing is blocked (and no per-skill eval runs)."""
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    spec = AgentSpec(
+        spec_version=1,
+        name="plain",
+        description="No guardrails",
+        executor=ExecutorSpec(type="claude_sdk"),
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        lambda sp, sid, cs: build_policy_engine(
+            spec=sp, conversation_id=sid, conversation_store=cs
+        ),
+    )
+
+    blocked = await sessions_mod._compute_blocked_skills(
+        spec,
+        "conv_plain",
+        store,  # type: ignore[arg-type]
+        ["anything"],
+        user_id=None,
+    )
+
+    # build_policy_engine always appends the sys_add_policy guard, so the
+    # engine is non-empty; the Skill tool-call still resolves to ALLOW.
+    assert blocked == {"anything": False}

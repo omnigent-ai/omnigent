@@ -283,6 +283,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
     {
         "handler": "omnigent.policies.builtins.context.detect_task_switch",
         "kind": "factory",
+        "llm_backed": True,
         "name": "Detect Task Switch",
         "description": (
             "Uses the server-level LLM to classify each user message as a "

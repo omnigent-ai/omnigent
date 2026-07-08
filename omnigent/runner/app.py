@@ -80,7 +80,11 @@ from omnigent.runner.resource_registry import (
     TerminalLifecycle,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
-from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
+from omnigent.spec.skill_sources import (
+    SkillSourceContext,
+    classify_skill_source,
+    resolve_harness_skills,
+)
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
@@ -17608,6 +17612,49 @@ def create_runner_app(
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_resolved_spec(entry) if entry is not None else None
 
+    async def _resolve_session_discovery(
+        session_id: str,
+    ) -> tuple[Any, list[Path], Path | None] | None:
+        """
+        Resolve a session's spec + host-discovery roots (no walk).
+
+        Shared by :func:`_resolve_session_skills` (the cached in-scope
+        merge) and :func:`_resolve_session_skills_enriched` (the full
+        set with provenance), so both root against exactly the same
+        workspace / bundle paths.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``(spec, roots, bundle_dir)`` or ``None`` when no spec
+            resolves.
+        """
+        entry = await _resolve_session_spec_entry(session_id)
+        spec = _unwrap_resolved_spec(entry) if entry is not None else None
+        if spec is None:
+            return None
+        workspace = await _session_workspace_value(session_id)
+        # Host-discovery roots in priority order: the session workspace
+        # (where the harness runs) first, then the agent bundle workdir.
+        # Both are unioned; ``discover_host_skills`` also scans ``~`` on
+        # each call. Distinct, resolved, non-None paths only.
+        candidate_roots = [
+            Path(workspace).resolve()
+            if workspace is not None
+            else (runner_workspace.resolve() if runner_workspace is not None else None),
+            _resolved_spec_workdir(entry),
+        ]
+        roots: list[Path] = []
+        for candidate in candidate_roots:
+            if candidate is None:
+                continue
+            resolved = candidate.resolve()
+            if resolved not in roots:
+                roots.append(resolved)
+        # No workspace and no bundle workdir: match the cwd fallback the
+        # in-process LoadSkillTool uses so behavior stays consistent.
+        if not roots:
+            roots.append(Path.cwd())
+        return spec, roots, _resolved_spec_workdir(entry)
+
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
         """
         Resolve the merged (bundled + host) skills for a session.
@@ -17653,32 +17700,10 @@ def create_runner_app(
                 return cached_skills
             # TTL elapsed — fall through to re-walk so a skill or plugin
             # installed mid-session surfaces without a session restart.
-        entry = await _resolve_session_spec_entry(session_id)
-        spec = _unwrap_resolved_spec(entry) if entry is not None else None
-        if spec is None:
+        resolved = await _resolve_session_discovery(session_id)
+        if resolved is None:
             return []
-        workspace = await _session_workspace_value(session_id)
-        # Host-discovery roots in priority order: the session workspace
-        # (where the harness runs) first, then the agent bundle workdir.
-        # Both are unioned; ``discover_host_skills`` also scans ``~`` on
-        # each call. Distinct, resolved, non-None paths only.
-        candidate_roots = [
-            Path(workspace).resolve()
-            if workspace is not None
-            else (runner_workspace.resolve() if runner_workspace is not None else None),
-            _resolved_spec_workdir(entry),
-        ]
-        roots: list[Path] = []
-        for candidate in candidate_roots:
-            if candidate is None:
-                continue
-            resolved = candidate.resolve()
-            if resolved not in roots:
-                roots.append(resolved)
-        # No workspace and no bundle workdir: match the cwd fallback the
-        # in-process LoadSkillTool uses so behavior stays consistent.
-        if not roots:
-            roots.append(Path.cwd())
+        spec, roots, bundle_dir = resolved
 
         def _discover() -> list[SkillSpec]:
             """Merge bundled skills with the harness's extra skills off the loop."""
@@ -17700,7 +17725,7 @@ def create_runner_app(
                 roots=tuple(roots),
                 home=Path.home(),
                 skills_filter=spec.skills_filter,
-                bundle_dir=_resolved_spec_workdir(entry),
+                bundle_dir=bundle_dir,
             )
             harness = canonicalize_harness(spec.executor.harness_kind)
             for hs in resolve_harness_skills(ctx, harness):
@@ -17721,8 +17746,68 @@ def create_runner_app(
         )
         return skills
 
+    async def _resolve_session_skills_enriched(
+        session_id: str,
+    ) -> list[tuple[SkillSpec, str, bool]]:
+        """
+        Resolve the **full** skill set for a session, with provenance.
+
+        Unlike :func:`_resolve_session_skills` (which returns only the
+        in-scope merge that feeds the slash-command menu), this returns
+        every skill the agent *could* see — the union of in-scope and
+        out-of-scope host skills — each tagged with its ``source`` and an
+        ``in_scope`` flag. Powers the read-only Capabilities panel's
+        provenance view and its "only skills in scope" toggle.
+
+        In-scope membership is computed by reusing the cached in-scope
+        merge (bundled + host that passed ``skills_filter``); the full
+        set comes from one extra discovery walk with the filter widened to
+        ``"all"``. Bundled skills are always in scope; a host skill is in
+        scope iff it appears in the cached merge.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``(spec, source, in_scope)`` triples — bundled first,
+            then host skills. Empty when no spec resolver is wired.
+        """
+        in_scope_names = {s.name for s in await _resolve_session_skills(session_id)}
+        resolved = await _resolve_session_discovery(session_id)
+        if resolved is None:
+            return []
+        spec, roots, bundle_dir = resolved
+
+        def _discover_all() -> list[tuple[SkillSpec, str, bool]]:
+            """Walk the full (unfiltered) host set off the loop."""
+            home = Path.home()
+            out: list[tuple[SkillSpec, str, bool]] = [
+                (s, "bundle", True) for s in spec.skills if s.user_invocable
+            ]
+            seen = {s.name for s in spec.skills}
+            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+            ctx = SkillSourceContext(
+                roots=tuple(roots),
+                home=home,
+                skills_filter="all",
+                bundle_dir=bundle_dir,
+            )
+            harness = canonicalize_harness(spec.executor.harness_kind)
+            for hs in resolve_harness_skills(ctx, harness):
+                if hs.name in seen:
+                    continue
+                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
+                    continue
+                seen.add(hs.name)
+                if hs.skill_dir is not None:
+                    seen_dirs.add(hs.skill_dir.resolve())
+                out.append((hs, classify_skill_source(hs, home=home), hs.name in in_scope_names))
+            return out
+
+        return await asyncio.to_thread(_discover_all)
+
     @app.get("/v1/sessions/{session_id}/skills")
-    async def get_session_skills(session_id: str) -> JSONResponse:
+    async def get_session_skills(
+        session_id: str,
+        include_out_of_scope: bool = False,
+    ) -> JSONResponse:
         """
         Return the merged (bundled + host) skills for a session.
 
@@ -17732,11 +17817,38 @@ def create_runner_app(
         this list onto the session snapshot it serves to clients (the
         web composer's slash-command menu).
 
+        Default (``include_out_of_scope=false``): the in-scope merge only,
+        as ``{"name", "description"}`` — the exact shape the snapshot /
+        slash-command menu consume. With ``include_out_of_scope=true`` the
+        response widens to the **full** set (in-scope ∪ out-of-scope) and
+        each entry additionally carries ``source`` (provenance) and
+        ``in_scope`` (whether ``skills_filter`` admits it) for the
+        read-only Capabilities panel. The extra keys are additive; existing
+        consumers that read only ``name`` / ``description`` are unaffected.
+
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :returns: JSON ``{"skills": [{"name", "description"}, ...]}``.
-            Empty list when the runner has no spec resolver wired.
+        :param include_out_of_scope: Return the full enriched set instead
+            of the in-scope-only merge.
+        :returns: JSON ``{"skills": [...]}``. Empty list when the runner
+            has no spec resolver wired.
         """
+        if include_out_of_scope:
+            enriched = await _resolve_session_skills_enriched(session_id)
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "skills": [
+                        {
+                            "name": s.name,
+                            "description": s.description,
+                            "source": source,
+                            "in_scope": in_scope,
+                        }
+                        for s, source, in_scope in enriched
+                    ]
+                },
+            )
         skills = await _resolve_session_skills(session_id)
         return JSONResponse(
             status_code=200,

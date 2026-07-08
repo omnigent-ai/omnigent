@@ -49,6 +49,11 @@ class PolicyRegistryEntry:
         factory parameters. Only meaningful when ``kind`` is
         ``"factory"``. ``None`` when the handler takes no
         factory params.
+    :param llm_backed: ``True`` when the handler can call the
+        server-level LLM client while evaluating (a prompt
+        classifier or an LLM-gated router). Consumers that must
+        stay zero-cost — e.g. the read-only capabilities/blocked
+        preview — use this to exclude the policy before evaluating.
     """
 
     handler: str
@@ -57,6 +62,7 @@ class PolicyRegistryEntry:
     description: str
     params_schema: dict[str, Any] | None = None
     internal_only: bool = False
+    llm_backed: bool = False
 
 
 # Module-level singleton. Populated by load_registry().
@@ -122,6 +128,7 @@ def load_registry(
                 description=raw.get("description", ""),
                 params_schema=raw.get("params_schema"),
                 internal_only=raw.get("internal_only", False),
+                llm_backed=raw.get("llm_backed", False),
             )
             _registry.append(entry)
             _registry_by_handler[entry.handler] = entry
@@ -189,6 +196,35 @@ def is_registered_handler(handler: str) -> bool:
     if not _registry_by_handler:
         load_registry()
     return handler in _registry_by_handler
+
+
+def is_llm_backed_handler(handler: str) -> bool:
+    """Return whether *handler* is a registered LLM-backed policy factory.
+
+    An LLM-backed policy calls the server-level LLM client while it
+    evaluates (a prompt classifier, or an LLM-gated router such as
+    intent-based authorization). Callers that must stay zero-cost — the
+    read-only capabilities/blocked preview — consult this to drop such
+    policies from a throwaway probe engine before evaluating, so opening
+    the panel never fires an LLM call per discovered skill.
+
+    New LLM-backed builtins are covered automatically: set
+    ``"llm_backed": True`` on the factory's ``POLICY_REGISTRY`` entry and
+    it flows through here — no string check to edit.
+
+    Follows :func:`is_registered_handler`'s lazy-load convention: an empty
+    registry means "not yet scanned", so the built-ins are scanned on
+    first use. An unregistered handler (custom policy) returns ``False``.
+
+    :param handler: Full dotted import path, e.g.
+        ``"omnigent.policies.builtins.prompt.prompt_policy"``.
+    :returns: ``True`` if the handler is registered and flagged
+        ``llm_backed``.
+    """
+    if not _registry_by_handler:
+        load_registry()
+    entry = _registry_by_handler.get(handler)
+    return entry is not None and entry.llm_backed
 
 
 def get_params_schema(handler: str) -> dict[str, Any] | None:

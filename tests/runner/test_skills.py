@@ -668,3 +668,51 @@ async def test_codex_bundle_skill_not_duplicated_when_dir_differs_from_name(
     names = [s["name"] for s in resp.json()["skills"]]
     # Exactly one entry for the skill (no phantom dir-named duplicate).
     assert names.count("triage") + names.count("sra--triage") == 1
+
+
+@pytest.mark.asyncio
+async def test_get_session_skills_include_out_of_scope_flags_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``?include_out_of_scope=true`` returns the FULL set — in-scope ∪
+    out-of-scope — with each skill's ``source`` and ``in_scope`` flag.
+
+    With a list ``skills_filter`` that admits only the bundled skill, a
+    workspace host skill is out of scope: the default endpoint omits it,
+    but the enriched endpoint surfaces it with ``in_scope=false`` while the
+    bundled skill stays ``in_scope=true`` (``source="bundle"``).
+    """
+    home = tmp_path / "home"
+    (home / ".claude" / "skills").mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    workspace = tmp_path / "workspace"
+    ws_host = workspace / ".claude" / "skills" / "workspace-host"
+    ws_host.mkdir(parents=True)
+    (ws_host / "SKILL.md").write_text(_skill_md("workspace-host", "From the workspace."))
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    bundled = [SkillSpec(name="grill-me", description="Bundled.", content="c")]
+    # List filter admits only "grill-me" host skills → workspace-host is out
+    # of scope. Bundled skills are never filtered.
+    app = _make_app(bundle, bundled, ["grill-me"], workspace=workspace)
+
+    async for c in _client(app):
+        default = await c.get("/v1/sessions/conv_scope/skills")
+        enriched = await c.get(
+            "/v1/sessions/conv_scope/skills", params={"include_out_of_scope": "true"}
+        )
+
+    assert default.status_code == 200, default.text
+    # Default (in-scope only): out-of-scope host skill omitted, shape unchanged.
+    assert default.json()["skills"] == [{"name": "grill-me", "description": "Bundled."}]
+
+    assert enriched.status_code == 200, enriched.text
+    by_name = {s["name"]: s for s in enriched.json()["skills"]}
+    assert by_name["grill-me"]["source"] == "bundle"
+    assert by_name["grill-me"]["in_scope"] is True
+    assert by_name["workspace-host"]["source"] == "workspace"
+    assert by_name["workspace-host"]["in_scope"] is False

@@ -8,8 +8,10 @@ import pytest
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _harness_family,
+    classify_skill_source,
     resolve_harness_skills,
 )
+from omnigent.spec.types import SkillSpec
 
 
 def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = None) -> None:
@@ -638,3 +640,97 @@ def test_cursor_provider_tolerates_unreadable_skills_dir(
     # Must not raise.
     out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "cursor-native")
     assert out == []
+
+
+# ── classify_skill_source ────────────────────────────────────────────────
+
+
+def _host_skill(name: str, skill_dir: Path | None) -> SkillSpec:
+    """A minimal host SkillSpec for source classification."""
+    return SkillSpec(name=name, description="d", content="c", skill_dir=skill_dir)
+
+
+def test_classify_source_plugin_by_namespaced_name(tmp_path: Path) -> None:
+    """A ``<plugin>:<skill>`` name classifies as plugin regardless of dir."""
+    home = tmp_path / "home"
+    spec = _host_skill("superpowers:using-superpowers", tmp_path / "somewhere")
+    assert classify_skill_source(spec, home=home) == "plugin"
+
+
+def test_classify_source_plugin_by_dir(tmp_path: Path) -> None:
+    """A skill under ``~/.claude/plugins`` classifies as plugin."""
+    home = tmp_path / "home"
+    d = home / ".claude" / "plugins" / "cache" / "mkt" / "p" / "1.0" / "skills" / "s"
+    spec = _host_skill("s", d)
+    assert classify_skill_source(spec, home=home) == "plugin"
+
+
+def test_classify_source_codex_and_cursor(tmp_path: Path) -> None:
+    """Host-specific dirs classify as their harness."""
+    home = tmp_path / "home"
+    codex = _host_skill("cx", home / ".codex" / "skills" / "cx")
+    cursor = _host_skill("cs", home / ".cursor" / "skills" / "cs")
+    assert classify_skill_source(codex, home=home) == "codex"
+    assert classify_skill_source(cursor, home=home) == "cursor"
+
+
+def test_classify_source_user_global(tmp_path: Path) -> None:
+    """User-global ``~/.claude`` / ``~/.agents`` skills classify as user."""
+    home = tmp_path / "home"
+    claude = _host_skill("u1", home / ".claude" / "skills" / "u1")
+    agents = _host_skill("u2", home / ".agents" / "skills" / "u2")
+    assert classify_skill_source(claude, home=home) == "user"
+    assert classify_skill_source(agents, home=home) == "user"
+
+
+def test_classify_source_workspace(tmp_path: Path) -> None:
+    """A project-local skill (not under home) classifies as workspace."""
+    home = tmp_path / "home"
+    ws = tmp_path / "project" / ".claude" / "skills" / "w"
+    assert classify_skill_source(_host_skill("w", ws), home=home) == "workspace"
+
+
+def test_classify_source_unknown_when_no_dir(tmp_path: Path) -> None:
+    """An unnamespaced skill with no on-disk dir classifies as unknown."""
+    home = tmp_path / "home"
+    assert classify_skill_source(_host_skill("x", None), home=home) == "unknown"
+
+
+def test_classify_source_realistic_user_home_path(tmp_path: Path) -> None:
+    """A realistic absolute ``~/.claude/skills/<name>`` path classifies as user."""
+    home = Path("/Users/alice")
+    d = home / ".claude" / "skills" / "agent-evaluation"
+    assert classify_skill_source(_host_skill("agent-evaluation", d), home=home) == "user"
+
+
+def test_classify_source_symlinked_home_claude_is_user(tmp_path: Path) -> None:
+    """
+    A user skill under a **symlinked** ``~/.claude`` still classifies as user.
+
+    Dotfile managers, container volume mounts, and macOS ``/var`` ->
+    ``/private/var`` make ``~/.claude`` (or its prefix) a symlink, so
+    ``skill_dir.resolve()`` follows it. The comparison root must be resolved
+    the same way or every host skill wrongly falls through to ``workspace``.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    real = tmp_path / "real_claude"
+    skill_dir = real / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (home / ".claude").symlink_to(real)
+    # skill_dir as discovered (through the symlinked path), pre-resolution.
+    discovered = home / ".claude" / "skills" / "demo"
+    assert discovered.resolve() == skill_dir.resolve()  # sanity: symlink in play
+    assert classify_skill_source(_host_skill("demo", discovered), home=home) == "user"
+
+
+def test_classify_source_symlinked_home_plugins_is_plugin(tmp_path: Path) -> None:
+    """A plugin skill under a symlinked ``~/.claude/plugins`` classifies as plugin."""
+    home = tmp_path / "home"
+    home.mkdir()
+    real = tmp_path / "real_claude"
+    skill_dir = real / "plugins" / "cache" / "mkt" / "p" / "1.0" / "skills" / "s"
+    skill_dir.mkdir(parents=True)
+    (home / ".claude").symlink_to(real)
+    discovered = home / ".claude" / "plugins" / "cache" / "mkt" / "p" / "1.0" / "skills" / "s"
+    assert classify_skill_source(_host_skill("s", discovered), home=home) == "plugin"

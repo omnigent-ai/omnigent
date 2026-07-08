@@ -102,6 +102,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_terminal_name,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.policies.registry import is_llm_backed_handler
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -259,6 +260,7 @@ from omnigent.server.schemas import (
     SessionTerminalPendingEvent,
     SessionTodosEvent,
     SessionUsageEvent,
+    SkillCapability,
     SkillSummary,
     SubAgentCapability,
     UpdateSessionRequest,
@@ -10644,6 +10646,114 @@ def _build_policy_engine_from_spec(
     )
 
 
+def _is_llm_backed_policy(policy: Any) -> bool:
+    """
+    Whether a runtime policy can call the server-level LLM while evaluating.
+
+    Every builtin LLM-backed policy — the prompt classifier
+    (``prompt_policy``) and the LLM-gated routers (``intent_based_authorization``,
+    ``detect_task_switch``, ``deny_trivial_to_expensive_model``) — compiles to
+    a :class:`FunctionPolicy` carrying its factory handler path on
+    ``spec.function``. That path is resolved against the policy registry, and
+    the entry's ``llm_backed`` flag is the discriminator. Any other
+    :class:`FunctionPolicy` (``block_skills``, CEL, …) gates cheaply by
+    name/expression and returns ``False``.
+
+    Using the registry flag rather than a hard-coded path check means a
+    FUTURE LLM-backed builtin is covered automatically: mark its
+    ``POLICY_REGISTRY`` entry ``llm_backed: True`` and it is excluded here
+    with no edit to this function.
+
+    :param policy: A runtime policy from ``engine.policies``.
+    :returns: ``True`` for any known LLM-backed policy factory.
+    """
+    func = getattr(getattr(policy, "spec", None), "function", None)
+    path = getattr(func, "path", None)
+    return isinstance(path, str) and is_llm_backed_handler(path)
+
+
+async def _compute_blocked_skills(
+    spec: AgentSpec,
+    session_id: str,
+    conversation_store: ConversationStore,
+    skill_names: list[str],
+    *,
+    user_id: str | None,
+) -> dict[str, bool]:
+    """
+    Read-only "would a policy block loading this skill?" check per name.
+
+    Powers the Capabilities panel's ``blocked`` flag. Builds the session's
+    policy engine (session + agent + admin policies, sub-agent inheritance)
+    and, for each skill name, evaluates a synthetic native ``Skill``
+    tool-call — the same shape ``block_skills`` enforces on. Evaluation is
+    ``read_only=True`` (skips every persistent side effect) and goes
+    straight to the engine rather than the ``/policies/evaluate`` route, so
+    it never enters the ASK / elicitation gate. A name is ``blocked`` when
+    the composed decision is ``DENY``.
+
+    Only cheap, name-based deny rules are consulted: the probe engine is
+    narrowed to non-LLM-backed policies (``block_skills`` and CEL / other
+    :class:`FunctionPolicy` evaluators, which gate by skill name or
+    expression). ALL known LLM-backed policies — the prompt classifier and
+    every LLM-gated router (intent-based authorization, task-switch
+    detection, trivial-model denial), identified via their registry
+    ``llm_backed`` flag — are intentionally excluded: their verdict is
+    content/runtime dependent and not previewable per skill name, and
+    running them here would fire one LLM call per discovered skill. They
+    still apply at actual skill invocation at runtime; ``blocked`` reflects
+    name-based / expression deny rules only.
+
+    Best-effort: if the policy infrastructure is unavailable or evaluation
+    raises, the name defaults to not-blocked so the panel degrades to an
+    empty/false state rather than failing the read.
+
+    :param spec: The session's (context-aware) agent spec.
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store the engine reads label/state from.
+    :param skill_names: Skill names to test.
+    :param user_id: Authenticated caller, for the evaluation actor.
+    :returns: ``{skill_name: blocked}``; empty when no policies apply or
+        the engine can't be built.
+    """
+    if not skill_names:
+        return {}
+    try:
+        engine = await asyncio.to_thread(
+            _build_policy_engine_from_spec, spec, session_id, conversation_store
+        )
+    except Exception:  # noqa: BLE001 — best-effort: policy infra down → nothing blocked
+        _logger.debug("Blocked-skills engine build failed for %s", session_id, exc_info=True)
+        return {}
+    # No policies ⇒ nothing can deny; skip the per-skill evaluation entirely.
+    if not engine.policies:
+        return {}
+    # Narrow the probe engine to cheap, name-based deny policies only. Any
+    # LLM-backed policy (prompt classifier or LLM-gated router, flagged
+    # ``llm_backed`` in the registry) left in would fire one LLM call per
+    # skill name. This engine is a fresh throwaway built above, so mutating
+    # its policy list here does not affect the runtime engine used elsewhere.
+    engine.policies = [p for p in engine.policies if not _is_llm_backed_policy(p)]
+    # No name-based policies left ⇒ nothing cheap can deny; short-circuit.
+    if not engine.policies:
+        return dict.fromkeys(skill_names, False)
+    actor = _build_actor(user_id)
+    blocked: dict[str, bool] = {}
+    for name in skill_names:
+        event: dict[str, Any] = {
+            "type": "tool_call",
+            "data": {"name": "Skill", "arguments": {"skill": name}},
+        }
+        try:
+            ctx = _build_evaluation_context(Phase.TOOL_CALL, event["data"], event, actor=actor)
+            result = await engine.evaluate(ctx, read_only=True)
+            blocked[name] = result.action == PolicyAction.DENY
+        except Exception:  # noqa: BLE001 — best-effort: eval error → treat as not blocked
+            _logger.debug("Blocked-skills eval failed for %s/%s", session_id, name, exc_info=True)
+            blocked[name] = False
+    return blocked
+
+
 async def _apply_pending_policy_ask_writes(
     session_id: str,
     conv: Conversation,
@@ -20474,9 +20584,10 @@ def create_sessions_router(
         mcp_servers, local_tools, sub_agents = await asyncio.to_thread(
             _build_session_capability_groups, spec
         )
-        # Skills are runner-owned: reuse the same best-effort, cache-backed
-        # source the session snapshot uses (the runner's GET /skills proxy).
-        # No new runner round-trip is introduced here.
+        # Skills are runner-owned: the runner discovers the full set (in
+        # scope ∪ out of scope) with per-skill ``source`` + ``in_scope``.
+        # Awaited inline (best-effort) since this is an on-demand read, not
+        # the continuously-polled snapshot.
         from omnigent.runtime import get_runner_client, get_runner_router
 
         runner_client: httpx.AsyncClient | None = None
@@ -20492,7 +20603,19 @@ def create_sessions_router(
                 )
         if runner_client is None:
             runner_client = get_runner_client()
-        skills = await _fetch_runner_skills(runner_client, session_id)
+        skills = await _fetch_runner_skill_capabilities(runner_client, session_id)
+        # Layer the policy ``blocked`` flag on server-side (policy is
+        # server-owned). Read-only, best-effort: a name absent from the map
+        # keeps its default ``blocked=False``.
+        blocked_map = await _compute_blocked_skills(
+            spec,
+            session_id,
+            conversation_store,
+            [s.name for s in skills],
+            user_id=user_id,
+        )
+        for skill in skills:
+            skill.blocked = blocked_map.get(skill.name, False)
         return SessionCapabilities(
             session_id=session_id,
             agent_id=conv.agent_id,
@@ -20877,6 +21000,61 @@ async def _load_runner_skills(
     # Nudge any subscribed client to re-read the (now-warm) snapshot so
     # its slash-command menu fills without waiting for the next bind.
     _publish_runner_skills(session_id)
+
+
+async def _fetch_runner_skill_capabilities(
+    runner_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> list[SkillCapability]:
+    """
+    Fetch a session's **full** enriched skill set from its bound runner.
+
+    Backs the read-only Capabilities panel: unlike the snapshot's
+    in-scope-only :func:`_fetch_runner_skills`, this asks the runner for
+    the full set (in-scope ∪ out-of-scope) via ``?include_out_of_scope``,
+    with each skill's ``source`` and ``in_scope`` flag. The ``blocked``
+    flag is layered on afterwards by the caller (policy is server-owned).
+
+    Awaited inline rather than background-cached: the capabilities view is
+    an on-demand read (not the continuously-polled snapshot), so the small
+    round-trip is fine and gives the panel data on first open. Best-effort:
+    a missing/unreachable runner, a non-200, or a malformed payload yields
+    an empty list rather than failing the endpoint.
+
+    :param runner_client: HTTP client pointed at the bound runner, or
+        ``None`` when no runner is bound.
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :returns: Enriched skill capabilities (``blocked`` left at its default
+        ``False`` here), or ``[]`` when unavailable.
+    """
+    if runner_client is None:
+        return []
+    try:
+        resp = await runner_client.get(
+            f"/v1/sessions/{session_id}/skills",
+            params={"include_out_of_scope": "true"},
+            timeout=5.0,
+        )
+    except (httpx.HTTPError, ConnectionError):
+        _logger.debug("Runner skill-capabilities query failed for %s", session_id)
+        return []
+    if resp.status_code != 200:
+        return []
+    try:
+        raw = resp.json().get("skills", [])
+        return [
+            SkillCapability(
+                name=s["name"],
+                description=s["description"],
+                source=s.get("source", "unknown"),
+                in_scope=bool(s.get("in_scope", True)),
+            )
+            for s in raw
+        ]
+    except (ValueError, AttributeError, KeyError, TypeError):
+        _logger.debug("Runner skill-capabilities payload malformed for %s", session_id)
+        return []
 
 
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:

@@ -34,6 +34,12 @@ from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
 
 _log = logging.getLogger(__name__)
 
+# Dotted handler path of the LLM-backed prompt classifier factory.
+# Single source of truth for the registry entry below and for callers
+# that must tell this LLM-backed policy apart from cheap name-based
+# FunctionPolicies (e.g. the Capabilities ``blocked`` preview).
+PROMPT_POLICY_HANDLER = "omnigent.policies.builtins.prompt.prompt_policy"
+
 # The framework-generated system prompt wrapper. The JSON schema
 # is enforced via structured output, so the envelope focuses on
 # the domain instructions and payload.
@@ -248,8 +254,9 @@ def _extract_response_text(response: Any) -> str:
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
     {
-        "handler": "omnigent.policies.builtins.prompt.prompt_policy",
+        "handler": PROMPT_POLICY_HANDLER,
         "kind": "factory",
+        "llm_backed": True,
         "name": "LLM Prompt Classifier Policy",
         "description": (
             "LLM-backed classifier policy. The author supplies domain "
