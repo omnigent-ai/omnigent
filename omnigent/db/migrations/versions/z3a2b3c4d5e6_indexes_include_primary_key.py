@@ -111,7 +111,7 @@ _PLAIN_INDEXES: list[tuple[str, str, list[str], list[str]]] = [
         "ix_comments_conversation_id",
         "comments",
         ["conversation_id"],
-        ["workspace_id", "conversation_id", "id"],
+        ["workspace_id", "conversation_id", "created_at", "id"],
     ),
 ]
 

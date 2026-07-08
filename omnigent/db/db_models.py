@@ -792,7 +792,17 @@ class SqlComment(Base):
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2)", name="ck_comments_status"),
-        Index("ix_comments_conversation_id", "workspace_id", "conversation_id", "id"),
+        # Serves list_for_conversation: WHERE workspace_id + conversation_id
+        # ORDER BY created_at, id. Folds created_at in (over a bare
+        # conversation_id index) so the sort is index-ordered; trails id to
+        # complete the PK.
+        Index(
+            "ix_comments_conversation_id",
+            "workspace_id",
+            "conversation_id",
+            "created_at",
+            "id",
+        ),
     )
 
 
