@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 import tarfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -20,9 +20,11 @@ import yaml
 from click import ClickException
 from click.testing import CliRunner, Result
 
+import omnigent.cli as cli_mod
 from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
+    _LOGIN_ENV_SENTINEL,
     _adopt_ambient_credentials,
     _announce_auto_configured_credentials,
     _bundle,
@@ -70,6 +72,10 @@ from omnigent.runner.transports.ws_tunnel.limits import (
 )
 
 
+class _ExecveCalled(RuntimeError):
+    """Raised by tests when a patched ``os.execve`` would replace the process."""
+
+
 @pytest.fixture(autouse=True)
 def _restore_logging_state() -> Iterator[None]:
     """
@@ -100,6 +106,107 @@ def _restore_logging_state() -> Iterator[None]:
         logger.handlers = list(handlers)
         logger.setLevel(level)
         logger.propagate = propagate
+
+
+def test_login_env_probe_targets_noninteractive_worker_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Login-shell env recovery should only run for non-interactive worker launches.
+
+    GUI-launched host/native commands need PATH repair; help and config-only
+    commands do not, and terminal invocations already inherit the user's shell.
+    """
+    monkeypatch.setattr(cli_mod, "IS_WINDOWS", False)
+    env = {"PATH": "/usr/bin:/bin"}
+
+    assert cli_mod._should_reexec_with_login_env(
+        ["host"],
+        env=env,
+        stdin_isatty=False,
+        stderr_isatty=False,
+    )
+    assert cli_mod._should_reexec_with_login_env(
+        ["agent.yaml"],
+        env=env,
+        stdin_isatty=False,
+        stderr_isatty=False,
+    )
+    assert not cli_mod._should_reexec_with_login_env(
+        ["--help"],
+        env=env,
+        stdin_isatty=False,
+        stderr_isatty=False,
+    )
+    assert not cli_mod._should_reexec_with_login_env(
+        ["config"],
+        env=env,
+        stdin_isatty=False,
+        stderr_isatty=False,
+    )
+    assert not cli_mod._should_reexec_with_login_env(
+        ["host"],
+        env=env,
+        stdin_isatty=True,
+        stderr_isatty=False,
+    )
+    assert not cli_mod._should_reexec_with_login_env(
+        ["host"],
+        env={**env, _LOGIN_ENV_SENTINEL: "1"},
+        stdin_isatty=False,
+        stderr_isatty=False,
+    )
+
+
+def test_maybe_reexec_with_login_env_uses_login_shell_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A GUI-style ``host`` launch is restarted once with the login shell PATH.
+
+    The merged environment preserves existing launcher variables, overlays the
+    shell-derived PATH, and marks the process so the restarted entrypoint does
+    not loop.
+    """
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(cli_mod, "IS_WINDOWS", False)
+    monkeypatch.setattr(cli_mod, "_resolve_login_shell", lambda _env: "/bin/zsh")
+    monkeypatch.setattr(
+        cli_mod,
+        "_load_login_shell_env",
+        lambda _shell: {"PATH": "/opt/homebrew/bin:/usr/bin", "SHELL": "/bin/zsh"},
+    )
+    monkeypatch.setattr(
+        cli_mod.shutil,
+        "which",
+        lambda command, path=None: "/opt/homebrew/bin/omnigent"
+        if command == "omnigent" and path == "/opt/homebrew/bin:/usr/bin"
+        else None,
+    )
+    monkeypatch.setattr(cli_mod.sys, "argv", ["omnigent", "host"])
+    monkeypatch.setattr(cli_mod.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(cli_mod.sys, "stderr", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    monkeypatch.setenv("OMNIGENT_KEEP_ME", "yes")
+    monkeypatch.delenv(_LOGIN_ENV_SENTINEL, raising=False)
+
+    def _fake_execve(path: str, args: list[str], env: Mapping[str, str]) -> None:
+        captured.update({"path": path, "args": args, "env": env})
+        raise _ExecveCalled
+
+    monkeypatch.setattr(cli_mod.os, "execve", _fake_execve)
+
+    with pytest.raises(_ExecveCalled):
+        cli_mod._maybe_reexec_with_login_env(["host"])
+
+    assert captured["path"] == cli_mod.sys.executable
+    assert captured["args"] == [cli_mod.sys.executable, "/opt/homebrew/bin/omnigent", "host"]
+    env = cast("Mapping[str, str]", captured["env"])
+    assert env["PATH"] == "/opt/homebrew/bin:/usr/bin"
+    assert env["SHELL"] == "/bin/zsh"
+    assert env["OMNIGENT_KEEP_ME"] == "yes"
+    assert env[_LOGIN_ENV_SENTINEL] == "1"
 
 
 def test_python_module_entrypoint_uses_unified_click_cli() -> None:

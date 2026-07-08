@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1210,6 +1211,31 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     }
 )
 
+_LOGIN_ENV_SENTINEL = "_OMNIGENT_LOGIN_ENV"
+_LOGIN_ENV_COMMANDS: frozenset[str] = frozenset(
+    {
+        "antigravity",
+        "claude",
+        "codex",
+        "cursor",
+        "debby",
+        "goose",
+        "hermes",
+        "host",
+        "kimi",
+        "kiro",
+        "opencode",
+        "pi",
+        "polly",
+        "qwen",
+        "run",
+    }
+)
+_LOGIN_ENV_DUMP_CODE = (
+    "import json, os; "
+    "print(json.dumps(dict(os.environ), separators=(',', ':')))"
+)
+
 
 def _should_skip_update_check(argv: list[str]) -> bool:
     """Decide whether the update notice should be suppressed for *argv*.
@@ -1238,6 +1264,204 @@ def _should_skip_update_check(argv: list[str]) -> bool:
     }
 
 
+def _login_env_target_command(argv: Sequence[str]) -> str | None:
+    """
+    Return the user-facing command that may need a login-shell environment.
+
+    GUI launchers commonly start ``omnigent host`` or a native harness command
+    with a stripped PATH. Help/version/config-only commands should stay on the
+    fast path, while run shorthands should be treated like ``run``.
+
+    :param argv: CLI arguments without the program name.
+    :returns: Command name to check, or ``None`` when no refresh is useful.
+    """
+    if not argv:
+        return "run"
+    first = argv[0]
+    if first in {"--help", "-h", "--version", "version"}:
+        return None
+    if first.startswith("-"):
+        return "run"
+    if first in _LOGIN_ENV_COMMANDS:
+        return first
+    if _is_run_shorthand(list(argv)):
+        return "run"
+    return None
+
+
+def _should_reexec_with_login_env(
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    stdin_isatty: bool,
+    stderr_isatty: bool,
+) -> bool:
+    """
+    Decide whether the current process should probe the login shell env.
+
+    The re-exec is only for non-interactive POSIX launches that can start
+    local workers. Terminal invocations already inherit the user's shell PATH,
+    and the sentinel prevents a loop after the refreshed process starts.
+
+    :param argv: CLI arguments without the program name.
+    :param env: Current process environment.
+    :param stdin_isatty: Whether stdin is attached to a terminal.
+    :param stderr_isatty: Whether stderr is attached to a terminal.
+    :returns: ``True`` when a login-shell environment probe is worthwhile.
+    """
+    if IS_WINDOWS:
+        return False
+    if env.get(_LOGIN_ENV_SENTINEL):
+        return False
+    if stdin_isatty or stderr_isatty:
+        return False
+    target = _login_env_target_command(argv)
+    return target in _LOGIN_ENV_COMMANDS
+
+
+def _resolve_login_shell(env: Mapping[str, str]) -> str | None:
+    """
+    Resolve the user's login shell path.
+
+    Prefer ``$SHELL`` when present; GUI-launched macOS processes may omit it,
+    so fall back to the account database on POSIX systems.
+
+    :param env: Current process environment.
+    :returns: Absolute shell path, or ``None`` when no usable shell is known.
+    """
+    shell = env.get("SHELL")
+    if not shell:
+        with contextlib.suppress(ImportError, KeyError, OSError, AttributeError):
+            import pwd
+
+            shell = pwd.getpwuid(os.getuid()).pw_shell
+    if not shell:
+        return None
+
+    shell_path = Path(shell)
+    if shell_path.name in {"false", "nologin"}:
+        return None
+    if not shell_path.is_absolute():
+        resolved = shutil.which(shell)
+        if resolved is None:
+            return None
+        shell_path = Path(resolved)
+    if not shell_path.is_file():
+        return None
+    return str(shell_path)
+
+
+def _load_login_shell_env(shell: str) -> dict[str, str] | None:
+    """
+    Return the environment produced by running the user's shell as a login shell.
+
+    Shell startup files occasionally print banners. Parse the last JSON-looking
+    line so a noisy profile does not prevent PATH recovery.
+
+    :param shell: Absolute shell path.
+    :returns: Environment mapping, or ``None`` if probing fails.
+    """
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(_LOGIN_ENV_DUMP_CODE)}"
+    try:
+        completed = subprocess.run(
+            [shell, "-l", "-c", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+
+    for line in reversed(completed.stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(raw, dict):
+            return {
+                str(key): str(value)
+                for key, value in raw.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+    return None
+
+
+def _reexec_current_entrypoint(env: Mapping[str, str]) -> None:
+    """
+    Replace this process with the same CLI entrypoint under ``env``.
+
+    Console scripts are often invoked as ``omnigent`` through PATH, while
+    ``python -m omnigent`` sets ``sys.argv[0]`` to ``omnigent/__main__.py``.
+    Resolve command-name entrypoints against the refreshed PATH so the re-exec
+    works for both shapes.
+
+    :param env: Environment for the replacement process.
+    :returns: None. On successful ``exec`` this function never returns.
+    """
+    argv0 = sys.argv[0]
+    resolved_entrypoint: str | None = None
+    if argv0:
+        argv0_path = Path(argv0)
+        if argv0_path.is_file():
+            resolved_entrypoint = str(argv0_path)
+        else:
+            resolved_entrypoint = shutil.which(argv0, path=env.get("PATH"))
+
+    if resolved_entrypoint:
+        os.execve(sys.executable, [sys.executable, resolved_entrypoint, *sys.argv[1:]], env)
+    else:
+        os.execvpe(argv0 or sys.executable, list(sys.argv) or [sys.executable], env)
+
+
+def _maybe_reexec_with_login_env(argv: Sequence[str] | None = None) -> None:
+    """
+    Re-exec through a login-shell-derived environment when GUI PATH is stripped.
+
+    macOS launchd and Linux desktop launchers often start apps with
+    ``/usr/bin:/bin:/usr/sbin:/sbin`` only. Native harnesses then fail
+    ``shutil.which("claude")`` / ``shutil.which("codex")`` even though the
+    tools work from Terminal. This probes the user's login shell once, merges
+    its environment over the current one, and restarts the same Python entry
+    point only if PATH actually changes.
+
+    :param argv: CLI arguments without the program name. Defaults to
+        ``sys.argv[1:]``.
+    :returns: None. On successful ``execve`` this function never returns.
+    """
+    effective_argv = tuple(sys.argv[1:] if argv is None else argv)
+    if not _should_reexec_with_login_env(
+        effective_argv,
+        env=os.environ,
+        stdin_isatty=sys.stdin.isatty(),
+        stderr_isatty=sys.stderr.isatty(),
+    ):
+        return
+
+    shell = _resolve_login_shell(os.environ)
+    if shell is None:
+        return
+    login_env = _load_login_shell_env(shell)
+    if not login_env:
+        return
+    login_path = login_env.get("PATH")
+    if not login_path or login_path == os.environ.get("PATH"):
+        return
+
+    merged_env = dict(os.environ)
+    merged_env.update(login_env)
+    merged_env[_LOGIN_ENV_SENTINEL] = "1"
+    with contextlib.suppress(OSError):
+        merged_env["PWD"] = os.getcwd()
+    with contextlib.suppress(OSError):
+        _reexec_current_entrypoint(merged_env)
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1259,6 +1483,8 @@ def main() -> None:
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
     """
+    _maybe_reexec_with_login_env(sys.argv[1:])
+
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
