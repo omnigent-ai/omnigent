@@ -320,6 +320,52 @@ describe("PermissionsModal", () => {
     });
   });
 
+  // Overflow regression: DialogContent is a CSS grid, and a long nowrap email
+  // used to set the grants section's min-content, pushing every row past the
+  // dialog edge. jsdom does no layout, so these tests pin the DOM contract the
+  // CSS fix relies on: min-w-0 on the grants grid item, and a truncating row
+  // label that keeps the full id reachable via its title tooltip.
+  describe("long user id rendering", () => {
+    it("caps the grants section's grid min-content (min-w-0)", async () => {
+      listMock.mockResolvedValue([
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      ]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => expect(screen.getByText("bob@example.com")).toBeInTheDocument());
+      expect(screen.getByTestId("share-grants")).toHaveClass("min-w-0");
+    });
+
+    it("renders a long email as a truncating label with the full id in its title", async () => {
+      listMock.mockResolvedValue([
+        {
+          user_id: "alice.a-very-long-local-part-that-overflows@example.com",
+          conversation_id: "conv_abc",
+          level: 1,
+        },
+      ]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      const label = await screen.findByText(
+        "alice.a-very-long-local-part-that-overflows@example.com",
+      );
+      // Tail truncation prioritizes the local part (the distinguishing half
+      // when every grantee shares one company domain); the title tooltip
+      // carries the full id.
+      expect(label).toHaveClass("truncate");
+      expect(label).toHaveAttribute(
+        "title",
+        "alice.a-very-long-local-part-that-overflows@example.com",
+      );
+    });
+  });
+
   describe("with a host user-search provider (combobox)", () => {
     beforeEach(() => {
       // Install a deterministic searcher so the add-user field upgrades to the
