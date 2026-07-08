@@ -761,6 +761,12 @@ def _resolve_oidc_email(
     IdPs that omit the claim for directory-managed users (e.g. Okta
     without custom API Access Management).
 
+    ``config.email_claim`` (from ``OMNIGENT_OIDC_EMAIL_CLAIM``) names
+    the claim that carries the email identity, for IdPs that omit
+    ``email`` (Microsoft Entra ID commonly issues only
+    ``preferred_username``). ``email_verified`` refers to the ``email``
+    claim, so a custom claim always needs the verification opt-out too.
+
     :param token_json: The token endpoint response JSON containing
         ``id_token``.
     :param config: The OIDC configuration with JWKS URI and
@@ -788,8 +794,38 @@ def _resolve_oidc_email(
         _logger.warning("id_token validation failed: %s", exc)
         return None
 
-    email = claims.get("email")
+    email = claims.get(config.email_claim)
     if not email:
+        _logger.warning(
+            "Rejecting id_token: no %r claim (claims present: %s). "
+            "IdPs that use a different claim for the email identity "
+            "can set OMNIGENT_OIDC_EMAIL_CLAIM.",
+            config.email_claim,
+            sorted(claims.keys()),
+        )
+        return None
+
+    # ``email_verified`` refers to the ``email`` claim (OIDC core), so
+    # it vouches nothing about a custom identity claim — a token can
+    # carry ``email_verified: true`` for a *different* address than the
+    # one being minted. A custom claim therefore always requires the
+    # explicit opt-out, regardless of ``email_verified``.
+    if config.email_claim != "email":
+        if config.skip_email_verification:
+            _logger.info(
+                "Accepting id_token %s %r; the claim has no verified "
+                "marker (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                config.email_claim,
+                email,
+            )
+            return email
+        _logger.warning(
+            "Rejecting id_token: %s %r has no email_verified marker "
+            "(email_verified refers to the email claim); set "
+            "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION to accept it",
+            config.email_claim,
+            email,
+        )
         return None
 
     # Reject unless the IdP affirmatively verified the email. A signed
