@@ -224,6 +224,7 @@ function TerminalFirstViewProbe() {
       data-testid="view-probe"
       data-is-terminal-first={ctx.isTerminalFirst ? "true" : "false"}
       data-is-claude-native={ctx.isClaudeNative ? "true" : "false"}
+      data-is-native-wrapper={ctx.isNativeWrapper ? "true" : "false"}
       data-view={ctx.view}
       data-terminals-available={ctx.terminalsAvailable ? "true" : "false"}
       data-terminal-starting-up={ctx.terminalStartingUp ? "true" : "false"}
@@ -345,6 +346,7 @@ function mockConversations(
     id: string;
     permission_level: number | null;
     labels?: Record<string, string>;
+    agent_name?: string | null;
     host_id?: string | null;
     runner_id?: string | null;
   }>,
@@ -361,6 +363,7 @@ function mockConversations(
             updated_at: 0,
             labels: c.labels ?? {},
             permission_level: c.permission_level,
+            agent_name: c.agent_name ?? null,
             host_id: c.host_id ?? null,
             runner_id: c.runner_id ?? null,
           })),
@@ -546,6 +549,51 @@ describe("TerminalFirstContext", () => {
     const regularProbe = screen.getByTestId("view-probe");
     expect(regularProbe).toHaveAttribute("data-is-terminal-first", "false");
     expect(regularProbe).toHaveAttribute("data-is-claude-native", "false");
+  });
+
+  it.each(["glitchy-codex", "polly-codex"])(
+    "flags %s sessions terminal-first without a UI label",
+    (agentName) => {
+      // These custom Codex agents are not created by the direct `omnigent codex`
+      // wrapper, so their rows may lack `omnigent.ui: terminal` even though the
+      // runner owns a Codex terminal resource. The shell should still expose the
+      // existing Chat/Terminal surface, without treating them as native wrappers.
+      mockConversations([
+        {
+          id: "conv_codex_agent",
+          permission_level: null,
+          labels: {},
+          agent_name: agentName,
+        },
+      ]);
+      useTerminalsMock.mockReturnValue({
+        terminals: [{ id: "terminal_codex_main", name: "codex", session: "main", running: true }],
+        isLoading: false,
+        error: null,
+      });
+
+      renderShell("/c/conv_codex_agent");
+      const probe = screen.getByTestId("view-probe");
+      expect(probe).toHaveAttribute("data-is-terminal-first", "true");
+      expect(probe).toHaveAttribute("data-is-native-wrapper", "false");
+      expect(probe).toHaveAttribute("data-terminals-available", "true");
+      expect(screen.queryByTestId("terminals-panel")).toBeNull();
+    },
+  );
+
+  it("keeps ordinary Polly sessions chat-first without a UI label", () => {
+    mockConversations([
+      {
+        id: "conv_polly",
+        permission_level: null,
+        labels: {},
+        agent_name: "polly",
+      },
+    ]);
+
+    renderShell("/c/conv_polly");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-is-terminal-first", "false");
   });
 
   it("flags a child (sub-agent) session terminal-first from the snapshot when the sidebar omits it", () => {

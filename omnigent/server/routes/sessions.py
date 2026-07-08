@@ -120,6 +120,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
+    activity_stream,
     get_agent_cache,
     get_caps,
     get_policy_store,
@@ -1039,6 +1040,46 @@ def _announce_session_added(user_id: str | None, session_id: str) -> None:
     """
     user_session_stream.publish(
         _discovery_key(user_id), {"type": "session_added", "session_id": session_id}
+    )
+
+
+async def _register_activity_session_context(
+    conv: Conversation,
+    agent_store: AgentStore,
+    *,
+    agent_name: str | None = None,
+) -> None:
+    """
+    Register session metadata for the Glitchy activity side channel.
+
+    The hot publish path only knows ``conversation_id`` and the SSE event
+    dict. Route handlers already have the conversation row, so they cache
+    enough context here for :mod:`omnigent.runtime.activity_stream` to gate
+    emission to explicitly Glitchy / attention-librarian sessions without a
+    store lookup on every token, status, or tool event.
+
+    :param conv: Conversation/session row being handled.
+    :param agent_store: Store used to resolve an agent name when the caller
+        has not already done so.
+    :param agent_name: Optional already-resolved agent name.
+    :returns: None.
+    """
+    resolved_agent_name = agent_name
+    if resolved_agent_name is None and conv.agent_id is not None:
+        try:
+            agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+            resolved_agent_name = agent.name if agent is not None else None
+        except Exception:  # noqa: BLE001 -- metadata cache failure must not break routes
+            _logger.debug(
+                "activity stream: could not resolve agent name for %s",
+                conv.id,
+                exc_info=True,
+            )
+    activity_stream.register_session_context(
+        conv.id,
+        labels=conv.labels,
+        agent_name=resolved_agent_name,
+        session_title=conv.title,
     )
 
 
@@ -11518,6 +11559,41 @@ async def _stream_live_events(
         yield "data: [DONE]\n\n"
 
 
+async def _stream_activity_events(
+    request: Request,
+    *,
+    visible_only: bool = False,
+) -> AsyncIterator[str]:
+    """
+    Yield SSE-formatted Glitchy activity events.
+
+    This is a separate observer stream, not a normal session stream variant:
+    payloads are classified ``glitchy.activity`` records emitted only for
+    explicitly Glitchy / attention-librarian routed sessions. There is no
+    history replay and no snapshot poll; subscribers see live activity from
+    subscription forward.
+
+    :param request: FastAPI request, used to detect disconnect.
+    :param visible_only: Drop quiet/background records at the subscriber
+        edge. The default is ``False`` so the librarian can maintain memory
+        even for quiet/backlog events.
+    :returns: An async iterator of SSE message strings.
+    """
+    try:
+        async for event in activity_stream.subscribe(
+            visible_only=visible_only,
+            heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
+        ):
+            if await request.is_disconnected():
+                break
+            event_type = event.get("type")
+            if not isinstance(event_type, str):
+                raise ValueError(f"activity event missing string ``type`` field: {event!r}")
+            yield _format_sse(event_type, event)
+    finally:
+        yield "data: [DONE]\n\n"
+
+
 # Bounds for per-session native-terminal pass-through args
 # (conversations.terminal_launch_args). These are CLI flags for the
 # user's own claude / codex binary, so a few hundred short strings is
@@ -12407,6 +12483,10 @@ async def _create_session_from_existing_agent(
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+    refreshed_for_activity = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+    if refreshed_for_activity is not None:
+        conv = refreshed_for_activity
+    await _register_activity_session_context(conv, agent_store, agent_name=agent.name)
     if body.initial_items:
         runner_client = await _get_runner_client(conv.id, runner_router)
         if runner_client is None:
@@ -13912,6 +13992,37 @@ def create_sessions_router(
     """
     router = APIRouter()
 
+    @router.get(
+        "/activity/stream",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def stream_activity(
+        request: Request,
+        visible_only: bool = Query(default=False),
+    ) -> StreamingResponse:
+        """
+        Subscribe to live Glitchy attention-librarian activity.
+
+        This is a classified side-channel over existing session events. It
+        does not replay history, scan session snapshots, or wake chat; it
+        only forwards events emitted after the subscription opens.
+
+        :param request: The incoming FastAPI request.
+        :param visible_only: When true, suppress quiet/background records.
+        :returns: An SSE :class:`StreamingResponse`.
+        """
+        if permission_store is not None and _get_user_id(request, auth_provider) is None:
+            raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
+        return StreamingResponse(
+            _stream_activity_events(request, visible_only=visible_only),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     # ── POST /sessions ───────────────────────────────────────────
 
     @router.post(
@@ -13961,6 +14072,17 @@ def create_sessions_router(
                 await asyncio.to_thread(
                     permission_store.grant, user_id, result.session_id, LEVEL_OWNER
                 )
+            conv = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                result.session_id,
+            )
+            agent = await asyncio.to_thread(agent_store.get, result.agent_id)
+            if conv is not None:
+                await _register_activity_session_context(
+                    conv,
+                    agent_store,
+                    agent_name=agent.name if agent is not None else None,
+                )
             # Push the new session to this user's other open tabs so it
             # enters the sidebar without a list poll (WS /sessions/updates).
             _announce_session_added(user_id, result.session_id)
@@ -14007,6 +14129,8 @@ def create_sessions_router(
         # Without this, the runner doesn't know this session exists
         # until the first forwarded event.
         conv = conversation_store.get_conversation(resp.id)
+        if conv is not None:
+            await _register_activity_session_context(conv, agent_store)
         # Mark the terminal spin-up flag at creation — the earliest
         # possible point — for a host-launched terminal-first session
         # (claude-native / codex-native). The runner's own pending emit
@@ -14632,6 +14756,14 @@ def create_sessions_router(
             for conv in page.data
             if conv.agent_id is not None
         ]
+        for conv in page.data:
+            if conv.agent_id is not None:
+                activity_stream.register_session_context(
+                    conv.id,
+                    labels=conv.labels,
+                    agent_name=agent_names_by_id.get(conv.agent_id),
+                    session_title=conv.title,
+                )
         # The list deliberately does NOT compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
         # sidebar no longer surfaces connection state, and the only live
@@ -15410,6 +15542,9 @@ def create_sessions_router(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        activity_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if activity_conv is not None:
+            await _register_activity_session_context(activity_conv, agent_store)
         level = await _get_permission_level(user_id, session_id, permission_store)
         return await _get_session_snapshot(
             conversation_store,
@@ -18694,6 +18829,7 @@ def create_sessions_router(
                     "Session not found",
                     code=ErrorCode.NOT_FOUND,
                 )
+        await _register_activity_session_context(conv, agent_store)
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -19691,6 +19827,7 @@ def create_sessions_router(
                     "Session not found",
                     code=ErrorCode.NOT_FOUND,
                 )
+        await _register_activity_session_context(conv, agent_store)
         runner_client = await _get_runner_client(
             session_id,
             runner_router,
@@ -19930,6 +20067,7 @@ def create_sessions_router(
                 "Session not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        activity_stream.unregister_session_context(session_id)
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted
