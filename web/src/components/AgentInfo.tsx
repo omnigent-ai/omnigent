@@ -482,7 +482,7 @@ function AddPolicyDialog({
                         <span>
                           (
                           {prop.type === "array" && prop.items?.enum
-                            ? "select"
+                            ? "multi-select"
                             : prop.type === "array"
                               ? "comma-separated"
                               : prop.type}
@@ -535,35 +535,83 @@ function AddPolicyDialog({
                         ))}
                       </select>
                     ) : prop?.type === "array" && prop.items?.enum ? (
-                      <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-1">
-                        {prop.items.enum.map((v: string) => {
-                          const current = factoryParams[key]
-                            ? factoryParams[key].split(",").filter(Boolean)
-                            : Array.isArray(prop?.default)
-                              ? (prop.default as string[])
-                              : [];
-                          const checked = current.includes(v);
-                          return (
-                            <label key={v} className="flex items-center gap-1 text-sm">
-                              <input
-                                type="checkbox"
-                                checked={checked}
+                      (() => {
+                        const current = factoryParams[key]
+                          ? factoryParams[key].split(",").filter(Boolean)
+                          : Array.isArray(prop?.default)
+                            ? (prop.default as string[])
+                            : [];
+                        const available = prop.items.enum.filter(
+                          (v: string) => !current.includes(v),
+                        );
+                        return (
+                          <div className="mt-0.5 space-y-1.5">
+                            {current.length > 0 && (
+                              <div className="flex flex-wrap gap-1">
+                                {current.map((v: string) => (
+                                  <span
+                                    key={v}
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                  >
+                                    {v}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const next = current.filter((x) => x !== v);
+                                        setFactoryParams((prev) => ({
+                                          ...prev,
+                                          [key]: next.join(","),
+                                        }));
+                                      }}
+                                      className="ml-0.5 text-muted-foreground hover:text-foreground"
+                                    >
+                                      <XIcon className="size-3" />
+                                    </button>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            {available.length > 0 && (
+                              <select
+                                value=""
                                 onChange={(e) => {
-                                  const next = e.target.checked
-                                    ? [...current, v]
-                                    : current.filter((x) => x !== v);
+                                  if (!e.target.value) return;
+                                  const next = [...current, e.target.value];
                                   setFactoryParams((prev) => ({
                                     ...prev,
                                     [key]: next.join(","),
                                   }));
                                 }}
-                                className="rounded border-border"
-                              />
-                              <span>{v}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
+                                className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                              >
+                                <option value="">Add from list…</option>
+                                {available.map((v: string) => (
+                                  <option key={v} value={v}>
+                                    {v}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                            <input
+                              type="text"
+                              placeholder="Add custom value…"
+                              onKeyDown={(e) => {
+                                if (e.key !== "Enter") return;
+                                e.preventDefault();
+                                const v = e.currentTarget.value.trim();
+                                if (!v || current.includes(v)) return;
+                                const next = [...current, v];
+                                setFactoryParams((prev) => ({
+                                  ...prev,
+                                  [key]: next.join(","),
+                                }));
+                                e.currentTarget.value = "";
+                              }}
+                              className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                            />
+                          </div>
+                        );
+                      })()
                     ) : (
                       <input
                         type={
