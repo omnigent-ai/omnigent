@@ -31,6 +31,7 @@ class _FakeItem:
     """Minimal stub for ConversationItem."""
 
     id: str
+    conversation_id: str | None
     response_id: str
     created_at: int
     type: str
@@ -101,7 +102,8 @@ def test_invoke_returns_results(monkeypatch: pytest.MonkeyPatch) -> None:
     items = [
         _FakeItem(
             id="item_1",
-            response_id="conv_1",
+            conversation_id="conv_1",
+            response_id="resp_1",
             created_at=1000,
             type="message",
             data=_message_data(),
@@ -142,7 +144,10 @@ def test_invoke_missing_query() -> None:
 
 def test_invoke_respects_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """invoke() passes limit to the store."""
-    items = [_FakeItem(f"item_{i}", f"conv_{i}", i, "message", _message_data()) for i in range(20)]
+    items = [
+        _FakeItem(f"item_{i}", f"conv_{i}", f"resp_{i}", i, "message", _message_data())
+        for i in range(20)
+    ]
     store = _FakeConversationStore(items)
     monkeypatch.setattr(
         "omnigent.runtime.get_conversation_store",
@@ -159,13 +164,13 @@ def test_invoke_respects_limit(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_extract_text_message() -> None:
     """Extract text from a message item."""
-    item = _FakeItem("i", "r", 0, "message", _message_data("Hello world"))
+    item = _FakeItem("i", "conv_1", "r", 0, "message", _message_data("Hello world"))
     assert _extract_text(item) == "Hello world"
 
 
 def test_extract_text_function_call() -> None:
     """Extract text from a function call item."""
-    item = _FakeItem("i", "r", 0, "function_call", _function_call_data())
+    item = _FakeItem("i", "conv_1", "r", 0, "function_call", _function_call_data())
     text = _extract_text(item)
     assert "web_search" in text
     assert '{"query": "test"}' in text
@@ -173,7 +178,7 @@ def test_extract_text_function_call() -> None:
 
 def test_extract_text_function_call_output() -> None:
     """Extract text from a function call output item."""
-    item = _FakeItem("i", "r", 0, "function_call_output", _function_call_output_data())
+    item = _FakeItem("i", "conv_1", "r", 0, "function_call_output", _function_call_output_data())
     assert _extract_text(item) == "Search results here"
 
 
@@ -184,7 +189,7 @@ def test_extract_text_unknown_type() -> None:
     class _Unknown:
         pass
 
-    item = _FakeItem("i", "r", 0, "unknown", _Unknown())
+    item = _FakeItem("i", "conv_1", "r", 0, "unknown", _Unknown())
     assert _extract_text(item) == ""
 
 
@@ -194,7 +199,7 @@ def test_extract_text_unknown_type() -> None:
 def test_format_results_includes_all_fields() -> None:
     """Each result has conversation_id, item_id, created_at, type."""
     items = [
-        _FakeItem("i1", "conv_1", 1000, "message", _message_data()),
+        _FakeItem("i1", "conv_1", "resp_1", 1000, "message", _message_data()),
     ]
     results = _format_results(items)
     assert len(results) == 1

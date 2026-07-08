@@ -429,6 +429,7 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
     """
     return ConversationItem(
         id=row.id,
+        conversation_id=row.conversation_id,
         type=row.type,
         status=row.status,
         response_id=row.response_id,
@@ -1560,6 +1561,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 persisted.append(
                     ConversationItem(
                         id=row.id,
+                        conversation_id=conversation_id,
                         type=row.type,
                         status=row.status,
                         response_id=row.response_id,

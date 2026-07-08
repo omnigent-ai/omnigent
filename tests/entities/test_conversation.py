@@ -39,6 +39,23 @@ def test_to_api_dict_omits_created_by_when_none() -> None:
     assert "created_by" not in api
 
 
+def test_conversation_id_is_internal_metadata() -> None:
+    """Stored items can carry owner metadata without changing API dumps."""
+    item = ConversationItem(
+        id="msg_1",
+        conversation_id="conv_1",
+        type="message",
+        status="completed",
+        response_id="resp_1",
+        created_at=0,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+
+    assert item.conversation_id == "conv_1"
+    assert "conversation_id" not in item.model_dump()
+    assert "conversation_id" not in item.to_api_dict()
+
+
 def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
     """Interrupted assistant items surface the reload marker in API shape."""
     item = ConversationItem(
