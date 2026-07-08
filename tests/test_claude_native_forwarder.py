@@ -6725,6 +6725,273 @@ async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
 
 
 @pytest.mark.asyncio
+async def test_background_task_wait_under_bound_does_not_post_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Background-task ``waiting`` stays non-terminal while under the bound."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [{"id": "bg-1", "status": "running"}],
+        },
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(forwarder, "_background_wait_wall_time", lambda: 100.0)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_child"
+        )
+        hook_state = await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+        monkeypatch.setattr(
+            forwarder,
+            "_background_wait_wall_time",
+            lambda: 100.0 + forwarder._BACKGROUND_TASK_WAIT_MAX_S - 1.0,
+        )
+        hook_state = await forwarder._maybe_fire_background_task_wait_fallback(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+        )
+
+    assert bodies == [
+        {
+            "type": "external_session_status",
+            "data": {"status": "waiting", "background_task_count": 1},
+        }
+    ]
+    assert hook_state.background_task_wait_started_at == 100.0
+    persisted_state = forwarder._read_hook_state(bridge_dir)
+    assert persisted_state is not None
+    assert persisted_state.background_task_wait_started_at == 100.0
+
+
+@pytest.mark.asyncio
+async def test_background_task_wait_fallback_posts_idle_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After the bound elapses, fallback ``idle`` fires once and is logged."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [{"id": "bg-1", "status": "running"}],
+        },
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
+    monkeypatch.setattr(forwarder, "_background_wait_wall_time", lambda: 100.0)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_child"
+        )
+        hook_state = await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+        monkeypatch.setattr(
+            forwarder,
+            "_background_wait_wall_time",
+            lambda: 100.0 + forwarder._BACKGROUND_TASK_WAIT_MAX_S + 1.0,
+        )
+        hook_state = await forwarder._maybe_fire_background_task_wait_fallback(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+        )
+        hook_state = await forwarder._maybe_fire_background_task_wait_fallback(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+        )
+
+    assert bodies == [
+        {
+            "type": "external_session_status",
+            "data": {"status": "waiting", "background_task_count": 1},
+        },
+        {
+            "type": "external_session_status",
+            "data": {"status": "idle", "background_task_count": 0},
+        },
+    ]
+    assert hook_state.background_task_wait_started_at is None
+    persisted_state = forwarder._read_hook_state(bridge_dir)
+    assert persisted_state is not None
+    assert persisted_state.background_task_wait_started_at is None
+    assert "Posted fallback idle after background-task wait timeout" in caplog.text
+    assert "conv_child" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_background_task_wait_real_stop_cancels_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later real ``Stop`` with zero background tasks delivers normally."""
+    bridge_dir = tmp_path / "bridge"
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(forwarder, "_background_wait_wall_time", lambda: 100.0)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_child"
+        )
+        record_hook_event(
+            bridge_dir,
+            {
+                "hook_event_name": "Stop",
+                "session_id": "claude-session",
+                "background_tasks": [{"id": "bg-1", "status": "running"}],
+            },
+        )
+        hook_state = await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+        monkeypatch.setattr(forwarder, "_background_wait_wall_time", lambda: 150.0)
+        record_hook_event(
+            bridge_dir,
+            {"hook_event_name": "Stop", "session_id": "claude-session"},
+        )
+        hook_state = await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+        monkeypatch.setattr(
+            forwarder,
+            "_background_wait_wall_time",
+            lambda: 100.0 + forwarder._BACKGROUND_TASK_WAIT_MAX_S + 1.0,
+        )
+        hook_state = await forwarder._maybe_fire_background_task_wait_fallback(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+        )
+
+    assert bodies == [
+        {
+            "type": "external_session_status",
+            "data": {"status": "waiting", "background_task_count": 1},
+        },
+        {
+            "type": "external_session_status",
+            "data": {"status": "idle", "background_task_count": 0},
+        },
+    ]
+    assert hook_state.background_task_wait_started_at is None
+
+
+@pytest.mark.asyncio
+async def test_background_task_wait_no_background_tasks_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal ``Stop`` still posts ``idle`` with no fallback timer."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "Stop", "session_id": "claude-session"},
+    )
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(forwarder, "_background_wait_wall_time", lambda: 100.0)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_child"
+        )
+        hook_state = await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+        monkeypatch.setattr(
+            forwarder,
+            "_background_wait_wall_time",
+            lambda: 100.0 + forwarder._BACKGROUND_TASK_WAIT_MAX_S + 1.0,
+        )
+        hook_state = await forwarder._maybe_fire_background_task_wait_fallback(
+            client=client,
+            session_id="conv_child",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+        )
+
+    assert bodies == [
+        {
+            "type": "external_session_status",
+            "data": {"status": "idle", "background_task_count": 0},
+        }
+    ]
+    assert hook_state.background_task_wait_started_at is None
+
+
+@pytest.mark.asyncio
 async def test_post_external_session_status_includes_and_omits_response_id() -> None:
     """
     ``post_external_session_status`` attaches ``response_id`` only when given.
