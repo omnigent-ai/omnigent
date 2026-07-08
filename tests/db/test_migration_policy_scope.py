@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -37,10 +38,14 @@ def test_scope_column_exists_and_is_not_nullable(db_engine: Engine) -> None:
 
 
 def test_ix_policies_default_name_index_exists(db_engine: Engine) -> None:
-    """ix_policies_default_name unique index is present after the migration."""
+    """The default-name unique index is present after the migration chain.
+
+    At head the index keys on ``name_cksum`` (see x1a2b3c4d5e6), not the raw
+    name — the ``_cksum`` name is what survives the full chain.
+    """
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("policies")}
-    assert "ix_policies_default_name" in indexes
-    assert indexes["ix_policies_default_name"]["unique"]
+    assert "ix_policies_default_name_cksum" in indexes
+    assert indexes["ix_policies_default_name_cksum"]["unique"]
 
 
 def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> None:
@@ -48,22 +53,27 @@ def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> 
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
+                # kind/type run at head, where they are int codes
+                # (1 = "default"/"python" per enum_codecs).
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id, kind)"
-                " VALUES ('conv_sc1', 1, 1, 'conv_sc1', 'default')"
+                " VALUES ('conv_sc1', 1, 1, 'conv_sc1', 1)"
             )
         )
         conn.execute(
             sa.text(
+                # scope runs at head, where it is an int code (2 = "session").
+                # name_cksum is NOT NULL at head (x1a2b3c4d5e6) — sha256(name).
                 "INSERT INTO policies"
-                " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_sc1', 'sess_pol', 'conv_sc1', 'session', 1, 'python', 'mod.f', 1)"
-            )
+                " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
+                " VALUES ('pol_sc1', 'sess_pol', :cksum, 'conv_sc1', 2, 1, 1, 'mod.f', 1)"
+            ),
+            {"cksum": hashlib.sha256(b"sess_pol").digest()},
         )
         scope = conn.execute(
             sa.text("SELECT scope FROM policies WHERE id = 'pol_sc1'")
         ).scalar_one()
-    assert scope == "session"
+    assert scope == 2
 
 
 def test_backfill_sets_default_scope_for_default_policies(db_engine: Engine) -> None:
@@ -71,15 +81,18 @@ def test_backfill_sets_default_scope_for_default_policies(db_engine: Engine) -> 
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
+                # scope runs at head, where it is an int code (1 = "default").
+                # name_cksum is NOT NULL at head (x1a2b3c4d5e6) — sha256(name).
                 "INSERT INTO policies"
-                " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_def1', 'def_pol', NULL, 'default', 1, 'python', 'mod.f', 1)"
-            )
+                " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
+                " VALUES ('pol_def1', 'def_pol', :cksum, NULL, 1, 1, 1, 'mod.f', 1)"
+            ),
+            {"cksum": hashlib.sha256(b"def_pol").digest()},
         )
         scope = conn.execute(
             sa.text("SELECT scope FROM policies WHERE id = 'pol_def1'")
         ).scalar_one()
-    assert scope == "default"
+    assert scope == 1
 
 
 def test_scope_round_trip_via_store(db_engine: Engine) -> None:
@@ -147,10 +160,11 @@ def test_downgrade_removes_scope_column(tmp_path: Path) -> None:
     uri = f"sqlite:///{db_path}"
     engine = get_or_create_engine(uri)
 
-    # Start at head (includes q1a2b3c4d5e6).
+    # Start at head (includes the scope migration q1a2b3c4d5e6).
     assert "scope" in {c["name"] for c in sa.inspect(engine).get_columns("policies")}
 
-    # Downgrade one step.
+    # Downgrade below the scope migration (through the later enums→SMALLINT
+    # migration that now sits above it).
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
         config.attributes["connection"] = conn

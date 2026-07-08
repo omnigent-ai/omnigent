@@ -86,7 +86,7 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :id)"
+                "VALUES (:id, :ts, :ts, 1, :id)"
             ),
             {"id": "conv_tla_null", "ts": 1700000000},
         )
@@ -104,7 +104,7 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, terminal_launch_args, "
                 "root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :tla, :id)"
+                "VALUES (:id, :ts, :ts, 1, :tla, :id)"
             ),
             {
                 "id": "conv_tla_value",

@@ -210,6 +210,64 @@ describe("PoliciesPage actions", () => {
       expect.anything(),
     );
   });
+
+  it("Cancel steps back to the policy list after a policy is selected", async () => {
+    // WHY: once a policy is selected the dialog shows its config; Cancel must
+    // return to the list so the user can pick a different policy (not close).
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+        {
+          handler: "omnigent.policies.rate_limit",
+          kind: "callable",
+          name: "Rate Limit",
+          description: "Cap request rate.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Block Canada"));
+    expect(within(dialog).queryByPlaceholderText("Filter policies...")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(within(dialog).getByPlaceholderText("Filter policies...")).toBeInTheDocument();
+    expect(within(dialog).getByText("Block Canada")).toBeInTheDocument();
+    expect(within(dialog).getByText("Rate Limit")).toBeInTheDocument();
+    expect(addMutate).not.toHaveBeenCalled();
+  });
+
+  it("Cancel from the policy list closes the dialog", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
 });
 
 describe("PoliciesPage single-user mode", () => {

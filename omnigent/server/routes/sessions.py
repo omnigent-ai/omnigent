@@ -95,7 +95,7 @@ from omnigent.harness_plugins import (
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.model_override import model_family_mismatch, validate_model_override
+from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -218,6 +218,7 @@ from omnigent.server.schemas import (
     OutputTextDeltaEvent,
     PaginatedList,
     PermissionObject,
+    PolicyDeniedEvent,
     PolicySummary,
     ReadStatePutRequest,
     ReasoningStartedEvent,
@@ -492,6 +493,29 @@ def _publish_collaboration_mode(session_id: str, mode: str) -> None:
         type="session.collaboration_mode",
         conversation_id=session_id,
         mode=mode,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
+    """
+    Publish a native policy-DENY signal on the session stream.
+
+    A native harness's policy DENY is decided synchronously in the
+    ``/policies/evaluate`` hook response, so nothing on the stream otherwise
+    reflects that an action was blocked. This surfaces the decision as a
+    positive event for observers (web UI, capability bench). Fire-and-forget.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param reason: Deny reason from the deciding policy.
+    :param phase: The policy phase the DENY landed on, e.g. ``"tool_call"``.
+    :returns: None.
+    """
+    event = PolicyDeniedEvent(
+        type="response.policy_denied",
+        conversation_id=session_id,
+        reason=reason,
+        phase=phase,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -6175,6 +6199,7 @@ async def _launch_runner_on_host(
             request_id=request_id,
             binding_token=binding_token,
             workspace=conv.workspace,
+            session_id=conv.id,
             # Canonical harness (see _resolve_harness) so the host runs the
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
@@ -10260,34 +10285,6 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
     return family_a is not None and family_a == _agent_provider_family(b)
 
 
-def _agent_harness_id(agent: Agent) -> str | None:
-    """Return an agent's canonical harness id, or ``None`` when unloadable.
-
-    Used to family-check a fork's explicit ``model_override`` against the
-    harness the fork will actually run (e.g. reject a Claude model on a
-    codex-native fork). ``None`` when the bundle can't be loaded — the
-    caller then skips the family guard (the runner's fail-loud launch
-    remains the safety net) rather than blocking the fork.
-
-    :param agent: The agent whose harness to resolve, e.g. the fork's
-        base agent.
-    :returns: The canonical harness id, e.g. ``"codex-native"``, or
-        ``None`` when the bundle can't be loaded.
-    """
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-            .spec
-        )
-    except Exception:  # noqa: BLE001 — unloadable bundle → skip the family guard
-        return None
-    from omnigent.harness_aliases import canonicalize_harness
-
-    harness_kind = spec.executor.harness_kind
-    return canonicalize_harness(harness_kind) or harness_kind
-
-
 def _agent_is_native(agent: Agent) -> bool:
     """Return whether an agent runs a native CLI harness.
 
@@ -12239,18 +12236,40 @@ async def _create_session_from_existing_agent(
             request=request,
         )
 
-    # Git worktree creation (optional): the worktree becomes the
-    # stored workspace and its branch is recorded.
+    # Git worktree options (optional). Two modes on body.git:
+    #  - create (default): make a worktree; it becomes the stored
+    #    workspace and its branch is recorded.
+    #  - bind (existing_worktree): workspace already IS the worktree;
+    #    record its branch only, create nothing.
     git_branch: str | None = None
+    # Set to the created worktree path ONLY when Omnigent creates one.
+    # Gates create-rollback: an existing worktree bound via
+    # existing_worktree must never be force-removed on failure — it is
+    # the user's, not an Omnigent orphan.
+    created_worktree_path: str | None = None
     if body.git is not None:
-        created_worktree = await _create_session_worktree(
-            host_id=body.host_id,
-            source_repo=canonical_workspace,
-            git=body.git,
-            request=request,
-        )
-        canonical_workspace = created_worktree.worktree_path
-        git_branch = created_worktree.branch
+        if body.git.existing_worktree:
+            # Starting in a pre-existing worktree: no worktree is created, but
+            # record its branch so the sidebar shows it and the opt-in delete
+            # flow can offer to remove it. Validate the name (the host never
+            # runs git for this path, so the server is the only gate).
+            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+
+            try:
+                validate_branch_name(body.git.branch_name)
+            except WorktreeError as exc:
+                raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+            git_branch = body.git.branch_name
+        else:
+            created_worktree = await _create_session_worktree(
+                host_id=body.host_id,
+                source_repo=canonical_workspace,
+                git=body.git,
+                request=request,
+            )
+            canonical_workspace = created_worktree.worktree_path
+            git_branch = created_worktree.branch
+            created_worktree_path = created_worktree.worktree_path
 
     # Native-terminal pass-through args.
     #
@@ -12313,12 +12332,18 @@ async def _create_session_from_existing_agent(
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
         # cleanup before the error propagates. We re-raise unchanged
-        # below, so nothing is swallowed. git_branch is set only on
-        # worktree success.
-        if git_branch is not None and canonical_workspace is not None and body.host_id is not None:
+        # below, so nothing is swallowed. Gate on created_worktree_path,
+        # NOT git_branch: only a worktree Omnigent created here may be
+        # force-removed. An existing worktree bound via workspace_branch
+        # also sets git_branch but is the user's — never destroy it.
+        if (
+            created_worktree_path is not None
+            and body.host_id is not None
+            and git_branch is not None
+        ):
             await _remove_session_worktree_best_effort(
                 host_id=body.host_id,
-                worktree_path=canonical_workspace,
+                worktree_path=created_worktree_path,
                 branch=git_branch,
                 delete_branch=True,
                 request=request,
@@ -14160,6 +14185,7 @@ def create_sessions_router(
                         request_id=request_id,
                         binding_token=binding_token,
                         workspace=resp.workspace,
+                        session_id=resp.id,
                         # Already canonical (see _resolve_harness); lets
                         # the host refuse an unconfigured harness before
                         # spawning. None (agent not resolvable) skips the
@@ -15499,37 +15525,6 @@ def create_sessions_router(
         cloned_agent_id = generate_agent_id()
         cloned_agent_name = base_agent.name
 
-        # An explicit "restart with model" override for the fork. Validated
-        # (charset/length) and family-checked against the harness the fork
-        # will actually run, so a bad or cross-family id (e.g. a Claude model
-        # on a codex-native fork) fails loud here rather than after launch.
-        # Wins over the source's copied model in the store.
-        fork_model_override: str | None = None
-        if body.model_override is not None:
-            try:
-                fork_model_override = validate_model_override(body.model_override)
-            except ValueError as exc:
-                raise OmnigentError(
-                    f"invalid model_override: {exc}",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            base_harness = await asyncio.to_thread(_agent_harness_id, base_agent)
-            # Fail CLOSED: if the fork harness can't be resolved we can't
-            # family-check the override, so reject rather than launch an
-            # unvalidated cross-family model. (Only when an override was
-            # actually supplied — a normal fork with no override is
-            # unaffected by an unloadable bundle here.)
-            if base_harness is None:
-                raise OmnigentError(
-                    "cannot validate model_override: the fork's harness could not "
-                    "be resolved. Retry without a model override to keep the "
-                    "source's model.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            mismatch = model_family_mismatch(base_harness, fork_model_override)
-            if mismatch is not None:
-                raise OmnigentError(mismatch, code=ErrorCode.INVALID_INPUT)
-
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
         # provider family. A cross-family switch (or an undeterminable
@@ -15592,7 +15587,6 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
-                model_override=fork_model_override,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
@@ -16436,6 +16430,13 @@ def create_sessions_router(
             _spawn_native_blocked_notice_forward(
                 session_id, result.reason or "Blocked by policy.", result.deciding_policy
             )
+        # A tool-call DENY is decided synchronously here, so nothing else on the
+        # stream reflects that the native tool was blocked. Publish a positive
+        # signal so observers (web UI, capability bench) see the decision rather
+        # than infer it from the blocked tool's absence. Observational, so it is
+        # not gated on write access.
+        if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
+            _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",

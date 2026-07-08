@@ -255,6 +255,12 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
+# Hindsight long-term memory builtins. Runner-local (like web_search) so that a
+# wrapped harness's (claude-sdk / codex / cursor / pi) tool call resolves to the
+# spec-configured Hindsight tool via its ``invoke``. Without this entry the call
+# falls through to the harness, which has no such tool, and silently no-ops.
+_HINDSIGHT_TOOLS = frozenset({"hindsight_retain", "hindsight_recall", "hindsight_reflect"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -332,6 +338,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    # Memory builtins are relayed to native harnesses too — unlike web_search,
+    # native harnesses have no built-in long-term memory of their own.
+    | _HINDSIGHT_TOOLS
 )
 
 
@@ -462,6 +471,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -2558,6 +2568,68 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
+    """
+    Return a Hindsight builtin's config dict from the parent spec.
+
+    Mirrors ``ToolManager._register_builtin_tools``: scans ``spec.tools.builtins``
+    for the entry named *tool_name* (e.g. ``"hindsight_recall"``) and returns its
+    ``config`` (api_key, bank_id, etc.). Empty dict when declared bare or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :param tool_name: The Hindsight tool name to look up.
+    :returns: The builtin's config dict.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == tool_name:
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_hindsight_tool(
+    args: dict[str, Any],
+    *,
+    tool_name: str,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a Hindsight memory tool call (retain / recall / reflect).
+
+    Builds the tool from the spec's builtin config and runs its synchronous
+    ``invoke`` off the event loop (it makes a blocking HTTP call to Hindsight).
+    The bank is resolved inside the tool from ``config.bank_id`` → ``ctx.agent_id``
+    → ``ctx.conversation_id``, so the real ``agent_id`` is threaded through here.
+
+    :param args: Parsed LLM arguments (``content`` for retain, ``query`` otherwise).
+    :param tool_name: The Hindsight tool name being dispatched.
+    :param agent_spec: Parent agent's spec; carries the Hindsight builtin config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id — the default memory bank.
+    :returns: The tool's string result, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins import get_builtin_tool
+
+    config = _hindsight_config_from_spec(agent_spec, tool_name)
+    tool = get_builtin_tool(tool_name, config)
+    if tool is None:
+        return f"Hindsight tool {tool_name!r} is not available."
+    ctx = ToolContext(
+        task_id=task_id or tool_name,
+        agent_id=agent_id or tool_name,
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _has_subagent(
     sub_agent_name: str,
     agent_spec: Any | None,
@@ -4375,6 +4447,15 @@ async def execute_tool(
         elif tool_name in _WEB_SEARCH_TOOLS:
             output = await _execute_web_search_tool(
                 args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _HINDSIGHT_TOOLS:
+            output = await _execute_hindsight_tool(
+                args,
+                tool_name=tool_name,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
                 task_id=task_id,

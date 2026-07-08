@@ -113,7 +113,7 @@ class TestManagedSessionMaker:
 
         # Data should be visible in a new session
         with managed() as session:
-            loaded = session.get(SqlUser, "commit_test")
+            loaded = session.get(SqlUser, (0, "commit_test"))
             assert loaded is not None
 
     def test_auto_rollback_on_exception(self, db_uri: str) -> None:
@@ -127,7 +127,7 @@ class TestManagedSessionMaker:
 
         # Data should NOT be visible
         with managed() as session:
-            loaded = session.get(SqlUser, "rollback_test")
+            loaded = session.get(SqlUser, (0, "rollback_test"))
             assert loaded is None
 
     def test_sqlite_foreign_keys_enabled(self, db_uri: str) -> None:
@@ -147,7 +147,7 @@ class TestManagedSessionMaker:
             session.add(SqlUser(id="immediate_test", is_admin=False))
 
         with managed() as session:
-            loaded = session.get(SqlUser, "immediate_test")
+            loaded = session.get(SqlUser, (0, "immediate_test"))
             assert loaded is not None
 
 

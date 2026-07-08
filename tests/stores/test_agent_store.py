@@ -46,7 +46,7 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, root_conversation_id, kind) "
-                "VALUES (:id, :ts, :ts, :id, 'default')",
+                "VALUES (:id, :ts, :ts, :id, 1)",
             ),
             {"id": "conv_agent_store_session", "ts": 1700000000},
         )
@@ -54,7 +54,7 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
             sa.text(
                 "INSERT INTO agents "
                 "(id, created_at, name, bundle_location, version, kind) "
-                "VALUES (:id, :ts, :name, :loc, 1, 'session')",
+                "VALUES (:id, :ts, :name, :loc, 1, 2)",  # kind=2 → 'session'
             ),
             {
                 "id": "ag_agent_store_session",

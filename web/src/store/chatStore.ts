@@ -754,6 +754,9 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  // Reset the POST-ordering chain so a prior run's unresolved send can't block
+  // the next one (production calls this once at boot; tests call it per case).
+  sendChain = Promise.resolve();
   queryClient = client;
 }
 
@@ -1051,6 +1054,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
+      // Join the SAME send chain the foreground path uses. A queued message can
+      // hand off from the foreground flush (send() → sendChain) to here the
+      // moment the user navigates away, and the two POST paths would otherwise
+      // race — a background postEvent could overtake a foreground send() still
+      // awaiting its chain slot, delivering out of FIFO order. Taking a slot
+      // here (await priorSend before the upload/post, release in finally)
+      // serializes every POST across both paths through one ordering primitive.
+      const priorSend = sendChain;
+      let releaseSend: () => void = () => {};
+      sendChain = new Promise<void>((resolve) => {
+        releaseSend = resolve;
+      });
       // Upload any attachments, then post the message referencing their
       // server-assigned file_ids — the same two-phase sequence send() runs
       // (no combined endpoint exists: /resources/files stores the blob and
@@ -1063,6 +1078,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // head (preserving this conversation's FIFO order) and set a cooldown so
       // the next trigger backs off instead of hammering a failing runner.
       void (async () => {
+        await priorSend;
         const fileBlocks: ContentBlock[] = [];
         for (const file of head.files ?? []) {
           // Reuse a prior successful upload so the cooldown-paced retry doesn't
@@ -1097,6 +1113,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         })
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
+          // Hand the chain to the next POST (foreground or background) so it
+          // can start its own network work in submission order.
+          releaseSend();
         });
     }
   },
