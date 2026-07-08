@@ -19,7 +19,7 @@ No LLM turn is involved.
 
 from __future__ import annotations
 
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 
 def _html_has_dark(page: Page) -> bool:
@@ -32,10 +32,17 @@ def _stored_theme(page: Page) -> str | None:
     return page.evaluate("() => window.localStorage.getItem('web-theme')")
 
 
+def _theme_radiogroup(page: Page) -> Locator:
+    """The app-theme radiogroup, matched exactly so it can't also resolve the
+    Appearance page's "Terminal theme" radiogroup, whose name contains "Theme"
+    and whose cards reuse the Light/Dark labels."""
+    return page.get_by_role("radiogroup", name="Theme", exact=True)
+
+
 def _open_appearance(page: Page, base_url: str) -> None:
     """Navigate to the Settings Appearance section and wait for the cards."""
     page.goto(f"{base_url}/settings/appearance")
-    expect(page.get_by_role("radiogroup", name="Theme")).to_be_visible(timeout=30_000)
+    expect(_theme_radiogroup(page)).to_be_visible(timeout=30_000)
 
 
 def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
@@ -54,12 +61,14 @@ def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str,
 
     # Fresh context → no stored preference → default "system" is selected, and
     # on a light OS that renders without the dark class.
-    expect(page.get_by_role("radio", name="System")).to_have_attribute("aria-checked", "true")
+    expect(_theme_radiogroup(page).get_by_role("radio", name="System")).to_have_attribute(
+        "aria-checked", "true"
+    )
     assert _stored_theme(page) is None, "expected no persisted theme on a fresh load"
     assert not _html_has_dark(page), "system on a light OS should not apply the dark class"
 
     # → Dark: the dark class lands and the choice persists.
-    dark = page.get_by_role("radio", name="Dark")
+    dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
     dark.click()
     expect(dark).to_have_attribute("aria-checked", "true")
     assert _html_has_dark(page), "<html> did not gain the dark class after selecting Dark"
@@ -67,7 +76,7 @@ def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str,
 
     # → System: the dark class clears (system resolves to light) and "system"
     # persists.
-    system = page.get_by_role("radio", name="System")
+    system = _theme_radiogroup(page).get_by_role("radio", name="System")
     system.click()
     expect(system).to_have_attribute("aria-checked", "true")
     assert not _html_has_dark(page), "<html> kept the dark class after returning to System"
@@ -88,12 +97,14 @@ def test_theme_toggle_reaches_explicit_light_on_dark_os(
     _open_appearance(page, base_url)
 
     # Fresh "system" on a dark OS renders dark; System is the checked card.
-    expect(page.get_by_role("radio", name="System")).to_have_attribute("aria-checked", "true")
+    expect(_theme_radiogroup(page).get_by_role("radio", name="System")).to_have_attribute(
+        "aria-checked", "true"
+    )
     assert _html_has_dark(page), "system on a dark OS should apply the dark class"
     assert _stored_theme(page) is None, "expected no persisted theme on a fresh load"
 
     # → Light: the dark class clears and "light" persists.
-    light = page.get_by_role("radio", name="Light")
+    light = _theme_radiogroup(page).get_by_role("radio", name="Light")
     light.click()
     expect(light).to_have_attribute("aria-checked", "true")
     assert not _html_has_dark(page), "<html> kept the dark class after selecting Light"
@@ -101,7 +112,7 @@ def test_theme_toggle_reaches_explicit_light_on_dark_os(
 
     # → System: the dark class returns (system resolves to dark) and "system"
     # persists.
-    system = page.get_by_role("radio", name="System")
+    system = _theme_radiogroup(page).get_by_role("radio", name="System")
     system.click()
     expect(system).to_have_attribute("aria-checked", "true")
     assert _html_has_dark(page), "<html> did not regain the dark class after returning to System"
