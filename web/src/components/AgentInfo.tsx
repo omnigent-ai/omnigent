@@ -271,6 +271,7 @@ function AddPolicyDialog({
 }) {
   const [selected, setSelected] = useState<string>("");
   const [filter, setFilter] = useState("");
+  const [policyName, setPolicyName] = useState<string>("");
   const [factoryParams, setFactoryParams] = useState<Record<string, string>>({});
   const [paramError, setParamError] = useState<string | null>(null);
   const addPolicy = useAddPolicy(sessionId);
@@ -297,8 +298,10 @@ function AddPolicyDialog({
   const paramKeys = Object.keys(properties);
 
   function handleSelect(handler: string) {
+    const e = registry.find((r) => r.handler === handler);
     setSelected(handler);
     setFilter("");
+    setPolicyName(e ? e.name.toLowerCase().replace(/\s+/g, "_") : "");
     setFactoryParams({});
     setParamError(null);
   }
@@ -326,7 +329,7 @@ function AddPolicyDialog({
       entry.kind === "factory" ? { factory_params: parsedParams ?? {} } : {};
     addPolicy.mutate(
       {
-        name: entry.name.toLowerCase().replace(/\s+/g, "_"),
+        name: policyName || entry.name.toLowerCase().replace(/\s+/g, "_"),
         type: "python",
         handler: entry.handler,
         ...includeFactoryParams,
@@ -334,6 +337,7 @@ function AddPolicyDialog({
       {
         onSuccess: () => {
           setSelected("");
+          setPolicyName("");
           setFactoryParams({});
           onOpenChange(false);
         },
@@ -348,6 +352,7 @@ function AddPolicyDialog({
         // Reset to the policy list on close so reopening never lands mid-config.
         if (!next) {
           setSelected("");
+          setPolicyName("");
           setFactoryParams({});
           setParamError(null);
         }
@@ -359,7 +364,7 @@ function AddPolicyDialog({
           <DialogTitle>Add Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply to this session.</DialogDescription>
         </DialogHeader>
-        <div className="space-y-3 pt-1">
+        <div className="min-w-0 space-y-3 pt-1">
           {!selected &&
             (() => {
               const available = registry.filter((r) => !appliedHandlers.has(r.handler));
@@ -417,6 +422,7 @@ function AddPolicyDialog({
                   type="button"
                   onClick={() => {
                     setSelected("");
+                    setPolicyName("");
                     setFactoryParams({});
                     setParamError(null);
                   }}
@@ -428,6 +434,19 @@ function AddPolicyDialog({
               {entry.description && (
                 <p className="text-xs text-muted-foreground">{entry.description}</p>
               )}
+            </div>
+          )}
+          {entry && (
+            <div>
+              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">name</span>
+              </label>
+              <input
+                type="text"
+                value={policyName}
+                onChange={(e) => setPolicyName(e.target.value)}
+                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+              />
             </div>
           )}
           {entry?.kind === "factory" && paramKeys.length > 0 && (
@@ -451,7 +470,9 @@ function AddPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="text-[11px] text-muted-foreground">{prop.description}</p>
+                      <p className="break-all text-[11px] text-muted-foreground">
+                        {prop.description}
+                      </p>
                     )}
                     {prop?.type === "boolean" ? (
                       <select
