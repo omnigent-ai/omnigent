@@ -559,6 +559,62 @@ describe("SessionPoliciesSection", () => {
     expect(payload.handler).toBe("h.factory");
   });
 
+  it("Cancel steps back to the policy list after a policy is selected", () => {
+    // WHY: once a policy is selected the dialog shows its config; Cancel must
+    // return to the list (not close), so the user can pick a different policy.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+      { handler: "h.beta", kind: "callable", name: "Beta Guard", description: "blocks beta" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Beta Guard"));
+    // Config view: the filter list is gone, the "Change" affordance is shown.
+    expect(within(dialog).queryByPlaceholderText("Filter policies...")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    // Back on the list: filter box returns and both policies are pickable.
+    expect(within(dialog).getByPlaceholderText("Filter policies...")).toBeInTheDocument();
+    expect(within(dialog).getByText("Alpha Guard")).toBeInTheDocument();
+    expect(within(dialog).getByText("Beta Guard")).toBeInTheDocument();
+    expect(addMutate).not.toHaveBeenCalled();
+  });
+
+  it("Cancel from the policy list closes the dialog", () => {
+    // WHY: with nothing selected, Cancel is a plain close.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("reopening the dialog after closing mid-config starts back at the list", () => {
+    // WHY: closing (X / Escape) while a policy was selected must reset state so
+    // the next open never resurfaces the stale config view.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    fireEvent.click(within(screen.getByRole("dialog")).getByText("Alpha Guard"));
+    // Close via Escape (equivalent to the X button's onOpenChange(false)).
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    expect(
+      within(screen.getByRole("dialog")).getByPlaceholderText("Filter policies..."),
+    ).toBeInTheDocument();
+  });
+
   it("shows the all-applied empty message when every registry policy is already added", () => {
     // WHY: when appliedHandlers covers the whole registry the filtered list is
     // empty AND available.length === 0, so the dialog says all are applied.
