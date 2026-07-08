@@ -1232,7 +1232,6 @@ describe("shouldQueueSend", () => {
   });
 
   it("sends directly (no queue) for a brand-new chat with no conversation", () => {
-    // A new chat must POST so the session gets created — never queue.
     expect(shouldQueueSend(null, "streaming", "running", [])).toBe(false);
   });
 
@@ -1247,13 +1246,12 @@ describe("shouldQueueSend", () => {
   });
 
   it("queues when idle but this conversation already has a queued message", () => {
-    // The ordering fix: a momentary idle flicker (cursor-native) must not let a
-    // later send take the direct path and overtake the still-queued earlier one.
+    // The ordering fix: an idle flicker must not let a later send overtake the
+    // still-queued earlier one.
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")])).toBe(true);
   });
 
   it("ignores queued messages belonging to a different conversation", () => {
-    // Another conversation's queue must not force THIS idle one onto the queue.
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
   });
 });

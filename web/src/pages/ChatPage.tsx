@@ -469,24 +469,12 @@ export function shouldShowAuthorBadge(
 }
 
 /**
- * Whether a submitted message should be held in the client-side queue rather
- * than POSTed immediately via `send()`.
+ * Whether a submitted message should be queued rather than POSTed now.
  *
- * Queue when the session is busy (the normal type-ahead case) OR when this
- * conversation already has a queued message — even if the session momentarily
- * reads idle. The direct-send and queue-drain paths aren't ordered against each
- * other, so a later message taking the direct path while an earlier one waits
- * in the queue would overtake it; this surfaces on harnesses whose status
- * flickers idle between quick turns (cursor-native), scrambling delivery order.
- * Funnelling every send through the single FIFO queue once anything is queued
- * preserves it. A brand-new chat (no `conversationId`) always sends so the
- * session gets created.
- *
- * @param conversationId The bound conversation id, or `null` for a new chat.
- * @param status The local send lifecycle state.
- * @param sessionStatus The server-derived session status.
- * @param queuedMessages The client-side queue across all conversations.
- * @returns `true` to enqueue, `false` to send now.
+ * Queue when busy, or when this conversation already has a queued message even
+ * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
+ * later direct send could overtake a still-queued earlier one when status
+ * flickers idle mid-queue (cursor-native). A new chat always sends.
  */
 export function shouldQueueSend(
   conversationId: string | null,
@@ -1006,12 +994,8 @@ export function ChatPage() {
       setReconnectDialogOpen(true);
       return;
     }
-    // Hold the message in the client-side queue (shown in the strip above the
-    // composer) instead of POSTing now when the session is busy — or when this
-    // conversation already has a queued message, so a later send can't overtake
-    // an earlier queued one. See shouldQueueSend for the full rationale. The
-    // queue drains FIFO via maybeFlushQueuedHead (which enqueueMessage triggers
-    // immediately when the session is genuinely idle, so nothing stalls).
+    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+    // FIFO immediately when genuinely idle, so nothing stalls.
     const chat = useChatStore.getState();
     if (
       shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
