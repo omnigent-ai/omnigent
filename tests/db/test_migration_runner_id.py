@@ -72,7 +72,7 @@ def test_runner_id_round_trip_null_and_value(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, root_conversation_id, kind) "
-                "VALUES (:id, :ts, :ts, :id, 'default')"
+                "VALUES (:id, :ts, :ts, :id, 1)"
             ),
             {"id": "conv_null_test", "ts": 1700000000},
         )
@@ -87,7 +87,7 @@ def test_runner_id_round_trip_null_and_value(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, root_conversation_id, kind, runner_id) "
-                "VALUES (:id, :ts, :ts, :id, 'default', :rid)"
+                "VALUES (:id, :ts, :ts, :id, 1, :rid)"
             ),
             {"id": "conv_value_test", "ts": 1700000000, "rid": "runner-uuid-abc"},
         )

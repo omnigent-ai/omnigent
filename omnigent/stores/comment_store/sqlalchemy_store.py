@@ -7,6 +7,7 @@ import uuid
 from sqlalchemy import delete, func, select
 
 from omnigent.db.db_models import SqlComment, current_workspace_id
+from omnigent.db.enum_codecs import decode_comment_status, encode_comment_status
 from omnigent.db.utils import (
     get_or_create_engine,
     make_managed_session_maker,
@@ -29,7 +30,7 @@ def _to_entity(row: SqlComment) -> Comment:
         start_index=row.start_index,
         end_index=row.end_index,
         body=row.body,
-        status=row.status,
+        status=decode_comment_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
         anchor_content=row.anchor_content,
@@ -86,7 +87,7 @@ class SqlAlchemyCommentStore(CommentStore):
             start_index=start_index,
             end_index=end_index,
             body=body,
-            status="draft",
+            status=encode_comment_status("draft"),
             created_at=created_us // 1_000_000,
             updated_at=created_us,
             anchor_content=anchor_content,
@@ -127,7 +128,7 @@ class SqlAlchemyCommentStore(CommentStore):
             if row is None or row.conversation_id != conversation_id:
                 return None
             if status is not None:
-                row.status = status
+                row.status = encode_comment_status(status)
             if body is not None:
                 row.body = body
             if status is not None or body is not None:

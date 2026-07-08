@@ -25,7 +25,6 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
-    AGENT_KIND_SESSION,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -36,6 +35,15 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
+)
+from omnigent.db.enum_codecs import (
+    decode_conversation_kind,
+    decode_item_status,
+    decode_item_type,
+    encode_agent_kind,
+    encode_conversation_kind,
+    encode_item_status,
+    encode_item_type,
 )
 from omnigent.db.utils import (
     _supports_fts5,
@@ -100,8 +108,8 @@ def _to_conversation(
         id=row.id,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        title=row.title,
-        kind=row.kind,
+        title=row.title or None,  # empty string → None at entity layer
+        kind=decode_conversation_kind(row.kind),
         parent_conversation_id=row.parent_conversation_id,
         root_conversation_id=row.root_conversation_id,
         agent_id=row.agent_id,
@@ -171,12 +179,16 @@ def _new_session_conversation_row(
         the column NULL.
     :returns: Unsaved :class:`SqlConversation` row.
     """
+    # Sub-agent children must have a unique title per parent.
+    # Fall back to the conversation id to guarantee uniqueness.
+    if parent_conversation_id and not title:
+        title = f"untitled:{conversation_id}"
     return SqlConversation(
         id=conversation_id,
         created_at=now,
         updated_at=now,
-        title=title,
-        kind="sub_agent" if parent_conversation_id else "default",
+        title=title or "",  # None → '' for top-level conversations
+        kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         parent_conversation_id=parent_conversation_id,
         # Top-level row: ``root_conversation_id`` mirrors the
         # primary key so tree-scoped lookups treat it as its own
@@ -216,7 +228,7 @@ def _new_session_agent_row(
         name=agent_name,
         bundle_location=agent_bundle_location,
         version=1,
-        kind=AGENT_KIND_SESSION,
+        kind=encode_agent_kind("session"),
         description=agent_description,
     )
 
@@ -423,13 +435,14 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
     :param row: The SQLAlchemy ORM row to convert.
     :returns: A :class:`ConversationItem` Pydantic model.
     """
+    item_type = decode_item_type(row.type)
     return ConversationItem(
         id=row.id,
-        type=row.type,
-        status=row.status,
+        type=item_type,
+        status=decode_item_status(row.status),
         response_id=row.response_id,
         created_at=row.created_at,
-        data=parse_item_data(row.type, json.loads(row.data)),
+        data=parse_item_data(item_type, json.loads(row.data)),
         created_by=row.created_by,
     )
 
@@ -456,7 +469,7 @@ def _ranked_latest_message_item_ids(conversation_ids: list[str]) -> Subquery:
         .where(
             SqlConversationItem.workspace_id == current_workspace_id(),
             SqlConversationItem.conversation_id.in_(conversation_ids),
-            SqlConversationItem.type == "message",
+            SqlConversationItem.type == encode_item_type("message"),
         )
         .subquery()
     )
@@ -656,12 +669,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # ``root_conversation_id`` is NOT NULL (see migration
                     # d8e2f3b4c910), so the parent always has one.
                     root_id = parent_row.root_conversation_id
+                # Sub-agent children must have a unique title per parent because
+                # of ix_conversations_parent_title_unique. Production paths
+                # always supply a derived title (e.g. "agent_type:session_id").
+                # Fall back to the conversation id to guarantee uniqueness.
+                if parent_conversation_id is not None and not title:
+                    title = f"untitled:{new_id}"
                 row = SqlConversation(
                     id=new_id,
                     created_at=now,
                     updated_at=now,
-                    title=title,
-                    kind=kind,
+                    title=title or "",  # None → '' for top-level conversations
+                    kind=encode_conversation_kind(kind),
                     parent_conversation_id=parent_conversation_id,
                     root_conversation_id=root_id,
                     agent_id=agent_id,
@@ -866,7 +885,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             rows = session.execute(
                 select(SqlConversation.parent_conversation_id, SqlConversation.id)
                 .where(SqlConversation.workspace_id == current_workspace_id())
-                .where(SqlConversation.kind == "sub_agent")
+                .where(SqlConversation.kind == encode_conversation_kind("sub_agent"))
                 .where(SqlConversation.parent_conversation_id.in_(unique_ids))
                 .order_by(
                     SqlConversation.parent_conversation_id,
@@ -1371,7 +1390,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationItem.conversation_id == conversation_id,
             )
             if type is not None:
-                stmt = stmt.where(SqlConversationItem.type == type)
+                stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
             if after:
                 sub = (
                     select(SqlConversationItem.position)
@@ -1538,9 +1557,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     conversation_id=conversation_id,
                     response_id=item.response_id,
                     created_at=now,
-                    status="completed",  # items are final on append
+                    status=encode_item_status("completed"),  # items are final on append
                     position=position,
-                    type=item.type,
+                    type=encode_item_type(item.type),
                     data=data,
                     search_text=search,
                     created_by=item.created_by,
@@ -1550,8 +1569,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 persisted.append(
                     ConversationItem(
                         id=row.id,
-                        type=row.type,
-                        status=row.status,
+                        # The row stores int codes; the entity carries the
+                        # string names. item.type is the source string and
+                        # the status was just written as "completed".
+                        type=item.type,
+                        status="completed",
                         response_id=row.response_id,
                         created_at=row.created_at,
                         data=item.data,
@@ -1717,7 +1739,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             # Filter by kind when specified (None = no filter).
             if kind is not None:
-                stmt = stmt.where(SqlConversation.kind == kind)
+                stmt = stmt.where(SqlConversation.kind == encode_conversation_kind(kind))
             if parent_conversation_id is not None:
                 stmt = stmt.where(
                     SqlConversation.parent_conversation_id == parent_conversation_id,
@@ -1962,7 +1984,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return None
             changed = False
             if title is not None:
-                row.title = title
+                row.title = title or ""  # None/'' → empty string at DB layer
                 changed = True
             if archived is not None:
                 row.archived = archived
@@ -2369,7 +2391,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
-        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -2425,13 +2446,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
-        :param model_override: When set, the fork's ``model_override`` is
-            this value instead of the source's copied one — the
-            "restart with model" path, where the whole point is to launch
-            the clone on a different model. Wins over the
-            ``copy_model_settings`` copy; ``reasoning_effort`` still follows
-            ``copy_model_settings`` (a same-family model switch keeps the
-            effort). ``None`` (default) leaves the copy behavior unchanged.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
@@ -2492,8 +2506,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 id=new_conv_id,
                 created_at=now,
                 updated_at=now,
-                title=fork_title,
-                kind="default",
+                title=fork_title or "",  # None → empty string at DB layer
+                kind=encode_conversation_kind("default"),
                 # A fork is a fresh top-level conversation, so its
                 # root mirrors its own id (matches the
                 # ``_new_session_conversation_row`` invariant).
@@ -2504,14 +2518,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else (agent_id if agent_id is not None else source.agent_id)
                 ),
                 reasoning_effort=source.reasoning_effort if copy_model_settings else None,
-                # An explicit override wins over the copied value — this is
-                # the "restart with model" launch model. Otherwise fall back
-                # to the source's copied model (gated by copy_model_settings).
-                model_override=(
-                    model_override
-                    if model_override is not None
-                    else (source.model_override if copy_model_settings else None)
-                ),
+                model_override=source.model_override if copy_model_settings else None,
                 # The brain-harness override is family-bound like the model,
                 # so it follows the same copy gate.
                 harness_override=source.harness_override if copy_model_settings else None,
@@ -2566,7 +2573,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             source_items = session.execute(items_query).scalars().all()
 
             for pos, src_item in enumerate(source_items):
-                new_item_id = generate_item_id(src_item.type)
+                # src_item.type/status are int codes copied verbatim to the new
+                # row; only generate_item_id needs the decoded string type.
+                new_item_id = generate_item_id(decode_item_type(src_item.type))
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -2727,7 +2736,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.flush()
             if old_agent_id is not None:
                 old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
-                if old_agent is not None and old_agent.kind == AGENT_KIND_SESSION:
+                if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
                     session.delete(old_agent)
                     session.flush()
 

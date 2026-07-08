@@ -24,8 +24,11 @@ class OmnigentWebViewClient(
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
 ) : WebViewClient() {
-
-    override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+    override fun onPageStarted(
+        view: WebView,
+        url: String?,
+        favicon: Bitmap?,
+    ) {
         super.onPageStarted(view, url, favicon)
 
         val origin = originOf(url)
@@ -60,12 +63,18 @@ class OmnigentWebViewClient(
         }
     }
 
-    override fun onPageFinished(view: WebView, url: String?) {
+    override fun onPageFinished(
+        view: WebView,
+        url: String?,
+    ) {
         super.onPageFinished(view, url)
         onPageReady(url)
     }
 
-    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+    override fun shouldOverrideUrlLoading(
+        view: WebView,
+        request: WebResourceRequest,
+    ): Boolean {
         val url = request.url
         val scheme = url.scheme?.lowercase()
 

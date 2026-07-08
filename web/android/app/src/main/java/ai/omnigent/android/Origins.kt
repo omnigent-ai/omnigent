@@ -17,9 +17,10 @@ fun originOf(url: String?): String? {
     // The pinned origin and every page URL both flow through here, so they
     // canonicalize identically.
     val port = uri.port
-    val hasExplicitPort = port != -1 &&
-        !(scheme == "https" && port == 443) &&
-        !(scheme == "http" && port == 80)
+    val hasExplicitPort =
+        port != -1 &&
+            !(scheme == "https" && port == 443) &&
+            !(scheme == "http" && port == 80)
     return if (hasExplicitPort) "$scheme://$host:$port" else "$scheme://$host"
 }
 

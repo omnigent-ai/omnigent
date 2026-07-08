@@ -246,7 +246,16 @@ def remap_identities(
                 .all()
             )
             for host in old_hosts:
-                clash = session.get(SqlHost, (current_workspace_id(), new_id, host.name))
+                # Check if the new owner already has a host with the same name
+                # (collision on the uq_hosts_workspace_owner_name unique constraint).
+                # PK is now (workspace_id, host_id) so we SELECT by the unique key.
+                clash = session.execute(
+                    select(SqlHost).where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.owner == new_id,
+                        SqlHost.name == host.name,
+                    )
+                ).scalar_one_or_none()
                 if clash is not None:
                     session.delete(host)  # new owner already has this host name
                 else:

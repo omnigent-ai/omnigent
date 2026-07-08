@@ -56,6 +56,12 @@ import {
 } from "./chatStore";
 import { useTerminalActivityStore } from "./terminalActivity";
 
+// The real `send` action, captured before any test stubs it via
+// setState({ send: spy }). Zustand's setState permanently overwrites the
+// action, so beforeEach restores this so a later test (e.g. cross-path
+// ordering) exercises the genuine send() path rather than a leftover spy.
+const realSend = useChatStore.getState().send;
+
 // Stub the viewer-identity lookup for deterministic author stamping on
 // optimistic sends. Defaults to null — the same value the real module
 // returns before identity resolves / in single-user mode — so tests
@@ -364,6 +370,8 @@ beforeEach(() => {
     costControlModeOverride: null,
     codexPlanMode: false,
     abortController: null,
+    // Restore the real send action; a prior test may have stubbed it.
+    send: realSend,
   });
   fetchMock.mockReset();
   fetchMock.mockImplementation(defaultFetchHandler);
@@ -8186,5 +8194,60 @@ describe("chatStore — background cross-session flush", () => {
       file_id: "file_bg_dedupe",
       filename: "shot.png",
     });
+  });
+
+  it("serializes a background flush behind an in-flight foreground send (FIFO across paths)", async () => {
+    // The navigate-away race: a foreground send() for the active conversation is
+    // still in flight (its /events POST held open) when the background flush
+    // fires for another conversation. Both POSTs must go through the one send
+    // chain, so the background POST cannot overtake the foreground one — it
+    // waits until the foreground POST resolves.
+    seedConversationsCache([conv("conv_active", "idle"), conv("conv_bg", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_active",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_bg" }],
+    });
+
+    // Hold conv_active's foreground POST open; conv_bg's background POST resolves
+    // immediately. Records delivery order across both endpoints.
+    const delivered: string[] = [];
+    let releaseForeground: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_active/events" && init?.method === "POST") {
+        delivered.push("foreground");
+        return new Promise<Response>((resolve) => {
+          releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
+        });
+      }
+      if (url === "/v1/sessions/conv_bg/events" && init?.method === "POST") {
+        delivered.push("background");
+        return mockResponse({ queued: true, item_id: "ci_bg" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    // Foreground send() takes the first chain slot and its POST is held open.
+    const fg = useChatStore.getState().send("fg-msg", "agent_xyz");
+    await tick();
+    expect(delivered).toEqual(["foreground"]);
+
+    // Background flush fires while the foreground POST is still in flight. It
+    // must NOT deliver yet — it's queued behind the foreground POST on the chain.
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["foreground"]);
+
+    // Release the foreground POST → the background POST is now free to deliver.
+    releaseForeground();
+    await fg;
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["foreground", "background"]);
   });
 });

@@ -1,0 +1,65 @@
+# Remy — an assistant that remembers.
+#
+# Remy uses Hindsight long-term memory so what you tell it in one run is
+# available in every future run. Before answering it recalls what it already
+# knows about you; when you share a durable fact it retains it; and it can
+# reflect over everything it has stored.
+#
+# Memory is keyed by the agent id, so all of Remy's runs share one memory bank.
+#
+# Setup:
+#   pip install 'omnigent[hindsight]'
+#   export HINDSIGHT_API_KEY=hsk_...        # https://ui.hindsight.vectorize.io
+#
+# Usage:
+#   omnigent run examples/remy
+#
+# Remy runs on the Claude Agent SDK harness, so configure a Claude provider
+# first (e.g. `omnigent setup`, or export ANTHROPIC_API_KEY).
+
+spec_version: 1
+name: remy
+description: >-
+  A helpful assistant with long-term memory. Remy recalls what it already knows
+  before answering, retains durable facts you share, and can reflect over its
+  memory — powered by Hindsight.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are Remy, a helpful assistant with long-term memory powered by Hindsight.
+
+  Your conversation context is wiped between sessions — the ONLY way you
+  remember anything is by calling these tools. Acknowledging a fact in chat does
+  NOT save it.
+
+  Use your memory tools deliberately:
+  - Call `hindsight_recall` BEFORE answering anything that might depend on what
+    you already know about the user or past conversations.
+  - When the user shares a durable fact, preference, or decision — or asks you
+    to remember something — you MUST call `hindsight_retain`. Never say you have
+    saved or will remember something unless `hindsight_retain` actually ran and
+    returned success in this turn.
+  - Call `hindsight_reflect` when the user asks you to summarize or reason about
+    what you know overall, rather than retrieve specific facts.
+
+  Weave recalled memories into your answer naturally — don't dump raw tool
+  output. If recall returns nothing relevant, just answer normally.
+
+# bank_id pins a stable, human-readable memory bank. Omit it and the bank
+# defaults to the agent id (per-agent isolation) — handy, but opaque to find
+# in Hindsight. A fixed name keeps Remy's memory in one easy-to-inspect bank.
+tools:
+  builtins:
+    - name: hindsight_recall
+      api_key: ${HINDSIGHT_API_KEY}
+      bank_id: remy
+    - name: hindsight_retain
+      api_key: ${HINDSIGHT_API_KEY}
+      bank_id: remy
+    - name: hindsight_reflect
+      api_key: ${HINDSIGHT_API_KEY}
+      bank_id: remy

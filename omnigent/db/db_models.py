@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from collections.abc import Iterator
 from contextvars import ContextVar
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -13,6 +15,8 @@ from sqlalchemy import (
     Float,
     Index,
     Integer,
+    LargeBinary,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -20,7 +24,13 @@ from sqlalchemy import (
     text,
     true,
 )
+from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
+# but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
+# BINARY(32) there — an exact fit for the digest and fully indexable.
+_CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
 
 class Base(DeclarativeBase):
@@ -117,21 +127,25 @@ class SqlAgent(Base):
     name: Mapped[str] = mapped_column(String(256))
     bundle_location: Mapped[str] = mapped_column(String(512))
     version: Mapped[int] = mapped_column(Integer, default=1)
-    kind: Mapped[str] = mapped_column(String(16))
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # AGENT_KIND: template=1, session=2). The store converts to/from the
+    # string name at the row↔entity boundary.
+    kind: Mapped[int] = mapped_column(SmallInteger)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
+        CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),
         Index("ix_agents_created_at", "created_at"),
-        # Template agents have unique names; session-scoped agents (kind='session')
+        # Template agents have unique names; session-scoped agents (kind=2)
         # may reuse the same name across conversations. The partial index enforces
-        # uniqueness only within the template set.
+        # uniqueness only within the template set. kind = 1 is the "template" code.
         Index(
             "ix_agents_template_name",
             "name",
             unique=True,
-            sqlite_where=text("kind = 'template'"),
-            postgresql_where=text("kind = 'template'"),
+            sqlite_where=text("kind = 1"),
+            postgresql_where=text("kind = 1"),
         ),
     )
 
@@ -261,7 +275,10 @@ class SqlAccountToken(Base):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # ACCOUNT_TOKEN_KIND: invite=1, magic=2). The store converts to/from
+    # the string name at the row↔entity boundary.
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -270,7 +287,7 @@ class SqlAccountToken(Base):
     invited_is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
 
     __table_args__ = (
-        CheckConstraint("kind IN ('invite', 'magic')", name="ck_account_tokens_kind"),
+        CheckConstraint("kind IN (1, 2)", name="ck_account_tokens_kind"),
         Index("ix_account_tokens_expires_at", "expires_at"),
     )
 
@@ -335,8 +352,7 @@ class SqlConversation(Base):
         created.
     :param updated_at: Unix epoch seconds when the conversation was
         last updated (item append, title change, etc.).
-    :param title: Optional human-readable title for the conversation.
-        ``None`` when not provided.
+    :param title: Human-readable title; empty string when untitled.
     :param kind: Conversation type. ``"default"`` for user-initiated,
         ``"sub_agent"`` for sub-agent execution conversations.
     :param parent_conversation_id: For Phase 4 named sub-agents,
@@ -412,8 +428,11 @@ class SqlConversation(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
-    title: Mapped[str | None] = mapped_column(Text, nullable=True)
-    kind: Mapped[str] = mapped_column(String(32), default="default")
+    title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # CONVERSATION_KIND: default=1, sub_agent=2). The store converts to/from
+    # the string name at the row↔entity boundary.
+    kind: Mapped[int] = mapped_column(SmallInteger, default=1)
     parent_conversation_id: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
@@ -501,7 +520,7 @@ class SqlConversation(Base):
     )
 
     __table_args__ = (
-        CheckConstraint("kind IN ('default', 'sub_agent')", name="ck_conversations_kind"),
+        CheckConstraint("kind IN (1, 2)", name="ck_conversations_kind"),
         CheckConstraint(
             "host_id IS NULL OR workspace IS NOT NULL",
             name="ck_conversations_workspace_required_for_host",
@@ -528,16 +547,18 @@ class SqlConversation(Base):
             unique=True,
             sqlite_where=text("parent_conversation_id IS NOT NULL"),
             postgresql_where=text("parent_conversation_id IS NOT NULL"),
+            mysql_length={"title": 512},
         ),
         # Partial composite index for child-session listing
         # (list_conversations(kind="sub_agent", parent_conversation_id=...)).
+        # kind = 2 is the "sub_agent" code (enum_codecs.CONVERSATION_KIND).
         Index(
             "idx_conversations_parent",
             "parent_conversation_id",
             text("created_at DESC"),
             text("id DESC"),
-            sqlite_where=text("kind = 'sub_agent'"),
-            postgresql_where=text("kind = 'sub_agent'"),
+            sqlite_where=text("kind = 2"),
+            postgresql_where=text("kind = 2"),
         ),
     )
 
@@ -587,9 +608,15 @@ class SqlConversationItem(Base):
     )
     response_id: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(32), default="completed")
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # ITEM_STATUS: completed=1). Only "completed" is written today, but the
+    # CHECK admits the wider OpenAI-style status vocabulary reserved there.
+    status: Mapped[int] = mapped_column(SmallInteger, default=1)
     position: Mapped[int] = mapped_column(Integer)
-    type: Mapped[str] = mapped_column(String(32))
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # ITEM_TYPE). The store converts to/from the string name at the
+    # row↔entity boundary.
+    type: Mapped[int] = mapped_column(SmallInteger)
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -602,6 +629,11 @@ class SqlConversationItem(Base):
             unique=True,
         ),
         Index("ix_conversation_items_response_id", "response_id"),
+        CheckConstraint(
+            "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
+            name="ck_conversation_items_type",
+        ),
+        CheckConstraint("status IN (1, 2, 3, 4)", name="ck_conversation_items_status"),
     )
 
 
@@ -712,16 +744,39 @@ class SqlComment(Base):
     start_index: Mapped[int] = mapped_column(Integer)
     end_index: Mapped[int] = mapped_column(Integer)
     body: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(32))
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # COMMENT_STATUS: draft=1, addressed=2).
+    status: Mapped[int] = mapped_column(SmallInteger)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(BigInteger)
     anchor_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
+        CheckConstraint("status IN (1, 2)", name="ck_comments_status"),
         Index("ix_comments_conversation_id", "conversation_id"),
         Index("ix_comments_created_at", "created_at"),
     )
+
+
+def policy_name_cksum(name: str) -> bytes:
+    """Return the sha256 digest of a policy name.
+
+    This 32-byte digest is what the name-uniqueness indexes key on instead
+    of the raw ``VARCHAR(256)`` name — a fixed, compact index entry. Two
+    names collide iff their digests do, so uniqueness is preserved.
+    """
+    return hashlib.sha256(name.encode("utf-8")).digest()
+
+
+def _default_policy_name_cksum(context: Any) -> bytes:
+    """Column default: derive ``name_cksum`` from the bound ``name`` on INSERT.
+
+    Mirrors the ``workspace_id`` default pattern so every ORM insert stamps
+    the checksum without the caller setting it. Column defaults do not fire
+    on UPDATE, so renames recompute it explicitly in the store.
+    """
+    return policy_name_cksum(context.get_current_parameters()["name"])
 
 
 class SqlPolicy(Base):
@@ -737,9 +792,14 @@ class SqlPolicy(Base):
     are created via ``POST /v1/policies``.
 
     :param id: Opaque PK, e.g. ``"pol_a1b2c3..."``.
-    :param name: Human-readable name. UNIQUE per
-        ``(session_id, name)`` for session policies; globally
-        unique for default policies (``session_id IS NULL``).
+    :param name: Human-readable name. UNIQUE per session for
+        session policies; globally unique for default policies
+        (``session_id IS NULL``). Uniqueness is enforced on
+        ``name_cksum`` rather than this column.
+    :param name_cksum: sha256 digest of ``name`` (32 bytes). The
+        name-uniqueness indexes key on this compact digest instead
+        of the wide ``VARCHAR(256)`` name. Stamped on INSERT by a
+        column default; recomputed by the store on rename.
     :param session_id: FK to ``conversations.id``. ``None`` for
         server-wide default policies. ``ON DELETE CASCADE`` so
         removing a session cleans up its policies.
@@ -776,6 +836,10 @@ class SqlPolicy(Base):
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(256))
+    # sha256(name) — the value the name-uniqueness indexes key on instead of
+    # the wide name column. Stamped from `name` on INSERT via the column
+    # default; the store recomputes it on rename (defaults don't fire on UPDATE).
+    name_cksum: Mapped[bytes] = mapped_column(_CKSUM32, default=_default_policy_name_cksum)
     # Nullable: NULL for server-wide default policies.
     session_id: Mapped[str | None] = mapped_column(
         String(64),
@@ -783,7 +847,9 @@ class SqlPolicy(Base):
     )
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    type: Mapped[str] = mapped_column(String(16))
+    # Handler discriminator stored as a stable int code (see
+    # omnigent.db.enum_codecs POLICY_TYPE: python=1, url=2).
+    type: Mapped[int] = mapped_column(SmallInteger)
     # Dotted import path (type="python") or HTTPS URL
     # (type="url") for the policy handler.
     handler: Mapped[str] = mapped_column(Text)
@@ -795,23 +861,29 @@ class SqlPolicy(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, server_default=true())
     # "default" for server-wide policies; "session" for per-conversation
     # copies. Mirrors the agents.kind pattern so queries filter by column
-    # value rather than session_id IS NULL.
-    scope: Mapped[str] = mapped_column(String(16))
+    # value rather than session_id IS NULL. Enum stored as a stable int
+    # code (see omnigent.db.enum_codecs POLICY_SCOPE: default=1, session=2).
+    scope: Mapped[int] = mapped_column(SmallInteger)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
+        CheckConstraint("type IN (1, 2)", name="ck_policies_type"),
+        CheckConstraint("scope IN (1, 2)", name="ck_policies_scope"),
         Index("ix_policies_created_at", "created_at"),
         Index("ix_policies_session_id", "session_id"),
-        UniqueConstraint("session_id", "name", name="uq_policies_session_id_name"),
+        # Name uniqueness keys on name_cksum (sha256 of name) rather than the
+        # wide name column, for a compact 32-byte index entry.
+        UniqueConstraint("session_id", "name_cksum", name="uq_policies_session_id_name_cksum"),
         # Default policies must have unique names; session-scoped policies
         # may reuse the same name across conversations. Mirrors
-        # ix_agents_template_name scoping to the 'default' set.
+        # ix_agents_template_name scoping to the 'default' set. scope = 1 is
+        # the "default" code.
         Index(
-            "ix_policies_default_name",
-            "name",
+            "ix_policies_default_name_cksum",
+            "name_cksum",
             unique=True,
-            sqlite_where=text("scope = 'default'"),
-            postgresql_where=text("scope = 'default'"),
+            sqlite_where=text("scope = 1"),
+            postgresql_where=text("scope = 1"),
         ),
     )
 
@@ -827,7 +899,8 @@ class SqlHost(Base):
     :param host_id: Stable host identifier from the host's local
         ``~/.omnigent/config.yaml``, e.g. ``"host_a1b2c3d4e5f6..."``.
     :param name: Human-readable name from ``config.yaml``, e.g.
-        ``"corey-laptop"``. Displayed in the Web UI host picker.
+        ``"corey-laptop"``. Displayed in the Web UI host picker. Max 64
+        characters.
     :param owner: User ID from the Databricks auth Bearer token
         presented during the host's WebSocket handshake, e.g.
         ``"corey.zumar@databricks.com"``.
@@ -876,10 +949,12 @@ class SqlHost(Base):
         server_default="0",
         default=current_workspace_id,
     )
-    owner: Mapped[str] = mapped_column(String(256), primary_key=True)
-    name: Mapped[str] = mapped_column(String(256), primary_key=True)
-    host_id: Mapped[str] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(16))
+    host_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(256), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # HOST_STATUS: online=1, offline=2).
+    status: Mapped[int] = mapped_column(SmallInteger)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -890,10 +965,13 @@ class SqlHost(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('online', 'offline')",
+            "status IN (1, 2)",
             name="ck_hosts_status",
         ),
-        UniqueConstraint("host_id", name="uq_hosts_host_id"),
+        # (workspace_id, owner, name) was the old PK; keep it unique so the
+        # upsert-on-connect logic (look up by owner+name to detect host_id
+        # rotation) stays consistent.
+        UniqueConstraint("workspace_id", "owner", "name", name="uq_hosts_workspace_owner_name"),
         UniqueConstraint("token_hash", name="uq_hosts_token_hash"),
     )
 

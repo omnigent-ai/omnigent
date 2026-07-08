@@ -6,12 +6,11 @@ from sqlalchemy import and_, asc, desc, or_, select
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
-    AGENT_KIND_SESSION,
-    AGENT_KIND_TEMPLATE,
     SqlAgent,
     SqlConversation,
     current_workspace_id,
 )
+from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import (
     get_or_create_engine,
     make_managed_session_maker,
@@ -68,7 +67,7 @@ class SqlAlchemyAgentStore(AgentStore):
             name=name,
             bundle_location=bundle_location,
             version=1,
-            kind=AGENT_KIND_TEMPLATE,
+            kind=encode_agent_kind("template"),
             description=description,
         )
         with self._session() as session:
@@ -90,7 +89,7 @@ class SqlAlchemyAgentStore(AgentStore):
             # For session-scoped agents, derive the owning conversation id
             # from the forward pointer so callers can use agent.session_id.
             session_id: str | None = None
-            if row.kind == AGENT_KIND_SESSION:
+            if row.kind == encode_agent_kind("session"):
                 session_id = session.execute(
                     select(SqlConversation.id)
                     .where(
@@ -117,7 +116,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 select(SqlAgent).where(
                     SqlAgent.workspace_id == current_workspace_id(),
                     SqlAgent.name == name,
-                    SqlAgent.kind == AGENT_KIND_TEMPLATE,
+                    SqlAgent.kind == encode_agent_kind("template"),
                 )
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
@@ -147,7 +146,7 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            is_template = SqlAgent.kind == AGENT_KIND_TEMPLATE
+            is_template = SqlAgent.kind == encode_agent_kind("template")
             in_workspace = SqlAgent.workspace_id == current_workspace_id()
             stmt = select(SqlAgent).where(in_workspace, is_template)
             if after:
@@ -230,7 +229,7 @@ class SqlAlchemyAgentStore(AgentStore):
             row.version = row.version + 1
             row.updated_at = now_epoch()
             session_id: str | None = None
-            if row.kind == AGENT_KIND_SESSION:
+            if row.kind == encode_agent_kind("session"):
                 session_id = session.execute(
                     select(SqlConversation.id)
                     .where(

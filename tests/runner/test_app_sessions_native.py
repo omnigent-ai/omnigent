@@ -6537,10 +6537,12 @@ class _ForwardBlockingHarnessClient(_BlockingHarnessClient):
         """
         super().__init__(sse_frames, gate)
         self._fwd_gate = fwd_gate
+        self.fwd_seen: asyncio.Event = asyncio.Event()
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
         """Block an interrupt forward on ``fwd_gate``; pass other posts through."""
         if isinstance(json, dict) and json.get("type") == "interrupt":
+            self.fwd_seen.set()
             await self._fwd_gate.wait()
         return await super().post(url, json=json, timeout=timeout)
 
@@ -6618,8 +6620,10 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         int_task = _aio.create_task(
             client.post(f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"})
         )
-        with pytest.raises(_aio.TimeoutError):
-            await _aio.wait_for(_aio.shield(int_task), timeout=0.5)
+        # Wait until the route is actually blocked on fwd_gate — deterministic
+        # proof the forward is in-flight. This replaces a flaky 0.5 s sleep that
+        # could race on loaded CI machines.
+        await _aio.wait_for(_hc.fwd_seen.wait(), timeout=5.0)
         assert not int_task.done(), "interrupt must await the harness forward (forward-first)"
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.

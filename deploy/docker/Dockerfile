@@ -211,7 +211,7 @@ RUN apt-get update \
 # user-namespace remapping the sandbox user maps to an unprivileged, unused
 # host id. Unused by the root-based providers.
 RUN groupadd -g 1000660000 sandbox \
- && useradd -m -u 1000660000 -g sandbox sandbox
+ && useradd -m -d /sandbox -u 1000660000 -g sandbox sandbox
 
 # Git credential helper for private repositories over HTTPS: answers
 # `git credential get` from GIT_TOKEN / GIT_USERNAME in the
@@ -328,11 +328,13 @@ RUN set -eu; \
     fi; \
     echo "agy ${AGY_VERSION} pinned (sha256 verified)"
 
-# Preserve /build/ — the venv's editable install .pth files reference
-# /build/omnigent and /build/sdks/* by absolute path. Copying these to
-# /app/ would break the import paths silently.
+# Copy the venv and source tree. The editable install's .pth files reference
+# /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
+# policy. Re-install without -e so the package bytes land in the venv's
+# site-packages and imports no longer require /build at runtime.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
+RUN pip install --no-cache-dir /build
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV

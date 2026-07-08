@@ -195,7 +195,13 @@ class MainActivity : ComponentActivity() {
                             if (webView.canGoBack()) webView.goBack() else finish()
                         }
                     }
-                    val fallback = Runnable { if (!acted) { acted = true; navigate() } }
+                    val fallback =
+                        Runnable {
+                            if (!acted) {
+                                acted = true
+                                navigate()
+                            }
+                        }
                     webView.postDelayed(fallback, BACK_FALLBACK_MS)
                     webView.evaluateJavascript(
                         "!!(window.__omnigentNativeHandleBack && window.__omnigentNativeHandleBack())",
@@ -298,18 +304,24 @@ class MainActivity : ComponentActivity() {
         val secure = origin.startsWith("https://")
         // Matches the server's session_cookie_name: __Host- prefix on HTTPS.
         val name = if (secure) "__Host-ap_session" else "ap_session"
-        val cookie = buildString {
-            append(name).append('=').append(token).append("; Path=/")
-            if (secure) append("; Secure")
-            append("; SameSite=Lax")
-        }
+        val cookie =
+            buildString {
+                append(name).append('=').append(token).append("; Path=/")
+                if (secure) append("; Secure")
+                append("; SameSite=Lax")
+            }
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
         authLog("onSessionToken: injecting $name (token len=${token.length})")
         cookies.setCookie(origin, cookie) { accepted ->
             // setCookie's callback is async — re-check the WebView is still alive.
             if (isDestroyed || !::webView.isInitialized) return@setCookie
-            authLog("setCookie accepted=$accepted present=${cookies.getCookie(origin)?.contains(name) == true}")
+            authLog(
+                "setCookie accepted=$accepted present=${cookies
+                    .getCookie(
+                        origin,
+                    )?.contains(name) == true}",
+            )
             // A rejected cookie means the reload would land unauthenticated,
             // bounce to login, and re-launch the browser — burning the retry
             // budget on a failure that retrying can't fix. Stay put instead.
@@ -398,7 +410,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun navigatePathOf(intent: Intent?): String? =
-        intent?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
+        intent
+            ?.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
             ?.takeIf { it.startsWith("/") }
 
     private fun emitNotificationActivation(path: String?) {
@@ -450,19 +463,28 @@ class MainActivity : ComponentActivity() {
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
     private fun ensureNotificationPermission() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return // granted at install < API 33
+        // Notification permission is granted at install time below API 33.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         if (!hasPermission(Manifest.permission.POST_NOTIFICATIONS)) {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
     /** Back [OmnigentWebChromeClient.onShowFileChooser] with a document picker. */
-    private fun chooseFiles(callback: ValueCallback<Array<Uri>>, acceptTypes: Array<String>): Boolean {
+    private fun chooseFiles(
+        callback: ValueCallback<Array<Uri>>,
+        acceptTypes: Array<String>,
+    ): Boolean {
         pendingFileCallback?.onReceiveValue(null) // cancel any in-flight chooser
         pendingFileCallback = callback
         // Keep MIME types as-is; resolve ".pdf"-style extension tokens to MIME so
         // the declared accept constraint isn't silently widened to */*.
-        val mimeTypes = acceptTypes.mapNotNull(::mimeTypeFor).toTypedArray().ifEmpty { arrayOf("*/*") }
+        val mimeTypes =
+            acceptTypes
+                .mapNotNull(
+                    ::mimeTypeFor,
+                ).toTypedArray()
+                .ifEmpty { arrayOf("*/*") }
         return try {
             pickFiles.launch(mimeTypes)
             true
@@ -477,11 +499,20 @@ class MainActivity : ComponentActivity() {
     private fun mimeTypeFor(accept: String): String? {
         val token = accept.trim()
         return when {
-            token.isEmpty() -> null
-            token.contains('/') -> token // already a MIME type / wildcard
-            else ->
-                MimeTypeMap.getSingleton()
+            token.isEmpty() -> {
+                null
+            }
+
+            token.contains('/') -> {
+                token
+            }
+
+            // already a MIME type / wildcard
+            else -> {
+                MimeTypeMap
+                    .getSingleton()
                     .getMimeTypeFromExtension(token.removePrefix(".").lowercase())
+            }
         }
     }
 
@@ -501,7 +532,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun downloadFile(url: String, contentDisposition: String?, mimeType: String?) {
+    private fun downloadFile(
+        url: String,
+        contentDisposition: String?,
+        mimeType: String?,
+    ) {
         val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
 
         // Agent-generated files arrive as blob:/data: URLs, which DownloadManager

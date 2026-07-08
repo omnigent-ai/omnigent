@@ -25,6 +25,13 @@ from omnigent.db.db_models import (
     SqlHost,
     SqlPolicy,
 )
+from omnigent.db.enum_codecs import (
+    encode_account_token_kind,
+    encode_comment_status,
+    encode_host_status,
+    encode_policy_scope,
+    encode_policy_type,
+)
 from omnigent.db.utils import get_or_create_engine
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.identity_migration import build_domain_mapping, remap_identities
@@ -112,7 +119,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
                 start_index=0,
                 end_index=1,
                 body="hi",
-                status="draft",
+                status=encode_comment_status("draft"),
                 created_at=1,
                 # created_at scaled to epoch-µs, matching the store's invariant.
                 updated_at=1_000_000,
@@ -124,9 +131,9 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
                 id="pol_1",
                 name="p",
                 session_id=None,
-                scope="default",
+                scope=encode_policy_scope("default"),
                 created_at=1,
-                type="python",
+                type=encode_policy_type("python"),
                 handler="x.y",
                 created_by="alice",
             )
@@ -134,7 +141,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
         s.add(
             SqlAccountToken(
                 id="tok_1",
-                kind="invite",
+                kind=encode_account_token_kind("invite"),
                 user_id=None,
                 created_by="alice",
                 created_at=1,
@@ -146,7 +153,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
                 owner="alice",
                 name="laptop",
                 host_id="h1",
-                status="offline",
+                status=encode_host_status("offline"),
                 created_at=1,
                 updated_at=1,
             )
