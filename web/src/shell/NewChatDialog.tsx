@@ -110,8 +110,8 @@ import { IntelligentModelControl, type CostControlMode } from "@/components/Cost
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
-import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { buildAgentBundle, pendingAgentDisplay, type PendingAgentSource } from "@/lib/agentBundle";
+import { createBundledSession, createSessionFromGithub, launchRunner } from "@/lib/sessionsApi";
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
@@ -1272,7 +1272,7 @@ function AgentHarnessPicker({
   hasAgents: boolean;
   host: Host | undefined | null;
   onSelectAgent: (agent: AvailableAgent) => void;
-  pendingAgent: AgentBundleInput | null;
+  pendingAgent: PendingAgentSource | null;
   pendingAgentId: string;
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
@@ -1652,7 +1652,7 @@ function AgentHarnessPicker({
                 className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
               >
                 <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
-                  <span className="truncate">{pendingAgent.name}</span>
+                  <span className="truncate">{pendingAgentDisplay(pendingAgent).name}</span>
                   <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
                 </div>
               </DropdownMenuItem>
@@ -1742,7 +1742,7 @@ export function NewChatLandingScreen() {
   // form submit, handleCreate detects the pending bundle, builds the
   // tar.gz, and uses multipart POST instead of the normal JSON path.
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
-  const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
+  const [pendingAgent, setPendingAgent] = useState<PendingAgentSource | null>(null);
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
 
@@ -2062,20 +2062,20 @@ export function NewChatLandingScreen() {
       ? PENDING_AGENT_ID
       : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
         null);
-  const selectedAgent = useMemo(
-    () =>
-      effectiveAgentId === PENDING_AGENT_ID && pendingAgent
-        ? ({
-            id: PENDING_AGENT_ID,
-            name: pendingAgent.name,
-            display_name: pendingAgent.name,
-            description: pendingAgent.description ?? null,
-            harness: pendingAgent.harness ?? null,
-            skills: [],
-          } satisfies AvailableAgent)
-        : agentList.find((a) => a.id === effectiveAgentId),
-    [agentList, effectiveAgentId, pendingAgent],
-  );
+  const selectedAgent = useMemo(() => {
+    if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
+      const display = pendingAgentDisplay(pendingAgent);
+      return {
+        id: PENDING_AGENT_ID,
+        name: display.name,
+        display_name: display.name,
+        description: display.description ?? null,
+        harness: display.harness,
+        skills: [],
+      } satisfies AvailableAgent;
+    }
+    return agentList.find((a) => a.id === effectiveAgentId);
+  }, [agentList, effectiveAgentId, pendingAgent]);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -2542,20 +2542,35 @@ export function NewChatLandingScreen() {
       let data: { id: string };
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
-        // Custom agent path: build bundle client-side and use multipart POST.
-        // The multipart create only stores the agent + session rows — it does
-        // NOT launch a runner on the host. We must follow up with launchRunner
-        // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
-        // same way the fork-resume path does.
-        const bundle = await buildAgentBundle(pendingAgent);
+        // Custom agent path: the create call only stores the agent + session
+        // rows — it does NOT launch a runner on the host. We must follow up
+        // with launchRunner (POST /v1/hosts/{id}/runners) to bind the session
+        // to a runner, the same way the fork-resume path does.
         const metadata: Record<string, unknown> = {};
         if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
-        data = await createBundledSession(
-          bundle,
-          metadata as Parameters<typeof createBundledSession>[1],
-        );
-        // Launch the runner on the selected host. The multipart create
-        // only stores DB rows — launchRunner binds + starts the runner.
+        const typedMetadata = metadata as Parameters<typeof createBundledSession>[1];
+        if (pendingAgent.kind === "github") {
+          // Server fetches the repo, repackages, and validates it exactly like
+          // an upload; ${VAR} stays literal (never expanded server-side).
+          data = await createSessionFromGithub(
+            {
+              source_url: pendingAgent.sourceUrl,
+              ref: pendingAgent.ref,
+              subdir: pendingAgent.subdir,
+            },
+            typedMetadata,
+          );
+        } else {
+          // "form" builds the bundle client-side; "bundle" (folder / file /
+          // tarball) is already a built File — both go through multipart POST.
+          const bundle =
+            pendingAgent.kind === "form"
+              ? await buildAgentBundle(pendingAgent.input)
+              : pendingAgent.bundle;
+          data = await createBundledSession(bundle, typedMetadata);
+        }
+        // Launch the runner on the selected host. The create above only
+        // stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
           // Create a new worktree, bind an existing one (records the branch
           // for the sidebar + delete flow without creating anything), or
@@ -3613,8 +3628,8 @@ export function NewChatLandingScreen() {
       <CreateAgentDialog
         open={createAgentOpen}
         onOpenChange={setCreateAgentOpen}
-        onCreate={(input) => {
-          setPendingAgent(input);
+        onCreate={(source) => {
+          setPendingAgent(source);
           setPickedAgentId(PENDING_AGENT_ID);
           setPickedHarness(null);
         }}

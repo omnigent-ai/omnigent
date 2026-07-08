@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { PlusIcon, TrashIcon } from "lucide-react";
 import {
   Dialog,
@@ -17,8 +17,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
-import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
+import {
+  buildBundleFromFiles,
+  type BundleFile,
+  type MCPServerInput,
+  type PendingAgentSource,
+} from "@/lib/agentBundle";
 
 /**
  * Harness options for the picker. "default" uses the server's default
@@ -102,13 +108,28 @@ function toMCPInputs(entries: MCPFormEntry[]): MCPServerInput[] | undefined {
   return result.length > 0 ? result : undefined;
 }
 
+/** Derive a display name from a bundle path or filename. */
+function bundleDisplayName(path: string): string {
+  const base = path.split("/")[0] || path;
+  return base.replace(/\.(tar\.gz|ya?ml)$/i, "") || "custom-agent";
+}
+
+/** Derive a display name from a GitHub URL / shorthand (the "repo" segment). */
+function githubDisplayName(url: string): string {
+  const cleaned = url.replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "");
+  const match = cleaned.match(/^[^/]+\/([^/@]+)/);
+  return match?.[1] ?? "github-agent";
+}
+
 /**
  * Dialog for creating a custom agent from the new-session picker.
  *
- * Collects a name, optional description, optional system instructions,
- * a harness choice, and zero or more MCP server declarations. On submit,
- * passes the agent configuration back to the parent via `onCreate` so it
- * can build a bundle and start a session with it.
+ * Four sources (tabs): a field Form, a File upload (single YAML or a
+ * pre-built `.tar.gz`), a Folder upload (a whole bundle directory), and a
+ * public GitHub repo URL. Each produces a {@link PendingAgentSource} passed
+ * back via `onCreate`; the parent builds/uploads the bundle and starts a
+ * session. Browser uploads keep `${VAR}` references literal (no env), so
+ * secrets must never be committed to a folder or public repo.
  */
 export function CreateAgentDialog({
   open,
@@ -117,13 +138,14 @@ export function CreateAgentDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onCreate: (input: AgentBundleInput) => void;
+  onCreate: (source: PendingAgentSource) => void;
 }) {
   const brainHarnessLabels = useBrainHarnessLabels();
   const harnessOptions = Object.entries(brainHarnessLabels).map(([value, label]) => ({
     value,
     label,
   }));
+  const [tab, setTab] = useState<"form" | "file" | "folder" | "github">("form");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [instructions, setInstructions] = useState("");
@@ -132,7 +154,17 @@ export function CreateAgentDialog({
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
 
+  // Non-form tab state.
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [githubUrl, setGithubUrl] = useState("");
+  const [githubRef, setGithubRef] = useState("");
+  const [githubSubdir, setGithubSubdir] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
   function reset() {
+    setTab("form");
     setName("");
     setDescription("");
     setInstructions("");
@@ -140,6 +172,11 @@ export function CreateAgentDialog({
     setModel("");
     setMcpEntries([]);
     setNextKey(0);
+    setUploadError(null);
+    setBusy(false);
+    setGithubUrl("");
+    setGithubRef("");
+    setGithubSubdir("");
   }
 
   function handleOpenChange(next: boolean) {
@@ -160,23 +197,71 @@ export function CreateAgentDialog({
     setMcpEntries((prev) => prev.map((e) => (e.key === key ? { ...e, ...patch } : e)));
   }
 
-  function handleSubmit() {
-    const trimmedName = name.trim();
-    if (!trimmedName) return;
-
-    onCreate({
-      name: trimmedName,
-      description: description.trim() || undefined,
-      instructions: instructions.trim() || undefined,
-      harness,
-      model: model.trim(),
-      mcpServers: toMCPInputs(mcpEntries),
-    });
+  /** Emit a source and close the dialog. */
+  function emit(source: PendingAgentSource) {
+    onCreate(source);
     reset();
     onOpenChange(false);
   }
 
+  function handleSubmit() {
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+    emit({
+      kind: "form",
+      input: {
+        name: trimmedName,
+        description: description.trim() || undefined,
+        instructions: instructions.trim() || undefined,
+        harness,
+        model: model.trim(),
+        mcpServers: toMCPInputs(mcpEntries),
+      },
+    });
+  }
+
+  /** Read selected files (single YAML, folder, or tarball) into a bundle. */
+  async function handleFiles(files: FileList | null, kind: "file" | "folder") {
+    setUploadError(null);
+    if (!files || files.length === 0) return;
+    setBusy(true);
+    try {
+      // A single .tar.gz is already a bundle — pass it straight through.
+      if (kind === "file" && files.length === 1 && /\.tar\.gz$/i.test(files[0].name)) {
+        emit({ kind: "bundle", bundle: files[0], name: bundleDisplayName(files[0].name) });
+        return;
+      }
+      const bundleFiles: BundleFile[] = await Promise.all(
+        Array.from(files).map(async (file) => ({
+          // Folder pick carries webkitRelativePath (e.g. "my-agent/config.yaml");
+          // a single file has none, so fall back to its name.
+          path: file.webkitRelativePath || file.name,
+          bytes: new Uint8Array(await file.arrayBuffer()),
+        })),
+      );
+      const bundle = await buildBundleFromFiles(bundleFiles);
+      emit({ kind: "bundle", bundle, name: bundleDisplayName(bundleFiles[0]?.path ?? "agent") });
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleGithubSubmit() {
+    const url = githubUrl.trim();
+    if (!url) return;
+    emit({
+      kind: "github",
+      sourceUrl: url,
+      ref: githubRef.trim() || undefined,
+      subdir: githubSubdir.trim() || undefined,
+      name: githubDisplayName(url),
+    });
+  }
+
   const canSubmit = name.trim().length > 0 && model.trim().length > 0;
+  const canSubmitGithub = githubUrl.trim().length > 0 && !busy;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -188,133 +273,293 @@ export function CreateAgentDialog({
           <DialogTitle>Create custom agent</DialogTitle>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
-          {/* Name */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-name"
-              className="text-xs font-medium text-muted-foreground"
-            >
-              Name <span className="text-destructive">*</span>
-            </label>
-            <Input
-              id="create-agent-name"
-              data-testid="create-agent-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="my-agent"
-              autoFocus
-            />
-          </div>
+        <Tabs
+          value={tab}
+          onValueChange={(v) => {
+            setUploadError(null);
+            setTab(v as typeof tab);
+          }}
+          className="flex min-h-0 flex-1 flex-col gap-4"
+        >
+          <TabsList className="w-full" data-testid="create-agent-tabs">
+            <TabsTrigger value="form" data-testid="create-agent-tab-form">
+              Form
+            </TabsTrigger>
+            <TabsTrigger value="file" data-testid="create-agent-tab-file">
+              File
+            </TabsTrigger>
+            <TabsTrigger value="folder" data-testid="create-agent-tab-folder">
+              Folder
+            </TabsTrigger>
+            <TabsTrigger value="github" data-testid="create-agent-tab-github">
+              GitHub
+            </TabsTrigger>
+          </TabsList>
 
-          {/* Description */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-description"
-              className="text-xs font-medium text-muted-foreground"
-            >
-              Description
-            </label>
-            <Input
-              id="create-agent-description"
-              data-testid="create-agent-description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="A short summary of what this agent does"
-            />
-          </div>
-
-          {/* Harness */}
-          <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-medium text-muted-foreground">
-              Harness <span className="text-destructive">*</span>
-            </label>
-            <Select value={harness} onValueChange={setHarness}>
-              <SelectTrigger data-testid="create-agent-harness" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {harnessOptions.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Model */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-model"
-              className="text-xs font-medium text-muted-foreground"
-            >
-              Model <span className="text-destructive">*</span>
-            </label>
-            <Input
-              id="create-agent-model"
-              data-testid="create-agent-model"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="claude-sonnet-4-20250514"
-            />
-          </div>
-
-          {/* Instructions / System Prompt */}
-          <div className="flex flex-col gap-1.5">
-            <label
-              htmlFor="create-agent-instructions"
-              className="text-xs font-medium text-muted-foreground"
-            >
-              System instructions
-            </label>
-            <Textarea
-              id="create-agent-instructions"
-              data-testid="create-agent-instructions"
-              value={instructions}
-              onChange={(e) => setInstructions(e.target.value)}
-              placeholder="You are a helpful assistant that..."
-              className="min-h-[120px]"
-            />
-          </div>
-
-          {/* MCP Servers */}
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">MCP Tools</span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={addMCPServer}
-                data-testid="create-agent-add-mcp"
-                className="h-6 gap-1 px-2 text-xs text-muted-foreground"
+          <TabsContent value="form" className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+            {/* Name */}
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="create-agent-name"
+                className="text-xs font-medium text-muted-foreground"
               >
-                <PlusIcon className="size-3" />
-                Add server
-              </Button>
-            </div>
-            {mcpEntries.map((entry) => (
-              <MCPServerRow
-                key={entry.key}
-                entry={entry}
-                onChange={(patch) => updateMCPEntry(entry.key, patch)}
-                onRemove={() => removeMCPServer(entry.key)}
+                Name <span className="text-destructive">*</span>
+              </label>
+              <Input
+                id="create-agent-name"
+                data-testid="create-agent-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="my-agent"
+                autoFocus
               />
-            ))}
-          </div>
-        </div>
+            </div>
+
+            {/* Description */}
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="create-agent-description"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Description
+              </label>
+              <Input
+                id="create-agent-description"
+                data-testid="create-agent-description"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="A short summary of what this agent does"
+              />
+            </div>
+
+            {/* Harness */}
+            <div className="flex flex-col gap-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                Harness <span className="text-destructive">*</span>
+              </label>
+              <Select value={harness} onValueChange={setHarness}>
+                <SelectTrigger data-testid="create-agent-harness" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {harnessOptions.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Model */}
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="create-agent-model"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Model <span className="text-destructive">*</span>
+              </label>
+              <Input
+                id="create-agent-model"
+                data-testid="create-agent-model"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder="claude-sonnet-4-20250514"
+              />
+            </div>
+
+            {/* Instructions / System Prompt */}
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="create-agent-instructions"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                System instructions
+              </label>
+              <Textarea
+                id="create-agent-instructions"
+                data-testid="create-agent-instructions"
+                value={instructions}
+                onChange={(e) => setInstructions(e.target.value)}
+                placeholder="You are a helpful assistant that..."
+                className="min-h-[120px]"
+              />
+            </div>
+
+            {/* MCP Servers */}
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-muted-foreground">MCP Tools</span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={addMCPServer}
+                  data-testid="create-agent-add-mcp"
+                  className="h-6 gap-1 px-2 text-xs text-muted-foreground"
+                >
+                  <PlusIcon className="size-3" />
+                  Add server
+                </Button>
+              </div>
+              {mcpEntries.map((entry) => (
+                <MCPServerRow
+                  key={entry.key}
+                  entry={entry}
+                  onChange={(patch) => updateMCPEntry(entry.key, patch)}
+                  onRemove={() => removeMCPServer(entry.key)}
+                />
+              ))}
+            </div>
+          </TabsContent>
+
+          {/* File tab — a single YAML or a pre-built .tar.gz bundle. */}
+          <TabsContent value="file" className="flex flex-col gap-3">
+            <p className="text-13 text-muted-foreground">
+              Upload a single <code>config.yaml</code> / <code>agent.yaml</code>, or a pre-built{" "}
+              <code>.tar.gz</code> bundle.
+            </p>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".yaml,.yml,.tar.gz"
+              className="hidden"
+              data-testid="create-agent-file-input"
+              onChange={(e) => void handleFiles(e.target.files, "file")}
+            />
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => fileInputRef.current?.click()}
+              data-testid="create-agent-file-pick"
+            >
+              Choose file…
+            </Button>
+            <VarNote />
+          </TabsContent>
+
+          {/* Folder tab — a whole bundle directory (webkitdirectory). */}
+          <TabsContent value="folder" className="flex flex-col gap-3">
+            <p className="text-13 text-muted-foreground">
+              Upload a folder containing <code>config.yaml</code> at its root, plus any bundled
+              instructions, MCP configs, or skills.
+            </p>
+            <input
+              ref={folderInputRef}
+              type="file"
+              // webkitdirectory is a non-standard attribute React doesn't type.
+              {...{ webkitdirectory: "", directory: "" }}
+              multiple
+              className="hidden"
+              data-testid="create-agent-folder-input"
+              onChange={(e) => void handleFiles(e.target.files, "folder")}
+            />
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => folderInputRef.current?.click()}
+              data-testid="create-agent-folder-pick"
+            >
+              Choose folder…
+            </Button>
+            <VarNote />
+          </TabsContent>
+
+          {/* GitHub tab — a public repo URL, fetched + repackaged server-side. */}
+          <TabsContent value="github" className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="create-agent-github-url"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Public repo URL <span className="text-destructive">*</span>
+              </label>
+              <Input
+                id="create-agent-github-url"
+                data-testid="create-agent-github-url"
+                value={githubUrl}
+                onChange={(e) => setGithubUrl(e.target.value)}
+                placeholder="https://github.com/owner/repo"
+                autoFocus
+              />
+            </div>
+            <div className="flex gap-2">
+              <div className="flex flex-1 flex-col gap-1.5">
+                <label
+                  htmlFor="create-agent-github-ref"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Ref (tag / branch / commit)
+                </label>
+                <Input
+                  id="create-agent-github-ref"
+                  data-testid="create-agent-github-ref"
+                  value={githubRef}
+                  onChange={(e) => setGithubRef(e.target.value)}
+                  placeholder="v1.0.0"
+                />
+              </div>
+              <div className="flex flex-1 flex-col gap-1.5">
+                <label
+                  htmlFor="create-agent-github-subdir"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  Subdir
+                </label>
+                <Input
+                  id="create-agent-github-subdir"
+                  data-testid="create-agent-github-subdir"
+                  value={githubSubdir}
+                  onChange={(e) => setGithubSubdir(e.target.value)}
+                  placeholder="agents/my-agent"
+                />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Pin a ref for reproducibility; the default branch is used otherwise. Public repos
+              only.
+            </p>
+            <VarNote />
+          </TabsContent>
+        </Tabs>
+
+        {uploadError && (
+          <p className="text-13 text-destructive" data-testid="create-agent-upload-error">
+            {uploadError}
+          </p>
+        )}
 
         <DialogFooter>
           <Button variant="ghost" onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>
-          <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
-            Create
-          </Button>
+          {tab === "form" && (
+            <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
+              Create
+            </Button>
+          )}
+          {tab === "github" && (
+            <Button
+              data-testid="create-agent-github-submit"
+              onClick={handleGithubSubmit}
+              disabled={!canSubmitGithub}
+            >
+              Create from GitHub
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Inline note reminding users that `${VAR}` refs are uploaded literally. */
+function VarNote() {
+  return (
+    <p className="text-xs text-muted-foreground/80">
+      <code>{"${VAR}"}</code> references are uploaded as-is and never expanded — keep secrets out of
+      the bundle.
+    </p>
   );
 }
 

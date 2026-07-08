@@ -157,6 +157,7 @@ from omnigent.server.auth import (
     local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.github_bundle import fetch_github_bundle, parse_github_source
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -14225,6 +14226,93 @@ def create_sessions_router(
                 resp.host_id = launch_host_id
 
         return resp
+
+    # ── POST /sessions/from-github ───────────────────────────────
+    #
+    # MUST be registered before ``GET /sessions/{session_id}`` for the
+    # same reason as ``/sessions/projects`` — literal paths first.
+
+    @router.post(
+        "/sessions/from-github",
+        status_code=201,
+        response_model=None,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def create_session_from_github(
+        request: Request,
+    ) -> CreatedSessionResponse:
+        """
+        Create a session from a public GitHub repo.
+
+        The request body is JSON: ``source_url`` (plus optional ``ref`` /
+        ``subdir``) and a nested ``metadata`` object matching the multipart
+        create's metadata part. The server fetches the repo's codeload
+        tarball, repackages it into the canonical bundle, and runs it through
+        the exact same validation + session-scoped agent creation as an
+        upload. ``${VAR}`` references are never expanded — the repo must hold
+        no resolved secrets.
+
+        :param request: FastAPI request carrying the JSON body.
+        :returns: :class:`CreatedSessionResponse` with the new session id.
+        :raises HTTPException: 422 for a malformed body.
+        :raises OmnigentError: ``invalid_input`` for a bad URL, missing/private
+            repo, oversize download, or a bundle that fails structure
+            validation.
+        """
+        user_id = _require_user(request, auth_provider)
+        if artifact_store is None:
+            raise OmnigentError(
+                "artifact store is not configured",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "type": "json_invalid",
+                        "loc": ["body"],
+                        "msg": "Invalid JSON",
+                        "input": None,
+                    },
+                ],
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="expected a JSON object body")
+        source_url = payload.get("source_url")
+        if not isinstance(source_url, str) or not source_url.strip():
+            raise HTTPException(status_code=422, detail="source_url is required")
+        ref = payload.get("ref")
+        subdir = payload.get("subdir")
+
+        # Reuse the multipart metadata validation path: re-serialize the
+        # nested object so there is a single SessionCreateMetadata parser.
+        parsed_metadata = _parse_session_create_metadata(json.dumps(payload.get("metadata") or {}))
+        _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+
+        source = parse_github_source(
+            source_url,
+            ref=ref if isinstance(ref, str) else None,
+            subdir=subdir if isinstance(subdir, str) else None,
+        )
+        bundle_bytes = await asyncio.to_thread(fetch_github_bundle, source)
+        result = await asyncio.to_thread(
+            _create_session_from_bundle,
+            conversation_store,
+            artifact_store,
+            parsed_metadata,
+            bundle_bytes,
+            None,
+        )
+        if permission_store is not None and user_id is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+            await asyncio.to_thread(
+                permission_store.grant, user_id, result.session_id, LEVEL_OWNER
+            )
+        _announce_session_added(user_id, result.session_id)
+        return result
 
     async def _create_bundled_session_from_multipart(
         request: Request,

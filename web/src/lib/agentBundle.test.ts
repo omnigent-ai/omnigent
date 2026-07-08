@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 // We mock CompressionStream and verify the config.yaml content
 // that gets fed to the tar/gzip pipeline.
 
-import type { AgentBundleInput } from "./agentBundle";
+import type { AgentBundleInput, BundleFile } from "./agentBundle";
 
 // Capture what buildAgentBundle passes to `new File(...)` by
 // mocking CompressionStream (not in jsdom) to be a passthrough.
@@ -40,8 +40,33 @@ class PassthroughStream {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).CompressionStream = PassthroughStream;
 
-// Now import the function (it will use our mock CompressionStream).
-const { buildAgentBundle } = await import("./agentBundle");
+// Now import the functions (they will use our mock CompressionStream).
+const { buildAgentBundle, buildBundleFromFiles, stripCommonPrefix, pendingAgentDisplay } =
+  await import("./agentBundle");
+
+/** Decode a null-padded tar header field to its leading text. */
+function tarField(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes).split("\u0000")[0];
+}
+
+/** List every tar entry name (walks the 512-byte header chain). */
+async function tarEntryNames(file: File): Promise<string[]> {
+  const tar = new Uint8Array(await file.arrayBuffer());
+  const names: string[] = [];
+  let offset = 0;
+  while (offset + 512 <= tar.length) {
+    const name = tarField(tar.slice(offset, offset + 100));
+    if (name === "") break; // end-of-archive zero block
+    const size = parseInt(tarField(tar.slice(offset + 124, offset + 135)), 8);
+    names.push(name);
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return names;
+}
+
+function bf(path: string, content = "x"): BundleFile {
+  return { path, bytes: new TextEncoder().encode(content) };
+}
 
 /** Extract the config.yaml from the raw tar bytes inside the File. */
 async function extractConfigYaml(file: File): Promise<string> {
@@ -196,5 +221,89 @@ describe("buildAgentBundle", () => {
     const yaml = await extractConfigYaml(await buildAgentBundle(input));
     expect(yaml).toContain("harness: openai-agents");
     expect(yaml).toContain("model: gpt-4o");
+  });
+});
+
+describe("stripCommonPrefix", () => {
+  it("removes a shared top-level directory", () => {
+    const out = stripCommonPrefix([bf("my-agent/config.yaml"), bf("my-agent/AGENTS.md")]);
+    expect(out.map((f) => f.path)).toEqual(["config.yaml", "AGENTS.md"]);
+  });
+
+  it("leaves paths unchanged when there is no common directory", () => {
+    const out = stripCommonPrefix([bf("config.yaml"), bf("AGENTS.md")]);
+    expect(out.map((f) => f.path)).toEqual(["config.yaml", "AGENTS.md"]);
+  });
+
+  it("does not strip when only a filename shares the segment", () => {
+    // A single top-level file must not be treated as a directory prefix.
+    const out = stripCommonPrefix([bf("config.yaml")]);
+    expect(out.map((f) => f.path)).toEqual(["config.yaml"]);
+  });
+});
+
+describe("buildBundleFromFiles", () => {
+  it("strips the common prefix and drops junk", async () => {
+    const file = await buildBundleFromFiles([
+      bf("my-agent/config.yaml", "spec_version: 1\nname: x"),
+      bf("my-agent/AGENTS.md"),
+      bf("my-agent/.git/HEAD"),
+      bf("my-agent/node_modules/pkg/index.js"),
+      bf("my-agent/.DS_Store"),
+    ]);
+    const names = await tarEntryNames(file);
+    expect(names.sort()).toEqual(["AGENTS.md", "config.yaml"]);
+  });
+
+  it("accepts a single top-level YAML (no config.yaml)", async () => {
+    const file = await buildBundleFromFiles([bf("agent.yaml", "spec_version: 1\nname: x")]);
+    expect(await tarEntryNames(file)).toEqual(["agent.yaml"]);
+  });
+
+  it("throws when no top-level YAML exists", async () => {
+    await expect(buildBundleFromFiles([bf("my-agent/AGENTS.md")])).rejects.toThrow(/config\.yaml/);
+  });
+
+  it("throws when multiple top-level YAMLs exist", async () => {
+    await expect(buildBundleFromFiles([bf("a.yaml"), bf("b.yaml")])).rejects.toThrow(
+      /top-level YAML/,
+    );
+  });
+
+  it("rejects path traversal", async () => {
+    await expect(buildBundleFromFiles([bf("config.yaml"), bf("../escape.txt")])).rejects.toThrow(
+      /Unsafe file path/,
+    );
+  });
+
+  it("rejects an empty selection", async () => {
+    await expect(buildBundleFromFiles([bf(".DS_Store")])).rejects.toThrow(/No files/);
+  });
+});
+
+describe("pendingAgentDisplay", () => {
+  it("reads form fields", () => {
+    expect(
+      pendingAgentDisplay({
+        kind: "form",
+        input: { name: "f", description: "d", harness: "claude-sdk", model: "m" },
+      }),
+    ).toEqual({ name: "f", description: "d", harness: "claude-sdk" });
+  });
+
+  it("reads bundle fields", () => {
+    const bundle = new File([new Uint8Array()], "agent.tar.gz");
+    expect(pendingAgentDisplay({ kind: "bundle", bundle, name: "b" })).toEqual({
+      name: "b",
+      description: undefined,
+      harness: null,
+    });
+  });
+
+  it("reads github fields", () => {
+    expect(pendingAgentDisplay({ kind: "github", sourceUrl: "acme/bot", name: "bot" })).toEqual({
+      name: "bot",
+      harness: null,
+    });
   });
 });

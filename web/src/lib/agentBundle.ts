@@ -36,6 +36,65 @@ export interface AgentBundleInput {
 }
 
 /**
+ * A pending custom agent, produced by one of the CreateAgentDialog tabs and
+ * held by NewChatDialog until submit.
+ *
+ * - "form": the classic field form → built into a bundle at submit via
+ *   {@link buildAgentBundle}.
+ * - "bundle": an already-built `.tar.gz` (folder pick, single file, tarball)
+ *   passed straight through to the multipart upload.
+ * - "github": a public repo reference resolved + repackaged server-side via
+ *   `POST /v1/sessions/from-github` (no client-built bundle).
+ */
+export type PendingAgentSource =
+  | { kind: "form"; input: AgentBundleInput }
+  | {
+      kind: "bundle";
+      bundle: File;
+      name: string;
+      description?: string;
+      harness?: string | null;
+    }
+  | {
+      kind: "github";
+      sourceUrl: string;
+      ref?: string;
+      subdir?: string;
+      /** Display name for the picker (the server reads the real name). */
+      name: string;
+    };
+
+/** Display fields for a pending agent, regardless of source variant. */
+export function pendingAgentDisplay(source: PendingAgentSource): {
+  name: string;
+  description?: string;
+  harness: string | null;
+} {
+  if (source.kind === "form") {
+    return {
+      name: source.input.name,
+      description: source.input.description,
+      harness: source.input.harness ?? null,
+    };
+  }
+  if (source.kind === "github") {
+    return { name: source.name, harness: null };
+  }
+  return {
+    name: source.name,
+    description: source.description,
+    harness: source.harness ?? null,
+  };
+}
+
+/** A single file destined for a bundle, keyed by its bundle-relative path. */
+export interface BundleFile {
+  /** Path within the bundle, e.g. "my-agent/tools/mcp/github.yaml". */
+  path: string;
+  bytes: Uint8Array;
+}
+
+/**
  * Build a `.tar.gz` agent bundle from the given input fields.
  *
  * Uses the pako library (already a transitive dep via codemirror) for
@@ -111,6 +170,103 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   return new File([gzipped.buffer as ArrayBuffer], "agent.tar.gz", {
     type: "application/gzip",
   });
+}
+
+/** Path segments that mark editor/tooling junk we never want in a bundle. */
+const IGNORED_SEGMENTS = [".git", "node_modules", ".venv", "__pycache__", ".idea", ".vscode"];
+/** Basenames dropped regardless of location. */
+const IGNORED_BASENAMES = [".DS_Store"];
+
+/** Client-side ceilings mirroring the server's extract_safe guards. */
+const MAX_BUNDLE_ENTRIES = 10_000;
+const MAX_BUNDLE_BYTES = 500 * 1024 * 1024;
+
+/**
+ * Build a `.tar.gz` agent bundle from a set of files (a picked folder, a
+ * fetched repo, or a single YAML wrapped as one entry).
+ *
+ * Strips the common top-level directory so `config.yaml` lands at the tar
+ * root, filters editor/VCS junk, and validates the bundle structure and size
+ * client-side so obvious problems surface here instead of as a server 400.
+ *
+ * Throws an Error with a user-facing message on any validation failure.
+ */
+export async function buildBundleFromFiles(files: BundleFile[]): Promise<File> {
+  const kept = files.filter((f) => !isIgnoredPath(f.path));
+  if (kept.length === 0) {
+    throw new Error("No files found in the selection.");
+  }
+
+  const stripped = stripCommonPrefix(kept);
+
+  // Path safety (defense-in-depth; webkitRelativePath is normally relative).
+  for (const f of stripped) {
+    const parts = f.path.split("/");
+    if (f.path.startsWith("/") || parts.includes("..")) {
+      throw new Error(`Unsafe file path in bundle: ${f.path}`);
+    }
+  }
+
+  // Structure: a root config.yaml, or exactly one top-level *.yaml / *.yml.
+  const topLevelYaml = stripped.filter((f) => !f.path.includes("/") && /\.ya?ml$/i.test(f.path));
+  const hasConfig = stripped.some((f) => f.path === "config.yaml");
+  if (!hasConfig && topLevelYaml.length !== 1) {
+    if (topLevelYaml.length === 0) {
+      throw new Error(
+        "Bundle must contain a config.yaml (or a single top-level YAML file) at its root.",
+      );
+    }
+    throw new Error(
+      `Bundle has ${topLevelYaml.length} top-level YAML files; expected exactly one (or a config.yaml).`,
+    );
+  }
+
+  // Ceilings mirroring the server.
+  if (stripped.length > MAX_BUNDLE_ENTRIES) {
+    throw new Error(
+      `Bundle has ${stripped.length} files, which exceeds the ${MAX_BUNDLE_ENTRIES} limit.`,
+    );
+  }
+  const totalBytes = stripped.reduce((sum, f) => sum + f.bytes.length, 0);
+  if (totalBytes > MAX_BUNDLE_BYTES) {
+    throw new Error("Bundle exceeds the 500 MB size limit.");
+  }
+
+  const entries: TarEntry[] = stripped.map((f) => ({
+    name: f.path,
+    content: f.bytes,
+  }));
+  const tarBytes = createTar(entries);
+  const gzipped = await gzip(tarBytes);
+  return new File([gzipped.buffer as ArrayBuffer], "agent.tar.gz", {
+    type: "application/gzip",
+  });
+}
+
+/** True if a bundle-relative path is editor/VCS junk to be skipped. */
+function isIgnoredPath(path: string): boolean {
+  const parts = path.split("/");
+  if (IGNORED_BASENAMES.includes(parts[parts.length - 1])) return true;
+  return parts.some((seg) => IGNORED_SEGMENTS.includes(seg));
+}
+
+/**
+ * Remove the shared leading directory segment from every path (folder picks
+ * and GitHub subdirs produce `my-agent/…`). Returns paths unchanged when there
+ * is no common top-level directory.
+ */
+export function stripCommonPrefix(files: BundleFile[]): BundleFile[] {
+  if (files.length === 0) return files;
+  const firstSegs = files.map((f) => f.path.split("/")[0]);
+  const common = firstSegs[0];
+  // Only strip when every path shares the same first segment AND that segment
+  // is a directory prefix (i.e. every path has something after it).
+  const allShared =
+    common !== undefined &&
+    firstSegs.every((s) => s === common) &&
+    files.every((f) => f.path.length > common.length + 1);
+  if (!allShared) return files;
+  return files.map((f) => ({ ...f, path: f.path.slice(common.length + 1) }));
 }
 
 // ── Helpers ──────────────────────────────────────────────────────

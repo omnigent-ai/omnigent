@@ -475,6 +475,47 @@ export async function createBundledSession(
 }
 
 /**
+ * Create a session from a public GitHub repo via
+ * POST /v1/sessions/from-github.
+ *
+ * The server fetches the repo's codeload tarball, repackages it into the
+ * canonical agent bundle (stripping GitHub's `repo-<sha>/` top dir and any
+ * subdir), and runs it through the same validation as a multipart upload.
+ * `${VAR}` references are never expanded server-side, so the repo must keep
+ * them literal and hold no resolved secrets.
+ *
+ * @param source - The repo URL plus optional ref (tag/branch/commit) and
+ *   subdir within the repo where the bundle root lives.
+ * @param metadata - Session-level metadata (workspace, etc.), same shape as
+ *   {@link createBundledSession}.
+ * @returns The created session's id.
+ */
+export async function createSessionFromGithub(
+  source: { source_url: string; ref?: string; subdir?: string },
+  metadata: Parameters<typeof createBundledSession>[1] = {},
+): Promise<{ id: string }> {
+  const res = await authenticatedFetch("/v1/sessions/from-github", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...source, metadata }),
+  });
+  if (!res.ok) {
+    // Surface the server's failure detail (bad URL, 404, oversize, invalid
+    // bundle structure) so the dialog can show it inline.
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const err = (await res.json()) as { detail?: string };
+      if (typeof err.detail === "string" && err.detail) detail = err.detail;
+    } catch {
+      // Non-JSON body — keep the status-line fallback.
+    }
+    throw new Error(detail);
+  }
+  const body = (await res.json()) as { session_id: string };
+  return { id: body.session_id };
+}
+
+/**
  * Fork (clone) a session into a new one via
  * POST /v1/sessions/{source_id}/fork.
  *
