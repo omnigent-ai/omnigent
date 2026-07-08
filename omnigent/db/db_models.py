@@ -531,6 +531,10 @@ class SqlConversation(Base):
         # Agent lookups: find the conversation(s) that own a given agent.
         Index("ix_conversations_agent_id", "agent_id"),
         Index("ix_conversations_root_conversation_id", "root_conversation_id"),
+        # Reconnect/relaunch reconciliation looks up a runner's session(s)
+        # by runner_id (list_conversations_by_runner_id) on every runner
+        # reconnect; index it to avoid a full scan.
+        Index("ix_conversations_runner_id", "runner_id"),
         # Phase 4: partial unique index on (parent_conversation_id,
         # title) prevents two same-named children under the same
         # parent (G36 race protection at the DB layer). The
