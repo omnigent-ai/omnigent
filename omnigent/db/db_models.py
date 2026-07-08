@@ -528,9 +528,6 @@ class SqlConversation(Base):
         Index("ix_conversations_created_at", "created_at"),
         Index("ix_conversations_updated_at", "updated_at"),
         Index("ix_conversations_kind", "kind"),
-        # Reconnect reconciliation queries conversations by host_id on
-        # every host reconnect; index it to avoid a full scan.
-        Index("ix_conversations_host_id", "host_id"),
         # Agent lookups: find the conversation(s) that own a given agent.
         Index("ix_conversations_agent_id", "agent_id"),
         Index("ix_conversations_root_conversation_id", "root_conversation_id"),
