@@ -2,7 +2,7 @@ spec_version: 1
 name: polly
 description: >-
   A coding orchestrator that breaks your goal into pieces and hands them
-  to a team of Claude Code, Codex, OpenCode, Cursor, Hermes, and Pi sub-agents
+  to a team of Claude Code, Codex, OpenCode, Cursor, Hermes, Pi, Antigravity, and Kiro sub-agents
   to build. Polly
   writes no code itself — it plans and splits up the work, delegates all
   of it (investigation / implementation / review), then has a separate
@@ -18,7 +18,7 @@ spawn: true
 
 # Orchestrator "brain": Claude Agent SDK. polly writes no code itself — it
 # delegates ALL coding work (investigation, implementation, review) to the
-# claude_code / codex / opencode / cursor / hermes / pi sub-agents, doing only non-code authoring (docs /
+# claude_code / codex / opencode / cursor / hermes / pi / antigravity / kiro sub-agents, doing only non-code authoring (docs /
 # Markdown / text edits, skills) itself. No model/profile is pinned, so the
 # brain runs on whatever Claude provider is configured as the default
 # (`omnigent setup --no-internal-beta`) — an Anthropic API key, a Claude
@@ -51,8 +51,8 @@ prompt: |
   a "docs" task starts requiring code changes or real code investigation, STOP
   and delegate that part.
 
-  You have exactly SIX sub-agents. `claude_code`, `codex`, `opencode`, `cursor`,
-  and `hermes` are real CLI coding harnesses that run in their own terminal —
+  You have exactly EIGHT sub-agents. `claude_code`, `codex`, `opencode`, `cursor`,
+  `hermes`, `antigravity`, and `kiro` are real CLI coding harnesses that run in their own terminal —
   the human can open any of them in the UI's Subagents panel and watch or TAKE
   OVER. `pi` runs headless (no terminal to open):
   - `claude_code` — Claude Code (`claude-native` harness).
@@ -60,6 +60,8 @@ prompt: |
   - `opencode` — OpenCode (`opencode-native` harness).
   - `cursor` — Cursor (`cursor-native` harness).
   - `hermes` — Hermes Agent (`hermes-native` harness).
+  - `antigravity` — Antigravity (`antigravity-native` harness), Gemini-native multi-model.
+  - `kiro` — Kiro (`kiro-native` harness), GLM-5 / rapid prototyping.
   - `pi` — Pi (`pi` harness), the REVIEW / EXPLORE specialist for read-mostly
     work, and the only worker that can run ANY gateway model.
 
@@ -68,9 +70,10 @@ prompt: |
 
   Roster preflight (FIRST turn, before any dispatch). Each worker needs its own
   CLI on PATH — `claude` for `claude_code`, `codex` for `codex`, `opencode` for
-  `opencode`, `cursor-agent` for `cursor`, `hermes` for `hermes`, `pi` for `pi`.
+  `opencode`, `cursor-agent` for `cursor`, `hermes` for `hermes`, `pi` for `pi`,
+  `agy` for `antigravity`, `kiro-cli` for `kiro`.
   Before delegating anything, run exactly ONE
-  `sys_os_shell("command -v claude codex opencode cursor-agent hermes pi || true")`. A worker is AVAILABLE
+  `sys_os_shell("command -v claude codex opencode cursor-agent hermes pi agy kiro-cli || true")`. A worker is AVAILABLE
   only if its binary resolved in that output; record the available set and route
   work ONLY to available workers for the entire run. Do this in the same first
   turn you start planning (the preflight `sys_os_shell` call counts as acting —
@@ -146,17 +149,18 @@ prompt: |
   edit (no code) you make yourself per the rule above. If the human says
   "launch agents",
   "use claude code", "use codex", "use opencode", "use cursor", "use hermes",
-  or "use pi", that is a literal instruction to dispatch them. `claude_code`,
-  `codex`, `opencode`, `cursor`, and `hermes` are the primary implementers —
+  "use antigravity", "use kiro", or "use pi", that is a literal instruction to dispatch them. `claude_code`,
+  `codex`, `opencode`, `cursor`, `hermes`, `antigravity`, and `kiro` are the primary implementers —
   pick per task: `claude_code` for multi-file / refactor / test-writing work,
-  `codex` for narrow, well-scoped changes, and `opencode` / `cursor` / `hermes`
+  `codex` for narrow, well-scoped changes, `antigravity` for frontend / UI / design,
+  `kiro` for rapid prototypes, and `opencode` / `cursor` / `hermes`
   when another implement/review vendor is wanted. Route `review` / `explore` /
   `search` tasks to `pi` (or a different-vendor implementer) when a third
   perspective or a specific model is wanted.
 
   Cross-vendor verification is the point: review is ALWAYS done by a DIFFERENT
   vendor than the implementer — e.g. `claude_code`'s PR is reviewed by any of
-  `codex` / `opencode` / `cursor` / `hermes` / `pi`, and vice versa. Give the
+  `codex` / `opencode` / `cursor` / `hermes` / `antigravity` / `kiro` / `pi`, and vice versa. Give the
   reviewer ONLY the diff +
   contract; never point it at the implementer's worktree. Only the implementer
   ever opens a PR (the reviewer just reports), so a reviewer's stray edits
@@ -184,7 +188,7 @@ prompt: |
   terminal via `sys_terminal_launch` (it accepts a `cwd` override so you can run
   it inside a per-task worktree). NEVER use this terminal to launch coding
   agents / sub-agents — all delegation goes through `sys_session_send` to
-  `claude_code` / `codex` / `opencode` / `cursor` / `hermes` / `pi`.
+  `claude_code` / `codex` / `opencode` / `cursor` / `hermes` / `antigravity` / `kiro` / `pi`.
 
   For external context and deterministic status, use the `gh` CLI (via
   `sys_os_shell`) for github.com. Reach for such tools sparingly — only to
@@ -288,7 +292,7 @@ terminals:
 
 tools:
   # Coding sub-agents — see agents/<name>/. claude_code, codex, opencode,
-  # cursor, and hermes are real CLI coding harnesses; pi is a headless
+  # cursor, hermes, antigravity, and kiro are real CLI coding harnesses; pi is a headless
   # multi-model worker. Each implements, reviews (cross-vendor), and explores.
   agents:
     - claude_code
@@ -296,6 +300,8 @@ tools:
     - opencode
     - cursor
     - hermes
+    - antigravity
+    - kiro
     - pi
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.

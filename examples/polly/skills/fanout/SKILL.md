@@ -14,7 +14,7 @@ dependency).
    Record the worktree path + branch in the registry
    (`.polly/registry.json`).
 2. Dispatch one implementation sub-agent per task, scoped to its worktree:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes", title="<task_slug>",
+   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"antigravity"|"kiro", title="<task_slug>",
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
@@ -43,8 +43,9 @@ dependency).
 ## Notes
 - Respect the per-turn dispatch cap (enforced by policy). More tasks than the
   cap → dispatch in waves (let the running batch finish before dispatching more).
-- The human can open any sub-agent in the UI's Subagents panel and read its
-  conversation while it runs.
+- The human can open any terminal-based sub-agent (`claude_code`, `codex`,
+  `opencode`, `cursor`, `hermes`, `antigravity`, `kiro`) in the UI's Subagents
+  panel and read its conversation while it runs.
 - If a running worker is wrong, runaway, superseded, or no longer useful, call
   `sys_cancel_task` with `task_id` set to the recorded `conversation_id` before
   dispatching a replacement. `claude_code` is hard-stopped; `codex` cancellation
