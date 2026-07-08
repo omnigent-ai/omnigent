@@ -517,4 +517,237 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
             "required": [],
         },
     },
+    {
+        "handler": "omnigent.policies.builtins.routing.smart_registry_router",
+        "kind": "factory",
+        "name": "Smart Registry Router",
+        "description": (
+            "Routes sub-agent dispatches using a model registry with fallback capabilities. "
+            "Intercepts sys_session_send calls and redirects depleted or rate-limited models "
+            "to configured fallbacks."
+        ),
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "registry_path": {
+                    "type": "string",
+                    "description": "Path to the model_registry.yaml configuration file.",
+                    "default": "examples/polly/model_registry.yaml",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
+
+
+def smart_registry_router(
+    registry_path: str = "examples/polly/model_registry.yaml",
+) -> PolicyCallable:
+    """Factory: Route sub-agent dispatches using a model registry with fallback capabilities.
+
+    Fires on ``tool_call`` and ``tool_result`` phases of ``sys_session_send``.
+    Reads the model capabilities registry to perform static model and fallback
+    routing when primary models are depleted or encounter errors.
+    """
+    import os
+    import yaml
+    from pathlib import Path
+
+    # Load registry
+    registry = {}
+    if os.path.exists(registry_path):
+        try:
+            with open(registry_path, "r", encoding="utf-8") as f:
+                registry = yaml.safe_load(f) or {}
+        except Exception:
+            _log.exception(f"Failed to load model registry from {registry_path}")
+
+    models_config = registry.get("models", {})
+    routing_config = registry.get("routing", {})
+
+    async def evaluate(event: PolicyEvent) -> PolicyResponse | None:
+        phase = event.get("type")
+        if phase not in ("tool_call", "tool_result"):
+            return None
+
+        target = event.get("target")
+        is_dispatch = (target == "sys_session_send")
+        if not is_dispatch and target not in models_config:
+            # Not a sub-agent dispatch, ignore
+            return None
+
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return None
+
+        state = event.get("session_state") or {}
+
+        # --- Phase 1: tool_call (routing and rewriting arguments) ---
+        if phase == "tool_call":
+            arguments = data.get("arguments", {})
+            if not isinstance(arguments, dict):
+                return None
+
+            agent = arguments.get("agent")
+            child_args = arguments.get("args")
+
+            # Support direct subagent tool calls (where tool name is the agent name)
+            if not is_dispatch:
+                agent = target
+                child_args = arguments
+
+            if not agent or not child_args:
+                return None
+
+            # Ensure child_args is a dict
+            if isinstance(child_args, str):
+                child_args = {"input": child_args}
+            else:
+                child_args = dict(child_args)
+
+            model = child_args.get("model")
+            title = arguments.get("title", "") if is_dispatch else arguments.get("title", "default")
+
+            # If no model is explicitly requested, try to get the default model from the agent's config
+            if not model:
+                paths_to_check = [
+                    Path("examples/polly/agents") / agent / "config.yaml",
+                    Path("agents") / agent / "config.yaml",
+                ]
+                for p in paths_to_check:
+                    if p.exists():
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                agent_yaml = yaml.safe_load(f) or {}
+                                model = agent_yaml.get("executor", {}).get("model")
+                                if model:
+                                    break
+                        except Exception:
+                            pass
+
+            if not model:
+                # Default fallback based on agent name if nothing is found
+                if agent == "coordinator":
+                    model = "k2.7_code"
+                elif agent == "implementor":
+                    model = "minimax_m3"
+                elif agent in ("quickfix", "reviewer"):
+                    model = "deepseek_v4"
+                elif agent in ("agent_runner", "antigravity"):
+                    model = "gemini_35_flash"
+                else:
+                    return None
+
+            # Store the mapped model for error tracking
+            state_key = f"_last_dispatched_model:{agent}:{title}"
+            state_updates = [{"key": state_key, "action": "set", "value": model}]
+
+            # Check fallback chain if the model is marked depleted
+            active_model = model
+            visited_models = {active_model}
+            
+            while state.get(f"_model_depleted:{active_model}"):
+                fallback_list = []
+                if active_model in models_config:
+                    fallback_list = models_config[active_model].get("fallback", [])
+                    if isinstance(fallback_list, str):
+                        fallback_list = [fallback_list]
+                
+                if not fallback_list:
+                    for route_name, route_val in routing_config.items():
+                        if isinstance(route_val, dict) and route_val.get("primary") == active_model:
+                            fallback_list = route_val.get("fallback", [])
+                            break
+
+                found_fallback = False
+                for fb in fallback_list:
+                    if fb not in visited_models and not state.get(f"_model_depleted:{fb}"):
+                        active_model = fb
+                        visited_models.add(fb)
+                        found_fallback = True
+                        break
+                
+                if not found_fallback:
+                    break
+
+            if active_model != model:
+                _log.warning(
+                    f"Model '{model}' is marked depleted. "
+                    f"Falling back to '{active_model}' for agent '{agent}'."
+                )
+                child_args["model"] = active_model
+                
+                new_arguments = dict(arguments)
+                if is_dispatch:
+                    new_arguments["args"] = child_args
+                else:
+                    new_arguments = child_args
+
+                return {
+                    "result": "ALLOW",
+                    "data": {
+                        "name": target,
+                        "arguments": new_arguments,
+                    },
+                    "state_updates": state_updates,
+                }
+
+            return {
+                "result": "ALLOW",
+                "state_updates": state_updates,
+            }
+
+        # --- Phase 2: tool_result (detect failures and mark models as depleted) ---
+        elif phase == "tool_result":
+            arguments = event.get("request_data", {}).get("arguments", {})
+            if not isinstance(arguments, dict):
+                return None
+
+            agent = arguments.get("agent")
+            title = arguments.get("title", "")
+            
+            if not is_dispatch:
+                agent = target
+                title = arguments.get("title", "default")
+
+            if not agent:
+                return None
+
+            result_val = data.get("result", "")
+            result_str = str(result_val).lower()
+
+            error_indicators = (
+                "rate limit",
+                "quota exceeded",
+                "429",
+                "insufficient_quota",
+                "exhausted",
+                "rate_limit",
+                "too many requests",
+                "billing limits",
+            )
+
+            if any(indicator in result_str for indicator in error_indicators):
+                state_key = f"_last_dispatched_model:{agent}:{title}"
+                failed_model = state.get(state_key)
+                if failed_model:
+                    _log.error(
+                        f"Detected API depletion/rate limit error for model '{failed_model}' "
+                        f"during dispatch of agent '{agent}'. Marking model as depleted."
+                    )
+                    return {
+                        "result": "ALLOW",
+                        "state_updates": [
+                            {
+                                "key": f"_model_depleted:{failed_model}",
+                                "action": "set",
+                                "value": True,
+                            }
+                        ],
+                    }
+
+        return None
+
+    return evaluate
+

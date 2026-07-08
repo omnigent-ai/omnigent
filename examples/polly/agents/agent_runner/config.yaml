@@ -1,0 +1,31 @@
+spec_version: 1
+name: agent_runner
+description: Agent Runner sub-agent for multi-step agent operations, terminal-bench tasks, and multimodal execution.
+
+executor:
+  type: omnigent
+  config:
+    harness: antigravity-native
+    permission_mode: auto
+  model: gemini_35_flash
+
+prompt: |
+  You are the Agent Runner. Your task is to execute multi-step terminal workflows, cross-tool orchestration,
+  frontend/UI verification, and multimodal checks. You have full terminal access and can drive browser instances
+  or run background tasks as required by the orchestrator.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false

@@ -51,10 +51,9 @@ prompt: |
   a "docs" task starts requiring code changes or real code investigation, STOP
   and delegate that part.
 
-  You have exactly EIGHT sub-agents. `claude_code`, `codex`, `opencode`, `cursor`,
-  `hermes`, `antigravity`, and `kiro` are real CLI coding harnesses that run in their own terminal —
-  the human can open any of them in the UI's Subagents panel and watch or TAKE
-  OVER. `pi` runs headless (no terminal to open):
+  You have exactly EIGHT harness-based sub-agents. `claude_code`, `codex`, `opencode`, `cursor`,
+  `hermes`, `antigravity`, and `kiro` are real CLI coding harnesses that run in their own terminal.
+  `pi` runs headless (no terminal to open):
   - `claude_code` — Claude Code (`claude-native` harness).
   - `codex` — Codex (`codex-native` harness).
   - `opencode` — OpenCode (`opencode-native` harness).
@@ -64,6 +63,13 @@ prompt: |
   - `kiro` — Kiro (`kiro-native` harness), GLM-5 / rapid prototyping.
   - `pi` — Pi (`pi` harness), the REVIEW / EXPLORE specialist for read-mostly
     work, and the only worker that can run ANY gateway model.
+
+  Additionally, you have FIVE role-based headless sub-agents (each running behind the `pi` or `antigravity-native` harnesses and configured with appropriate models via the Gateway model groups):
+  - `coordinator` — Coordinator for architecture, planning, decomposition, and complex debugging (backed by Gateway `k2.7_code`).
+  - `implementor` — Implementor for multi-file implementation and structured coding tasks (backed by Gateway `minimax_m3`).
+  - `quickfix` — Quickfix for small single-file edits, unit tests, and rapid edits (backed by Gateway `deepseek_v4`).
+  - `reviewer` — Reviewer for independent code review and diff validation (backed by Gateway `deepseek_v4`).
+  - `agent_runner` — Agent Runner for multi-step agent operations, terminal-bench tasks, and multimodal execution (backed by `gemini_35_flash`).
 
   Extra vendors widen cross-vendor review (any implementer's diff can be judged
   by a DIFFERENT vendor). Route to whichever workers the preflight finds.
@@ -291,9 +297,7 @@ terminals:
         type: none
 
 tools:
-  # Coding sub-agents — see agents/<name>/. claude_code, codex, opencode,
-  # cursor, hermes, antigravity, and kiro are real CLI coding harnesses; pi is a headless
-  # multi-model worker. Each implements, reviews (cross-vendor), and explores.
+  # Coding sub-agents — see agents/<name>/.
   agents:
     - claude_code
     - codex
@@ -303,6 +307,11 @@ tools:
     - antigravity
     - kiro
     - pi
+    - coordinator
+    - implementor
+    - quickfix
+    - reviewer
+    - agent_runner
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.
 guardrails:
@@ -335,3 +344,23 @@ guardrails:
         path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [implement, review, explore, search]
+    smart_registry_router:
+      type: function
+      function:
+        path: omnigent.policies.builtins.routing.smart_registry_router
+        arguments:
+          registry_path: examples/polly/model_registry.yaml
+    cost_budget:
+      type: function
+      function:
+        path: omnigent.policies.builtins.cost.cost_budget
+        arguments:
+          max_cost_usd: 15.0
+          ask_thresholds_usd: [10.0, 12.0]
+          expensive_models: ["k2.7_code", "minimax_m3", "claude-opus", "gpt-5"]
+    max_tool_calls:
+      type: function
+      function:
+        path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+        arguments:
+          limit: 50

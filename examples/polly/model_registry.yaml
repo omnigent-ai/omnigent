@@ -1,0 +1,58 @@
+# model_registry.yaml
+# Defines model strengths, tiers, contexts, price indicators, and fallback/routing rules.
+
+models:
+  k2.7_code:
+    harness: pi
+    tier: frontier
+    strengths: [architecture, complex_debug, multi_file_refactor]
+    context_window: 256000
+    cost_per_task: high
+    quota: monthly_subscription
+  minimax_m3:
+    harness: pi
+    tier: frontier
+    strengths: [long_context, coding, analysis]
+    context_window: 1000000
+    cost_per_task: low
+    quota: monthly_pool_generous
+  gemini_35_flash:
+    harness: antigravity-native
+    tier: strong
+    strengths: [multi_step_agent, terminal_ops, multimodal]
+    context_window: 1000000
+    cost_per_task: free
+    quota: rate_limited
+  deepseek_v4:
+    harness: opencode-native
+    tier: capable
+    strengths: [quick_edit, batch_tasks, simple_qa]
+    context_window: 128000
+    cost_per_task: free
+    quota: unlimited
+  spark_53:
+    harness: codex-native
+    tier: capable
+    strengths: [scaffold, unit_test, quick_prototype]
+    cost_per_task: medium
+    quota: depleting
+  glm_5:
+    harness: kiro-native
+    tier: basic
+    strengths: [chinese_docs, simple_qa]
+    cost_per_task: free
+    quota: 50_per_day
+
+routing:
+  frontier_tasks:
+    primary: k2.7_code
+    fallback: [minimax_m3]
+  strong_tasks:
+    primary: gemini_35_flash
+    fallback: [minimax_m3, k2.7_code]
+  capable_tasks:
+    primary: deepseek_v4
+    fallback: [spark_53, glm_5]
+  long_context:
+    primary: minimax_m3
+    fallback: [gemini_35_flash]
