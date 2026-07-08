@@ -12,7 +12,7 @@ reference for the mapping.
 
 ## Routing rules
 
-- Frontend / UI / design tasks → `antigravity` with `args.model: gemini-flash-3.5`
+- Frontend / UI / design tasks → `antigravity` with `args.model: gemini-3.5-flash`
 - Code review / architecture → `claude_code` with `args.model: claude-sonnet-4-6`
 - Core implementation → `claude_code` with `args.model: claude-opus-4-6`
 - Light exploration / search → `pi` with `args.model: MiniMax-M3`
