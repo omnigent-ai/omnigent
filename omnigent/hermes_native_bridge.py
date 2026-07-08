@@ -36,6 +36,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,24 @@ _logger = logging.getLogger(__name__)
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_HERMES_NATIVE_BRIDGE_DIR"
+
+#: Session metadata key carrying hermes-native state/config mode.
+STATE_MODE_METADATA_KEY = "hermes_native_state_mode"
+
+#: Session label key mirroring :data:`STATE_MODE_METADATA_KEY` for discovery.
+STATE_MODE_LABEL_KEY = "omnigent.hermes_native.state_mode"
+
+#: Runner-side override for deployments that want one global hermes-native mode.
+STATE_MODE_ENV_VAR = "OMNIGENT_HERMES_NATIVE_STATE_MODE"
+
+STATE_MODE_MANAGED = "managed"
+STATE_MODE_AMBIENT = "ambient"
+_STATE_MODE_ALIASES = {
+    STATE_MODE_MANAGED: STATE_MODE_MANAGED,
+    "isolated": STATE_MODE_MANAGED,
+    STATE_MODE_AMBIENT: STATE_MODE_AMBIENT,
+    "real": STATE_MODE_AMBIENT,
+}
 
 _BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "hermes-native"
 _TMUX_FILE = "tmux.json"
@@ -81,6 +100,58 @@ _RETRY_SETTLE_S = 10.0
 # acceptance, so a confirmation this slow means the keystrokes were dropped.
 _DELIVERY_CONFIRM_TIMEOUT_S = 12.0
 _DELIVERY_POLL_INTERVAL_S = 0.3
+
+
+def normalize_hermes_native_state_mode(value: object | None) -> str:
+    """Return canonical hermes-native state mode for *value*.
+
+    Public values are ``"managed"`` (Omnigent-controlled per-session
+    ``HERMES_HOME``) and ``"ambient"`` (inherit the user's normal Hermes home).
+    ``"isolated"`` and ``"real"`` are accepted as compatibility aliases because
+    those terms appeared in early design discussion.
+
+    :param value: Raw mode from env, session metadata, or labels.
+    :returns: ``"managed"`` or ``"ambient"``.
+    :raises ValueError: If *value* is non-empty and unsupported.
+    """
+    if value is None:
+        return STATE_MODE_MANAGED
+    if not isinstance(value, str):
+        raise ValueError("hermes-native state mode must be a string")
+    raw = value.strip().lower()
+    if not raw:
+        return STATE_MODE_MANAGED
+    try:
+        return _STATE_MODE_ALIASES[raw]
+    except KeyError as exc:
+        allowed = ", ".join(sorted({STATE_MODE_MANAGED, STATE_MODE_AMBIENT}))
+        raise ValueError(
+            f"unsupported hermes-native state mode {value!r}; expected {allowed}"
+        ) from exc
+
+
+def resolve_hermes_native_state_mode(
+    *,
+    snapshot: dict[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve hermes-native state mode from env then session snapshot.
+
+    The runner env override wins so operators can test or force a deployment-wide
+    mode without recreating sessions. Otherwise the session's explicit metadata
+    key wins, falling back to the mirrored label key. Missing values preserve the
+    existing managed behavior.
+    """
+    resolved_env = os.environ if env is None else env
+    if resolved_env.get(STATE_MODE_ENV_VAR):
+        return normalize_hermes_native_state_mode(resolved_env.get(STATE_MODE_ENV_VAR))
+    snapshot = snapshot or {}
+    if STATE_MODE_METADATA_KEY in snapshot:
+        return normalize_hermes_native_state_mode(snapshot.get(STATE_MODE_METADATA_KEY))
+    labels = snapshot.get("labels")
+    if isinstance(labels, dict) and STATE_MODE_LABEL_KEY in labels:
+        return normalize_hermes_native_state_mode(labels.get(STATE_MODE_LABEL_KEY))
+    return STATE_MODE_MANAGED
 
 
 def mint_hermes_session_id() -> str:
