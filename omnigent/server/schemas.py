@@ -262,6 +262,98 @@ class AgentObject(BaseModel):
     builtin: bool = False
 
 
+# ── Session Capabilities ───────────────────────────────────────
+
+
+class SessionCapabilityTool(BaseModel):
+    """
+    Safe summary of a single function tool for the capabilities view.
+
+    Surfaces only the name and one-line description so the panel can
+    list which tools an agent can call without leaking the full
+    parameter schema.
+
+    :param name: OpenAI-format function name, e.g. ``"sys_os_read"``.
+    :param description: One-line summary from the tool schema, or
+        ``None`` when the tool declares none.
+    """
+
+    name: str
+    description: str | None = None
+
+
+class SessionCapabilityMCPServer(MCPServerSummary):
+    """
+    An MCP server's config plus a (deferred) per-server tool list.
+
+    Reuses the secret-free :class:`MCPServerSummary` shape (name,
+    transport, description, url, command, args) and adds ``tools``.
+    Per-server tool discovery needs a runner round-trip (``tools/list``
+    against the live MCP connection), so it is deferred — this field is
+    always empty in this slice.
+
+    :param tools: Discovered MCP tools for this server. Always ``[]``
+        for now (Slice D: per-server tool discovery via the runner).
+    """
+
+    tools: list[SessionCapabilityTool] = Field(default_factory=list)
+
+
+class SubAgentCapability(BaseModel):
+    """
+    A declared sub-agent node in the capabilities tree.
+
+    Built recursively from ``spec.sub_agents`` so the panel can render
+    the full declared sub-agent hierarchy. Read-only and derived purely
+    from the spec — no live child-session status this slice.
+
+    :param name: Sub-agent name as declared in the parent spec, e.g.
+        ``"researcher"``. ``None`` when the spec omits it.
+    :param description: Optional free-text description from the spec.
+    :param sub_agents: This sub-agent's own declared sub-agents, same
+        shape, recursively.
+    """
+
+    name: str | None = None
+    description: str | None = None
+    sub_agents: list[SubAgentCapability] = Field(default_factory=list)
+
+
+class SessionCapabilities(BaseModel):
+    """
+    Consolidated read-only capabilities of a session's bound agent.
+
+    Returned by ``GET /v1/sessions/{session_id}/capabilities``. Resolves
+    the agent bound to the session (context-aware: an omnigent-spawned
+    sub-agent child reports THAT sub-agent's capabilities, resolved from
+    its ``sub_agent_name`` against the parent spec).
+
+    :param object: Fixed resource type, ``"session.capabilities"``.
+    :param session_id: The queried session/conversation id.
+    :param agent_id: The agent row bound to the session. For an
+        omnigent-spawned sub-agent this is the parent's agent id (the
+        sub-agent is identified by ``sub_agent_name``).
+    :param sub_agent_name: The dispatched sub-agent name when the
+        session is a named sub-agent child, else ``None``.
+    :param skills: The merged (bundled + host-discovered) skill list,
+        from the same runner-owned source as the session snapshot.
+    :param mcp_servers: The agent's MCP server config (secret fields
+        omitted). Each carries a deferred, empty ``tools`` list.
+    :param local_tools: The agent's effective local/builtin function
+        tools, name + description only.
+    :param sub_agents: The declared sub-agent tree from the spec.
+    """
+
+    object: str = "session.capabilities"
+    session_id: str
+    agent_id: str
+    sub_agent_name: str | None = None
+    skills: list[SkillSummary] = Field(default_factory=list)
+    mcp_servers: list[SessionCapabilityMCPServer] = Field(default_factory=list)
+    local_tools: list[SessionCapabilityTool] = Field(default_factory=list)
+    sub_agents: list[SubAgentCapability] = Field(default_factory=list)
+
+
 # ── Session Policies ───────────────────────────────────────────
 
 

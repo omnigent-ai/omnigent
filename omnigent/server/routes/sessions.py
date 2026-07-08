@@ -227,6 +227,9 @@ from omnigent.server.schemas import (
     SandboxStatus,
     ServerStreamEvent,
     SessionAgentChangedEvent,
+    SessionCapabilities,
+    SessionCapabilityMCPServer,
+    SessionCapabilityTool,
     SessionCollaborationModeEvent,
     SessionCreatedEvent,
     SessionCreateMetadata,
@@ -257,6 +260,7 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     SessionUsageEvent,
     SkillSummary,
+    SubAgentCapability,
     UpdateSessionRequest,
 )
 from omnigent.session_lifecycle import (
@@ -10520,6 +10524,106 @@ def _load_agent_spec_for_session(
     )
 
 
+def _resolve_session_effective_spec(
+    conv: Conversation,
+    agent_store: AgentStore,
+) -> AgentSpec | None:
+    """Resolve the spec of the agent bound to *conv*, context-aware.
+
+    Loads the conversation's bound-agent spec, then — for an
+    omnigent-spawned named sub-agent child (``conv.sub_agent_name`` set,
+    which shares the parent's ``agent_id``) — narrows to THAT sub-agent's
+    spec resolved from the parent bundle. Claude-native sub-agents reuse
+    the parent ``agent_id`` with no ``sub_agent_name`` and so report the
+    parent's spec, exactly as ``GET /sessions/{id}/agent`` does.
+
+    Pure/sync spec traversal — blocking DB/IO (bundle load) only, no
+    runner round-trip and no MCP connect. Run under ``asyncio.to_thread``.
+
+    :param conv: The session conversation (its ``agent_id`` /
+        ``sub_agent_name`` drive resolution).
+    :param agent_store: Store for the bound-agent lookup.
+    :returns: The effective (sub-)agent spec, or ``None`` when the
+        conversation has no agent or the bundle can't be loaded.
+    """
+    spec = _load_agent_spec_for_session(conv, agent_store)
+    if spec is None:
+        return None
+    if conv.sub_agent_name:
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        sub = _find_spec_by_name(spec, conv.sub_agent_name)
+        if sub is not None:
+            return sub
+    return spec
+
+
+def _sub_agent_capability_tree(
+    sub_agents: list[AgentSpec],
+) -> list[SubAgentCapability]:
+    """Build the recursive declared-sub-agent tree for the capabilities view.
+
+    :param sub_agents: A spec's ``sub_agents`` list.
+    :returns: One :class:`SubAgentCapability` per declared sub-agent, each
+        carrying its own children recursively.
+    """
+    return [
+        SubAgentCapability(
+            name=sub.name,
+            description=sub.description,
+            sub_agents=_sub_agent_capability_tree(sub.sub_agents),
+        )
+        for sub in sub_agents
+    ]
+
+
+def _build_session_capability_groups(
+    spec: AgentSpec,
+) -> tuple[
+    list[SessionCapabilityMCPServer],
+    list[SessionCapabilityTool],
+    list[SubAgentCapability],
+]:
+    """Derive the spec-only capability groups (mcp config, local tools, sub-agents).
+
+    ``ToolManager(spec)`` is construction-only (MCP is ``start()``-gated),
+    so the local-tool surface is resolved without any runner round-trip or
+    MCP connect. Per-server MCP ``tools`` are intentionally left empty — that
+    discovery needs a live runner ``tools/list`` (Slice D). Skills come from
+    a separate runner-owned source and are added by the caller.
+
+    Blocking/CPU-bound (schema build), so run under ``asyncio.to_thread``.
+
+    :param spec: The resolved (sub-)agent spec.
+    :returns: ``(mcp_servers, local_tools, sub_agents)``.
+    """
+    from omnigent.tools.manager import ToolManager
+
+    mcp_servers = [
+        SessionCapabilityMCPServer(
+            name=srv.name,
+            transport=srv.transport,
+            description=srv.description,
+            url=srv.url,
+            command=srv.command,
+            args=srv.args,
+            # Deferred: per-server tool discovery needs a runner tools/list
+            # round-trip against the live MCP connection (Slice D).
+            tools=[],
+        )
+        for srv in spec.mcp_servers
+    ]
+    local_tools: list[SessionCapabilityTool] = []
+    for schema in ToolManager(spec).get_tool_schemas():
+        fn = schema.get("function", {})
+        name = fn.get("name")
+        if not name:
+            continue
+        local_tools.append(SessionCapabilityTool(name=name, description=fn.get("description")))
+    sub_agents = _sub_agent_capability_tree(spec.sub_agents)
+    return mcp_servers, local_tools, sub_agents
+
+
 def _build_policy_engine_from_spec(
     spec: AgentSpec,
     session_id: str,
@@ -20305,6 +20409,99 @@ def create_sessions_router(
                 code=ErrorCode.NOT_FOUND,
             )
         return _to_agent_object(agent, agent_cache)
+
+    @router.get("/sessions/{session_id}/capabilities")
+    async def get_session_capabilities(
+        request: Request,
+        session_id: str,
+    ) -> SessionCapabilities:
+        """
+        Return the consolidated capabilities of the session's agent.
+
+        Read-only observability view over the agent bound to
+        *session_id*. Resolves the agent the same way as
+        ``GET /sessions/{id}/agent`` (under ``LEVEL_READ``, no
+        top-level assertion), so it works identically for a top
+        agent's conversation and a sub-agent's child conversation.
+        For an omnigent-spawned named sub-agent child the capabilities
+        are context-aware — resolved from the child's ``sub_agent_name``
+        against the parent spec.
+
+        Four groups:
+
+        * ``skills`` — the merged (bundled + host-discovered) skill
+          list, from the same runner-owned source as the session
+          snapshot (best-effort; empty until the runner fetch warms).
+        * ``mcp_servers`` — the agent's MCP server config
+          (secret-free). Per-server ``tools`` is deferred and left
+          empty (Slice D needs a runner ``tools/list`` round-trip).
+        * ``local_tools`` — the agent's effective local/builtin
+          function tools (name + description).
+        * ``sub_agents`` — the declared sub-agent tree from the spec.
+
+        :param request: The incoming FastAPI request.
+        :param session_id: Session identifier, e.g. ``"conv_abc123"``.
+        :returns: The session's :class:`SessionCapabilities`.
+        :raises OmnigentError: If the session or agent is not found,
+            or the session has no agent binding.
+        """
+        user_id = _require_user(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is None:
+                raise OmnigentError(
+                    f"Session not found: {session_id!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
+        if conv.agent_id is None:
+            raise OmnigentError(
+                "Session has no agent binding",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        # Resolve the effective (context-aware) spec off the loop: the
+        # agent lookup + cold-cache bundle load are blocking DB/IO, and
+        # ToolManager schema construction is CPU-bound.
+        spec = await asyncio.to_thread(_resolve_session_effective_spec, conv, agent_store)
+        if spec is None:
+            raise OmnigentError(
+                f"Agent spec not found for session: {session_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+        mcp_servers, local_tools, sub_agents = await asyncio.to_thread(
+            _build_session_capability_groups, spec
+        )
+        # Skills are runner-owned: reuse the same best-effort, cache-backed
+        # source the session snapshot uses (the runner's GET /skills proxy).
+        # No new runner round-trip is introduced here.
+        from omnigent.runtime import get_runner_client, get_runner_router
+
+        runner_client: httpx.AsyncClient | None = None
+        skills_router = get_runner_router()
+        if skills_router is not None:
+            try:
+                routed = skills_router.client_for_session_resources(session_id)
+                runner_client = routed.client
+            except (LookupError, httpx.HTTPError, OmnigentError):
+                _logger.debug(
+                    "No runner bound for session=%s on capabilities build",
+                    session_id,
+                )
+        if runner_client is None:
+            runner_client = get_runner_client()
+        skills = await _fetch_runner_skills(runner_client, session_id)
+        return SessionCapabilities(
+            session_id=session_id,
+            agent_id=conv.agent_id,
+            sub_agent_name=conv.sub_agent_name,
+            skills=skills,
+            mcp_servers=mcp_servers,
+            local_tools=local_tools,
+            sub_agents=sub_agents,
+        )
 
     @router.get(
         "/sessions/{session_id}/agent/contents",

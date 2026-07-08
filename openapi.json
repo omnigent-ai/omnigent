@@ -3163,6 +3163,171 @@
         "title": "SessionAgentChangedEvent",
         "type": "object"
       },
+      "SessionCapabilities": {
+        "description": "Consolidated read-only capabilities of a session's bound agent.\n\nReturned by `GET /v1/sessions/{session_id}/capabilities`. Resolves\nthe agent bound to the session (context-aware: an omnigent-spawned\nsub-agent child reports THAT sub-agent's capabilities, resolved from\nits `sub_agent_name` against the parent spec).",
+        "properties": {
+          "agent_id": {
+            "description": "The agent row bound to the session. For an omnigent-spawned sub-agent this is the parent's agent id (the sub-agent is identified by `sub_agent_name`).",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "local_tools": {
+            "description": "The agent's effective local/builtin function tools, name + description only.",
+            "items": {
+              "$ref": "#/components/schemas/SessionCapabilityTool"
+            },
+            "title": "Local Tools",
+            "type": "array"
+          },
+          "mcp_servers": {
+            "description": "The agent's MCP server config (secret fields omitted). Each carries a deferred, empty `tools` list.",
+            "items": {
+              "$ref": "#/components/schemas/SessionCapabilityMCPServer"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          },
+          "object": {
+            "default": "session.capabilities",
+            "description": "Fixed resource type, `\"session.capabilities\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The queried session/conversation id.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "skills": {
+            "description": "The merged (bundled + host-discovered) skill list, from the same runner-owned source as the session snapshot.",
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The dispatched sub-agent name when the session is a named sub-agent child, else `None`.",
+            "title": "Sub Agent Name"
+          },
+          "sub_agents": {
+            "description": "The declared sub-agent tree from the spec.",
+            "items": {
+              "$ref": "#/components/schemas/SubAgentCapability"
+            },
+            "title": "Sub Agents",
+            "type": "array"
+          }
+        },
+        "required": [
+          "session_id",
+          "agent_id"
+        ],
+        "title": "SessionCapabilities",
+        "type": "object"
+      },
+      "SessionCapabilityMCPServer": {
+        "description": "An MCP server's config plus a (deferred) per-server tool list.\n\nReuses the secret-free `MCPServerSummary` shape (name,\ntransport, description, url, command, args) and adds `tools`.\nPer-server tool discovery needs a runner round-trip (`tools/list`\nagainst the live MCP connection), so it is deferred \u2014 this field is\nalways empty in this slice.",
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "tools": {
+            "description": "Discovered MCP tools for this server. Always `[]` for now (Slice D: per-server tool discovery via the runner).",
+            "items": {
+              "$ref": "#/components/schemas/SessionCapabilityTool"
+            },
+            "title": "Tools",
+            "type": "array"
+          },
+          "transport": {
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "name",
+          "transport"
+        ],
+        "title": "SessionCapabilityMCPServer",
+        "type": "object"
+      },
+      "SessionCapabilityTool": {
+        "description": "Safe summary of a single function tool for the capabilities view.\n\nSurfaces only the name and one-line description so the panel can\nlist which tools an agent can call without leaking the full\nparameter schema.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "One-line summary from the tool schema, or `None` when the tool declares none.",
+            "title": "Description"
+          },
+          "name": {
+            "description": "OpenAI-format function name, e.g. `\"sys_os_read\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SessionCapabilityTool",
+        "type": "object"
+      },
       "SessionChangedFilesInvalidatedEvent": {
         "description": "The session's changed-files list may have changed \u2014 refetch it.\n\nA coarse \"something changed\" signal (per-file events aren't available\nfor git-mode workspaces) emitted by the runner after a file-mutating\ntool. The web treats it as a refetch trigger for the changed-files\npanel; transient (not persisted \u2014 the REST list is source of truth).",
         "properties": {
@@ -5311,6 +5476,45 @@
           "arguments"
         ],
         "title": "SlashCommandData",
+        "type": "object"
+      },
+      "SubAgentCapability": {
+        "description": "A declared sub-agent node in the capabilities tree.\n\nBuilt recursively from `spec.sub_agents` so the panel can render\nthe full declared sub-agent hierarchy. Read-only and derived purely\nfrom the spec \u2014 no live child-session status this slice.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional free-text description from the spec.",
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Sub-agent name as declared in the parent spec, e.g. `\"researcher\"`. `None` when the spec omits it.",
+            "title": "Name"
+          },
+          "sub_agents": {
+            "description": "This sub-agent's own declared sub-agents, same shape, recursively.",
+            "items": {
+              "$ref": "#/components/schemas/SubAgentCapability"
+            },
+            "title": "Sub Agents",
+            "type": "array"
+          }
+        },
+        "title": "SubAgentCapability",
         "type": "object"
       },
       "TerminalCommandData": {
@@ -7853,6 +8057,50 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/capabilities": {
+      "get": {
+        "description": "Return the consolidated capabilities of the session's agent.\n\nRead-only observability view over the agent bound to\n*session_id*. Resolves the agent the same way as\n`GET /sessions/{id}/agent` (under `LEVEL_READ`, no\ntop-level assertion), so it works identically for a top\nagent's conversation and a sub-agent's child conversation.\nFor an omnigent-spawned named sub-agent child the capabilities\nare context-aware \u2014 resolved from the child's `sub_agent_name`\nagainst the parent spec.\n\nFour groups:\n\n* `skills` \u2014 the merged (bundled + host-discovered) skill\n  list, from the same runner-owned source as the session\n  snapshot (best-effort; empty until the runner fetch warms).\n* `mcp_servers` \u2014 the agent's MCP server config\n  (secret-free). Per-server `tools` is deferred and left\n  empty (Slice D needs a runner `tools/list` round-trip).\n* `local_tools` \u2014 the agent's effective local/builtin\n  function tools (name + description).\n* `sub_agents` \u2014 the declared sub-agent tree from the spec.\n\n**Returns:** The session's `SessionCapabilities`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, or the session has no agent binding.",
+        "operationId": "get_session_capabilities_v1_sessions__session_id__capabilities_get",
+        "parameters": [
+          {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionCapabilities"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Capabilities",
+        "tags": [
+          "sessions"
         ]
       }
     },
