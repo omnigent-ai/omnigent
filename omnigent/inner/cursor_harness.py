@@ -33,11 +33,9 @@ Env vars read at startup:
 - ``HARNESS_CURSOR_BUNDLE_DIR`` / ``HARNESS_CURSOR_AGENT_NAME``:
   reserved for future use.
 - ``HARNESS_CURSOR_PERMISSION_MODE``: mirrors
-  ``HARNESS_CLAUDE_SDK_PERMISSION_MODE``. ``None``/unset keeps the
-  historical ``"default"`` behavior (every Cursor-native tool call surfaces
-  a human-consent elicitation card). ``"auto"`` / ``"bypassPermissions"``
-  skip that elicitation for native tools, matching claude-sdk's autonomous
-  modes. A configured Omnigent policy DENY still applies in every mode.
+  ``HARNESS_CLAUDE_SDK_PERMISSION_MODE``. Unset defaults to ``"default"``
+  (elicit on every native tool call). ``"auto"`` / ``"bypassPermissions"``
+  skip that elicitation, matching claude-sdk's autonomous modes.
 """
 
 from __future__ import annotations

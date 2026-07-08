@@ -1636,11 +1636,15 @@ async def test_ensure_session_writes_hooks_json(
     # ...so it must be owner-only (the baked token is never world-readable).
     assert wrapper.stat().st_mode & 0o777 == 0o700
 
-    # auto_review=True must be passed so cursor's own TUI approval prompts
-    # are bypassed in favour of the executor's native elicitation card.
+    # auto_review is deliberately NOT set: leaving it unset (the SDK's true
+    # Local-SDK default) lets tool calls run without cursor's own Smart Auto
+    # Review classifier able to HOLD on one and hit the hardcoded "Local SDK
+    # runs cannot request interactive approval" dead end. Omnigent's own
+    # policy/elicitation gate (_evaluate_native_tool_policy) remains the sole
+    # approval authority for native tools regardless.
     local_opts = sdk_state.get("local_options", [])
     assert local_opts, "LocalAgentOptions was never constructed"
-    assert local_opts[0].auto_review is True
+    assert local_opts[0].auto_review is None
 
     await executor.close()
     # Both files are cleaned up on close.

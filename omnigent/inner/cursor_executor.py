@@ -481,13 +481,10 @@ class CursorExecutor(Executor):
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
         :param agent_name: Optional agent name passed to the SDK.
         :param skills_filter: Accepted for parity; cursor has no skill mechanism here.
-        :param permission_mode: Mirrors :class:`~omnigent.inner.claude_sdk_executor.
-            ClaudeSDKExecutor`'s ``permission_mode``. ``"default"`` (the
-            historical cursor behavior) surfaces a human-consent elicitation
-            card for every Cursor-native tool call, same as an unset
-            ``permission_mode`` always did. ``"auto"`` / ``"bypassPermissions"``
-            skip that elicitation for native tools (Omnigent policy DENY still
-            applies), matching the claude-sdk harness's autonomous mode.
+        :param permission_mode: Mirrors ``ClaudeSDKExecutor``'s
+            ``permission_mode``. ``"default"`` elicits on every native tool
+            call (historical behavior). ``"auto"`` / ``"bypassPermissions"``
+            skip elicitation for native tools (a policy DENY still applies).
         """
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
@@ -553,18 +550,15 @@ class CursorExecutor(Executor):
 
         1. **Policy hard-deny**: if the policy evaluator returns
            ``POLICY_ACTION_DENY``, block immediately without prompting the
-           user (the admin already decided). Runs in EVERY permission mode
-           — including ``auto`` / ``bypassPermissions`` — so a configured
-           Omnigent policy can't be skipped by opting into autonomous mode.
+           user (the admin already decided). Runs in every permission mode,
+           including ``auto`` / ``bypassPermissions``.
 
         2. **Native elicitation**: for any other outcome (ALLOW, ASK, or no
            evaluator wired), invoke ``_elicitation_handler`` so the user can
            review the call and approve or abort the remainder of the turn
-           from the web-UI approval card. Skipped entirely when
-           ``permission_mode`` is ``"auto"`` or ``"bypassPermissions"`` —
-           mirrors :meth:`ClaudeSDKExecutor._can_use_tool_gate
-           <omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor._can_use_tool_gate>`,
-           which pre-approves autonomously in those modes.
+           from the web-UI approval card. Skipped when ``permission_mode``
+           is ``"auto"`` / ``"bypassPermissions"``, mirroring
+           ``ClaudeSDKExecutor._can_use_tool_gate``.
 
         Cursor native tools execute inside the Cursor process, so they have
         already started by the time the executor observes
@@ -718,12 +712,18 @@ class CursorExecutor(Executor):
             local_kwargs: dict[str, Any] = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
-                # Bypass cursor's own TUI approval prompts so native tool calls
-                # reach the executor's event stream and can be gated via the
-                # web-UI elicitation card (see _evaluate_native_tool_policy).
-                # Without this cursor may pause internally for its own approval
-                # before emitting a ToolCallRequest event.
-                "auto_review": True,
+                # auto_review is deliberately left unset. A prior version set
+                # it to True to "bypass cursor's own TUI approval", but the
+                # Local SDK's true default (no auto_review, no
+                # sandbox_options) already runs tool calls without any gate
+                # of cursor's own. auto_review=True instead re-enables Smart
+                # Auto Review, which can HOLD (ask a human) on a call — fatal
+                # in Local SDK mode, since requestApproval() is hardcoded in
+                # the bridge to always deny with "Local SDK runs cannot
+                # request interactive approval ...". Reproduced live: an MCP
+                # call failed with that exact message under auto_review=True
+                # and succeeded once it was unset. Omnigent's own
+                # _evaluate_native_tool_policy gate is unaffected either way.
             }
             # Tell the SDK to read project-level settings (including hooks.json).
             if state.hooks_file is not None:
