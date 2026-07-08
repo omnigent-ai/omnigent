@@ -108,6 +108,7 @@ import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
   type PendingUserMessage,
+  type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
@@ -465,6 +466,39 @@ export function shouldShowAuthorBadge(
   isSessionShared: boolean,
 ): boolean {
   return isSessionShared && author !== undefined && author !== viewerId;
+}
+
+/**
+ * Whether a submitted message should be held in the client-side queue rather
+ * than POSTed immediately via `send()`.
+ *
+ * Queue when the session is busy (the normal type-ahead case) OR when this
+ * conversation already has a queued message — even if the session momentarily
+ * reads idle. The direct-send and queue-drain paths aren't ordered against each
+ * other, so a later message taking the direct path while an earlier one waits
+ * in the queue would overtake it; this surfaces on harnesses whose status
+ * flickers idle between quick turns (cursor-native), scrambling delivery order.
+ * Funnelling every send through the single FIFO queue once anything is queued
+ * preserves it. A brand-new chat (no `conversationId`) always sends so the
+ * session gets created.
+ *
+ * @param conversationId The bound conversation id, or `null` for a new chat.
+ * @param status The local send lifecycle state.
+ * @param sessionStatus The server-derived session status.
+ * @param queuedMessages The client-side queue across all conversations.
+ * @returns `true` to enqueue, `false` to send now.
+ */
+export function shouldQueueSend(
+  conversationId: string | null,
+  status: "idle" | "streaming",
+  sessionStatus: SessionStatus,
+  queuedMessages: QueuedMessage[],
+): boolean {
+  if (conversationId === null) return false;
+  const isBusy =
+    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  return isBusy || hasQueued;
 }
 
 // Author labels render only in a shared session; ChatPage provides the
@@ -972,26 +1006,16 @@ export function ChatPage() {
       setReconnectDialogOpen(true);
       return;
     }
-    // Busy → hold the message in the client-side queue (shown in the strip
-    // above the composer) instead of POSTing now. The queue head is flushed
-    // FIFO when the session next goes idle. Only queue for an already-bound
-    // conversation; a brand-new chat (no conversationId) always sends so the
-    // session gets created.
-    //
-    // Also queue when this conversation ALREADY has queued messages, even if it
-    // momentarily reads idle: the direct-send path and the queue drain aren't
-    // ordered against each other, so a later message that slips through here
-    // while an earlier one waits in the queue would jump ahead of it. This
-    // surfaces on harnesses whose status flickers idle between quick turns
-    // (e.g. cursor-native), scrambling the delivered order; funnelling every
-    // send for a queued conversation through the single FIFO queue preserves it.
+    // Hold the message in the client-side queue (shown in the strip above the
+    // composer) instead of POSTing now when the session is busy — or when this
+    // conversation already has a queued message, so a later send can't overtake
+    // an earlier queued one. See shouldQueueSend for the full rationale. The
+    // queue drains FIFO via maybeFlushQueuedHead (which enqueueMessage triggers
+    // immediately when the session is genuinely idle, so nothing stalls).
     const chat = useChatStore.getState();
-    const isBusy =
-      chat.status === "streaming" || ["running", "waiting"].includes(chat.sessionStatus);
-    const hasQueued =
-      chat.conversationId !== null &&
-      chat.queuedMessages.some((m) => m.conversationId === chat.conversationId);
-    if ((isBusy || hasQueued) && chat.conversationId !== null) {
+    if (
+      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
+    ) {
       chat.enqueueMessage(text, files);
       return;
     }
