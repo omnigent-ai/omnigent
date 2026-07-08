@@ -2296,6 +2296,10 @@ async def _execute_web_search_tool(
     model = getattr(getattr(agent_spec, "executor", None), "model", None)
     if model and not model.startswith("databricks-"):
         harness = getattr(getattr(agent_spec, "executor", None), "harness_kind", None)
+        if not harness or harness == "omnigent":
+            from omnigent.llms.routing import infer_harness_from_model
+
+            harness = infer_harness_from_model(model) or harness
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.onboarding.provider_config import _EXECUTOR_TYPE_HARNESS_ALIASES
 

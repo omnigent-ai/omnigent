@@ -360,6 +360,10 @@ class ToolManager:
                 from omnigent.onboarding.provider_config import _EXECUTOR_TYPE_HARNESS_ALIASES
 
                 harness = self._spec.executor.harness_kind
+                if not harness or harness == "omnigent":
+                    from omnigent.llms.routing import infer_harness_from_model
+
+                    harness = infer_harness_from_model(model) or harness
                 canonical = canonicalize_harness(harness) or harness
                 canonical = _EXECUTOR_TYPE_HARNESS_ALIASES.get(canonical, canonical)
                 if canonical in ("openai-agents", "codex"):
