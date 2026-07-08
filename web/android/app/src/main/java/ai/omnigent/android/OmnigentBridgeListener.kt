@@ -24,7 +24,6 @@ class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
 ) : WebViewCompat.WebMessageListener {
-
     override fun onPostMessage(
         view: WebView,
         message: WebMessageCompat,
@@ -42,7 +41,10 @@ class OmnigentBridgeListener(
             }
 
         when (json.optString("method")) {
-            "setBadgeCount" -> notifications.setBadgeCount(json.optInt("count", 0))
+            "setBadgeCount" -> {
+                notifications.setBadgeCount(json.optInt("count", 0))
+            }
+
             "notify" -> {
                 val params = json.optJSONObject("params") ?: return
                 val title = params.optString("title").ifEmpty { return }
@@ -52,12 +54,14 @@ class OmnigentBridgeListener(
                     navigatePath = params.optString("navigatePath").ifEmpty { null },
                 )
             }
-            "blobBase64" ->
+
+            "blobBase64" -> {
                 blobSaver.save(
                     base64 = json.optString("base64").ifEmpty { return },
                     mimeType = json.optString("mimeType").ifEmpty { "application/octet-stream" },
                     suggestedName = json.optString("name"),
                 )
+            }
         }
     }
 
