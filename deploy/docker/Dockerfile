@@ -211,7 +211,7 @@ RUN apt-get update \
 # user-namespace remapping the sandbox user maps to an unprivileged, unused
 # host id. Unused by the root-based providers.
 RUN groupadd -g 1000660000 sandbox \
- && useradd -m -u 1000660000 -g sandbox sandbox
+ && useradd -m -d /sandbox -u 1000660000 -g sandbox sandbox
 
 # Git credential helper for private repositories over HTTPS: answers
 # `git credential get` from GIT_TOKEN / GIT_USERNAME in the
