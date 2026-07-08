@@ -136,12 +136,15 @@ class SqlAgent(Base):
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),
-        Index("ix_agents_created_at", "created_at"),
+        Index("ix_agents_created_at", "workspace_id", "created_at", "id"),
         # Template agents have unique names; session-scoped agents (kind=2)
         # may reuse the same name across conversations. The partial index enforces
         # uniqueness only within the template set. kind = 1 is the "template" code.
+        # MySQL has no partial index, so the WHERE is dropped there and the
+        # unique spans all kinds (more restrictive; acceptable).
         Index(
             "ix_agents_template_name",
+            "workspace_id",
             "name",
             unique=True,
             sqlite_where=text("kind = 1"),
@@ -184,8 +187,14 @@ class SqlFile(Base):
     session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
-        Index("ix_files_created_at", "created_at"),
-        Index("ix_files_session_id_created_at", "session_id", "created_at", "id"),
+        Index("ix_files_created_at", "workspace_id", "created_at", "id"),
+        Index(
+            "ix_files_session_id_created_at",
+            "workspace_id",
+            "session_id",
+            "created_at",
+            "id",
+        ),
     )
 
 
@@ -288,7 +297,7 @@ class SqlAccountToken(Base):
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_account_tokens_kind"),
-        Index("ix_account_tokens_expires_at", "expires_at"),
+        Index("ix_account_tokens_expires_at", "workspace_id", "expires_at", "id"),
     )
 
 
@@ -335,7 +344,14 @@ class SqlSessionPermission(Base):
 
     __table_args__ = (
         CheckConstraint("level IN (1, 2, 3, 4)", name="ck_session_permissions_level"),
-        Index("ix_session_permissions_conversation_id", "conversation_id"),
+        # Lookups by conversation (get_session_owner) filter workspace_id +
+        # conversation_id; user_id trails to complete the PK.
+        Index(
+            "ix_session_permissions_conversation_id",
+            "workspace_id",
+            "conversation_id",
+            "user_id",
+        ),
     )
 
 
@@ -525,24 +541,32 @@ class SqlConversation(Base):
             "host_id IS NULL OR workspace IS NOT NULL",
             name="ck_conversations_workspace_required_for_host",
         ),
-        Index("ix_conversations_created_at", "created_at"),
-        Index("ix_conversations_updated_at", "updated_at"),
-        Index("ix_conversations_kind", "kind"),
+        Index("ix_conversations_created_at", "workspace_id", "created_at", "id"),
+        Index("ix_conversations_updated_at", "workspace_id", "updated_at", "id"),
+        Index("ix_conversations_kind", "workspace_id", "kind", "id"),
         # Agent lookups: find the conversation(s) that own a given agent.
-        Index("ix_conversations_agent_id", "agent_id"),
-        Index("ix_conversations_root_conversation_id", "root_conversation_id"),
+        Index("ix_conversations_agent_id", "workspace_id", "agent_id", "id"),
+        Index(
+            "ix_conversations_root_conversation_id",
+            "workspace_id",
+            "root_conversation_id",
+            "id",
+        ),
         # Reconnect/relaunch reconciliation looks up a runner's session(s)
         # by runner_id (list_conversations_by_runner_id) on every runner
         # reconnect; index it to avoid a full scan.
-        Index("ix_conversations_runner_id", "runner_id"),
+        Index("ix_conversations_runner_id", "workspace_id", "runner_id", "id"),
         # Phase 4: partial unique index on (parent_conversation_id,
         # title) prevents two same-named children under the same
         # parent (G36 race protection at the DB layer). The
         # ``sqlite_where`` / ``postgresql_where`` clauses scope the
         # index so multiple top-level conversations (NULL parent)
         # remain valid.
+        # MySQL has no partial index, so the WHERE is dropped there and the
+        # unique spans NULL parents too (more restrictive; acceptable).
         Index(
             "ix_conversations_parent_title_unique",
+            "workspace_id",
             "parent_conversation_id",
             "title",
             unique=True,
@@ -555,6 +579,7 @@ class SqlConversation(Base):
         # kind = 2 is the "sub_agent" code (enum_codecs.CONVERSATION_KIND).
         Index(
             "idx_conversations_parent",
+            "workspace_id",
             "parent_conversation_id",
             text("created_at DESC"),
             text("id DESC"),
@@ -628,11 +653,20 @@ class SqlConversationItem(Base):
     __table_args__ = (
         Index(
             "ix_conversation_items_conversation_id_position",
+            "workspace_id",
             "conversation_id",
             "position",
             unique=True,
         ),
-        Index("ix_conversation_items_response_id", "response_id"),
+        # Fork-truncation looks up by workspace_id + conversation_id +
+        # response_id; id trails to complete the PK.
+        Index(
+            "ix_conversation_items_response_id",
+            "workspace_id",
+            "conversation_id",
+            "response_id",
+            "id",
+        ),
         CheckConstraint(
             "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
             name="ck_conversation_items_type",
@@ -758,8 +792,17 @@ class SqlComment(Base):
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2)", name="ck_comments_status"),
-        Index("ix_comments_conversation_id", "conversation_id"),
-        Index("ix_comments_created_at", "created_at"),
+        # Serves list_for_conversation: WHERE workspace_id + conversation_id
+        # ORDER BY created_at, id. Folds created_at in (over a bare
+        # conversation_id index) so the sort is index-ordered; trails id to
+        # complete the PK.
+        Index(
+            "ix_comments_conversation_id",
+            "workspace_id",
+            "conversation_id",
+            "created_at",
+            "id",
+        ),
     )
 
 
@@ -873,17 +916,24 @@ class SqlPolicy(Base):
     __table_args__ = (
         CheckConstraint("type IN (1, 2)", name="ck_policies_type"),
         CheckConstraint("scope IN (1, 2)", name="ck_policies_scope"),
-        Index("ix_policies_created_at", "created_at"),
-        Index("ix_policies_session_id", "session_id"),
+        Index("ix_policies_created_at", "workspace_id", "created_at", "id"),
+        Index("ix_policies_session_id", "workspace_id", "session_id", "id"),
         # Name uniqueness keys on name_cksum (sha256 of name) rather than the
         # wide name column, for a compact 32-byte index entry.
-        UniqueConstraint("session_id", "name_cksum", name="uq_policies_session_id_name_cksum"),
+        UniqueConstraint(
+            "workspace_id",
+            "session_id",
+            "name_cksum",
+            name="uq_policies_session_id_name_cksum",
+        ),
         # Default policies must have unique names; session-scoped policies
         # may reuse the same name across conversations. Mirrors
         # ix_agents_template_name scoping to the 'default' set. scope = 1 is
-        # the "default" code.
+        # the "default" code. MySQL has no partial index, so the WHERE is
+        # dropped there and the unique spans all scopes (more restrictive).
         Index(
             "ix_policies_default_name_cksum",
+            "workspace_id",
             "name_cksum",
             unique=True,
             sqlite_where=text("scope = 1"),
@@ -976,7 +1026,9 @@ class SqlHost(Base):
         # upsert-on-connect logic (look up by owner+name to detect host_id
         # rotation) stays consistent.
         UniqueConstraint("workspace_id", "owner", "name", name="uq_hosts_workspace_owner_name"),
-        UniqueConstraint("token_hash", name="uq_hosts_token_hash"),
+        # resolve_launch_token filters workspace_id + token_hash, so scoping
+        # the unique to the workspace keeps that lookup index-served.
+        UniqueConstraint("workspace_id", "token_hash", name="uq_hosts_token_hash"),
     )
 
 
