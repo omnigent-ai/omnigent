@@ -52,14 +52,13 @@ def test_remy_memory_builtins_present(remy_spec: AgentSpec) -> None:
 def test_remy_memory_builtins_share_bank(remy_spec: AgentSpec) -> None:
     """All three builtins use the same bank_id so memory is shared across runs."""
     memory_tools = [
-        b for b in remy_spec.tools.builtins
+        b
+        for b in remy_spec.tools.builtins
         if b.name in {"hindsight_recall", "hindsight_retain", "hindsight_reflect"}
     ]
     assert len(memory_tools) == 3, "Expected exactly 3 Hindsight builtins"
     bank_ids = {b.config.get("bank_id") for b in memory_tools}
-    assert bank_ids == {"remy"}, (
-        f"All memory builtins must share bank_id 'remy'; got {bank_ids}"
-    )
+    assert bank_ids == {"remy"}, f"All memory builtins must share bank_id 'remy'; got {bank_ids}"
 
 
 def test_remy_has_no_sub_agents(remy_spec: AgentSpec) -> None:
