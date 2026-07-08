@@ -44,7 +44,7 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 |---|---|---|
 | server | `uv run omnigent server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
 | host   | `uv run omnigent host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
-| vite   | `npm run dev -- --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
+| vite   | `npm run dev -- --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
 
 Before Vite starts (and on a manual Vite restart), omnidev runs `npm install`
 in `web/` when needed — `node_modules/` is missing, or `package.json` /
@@ -73,10 +73,37 @@ canonical checkout path. Per-process logs are written through to
 ```
 --server-port <N>   Force the backend port (default: probe from 6767)
 --vite-port <N>     Force the Vite port (default: probe from 5173)
+--vite-host <ADDR>  Vite bind host (default: 127.0.0.1; use 0.0.0.0 for LAN access)
+--trust-lan-origins Trust this machine's LAN origins (for device testing)
 --pod-dir <PATH>    Use a specific pod dir instead of the per-repo default
 --no-vite           Backend + host only (no frontend)
 --clean             Wipe the pod dir before starting
 ```
+
+`--vite-host 0.0.0.0` exposes the Vite dev server on all interfaces for device
+testing. Vite still proxies API traffic to the pod backend through `127.0.0.1`.
+
+### Testing from a phone or tablet
+
+`--vite-host 0.0.0.0` alone lets a device load the UI, but the backend runs in
+single-user local mode, where its CSRF/CSWSH guard trusts only loopback
+origins. A device loads the UI at `http://<your-lan-ip>:<vite-port>`, so its
+browser stamps that non-loopback origin on every request — and the guard then
+rejects multipart uploads (403) and refuses the live WebSocket stream.
+
+`--trust-lan-origins` fixes that: omnidev enumerates this machine's LAN IPv4
+addresses and trusts the matching `http://<ip>:<vite-port>` origins via the
+server's `OMNIGENT_WS_ALLOWED_ORIGINS` allowlist (merged with any value you
+already export). It stays exact-match — only those origins are trusted, nothing
+is disabled — so it's for dev pods, not deployed servers. The trusted origins
+are printed in the combined log at startup.
+
+```bash
+omnidev --vite-host 0.0.0.0 --trust-lan-origins
+```
+
+This covers IPv4 LAN addresses; mDNS `.local` hostnames and HTTPS origins are
+not auto-trusted (add those to `OMNIGENT_WS_ALLOWED_ORIGINS` yourself).
 
 ## Keys
 
