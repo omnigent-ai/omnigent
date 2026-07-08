@@ -218,6 +218,7 @@ from omnigent.server.schemas import (
     OutputTextDeltaEvent,
     PaginatedList,
     PermissionObject,
+    PolicyDeniedEvent,
     PolicySummary,
     ReadStatePutRequest,
     ReasoningStartedEvent,
@@ -492,6 +493,29 @@ def _publish_collaboration_mode(session_id: str, mode: str) -> None:
         type="session.collaboration_mode",
         conversation_id=session_id,
         mode=mode,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
+    """
+    Publish a native policy-DENY signal on the session stream.
+
+    A native harness's policy DENY is decided synchronously in the
+    ``/policies/evaluate`` hook response, so nothing on the stream otherwise
+    reflects that an action was blocked. This surfaces the decision as a
+    positive event for observers (web UI, capability bench). Fire-and-forget.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param reason: Deny reason from the deciding policy.
+    :param phase: The policy phase the DENY landed on, e.g. ``"tool_call"``.
+    :returns: None.
+    """
+    event = PolicyDeniedEvent(
+        type="response.policy_denied",
+        conversation_id=session_id,
+        reason=reason,
+        phase=phase,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -16436,6 +16460,13 @@ def create_sessions_router(
             _spawn_native_blocked_notice_forward(
                 session_id, result.reason or "Blocked by policy.", result.deciding_policy
             )
+        # A tool-call DENY is decided synchronously here, so nothing else on the
+        # stream reflects that the native tool was blocked. Publish a positive
+        # signal so observers (web UI, capability bench) see the decision rather
+        # than infer it from the blocked tool's absence. Observational, so it is
+        # not gated on write access.
+        if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
+            _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",

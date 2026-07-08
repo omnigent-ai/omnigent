@@ -2175,6 +2175,52 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PolicyDeniedEvent": {
+        "description": "Signal that a policy DENY was enforced on a native harness turn.\n\nA native harness (Claude Code, Codex, ...) routes each tool call and\nprompt through Omnigent's policy engine via the vendor command-hook\n(`POST /v1/sessions/{id}/policies/evaluate`). The DENY verdict is\nreturned synchronously to that hook, so unlike the SDK/wrap path there is\nno stream-visible signal that a native action was blocked \u2014 only the\n*effect* (the blocked tool never runs). This event surfaces the decision\nitself on the session stream so observers (the web UI, the capability\nbench) can see a native DENY as a positive signal rather than infer it\nfrom an absence.\n\nFire-and-forget and observational: it does not gate the turn (the hook\nresponse already did that) and carries no correlation id.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session/conversation id the DENY applies to, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "phase": {
+            "default": "",
+            "description": "The policy phase the DENY landed on, e.g. `\"tool_call\"`.",
+            "title": "Phase",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "description": "Human-readable deny reason from the deciding policy, e.g. `\"Blocked by policy.\"`.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "response.policy_denied",
+            "description": "Always `\"response.policy_denied\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "PolicyDeniedEvent",
+        "type": "object"
+      },
       "PolicySummary": {
         "description": "Safe subset of a policy's spec for API exposure.\n\nExposes the policy name, type, and phases so the UI can\ndisplay which guardrails are active on an agent. The full\npolicy body (prompt text, callable path, label conditions)\nis intentionally excluded \u2014 this is a summary for display,\nnot a full spec.",
         "properties": {
@@ -2886,6 +2932,7 @@
             "response.output_file.done": "#/components/schemas/OutputFileDoneEvent",
             "response.output_item.done": "#/components/schemas/OutputItemDoneEvent",
             "response.output_text.delta": "#/components/schemas/OutputTextDeltaEvent",
+            "response.policy_denied": "#/components/schemas/PolicyDeniedEvent",
             "response.queued": "#/components/schemas/QueuedEvent",
             "response.reasoning.started": "#/components/schemas/ReasoningStartedEvent",
             "response.reasoning_summary_text.delta": "#/components/schemas/ReasoningSummaryTextDeltaEvent",
@@ -3013,6 +3060,9 @@
           },
           {
             "$ref": "#/components/schemas/ElicitationResolvedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/PolicyDeniedEvent"
           },
           {
             "$ref": "#/components/schemas/CreatedEvent"
