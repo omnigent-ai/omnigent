@@ -4,7 +4,7 @@
 
 ### The open-source meta-harness for all your AI agents.
 
-Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Hermes, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Hermes, Pi, Goose, Kimi, Qwen, Kiro, Antigravity, Copilot, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
@@ -30,7 +30,7 @@ Omnigent lets you:
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
 - **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
-  Hermes, Pi, and custom agents (defined in YAML) together in the same
+  Hermes, Pi, Goose, Kimi, Qwen, Kiro, Antigravity, Copilot, and custom agents (defined in YAML) together in the same
   session. Ask one agent to review another's work, or split a task across
   agents that are each good at different things.
 
@@ -97,7 +97,7 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   The installer offers to set this up for you.
 - **`git`** (required).
 - **Node.js 22 LTS or newer** with **`npm`**, for the npm-installed coding
-  harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
+  harnesses (Claude, Codex, OpenCode, Pi, Goose, Kimi, Qwen). `omnigent run` installs the
   harness CLI you pick.
   https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
@@ -106,7 +106,7 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   one-time approvals also appear as Chat cards. See
   `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
+  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`, `goose`, `kimi`, `qwen`, `antigravity`, `opencode`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
