@@ -172,7 +172,7 @@ def _require_hindsight() -> None:
     """
     Validate that the Hindsight client SDK is installed.
 
-    ``hindsight-client`` is an optional dependency (the ``hindsight`` extra),
+    ``hindsight-client`` is an optional dependency (the ``memory`` extra),
     so the memory tools probe for it at construction time and fail with an
     actionable message rather than an opaque ImportError mid-run. Mirrors the
     Modal sandbox launcher's ``_ensure_sdk``.
@@ -185,7 +185,7 @@ def _require_hindsight() -> None:
         raise ImportError(
             "The 'hindsight-client' SDK is required for the Hindsight memory "
             "tools (hindsight_retain / hindsight_recall / hindsight_reflect). "
-            "Install it with `pip install 'omnigent[hindsight]'`."
+            "Install it with `pip install 'omnigent[memory]'`."
         ) from exc
 
 
@@ -250,7 +250,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
-    # Hindsight long-term memory (optional ``hindsight`` extra). Each factory
+    # Hindsight long-term memory (optional ``memory`` extra). Each factory
     # probes for ``hindsight-client`` and fails with an install hint if absent.
     "hindsight_retain": _create_hindsight_retain,
     "hindsight_recall": _create_hindsight_recall,
