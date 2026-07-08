@@ -40,12 +40,15 @@ _ORIGINAL_PKS: dict[str, list[str]] = {
 
 # Tables whose PK was changed again by a migration that came after
 # r1a2b3c4d5e6. The value is the expected PK at the current head.
-# ``test_workspace_id_leads_the_primary_key`` skips these so that later
+# ``test_workspace_id_leads_the_primary_key`` uses these so that later
 # migrations don't break the r-migration test.
 _LATER_PK_OVERRIDES: dict[str, list[str]] = {
     # v1a2b3c4d5e6 replaced (workspace_id, owner, name) with
     # (workspace_id, host_id) for the hosts table.
     "hosts": ["workspace_id", "host_id"],
+    # y1a2b3c4d5e6 widened conversation_items to insert conversation_id
+    # between workspace_id and id.
+    "conversation_items": ["workspace_id", "conversation_id", "id"],
 }
 
 

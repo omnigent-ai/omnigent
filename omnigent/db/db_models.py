@@ -602,10 +602,13 @@ class SqlConversationItem(Base):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # conversation_id leads id in the PK so a conversation's items stay
+    # contiguous for the per-conversation prefix scans that dominate reads.
     conversation_id: Mapped[str] = mapped_column(
         String(64),
+        primary_key=True,
     )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
     response_id: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[int] = mapped_column(Integer)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
