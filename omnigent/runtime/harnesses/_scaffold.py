@@ -822,24 +822,19 @@ class HarnessApp:
 
         Default implementation: uses the exception class name as
         the error code (e.g. ``"RuntimeError"``, ``"ValueError"``)
-        and ``str(exception)`` as the message. AP's retryable-error
-        allowlist at
-        :data:`omnigent.runtime.harnesses._client_executor._RETRYABLE_HARNESS_ERROR_CODES`
-        uses semantic names (``"rate_limit_exceeded"``,
-        ``"timeout"``, etc.), so the default mapping makes every
-        failure non-retryable — safe but coarse.
+        and ``str(exception)`` as the message. Semantic names
+        (``"rate_limit_exceeded"``, ``"timeout"``, etc.) are more
+        useful to downstream callers than raw exception class names;
+        the default mapping is safe but coarse.
 
         Per-harness subclasses (e.g.
         :class:`omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`)
         override this to translate SDK-specific exception types
-        onto the semantic allowlist so the retry-classification
-        promise from §Error envelopes / step 5j actually fires
-        for known retryable failures.
+        onto semantic error codes for known retryable failures.
 
         :param exception: The exception :meth:`run_turn` raised.
         :returns: An :class:`ErrorDetail` whose ``code`` field
-            ideally matches one of the contract-recognized codes
-            so AP-side retry decisions can act on it.
+            uses a contract-recognized code when one is known.
         """
         from omnigent.server.schemas import ErrorDetail
 

@@ -254,10 +254,14 @@ class ExecutorError(ExecutorEvent):
         failures (auth, SDK crash, protocol violation) that would recur.
         Consumed by the omnigent workflow to pick between
         :class:`RetryableLLMError` and :class:`PermanentLLMError`.
+    :param code: Optional semantic error code for retryable failures,
+        e.g. ``"timeout"`` or ``"connection_error"``. When omitted,
+        adapters use their safest generic retryable code.
     """
 
     message: str
     retryable: bool = False
+    code: str | None = None
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:

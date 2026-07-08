@@ -2632,6 +2632,34 @@ def test_inject_user_message_raises_when_prompt_never_renders(
     assert send_keys == [], "no keystrokes should be sent when the prompt never renders"
 
 
+def test_claude_prompt_ready_timeout_classifier_is_precise() -> None:
+    """
+    Only the prompt-readiness boot timeout is eligible for recovery.
+
+    Other bridge ``RuntimeError`` paths must not trigger pane teardown
+    and relaunch, because they can represent unrelated tmux or submit
+    failures.
+    """
+    assert claude_native_bridge.is_claude_prompt_ready_timeout(
+        claude_native_bridge.ClaudePromptReadyTimeout("prompt never rendered")
+    )
+    assert claude_native_bridge.is_claude_prompt_ready_timeout(
+        RuntimeError(
+            "Claude Code terminal did not become ready within 30.0s "
+            "(input prompt never rendered). The message was not delivered."
+        )
+    )
+    assert not claude_native_bridge.is_claude_prompt_ready_timeout(
+        RuntimeError("Claude terminal tmux target is not advertised yet.")
+    )
+    assert not claude_native_bridge.is_claude_prompt_ready_timeout(
+        RuntimeError(
+            "Claude Code did not accept the submitted message within 10.0s "
+            "(the draft is still in the input box). The message was not delivered."
+        )
+    )
+
+
 def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -149,6 +149,19 @@ def _build_error() -> Executor:
     return executor
 
 
+def _build_retryable_error() -> Executor:
+    """
+    MockExecutor scripted with a retryable :class:`ExecutorError`.
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    executor = MockExecutor()
+    executor._turns.append(
+        [ExecutorError(message="transient boot timeout", retryable=True, code="timeout")]
+    )
+    return executor
+
+
 def _build_cancelled() -> Executor:
     """
     MockExecutor scripted with a provider-side :class:`TurnCancelled`.
@@ -180,6 +193,7 @@ _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
     "error": _build_error,
+    "retryable_error": _build_retryable_error,
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
 }

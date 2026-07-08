@@ -155,6 +155,12 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_retryable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields a retryable ExecutorError."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "retryable_error")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -403,6 +409,32 @@ async def test_executor_error_terminates_with_response_failed(
     assert "mock error" in error_detail["message"]
 
 
+async def test_retryable_executor_error_preserves_semantic_code(
+    use_retryable_error: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    ``ExecutorError.retryable`` survives the adapter boundary.
+
+    A retryable inner error must not be demoted to a plain
+    ``RuntimeError`` code in the emitted ``response.failed`` detail.
+    """
+    conv_id = "conv_retryable_err"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    error_detail = events[-1].data["response"]["error"]
+    assert error_detail is not None
+    assert error_detail["code"] == "timeout"
+    assert "transient boot timeout" in error_detail["message"]
+
+
 async def test_turn_cancelled_terminates_with_response_cancelled(
     use_cancelled: None,
     manager: HarnessProcessManager,
@@ -441,10 +473,9 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
 
     What breaks if this fails: a ``RetryableLLMError(code="timeout")``
     raised by the inner executor would surface as
-    ``code="RetryableLLMError"``, AP's allowlist wouldn't
-    match, and the workflow's retry policy would treat the
-    timeout as permanent. The whole point of step 5j is the
-    structured ``code + retryable`` flowing through.
+    ``code="RetryableLLMError"`` instead of the semantic timeout code.
+    The whole point of the adapter override is the structured
+    ``code + retryable`` flowing through.
     """
     from omnigent.llms.errors import LLMErrorDetail, RetryableLLMError
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -458,10 +489,9 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
     )
     detail = adapter._build_error_detail(error)
 
-    # Code preserved verbatim — the Omnigent allowlist matches this and
-    # marks the failure retryable. Class-name fallback (which the
-    # base HarnessApp implementation would have used) gives
-    # ``"RetryableLLMError"`` instead, which Omnigent would NOT match.
+    # Code preserved verbatim. Class-name fallback (which the base
+    # HarnessApp implementation would have used) gives
+    # ``"RetryableLLMError"`` instead.
     assert detail.code == "rate_limit_exceeded"
     assert "rate-limited by gateway" in detail.message
     # Sanity: the base class fallback would NOT have produced this
@@ -511,7 +541,7 @@ def test_classify_openai_exception_maps_known_types() -> None:
         body=None,
     )
 
-    # Each known type maps onto AP's allowlist verbatim.
+    # Each known type maps onto a semantic error code verbatim.
     assert _classify_openai_exception(rate) == "rate_limit_exceeded"
     assert _classify_openai_exception(timeout) == "timeout"
     assert _classify_openai_exception(connect) == "connection_error"
@@ -679,9 +709,7 @@ def test_classify_anthropic_exception_maps_known_types(
     which can still surface raw :class:`anthropic.RateLimitError`
     upward when the SDK's framing layer fails. Without this
     classifier, those would render as ``[llm] RateLimitError``
-    and AP's retry allowlist (which uses semantic codes, not
-    class names) wouldn't match — silent demotion of retryable
-    failures to permanent.
+    instead of a semantic rate-limit code.
     """
     import sys
     import types

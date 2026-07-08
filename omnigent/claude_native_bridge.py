@@ -167,8 +167,38 @@ _DRAFT_NEEDLE_MAX_CHARS = 24
 # surfaces in the web UI error banner instead of only in the terminal.
 _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
+_CLAUDE_PROMPT_READY_TIMEOUT_PREFIX = "Claude Code terminal did not become ready"
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
+
+
+class ClaudePromptReadyTimeout(RuntimeError):
+    """Claude Code never rendered its input prompt after tmux launch."""
+
+
+def is_claude_prompt_ready_timeout(exc: BaseException) -> bool:
+    """
+    Return whether *exc* is the Claude Code prompt readiness timeout.
+
+    The recovery path must stay narrow: only a launched tmux pane whose
+    Claude input prompt never rendered is safe to tear down and cold
+    relaunch automatically. Other ``RuntimeError`` paths (tmux target
+    missing, send-keys failure, submit verification failure) keep their
+    existing behavior.
+
+    :param exc: Exception raised by :func:`inject_user_message`.
+    :returns: ``True`` for the prompt-readiness timeout class/message.
+    """
+    if isinstance(exc, ClaudePromptReadyTimeout):
+        return True
+    # Compatibility for stale bridge/runtime pairs that still raise a
+    # plain RuntimeError with the historic prompt-timeout message.
+    if type(exc) is not RuntimeError:
+        return False
+    message = str(exc)
+    return message.startswith(_CLAUDE_PROMPT_READY_TIMEOUT_PREFIX) and (
+        "input prompt never rendered" in message
+    )
 
 
 def _absolute_syntactic_path(path: Path) -> Path:
@@ -3006,7 +3036,7 @@ def _wait_for_claude_prompt_ready(
     # error banner this raises into, instead of only a generic timeout
     # the user has to open the terminal to diagnose.
     pane = _capture_pane(socket_path, tmux_target)
-    raise RuntimeError(
+    raise ClaudePromptReadyTimeout(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         "(input prompt never rendered). The message was not delivered."
         + _format_terminal_failure_tail(pane)

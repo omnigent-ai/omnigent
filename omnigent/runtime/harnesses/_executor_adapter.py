@@ -108,6 +108,15 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
+_DEFAULT_RETRYABLE_EXECUTOR_ERROR_CODE = "server_error"
+
+
+class _RetryableExecutorError(RuntimeError):
+    """Runtime wrapper preserving ``ExecutorError.retryable`` semantics."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code or _DEFAULT_RETRYABLE_EXECUTOR_ERROR_CODE
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -457,7 +466,10 @@ class ExecutorAdapter(HarnessApp):
                                 error=event.message,
                             )
                             agent_span = None
-                        raise RuntimeError(f"inner executor error: {event.message}")
+                        error_message = f"inner executor error: {event.message}"
+                        if event.retryable:
+                            raise _RetryableExecutorError(error_message, code=event.code)
+                        raise RuntimeError(error_message)
         except ElicitationDeclinedError:
             # Fallback for executors that propagate the exception directly
             # (non-SDK / non-spawned-task paths). SDK-based executors use
@@ -1043,16 +1055,11 @@ class ExecutorAdapter(HarnessApp):
         error code.
 
         Default :meth:`HarnessApp._build_error_detail` uses
-        ``type(exception).__name__`` as the code, which never
-        matches AP's retryable allowlist
-        (:data:`omnigent.runtime.harnesses._client_executor._RETRYABLE_HARNESS_ERROR_CODES`).
-        Result before this override: a known transient failure
-        like ``anthropic.RateLimitError`` would surface as
-        ``code="RateLimitError"``, AP's allowlist wouldn't match,
-        retry-classification would call it permanent, and the
-        workflow would never retry. This method closes that gap
-        for the harnesses the adapter wraps (claude-sdk, plus the
-        codex / openai-agents-sdk / pi wraps once they land).
+        ``type(exception).__name__`` as the code. This method preserves
+        structured retryable executor codes and translates known SDK
+        exceptions to semantic codes such as ``"timeout"`` or
+        ``"connection_error"`` so callers do not have to understand
+        provider-specific exception class names.
 
         Translation precedence:
 
@@ -1062,8 +1069,7 @@ class ExecutorAdapter(HarnessApp):
            project's own classification, so use it verbatim.
         2. OpenAI SDK exceptions — surfaced by the inner OpenAI
            Agents SDK / Open Responses SDK executors used by the
-           codex / openai-agents wraps. Maps onto the AP
-           allowlist's semantic codes
+           codex / openai-agents wraps. Maps onto semantic codes
            (``"rate_limit_exceeded"``, ``"server_error"``,
            ``"timeout"``, ``"connection_error"``).
         3. ``claude_agent_sdk`` exceptions — the Claude Code CLI
@@ -1080,9 +1086,8 @@ class ExecutorAdapter(HarnessApp):
 
         :param exception: The exception :meth:`run_turn` raised.
         :returns: An :class:`ErrorDetail` whose ``code`` matches
-            the Omnigent allowlist for known retryable failures, and is
-            still informative (provider exception class) for the
-            rest.
+            the Omnigent contract for known retryable failures, and is
+            still informative (provider exception class) for the rest.
         """
         from omnigent.errors import OmnigentError
         from omnigent.server.schemas import ErrorDetail
@@ -1091,14 +1096,15 @@ class ExecutorAdapter(HarnessApp):
             # Project-internal structured errors already carry a
             # semantic code (e.g. ``RetryableLLMError(code="timeout")``).
             return ErrorDetail(code=exception.code, message=str(exception))
+        if isinstance(exception, _RetryableExecutorError):
+            return ErrorDetail(code=exception.code, message=str(exception))
 
         code = classify_inner_exception(exception)
         if code is not None:
             return ErrorDetail(code=code, message=str(exception))
 
         # Unknown exception type — preserve the class name so
-        # operators can still grep for it in logs, even though
-        # AP's retry allowlist won't match.
+        # operators can still grep for it in logs.
         return super()._build_error_detail(exception)
 
     async def on_shutdown(self) -> None:
@@ -1341,6 +1347,8 @@ def classify_inner_exception(exception: BaseException) -> str | None:
         ``"rate_limit_exceeded"``), or ``None`` when no
         classifier matched.
     """
+    if isinstance(exception, _RetryableExecutorError):
+        return exception.code
     for classifier in (
         _classify_openai_exception,
         _classify_anthropic_exception,
