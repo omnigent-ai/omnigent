@@ -88,7 +88,7 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :id)"
+                "VALUES (:id, :ts, :ts, 1, :id)"
             ),
             {"id": "conv_ws_null", "ts": 1700000000},
         )
@@ -103,7 +103,7 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :ws, :id)"
             ),
             {
                 "id": "conv_ws_cli",
@@ -140,7 +140,7 @@ def test_check_constraint_blocks_host_id_without_workspace(
                 sa.text(
                     "INSERT INTO conversations "
                     "(id, created_at, updated_at, kind, host_id, root_conversation_id) "
-                    "VALUES (:id, :ts, :ts, 'default', :hid, :id)"
+                    "VALUES (:id, :ts, :ts, 1, :hid, :id)"
                 ),
                 {
                     "id": "conv_ws_host_no_ws",
@@ -174,7 +174,7 @@ def test_check_constraint_allows_host_id_with_workspace(
             sa.text(
                 "INSERT INTO hosts "
                 "(owner, name, host_id, status, created_at, updated_at) "
-                "VALUES (:o, :n, :hid, 'online', :ts, :ts)"
+                "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {"o": "alice@test.com", "n": "laptop", "hid": "host_abc", "ts": 1700000000},
         )
@@ -182,7 +182,7 @@ def test_check_constraint_allows_host_id_with_workspace(
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, host_id, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :hid, :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :hid, :ws, :id)"
             ),
             {
                 "id": "conv_ws_host_ok",
@@ -226,7 +226,7 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO hosts "
                 "(owner, name, host_id, status, created_at, updated_at) "
-                "VALUES (:o, :n, :hid, 'online', :ts, :ts)"
+                "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {"o": "alice@test.com", "n": "laptop", "hid": "host_del", "ts": 1700000000},
         )
@@ -234,7 +234,7 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, host_id, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :hid, :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :hid, :ws, :id)"
             ),
             {"id": "conv_fk", "ts": 1700000000, "hid": "host_del", "ws": "/ws/foo"},
         )
@@ -273,7 +273,7 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :ws, :id)"
             ),
             {
                 "id": "conv_cli_ws_only",

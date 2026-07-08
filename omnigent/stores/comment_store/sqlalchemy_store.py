@@ -6,7 +6,8 @@ import uuid
 
 from sqlalchemy import delete, func, select
 
-from omnigent.db.db_models import SqlComment
+from omnigent.db.db_models import SqlComment, current_workspace_id
+from omnigent.db.enum_codecs import decode_comment_status, encode_comment_status
 from omnigent.db.utils import (
     get_or_create_engine,
     make_managed_session_maker,
@@ -29,7 +30,7 @@ def _to_entity(row: SqlComment) -> Comment:
         start_index=row.start_index,
         end_index=row.end_index,
         body=row.body,
-        status=row.status,
+        status=decode_comment_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
         anchor_content=row.anchor_content,
@@ -58,7 +59,7 @@ class SqlAlchemyCommentStore(CommentStore):
     def get(self, comment_id: str, conversation_id: str) -> Comment | None:
         """Fetch a single comment by id, scoped to a conversation. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlComment, comment_id)
+            row = session.get(SqlComment, (current_workspace_id(), comment_id))
             if row is None or row.conversation_id != conversation_id:
                 return None
             return _to_entity(row)
@@ -86,7 +87,7 @@ class SqlAlchemyCommentStore(CommentStore):
             start_index=start_index,
             end_index=end_index,
             body=body,
-            status="draft",
+            status=encode_comment_status("draft"),
             created_at=created_us // 1_000_000,
             updated_at=created_us,
             anchor_content=anchor_content,
@@ -102,7 +103,10 @@ class SqlAlchemyCommentStore(CommentStore):
         path: str | None = None,
     ) -> list[Comment]:
         """Return comments for a conversation. See base class for contract."""
-        stmt = select(SqlComment).where(SqlComment.conversation_id == conversation_id)
+        stmt = select(SqlComment).where(
+            SqlComment.workspace_id == current_workspace_id(),
+            SqlComment.conversation_id == conversation_id,
+        )
         if path is not None:
             stmt = stmt.where(SqlComment.path == path)
         stmt = stmt.order_by(SqlComment.created_at)
@@ -120,11 +124,11 @@ class SqlAlchemyCommentStore(CommentStore):
     ) -> Comment | None:
         """Update a comment's fields, scoped to a conversation. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlComment, comment_id)
+            row = session.get(SqlComment, (current_workspace_id(), comment_id))
             if row is None or row.conversation_id != conversation_id:
                 return None
             if status is not None:
-                row.status = status
+                row.status = encode_comment_status(status)
             if body is not None:
                 row.body = body
             if status is not None or body is not None:
@@ -134,7 +138,7 @@ class SqlAlchemyCommentStore(CommentStore):
     def delete(self, comment_id: str, conversation_id: str) -> Comment | None:
         """Delete a single comment by id, scoped to a conversation. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlComment, comment_id)
+            row = session.get(SqlComment, (current_workspace_id(), comment_id))
             if row is None or row.conversation_id != conversation_id:
                 return None
             entity = _to_entity(row)
@@ -153,7 +157,10 @@ class SqlAlchemyCommentStore(CommentStore):
                 func.count(SqlComment.id),
                 func.max(SqlComment.updated_at),
             )
-            .where(SqlComment.conversation_id.in_(conversation_ids))
+            .where(
+                SqlComment.workspace_id == current_workspace_id(),
+                SqlComment.conversation_id.in_(conversation_ids),
+            )
             .group_by(SqlComment.conversation_id)
         )
         with self._session() as session:
@@ -164,6 +171,9 @@ class SqlAlchemyCommentStore(CommentStore):
 
     def remove_conversation(self, conversation_id: str) -> None:
         """Delete all comments for a conversation. See base class for contract."""
-        stmt = delete(SqlComment).where(SqlComment.conversation_id == conversation_id)
+        stmt = delete(SqlComment).where(
+            SqlComment.workspace_id == current_workspace_id(),
+            SqlComment.conversation_id == conversation_id,
+        )
         with self._session() as session:
             session.execute(stmt)

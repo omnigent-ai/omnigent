@@ -63,6 +63,15 @@ _AUTH_PROSE: dict[AuthModel, str] = {
 # These stay explicitly SUPPORTED for the official (P0) harnesses: every one
 # completes a turn, calls tools, and enforces a policy DENY. They are NOT
 # derived from any capability axis (see the module docstring / seam brief).
+#
+# tool_calling is now live-probed on BOTH transports: SDK harnesses via
+# full-server (server-dispatched builtin) and native harnesses via native-tui
+# (observing the vendor's own function_call item). policy_deny is live on
+# full-server (spec-baked deny) and wired on native-tui (a session-attached CEL
+# deny + the response.policy_denied stream signal), though native enforcement is
+# a follow-up. An environment gap (fail-open policy, no tool-provocation mapping,
+# CEL unavailable) reports SKIPPED, so SUPPORTED here only ever drifts on a
+# genuine capability gap.
 _PROBE_ONLY_DECLARED: dict[str, Verdict] = {
     "basic_turn": Verdict.SUPPORTED,
     "tool_calling": Verdict.SUPPORTED,

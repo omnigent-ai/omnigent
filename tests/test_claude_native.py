@@ -546,7 +546,9 @@ def test_attach_url_encodes_path_components() -> None:
     )
 
 
-def test_materialized_session_spec_is_valid_terminal_metadata(tmp_path: Path) -> None:
+def test_materialized_session_spec_is_valid_terminal_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     The generated bundled agent spec validates for Omnigent session creation.
 
@@ -554,6 +556,10 @@ def test_materialized_session_spec_is_valid_terminal_metadata(tmp_path: Path) ->
     normal session row; Claude itself is launched as a terminal
     resource after creation, not through this executor block.
     """
+    # Pin the host shells so the declared terminals are deterministic
+    # ($SHELL=bash → the default/first terminal is ``bash``).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/bash")
     path = claude_native._materialize_claude_agent_spec(tmp_path)
 
     raw = yaml.safe_load(path.read_text())
@@ -581,13 +587,12 @@ def test_materialized_session_spec_is_valid_terminal_metadata(tmp_path: Path) ->
     # sys_session_create/send/close from the native CLI.
     assert raw["spawn"] is True
     assert spec.spawn is True
-    # The native wrapper declares a default shell terminal so the
-    # relay advertises the sys_terminal_* family to the wrapped
-    # Claude Code (the relay gate is a non-empty ``terminals:``
-    # block on this spec); a dropped block silently removes the
-    # terminal tools from the native CLI.
+    # The native wrapper declares one terminal per installed shell so the
+    # relay advertises the sys_terminal_* family to the wrapped Claude Code
+    # (the relay gate is a non-empty ``terminals:`` block on this spec); a
+    # dropped block silently removes the terminal tools from the native CLI.
     assert spec.terminals is not None
-    assert spec.terminals["shell"].command == "bash"
+    assert spec.terminals["bash"].command == "bash"
 
 
 def test_remote_run_preflights_local_claude_binary(

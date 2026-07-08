@@ -758,6 +758,21 @@ class TestConstructor(unittest.TestCase):
 
             self.assertEqual(paths, [config_path])
 
+    def test_claude_internal_write_files_includes_credentials_when_present(self):
+        from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            config_path = home / ".claude.json"
+            config_path.write_text("{}\n", encoding="utf-8")
+            credentials_path = home / ".claude" / ".credentials.json"
+            credentials_path.parent.mkdir(parents=True, exist_ok=True)
+            credentials_path.write_text("{}\n", encoding="utf-8")
+            with patch("omnigent.inner.claude_sdk_executor.pathlib.Path.home", return_value=home):
+                paths = _claude_internal_write_files()
+
+            self.assertEqual(paths, [config_path, credentials_path])
+
 
 # ---------------------------------------------------------------------------
 # Tests: MCP tool building

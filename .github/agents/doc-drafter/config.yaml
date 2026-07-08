@@ -91,7 +91,9 @@ prompt: |
   Read `DIFF_FILE` (with `sys_os_read`) carefully — it is your source of truth.
   Pull exact facts (flags, defaults, harness ids, CLI names, config keys) from the
   diff itself. Never invent a fact; if the diff doesn't settle something a doc must
-  state, flag it for manual review rather than guessing.
+  state, flag it for manual review rather than guessing. Note whether the PR
+  **adds**, **changes**, or **removes/deprecates** a user-facing feature — that
+  decides whether you add, edit, or delete docs (Step 3).
 
   ## Step 2 — Inspect the live site and decide placement
   This is why you have the whole site checked out. Read
@@ -116,7 +118,23 @@ prompt: |
   ## Step 3 — Write the edit (scoped, grounded, in-style)
   Make the change. Editing an existing `page.mdx` in place is best when one fits;
   otherwise create the new page and wire it into the nav. Keep the change scoped
-  to what this PR introduced. Be accurate and concise — no marketing fluff.
+  to what this PR introduced, changed, or removed. Be accurate and concise — no
+  marketing fluff.
+
+  When the PR **removes or deprecates** a user-facing feature, the docs must
+  shrink to match — treat this as first-class as adding docs, never as a no-op:
+  - **Feature removed**: delete the now-untrue content. If a whole page documented
+    only that feature, delete the `page.mdx` (with `sys_os_shell` `git rm`) AND
+    remove its entry from the `SECTIONS` array in
+    `components/DocsSidebarFull.js`. If it was one section of a larger page, cut
+    that section and any references, table rows, or links pointing at it. Leave
+    no dangling nav entry or cross-link to a page you deleted.
+  - **Feature deprecated (not yet gone)**: keep the page but mark it deprecated in
+    the site's usual style and state the replacement/removal timeline if the diff
+    gives one; don't delete prematurely.
+  Ground the removal in the diff: only delete docs for what the PR actually
+  removed. If you're unsure whether a doc references the removed feature elsewhere
+  on the site, flag it under "Manual review needed" rather than guessing.
 
   Match the site's conventions by mirroring a real file:
   - **Existing page**: preserve its `pageMeta(...)` frontmatter and JSX component
@@ -142,9 +160,10 @@ prompt: |
 
   ## Output contract (your final assistant text)
   After a line containing exactly `<!-- DOC_DRAFT_SUMMARY -->`, emit:
-  - `## Changes documented` — one bullet per file you created or edited (pages and
-    `components/DocsSidebarFull.js`): `path — what changed`. If you made no edits,
-    write `_No edits made._` and explain under the next section.
+  - `## Changes documented` — one bullet per file you created, edited, or deleted
+    (pages and `components/DocsSidebarFull.js`): `path — what changed` (say
+    "deleted" / "removed section" for removals). If you made no edits, write
+    `_No edits made._` and explain under the next section.
   - `## Manual review needed` — a checklist: `- [ ] <doc path or area> — <why>`.
     Use this for things you genuinely cannot do well: stale screenshots/GIFs (you
     can't regenerate binaries), or a placement decision you're truly unsure about.

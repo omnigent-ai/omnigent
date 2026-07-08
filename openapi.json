@@ -980,6 +980,33 @@
         "title": "ConversationRef",
         "type": "object"
       },
+      "CopyFilesRequest": {
+        "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; `source_session_id`\nmust be a STRICT ancestor of the destination up its\n`parent_conversation_id` chain (spawn lineage) \u2014 the destination may\nnot name itself as the source. The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.",
+        "properties": {
+          "file_ids": {
+            "description": "Non-empty, unique ids of the source-owned files to copy, e.g. `[\"file_abc123\"]`.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "File Ids",
+            "type": "array",
+            "uniqueItems": true
+          },
+          "source_session_id": {
+            "description": "Session that owns the source files, e.g. `\"conv_parent\"`. Must be a strict ancestor of the destination.",
+            "title": "Source Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_session_id",
+          "file_ids"
+        ],
+        "title": "CopyFilesRequest",
+        "type": "object"
+      },
       "CreateDefaultPolicyRequest": {
         "description": "Request body for `POST /v1/policies`.",
         "properties": {
@@ -1672,7 +1699,7 @@
                 "type": "null"
               }
             ],
-            "description": "Optional git worktree options. When set, the server creates a worktree for a new branch off `workspace` on the host and binds the runner to it (the fork-resume path; mirrors `POST /v1/sessions`). `None` binds `workspace` directly. `host_id` is always present (it is in the path), so no host requirement check is needed here."
+            "description": "Optional git worktree options. In create mode the server creates a worktree for a new branch off `workspace` on the host and binds the runner to it (the fork-resume path; mirrors `POST /v1/sessions`). In bind mode (`existing_worktree=True`) `workspace` already IS a worktree \u2014 no worktree is created; `branch_name` is recorded as the session's `git_branch` for display and opt-in cleanup. `None` binds `workspace` directly. `host_id` is always present (it is in the path), so no host check is needed here."
           },
           "session_id": {
             "description": "Session to bind the new runner to, e.g. `\"conv_abc123\"`.",
@@ -2146,6 +2173,52 @@
           "level"
         ],
         "title": "PermissionObject",
+        "type": "object"
+      },
+      "PolicyDeniedEvent": {
+        "description": "Signal that a policy DENY was enforced on a native harness turn.\n\nA native harness (Claude Code, Codex, ...) routes each tool call and\nprompt through Omnigent's policy engine via the vendor command-hook\n(`POST /v1/sessions/{id}/policies/evaluate`). The DENY verdict is\nreturned synchronously to that hook, so unlike the SDK/wrap path there is\nno stream-visible signal that a native action was blocked \u2014 only the\n*effect* (the blocked tool never runs). This event surfaces the decision\nitself on the session stream so observers (the web UI, the capability\nbench) can see a native DENY as a positive signal rather than infer it\nfrom an absence.\n\nFire-and-forget and observational: it does not gate the turn (the hook\nresponse already did that) and carries no correlation id.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session/conversation id the DENY applies to, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "phase": {
+            "default": "",
+            "description": "The policy phase the DENY landed on, e.g. `\"tool_call\"`.",
+            "title": "Phase",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "description": "Human-readable deny reason from the deciding policy, e.g. `\"Blocked by policy.\"`.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "response.policy_denied",
+            "description": "Always `\"response.policy_denied\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "PolicyDeniedEvent",
         "type": "object"
       },
       "PolicySummary": {
@@ -2859,6 +2932,7 @@
             "response.output_file.done": "#/components/schemas/OutputFileDoneEvent",
             "response.output_item.done": "#/components/schemas/OutputItemDoneEvent",
             "response.output_text.delta": "#/components/schemas/OutputTextDeltaEvent",
+            "response.policy_denied": "#/components/schemas/PolicyDeniedEvent",
             "response.queued": "#/components/schemas/QueuedEvent",
             "response.reasoning.started": "#/components/schemas/ReasoningStartedEvent",
             "response.reasoning_summary_text.delta": "#/components/schemas/ReasoningSummaryTextDeltaEvent",
@@ -2986,6 +3060,9 @@
           },
           {
             "$ref": "#/components/schemas/ElicitationResolvedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/PolicyDeniedEvent"
           },
           {
             "$ref": "#/components/schemas/CreatedEvent"
@@ -3295,18 +3372,6 @@
             "description": "Built-in agent to bind the fork to, switching it away from the source's agent/harness (e.g. fork a Claude session into a Codex one, or a Claude-SDK session into Claude Code). When `None`, the fork keeps the source's agent. Must be a built-in agent (one listed by `GET /v1/agents`).",
             "title": "Agent Id"
           },
-          "model_override": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Model id to launch the fork on, e.g. `\"databricks-gpt-5-4-mini\"` \u2014 the \"restart with model\" path. Overrides the model the fork would otherwise inherit from the source; the value is validated and family-checked against the fork's harness. When `None` (default), the fork keeps the source's model (within the same provider family).",
-            "title": "Model Override"
-          },
           "title": {
             "anyOf": [
               {
@@ -3336,7 +3401,7 @@
         "type": "object"
       },
       "SessionGitOptions": {
-        "description": "Git worktree options for `POST /v1/sessions`.\n\nWhen present, the server creates a git worktree on the host for a\nnew branch and starts the runner in that worktree instead of the\npicked directory. Requires `host_id` to be set (and therefore\n`workspace`, which is interpreted as the source repository\ndirectory). See designs/SESSION_GIT_WORKTREE.md.",
+        "description": "Git worktree options for `POST /v1/sessions`.\n\nRequires `host_id` to be set (and therefore `workspace`, which\nis interpreted as the source repository directory). Two modes,\nselected by `existing_worktree`:\n\n- **create** (default): the server creates a git worktree on the\n  host for a new branch and starts the runner in that worktree\n  instead of the picked directory.\n- **bind** (`existing_worktree=True`): `workspace` already IS a\n  pre-existing worktree; no worktree is created. `branch_name` is\n  recorded as the session's `git_branch` for display and opt-in\n  cleanup, and `base_branch` must not be set.\n\nSee designs/SESSION_GIT_WORKTREE.md.",
         "properties": {
           "base_branch": {
             "anyOf": [
@@ -3347,13 +3412,19 @@
                 "type": "null"
               }
             ],
-            "description": "Optional base ref to branch from, e.g. `\"main\"` or `\"origin/main\"`. `None` branches from the source repository's current `HEAD`.",
+            "description": "Optional base ref to branch from, e.g. `\"main\"` or `\"origin/main\"`. `None` branches from the source repository's current `HEAD`. Create mode only \u2014 invalid with `existing_worktree`.",
             "title": "Base Branch"
           },
           "branch_name": {
-            "description": "Name of the new branch to create and check out in the worktree, e.g. `\"feature/login\"`. Validated against git ref-format rules; invalid names fail with `invalid_input`.",
+            "description": "In create mode, the new branch to create and check out, e.g. `\"feature/login\"`. In bind mode, the branch already checked out in the existing worktree. Validated against git ref-format rules; invalid names fail with `invalid_input`.",
             "title": "Branch Name",
             "type": "string"
+          },
+          "existing_worktree": {
+            "default": false,
+            "description": "When `True`, bind to the pre-existing worktree at `workspace` instead of creating one (see above).",
+            "title": "Existing Worktree",
+            "type": "boolean"
           }
         },
         "required": [
@@ -7858,6 +7929,40 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "When set, only return children whose title starts with this agent type (the segment before the `\":\"`). Combined with `session_name` to form the exact title `\"{tool}:{session_name}\"` for server-side filtering.",
+            "in": "query",
+            "name": "tool",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tool"
+            }
+          },
+          {
+            "description": "When set alongside `tool`, only return children whose title matches `\"{tool}:{session_name}\"` exactly.",
+            "in": "query",
+            "name": "session_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Name"
+            }
           }
         ],
         "responses": {
@@ -10157,6 +10262,58 @@
           }
         },
         "summary": "Get Session File Content",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/files:copy": {
+      "post": {
+        "description": "Copy lineage-owned files into this (destination) session.\n\nAuthorizes by spawn lineage: `body.source_session_id` must be a\nSTRICT ancestor of this session up the `parent_conversation_id`\nchain \u2014 the session may not name itself as the source. Each source\nfile is read and re-stored as a new child-scoped row owned by\n`session_id` \u2014 this preserves the session-scoping invariant (the\nchild reads its OWN copy; no cross-session read grant is created).\nValidation is all-or-nothing: an unauthorized source, a missing\nfile, or a request past the copy limits copies nothing.\n\nThe request is bounded before any blob is read: the file count and\nthe summed `StoredFile.bytes` are checked against the copy limits\nduring metadata validation, so an over-limit request is rejected\nwithout buffering a single blob. Within the limits, files are copied\none at a time (read \u2192 create \u2192 put) so peak memory is a single blob,\nnot the whole batch.\n\n**Parameters**\n\n- `body` \u2014 Source session id plus the file ids to copy.\n\n**Returns:** A `session.files.copied` object carrying the `{source_file_id: new_file_id}` mapping.",
+        "operationId": "copy_session_files_v1_sessions__session_id__resources_files_copy_post",
+        "parameters": [
+          {
+            "description": "Destination (child) session/conversation id.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CopyFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Copy Session Files",
         "tags": [
           "session_resources"
         ]

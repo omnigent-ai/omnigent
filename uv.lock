@@ -1654,6 +1654,23 @@ wheels = [
 ]
 
 [[package]]
+name = "hindsight-client"
+version = "0.8.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "aiohttp-retry" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/90/88/8c802e8ea52ab8b7ae62b5ff57545b4c6c1e04f1282066f89fbc12cdb5ab/hindsight_client-0.8.3.tar.gz", hash = "sha256:b91f997eceaabb761267121ed0b6cf9f54213f60838a552f08f6658de4a3e11a", size = 114771, upload-time = "2026-06-18T09:14:24.938Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/0c/593f4e76764f607a16f6db0cb6b61c7c29410466edd388aecaa58990d75b/hindsight_client-0.8.3-py3-none-any.whl", hash = "sha256:52619325f319fc2b43050cab71f1f6a0f5c6f2bdff6bc09a06011a62430713ee", size = 285435, upload-time = "2026-06-18T09:14:23.407Z" },
+]
+
+[[package]]
 name = "hpack"
 version = "4.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2855,6 +2872,7 @@ daytona = [
 dev = [
     { name = "boto3" },
     { name = "filelock" },
+    { name = "hindsight-client" },
     { name = "moto", extra = ["s3"] },
     { name = "mypy" },
     { name = "pathspec" },
@@ -2878,6 +2896,9 @@ e2b = [
 ]
 kubernetes = [
     { name = "kubernetes" },
+]
+memory = [
+    { name = "hindsight-client" },
 ]
 modal = [
     { name = "modal" },
@@ -2921,6 +2942,8 @@ requires-dist = [
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1,<2" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
+    { name = "hindsight-client", marker = "extra == 'dev'", specifier = ">=0.4.0" },
+    { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "keyring", specifier = ">=24,<26" },
     { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = ">=36,<37" },
@@ -2973,7 +2996,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
     { name = "websockets", specifier = ">=10.4,<15" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "memory", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

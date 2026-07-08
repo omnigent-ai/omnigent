@@ -71,7 +71,6 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
-    "openai-agents": "OpenAI Agents SDK",
     codex: "Codex",
     cursor: "Cursor",
     pi: "Pi",
@@ -1054,7 +1053,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("workspace-picker-conflict")).toBeNull();
   });
 
-  it("lists existing worktrees and starts directly in a selected one (no git opts)", async () => {
+  it("lists existing worktrees and starts directly in a selected one (git bind mode)", async () => {
     // The seeded repo has one linked worktree; the main tree is filtered out.
     useHostWorktreesMock.mockReturnValue({
       data: [
@@ -1104,11 +1103,18 @@ describe("NewChatLandingScreen", () => {
 
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    // Workspace is bound straight to the worktree dir; NO git opts are sent
-    // (starting in an existing worktree creates nothing).
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      workspace?: string;
+      git?: { branch_name: string; existing_worktree?: boolean; base_branch?: string };
+    };
+    // Workspace is bound straight to the worktree dir. The git block is in
+    // bind mode (`existing_worktree`): no worktree is created, but the
+    // worktree's branch rides along as `branch_name` so the sidebar shows it
+    // and the delete flow can offer to remove it. No base_branch on a bind.
     expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
-    expect(body.git).toBeUndefined();
+    expect(body.git?.existing_worktree).toBe(true);
+    expect(body.git?.branch_name).toBe("feature/x");
+    expect(body.git?.base_branch).toBeUndefined();
   });
 
   it("creates a new worktree when the prefilled branch name is edited", async () => {
@@ -1154,10 +1160,12 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string) as {
-      git?: { branch_name: string };
+      git?: { branch_name: string; existing_worktree?: boolean };
     };
-    // A new worktree for the edited branch name is requested.
+    // A new worktree for the edited branch name is requested — this is a
+    // create, not a bind, so `existing_worktree` is not set.
     expect(body.git?.branch_name).toBe("feature/y");
+    expect(body.git?.existing_worktree).toBeUndefined();
   });
 
   it("filters the worktree dropdown as you type in the branch combobox", async () => {
@@ -1203,6 +1211,36 @@ describe("NewChatLandingScreen", () => {
     });
     expect(screen.queryByTestId("new-chat-landing-worktree-dropdown")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-worktree-option")).toBeNull();
+  });
+
+  it("generates a unique worktree branch name and sends it on create", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    // Clicking the generate button fills a "worktree-<hex>" name.
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-branch-generate"));
+    const branchInput = screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement;
+    expect(branchInput.value).toMatch(/^worktree-[0-9a-f]{8}$/);
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "spin up a scratch worktree" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      git?: { branch_name: string };
+    };
+    // The generated name rides through as a new-worktree create.
+    expect(body.git?.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 
   it("shows no conflict banner when no live session shares the directory", async () => {

@@ -24,6 +24,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from omnigent.server.schemas import (
+    PolicyDeniedEvent,
     ServerStreamEvent,
     SessionCreatedEvent,
     SessionModelOptionsEvent,
@@ -392,6 +393,77 @@ def test_session_created_event_is_known() -> None:
     # all_in_the_union) relies on ``is_known_event`` — a missed
     # registration would let the new event slip past the gate.
     assert is_known_event("session.created")
+
+
+def test_policy_denied_event_round_trips_through_union() -> None:
+    """``response.policy_denied`` routes via the discriminator.
+
+    ``_publish_policy_denied`` publishes this on a native tool-call DENY so
+    observers (web UI, capability bench) see the decision. If the variant were
+    missing from the union, the SSE serializer's boundary validation would
+    reject the emit and kill the stream. The wire name must be
+    ``response.policy_denied`` (not ``policy_denied``): the web-UI wire decoder
+    matches the raw ``event:`` name literally.
+    """
+    event = PolicyDeniedEvent(
+        type="response.policy_denied",
+        conversation_id="conv_abc",
+        reason="Blocked by policy.",
+        phase="tool_call",
+    )
+    dumped = event.model_dump()
+    parsed = _ADAPTER.validate_python(dumped)
+    assert isinstance(parsed, PolicyDeniedEvent)
+    assert parsed.conversation_id == "conv_abc"
+    assert parsed.phase == "tool_call"
+    assert parsed.reason == "Blocked by policy."
+    assert is_known_event("response.policy_denied")
+
+
+def test_publish_policy_denied_helper_emits_typed_event() -> None:
+    """``sessions._publish_policy_denied`` publishes a typed, union-valid event.
+
+    Captures the published payload via the live publish hook (the same pattern
+    as the status helper test) and asserts the wire name / fields, plus that
+    the dict round-trips the union adapter — the wire-validation gate.
+    """
+    from omnigent.runtime import session_stream as cs
+    from omnigent.server.routes.sessions import _publish_policy_denied
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    real_publish = cs.publish
+
+    def capturing_publish(conversation_id: str, event: dict[str, Any]) -> None:
+        captured.append((conversation_id, event))
+
+    cs.publish = capturing_publish  # type: ignore[assignment]
+    try:
+        _publish_policy_denied("conv_abc", "Blocked by policy.", "tool_call")
+    finally:
+        cs.publish = real_publish  # type: ignore[assignment]
+
+    assert len(captured) == 1
+    conv, event = captured[0]
+    assert conv == "conv_abc"
+    assert event["type"] == "response.policy_denied"
+    assert event["conversation_id"] == "conv_abc"
+    assert event["phase"] == "tool_call"
+    assert event["reason"] == "Blocked by policy."
+    parsed = _ADAPTER.validate_python(event)
+    assert isinstance(parsed, PolicyDeniedEvent)
+
+
+def test_policy_denied_format_sse_uses_response_prefixed_wire_name() -> None:
+    """``_format_sse`` emits ``event: response.policy_denied``.
+
+    Locks the exact ``event:`` line the web-UI wire decoder and the bench's
+    native driver key on — a rename to ``policy_denied`` would silently break
+    both (the web UI drops the frame, the driver's key misses).
+    """
+    from omnigent.server.routes.sessions import _format_sse
+
+    sse = _format_sse("response.policy_denied", {"type": "response.policy_denied"})
+    assert sse.startswith("event: response.policy_denied\ndata: {")
 
 
 def test_publish_session_status_helper_uses_waiting_literal() -> None:

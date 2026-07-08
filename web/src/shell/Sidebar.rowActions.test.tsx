@@ -48,6 +48,10 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+// Force a multi-user (non-local) server so the "Shared with me" tab renders —
+// jsdom's default loopback origin would otherwise read as single-user and hide
+// the tabs the shared-session row actions rely on.
+vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { __resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
@@ -238,9 +242,13 @@ describe("double-click to rename", () => {
 
   it("does not enter rename on double-click for a viewer-only row", () => {
     // permission_level 1 is below the edit threshold (>= 2), so the kebab's
-    // Rename item is disabled and double-click must be inert too.
+    // Rename item is disabled and double-click must be inert too. A viewer-only
+    // (non-owner) session lives on the "Shared with me" tab, so switch to it
+    // before reaching for the row.
     mockConversations([{ ...CONV, permission_level: 1 }]);
     renderSidebar();
+    // Radix Tabs triggers activate on mousedown (primary button), not click.
+    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
 

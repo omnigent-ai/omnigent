@@ -51,7 +51,7 @@ message is only sent to the server when it's flushed or steered.
 | **Edit** | pull the message back into the composer, purely client-side; persists across navigation/refresh |
 | **Delete** | drop the message from the queue |
 | **Steer** | POST it now (jump the queue) — deliver mid-turn where the harness supports it |
-| **Reorder** *(optional, follow-up)* | client-side drag to reorder the queue |
+| **Reorder** | client-side drag (grip handle) to reorder the queue within a conversation |
 
 ### Promote-to-bubble rule
 
@@ -81,15 +81,19 @@ message that arrives mid-response:
 | cursor-sdk / copilot-sdk | buffer & drain | ❌ next turn |
 | **codex-native** | explicit **`turn/steer`** RPC when a turn is active | ✅ deterministic *(verified)* |
 | **claude-native** | `send-keys` into the **live pane**; the TUI folds the paste into the response | ✅ verified (best-effort timing) |
-| cursor-native / pi-native / hermes-native | paste / inbox-queue into the app | ⚠️ app-defined — **not yet verified live** |
-| opencode-native | HTTP prompt; the native server has **no steer endpoint** → queued as a new prompt | ❌ next turn (verified) |
-| qwen / goose / kimi / kiro / antigravity -native | paste / file / RPC into the app | ⚠️ app-defined — not yet verified live |
+| cursor-native / hermes-native | `send-keys` paste into the **live pane** (`supports_enqueue=True`) | ⚠️ app-defined — mechanism confirmed in code, **not yet verified live** |
+| pi-native | queued to the **resident extension** (`supports_enqueue=True`) | ⚠️ app-defined — mechanism confirmed in code, not yet verified live |
+| opencode-native | HTTP prompt (`supports_enqueue=True`); the native server has **no live-steer endpoint** → admitted as a new prompt, promoted by the server's own queue at turn end | ❌ next turn (code-confirmed) |
+| qwen / goose / kimi / kiro / antigravity -native | paste / file / RPC into the app (`supports_enqueue=True`) | ⚠️ app-defined — not yet verified live |
 
-> **TODO:** verify live-steer behavior for cursor-native, pi-native,
-> hermes-native, opencode-native (and the remaining natives). The steer button
-> is already shown for them — the mechanism works uniformly — but whether the
-> app folds the message in mid-response vs. at the next turn is confirmed only
-> for claude-native + codex-native so far.
+> **TODO (live verification):** every native harness above reports
+> `supports_live_message_queue = True` and its delivery mechanism is confirmed
+> in code (see the enqueue path per harness), but whether the vendor app folds
+> the steered message in **mid-response** vs. at the **next turn** is confirmed
+> against a *live* runner only for claude-native + codex-native. Run a live
+> steer per harness to upgrade the ⚠️ rows. opencode-native is settled: its app
+> server exposes no live-steer endpoint, so the steered message is always
+> promoted at the next turn boundary.
 
 **No runner change is required for native steer** — every native `run_turn`
 returns right after delivering the input (decoupled from the response), so the

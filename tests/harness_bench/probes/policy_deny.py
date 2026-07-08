@@ -38,45 +38,52 @@ class PolicyDenyProbe(CapabilityProbe):
             "completed": result.completed,
         }
 
+        # A confirmed tool-call DENY is enforcement, whether or not a
+        # ``function_call`` item persisted. On full-server the denied call still
+        # surfaces an item (with a blocked output); on native-tui the deny is
+        # decided at the vendor hook *before* the tool runs, so no item persists
+        # and the only signal is the server's ``response.policy_denied`` event.
+        # Check the deny signal first so the native path is not swallowed by the
+        # "no tool call" guard below.
+        if result.tool_call_denied:
+            if result.completed or result.failed:
+                return ProbeResult(
+                    Verdict.SUPPORTED,
+                    note="tool-call DENY delivered and enforced; turn advanced past the block",
+                    detail=detail,
+                )
+            if result.timed_out:
+                return ProbeResult(
+                    Verdict.UNSUPPORTED,
+                    note="turn stalled after tool-call DENY (blocked call not handled)",
+                    detail=detail,
+                )
+            return ProbeResult(
+                Verdict.SUPPORTED,
+                note="tool-call DENY delivered and enforced",
+                detail=detail,
+            )
+
         if not result.tool_calls:
-            # The model never tried the tool, so the tool-call DENY path was
-            # never exercised — cannot conclude anything about enforcement.
+            # No deny signal AND no tool call: the model never tried the tool, so
+            # the tool-call DENY path was never exercised. (On native this also
+            # covers a turn where the vendor simply didn't call the tool.)
             return ProbeResult(
                 Verdict.SKIPPED,
                 note="model never attempted the tool; tool-call DENY path not exercised",
                 detail=detail,
             )
-        if not result.tool_call_denied:
-            # A tool call happened but no PHASE_TOOL_CALL evaluation was
-            # surfaced to deny. Policy evaluation is normally driven by the
-            # server / runner; in this wrap-direct transport some harnesses
-            # (e.g. codex) dispatch the tool without a tool-call evaluation
-            # hook, so we cannot exercise DENY here. That is a transport
-            # limitation, not proof the harness ignores policy — report
-            # SKIPPED and let the full-server transport assert enforcement.
-            return ProbeResult(
-                Verdict.SKIPPED,
-                note=(
-                    "tool call not routed through a tool-call policy evaluation "
-                    "(wrap-direct limitation)"
-                ),
-                detail=detail,
-            )
-        # A DENY landed on the tool-call phase and the turn advanced (to
-        # completion or a clean end) without hanging on the blocked call —
-        # the harness accepted and enforced the tool-call DENY.
-        if result.completed or result.failed:
-            return ProbeResult(
-                Verdict.SUPPORTED,
-                note="tool-call DENY delivered and enforced; blocked call did not stall the turn",
-                detail=detail,
-            )
-        if result.timed_out:
-            return ProbeResult(
-                Verdict.UNSUPPORTED,
-                note="turn stalled after tool-call DENY (blocked call not handled)",
-                detail=detail,
-            )
+        # A tool call happened but no DENY was surfaced. Policy evaluation is
+        # normally driven by the server / runner; in the wrap-direct transport
+        # some harnesses (e.g. codex) dispatch the tool without a tool-call
+        # evaluation hook, so we cannot exercise DENY here. That is a transport
+        # limitation, not proof the harness ignores policy — report SKIPPED and
+        # let the full-server / native transport assert enforcement.
         return ProbeResult(
-            Verdict.UNKNOWN, note="tool-call DENY delivered; outcome inconclusive", detail=detail
+            Verdict.SKIPPED,
+            note=(
+                "tool call not routed through a tool-call policy evaluation "
+                "(wrap-direct limitation)"
+            ),
+            detail=detail,
         )

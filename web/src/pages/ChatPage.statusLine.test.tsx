@@ -41,7 +41,6 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
-    "openai-agents": "OpenAI Agents SDK",
     codex: "Codex",
     cursor: "Cursor",
     pi: "Pi",

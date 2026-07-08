@@ -91,6 +91,66 @@ def default_shell_argv(command: str) -> list[str]:
     return [sh, "-c", command]
 
 
+#: Interactive shells we honor from ``$SHELL`` for a user terminal. Anything
+#: outside this set (or a ``$SHELL`` that doesn't resolve on PATH) falls back to
+#: bash for a predictable pane.
+_KNOWN_INTERACTIVE_SHELLS = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"})
+
+#: Mainstream interactive shells we proactively offer as launch choices (the
+#: "New shell" picker), in display order. The user's ``$SHELL`` is always
+#: offered first regardless (see :func:`installed_interactive_shells`); this is
+#: the set of well-known alternatives we surface beyond it.
+_OFFERED_INTERACTIVE_SHELLS = ("bash", "zsh", "fish")
+
+
+def default_interactive_shell() -> str:
+    """
+    Basename of the user's login shell for an interactive terminal.
+
+    Reads ``$SHELL`` and keeps its basename when it names a known shell that
+    resolves on PATH; otherwise falls back to ``"bash"``. Returns a basename
+    (not the absolute ``$SHELL`` path) so it stays PATH-resolvable when the
+    terminal launches under a runner on a different host than the one that read
+    the env.
+
+    :returns: A shell basename such as ``"zsh"``, ``"fish"``, or ``"bash"``.
+    """
+    if IS_WINDOWS:
+        # Native tmux/PTY terminals are unsupported on Windows anyway.
+        return "bash"
+    import shutil
+
+    name = os.path.basename(os.environ.get("SHELL", "")).strip()
+    if name in _KNOWN_INTERACTIVE_SHELLS and shutil.which(name):
+        return name
+    return "bash"
+
+
+def installed_interactive_shells() -> list[str]:
+    """
+    Ordered, deduped shell basenames to offer for a new interactive terminal.
+
+    The user's login shell (:func:`default_interactive_shell`) comes first — so
+    the "New shell" affordance can treat entry ``[0]`` as the click default —
+    followed by any mainstream alternatives (bash/zsh/fish) that resolve on
+    PATH. Always non-empty (the default is always present, and bash is the
+    ultimate fallback).
+
+    :returns: Basenames such as ``["zsh", "bash", "fish"]`` — the default first.
+    """
+    ordered = [default_interactive_shell()]
+    if IS_WINDOWS:
+        # Native tmux/PTY terminals are unsupported on Windows anyway; the lone
+        # bash default from above is all we can meaningfully offer.
+        return ordered
+    import shutil
+
+    for name in _OFFERED_INTERACTIVE_SHELLS:
+        if name not in ordered and shutil.which(name):
+            ordered.append(name)
+    return ordered
+
+
 def stable_user_id() -> str:
     """
     A stable, filesystem-safe token identifying the current OS user.
