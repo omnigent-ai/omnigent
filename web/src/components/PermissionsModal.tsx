@@ -417,26 +417,6 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   );
 }
 
-/**
- * A user id (usually an email) that truncates gracefully in tight rows:
- * the local part ellipsizes while the @domain stays pinned and visible,
- * so long emails never push the permission column or revoke button
- * around. The full id is available via the parent's title tooltip.
- */
-function UserIdLabel({ userId }: { userId: string }) {
-  const at = userId.lastIndexOf("@");
-  if (at <= 0) {
-    return <span className="truncate">{userId}</span>;
-  }
-  return (
-    <>
-      <span className="truncate">{userId.slice(0, at)}</span>
-      {/* Domain keeps priority but still truncates if it alone overflows. */}
-      <span className="max-w-[75%] shrink-0 truncate">{userId.slice(at)}</span>
-    </>
-  );
-}
-
 function GrantRow({
   permission,
   onRevoke,
@@ -456,8 +436,11 @@ function GrantRow({
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
-      <span className="flex min-w-0 flex-1 items-center text-sm" title={permission.user_id}>
-        <UserIdLabel userId={permission.user_id} />
+      {/* Tail truncation keeps the local part — the distinguishing half when
+          every grantee shares one company domain — and the title tooltip
+          carries the full id. */}
+      <span className="flex-1 truncate text-sm" title={permission.user_id}>
+        {permission.user_id}
       </span>
       {isOwner || isManage ? (
         <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
