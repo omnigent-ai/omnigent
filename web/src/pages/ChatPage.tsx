@@ -977,10 +977,21 @@ export function ChatPage() {
     // FIFO when the session next goes idle. Only queue for an already-bound
     // conversation; a brand-new chat (no conversationId) always sends so the
     // session gets created.
+    //
+    // Also queue when this conversation ALREADY has queued messages, even if it
+    // momentarily reads idle: the direct-send path and the queue drain aren't
+    // ordered against each other, so a later message that slips through here
+    // while an earlier one waits in the queue would jump ahead of it. This
+    // surfaces on harnesses whose status flickers idle between quick turns
+    // (e.g. cursor-native), scrambling the delivered order; funnelling every
+    // send for a queued conversation through the single FIFO queue preserves it.
     const chat = useChatStore.getState();
     const isBusy =
       chat.status === "streaming" || ["running", "waiting"].includes(chat.sessionStatus);
-    if (isBusy && chat.conversationId !== null) {
+    const hasQueued =
+      chat.conversationId !== null &&
+      chat.queuedMessages.some((m) => m.conversationId === chat.conversationId);
+    if ((isBusy || hasQueued) && chat.conversationId !== null) {
       chat.enqueueMessage(text, files);
       return;
     }
