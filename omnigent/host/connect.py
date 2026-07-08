@@ -648,18 +648,11 @@ class HostProcess:
 
         :param ws: The open tunnel connection.
         """
-        configured_harnesses = await asyncio.to_thread(configured_harness_map)
-        if configured_harnesses == self._last_configured_harnesses:
+        hello = await self._build_hello()
+        if hello.configured_harnesses == self._last_configured_harnesses:
             return
-        hello = HostHelloFrame(
-            version="0.1.0",
-            frame_protocol_version=1,
-            name=self._identity.name,
-            runners=self._alive_runner_ids(),
-            configured_harnesses=configured_harnesses,
-        )
         await ws.send(encode_host_frame(hello))
-        self._last_configured_harnesses = configured_harnesses
+        self._last_configured_harnesses = hello.configured_harnesses
 
     def _fatal_upgrade_error(self, exc: InvalidURI | InvalidStatus) -> HostConnectError | None:
         """Classify a WebSocket-upgrade failure as fatal, or return ``None``.
