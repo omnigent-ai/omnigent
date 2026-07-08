@@ -16,6 +16,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
     for _provider_id, _label, var in oc._ENV_PROVIDER_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_OPENCODE_API_KEY", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.secrets.load_secret", lambda _name: None)
 
 
 def _write_auth(tmp_path: Path, providers: dict[str, object]) -> None:
@@ -100,3 +103,63 @@ def test_reachable_provider_ids_merges_stored_and_env(
     assert "anthropic" in ids  # from auth.json
     assert "openai" in ids  # from env key
     assert "groq" not in ids
+
+
+def test_summary_zen_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setenv("OPENCODE_API_KEY", "sk-zen")
+    summary = oc.opencode_auth_summary()
+    assert summary.zen_key_source == "env:OPENCODE_API_KEY"
+    assert summary.has_provider
+    assert summary.ready
+
+
+def test_summary_zen_key_from_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.load_secret",
+        lambda name: "sk-vault" if name == "opencode-zen" else None,
+    )
+    summary = oc.opencode_auth_summary()
+    assert summary.zen_key_source == "keychain"
+    assert summary.has_provider
+
+
+def test_summary_no_zen_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    summary = oc.opencode_auth_summary()
+    assert summary.zen_key_source is None
+    assert not summary.has_provider
+
+
+def test_describe_includes_zen_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.load_secret",
+        lambda name: "sk-vault" if name == "opencode-zen" else None,
+    )
+    text = oc.opencode_auth_summary().describe()
+    assert "env: OpenAI" in text
+    assert "zen key: keychain" in text
+
+
+def test_reachable_ids_include_opencode_for_zen_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.load_secret",
+        lambda name: "sk-vault" if name == "opencode-zen" else None,
+    )
+    assert "opencode" in oc.reachable_provider_ids()
+
+
+def test_reachable_ids_include_opencode_for_env_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENCODE_API_KEY", "sk-zen")
+    assert "opencode" in oc.reachable_provider_ids()
+
+
+def test_reachable_ids_omit_opencode_without_key() -> None:
+    assert "opencode" not in oc.reachable_provider_ids()
