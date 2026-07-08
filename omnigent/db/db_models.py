@@ -826,7 +826,8 @@ class SqlHost(Base):
     :param host_id: Stable host identifier from the host's local
         ``~/.omnigent/config.yaml``, e.g. ``"host_a1b2c3d4e5f6..."``.
     :param name: Human-readable name from ``config.yaml``, e.g.
-        ``"corey-laptop"``. Displayed in the Web UI host picker.
+        ``"corey-laptop"``. Displayed in the Web UI host picker. Max 64
+        characters.
     :param owner: User ID from the Databricks auth Bearer token
         presented during the host's WebSocket handshake, e.g.
         ``"corey.zumar@databricks.com"``.
@@ -876,7 +877,7 @@ class SqlHost(Base):
         default=current_workspace_id,
     )
     owner: Mapped[str] = mapped_column(String(256), primary_key=True)
-    name: Mapped[str] = mapped_column(String(256), primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
     host_id: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[int] = mapped_column(Integer)
