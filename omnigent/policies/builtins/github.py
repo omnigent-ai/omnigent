@@ -25,7 +25,10 @@ policy is stateless and only ever inspects ``tool_call`` events):
 - Reads are allowed everywhere when ``read_all`` is ``True`` (default). When
   ``read_all`` is ``False``, reads are restricted to ``read_repos``.
 - Writes are restricted to ``write_repos`` and, when ``write_branches`` is set,
-  to those branches.
+  to those branches. ``write_branches_blocklist`` instead excludes specific
+  branches, so any other branch on an allowed repo remains writable — the two
+  compose: a branch must be in ``write_branches`` (if set) and absent from
+  ``write_branches_blocklist`` (if set).
 - When a *shell* command is a gated read/write but its target repo (or, for a
   branch-restricted write, its target branch) cannot be determined from the
   command text — e.g. ``git push origin main``, where ``origin`` is a local
@@ -866,6 +869,7 @@ def github_policy(
     read_repos: list[str] | None = None,
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
+    write_branches_blocklist: list[str] | None = None,
     mcp_tool_prefixes: list[str] | None = None,
     shell_tools: list[str] | None = None,
     deny_reason: str = "GitHub operation blocked by policy.",
@@ -883,6 +887,10 @@ def github_policy(
     :param write_branches: Branches writable within an allowed repo, e.g.
         ``["main", "develop"]``. ``None`` / empty means branches are not
         restricted (any branch on an allowed repo is writable).
+    :param write_branches_blocklist: Branches excluded from writes within an
+        allowed repo, e.g. ``["main", "master"]``. ``None`` / empty excludes
+        nothing. Composes with ``write_branches`` — a branch must pass both
+        (be allowlisted, if set, and not blocklisted) to be writable.
     :param mcp_tool_prefixes: GitHub MCP server name-prefixes to strip when
         canonicalizing MCP tool names. ``None`` uses the standard
         ``mcp__github__`` / ``github__``.
@@ -899,12 +907,22 @@ def github_policy(
     allowed_read_repos = _normalize_repos(read_repos)
     allowed_write_repos = _normalize_repos(write_repos)
     allowed_write_branches = _normalize_branches(write_branches)
+    blocked_write_branches = _normalize_branches(write_branches_blocklist)
     prefixes = (
         tuple(mcp_tool_prefixes) if mcp_tool_prefixes is not None else _DEFAULT_TOOL_PREFIXES
     )
     shell_tool_names = (
         frozenset(shell_tools) if shell_tools is not None else frozenset(_DEFAULT_SHELL_TOOLS)
     )
+
+    def _branch_restriction_desc() -> str:
+        """Describe the active branch restriction(s) for an undeterminable-branch message."""
+        parts = []
+        if allowed_write_branches:
+            parts.append(f"restricted to branches {sorted(allowed_write_branches)}")
+        if blocked_write_branches:
+            parts.append(f"blocked for branches {sorted(blocked_write_branches)}")
+        return " and ".join(parts)
 
     def _gate_read_repo(
         repos: set[str], *, undeterminable: PolicyResponse
@@ -937,13 +955,15 @@ def github_policy(
         no_branch: PolicyResponse,
     ) -> PolicyResponse | None:
         """
-        Apply the write repo + branch allowlists to a write operation.
+        Apply the write repo + branch allowlist/blocklist to a write operation.
 
-        Any branch the call names is checked against ``write_branches``. A
-        *branch-targeted* write (file write, push, branch create) with no
-        determinable branch additionally fails to *no_branch*, because it would
-        otherwise land on the repo's default branch unchecked. A write that is
-        not branch-targeted (issue, comment, PR merge by number) is governed by
+        Any branch the call names is checked against ``write_branches`` (must be
+        a member, if set) and ``write_branches_blocklist`` (must not be a
+        member, if set). A *branch-targeted* write (file write, push, branch
+        create) with no determinable branch additionally fails to *no_branch*
+        when either restriction is active, because it would otherwise land on
+        the repo's default branch unchecked. A write that is not
+        branch-targeted (issue, comment, PR merge by number) is governed by
         ``write_repos`` alone when it names no branch.
 
         :param repos: Target repos extracted from the call (may be empty).
@@ -963,14 +983,27 @@ def github_policy(
                 f"{deny_reason} Write is restricted to the configured repos; "
                 f"this call targets {sorted(repos)}."
             )
-        if allowed_write_branches:
+        if allowed_write_branches or blocked_write_branches:
             if branches:
-                bad = branches - allowed_write_branches
-                if bad:
-                    return _deny(
-                        f"{deny_reason} Write is restricted to branches "
-                        f"{sorted(allowed_write_branches)}; this call targets {sorted(bad)}."
-                    )
+                not_allowlisted = (
+                    branches - allowed_write_branches if allowed_write_branches else set()
+                )
+                blocklisted = (
+                    branches & blocked_write_branches if blocked_write_branches else set()
+                )
+                if not_allowlisted or blocklisted:
+                    reasons = []
+                    if not_allowlisted:
+                        reasons.append(
+                            f"restricted to branches {sorted(allowed_write_branches)} "
+                            f"(targets {sorted(not_allowlisted)})"
+                        )
+                    if blocklisted:
+                        reasons.append(
+                            f"blocked for branches {sorted(blocked_write_branches)} "
+                            f"(targets {sorted(blocklisted)})"
+                        )
+                    return _deny(f"{deny_reason} Write is " + " and ".join(reasons) + ".")
             elif branch_targeted:
                 return no_branch
         return None
@@ -1014,9 +1047,8 @@ def github_policy(
             branch_targeted=_mcp_base(canonical) in _MCP_BRANCH_WRITE_TOOLS,
             no_repo=_deny(f"{deny_reason} Write call carries no identifiable target repo."),
             no_branch=_deny(
-                f"{deny_reason} Write is restricted to branches "
-                f"{sorted(allowed_write_branches)} and this call's target branch could "
-                f"not be determined."
+                f"{deny_reason} Write is {_branch_restriction_desc()} and this call's "
+                f"target branch could not be determined."
             ),
         )
 
@@ -1133,8 +1165,9 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
             "Controls GitHub access across MCP tools (official per-operation server and the "
             "github_read_api_call / github_write_api_call HTTP-proxy wrapper) and git/gh shell "
             "commands run via sys_os_shell. Restricts reads to read_repos (unless read_all), and "
-            "writes to write_repos plus optional write_branches. Shell commands whose target repo "
-            "or branch cannot be determined return ASK for human approval."
+            "writes to write_repos plus optional write_branches / write_branches_blocklist. "
+            "Shell commands whose target repo or branch cannot be determined return ASK for "
+            "human approval."
         ),
         "params_schema": {
             "type": "object",
@@ -1158,6 +1191,13 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Branches writable within an allowed repo. Empty = any branch.",
+                },
+                "write_branches_blocklist": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Branches excluded from writes within an allowed repo. "
+                    "Composes with write_branches (a branch must be allowlisted, if set, "
+                    "and not blocklisted).",
                 },
                 "mcp_tool_prefixes": {
                     "type": "array",

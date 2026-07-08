@@ -217,6 +217,67 @@ def test_pr_create_gates_base_not_head() -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+def test_write_branch_blocklisted_denied() -> None:
+    """A write to a blocklisted branch is denied even with no allowlist set."""
+    policy = github_policy(write_repos=[_REPO], write_branches_blocklist=["main"])
+    event = tc(
+        "mcp__github__create_or_update_file", {"owner": "octo", "repo": "hello", "branch": "main"}
+    )
+    result = policy(event)
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_write_branch_not_blocklisted_allowed() -> None:
+    """Any branch outside the blocklist is writable — the blocklist is exclusion-only."""
+    policy = github_policy(write_repos=[_REPO], write_branches_blocklist=["main"])
+    event = tc(
+        "mcp__github__create_or_update_file", {"owner": "octo", "repo": "hello", "branch": "dev"}
+    )
+    assert policy(event) is None
+
+
+def test_branch_targeted_write_without_branch_denied_under_blocklist() -> None:
+    """A file write with no branch arg fails closed when a blocklist is active.
+
+    A missing branch means the repo's default branch, which could be a
+    blocklisted branch (e.g. ``main``) — so the safe decision is DENY.
+    """
+    policy = github_policy(write_repos=[_REPO], write_branches_blocklist=["main"])
+    result = policy(tc("mcp__github__create_or_update_file", {"owner": "octo", "repo": "hello"}))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_write_branch_allowlist_and_blocklist_compose() -> None:
+    """A branch must be allowlisted and not blocklisted — both restrictions apply together."""
+    policy = github_policy(
+        write_repos=[_REPO], write_branches=["main", "dev"], write_branches_blocklist=["dev"]
+    )
+    allowed = tc(
+        "mcp__github__create_or_update_file", {"owner": "octo", "repo": "hello", "branch": "main"}
+    )
+    assert policy(allowed) is None
+
+    blocked = tc(
+        "mcp__github__create_or_update_file", {"owner": "octo", "repo": "hello", "branch": "dev"}
+    )
+    result = policy(blocked)
+    assert result is not None and result["result"] == "DENY"
+
+    not_allowlisted = tc(
+        "mcp__github__create_or_update_file",
+        {"owner": "octo", "repo": "hello", "branch": "release"},
+    )
+    result = policy(not_allowlisted)
+    assert result is not None and result["result"] == "DENY"
+
+
+@pytest.mark.parametrize("tool", ["merge_pull_request", "add_issue_comment", "create_issue"])
+def test_non_branch_write_without_branch_allowed_under_blocklist(tool: str) -> None:
+    """Non-branch writes ignore write_branches_blocklist, same as write_branches."""
+    policy = github_policy(write_repos=[_REPO], write_branches_blocklist=["main"])
+    assert policy(tc(f"mcp__github__{tool}", {"owner": "octo", "repo": "hello"})) is None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 1 — HTTP-proxy wrapper (github_read_api_call / github_write_api_call)
 # ══════════════════════════════════════════════════════════════════════════════

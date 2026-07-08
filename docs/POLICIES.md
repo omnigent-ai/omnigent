@@ -100,8 +100,8 @@ policies:
     factory_params:
       write_repos:
         - myorg/my-repo
-      write_branches:
-        - "feature/*"
+      write_branches_blocklist:
+        - main
   google_policy:
     type: function
     handler: omnigent.policies.builtins.google.gdrive_policy
@@ -273,7 +273,8 @@ Controls GitHub access across MCP tools and `git`/`gh` shell commands. Restricts
 | `read_all` | boolean | `true` | Allow all reads |
 | `read_repos` | string[] | `[]` | Repos readable when `read_all` is false (`owner/repo` or URLs) |
 | `write_repos` | string[] | `[]` | Repos the agent may write to |
-| `write_branches` | string[] | `[]` | Branches writable within allowed repos (empty = any) |
+| `write_branches` | string[] | `[]` | Branches writable within allowed repos (empty = any); matched exactly, no globs |
+| `write_branches_blocklist` | string[] | `[]` | Branches excluded from writes within allowed repos (matched exactly); composes with `write_branches` |
 | `mcp_tool_prefixes` | string[] | `["mcp__github__", "github__"]` | Tool-name prefixes to match |
 | `shell_tools` | string[] | `["sys_os_shell"]` | Shell tools whose commands are parsed for git/gh |
 
@@ -285,9 +286,9 @@ github_access:
     write_repos:
       - myorg/frontend
       - myorg/backend
-    write_branches:
-      - "feature/*"
-      - "fix/*"
+    write_branches_blocklist:
+      - main
+      - master
 ```
 
 ### Google Workspace
