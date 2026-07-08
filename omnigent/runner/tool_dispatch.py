@@ -64,6 +64,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelTaskTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.compact import SysCompactTool
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.os_env import (
@@ -304,6 +305,7 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # Priority 5l: Policy management — sys_add_policy.
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
+_SESSION_CONTROL_TOOLS = frozenset({SysCompactTool.name()})
 
 # Builtin tools the claude-native / codex-native relay advertises to the
 # real CLI, beyond the always-relayed ``sys_os_*`` family. Native harnesses
@@ -332,6 +334,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    | _SESSION_CONTROL_TOOLS
 )
 
 
@@ -468,6 +471,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _SESSION_CONTROL_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -4315,6 +4319,12 @@ async def execute_tool(
                 session_inbox=session_inbox,
                 publish_event=publish_event,
             )
+        elif tool_name in _SESSION_CONTROL_TOOLS:
+            output = await _execute_session_control_tool(
+                tool_name,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
         elif tool_name in _ASYNC_INBOX_TOOLS:
             output = await _execute_async_inbox_tool(
                 tool_name,
@@ -4447,6 +4457,46 @@ async def execute_tool(
         output = f"Error: {type(exc).__name__}: {exc}"
 
     return output
+
+
+async def _execute_session_control_tool(
+    tool_name: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> str:
+    """Execute runner-dispatched current-session control tools."""
+    if tool_name != SysCompactTool.name():
+        return f"Error: {tool_name} not implemented in session control dispatch"
+    if server_client is None:
+        return "Error: sys_compact requires server_client"
+    if not conversation_id:
+        return "Error: sys_compact requires conversation_id"
+
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{conversation_id}/events",
+            json={"type": "compact", "data": {}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"Error: sys_compact request failed: {type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return f"Error: sys_compact returned {resp.status_code}: {resp.text[:200]}"
+
+    handled_by_runner = resp.status_code == 200
+    return json.dumps(
+        {
+            "status": "compact_requested",
+            "session_id": conversation_id,
+            "handled_by_runner": handled_by_runner,
+            "message": (
+                "Compaction was requested for the current session. For native "
+                "harnesses this is forwarded to the terminal; otherwise the "
+                "server may run AP-side compaction when the session is idle."
+            ),
+        }
+    )
 
 
 # Per-session leading-edge throttle for changed-files invalidation

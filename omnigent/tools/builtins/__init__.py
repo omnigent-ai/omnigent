@@ -35,6 +35,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.compact import SysCompactTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
@@ -75,6 +76,7 @@ __all__ = [
     "SysAgentListTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
+    "SysCompactTool",
     "SysListModelsTool",
     "SysReadInboxTool",
     "SysSessionCloseTool",
@@ -210,6 +212,9 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
+    # ``sys_compact`` is auto-registered by ToolManager and runner-dispatched
+    # through the existing session-events compact control path.
+    "sys_compact": None,
 }
 
 # Canonical set of every reserved builtin name. Derived from

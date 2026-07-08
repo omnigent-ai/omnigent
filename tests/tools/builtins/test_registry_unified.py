@@ -140,6 +140,9 @@ def test_builtin_names_size_matches_registry() -> None:
                 # is enabled (RuntimeCaps.routing_client is set).
                 "sys_list_models",
                 "sys_advise_models",
+                # sys_compact: auto-registered by ToolManager and
+                # runner-dispatched to the session-events compact path.
+                "sys_compact",
             }
         )
         == BUILTIN_NAMES
