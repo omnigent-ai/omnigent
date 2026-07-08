@@ -281,11 +281,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(kiro_root.parent.parent)
 
+    # Headless ACP harnesses (acp / goose / qwen) put their Omnigent-MCP relay
+    # bridge below ``$TMPDIR/omnigent-<uid>/acp-mcp`` (same uid-scoped shape as
+    # cursor/qwen/hermes-native), so trust the uid-scoped temp dir's parent.
+    acp_root = _absolute_syntactic_path(acp_mcp_bridge_root())
+    if target.is_relative_to(acp_root):
+        return _absolute_syntactic_path(acp_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s})"
+        f"{kiro_root!s}, {acp_root!s})"
     )
 
 
@@ -702,6 +709,38 @@ def _ensure_secure_dir(target: Path) -> None:
             )
         if (st.st_mode & 0o077) != 0:
             os.chmod(ancestor, 0o700)
+
+
+def acp_mcp_bridge_root() -> Path:
+    """Bridge root for the headless ACP harnesses' Omnigent-MCP relay.
+
+    Shares the uid-scoped temp parent with claude-native
+    (``$TMPDIR/omnigent-<uid>/acp-mcp``). Used by the acp / goose / qwen
+    executors' ``OmnigentAcpMcp`` relay so ``serve-mcp``'s bridge dir passes the
+    :func:`_trusted_parent_for_bridge_dir` secure-root check.
+
+    :returns: The ACP-MCP bridge root directory (not created here).
+    """
+    return _BRIDGE_ROOT_PARENT / "acp-mcp"
+
+
+def prepare_acp_mcp_bridge_dir() -> Path:
+    """Create a fresh, secure per-relay bridge dir for an ACP harness.
+
+    Returns a unique owner-only directory under :func:`acp_mcp_bridge_root` with
+    a minimal token-only ``bridge.json`` — so the shared ``serve-mcp`` serves
+    ONLY the relay tools (no raw ``sys_os_*`` filesystem tools; the ACP agent
+    owns those). The caller's relay writes ``tool_relay.json`` here and points
+    ``serve-mcp`` at the directory.
+
+    :returns: The prepared bridge directory path.
+    """
+    bridge_dir = acp_mcp_bridge_root() / secrets.token_hex(8)
+    _ensure_secure_dir(bridge_dir)
+    config_path = bridge_dir / _CONFIG_FILE
+    if not config_path.exists():
+        _write_json_file(config_path, {"token": secrets.token_urlsafe(32)})
+    return bridge_dir
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
