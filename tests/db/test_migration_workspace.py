@@ -216,6 +216,21 @@ def test_host_id_index_dropped(db_engine: Engine) -> None:
     )
 
 
+def test_runner_id_is_indexed(db_engine: Engine) -> None:
+    """
+    Verify ``ix_conversations_runner_id`` exists at head.
+
+    Reconnect/relaunch reconciliation queries conversations by
+    ``runner_id`` (``list_conversations_by_runner_id``) on every runner
+    reconnect; without the index (migration ``z2a2b3c4d5e6``) that's a
+    full table scan.
+    """
+    index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("conversations")}
+    assert "ix_conversations_runner_id" in index_names, (
+        f"Expected ix_conversations_runner_id on conversations; got {sorted(index_names)}."
+    )
+
+
 def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
     """
     After the FK was removed, deleting a host leaves conversations.host_id
