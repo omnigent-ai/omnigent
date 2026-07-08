@@ -21,6 +21,7 @@ from sqlalchemy import delete as sql_delete
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlConversation, SqlHost, current_workspace_id
+from omnigent.db.enum_codecs import decode_host_status, encode_host_status
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 
 # A host is considered live only if its row was touched (connect or
@@ -137,7 +138,7 @@ def _row_to_host(row: SqlHost) -> Host:
         host_id=row.host_id,
         name=row.name,
         owner=row.owner,
-        status=row.status,
+        status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
         sandbox_provider=row.sandbox_provider,
@@ -268,7 +269,7 @@ class HostStore:
                     # itself (ordering matters for the FK), so we only touch
                     # status/timestamp here.
                     self._rotate_host_id(session, row, host_id)
-                row.status = "online"
+                row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
             else:
@@ -276,7 +277,7 @@ class HostStore:
                     owner=owner,
                     name=name,
                     host_id=host_id,
-                    status="online",
+                    status=encode_host_status("online"),
                     created_at=now,
                     updated_at=now,
                     configured_harnesses=harnesses_json,
@@ -390,7 +391,7 @@ class HostStore:
             .values(
                 owner=owner,
                 name=name,
-                status="online",
+                status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
             )
@@ -424,7 +425,7 @@ class HostStore:
                 )
             ).scalar_one_or_none()
             if row is not None:
-                row.status = "offline"
+                row.status = encode_host_status("offline")
                 row.updated_at = now_epoch()
 
     def heartbeat(self, host_id: str) -> None:
@@ -503,10 +504,11 @@ class HostStore:
                     SqlHost.host_id.in_(unique_ids),
                 )
             ).all()
+        online_code = encode_host_status("online")
         return {
             row.host_id
             for row in rows
-            if row.status == "online" and row.updated_at >= ref - HOST_LIVENESS_TTL_S
+            if row.status == online_code and row.updated_at >= ref - HOST_LIVENESS_TTL_S
         }
 
     def list_hosts(self, owner: str) -> list[Host]:
@@ -627,7 +629,7 @@ class HostStore:
                 owner=owner,
                 name=name,
                 host_id=host_id,
-                status="offline",
+                status=encode_host_status("offline"),
                 created_at=now,
                 updated_at=now,
                 token_hash=token_hash,

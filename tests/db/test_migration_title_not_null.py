@@ -51,7 +51,7 @@ def test_title_defaults_empty_string_on_insert(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :id)"
+                "VALUES (:id, :ts, :ts, 1, :id)"
             ),
             {"id": "conv_title_default", "ts": 1700000000},
         )
@@ -71,13 +71,14 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
     uri = f"sqlite:///{db_path}"
     engine = get_or_create_engine(uri)
 
-    # At head (s1a2b3c4d5e6): insert a row with no title (will be '').
+    # At head: insert a row with no title (will be ''). kind=1 is the
+    # "default" int code (conversations.kind is a SMALLINT at head).
     with engine.connect() as conn:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, root_conversation_id, title) "
-                "VALUES (:id, :ts, :ts, 'default', :id, '')"
+                "VALUES (:id, :ts, :ts, 1, :id, '')"
             ),
             {"id": "conv_downgrade_test", "ts": 1700000001},
         )
@@ -89,13 +90,14 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, root_conversation_id, title) "
-                "VALUES (:id, :ts, :ts, 'default', :id, :title)"
+                "VALUES (:id, :ts, :ts, 1, :id, :title)"
             ),
             {"id": "conv_titled", "ts": 1700000002, "title": "My Session"},
         )
         conn.commit()
 
-    # Downgrade one step.
+    # Downgrade to r1a2b3c4d5e6 (below the title migration; passes back through
+    # the enums→SMALLINT downgrade that restores kind to a string).
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
         config.attributes["connection"] = conn

@@ -74,7 +74,7 @@ def test_archived_defaults_false_on_insert(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :id)"
+                "VALUES (:id, :ts, :ts, 1, :id)"
             ),
             {"id": "conv_arch_default", "ts": 1700000000},
         )

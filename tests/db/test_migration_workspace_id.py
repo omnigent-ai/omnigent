@@ -70,7 +70,7 @@ def test_existing_rows_and_omitted_inserts_default_to_zero(db_engine: Engine) ->
             sa.text(
                 "INSERT INTO agents"
                 " (id, created_at, name, bundle_location, version, kind)"
-                " VALUES ('ag_ws', 1, 'n', 'loc', 1, 'template')"
+                " VALUES ('ag_ws', 1, 'n', 'loc', 1, 1)"  # kind=1 → 'template'
             )
         )
         workspace_id = conn.execute(

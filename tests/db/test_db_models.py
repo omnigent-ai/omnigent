@@ -26,6 +26,17 @@ from omnigent.db.db_models import (
     SqlUser,
     SqlUserDailyCost,
 )
+from omnigent.db.enum_codecs import (
+    encode_account_token_kind,
+    encode_agent_kind,
+    encode_comment_status,
+    encode_conversation_kind,
+    encode_host_status,
+    encode_item_status,
+    encode_item_type,
+    encode_policy_scope,
+    encode_policy_type,
+)
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 
 # ── helpers ───────────────────────────────────────────
@@ -46,7 +57,7 @@ def _make_agent(
         name=name,
         bundle_location="ag_test1/abc123",
         version=1,
-        kind=kind,
+        kind=encode_agent_kind(kind),
     )
 
 
@@ -62,7 +73,7 @@ def _make_conversation(
         id=id,
         created_at=_now(),
         updated_at=_now(),
-        kind=kind,
+        kind=encode_conversation_kind(kind),
         agent_id=agent_id,
         parent_conversation_id=parent_conversation_id,
         root_conversation_id=root_conversation_id or id,
@@ -80,9 +91,9 @@ def _make_item(
         conversation_id=conversation_id,
         response_id="resp_test1",
         created_at=_now(),
-        status="completed",
+        status=encode_item_status("completed"),
         position=position,
-        type="message",
+        type=encode_item_type("message"),
         data='{"content": [{"type": "text", "text": "hello"}]}',
         search_text="hello",
     )
@@ -107,7 +118,7 @@ class TestSqlAgent:
             assert loaded.version == 1
             assert loaded.description is None
             assert loaded.updated_at is None
-            assert loaded.kind == "template"
+            assert loaded.kind == encode_agent_kind("template")
 
     def test_nullable_columns(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -137,7 +148,7 @@ class TestSqlAgent:
         with managed() as session:
             loaded = session.get(SqlAgent, (0, "ag_test1"))
             assert loaded is not None
-            assert loaded.kind == "session"
+            assert loaded.kind == encode_agent_kind("session")
 
     def test_multiple_session_agents_allowed(self, db_uri: str) -> None:
         """Multiple session-scoped agents are permitted (no unique constraint on kind)."""
@@ -257,7 +268,7 @@ class TestSqlAccountToken:
         now = _now()
         token = SqlAccountToken(
             id="tok_invite_abc",
-            kind="invite",
+            kind=encode_account_token_kind("invite"),
             created_at=now,
             expires_at=now + 3600,
             created_by="admin@example.com",
@@ -269,7 +280,7 @@ class TestSqlAccountToken:
         with managed() as session:
             loaded = session.get(SqlAccountToken, (0, "tok_invite_abc"))
             assert loaded is not None
-            assert loaded.kind == "invite"
+            assert loaded.kind == encode_account_token_kind("invite")
             assert loaded.user_id is None
             assert loaded.redeemed_at is None
             assert loaded.invited_is_admin is True
@@ -281,7 +292,7 @@ class TestSqlAccountToken:
         now = _now()
         token = SqlAccountToken(
             id="tok_magic_xyz",
-            kind="magic",
+            kind=encode_account_token_kind("magic"),
             user_id="alice@example.com",
             created_at=now,
             expires_at=now + 300,
@@ -292,7 +303,7 @@ class TestSqlAccountToken:
         with managed() as session:
             loaded = session.get(SqlAccountToken, (0, "tok_magic_xyz"))
             assert loaded is not None
-            assert loaded.kind == "magic"
+            assert loaded.kind == encode_account_token_kind("magic")
             assert loaded.user_id == "alice@example.com"
 
     def test_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
@@ -300,9 +311,10 @@ class TestSqlAccountToken:
         managed = make_managed_session_maker(engine)
 
         now = _now()
+        # An out-of-range int code must be rejected by ck_account_tokens_kind.
         token = SqlAccountToken(
             id="tok_bad",
-            kind="invalid",
+            kind=99,
             created_at=now,
             expires_at=now + 3600,
         )
@@ -327,7 +339,7 @@ class TestSqlConversation:
             loaded = session.get(SqlConversation, (0, "conv_test1"))
             assert loaded is not None
             assert loaded.title == "Hello World"
-            assert loaded.kind == "default"
+            assert loaded.kind == encode_conversation_kind("default")
             assert loaded.archived is False
 
     def test_defaults(self, db_uri: str) -> None:
@@ -356,7 +368,8 @@ class TestSqlConversation:
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
-        conv.kind = "invalid_kind"
+        # An out-of-range int code must be rejected by ck_conversations_kind.
+        conv.kind = 99
         with pytest.raises(IntegrityError):
             with managed() as session:
                 session.add(conv)
@@ -380,7 +393,7 @@ class TestSqlConversation:
         with managed() as session:
             loaded = session.get(SqlConversation, (0, "conv_child"))
             assert loaded is not None
-            assert loaded.kind == "sub_agent"
+            assert loaded.kind == encode_conversation_kind("sub_agent")
             assert loaded.parent_conversation_id == "conv_parent"
             assert loaded.root_conversation_id == "conv_parent"
 
@@ -433,9 +446,9 @@ class TestSqlConversationItem:
             loaded = session.get(SqlConversationItem, (0, "msg_test1"))
             assert loaded is not None
             assert loaded.conversation_id == "conv_test1"
-            assert loaded.type == "message"
+            assert loaded.type == encode_item_type("message")
             assert loaded.position == 0
-            assert loaded.status == "completed"
+            assert loaded.status == encode_item_status("completed")
             assert loaded.created_by is None
 
     def test_unique_position_per_conversation(self, db_uri: str) -> None:
@@ -609,7 +622,7 @@ class TestSqlComment:
             start_index=10,
             end_index=20,
             body="Looks good!",
-            status="draft",
+            status=encode_comment_status("draft"),
             created_at=now,
             updated_at=now * 1_000_000,
             anchor_content="selected text",
@@ -625,7 +638,7 @@ class TestSqlComment:
             assert loaded is not None
             assert loaded.path == "src/App.tsx"
             assert loaded.body == "Looks good!"
-            assert loaded.status == "draft"
+            assert loaded.status == encode_comment_status("draft")
             assert loaded.anchor_content == "selected text"
             assert loaded.created_by == "alice@example.com"
 
@@ -641,7 +654,7 @@ class TestSqlComment:
             start_index=0,
             end_index=5,
             body="Legacy comment",
-            status="addressed",
+            status=encode_comment_status("addressed"),
             created_at=now,
             updated_at=now * 1_000_000,
         )
@@ -668,9 +681,9 @@ class TestSqlPolicy:
         policy = SqlPolicy(
             id="pol_test1",
             name="cost-guard",
-            scope="default",
+            scope=encode_policy_scope("default"),
             created_at=_now(),
-            type="python",
+            type=encode_policy_type("python"),
             handler="omnigent.policies.cost_guard:handler",
             enabled=True,
         )
@@ -681,7 +694,7 @@ class TestSqlPolicy:
             loaded = session.get(SqlPolicy, (0, "pol_test1"))
             assert loaded is not None
             assert loaded.name == "cost-guard"
-            assert loaded.type == "python"
+            assert loaded.type == encode_policy_type("python")
             assert loaded.enabled is True
             assert loaded.session_id is None
 
@@ -695,18 +708,18 @@ class TestSqlPolicy:
             id="pol_1",
             name="guard",
             session_id="conv_test1",
-            scope="session",
+            scope=encode_policy_scope("session"),
             created_at=_now(),
-            type="python",
+            type=encode_policy_type("python"),
             handler="mod:fn",
         )
         p2 = SqlPolicy(
             id="pol_2",
             name="guard",
             session_id="conv_test1",
-            scope="session",
+            scope=encode_policy_scope("session"),
             created_at=_now(),
-            type="python",
+            type=encode_policy_type("python"),
             handler="mod:fn2",
         )
         with pytest.raises(IntegrityError):
@@ -729,7 +742,7 @@ class TestSqlHost:
             owner="corey@example.com",
             name="corey-laptop",
             host_id="host_abc123",
-            status="online",
+            status=encode_host_status("online"),
             created_at=now,
             updated_at=now,
         )
@@ -740,7 +753,7 @@ class TestSqlHost:
             loaded = session.get(SqlHost, (0, "corey@example.com", "corey-laptop"))
             assert loaded is not None
             assert loaded.host_id == "host_abc123"
-            assert loaded.status == "online"
+            assert loaded.status == encode_host_status("online")
             assert loaded.token_hash is None
             assert loaded.sandbox_provider is None
 
@@ -749,11 +762,12 @@ class TestSqlHost:
         managed = make_managed_session_maker(engine)
 
         now = _now()
+        # An out-of-range int code must be rejected by ck_hosts_status.
         host = SqlHost(
             owner="owner",
             name="host",
             host_id="host_bad",
-            status="unknown",
+            status=99,
             created_at=now,
             updated_at=now,
         )
@@ -770,7 +784,7 @@ class TestSqlHost:
             owner="a@x.com",
             name="h1",
             host_id="host_dup",
-            status="online",
+            status=encode_host_status("online"),
             created_at=now,
             updated_at=now,
         )
@@ -778,7 +792,7 @@ class TestSqlHost:
             owner="b@x.com",
             name="h2",
             host_id="host_dup",
-            status="offline",
+            status=encode_host_status("offline"),
             created_at=now,
             updated_at=now,
         )

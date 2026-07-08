@@ -59,13 +59,14 @@ def test_downgrade_restores_varchar256(tmp_path: Path) -> None:
             sa.text(
                 "INSERT INTO hosts "
                 "(workspace_id, owner, name, host_id, status, created_at, updated_at) "
-                "VALUES (0, 'user@example.com', 'my-laptop', 'host_abc123', 'online', "
+                "VALUES (0, 'user@example.com', 'my-laptop', 'host_abc123', 1, "
                 "1700000000, 1700000001)"
             )
         )
         conn.commit()
 
-    # Downgrade one step to s1a2b3c4d5e6.
+    # Downgrade to s1a2b3c4d5e6 (below the enums→SMALLINT migration that now
+    # sits above t1, which converts hosts.status back to a string on the way).
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
         config.attributes["connection"] = conn

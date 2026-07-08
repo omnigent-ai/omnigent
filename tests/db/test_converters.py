@@ -10,9 +10,13 @@ from __future__ import annotations
 import time
 
 from omnigent.db.converters import sql_agent_to_entity
-from omnigent.db.db_models import AGENT_KIND_SESSION, AGENT_KIND_TEMPLATE, SqlAgent
+from omnigent.db.db_models import SqlAgent
+from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Agent
+
+AGENT_KIND_TEMPLATE = encode_agent_kind("template")
+AGENT_KIND_SESSION = encode_agent_kind("session")
 
 
 def _now() -> int:

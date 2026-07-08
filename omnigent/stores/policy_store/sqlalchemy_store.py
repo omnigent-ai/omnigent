@@ -9,10 +9,14 @@ from sqlalchemy import asc, select
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.db_models import (
-    POLICY_SCOPE_DEFAULT,
-    POLICY_SCOPE_SESSION,
     SqlPolicy,
     current_workspace_id,
+)
+from omnigent.db.enum_codecs import (
+    decode_policy_scope,
+    decode_policy_type,
+    encode_policy_scope,
+    encode_policy_type,
 )
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -34,9 +38,9 @@ def _to_entity(row: SqlPolicy) -> Policy:
         id=row.id,
         name=row.name,
         session_id=row.session_id,
-        scope=row.scope,
+        scope=decode_policy_scope(row.scope),
         created_at=row.created_at,
-        type=row.type,
+        type=decode_policy_type(row.type),
         handler=row.handler,
         factory_params=json.loads(row.factory_params) if row.factory_params else None,
         enabled=bool(row.enabled),
@@ -88,10 +92,10 @@ class SqlAlchemyPolicyStore(PolicyStore):
             id=policy_id,
             name=name,
             session_id=session_id,
-            scope=POLICY_SCOPE_SESSION,
+            scope=encode_policy_scope("session"),
             created_at=now_epoch(),
             updated_at=None,
-            type=type,
+            type=encode_policy_type(type),
             handler=handler,
             factory_params=json.dumps(factory_params) if factory_params else None,
             enabled=enabled,
@@ -188,10 +192,10 @@ class SqlAlchemyPolicyStore(PolicyStore):
             id=policy_id,
             name=name,
             session_id=None,
-            scope=POLICY_SCOPE_DEFAULT,
+            scope=encode_policy_scope("default"),
             created_at=now_epoch(),
             updated_at=None,
-            type=type,
+            type=encode_policy_type(type),
             handler=handler,
             factory_params=json.dumps(factory_params) if factory_params else None,
             enabled=enabled,
@@ -205,7 +209,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 session.execute(
                     select(SqlPolicy)
                     .where(SqlPolicy.workspace_id == current_workspace_id())
-                    .where(SqlPolicy.scope == POLICY_SCOPE_DEFAULT)
+                    .where(SqlPolicy.scope == encode_policy_scope("default"))
                     .where(SqlPolicy.name == name)
                 )
                 .scalars()
@@ -225,7 +229,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         """Return a default policy by ID (``scope = 'default'``)."""
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
-            if row is None or row.scope != POLICY_SCOPE_DEFAULT:
+            if row is None or row.scope != encode_policy_scope("default"):
                 return None
             return _to_entity(row)
 
@@ -235,7 +239,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
             stmt = (
                 select(SqlPolicy)
                 .where(SqlPolicy.workspace_id == current_workspace_id())
-                .where(SqlPolicy.scope == POLICY_SCOPE_DEFAULT)
+                .where(SqlPolicy.scope == encode_policy_scope("default"))
                 .order_by(asc(SqlPolicy.created_at), asc(SqlPolicy.id))
             )
             rows = session.execute(stmt).scalars().all()
@@ -255,7 +259,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         """
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
-            if row is None or row.scope != POLICY_SCOPE_DEFAULT:
+            if row is None or row.scope != encode_policy_scope("default"):
                 return None
             changed = False
             if name is not None and row.name != name:
@@ -266,7 +270,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
                     session.execute(
                         select(SqlPolicy)
                         .where(SqlPolicy.workspace_id == current_workspace_id())
-                        .where(SqlPolicy.scope == POLICY_SCOPE_DEFAULT)
+                        .where(SqlPolicy.scope == encode_policy_scope("default"))
                         .where(SqlPolicy.name == name)
                         .where(SqlPolicy.id != policy_id)
                     )
@@ -296,7 +300,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         """Delete a default policy. Idempotent."""
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
-            if row is None or row.scope != POLICY_SCOPE_DEFAULT:
+            if row is None or row.scope != encode_policy_scope("default"):
                 return False
             session.delete(row)
             return True
