@@ -278,16 +278,16 @@ async def test_create_with_invalid_base_branch_fails_400(
     assert "base branch does not exist" in body["error"]["message"]
 
 
-async def test_create_with_workspace_branch_persists_without_creating(
+async def test_create_with_existing_worktree_persists_without_creating(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
 ) -> None:
     """Starting in an existing worktree persists its branch, creates nothing.
 
-    ``workspace_branch`` binds the session straight to a pre-existing
-    worktree directory: no create-worktree frame is sent to the host,
-    and the supplied branch is persisted as ``git_branch`` so the
-    sidebar shows it and the opt-in delete flow can offer to remove it.
+    ``git.existing_worktree`` binds the session straight to a
+    pre-existing worktree directory: no create-worktree frame is sent
+    to the host, and ``branch_name`` is persisted as ``git_branch`` so
+    the sidebar shows it and the opt-in delete flow can offer to remove it.
     """
     cap = register_worktree_host()
     agent = await create_test_agent(client, name="wt-existing-agent")
@@ -298,7 +298,7 @@ async def test_create_with_workspace_branch_persists_without_creating(
             "agent_id": agent["id"],
             "host_id": _HOST_ID,
             "workspace": _SOURCE_REPO,
-            "workspace_branch": "feature/existing",
+            "git": {"branch_name": "feature/existing", "existing_worktree": True},
         },
     )
     assert resp.status_code == 201, resp.text
@@ -313,11 +313,11 @@ async def test_create_with_workspace_branch_persists_without_creating(
     assert body["workspace"] == _SOURCE_REPO
 
 
-async def test_create_with_invalid_workspace_branch_fails_400(
+async def test_create_with_invalid_existing_worktree_branch_fails_400(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
 ) -> None:
-    """An invalid ``workspace_branch`` name fails the create with 400.
+    """An invalid bind-mode ``branch_name`` fails the create with 400.
 
     The host never runs git for this path, so the server is the only
     gate on the name; a malformed branch is user-correctable input and
@@ -332,7 +332,7 @@ async def test_create_with_invalid_workspace_branch_fails_400(
             "agent_id": agent["id"],
             "host_id": _HOST_ID,
             "workspace": _SOURCE_REPO,
-            "workspace_branch": "bad..branch",
+            "git": {"branch_name": "bad..branch", "existing_worktree": True},
         },
     )
 
@@ -350,8 +350,8 @@ async def test_create_failure_never_removes_existing_worktree(
 ) -> None:
     """A create_conversation failure must NOT destroy the user's worktree.
 
-    Regression: the ``workspace_branch`` path binds a *pre-existing*
-    worktree and sets ``git_branch`` without Omnigent creating one. The
+    Regression: the ``existing_worktree`` bind path sets ``git_branch``
+    for a *pre-existing* worktree without Omnigent creating one. The
     create-rollback (``git worktree remove --force`` + ``git branch -D``)
     is gated on Omnigent having created a worktree, NOT on ``git_branch``
     being set — otherwise a persistence failure would force-remove the
@@ -365,11 +365,11 @@ async def test_create_failure_never_removes_existing_worktree(
     cap = register_worktree_host()
     agent = await create_test_agent(client, name="wt-no-destroy-agent")
 
-    # Force the persistence step to fail after the workspace_branch path
-    # has already set git_branch — the exact window the rollback guards.
-    # Patch the class method (the store is a thin, stateless db_uri wrapper,
-    # and the route uses its own instance) so the failure hits regardless
-    # of which instance the router closed over.
+    # Force the persistence step to fail after the bind path has already
+    # set git_branch — the exact window the rollback guards. Patch the class
+    # method (the store is a thin, stateless db_uri wrapper, and the route
+    # uses its own instance) so the failure hits regardless of which
+    # instance the router closed over.
     def _boom(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("simulated create_conversation failure")
 
@@ -385,7 +385,7 @@ async def test_create_failure_never_removes_existing_worktree(
                 "agent_id": agent["id"],
                 "host_id": _HOST_ID,
                 "workspace": _SOURCE_REPO,
-                "workspace_branch": "feature/existing",
+                "git": {"branch_name": "feature/existing", "existing_worktree": True},
             },
         )
 

@@ -610,54 +610,50 @@ def test_session_create_git_with_host_id_ok() -> None:
     assert req.git.branch_name == "feature/x"
 
 
-def test_session_create_workspace_branch_requires_host_id() -> None:
-    """``workspace_branch`` without ``host_id`` is rejected (422).
+def test_session_git_existing_worktree_still_requires_host_id() -> None:
+    """``git`` in bind mode without ``host_id`` is rejected (422).
 
-    The branch is persisted as the session's ``git_branch``, which is
-    only meaningful for a host-bound session. Failing in the model
-    keeps the error at the boundary instead of deeper in the flow.
-    """
-    from omnigent.server.schemas import SessionCreateRequest
-
-    with pytest.raises(ValidationError, match="workspace_branch requires host_id"):
-        SessionCreateRequest(
-            agent_id="ag_x",
-            workspace="/repo/worktrees/feature-x",
-            workspace_branch="feature/x",
-        )
-
-
-def test_session_create_workspace_branch_rejects_git() -> None:
-    """``workspace_branch`` + ``git`` is contradictory and rejected (422).
-
-    ``git`` *creates* a worktree and sets its own branch;
-    ``workspace_branch`` records an *existing* worktree's branch
-    without creating one. Both at once is a caller bug.
+    ``existing_worktree`` records the branch as the session's
+    ``git_branch``, which is only meaningful for a host-bound session —
+    so the ``git`` → ``host_id`` requirement applies to bind mode too.
     """
     from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
 
-    with pytest.raises(ValidationError, match="workspace_branch cannot be combined with git"):
+    with pytest.raises(ValidationError, match="git worktree creation requires host_id"):
         SessionCreateRequest(
             agent_id="ag_x",
-            host_id="host_abc",
             workspace="/repo/worktrees/feature-x",
-            git=SessionGitOptions(branch_name="feature/x"),
-            workspace_branch="feature/x",
+            git=SessionGitOptions(branch_name="feature/x", existing_worktree=True),
         )
 
 
-def test_session_create_workspace_branch_with_host_id_ok() -> None:
-    """``workspace_branch`` with ``host_id`` and no ``git`` validates cleanly."""
-    from omnigent.server.schemas import SessionCreateRequest
+def test_session_git_existing_worktree_rejects_base_branch() -> None:
+    """Bind mode + ``base_branch`` is contradictory and rejected (422).
+
+    ``base_branch`` selects the ref a *new* branch forks from; it is
+    meaningless when binding to a worktree that already exists.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="base_branch cannot be set when existing_worktree is true"
+    ):
+        SessionGitOptions(branch_name="feature/x", base_branch="main", existing_worktree=True)
+
+
+def test_session_git_existing_worktree_with_host_id_ok() -> None:
+    """Bind mode with ``host_id`` and no ``base_branch`` validates cleanly."""
+    from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
 
     req = SessionCreateRequest(
         agent_id="ag_x",
         host_id="host_abc",
         workspace="/repo/worktrees/feature-x",
-        workspace_branch="feature/x",
+        git=SessionGitOptions(branch_name="feature/x", existing_worktree=True),
     )
-    assert req.workspace_branch == "feature/x"
-    assert req.git is None
+    assert req.git is not None
+    assert req.git.existing_worktree is True
+    assert req.git.branch_name == "feature/x"
 
 
 def test_session_create_host_type_defaults_external() -> None:
