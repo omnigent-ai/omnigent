@@ -15,18 +15,25 @@ import { authenticatedFetch } from "@/lib/identity";
 export interface CapabilitySkill {
   name: string;
   description: string;
+  /** Origin of the skill: bundle | workspace | user | plugin | codex | cursor | unknown. */
+  source: string;
+  /** Usable given the agent's skills_filter (bundled always true; host/plugin iff it passes). */
+  in_scope: boolean;
+  /** A name-based policy (block_skills/CEL) would DENY loading this skill. */
+  blocked: boolean;
 }
 
 /** Name + optional one-line description of a single function tool. */
 export interface CapabilityTool {
   name: string;
   description?: string | null;
+  /** A name-based policy would DENY calling this tool. */
+  blocked: boolean;
 }
 
 /**
- * An MCP server's secret-free config plus a (deferred) per-server tool
- * list. `tools` is intentionally empty in this slice — per-server tool
- * discovery needs a runner round-trip and lands in a later slice.
+ * An MCP server's secret-free config, connection status, and discovered
+ * per-server tool list.
  */
 export interface CapabilityMcpServer {
   name: string;
@@ -39,7 +46,11 @@ export interface CapabilityMcpServer {
   command?: string | null;
   /** Arguments passed to command. Only present when transport === "stdio". */
   args?: string[];
-  /** Discovered MCP tools. Always empty for now (deferred to a later slice). */
+  /** Connection status: "connected" | "failed" | "unknown". */
+  status: string;
+  /** Failure detail when the server could not be reached. */
+  error?: string | null;
+  /** Discovered MCP tools exposed by this server. */
   tools: CapabilityTool[];
 }
 
