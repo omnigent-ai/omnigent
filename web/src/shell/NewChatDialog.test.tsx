@@ -649,13 +649,12 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
 }
 
 /**
- * Open the agent/harness picker and open <agentId>'s config submenu via
- * keyboard (ArrowRight). A plain click on a knobbed row instead COMMITS the
- * pick and closes the menu, so config flows use the keyboard to drill in.
+ * Open the selected provider's run-config option dropdown by its trigger
+ * testid (Radix opens on pointerdown), e.g. `new-chat-landing-permission-select`
+ * or `new-chat-landing-approval-select`.
  */
-function openAgentConfig(agentId: string): void {
-  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "ArrowRight" });
+function openOption(triggerTestId: string): void {
+  fireEvent.pointerDown(screen.getByTestId(triggerTestId), { button: 0 });
 }
 
 /** Open the picker and commit (select + close) an agent by clicking its row. */
@@ -853,15 +852,19 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
   });
 
-  it("shows the Claude Code config knobs (model / effort / permission mode) in the picker submenu", () => {
+  it("shows the Claude Code config knobs (model / effort / permission mode) as sibling dropdowns", () => {
     renderLanding();
-    // The knobs live in the agent picker's per-entry submenu — absent until opened.
+    // The option rows live inside each dropdown — absent until that dropdown opens.
     expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-    // a1 (Claude Code, claude-native) is the default agent. Open its config
-    // submenu: model + effort + permission-mode radios all appear together.
-    openAgentConfig("a1");
+    // a1 (Claude Code, claude-native) is the default provider, so its Model /
+    // Effort / Permission dropdowns render next to the picker.
+    openOption("new-chat-landing-model-select");
     expect(screen.getByTestId("new-chat-landing-model-sonnet")).toBeTruthy();
+    closeMenu();
+    openOption("new-chat-landing-effort-select");
     expect(screen.getByTestId("new-chat-landing-effort-medium")).toBeTruthy();
+    closeMenu();
+    openOption("new-chat-landing-permission-select");
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");
     // The footer line explains the SELECTED mode until a row is hovered —
@@ -873,10 +876,12 @@ describe("NewChatLandingScreen", () => {
     expect(detail.textContent).toContain("Plans only; makes no edits");
   });
 
-  it("shows the Codex approval-mode knobs in the picker submenu", () => {
+  it("shows the Codex approval-mode knobs in the Approval dropdown", () => {
     renderLanding();
-    // Open Codex's (a2) config submenu — it carries the approval-mode radios.
-    openAgentConfig("a2");
+    // Select Codex (a2), then open its Approval dropdown — it carries the
+    // approval-mode radios.
+    selectAgent("a2");
+    openOption("new-chat-landing-approval-select");
     const fullAccessOption = screen.getByTestId("new-chat-landing-approval-full-access");
     expect(fullAccessOption.textContent).toContain("Full access");
     // The footer line explains the SELECTED mode until a row is hovered.
@@ -889,10 +894,10 @@ describe("NewChatLandingScreen", () => {
 
   it("arms codex full bypass only after the confirmation phrase is typed", async () => {
     renderLanding();
-    // Commit Codex as the selected agent, then reopen its config submenu where
-    // the bypass opt-in lives (arming requires Codex to be the live selection).
+    // Select Codex, then open its Approval dropdown where the bypass opt-in
+    // lives (arming requires Codex to be the live selection).
     selectAgent("a2");
-    openAgentConfig("a2");
+    openOption("new-chat-landing-approval-select");
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -932,10 +937,10 @@ describe("NewChatLandingScreen", () => {
 
   it("disarms the dangerous bypass when the agent changes (re-confirm per context)", () => {
     renderLanding();
-    // Arm bypass on Codex (a2): commit it, open its submenu, type the phrase,
-    // flip the switch, close the menu.
+    // Arm bypass on Codex (a2): commit it, open its Approval dropdown, type the
+    // phrase, flip the switch, close the menu.
     selectAgent("a2");
-    openAgentConfig("a2");
+    openOption("new-chat-landing-approval-select");
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
@@ -949,11 +954,12 @@ describe("NewChatLandingScreen", () => {
     selectAgent("a1");
     expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
 
-    // Switch back to Codex and reopen its submenu: the toggle is OFF and
-    // disabled again — the confirmation phrase must be re-typed for this fresh
-    // context. Without the reset effect it would re-render armed from stale state.
+    // Switch back to Codex and reopen its Approval dropdown: the toggle is OFF
+    // and disabled again — the confirmation phrase must be re-typed for this
+    // fresh context. Without the reset effect it would re-render armed from
+    // stale state.
     selectAgent("a2");
-    openAgentConfig("a2");
+    openOption("new-chat-landing-approval-select");
     const toggle = screen.getByTestId(
       "new-chat-landing-bypass-sandbox-switch",
     ) as HTMLButtonElement;
@@ -969,7 +975,7 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     renderLanding();
     selectAgent("a2");
-    openAgentConfig("a2");
+    openOption("new-chat-landing-approval-select");
     fireEvent.change(screen.getByTestId("new-chat-landing-bypass-sandbox-confirm"), {
       target: { value: "bypass sandbox" },
     });
@@ -2111,97 +2117,36 @@ describe("NewChatLandingScreen @-file-mention", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Mobile agent picker
+// Provider option dropdowns
 //
-// Touch devices can't hover, so the desktop knob flyout (a Radix sub-menu
-// opened on hover) is unreachable there. Below the `md` breakpoint the picker
-// instead swaps its contents in place: tapping anywhere on a configurable row
-// drills into that agent's knobs on the same surface (and selects it), with a
-// Back row to return. jsdom's matchMedia mock always reports `false`, so these tests
-// force the mobile branch by stubbing it to match the `max-width` query that
-// `useIsMobileViewport()` reads.
+// The run-config options (Model / Effort / Permission Mode / Approval / Mode /
+// Harness) are standalone dropdowns rendered next to the provider picker, keyed
+// off the selected provider's capabilities. They're viewport-independent — no
+// hover flyout or mobile drill-in — so a plain render exercises them.
 // ---------------------------------------------------------------------------
 
-/**
- * Make `useIsMobileViewport()` report a mobile (max-md) viewport. Returns a
- * restore fn. Only the `max-width` query matches, so `min-width` consumers
- * (e.g. desktop checks) keep reading false.
- */
-function forceMobileViewport(): () => void {
-  const real = window.matchMedia;
-  window.matchMedia = ((query: string) => ({
-    matches: /max-width/.test(query),
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  })) as typeof window.matchMedia;
-  return () => {
-    window.matchMedia = real;
-  };
-}
-
-describe("NewChatLandingScreen agent picker (mobile)", () => {
-  let restoreViewport: () => void;
+describe("NewChatLandingScreen provider option dropdowns", () => {
   beforeEach(() => {
     setupLandingMocks();
-    restoreViewport = forceMobileViewport();
   });
   afterEach(() => {
-    restoreViewport();
     cleanup();
     localStorage.clear();
   });
 
-  /** Open the picker (Radix opens on pointerdown). */
-  function openPicker(): void {
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  }
-
-  it("drills into an agent's knobs in place when the row is tapped (no hover flyout) and selects it", () => {
+  it("shows only the selected provider's option dropdowns and swaps them on switch", () => {
     renderLanding();
-    openPicker();
-    // The list is showing and the knobs are not — there's no hover flyout.
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
-    // Tap anywhere on a2 (Codex)'s row — its approval-mode knobs replace the
-    // list in place, and the tap also commits the pick.
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.getByTestId("new-chat-landing-agent-config-page")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-approval-full-access")).toBeTruthy();
-    // The list was replaced (not flown out alongside), so the OTHER agent
-    // row is gone while the knobs page is up.
-    expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
-    // Tapping the row selected the agent too — the trigger reflects the pick.
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Codex");
-  });
+    // a1 (Claude Code) is the default provider → Model / Effort / Permission
+    // dropdowns; Codex's Approval dropdown is absent.
+    expect(screen.getByTestId("new-chat-landing-model-select")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-permission-select")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-approval-select")).toBeNull();
 
-  it("returns to the agent list via Back without closing the menu", () => {
-    renderLanding();
-    openPicker();
-    // a1 (Claude Code) is configurable — tapping it drills into its knobs.
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a1"));
-    expect(screen.getByTestId("new-chat-landing-permission-plan")).toBeTruthy();
-    // Back steps to the list rather than closing: both agents reappear and
-    // the knobs are gone.
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-back"));
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-permission-plan")).toBeNull();
-  });
-
-  it("reopening after a drill-in lands back on the agent list", () => {
-    renderLanding();
-    openPicker();
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.getByTestId("new-chat-landing-agent-config-page")).toBeTruthy();
-    // Close, then reopen — the menu resets to the list, never a stale page.
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    openPicker();
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-    expect(screen.queryByTestId("new-chat-landing-agent-config-page")).toBeNull();
+    // Switch to Codex (a2): its Approval dropdown appears and Claude's
+    // Model/Permission dropdowns are gone.
+    selectAgent("a2");
+    expect(screen.getByTestId("new-chat-landing-approval-select")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-model-select")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-permission-select")).toBeNull();
   });
 });

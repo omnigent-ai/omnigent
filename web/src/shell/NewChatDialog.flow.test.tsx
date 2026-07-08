@@ -157,13 +157,12 @@ function openWorktree(): void {
 }
 
 /**
- * Open the agent/harness picker and open <agentId>'s config submenu via
- * keyboard (ArrowRight). A plain click on a knobbed row instead COMMITS the
- * pick and closes the menu, so config flows use the keyboard to drill in.
+ * Open the selected provider's run-config option dropdown by its trigger
+ * testid (Radix opens on pointerdown), e.g. `new-chat-landing-permission-select`
+ * or `new-chat-landing-model-select`.
  */
-function openAgentConfig(agentId: string): void {
-  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "ArrowRight" });
+function openOption(triggerTestId: string): void {
+  fireEvent.pointerDown(screen.getByTestId(triggerTestId), { button: 0 });
 }
 
 /** Open the picker and commit (select + close) an agent by clicking its row. */
@@ -553,12 +552,13 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Claude Code's config submenu (ArrowRight) and pick a non-default
-    // permission mode. The create call proves the choice travels as a
-    // `--permission-mode <mode>` pair in terminal_launch_args.
-    openAgentConfig("ag_native");
+    // Open Claude Code's Permission dropdown and pick a non-default mode. The
+    // create call proves the choice travels as a `--permission-mode <mode>`
+    // pair in terminal_launch_args.
+    openOption("new-chat-landing-permission-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-bypassPermissions"));
-    // The trigger label stays the bare agent name (the pick lives in the submenu).
+    // The provider trigger label stays the bare agent name (the pick lives in
+    // the separate Permission dropdown).
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     closeMenu();
     typeMessage("go");
@@ -609,7 +609,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_native");
+    openOption("new-chat-landing-permission-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-acceptEdits"));
 
     // The pick is snapshotted under the harness key immediately, so the next
@@ -632,10 +632,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Claude Code's submenu: its permission mode is at "Default" (the
-    // checked radio), and Codex's "Full access" approval preset doesn't even
-    // exist in this submenu — no cross-harness bleed.
-    openAgentConfig("ag_native");
+    // Open Claude Code's Permission dropdown: its mode is at "Default" (the
+    // checked radio), and Codex's "Full access" approval preset doesn't exist
+    // for Claude at all (no Approval dropdown) — no cross-harness bleed.
+    openOption("new-chat-landing-permission-select");
     await waitFor(() =>
       expect(
         screen.getByTestId("new-chat-landing-permission-default").getAttribute("aria-checked"),
@@ -661,12 +661,13 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick "Full access" for Codex (single-section submenu → closes on pick).
-    openAgentConfig("ag_codex");
+    // Pick "Full access" for Codex (the default provider) from its Approval
+    // dropdown.
+    openOption("new-chat-landing-approval-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
 
-    // Switch to OpenCode by clicking its row (a plain row — no config submenu,
-    // since it has no mode knobs).
+    // Switch to OpenCode — it has no approval capability, so no Approval
+    // dropdown renders for it.
     selectAgent("ag_opencode");
 
     typeMessage("go");
@@ -735,10 +736,11 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Model, effort and permission mode share Claude Code's one config submenu;
-    // it stays open across picks (multi-section) so both can be set in one visit.
-    openAgentConfig("ag_native");
+    // Model and effort are now separate sibling dropdowns; pick from each.
+    openOption("new-chat-landing-model-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
+    closeMenu();
+    openOption("new-chat-landing-effort-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-effort-high"));
     closeMenu();
     typeMessage("go");
@@ -788,7 +790,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    openAgentConfig("ag_native");
+    openOption("new-chat-landing-model-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
 
     await waitFor(() =>
@@ -835,7 +837,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    expect(screen.queryByTestId("new-chat-landing-model-trigger")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-model-select")).toBeNull();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -855,9 +857,8 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Codex's config submenu and pick "Full access" (single section →
-    // selecting it also commits and closes the menu).
-    openAgentConfig("ag_codex");
+    // Open Codex's Approval dropdown and pick "Full access".
+    openOption("new-chat-landing-approval-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -906,9 +907,8 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Polly's config submenu and pick the Pi harness (single section →
-    // selecting it commits the agent pick and closes the menu).
-    openAgentConfig("ag_polly");
+    // Open Polly's Harness dropdown and pick the Pi harness override.
+    openOption("new-chat-landing-harness-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
@@ -963,10 +963,10 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Pick Pi, then change mind back to the spec default (Claude SDK). Each
-    // pick closes the single-section submenu, so reopen between the two.
-    openAgentConfig("ag_polly");
+    // pick closes the Harness dropdown, so reopen between the two.
+    openOption("new-chat-landing-harness-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
-    openAgentConfig("ag_polly");
+    openOption("new-chat-landing-harness-select");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-claude-sdk"));
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
