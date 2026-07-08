@@ -44,6 +44,12 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.runner.transports.ws_tunnel.frames import (
+    PingFrame,
+    PongFrame,
+    decode_frame,
+    encode_frame,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -457,6 +463,63 @@ class _FakeTunnel:
         :raises ConnectionError: Always — ends the serve loop.
         """
         raise ConnectionError("test disconnect")
+
+
+class _PingThenDisconnectTunnel(_FakeTunnel):
+    """Fake tunnel that delivers one server ping before disconnecting."""
+
+    def __init__(self) -> None:
+        """Initialize with a queued ping frame."""
+        super().__init__()
+        self._sent_ping = False
+
+    async def recv(self) -> str:
+        """Return one ping frame, then simulate a disconnect."""
+        if not self._sent_ping:
+            self._sent_ping = True
+            return encode_frame(PingFrame(ts=123))
+        raise ConnectionError("test disconnect")
+
+
+async def test_serve_frames_refreshes_configured_harnesses_after_ping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live host refreshes the hello readiness map after daemon startup.
+
+    Regression guard for a long-lived daemon: it connected while opencode was
+    missing, the user installed opencode later, and the server/web picker kept
+    showing the original ``False`` snapshot until daemon restart. The host must
+    recompute the map on an existing tunnel event and send a later hello with
+    the fresh verdict.
+    """
+    host = _make_host_process()
+    maps = iter(
+        [
+            {"opencode-native": False},
+            {"opencode-native": True},
+        ]
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(maps),
+    )
+    tunnel = _PingThenDisconnectTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 3
+    first_hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(first_hello, HostHelloFrame)
+    assert first_hello.configured_harnesses == {"opencode-native": False}
+
+    pong = decode_frame(tunnel.sent[1])
+    assert isinstance(pong, PongFrame)
+    assert pong.ts == 123
+
+    refreshed_hello = decode_host_frame(tunnel.sent[2])
+    assert isinstance(refreshed_hello, HostHelloFrame)
+    assert refreshed_hello.configured_harnesses == {"opencode-native": True}
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(

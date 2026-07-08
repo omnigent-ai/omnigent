@@ -60,7 +60,7 @@ class HostFrameKind(str, Enum):
 
 @dataclass
 class HostHelloFrame:
-    """Host's first frame on a fresh tunnel.
+    """Host identity/readiness frame.
 
     :param version: Host software version, e.g. ``"0.1.0"``.
     :param frame_protocol_version: Wire-protocol major. Server
@@ -75,8 +75,10 @@ class HostHelloFrame:
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
         unknown (an older host that doesn't report it) — never
-        treat ``None`` as "nothing is configured". Recomputed on
-        each (re)connect; the launch-time check is authoritative.
+        treat ``None`` as "nothing is configured". Sent on connect
+        and may be resent while the tunnel is live to refresh the
+        server's advisory picker state; the launch-time check is
+        authoritative.
     """
 
     version: str

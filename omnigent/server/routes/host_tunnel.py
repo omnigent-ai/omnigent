@@ -8,7 +8,9 @@ or terminates runner subprocesses accordingly.
 Per ``designs/DAEMON_API.md``, the host sends a ``host.hello``
 frame on connect advertising its version, name, and live runner
 IDs. The server validates ``frame_protocol_version`` for
-version-skew enforcement (strict-major).
+version-skew enforcement (strict-major). A connected host may send
+later ``host.hello`` frames to refresh advisory readiness fields such
+as ``configured_harnesses``.
 
 The endpoint registers the host in the :class:`HostRegistry`
 (in-memory, per-replica) and upserts the host in the ``hosts``
@@ -151,14 +153,15 @@ def create_host_tunnel_router(
                 return
             tunnel_owner = managed.owner
         elif auth_provider is not None:
-            tunnel_owner = auth_provider.get_user_id(ws)
-            if tunnel_owner is None:
+            authenticated_owner = auth_provider.get_user_id(ws)
+            if authenticated_owner is None:
                 # Auth is enabled but this peer didn't authenticate. Fail
                 # closed — never fall back to RESERVED_USER_LOCAL, which is
                 # admin-equivalent under the multi-user header scheme
                 # Closing before accept() refuses the handshake.
                 await ws.close(code=4004, reason="unauthenticated")
                 return
+            tunnel_owner = authenticated_owner
         else:
             # No auth provider configured = explicit single-user / local
             # deployment; RESERVED_USER_LOCAL is the accepted local owner
@@ -218,7 +221,14 @@ def create_host_tunnel_router(
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
-                _receive_loop(ws, conn, host_id, runner_exit_reports, on_runner_exited),
+                _receive_loop(
+                    ws,
+                    conn,
+                    host_id,
+                    host_store,
+                    runner_exit_reports,
+                    on_runner_exited,
+                ),
                 name=f"host-receive:{host_id}",
             )
 
@@ -313,6 +323,7 @@ async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
     host_id: str,
+    host_store: HostStore,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
 ) -> None:
@@ -321,6 +332,8 @@ async def _receive_loop(
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection for resolving pending requests.
     :param host_id: Host id for logging.
+    :param host_store: Persistent host store; later ``host.hello`` frames
+        update its configured-harness snapshot for ``GET /v1/hosts``.
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
@@ -362,6 +375,20 @@ async def _receive_loop(
                 "Host %s sent unexpected runner frame; dropping: kind=%s",
                 host_id,
                 type(runner_frame).__name__,
+            )
+            continue
+
+        if isinstance(frame, HostHelloFrame):
+            # A connected host can resend hello as a lightweight readiness
+            # refresh. This updates the same DB field the initial hello wrote,
+            # so the web picker does not keep a daemon-start snapshot after a
+            # CLI is installed.
+            conn.hello.runners = frame.runners
+            conn.hello.configured_harnesses = frame.configured_harnesses
+            await asyncio.to_thread(
+                host_store.update_configured_harnesses,
+                host_id,
+                frame.configured_harnesses,
             )
             continue
 
