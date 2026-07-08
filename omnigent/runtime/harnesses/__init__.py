@@ -138,6 +138,11 @@ _HARNESS_MODULES: dict[str, str] = {
     # omnigent/inner/hermes_executor.py. The ``hermes`` binary must be
     # on PATH (or set by HARNESS_HERMES_PATH).
     "hermes": "omnigent.inner.hermes_harness",
+    # hermes-acp harness wrap. Streaming Hermes via ``hermes acp`` (JSON-RPC
+    # over stdio, same ACP mode as qwen/goose): text and thinking deltas and
+    # tool calls stream live instead of the batch path's one end-of-turn write.
+    # See omnigent/inner/hermes_acp_harness.py and hermes_acp_executor.py.
+    "hermes-acp": "omnigent.inner.hermes_acp_harness",
     # hermes-native harness wrap. Drives the resident ``hermes`` TUI by
     # injecting each web-UI turn into its tmux pane and mirroring the transcript
     # back from Hermes' SQLite ``state.db`` session store — a native-CLI harness

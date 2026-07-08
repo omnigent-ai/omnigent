@@ -183,9 +183,11 @@ def test_configured_harness_map_covers_all_spellings(
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
-        # Hermes — headless subprocess harness (``hermes``) + native TUI
-        # (``hermes-native`` / ``native-hermes``); all gate on the hermes CLI.
+        # Hermes — headless subprocess harness (``hermes``), streaming ACP
+        # harness (``hermes-acp``), + native TUI (``hermes-native`` /
+        # ``native-hermes``); all gate on the hermes CLI.
         "hermes",
+        "hermes-acp",
         "hermes-native",
         "native-hermes",
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI

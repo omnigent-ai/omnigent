@@ -220,6 +220,11 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     through its own provider config, not the shared gateway/profile probe
     wiring this matrix drives.
 
+    ``hermes-acp`` is excluded for the same reason as ``hermes``: it wraps the
+    same ``hermes`` CLI binary with Hermes' own provider config, just over the
+    ACP transport. Its live round-trip is covered by the dedicated
+    ``test_hermes_acp_e2e.py`` suite.
+
     ``hermes-native`` is excluded for the union of both reasons: it is a
     terminal-first TUI launched via ``omni hermes`` (tmux pane + bridge dir), not
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
@@ -245,6 +250,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi",
         "kimi-native",
         "hermes",
+        "hermes-acp",
         "hermes-native",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

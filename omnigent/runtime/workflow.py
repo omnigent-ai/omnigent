@@ -1457,6 +1457,39 @@ def _build_goose_spawn_env(
     return env
 
 
+def _build_hermes_acp_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the hermes-acp harness wrap reads.
+
+    Maps spec.executor fields to the shared ``HARNESS_HERMES_*`` env vars the
+    hermes wraps read (``omnigent/inner/hermes_harness.py``). Hermes owns its
+    own auth (``hermes model`` / ``hermes auth``), so this wires **no**
+    provider/gateway credential — it forwards only an optional model override
+    and the os_env/sandbox spec. A ``databricks-*`` model is dropped (not a
+    valid Hermes model id), mirroring the goose builder.
+
+    :param spec: The agent spec.
+    :param workdir: Accepted for signature parity with the other builders; the
+        hermes-acp wrap consumes no bundle dir yet.
+    :returns: A dict of env-var overrides for the harness process spawn.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None and not model.startswith(("databricks-", "databricks/")):
+        env["HARNESS_HERMES_MODEL"] = model
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_HERMES_OS_ENV"] = os_env_payload
+    # Always thread the skills filter: the wrap's _resolve_skills_filter
+    # defaults an ABSENT var to "all", so dropping it here would silently
+    # launch a skills-restricted spec with every skill enabled.
+    env["HARNESS_HERMES_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    return env
+
+
 def _build_acp_spawn_env(
     spec: AgentSpec,
     *,

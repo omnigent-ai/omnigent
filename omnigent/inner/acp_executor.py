@@ -313,7 +313,7 @@ class AcpExecutor(Executor):
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
         self._image_supported = False
-        env = os.environ.copy()
+        env = self._spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
         self._proc = await asyncio.create_subprocess_exec(
@@ -328,6 +328,12 @@ class AcpExecutor(Executor):
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    def _spawn_env(self) -> dict[str, str]:
+        """Environment for the agent subprocess. Subclasses override to inject
+        per-session state (e.g. a scoped config HOME) without re-implementing
+        :meth:`_start_process`."""
+        return os.environ.copy()
 
     def _sandbox_launch(self, spawn_env_names: tuple[str, ...]) -> tuple[str, list[str]]:
         """Return ``(launch_path, argv)`` — sandbox launcher or the bare binary.
