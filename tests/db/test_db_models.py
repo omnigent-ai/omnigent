@@ -7,6 +7,7 @@ behave as expected.
 
 from __future__ import annotations
 
+import hashlib
 import time
 
 import pytest
@@ -694,6 +695,8 @@ class TestSqlPolicy:
             loaded = session.get(SqlPolicy, (0, "pol_test1"))
             assert loaded is not None
             assert loaded.name == "cost-guard"
+            # The column default stamps sha256(name) on INSERT.
+            assert loaded.name_cksum == hashlib.sha256(b"cost-guard").digest()
             assert loaded.type == encode_policy_type("python")
             assert loaded.enabled is True
             assert loaded.session_id is None

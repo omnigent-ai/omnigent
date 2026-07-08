@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from collections.abc import Iterator
 from contextvars import ContextVar
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -13,6 +15,7 @@ from sqlalchemy import (
     Float,
     Index,
     Integer,
+    LargeBinary,
     SmallInteger,
     String,
     Text,
@@ -21,7 +24,13 @@ from sqlalchemy import (
     text,
     true,
 )
+from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
+# but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
+# BINARY(32) there — an exact fit for the digest and fully indexable.
+_CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
 
 class Base(DeclarativeBase):
@@ -750,6 +759,26 @@ class SqlComment(Base):
     )
 
 
+def policy_name_cksum(name: str) -> bytes:
+    """Return the sha256 digest of a policy name.
+
+    This 32-byte digest is what the name-uniqueness indexes key on instead
+    of the raw ``VARCHAR(256)`` name — a fixed, compact index entry. Two
+    names collide iff their digests do, so uniqueness is preserved.
+    """
+    return hashlib.sha256(name.encode("utf-8")).digest()
+
+
+def _default_policy_name_cksum(context: Any) -> bytes:
+    """Column default: derive ``name_cksum`` from the bound ``name`` on INSERT.
+
+    Mirrors the ``workspace_id`` default pattern so every ORM insert stamps
+    the checksum without the caller setting it. Column defaults do not fire
+    on UPDATE, so renames recompute it explicitly in the store.
+    """
+    return policy_name_cksum(context.get_current_parameters()["name"])
+
+
 class SqlPolicy(Base):
     """
     SQLAlchemy model for the ``policies`` table.
@@ -763,9 +792,14 @@ class SqlPolicy(Base):
     are created via ``POST /v1/policies``.
 
     :param id: Opaque PK, e.g. ``"pol_a1b2c3..."``.
-    :param name: Human-readable name. UNIQUE per
-        ``(session_id, name)`` for session policies; globally
-        unique for default policies (``session_id IS NULL``).
+    :param name: Human-readable name. UNIQUE per session for
+        session policies; globally unique for default policies
+        (``session_id IS NULL``). Uniqueness is enforced on
+        ``name_cksum`` rather than this column.
+    :param name_cksum: sha256 digest of ``name`` (32 bytes). The
+        name-uniqueness indexes key on this compact digest instead
+        of the wide ``VARCHAR(256)`` name. Stamped on INSERT by a
+        column default; recomputed by the store on rename.
     :param session_id: FK to ``conversations.id``. ``None`` for
         server-wide default policies. ``ON DELETE CASCADE`` so
         removing a session cleans up its policies.
@@ -802,6 +836,10 @@ class SqlPolicy(Base):
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(256))
+    # sha256(name) — the value the name-uniqueness indexes key on instead of
+    # the wide name column. Stamped from `name` on INSERT via the column
+    # default; the store recomputes it on rename (defaults don't fire on UPDATE).
+    name_cksum: Mapped[bytes] = mapped_column(_CKSUM32, default=_default_policy_name_cksum)
     # Nullable: NULL for server-wide default policies.
     session_id: Mapped[str | None] = mapped_column(
         String(64),
@@ -833,14 +871,16 @@ class SqlPolicy(Base):
         CheckConstraint("scope IN (1, 2)", name="ck_policies_scope"),
         Index("ix_policies_created_at", "created_at"),
         Index("ix_policies_session_id", "session_id"),
-        UniqueConstraint("session_id", "name", name="uq_policies_session_id_name"),
+        # Name uniqueness keys on name_cksum (sha256 of name) rather than the
+        # wide name column, for a compact 32-byte index entry.
+        UniqueConstraint("session_id", "name_cksum", name="uq_policies_session_id_name_cksum"),
         # Default policies must have unique names; session-scoped policies
         # may reuse the same name across conversations. Mirrors
         # ix_agents_template_name scoping to the 'default' set. scope = 1 is
         # the "default" code.
         Index(
-            "ix_policies_default_name",
-            "name",
+            "ix_policies_default_name_cksum",
+            "name_cksum",
             unique=True,
             sqlite_where=text("scope = 1"),
             postgresql_where=text("scope = 1"),

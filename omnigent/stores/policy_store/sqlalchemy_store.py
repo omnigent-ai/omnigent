@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.db.db_models import (
     SqlPolicy,
     current_workspace_id,
+    policy_name_cksum,
 )
 from omnigent.db.enum_codecs import (
     decode_policy_scope,
@@ -145,6 +146,8 @@ class SqlAlchemyPolicyStore(PolicyStore):
             changed = False
             if name is not None and row.name != name:
                 row.name = name
+                # Column defaults don't fire on UPDATE — recompute the digest.
+                row.name_cksum = policy_name_cksum(name)
                 changed = True
             if handler is not None and row.handler != handler:
                 row.handler = handler
@@ -183,9 +186,9 @@ class SqlAlchemyPolicyStore(PolicyStore):
         Raises ``IntegrityError`` on name collision among defaults.
 
         SQLite treats NULLs as distinct in composite unique
-        constraints, so the ``(session_id, name)`` constraint
+        constraints, so the ``(session_id, name_cksum)`` constraint
         does not enforce uniqueness among default policies.
-        This method checks for duplicates explicitly.
+        This method checks for duplicates explicitly (by name digest).
         """
 
         row = SqlPolicy(
@@ -210,7 +213,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
                     select(SqlPolicy)
                     .where(SqlPolicy.workspace_id == current_workspace_id())
                     .where(SqlPolicy.scope == encode_policy_scope("default"))
-                    .where(SqlPolicy.name == name)
+                    .where(SqlPolicy.name_cksum == policy_name_cksum(name))
                 )
                 .scalars()
                 .first()
@@ -264,14 +267,14 @@ class SqlAlchemyPolicyStore(PolicyStore):
             changed = False
             if name is not None and row.name != name:
                 # Explicit uniqueness check for the application layer;
-                # the partial index ix_policies_default_name is the
+                # the partial index ix_policies_default_name_cksum is the
                 # DB-layer guard, but checking here gives a cleaner error.
                 conflict = (
                     session.execute(
                         select(SqlPolicy)
                         .where(SqlPolicy.workspace_id == current_workspace_id())
                         .where(SqlPolicy.scope == encode_policy_scope("default"))
-                        .where(SqlPolicy.name == name)
+                        .where(SqlPolicy.name_cksum == policy_name_cksum(name))
                         .where(SqlPolicy.id != policy_id)
                     )
                     .scalars()
@@ -284,6 +287,8 @@ class SqlAlchemyPolicyStore(PolicyStore):
                         orig=Exception(f"UNIQUE constraint: name={name!r}"),
                     )
                 row.name = name
+                # Column defaults don't fire on UPDATE — recompute the digest.
+                row.name_cksum = policy_name_cksum(name)
                 changed = True
             if handler is not None and row.handler != handler:
                 row.handler = handler
