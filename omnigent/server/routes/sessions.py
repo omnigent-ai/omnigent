@@ -10560,20 +10560,38 @@ def _resolve_session_effective_spec(
     return spec
 
 
+# Cap on how deep the declared-sub-agent tree is walked for the capabilities
+# view. Sub-agent nesting in the wild is shallow (a handful of levels); a
+# pathological or cyclically-authored spec should not recurse without bound.
+_SUB_AGENT_TREE_MAX_DEPTH = 16
+
+
 def _sub_agent_capability_tree(
     sub_agents: list[AgentSpec],
+    *,
+    _depth: int = 0,
 ) -> list[SubAgentCapability]:
     """Build the recursive declared-sub-agent tree for the capabilities view.
 
+    Depth-bounded: recursion stops descending past
+    :data:`_SUB_AGENT_TREE_MAX_DEPTH`, so a pathological or accidentally
+    self-referential spec cannot drive unbounded recursion. Sub-agents have
+    no name-based gating today, so nodes are reported as-is (always in
+    scope) — the cap only bounds traversal.
+
     :param sub_agents: A spec's ``sub_agents`` list.
+    :param _depth: Current recursion depth (internal).
     :returns: One :class:`SubAgentCapability` per declared sub-agent, each
-        carrying its own children recursively.
+        carrying its own children recursively (children truncated to ``[]``
+        at the depth cap).
     """
+    if _depth >= _SUB_AGENT_TREE_MAX_DEPTH:
+        return []
     return [
         SubAgentCapability(
             name=sub.name,
             description=sub.description,
-            sub_agents=_sub_agent_capability_tree(sub.sub_agents),
+            sub_agents=_sub_agent_capability_tree(sub.sub_agents, _depth=_depth + 1),
         )
         for sub in sub_agents
     ]
@@ -10590,9 +10608,11 @@ def _build_session_capability_groups(
 
     ``ToolManager(spec)`` is construction-only (MCP is ``start()``-gated),
     so the local-tool surface is resolved without any runner round-trip or
-    MCP connect. Per-server MCP ``tools`` are intentionally left empty — that
-    discovery needs a live runner ``tools/list`` (Slice D). Skills come from
-    a separate runner-owned source and are added by the caller.
+    MCP connect. Per-server MCP ``tools`` / ``status`` and the per-tool
+    ``blocked`` flags are left at their defaults here — the caller layers
+    them on from a live runner ``tools/list`` round-trip and the policy
+    probe. Skills come from a separate runner-owned source, also added by
+    the caller.
 
     Blocking/CPU-bound (schema build), so run under ``asyncio.to_thread``.
 
@@ -10609,8 +10629,8 @@ def _build_session_capability_groups(
             url=srv.url,
             command=srv.command,
             args=srv.args,
-            # Deferred: per-server tool discovery needs a runner tools/list
-            # round-trip against the live MCP connection (Slice D).
+            # Config-only skeleton; the caller layers on the discovered
+            # ``tools`` + connection ``status`` from a runner tools/list.
             tools=[],
         )
         for srv in spec.mcp_servers
@@ -10716,42 +10736,144 @@ async def _compute_blocked_skills(
     :returns: ``{skill_name: blocked}``; empty when no policies apply or
         the engine can't be built.
     """
-    if not skill_names:
+    return await _compute_blocked_tool_events(
+        spec,
+        session_id,
+        conversation_store,
+        skill_names,
+        event_data_for=lambda name: {"name": "Skill", "arguments": {"skill": name}},
+        user_id=user_id,
+        label="skills",
+    )
+
+
+async def _compute_blocked_tool_events(
+    spec: AgentSpec,
+    session_id: str,
+    conversation_store: ConversationStore,
+    keys: list[str],
+    *,
+    event_data_for: Callable[[str], dict[str, Any]],
+    user_id: str | None,
+    label: str,
+) -> dict[str, bool]:
+    """
+    Shared read-only, name-based, non-LLM "would a policy DENY this?" probe.
+
+    The general core behind every Capabilities ``blocked`` flag (skills,
+    MCP tools, local tools). Builds the session policy engine, strips ALL
+    LLM-backed policies (via :func:`_is_llm_backed_policy` — the prompt
+    classifier and every LLM-gated router, identified by their registry
+    ``llm_backed`` flag, so a future LLM-backed builtin is excluded
+    automatically), then evaluates one synthetic ``read_only=True``
+    ``tool_call`` event per key straight through the engine (never the
+    ASK / elicitation gate). A key is ``blocked`` when the composed
+    decision is ``DENY``.
+
+    Only the per-key event *shape* is caller-specific: ``event_data_for``
+    maps a key to the ``tool_call`` ``data`` payload (``{"name", "arguments"}``).
+    The LLM-exclusion, engine build, and short-circuit logic live here so
+    callers never duplicate it.
+
+    Best-effort: an unbuildable engine or an eval error defaults to
+    not-blocked so the panel degrades to a false/empty state rather than
+    failing the read.
+
+    :param spec: The session's (context-aware) agent spec.
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store the engine reads label/state from.
+    :param keys: Opaque keys to test (skill names / tool names).
+    :param event_data_for: Maps a key to the synthetic ``tool_call``
+        event ``data`` payload.
+    :param user_id: Authenticated caller, for the evaluation actor.
+    :param label: Short tag for debug logging, e.g. ``"skills"``.
+    :returns: ``{key: blocked}``; empty when no policies apply or the
+        engine can't be built.
+    """
+    if not keys:
         return {}
     try:
         engine = await asyncio.to_thread(
             _build_policy_engine_from_spec, spec, session_id, conversation_store
         )
     except Exception:  # noqa: BLE001 — best-effort: policy infra down → nothing blocked
-        _logger.debug("Blocked-skills engine build failed for %s", session_id, exc_info=True)
+        _logger.debug("Blocked-%s engine build failed for %s", label, session_id, exc_info=True)
         return {}
-    # No policies ⇒ nothing can deny; skip the per-skill evaluation entirely.
+    # No policies ⇒ nothing can deny; skip the per-key evaluation entirely.
     if not engine.policies:
         return {}
     # Narrow the probe engine to cheap, name-based deny policies only. Any
     # LLM-backed policy (prompt classifier or LLM-gated router, flagged
     # ``llm_backed`` in the registry) left in would fire one LLM call per
-    # skill name. This engine is a fresh throwaway built above, so mutating
-    # its policy list here does not affect the runtime engine used elsewhere.
+    # key. This engine is a fresh throwaway built above, so mutating its
+    # policy list here does not affect the runtime engine used elsewhere.
     engine.policies = [p for p in engine.policies if not _is_llm_backed_policy(p)]
     # No name-based policies left ⇒ nothing cheap can deny; short-circuit.
     if not engine.policies:
-        return dict.fromkeys(skill_names, False)
+        return dict.fromkeys(keys, False)
+    # None of the surviving policies are LLM-backed, so the probe never needs
+    # the server LLM. Clear it so a non-serializable client object cannot leak
+    # into the dispatched event (``event["llm_client"]``) and corrupt CEL
+    # name-deny evaluation — CEL serializes the whole event, and a non-primitive
+    # value makes it abstain (falsely not-blocked). Safe: throwaway engine.
+    engine._llm_client = None
     actor = _build_actor(user_id)
     blocked: dict[str, bool] = {}
-    for name in skill_names:
-        event: dict[str, Any] = {
-            "type": "tool_call",
-            "data": {"name": "Skill", "arguments": {"skill": name}},
-        }
+    for key in keys:
+        data = event_data_for(key)
+        event: dict[str, Any] = {"type": "tool_call", "data": data}
         try:
-            ctx = _build_evaluation_context(Phase.TOOL_CALL, event["data"], event, actor=actor)
+            ctx = _build_evaluation_context(Phase.TOOL_CALL, data, event, actor=actor)
             result = await engine.evaluate(ctx, read_only=True)
-            blocked[name] = result.action == PolicyAction.DENY
+            blocked[key] = result.action == PolicyAction.DENY
         except Exception:  # noqa: BLE001 — best-effort: eval error → treat as not blocked
-            _logger.debug("Blocked-skills eval failed for %s/%s", session_id, name, exc_info=True)
-            blocked[name] = False
+            _logger.debug(
+                "Blocked-%s eval failed for %s/%s", label, session_id, key, exc_info=True
+            )
+            blocked[key] = False
     return blocked
+
+
+async def _compute_blocked_tool_names(
+    spec: AgentSpec,
+    session_id: str,
+    conversation_store: ConversationStore,
+    tool_names: list[str],
+    *,
+    user_id: str | None,
+) -> dict[str, bool]:
+    """
+    Read-only "would a policy block calling this tool?" check per name.
+
+    Powers the ``blocked`` flag on local tools and MCP tools. Reuses the
+    shared :func:`_compute_blocked_tool_events` probe (same non-LLM,
+    name-based deny semantics as the skills flag), evaluating a synthetic
+    ``tool_call`` event whose ``name`` is the tool name and ``arguments``
+    is empty — the shape a bare/namespaced builtin or MCP tool call carries
+    at runtime.
+
+    Callers pass whatever name shape(s) the runtime uses; for MCP tools
+    both the spec-proxied ``<server>__<tool>`` and the connector-native
+    ``mcp__<server>__<tool>`` forms are probed so a name-based deny authored
+    for either surface is reflected.
+
+    :param spec: The session's (context-aware) agent spec.
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store the engine reads label/state from.
+    :param tool_names: Tool names to test (bare or namespaced).
+    :param user_id: Authenticated caller, for the evaluation actor.
+    :returns: ``{tool_name: blocked}``; empty when no policies apply or
+        the engine can't be built.
+    """
+    return await _compute_blocked_tool_events(
+        spec,
+        session_id,
+        conversation_store,
+        tool_names,
+        event_data_for=lambda name: {"name": name, "arguments": {}},
+        user_id=user_id,
+        label="tools",
+    )
 
 
 async def _apply_pending_policy_ask_writes(
@@ -20543,10 +20665,12 @@ def create_sessions_router(
           list, from the same runner-owned source as the session
           snapshot (best-effort; empty until the runner fetch warms).
         * ``mcp_servers`` — the agent's MCP server config
-          (secret-free). Per-server ``tools`` is deferred and left
-          empty (Slice D needs a runner ``tools/list`` round-trip).
+          (secret-free), each enriched with its discovered per-server
+          ``tools`` (name + description + policy ``blocked``) and a
+          connection ``status`` / ``error`` read from the runner's live
+          MCP state via a bounded ``tools/list`` round-trip.
         * ``local_tools`` — the agent's effective local/builtin
-          function tools (name + description).
+          function tools (name + description + policy ``blocked``).
         * ``sub_agents`` — the declared sub-agent tree from the spec.
 
         :param request: The incoming FastAPI request.
@@ -20604,10 +20728,29 @@ def create_sessions_router(
         if runner_client is None:
             runner_client = get_runner_client()
         skills = await _fetch_runner_skill_capabilities(runner_client, session_id)
+        # Discover the live per-server MCP tool surface (best-effort, read-only
+        # runner round-trip). Populate each server's ``tools`` + connection
+        # ``status`` / ``error``; servers absent from the discovery degrade to
+        # ``status="unknown"`` with an empty tool list.
+        mcp_schemas, mcp_failures, mcp_discovered = await _fetch_runner_mcp_tools(
+            runner_client, session_id
+        )
+        tools_by_server = _group_mcp_tools_by_server(
+            [srv.name for srv in mcp_servers], mcp_schemas
+        )
+        for server in mcp_servers:
+            server.tools = tools_by_server.get(server.name, [])
+            if server.name in mcp_failures:
+                server.status = "failed"
+                server.error = mcp_failures[server.name]
+            elif mcp_discovered:
+                server.status = "connected"
+            # else: leave default ``status="unknown"`` (runner/MCP unavailable).
         # Layer the policy ``blocked`` flag on server-side (policy is
         # server-owned). Read-only, best-effort: a name absent from the map
-        # keeps its default ``blocked=False``.
-        blocked_map = await _compute_blocked_skills(
+        # keeps its default ``blocked=False``. Skills, local tools, and MCP
+        # tools all share one non-LLM, name-based deny probe.
+        blocked_skills = await _compute_blocked_skills(
             spec,
             session_id,
             conversation_store,
@@ -20615,7 +20758,30 @@ def create_sessions_router(
             user_id=user_id,
         )
         for skill in skills:
-            skill.blocked = blocked_map.get(skill.name, False)
+            skill.blocked = blocked_skills.get(skill.name, False)
+        # Local tools probe with their bare builtin name; MCP tools probe with
+        # BOTH namespaced surfaces (spec-proxied ``<server>__<tool>`` and
+        # connector-native ``mcp__<server>__<tool>``) so a name-based deny
+        # authored for either form is reflected.
+        tool_name_candidates: set[str] = {t.name for t in local_tools}
+        for server in mcp_servers:
+            for tool in server.tools:
+                tool_name_candidates.add(f"{server.name}__{tool.name}")
+                tool_name_candidates.add(f"mcp__{server.name}__{tool.name}")
+        blocked_tools = await _compute_blocked_tool_names(
+            spec,
+            session_id,
+            conversation_store,
+            sorted(tool_name_candidates),
+            user_id=user_id,
+        )
+        for tool in local_tools:
+            tool.blocked = blocked_tools.get(tool.name, False)
+        for server in mcp_servers:
+            for tool in server.tools:
+                tool.blocked = blocked_tools.get(
+                    f"{server.name}__{tool.name}", False
+                ) or blocked_tools.get(f"mcp__{server.name}__{tool.name}", False)
         return SessionCapabilities(
             session_id=session_id,
             agent_id=conv.agent_id,
@@ -21055,6 +21221,105 @@ async def _fetch_runner_skill_capabilities(
     except (ValueError, AttributeError, KeyError, TypeError):
         _logger.debug("Runner skill-capabilities payload malformed for %s", session_id)
         return []
+
+
+async def _fetch_runner_mcp_tools(
+    runner_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, str], bool]:
+    """
+    Fetch a session's discovered MCP tool surface from its bound runner.
+
+    Backs the Capabilities panel's per-server MCP ``tools`` + ``status``:
+    issues the same bounded, read-only ``tools/list`` round-trip the MCP
+    proxy uses — ``POST /v1/sessions/{id}/mcp/execute`` with
+    ``{"method": "tools/list"}`` — which the runner services from its live
+    :class:`RunnerMcpManager` state (:meth:`schemas_for`, awaiting any
+    in-flight connect). No tool is executed.
+
+    Awaited inline (best-effort), like the skills fetch: a missing /
+    unreachable runner, a non-200, an RPC error, or a malformed payload
+    yields ``([], {}, False)`` so the panel degrades to ``status="unknown"``
+    per server rather than failing the read.
+
+    :param runner_client: HTTP client pointed at the bound runner, or
+        ``None`` when no runner is bound.
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :returns: ``(schemas, failures, discovered)`` — the raw
+        OpenAI-function-tool schemas (namespaced ``<server>__<tool>``
+        names), the ``{server_name: error}`` connect-failure map, and
+        whether the discovery round-trip succeeded at all.
+    """
+    if runner_client is None:
+        return [], {}, False
+    try:
+        resp = await runner_client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+            timeout=30.0,
+        )
+    except (httpx.HTTPError, ConnectionError):
+        _logger.debug("Runner MCP tools/list query failed for %s", session_id)
+        return [], {}, False
+    if resp.status_code != 200:
+        return [], {}, False
+    try:
+        payload = resp.json()
+    except ValueError:
+        _logger.debug("Runner MCP tools/list payload malformed for %s", session_id)
+        return [], {}, False
+    if not isinstance(payload, dict) or "error" in payload:
+        # RPC error (no live MCP manager / no spec) → treat as not discovered.
+        return [], {}, False
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return [], {}, False
+    raw_schemas = result.get("schemas", [])
+    raw_failures = result.get("failures", {})
+    schemas = (
+        [s for s in raw_schemas if isinstance(s, dict)] if isinstance(raw_schemas, list) else []
+    )
+    failures = (
+        {str(k): str(v) for k, v in raw_failures.items()} if isinstance(raw_failures, dict) else {}
+    )
+    return schemas, failures, True
+
+
+def _group_mcp_tools_by_server(
+    server_names: list[str],
+    schemas: list[dict[str, Any]],
+) -> dict[str, list[SessionCapabilityTool]]:
+    """
+    Group runner ``tools/list`` schemas under their owning MCP server.
+
+    Each schema name is namespaced ``<server>__<bare_tool>`` (the shape
+    :class:`RunnerMcpManager` emits). A tool is assigned to the declared
+    server whose ``"<name>__"`` prefix it matches, longest name first so an
+    overlapping prefix (``git`` vs ``github``) resolves to the more specific
+    server — mirroring the runner's own tool routing.
+
+    :param server_names: The spec's declared MCP server names.
+    :param schemas: Raw OpenAI-function-tool schema dicts from the runner.
+    :returns: ``{server_name: [SessionCapabilityTool, ...]}`` — the bare
+        tool name + description per server (``blocked`` left at its default;
+        layered on afterwards). Servers with no discovered tools are absent.
+    """
+    ordered = sorted(server_names, key=len, reverse=True)
+    grouped: dict[str, list[SessionCapabilityTool]] = {}
+    for schema in schemas:
+        name = schema.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        for server in ordered:
+            prefix = f"{server}__"
+            if name.startswith(prefix):
+                bare = name[len(prefix) :]
+                grouped.setdefault(server, []).append(
+                    SessionCapabilityTool(name=bare, description=schema.get("description") or None)
+                )
+                break
+    return grouped
 
 
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:

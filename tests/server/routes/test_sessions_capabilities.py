@@ -760,3 +760,327 @@ async def test_compute_blocked_skills_empty_without_policies(
     # build_policy_engine always appends the sys_add_policy guard, so the
     # engine is non-empty; the Skill tool-call still resolves to ALLOW.
     assert blocked == {"anything": False}
+
+
+# ── MCP per-server tools + status (Slice D) ──────────────────────
+
+# A two-server spec so an endpoint test can show one connected server (with
+# discovered tools) alongside one that failed to connect.
+_TWO_MCP = AgentSpec(
+    spec_version=1,
+    name="two-mcp",
+    description="Two MCP servers",
+    executor=ExecutorSpec(type="claude_sdk"),
+    mcp_servers=[
+        MCPServerConfig(
+            name="github", transport="http", url="https://gh.example/sse", description="GitHub"
+        ),
+        MCPServerConfig(
+            name="broken", transport="http", url="https://x.example/sse", description="Broken"
+        ),
+    ],
+)
+
+
+def _gh_schemas() -> list[dict[str, Any]]:
+    """Two runner ``tools/list`` schemas for the ``github`` server."""
+    return [
+        {
+            "type": "function",
+            "name": "github__search",
+            "description": "Search repos",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "type": "function",
+            "name": "github__create_issue",
+            "description": "Open an issue",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+
+
+def test_mcp_per_server_tools_and_status_populated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner's discovered MCP tool surface lands per-server: a connected
+    server carries its tools + ``status="connected"``; a failed one carries an
+    empty tool list + ``status="failed"`` and the connect error."""
+    monkeypatch.setattr(
+        sessions_mod, "get_agent_cache", lambda: _AgentCacheStub({"ag_top": _TWO_MCP})
+    )
+    monkeypatch.setattr(
+        sessions_mod, "_fetch_runner_skill_capabilities", _fake_runner_skill_capabilities
+    )
+    monkeypatch.setattr(sessions_mod, "_compute_blocked_skills", _no_blocked_skills)
+
+    async def _fetch(runner_client: Any, session_id: str) -> tuple[Any, Any, bool]:
+        del runner_client, session_id
+        return _gh_schemas(), {"broken": "ConnectError: refused"}, True
+
+    async def _no_blocked_tools(
+        spec: Any, session_id: str, cs: Any, names: list[str], *, user_id: str | None
+    ) -> dict[str, bool]:
+        del spec, session_id, cs, names, user_id
+        return {}
+
+    monkeypatch.setattr(sessions_mod, "_fetch_runner_mcp_tools", _fetch)
+    monkeypatch.setattr(sessions_mod, "_compute_blocked_tool_names", _no_blocked_tools)
+
+    conv_store = _ConversationStore({"conv_top": _conv("conv_top")})
+    agent_store = _AgentStore({"ag_top": _agent()})
+    client = TestClient(_build_app(conv_store, agent_store))
+
+    body = client.get("/v1/sessions/conv_top/capabilities").json()
+    servers = {s["name"]: s for s in body["mcp_servers"]}
+
+    gh = servers["github"]
+    assert gh["status"] == "connected"
+    assert gh["error"] is None
+    assert [t["name"] for t in gh["tools"]] == ["search", "create_issue"]
+    assert gh["tools"][0]["description"] == "Search repos"
+    assert all(t["blocked"] is False for t in gh["tools"])
+
+    broken = servers["broken"]
+    assert broken["status"] == "failed"
+    assert broken["error"] == "ConnectError: refused"
+    assert broken["tools"] == []
+
+
+def test_mcp_degrades_to_unknown_when_runner_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable runner/MCP yields per-server ``status="unknown"`` with
+    empty tools — never a 500."""
+    monkeypatch.setattr(
+        sessions_mod, "get_agent_cache", lambda: _AgentCacheStub({"ag_top": _TWO_MCP})
+    )
+    monkeypatch.setattr(
+        sessions_mod, "_fetch_runner_skill_capabilities", _fake_runner_skill_capabilities
+    )
+    monkeypatch.setattr(sessions_mod, "_compute_blocked_skills", _no_blocked_skills)
+
+    async def _fetch_none(runner_client: Any, session_id: str) -> tuple[Any, Any, bool]:
+        del runner_client, session_id
+        return [], {}, False
+
+    monkeypatch.setattr(sessions_mod, "_fetch_runner_mcp_tools", _fetch_none)
+
+    conv_store = _ConversationStore({"conv_top": _conv("conv_top")})
+    agent_store = _AgentStore({"ag_top": _agent()})
+    client = TestClient(_build_app(conv_store, agent_store))
+
+    resp = client.get("/v1/sessions/conv_top/capabilities")
+    assert resp.status_code == 200, resp.text
+    for server in resp.json()["mcp_servers"]:
+        assert server["status"] == "unknown"
+        assert server["error"] is None
+        assert server["tools"] == []
+
+
+def _cel_deny_spec(name: str, denied_tool: str) -> AgentSpec:
+    """A spec with a single CEL policy that DENYs one tool-call name."""
+    return AgentSpec(
+        spec_version=1,
+        name=name,
+        description="CEL name-based deny",
+        executor=ExecutorSpec(type="claude_sdk"),
+        mcp_servers=[
+            MCPServerConfig(
+                name="github", transport="http", url="https://gh.example/sse", description="GitHub"
+            ),
+        ],
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="deny_one",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.cel.cel_policy",
+                        arguments={
+                            "expression": (
+                                f'event.data.name == "{denied_tool}" '
+                                '? {"result": "DENY"} : {"result": "ALLOW"}'
+                            )
+                        },
+                    ),
+                )
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denied", ["github__create_issue", "mcp__github__create_issue"])
+async def test_compute_blocked_tool_names_flags_mcp_tool(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    denied: str,
+) -> None:
+    """An MCP tool denied by a name-based CEL policy is ``blocked=True`` — for
+    BOTH the spec-proxied ``<server>__<tool>`` and connector-native
+    ``mcp__<server>__<tool>`` surfaces the endpoint probes; a sibling name is
+    ``blocked=False``."""
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    spec = _cel_deny_spec("mcp-guarded", denied)
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        lambda sp, sid, cs: build_policy_engine(
+            spec=sp, conversation_id=sid, conversation_store=cs
+        ),
+    )
+
+    blocked = await sessions_mod._compute_blocked_tool_names(
+        spec,
+        "conv_mcp",
+        store,  # type: ignore[arg-type]
+        [denied, "github__search"],
+        user_id="alice",
+    )
+
+    assert blocked[denied] is True
+    assert blocked["github__search"] is False
+
+
+def test_mcp_tool_blocked_wiring_ors_both_name_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The endpoint marks an MCP tool ``blocked`` when the probe denies EITHER
+    the spec-proxied or the connector-native name shape."""
+    monkeypatch.setattr(
+        sessions_mod, "get_agent_cache", lambda: _AgentCacheStub({"ag_top": _TWO_MCP})
+    )
+    monkeypatch.setattr(
+        sessions_mod, "_fetch_runner_skill_capabilities", _fake_runner_skill_capabilities
+    )
+    monkeypatch.setattr(sessions_mod, "_compute_blocked_skills", _no_blocked_skills)
+
+    async def _fetch(runner_client: Any, session_id: str) -> tuple[Any, Any, bool]:
+        del runner_client, session_id
+        return _gh_schemas(), {}, True
+
+    monkeypatch.setattr(sessions_mod, "_fetch_runner_mcp_tools", _fetch)
+
+    async def _blocked_tools(
+        spec: Any, session_id: str, cs: Any, names: list[str], *, user_id: str | None
+    ) -> dict[str, bool]:
+        del spec, session_id, cs, user_id
+        # Deny only the connector-native shape; the endpoint must still flag it.
+        return dict.fromkeys(names, False) | {"mcp__github__create_issue": True}
+
+    monkeypatch.setattr(sessions_mod, "_compute_blocked_tool_names", _blocked_tools)
+
+    conv_store = _ConversationStore({"conv_top": _conv("conv_top")})
+    agent_store = _AgentStore({"ag_top": _agent()})
+    client = TestClient(_build_app(conv_store, agent_store))
+
+    body = client.get("/v1/sessions/conv_top/capabilities").json()
+    tools = {t["name"]: t for t in body["mcp_servers"][0]["tools"]}
+    assert tools["create_issue"]["blocked"] is True
+    assert tools["search"]["blocked"] is False
+
+
+@pytest.mark.asyncio
+async def test_compute_blocked_tool_names_flags_builtin_and_runs_no_llm(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local builtin tool denied by a name policy is ``blocked=True``; a
+    normal one is ``blocked=False``; and NO LLM fires even with an LLM-backed
+    policy present and many tool names."""
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+
+    class _RecordingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            self.calls += 1
+            raise AssertionError("LLM policy must not run in blocked-tools preview")
+
+    spy = _RecordingLLM()
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="tool-guarded",
+        description="CEL deny + LLM policy",
+        executor=ExecutorSpec(type="claude_sdk"),
+        guardrails=GuardrailsSpec(
+            policies=[
+                FunctionPolicySpec(
+                    name="deny_shell",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.cel.cel_policy",
+                        arguments={
+                            "expression": (
+                                'event.data.name == "sys_os_shell" '
+                                '? {"result": "DENY"} : {"result": "ALLOW"}'
+                            )
+                        },
+                    ),
+                ),
+                FunctionPolicySpec(
+                    name="classify",
+                    on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+                    function=FunctionRef(
+                        path="omnigent.policies.builtins.prompt.prompt_policy",
+                        arguments={"prompt": "Deny risky tools."},
+                    ),
+                ),
+            ]
+        ),
+    )
+
+    def _build(sp: Any, sid: str, cs: Any) -> Any:
+        engine = build_policy_engine(spec=sp, conversation_id=sid, conversation_store=cs)
+        engine._llm_client = spy
+        return engine
+
+    monkeypatch.setattr(sessions_mod, "_build_policy_engine_from_spec", _build)
+
+    names = [f"sys_tool_{i}" for i in range(50)] + ["sys_os_shell", "sys_os_read"]
+    blocked = await sessions_mod._compute_blocked_tool_names(
+        spec,
+        "conv_tool_guarded",
+        store,  # type: ignore[arg-type]
+        names,
+        user_id="alice",
+    )
+
+    assert spy.calls == 0
+    assert blocked["sys_os_shell"] is True
+    assert blocked["sys_os_read"] is False
+    assert all(v is False for k, v in blocked.items() if k != "sys_os_shell")
+
+
+def test_sub_agent_tree_recursion_is_depth_bounded() -> None:
+    """A pathologically deep declared-sub-agent chain is truncated at the depth
+    cap instead of recursing without bound."""
+    depth = sessions_mod._SUB_AGENT_TREE_MAX_DEPTH + 10
+    # Build a linear chain deeper than the cap, innermost first.
+    node = AgentSpec(
+        spec_version=1, name="leaf", description="", executor=ExecutorSpec(type="claude_sdk")
+    )
+    for i in range(depth):
+        node = AgentSpec(
+            spec_version=1,
+            name=f"n{i}",
+            description="",
+            executor=ExecutorSpec(type="claude_sdk"),
+            sub_agents=[node],
+        )
+
+    tree = sessions_mod._sub_agent_capability_tree([node])
+
+    # Walk the single-child chain; it must terminate at exactly the cap.
+    walked = 0
+    level = tree
+    while level:
+        walked += 1
+        level = level[0].sub_agents
+    assert walked == sessions_mod._SUB_AGENT_TREE_MAX_DEPTH

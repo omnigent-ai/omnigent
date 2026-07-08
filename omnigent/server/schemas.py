@@ -308,27 +308,44 @@ class SessionCapabilityTool(BaseModel):
     :param name: OpenAI-format function name, e.g. ``"sys_os_read"``.
     :param description: One-line summary from the tool schema, or
         ``None`` when the tool declares none.
+    :param blocked: Whether a session policy would DENY calling this
+        tool by name (read-only, name-based deny rules only — the same
+        LLM-excluded probe the skills ``blocked`` flag uses). Local
+        tools are always in scope (allow-list config), so ``blocked``
+        is the only gate that applies to them.
     """
 
     name: str
     description: str | None = None
+    blocked: bool = False
 
 
 class SessionCapabilityMCPServer(MCPServerSummary):
     """
-    An MCP server's config plus a (deferred) per-server tool list.
+    An MCP server's config plus its discovered per-server tool list.
 
     Reuses the secret-free :class:`MCPServerSummary` shape (name,
-    transport, description, url, command, args) and adds ``tools``.
-    Per-server tool discovery needs a runner round-trip (``tools/list``
-    against the live MCP connection), so it is deferred — this field is
-    always empty in this slice.
+    transport, description, url, command, args) and adds the live
+    ``tools`` list plus a per-server connection ``status`` / ``error``,
+    read from the runner's MCP state via a bounded ``tools/list``
+    round-trip against the live connection.
 
-    :param tools: Discovered MCP tools for this server. Always ``[]``
-        for now (Slice D: per-server tool discovery via the runner).
+    :param tools: Discovered MCP tools for this server (name +
+        description + policy ``blocked`` flag). Empty when the server
+        exposes no tools, failed to connect, or the runner is
+        unavailable.
+    :param status: Per-server connection status — ``"connected"`` (the
+        runner reported this server's tool surface), ``"failed"`` (the
+        runner could not connect; see ``error``), or ``"unknown"`` (the
+        runner/MCP state was unavailable, so discovery did not run).
+    :param error: The connect error the runner reported for a
+        ``"failed"`` server, e.g. ``"ConnectError: refused"``; ``None``
+        otherwise.
     """
 
     tools: list[SessionCapabilityTool] = Field(default_factory=list)
+    status: str = "unknown"
+    error: str | None = None
 
 
 class SubAgentCapability(BaseModel):
@@ -372,9 +389,11 @@ class SessionCapabilities(BaseModel):
         flag (whether ``skills_filter`` admits it), and a ``blocked`` flag
         (whether a session policy would deny loading it).
     :param mcp_servers: The agent's MCP server config (secret fields
-        omitted). Each carries a deferred, empty ``tools`` list.
+        omitted). Each carries its discovered ``tools`` list (with a
+        per-tool ``blocked`` flag) and a per-server connection
+        ``status`` / ``error``.
     :param local_tools: The agent's effective local/builtin function
-        tools, name + description only.
+        tools (name + description + policy ``blocked`` flag).
     :param sub_agents: The declared sub-agent tree from the spec.
     """
 
