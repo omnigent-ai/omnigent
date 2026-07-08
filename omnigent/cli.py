@@ -10845,6 +10845,34 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     return f"✓ default model: {chosen}"
 
 
+def _prompt_opencode_zen_key() -> str | None:
+    """Paste-and-store the OpenCode Zen API key; return a status line.
+
+    Stored in Omnigent's keychain (``opencode-zen``) and injected as
+    ``OPENCODE_API_KEY`` when the opencode server spawns — never written to
+    opencode's own ``auth.json``. An ambient ``OPENCODE_API_KEY`` always
+    wins over the stored key at resolution time.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.interactive import prompt_text
+    from omnigent.opencode_zen_credentials import OPENCODE_ZEN_SECRET_NAME
+
+    pasted = prompt_text("OpenCode Zen API key (OPENCODE_API_KEY)", hide_input=True).strip()
+    if not pasted:
+        return None
+    secret_store.store_secret(OPENCODE_ZEN_SECRET_NAME, pasted)
+    return f"✓ Zen key stored ({secret_store.active_backend()})"
+
+
+def _clear_opencode_zen_key() -> str:
+    """Delete the stored OpenCode Zen key from Omnigent's keychain."""
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.opencode_zen_credentials import OPENCODE_ZEN_SECRET_NAME
+
+    secret_store.delete_secret(OPENCODE_ZEN_SECRET_NAME)
+    return "✓ Zen key cleared"
+
+
 def _print_opencode_auth_help() -> None:
     """Explain where OpenCode's model credentials come from."""
     from omnigent.onboarding.interactive import console
@@ -10856,7 +10884,9 @@ def _print_opencode_auth_help() -> None:
         "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are auto-detected.\n"
         "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
         "      Omnigent synthesizes opencode's per-session provider config from it.\n"
-        "  Omnigent stores no OpenCode credential of its own.\n"
+        "    • [bold]OpenCode Zen[/bold] — paste an API key ('Set OpenCode Zen API key');\n"
+        "      kept in Omnigent's keychain, injected as OPENCODE_API_KEY at launch.\n"
+        "  Omnigent stores only the optional Zen key — everything else stays with opencode.\n"
         "  [dim]Tip:[/dim] 'Set default model' picks which model `omni opencode` launches on\n"
         "  (otherwise OpenCode uses its built-in default, opencode/big-pickle)."
     )
@@ -10868,8 +10898,10 @@ def _manage_opencode_harness() -> None:
     OpenCode owns its own provider auth — ``opencode auth login`` (stored in
     ``~/.local/share/opencode/auth.json``) or ambient provider env vars — so,
     like the Goose / Qwen drill-ins, this reports which providers OpenCode can
-    reach and offers to launch its native login; it never stores a key through
-    Omnigent. (For the Databricks-gateway path the agent's ``profile`` is
+    reach and offers to launch its native login. The one key Omnigent stores
+    itself is the optional OpenCode Zen API key (kept in Omnigent's keychain,
+    injected as ``OPENCODE_API_KEY`` at spawn — never written to opencode's
+    ``auth.json``). (For the Databricks-gateway path the agent's ``profile`` is
     synthesized into opencode's per-session config instead — set under
     Claude / Codex.)
 
@@ -10940,11 +10972,18 @@ def _manage_opencode_harness() -> None:
         )
         rows: list[_HarnessMenuRow] = [
             _HarnessMenuRow("Run opencode auth login", action="login"),
-            _HarnessMenuRow(model_label, action="model"),
-            _HarnessMenuRow("List providers & credentials", action="list"),
-            _HarnessMenuRow("Show provider options", action="help"),
-            _HarnessMenuRow("← Back", action="back"),
+            _HarnessMenuRow("Set OpenCode Zen API key", action="zen"),
         ]
+        if summary.zen_key_source == "keychain":
+            rows.append(_HarnessMenuRow("Clear stored Zen key", action="zen-clear"))
+        rows.extend(
+            [
+                _HarnessMenuRow(model_label, action="model"),
+                _HarnessMenuRow("List providers & credentials", action="list"),
+                _HarnessMenuRow("Show provider options", action="help"),
+                _HarnessMenuRow("← Back", action="back"),
+            ]
+        )
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
             return
@@ -10953,6 +10992,10 @@ def _manage_opencode_harness() -> None:
             return
         if action == "login":
             status = _launch_opencode_auth_login()
+        elif action == "zen":
+            status = _prompt_opencode_zen_key()
+        elif action == "zen-clear":
+            status = _clear_opencode_zen_key()
         elif action == "model":
             status = _set_opencode_default_model(default_model)
         elif action == "list":
