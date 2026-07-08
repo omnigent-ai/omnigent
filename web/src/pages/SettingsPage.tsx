@@ -32,7 +32,14 @@ import {
   Trash2Icon,
   UserCogIcon,
 } from "lucide-react";
-import { LaptopMinimalIcon, MinusIcon, MoonIcon, PlusIcon, SunIcon } from "lucide-react";
+import {
+  LaptopMinimalIcon,
+  MinusIcon,
+  MonitorIcon,
+  MoonIcon,
+  PlusIcon,
+  SunIcon,
+} from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -83,6 +90,11 @@ import {
   writeCodeFontFamily,
   writeCodeFontSizePx,
 } from "@/lib/codeFontPreferences";
+import {
+  readTerminalThemeMode,
+  writeTerminalThemeMode,
+  type TerminalThemeMode,
+} from "@/lib/terminalThemePreferences";
 import { useIsEmbedded } from "@/lib/embedded";
 import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -162,6 +174,50 @@ const themeCards: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
 
+const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof SunIcon }[] = [
+  { mode: "auto", label: "Match app", icon: MonitorIcon },
+  { mode: "light", label: "Light", icon: SunIcon },
+  { mode: "dark", label: "Dark", icon: MoonIcon },
+];
+
+function TerminalThemeControl() {
+  const [mode, setMode] = useState(() => readTerminalThemeMode());
+
+  return (
+    <div className="flex flex-col gap-3">
+      <span className="text-sm font-medium">Terminal theme</span>
+      <span className="text-sm text-muted-foreground">
+        Use a light or dark terminal, or match the app.
+      </span>
+      <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Terminal theme">
+        {terminalThemeCards.map(({ mode: cardMode, label, icon: Icon }) => {
+          const selected = mode === cardMode;
+          return (
+            <button
+              key={cardMode}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              data-testid={`terminal-theme-${cardMode}`}
+              onClick={() => {
+                setMode(cardMode);
+                writeTerminalThemeMode(cardMode);
+              }}
+              className={cn(
+                "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
+                selected ? "border-primary bg-primary/5" : "border-border",
+              )}
+            >
+              <Icon className="size-6 text-muted-foreground" />
+              <span className="text-sm font-medium">{label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns the theme (embed.tsx forces light), so the
   // selector would be a no-op — match ThemeModeMenu and hide it.
@@ -205,6 +261,8 @@ function AppearanceSection() {
             </div>
           )}
         </div>
+
+        <TerminalThemeControl />
 
         <UiFontSizeControl />
 
