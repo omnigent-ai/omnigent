@@ -2,14 +2,22 @@
 
 use std::fs;
 
-// The crate is a binary, so pull in the modules under test directly.
+// The crate is a binary, so pull in the modules under test directly. Each test
+// target uses only part of the included source, so allow dead code.
+#[allow(dead_code)]
 #[path = "../src/lock.rs"]
 mod lock;
+#[allow(dead_code)]
 #[path = "../src/paths.rs"]
 mod paths;
+#[allow(dead_code)]
+#[path = "../src/pod.rs"]
+mod pod;
+#[allow(dead_code)]
 #[path = "../src/ports.rs"]
 mod ports;
 
+use pod::Pod;
 use ports::Ports;
 
 /// A fake checkout (.git + omnigent/ + web/) is recognized as a root, and a
@@ -41,6 +49,38 @@ fn pod_dir_is_per_repo_and_stable() {
     let b = paths::default_pod_dir(std::path::Path::new("/repos/two")).unwrap();
     assert_eq!(a1, a2);
     assert_ne!(a1, b);
+}
+
+/// npm install is needed when node_modules is missing, and when a manifest is
+/// newer than it; not needed when node_modules is up to date.
+#[test]
+fn needs_npm_install_tracks_manifests() {
+    let repo = tempdir();
+    let web = repo.join("web");
+    fs::create_dir_all(&web).unwrap();
+    fs::write(web.join("package.json"), "{}").unwrap();
+
+    let pod = Pod {
+        repo_root: repo.clone(),
+        dir: repo.join("pod"),
+        ports: Ports {
+            server: 6767,
+            vite: 5173,
+        },
+    };
+
+    // No node_modules yet → install needed.
+    assert!(pod.needs_npm_install());
+
+    // Fresh node_modules created after the manifest → up to date.
+    fs::create_dir_all(web.join("node_modules")).unwrap();
+    assert!(!pod.needs_npm_install());
+
+    // A manifest touched after node_modules → stale, install needed.
+    // (Sleep briefly so the mtime is observably newer on coarse filesystems.)
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    fs::write(web.join("package-lock.json"), "{}").unwrap();
+    assert!(pod.needs_npm_install());
 }
 
 /// Ports probe to bindable values and persist/reuse across calls.
