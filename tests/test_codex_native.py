@@ -635,12 +635,18 @@ def _elicitation_tracker() -> codex_native_forwarder._CodexElicitationTaskTracke
     return codex_native_forwarder._CodexElicitationTaskTracker()
 
 
-def test_materialize_codex_agent_spec_uses_codex_native_harness(tmp_path: Path) -> None:
+def test_materialize_codex_agent_spec_uses_codex_native_harness(
+    tmp_path: Path, monkeypatch
+) -> None:
     """
     The generated wrapper spec is self-contained and selects the
     isolated ``codex-native`` harness rather than the existing
     non-TUI ``codex`` harness.
     """
+    # Pin the host shells so the declared terminals are deterministic
+    # ($SHELL=bash → the default/first terminal is ``bash``).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/bash")
     spec_path = codex_native._materialize_codex_agent_spec(
         tmp_path,
         model="gpt-test",
@@ -682,13 +688,12 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
     # via ToolManager, so a dropped flag silently removes
     # sys_session_create/send/close from the native CLI.
     assert spec.spawn is True
-    # The native wrapper declares a default shell terminal so the
-    # relay advertises the sys_terminal_* family to the wrapped
-    # codex (the relay gate is a non-empty ``terminals:`` block on
-    # this spec); a dropped block silently removes the terminal
-    # tools from the native CLI.
+    # The native wrapper declares one terminal per installed shell so the
+    # relay advertises the sys_terminal_* family to the wrapped codex (the
+    # relay gate is a non-empty ``terminals:`` block on this spec); a
+    # dropped block silently removes the terminal tools from the native CLI.
     assert spec.terminals is not None
-    assert spec.terminals["shell"].command == "bash"
+    assert spec.terminals["bash"].command == "bash"
 
 
 @pytest.mark.parametrize(

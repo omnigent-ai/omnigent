@@ -66,6 +66,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -526,21 +527,11 @@ def _materialize_codex_agent_spec(
         },
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped codex (the relay's
-        # gate is a non-empty ``terminals:`` block on this spec).
-        # Caller process / no sandbox matches the ``os_env`` stance
-        # above — the native CLI already runs unsandboxed on the
-        # user's workspace.
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # gate is a non-empty ``terminals:`` block on this spec). Its
+        # command follows the user's ``$SHELL`` (zsh/fish/bash); caller
+        # process / no sandbox matches the ``os_env`` stance above — the
+        # native CLI already runs unsandboxed on the user's workspace.
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
