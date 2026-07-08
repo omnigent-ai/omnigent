@@ -33,6 +33,7 @@ import {
   UserCogIcon,
 } from "lucide-react";
 import {
+  CheckIcon,
   LaptopMinimalIcon,
   MinusIcon,
   MonitorIcon,
@@ -65,7 +66,11 @@ import {
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useSettingsRoute } from "@/shell/settingsNav";
-import { type ThemeMode, normalizeThemeMode } from "@/components/theme/themeMode";
+import {
+  normalizeResolvedTheme,
+  normalizeThemeMode,
+  type ThemeMode,
+} from "@/components/theme/themeMode";
 import {
   applyUiFontFamily,
   applyUiFontScale,
@@ -95,6 +100,14 @@ import {
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import {
+  applyThemePalette,
+  PALETTES,
+  type PaletteSwatch,
+  readThemePalette,
+  type ThemePalette,
+  writeThemePalette,
+} from "@/lib/themePalette";
 import { useIsEmbedded } from "@/lib/embedded";
 import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -218,6 +231,104 @@ function TerminalThemeControl() {
   );
 }
 
+/**
+ * Color-theme (palette) picker — the second appearance axis, shown under the
+ * same "Theme" heading as the mode cards. Renders a swatch grid of the
+ * available palettes (see lib/themePalette.ts); selecting one applies it live
+ * to <html> via `data-theme`, persists it, and composes with the light/dark
+ * mode picker above.
+ */
+function ColorThemeControl() {
+  // Render each swatch in the currently-resolved mode so the previews match
+  // what the app looks like right now.
+  const { resolvedTheme } = useTheme();
+  const isDark = normalizeResolvedTheme(resolvedTheme) === "dark";
+  const [palette, setPalette] = useState<ThemePalette>(() => readThemePalette());
+
+  const choose = useCallback((next: ThemePalette) => {
+    setPalette(next);
+    writeThemePalette(next);
+    applyThemePalette(next);
+  }, []);
+
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Color palette"
+      className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5"
+    >
+      {PALETTES.map((p) => {
+        const selected = palette === p.id;
+        return (
+          <button
+            key={p.id}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            title={p.blurb}
+            data-testid={`palette-${p.id}`}
+            onClick={() => choose(p.id)}
+            className={cn(
+              "flex flex-col gap-2 rounded-xl border-2 p-2 text-left transition-colors hover:bg-muted",
+              selected ? "border-primary" : "border-border",
+            )}
+          >
+            <PaletteSwatchPreview swatch={isDark ? p.dark : p.light} />
+            <span className="flex items-center justify-between gap-1 px-0.5 text-sm font-medium">
+              {p.label}
+              {selected && <CheckIcon className="size-3.5 text-primary" />}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Miniature "app window" preview for a palette: a canvas with a small sidebar
+ * and content card, a few text lines, and an accent chip — built purely from
+ * the swatch colors so each palette reads at a glance.
+ */
+function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
+  return (
+    <div
+      aria-hidden
+      className="flex h-16 w-full gap-1.5 overflow-hidden rounded-lg p-1.5"
+      style={{ backgroundColor: swatch.bg, border: `1px solid ${swatch.border}` }}
+    >
+      <div
+        className="flex w-1/3 flex-col gap-1 rounded-md p-1"
+        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
+      >
+        <div className="size-1.5 rounded-full" style={{ backgroundColor: swatch.accent }} />
+        <div
+          className="h-1 w-4/5 rounded-full"
+          style={{ backgroundColor: swatch.text, opacity: 0.35 }}
+        />
+        <div
+          className="h-1 w-3/5 rounded-full"
+          style={{ backgroundColor: swatch.text, opacity: 0.25 }}
+        />
+      </div>
+      <div
+        className="flex flex-1 flex-col gap-1 rounded-md p-1.5"
+        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
+      >
+        <div
+          className="h-1 w-3/4 rounded-full"
+          style={{ backgroundColor: swatch.text, opacity: 0.5 }}
+        />
+        <div
+          className="h-1 w-1/2 rounded-full"
+          style={{ backgroundColor: swatch.text, opacity: 0.3 }}
+        />
+        <div className="mt-auto h-2.5 w-2/5 rounded" style={{ backgroundColor: swatch.accent }} />
+      </div>
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns the theme (embed.tsx forces light), so the
   // selector would be a no-op — match ThemeModeMenu and hide it.
@@ -228,37 +339,41 @@ function AppearanceSection() {
   return (
     <Section title="Appearance" description="Choose how Omnigent looks on this device.">
       <div className="flex flex-col gap-8">
-        <div className="flex flex-col gap-3">
+        {/* One "Theme" group: appearance mode (System / Light / Dark) on top,
+            then the color palette swatches. Both are hidden when embedded — the
+            host owns theming there. */}
+        <div className="flex flex-col gap-4">
           <span className="text-sm font-medium">Theme</span>
-          {/* Embedded: the host owns the theme (embed.tsx forces light), so the
-              selector would be a no-op — match ThemeModeMenu and hide it. */}
           {isEmbedded ? (
             <p className="text-sm text-muted-foreground">
               Theme is controlled by the host application.
             </p>
           ) : (
-            <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
-              {themeCards.map(({ mode: cardMode, label, icon: Icon }) => {
-                const selected = mode === cardMode;
-                return (
-                  <button
-                    key={cardMode}
-                    type="button"
-                    role="radio"
-                    aria-checked={selected}
-                    data-testid={`theme-${cardMode}`}
-                    onClick={() => setTheme(cardMode)}
-                    className={cn(
-                      "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
-                      selected ? "border-primary bg-primary/5" : "border-border",
-                    )}
-                  >
-                    <Icon className="size-6 text-muted-foreground" />
-                    <span className="text-sm font-medium">{label}</span>
-                  </button>
-                );
-              })}
-            </div>
+            <>
+              <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
+                {themeCards.map(({ mode: cardMode, label, icon: Icon }) => {
+                  const selected = mode === cardMode;
+                  return (
+                    <button
+                      key={cardMode}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      data-testid={`theme-${cardMode}`}
+                      onClick={() => setTheme(cardMode)}
+                      className={cn(
+                        "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
+                        selected ? "border-primary bg-primary/5" : "border-border",
+                      )}
+                    >
+                      <Icon className="size-6 text-muted-foreground" />
+                      <span className="text-sm font-medium">{label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <ColorThemeControl />
+            </>
           )}
         </div>
 

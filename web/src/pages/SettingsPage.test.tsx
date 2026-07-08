@@ -101,6 +101,9 @@ afterEach(() => {
   // don't leak persisted state or the --ui-font-scale variable into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--ui-font-scale");
+  // The palette picker sets data-theme on <html>; clear it so a palette
+  // selected in one test doesn't leak into the next.
+  document.documentElement.removeAttribute("data-theme");
 });
 
 describe("SettingsPage", () => {
@@ -141,6 +144,23 @@ describe("SettingsPage", () => {
     renderPage("/settings/appearance");
     expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("renders the color palette picker, defaults to Omnigent, and applies a palette on click", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+
+    // The palette picker is its own radiogroup, distinct from the mode cards.
+    expect(screen.getByRole("radiogroup", { name: "Color palette" })).toBeInTheDocument();
+    // Nothing stored → the default (Omnigent) palette is selected and no
+    // data-theme override is applied to the document.
+    expect(screen.getByTestId("palette-omni")).toHaveAttribute("aria-checked", "true");
+
+    // Choosing a palette selects it, applies it live to <html>, and persists it.
+    fireEvent.click(screen.getByTestId("palette-github"));
+    expect(screen.getByTestId("palette-github")).toHaveAttribute("aria-checked", "true");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("github");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
   });
 
   it("shows the default UI font size and steps it up, persisting the choice", () => {
