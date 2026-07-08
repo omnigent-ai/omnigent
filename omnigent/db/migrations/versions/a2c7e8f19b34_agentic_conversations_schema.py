@@ -51,5 +51,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     # ── conversations ─────────────────────────────────────
     with op.batch_alter_table("conversations") as batch_op:
-        batch_op.drop_constraint("fk_conversations_agent_id", type_="foreignkey")
+        if any(
+            f["name"] == "fk_conversations_agent_id"
+            for f in sa.inspect(op.get_bind()).get_foreign_keys("conversations")
+        ):
+            batch_op.drop_constraint("fk_conversations_agent_id", type_="foreignkey")
         batch_op.drop_column("agent_id")

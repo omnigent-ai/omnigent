@@ -255,6 +255,12 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
+# Hindsight long-term memory builtins. Runner-local (like web_search) so that a
+# wrapped harness's (claude-sdk / codex / cursor / pi) tool call resolves to the
+# spec-configured Hindsight tool via its ``invoke``. Without this entry the call
+# falls through to the harness, which has no such tool, and silently no-ops.
+_HINDSIGHT_TOOLS = frozenset({"hindsight_retain", "hindsight_recall", "hindsight_reflect"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -332,6 +338,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    # Memory builtins are relayed to native harnesses too — unlike web_search,
+    # native harnesses have no built-in long-term memory of their own.
+    | _HINDSIGHT_TOOLS
 )
 
 
@@ -462,6 +471,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -812,6 +822,8 @@ async def _list_child_sessions(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     limit: int = 100,
+    tool: str | None = None,
+    session_name: str | None = None,
 ) -> list[dict[str, Any]] | str:
     """
     Fetch child-session summaries for a parent session.
@@ -819,11 +831,19 @@ async def _list_child_sessions(
     :param server_client: Omnigent server client.
     :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
     :param limit: Maximum child rows to request, e.g. ``100``.
+    :param tool: When set alongside ``session_name``, filter to
+        children whose title is ``"{tool}:{session_name}"``
+        server-side.
+    :param session_name: See ``tool``.
     :returns: List of child summary dicts, or an error string.
     """
+    params: dict[str, Any] = {"limit": limit, "order": "desc"}
+    if tool and session_name:
+        params["tool"] = tool
+        params["session_name"] = session_name
     resp = await server_client.get(
         f"/v1/sessions/{conversation_id}/child_sessions",
-        params={"limit": limit, "order": "desc"},
+        params=params,
         timeout=30.0,
     )
     if resp.status_code >= 400:
@@ -849,9 +869,7 @@ async def _find_existing_child_session(
     pair continue the existing child. The runner must therefore look
     up the row before trying to create a new one; otherwise the
     server's unique child-title constraint turns a continuation into
-    a duplicate-create failure. This currently fetches up to 1000
-    children and scans locally because the child-session endpoint does
-    not provide a ``(tool, session_name)`` filter yet.
+    a duplicate-create failure.
 
     :param server_client: Omnigent server client.
     :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
@@ -863,16 +881,16 @@ async def _find_existing_child_session(
     children = await _list_child_sessions(
         server_client=server_client,
         conversation_id=conversation_id,
-        limit=1000,
+        limit=1,
+        tool=agent,
+        session_name=title,
     )
     if isinstance(children, str):
         return children
     for child in children:
         if is_session_closed(child.get("labels"), child.get("title")):
             continue
-        label = _subagent_label(child)
-        if label.agent == agent and label.title == title:
-            return child
+        return child
     return None
 
 
@@ -2545,6 +2563,68 @@ async def _execute_web_search_tool(
     ctx = ToolContext(
         task_id=task_id or "web_search",
         agent_id=agent_id or "web_search",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
+def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
+    """
+    Return a Hindsight builtin's config dict from the parent spec.
+
+    Mirrors ``ToolManager._register_builtin_tools``: scans ``spec.tools.builtins``
+    for the entry named *tool_name* (e.g. ``"hindsight_recall"``) and returns its
+    ``config`` (api_key, bank_id, etc.). Empty dict when declared bare or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :param tool_name: The Hindsight tool name to look up.
+    :returns: The builtin's config dict.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == tool_name:
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_hindsight_tool(
+    args: dict[str, Any],
+    *,
+    tool_name: str,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a Hindsight memory tool call (retain / recall / reflect).
+
+    Builds the tool from the spec's builtin config and runs its synchronous
+    ``invoke`` off the event loop (it makes a blocking HTTP call to Hindsight).
+    The bank is resolved inside the tool from ``config.bank_id`` → ``ctx.agent_id``
+    → ``ctx.conversation_id``, so the real ``agent_id`` is threaded through here.
+
+    :param args: Parsed LLM arguments (``content`` for retain, ``query`` otherwise).
+    :param tool_name: The Hindsight tool name being dispatched.
+    :param agent_spec: Parent agent's spec; carries the Hindsight builtin config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id — the default memory bank.
+    :returns: The tool's string result, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins import get_builtin_tool
+
+    config = _hindsight_config_from_spec(agent_spec, tool_name)
+    tool = get_builtin_tool(tool_name, config)
+    if tool is None:
+        return f"Hindsight tool {tool_name!r} is not available."
+    ctx = ToolContext(
+        task_id=task_id or tool_name,
+        agent_id=agent_id or tool_name,
         conversation_id=conversation_id,
     )
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
@@ -4372,6 +4452,15 @@ async def execute_tool(
                 task_id=task_id,
                 agent_id=agent_id,
             )
+        elif tool_name in _HINDSIGHT_TOOLS:
+            output = await _execute_hindsight_tool(
+                args,
+                tool_name=tool_name,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
         elif tool_name in _TIMER_TOOLS:
             if tool_name == "sys_timer_set":
                 output = await _execute_timer_set(
@@ -5845,7 +5934,7 @@ def _spawn_async_tool(
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
             )
-            done, _pending = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 [
                     asyncio.ensure_future(exec_coro),
                     asyncio.ensure_future(cancel_event.wait()),
@@ -5853,6 +5942,11 @@ def _spawn_async_tool(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if cancel_event.is_set():
+                # Drop the losing future (the tool coro). This cancels the
+                # task/coroutine but cannot interrupt an underlying
+                # asyncio.to_thread, so that thread may run to completion.
+                for fut in pending:
+                    fut.cancel()
                 session_inbox.put_nowait(
                     {
                         "handle_id": handle_id,
@@ -5862,6 +5956,10 @@ def _spawn_async_tool(
                     }
                 )
                 return ""
+            # Drop the losing future (cancel_event.wait()) so it doesn't
+            # linger as a pending task for the life of the session.
+            for fut in pending:
+                fut.cancel()
             result = next(iter(done)).result()
             session_inbox.put_nowait(
                 {

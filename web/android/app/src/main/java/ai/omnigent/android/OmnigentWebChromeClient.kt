@@ -18,11 +18,13 @@ import android.webkit.WebView
  */
 class OmnigentWebChromeClient(
     /** Open a file picker for [acceptTypes]; return true if it was launched. */
-    private val onChooseFiles: (callback: ValueCallback<Array<Uri>>, acceptTypes: Array<String>) -> Boolean,
+    private val onChooseFiles: (
+        callback: ValueCallback<Array<Uri>>,
+        acceptTypes: Array<String>,
+    ) -> Boolean,
     /** Grant or deny a WebView permission request (currently audio capture). */
     private val onPermission: (PermissionRequest) -> Unit,
 ) : WebChromeClient() {
-
     override fun onShowFileChooser(
         webView: WebView,
         filePathCallback: ValueCallback<Array<Uri>>,

@@ -483,6 +483,7 @@ class ConversationStore(ABC):
         accessible_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        title: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -572,6 +573,11 @@ class ConversationStore(ABC):
             per-project folder fetch). When set to an empty string
             ``""``, only return sessions with NO project label (unfiled
             sessions). ``None`` disables the filter.
+        :param title: When set, only return conversations whose
+            ``title`` matches exactly. ``None`` disables the filter.
+            Powers the ``(agent, title)`` child-session lookup in
+            ``sys_session_send`` so the server can resolve the target
+            in a single indexed query instead of fetching all children.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -1199,7 +1205,6 @@ class ConversationStore(ABC):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
-        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -1243,10 +1248,6 @@ class ConversationStore(ABC):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
-        :param model_override: When set, the fork's ``model_override`` is
-            this value instead of the source's copied one — the "restart
-            with model" path. Wins over the ``copy_model_settings`` copy;
-            ``None`` (default) leaves the copy behavior unchanged.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's

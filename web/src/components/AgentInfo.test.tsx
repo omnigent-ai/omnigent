@@ -559,6 +559,62 @@ describe("SessionPoliciesSection", () => {
     expect(payload.handler).toBe("h.factory");
   });
 
+  it("Cancel steps back to the policy list after a policy is selected", () => {
+    // WHY: once a policy is selected the dialog shows its config; Cancel must
+    // return to the list (not close), so the user can pick a different policy.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+      { handler: "h.beta", kind: "callable", name: "Beta Guard", description: "blocks beta" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Beta Guard"));
+    // Config view: the filter list is gone, the "Change" affordance is shown.
+    expect(within(dialog).queryByPlaceholderText("Filter policies...")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    // Back on the list: filter box returns and both policies are pickable.
+    expect(within(dialog).getByPlaceholderText("Filter policies...")).toBeInTheDocument();
+    expect(within(dialog).getByText("Alpha Guard")).toBeInTheDocument();
+    expect(within(dialog).getByText("Beta Guard")).toBeInTheDocument();
+    expect(addMutate).not.toHaveBeenCalled();
+  });
+
+  it("Cancel from the policy list closes the dialog", () => {
+    // WHY: with nothing selected, Cancel is a plain close.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("reopening the dialog after closing mid-config starts back at the list", () => {
+    // WHY: closing (X / Escape) while a policy was selected must reset state so
+    // the next open never resurfaces the stale config view.
+    registryData.current = [
+      { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    fireEvent.click(within(screen.getByRole("dialog")).getByText("Alpha Guard"));
+    // Close via Escape (equivalent to the X button's onOpenChange(false)).
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    expect(
+      within(screen.getByRole("dialog")).getByPlaceholderText("Filter policies..."),
+    ).toBeInTheDocument();
+  });
+
   it("shows the all-applied empty message when every registry policy is already added", () => {
     // WHY: when appliedHandlers covers the whole registry the filtered list is
     // empty AND available.length === 0, so the dialog says all are applied.
@@ -682,45 +738,5 @@ describe("agentDisplayLabel", () => {
   it("capitalizes non-native names and strips their clone suffix", () => {
     expect(agentDisplayLabel("polly")).toBe("Polly");
     expect(agentDisplayLabel("polly (fork conv_ab12)")).toBe("Polly");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// "Restart with model…" trigger — codex-only affordance gated on harness.
-// ---------------------------------------------------------------------------
-
-function renderContentForAgent(agent: Agent, sessionId: string) {
-  const qc = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  return render(
-    <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <AgentInfoContent agent={agent} sessionId={sessionId} />
-      </TooltipProvider>
-    </QueryClientProvider>,
-  );
-}
-
-describe("AgentInfoContent restart-with-model trigger", () => {
-  it("shows the trigger for a codex-native session", () => {
-    renderContentForAgent(
-      { id: "ag_codex", name: "codex-native-ui", harness: "codex-native" },
-      "conv_codex",
-    );
-    expect(screen.getByTestId("restart-with-model-trigger")).toBeInTheDocument();
-  });
-
-  it("hides the trigger for a non-codex (claude) harness", () => {
-    renderContentForAgent(
-      { id: "ag_claude", name: "claude-native-ui", harness: "claude-native" },
-      "conv_claude",
-    );
-    expect(screen.queryByTestId("restart-with-model-trigger")).not.toBeInTheDocument();
-  });
-
-  it("hides the trigger when the harness is unknown (not yet loaded)", () => {
-    renderContentForAgent({ id: "ag_x", name: "mystery" }, "conv_x");
-    expect(screen.queryByTestId("restart-with-model-trigger")).not.toBeInTheDocument();
   });
 });

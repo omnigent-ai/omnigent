@@ -56,6 +56,12 @@ import {
 } from "./chatStore";
 import { useTerminalActivityStore } from "./terminalActivity";
 
+// The real `send` action, captured before any test stubs it via
+// setState({ send: spy }). Zustand's setState permanently overwrites the
+// action, so beforeEach restores this so a later test (e.g. cross-path
+// ordering) exercises the genuine send() path rather than a leftover spy.
+const realSend = useChatStore.getState().send;
+
 // Stub the viewer-identity lookup for deterministic author stamping on
 // optimistic sends. Defaults to null — the same value the real module
 // returns before identity resolves / in single-user mode — so tests
@@ -364,6 +370,8 @@ beforeEach(() => {
     costControlModeOverride: null,
     codexPlanMode: false,
     abortController: null,
+    // Restore the real send action; a prior test may have stubbed it.
+    send: realSend,
   });
   fetchMock.mockReset();
   fetchMock.mockImplementation(defaultFetchHandler);
@@ -4999,6 +5007,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     labels?: Record<string, string>;
     reasoning_effort?: string | null;
     model_override?: string | null;
+    cost_control_mode_override?: "on" | "off" | null;
     parent_session_id?: string | null;
     model_options?: Array<Record<string, unknown>>;
   }
@@ -5018,6 +5027,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
           labels: overrides.labels ?? {},
           reasoning_effort: overrides.reasoning_effort ?? null,
           model_override: overrides.model_override ?? null,
+          cost_control_mode_override: overrides.cost_control_mode_override ?? null,
           parent_session_id: overrides.parent_session_id ?? null,
           model_options: overrides.model_options ?? [],
         });
@@ -5062,6 +5072,28 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     const state = useChatStore.getState();
     expect(state.selectedModel).toBe("claude-opus-4-7");
     expect(state.selectedEffort).toBe("high");
+  });
+
+  it("does NOT apply a sticky model to a routing-enabled session", async () => {
+    // Intelligent routing owns model selection: the bind-time sticky handoff
+    // must NOT silently re-pin the last-used model, or the server's
+    // `model_override is None` routing guard would skip and the judge would
+    // never run. (This is the claude-native repro: new chat + routing on.)
+    seedSession("conv_routing", []);
+    withSnapshot("conv_routing", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      cost_control_mode_override: "on",
+      model_override: null,
+    });
+
+    useChatStore.setState({ selectedModel: "claude-opus-4-7" });
+    await useChatStore.getState().switchTo("conv_routing");
+
+    // No model_override PATCH fired (contrast the handoff test above).
+    const patches = patchCallsFor("conv_routing");
+    expect(patches.some((p) => "model_override" in p)).toBe(false);
+    // …and the session is not mislabeled as pinned to the sticky model.
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
   });
 
   it("PATCHes sticky model and effort onto a codex-native session with no overrides", async () => {
@@ -7071,6 +7103,56 @@ describe("chatStore — setCostControlMode", () => {
     expect(useChatStore.getState().costControlModeOverride).toBe("on");
   });
 
+  it("clears the pinned model when routing is turned on (mutual exclusion)", async () => {
+    // A session pinned to a model (e.g. Opus from the picker) must drop that
+    // pin when routing is enabled — otherwise `model_override` wins and the
+    // judge never runs. The clear rides in the SAME PATCH as the toggle.
+    seedSession("conv_cc_model", []);
+    await useChatStore.getState().switchTo("conv_cc_model");
+    useChatStore.setState({ sessionModelOverride: "claude-opus-4-7" });
+
+    // The optimistic clear is visible before the PATCH resolves.
+    const settled = useChatStore.getState().setCostControlMode("on");
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    await settled;
+
+    const patchCall = fetchMock.mock.calls.find(([u, init]) => {
+      const url = typeof u === "string" ? u : (u as URL | Request).toString();
+      return (
+        url === "/v1/sessions/conv_cc_model" &&
+        (init as RequestInit | undefined)?.method === "PATCH"
+      );
+    });
+    expect(patchCall).toBeDefined();
+    // One PATCH carries BOTH the toggle and the model clear ("default" alias).
+    expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
+      cost_control_mode_override: "on",
+      model_override: "default",
+    });
+  });
+
+  it("does NOT clear the model when routing is turned on but nothing is pinned", async () => {
+    // A model-less session (e.g. SDK) must not emit a spurious model clear —
+    // that would fire a redundant model_change and a bogus "changed to none".
+    seedSession("conv_cc_nomodel", []);
+    await useChatStore.getState().switchTo("conv_cc_nomodel");
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+
+    await useChatStore.getState().setCostControlMode("on");
+
+    const patchCall = fetchMock.mock.calls.find(([u, init]) => {
+      const url = typeof u === "string" ? u : (u as URL | Request).toString();
+      return (
+        url === "/v1/sessions/conv_cc_nomodel" &&
+        (init as RequestInit | undefined)?.method === "PATCH"
+      );
+    });
+    expect(patchCall).toBeDefined();
+    expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
+      cost_control_mode_override: "on",
+    });
+  });
+
   it("sends an explicit null on clear and settles back to unset", async () => {
     seedSession("conv_cc2", []);
     sessionCostControlOverrides.set("conv_cc2", "off");
@@ -8112,5 +8194,60 @@ describe("chatStore — background cross-session flush", () => {
       file_id: "file_bg_dedupe",
       filename: "shot.png",
     });
+  });
+
+  it("serializes a background flush behind an in-flight foreground send (FIFO across paths)", async () => {
+    // The navigate-away race: a foreground send() for the active conversation is
+    // still in flight (its /events POST held open) when the background flush
+    // fires for another conversation. Both POSTs must go through the one send
+    // chain, so the background POST cannot overtake the foreground one — it
+    // waits until the foreground POST resolves.
+    seedConversationsCache([conv("conv_active", "idle"), conv("conv_bg", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_active",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_bg" }],
+    });
+
+    // Hold conv_active's foreground POST open; conv_bg's background POST resolves
+    // immediately. Records delivery order across both endpoints.
+    const delivered: string[] = [];
+    let releaseForeground: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_active/events" && init?.method === "POST") {
+        delivered.push("foreground");
+        return new Promise<Response>((resolve) => {
+          releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
+        });
+      }
+      if (url === "/v1/sessions/conv_bg/events" && init?.method === "POST") {
+        delivered.push("background");
+        return mockResponse({ queued: true, item_id: "ci_bg" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    // Foreground send() takes the first chain slot and its POST is held open.
+    const fg = useChatStore.getState().send("fg-msg", "agent_xyz");
+    await tick();
+    expect(delivered).toEqual(["foreground"]);
+
+    // Background flush fires while the foreground POST is still in flight. It
+    // must NOT deliver yet — it's queued behind the foreground POST on the chain.
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["foreground"]);
+
+    // Release the foreground POST → the background POST is now free to deliver.
+    releaseForeground();
+    await fg;
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["foreground", "background"]);
   });
 });

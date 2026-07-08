@@ -100,6 +100,9 @@ class HostLaunchRunnerFrame:
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
         ``"/Users/corey/projects/frontend"``.
+    :param session_id: Conversation/session ID the runner is being
+        launched for, e.g. ``"conv_abc123"``. ``None`` means an older
+        server did not include it.
     :param harness: Canonical harness the session will run, e.g.
         ``"claude-sdk"``. The host checks it is configured before
         spawning and refuses with
@@ -111,6 +114,7 @@ class HostLaunchRunnerFrame:
     request_id: str
     binding_token: str
     workspace: str
+    session_id: str | None = None
     harness: str | None = None
 
 
@@ -588,6 +592,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "binding_token": frame.binding_token,
                 "workspace": frame.workspace,
+                "session_id": frame.session_id,
                 "harness": frame.harness,
             }
         )
@@ -878,6 +883,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
+        session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
     )
 

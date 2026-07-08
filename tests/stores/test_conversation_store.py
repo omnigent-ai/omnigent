@@ -1791,6 +1791,34 @@ def test_list_conversations_filtered_by_parent_returns_children_only(
     assert titles == ["coder:auth", "coder:payments"]
 
 
+def test_list_conversations_filtered_by_title(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``title`` filter returns only children with an exact title match."""
+    parent = conversation_store.create_conversation()
+    conversation_store.create_conversation(
+        kind="sub_agent", title="coder:auth", parent_conversation_id=parent.id
+    )
+    conversation_store.create_conversation(
+        kind="sub_agent", title="coder:payments", parent_conversation_id=parent.id
+    )
+
+    page = conversation_store.list_conversations(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title="coder:auth",
+    )
+    assert len(page.data) == 1
+    assert page.data[0].title == "coder:auth"
+
+    empty = conversation_store.list_conversations(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title="coder:nonexistent",
+    )
+    assert len(empty.data) == 0
+
+
 def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3486,39 +3514,6 @@ def test_fork_conversation_copy_model_settings_false_resets(
     assert reloaded_default.reasoning_effort == "high"
 
 
-def test_fork_conversation_model_override_wins_over_copy(
-    conversation_store: SqlAlchemyConversationStore,
-    agent_store: SqlAlchemyAgentStore,
-) -> None:
-    """An explicit ``model_override`` overrides the source's copied model.
-
-    The "restart with model" path: the fork must launch on the requested
-    model, not the source's. ``reasoning_effort`` still follows
-    ``copy_model_settings`` (a same-family model switch keeps the effort).
-    """
-    agent_store.create(
-        agent_id="ag_fork_mo",
-        name="fork-mo",
-        bundle_location="ag_fork_mo/fakehash",
-    )
-    source = conversation_store.create_conversation(agent_id="ag_fork_mo")
-    conversation_store.update_conversation(
-        source.id, reasoning_effort="high", model_override="databricks-gpt-5-5"
-    )
-
-    fork = conversation_store.fork_conversation(
-        source.id, model_override="databricks-gpt-5-4-mini"
-    )
-
-    reloaded = conversation_store.get_conversation(fork.id)
-    assert reloaded is not None
-    assert reloaded.model_override == "databricks-gpt-5-4-mini", (
-        "An explicit model_override must win over the source's copied model."
-    )
-    # reasoning_effort still copies (same-family switch keeps the effort).
-    assert reloaded.reasoning_effort == "high"
-
-
 def test_fork_conversation_carry_history_into_native_stamps_label(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -4122,7 +4117,7 @@ def _stored_next_position(
     from omnigent.db.db_models import SqlConversation
 
     with conversation_store._session() as session:
-        row = session.get(SqlConversation, conversation_id)
+        row = session.get(SqlConversation, (0, conversation_id))
         assert row is not None
         return row.next_position
 
@@ -4192,7 +4187,7 @@ def test_append_reads_counter_not_max_scan(
     conversation_store.append(conv.id, [_user_message("a"), _user_message("b")])
     # Real max position is 1; jump the counter ahead to 100.
     with conversation_store._session() as session:
-        session.get(SqlConversation, conv.id).next_position = 100
+        session.get(SqlConversation, (0, conv.id)).next_position = 100
 
     conversation_store.append(conv.id, [_user_message("c")])
 
@@ -4218,7 +4213,7 @@ def test_append_falls_back_to_scan_when_counter_null(
         conversation_store.append(conv.id, [_user_message(f"pre{i}") for i in range(preexisting)])
     # Simulate a pre-counter row: clear the maintained counter.
     with conversation_store._session() as session:
-        session.get(SqlConversation, conv.id).next_position = None
+        session.get(SqlConversation, (0, conv.id)).next_position = None
     assert _stored_next_position(conversation_store, conv.id) is None
 
     conversation_store.append(conv.id, [_user_message("new")])

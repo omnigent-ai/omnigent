@@ -48,7 +48,11 @@ class OidcLoginManager {
      * flight (a second concurrent call is ignored). The caller uses the result so
      * a no-op call isn't counted against a retry budget.
      */
-    fun start(activity: Activity, origin: String, onSession: (String) -> Unit): Boolean {
+    fun start(
+        activity: Activity,
+        origin: String,
+        onSession: (String) -> Unit,
+    ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
         io.execute {
@@ -59,7 +63,9 @@ class OidcLoginManager {
                 if (ticket != null) {
                     main.post { launchTab(activity, origin + ticket.loginUrl) }
                     token = pollForToken(origin, ticket.id)
-                    authLog("poll -> ${if (token != null) "token (len=${token.length})" else "no token"}")
+                    authLog(
+                        "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
+                    )
                 }
             } catch (_: InterruptedException) {
                 // shutdown() interrupted the poll — the host is going away; drop.
@@ -82,7 +88,10 @@ class OidcLoginManager {
         io.shutdownNow() // interrupts the polling sleep so the task exits promptly
     }
 
-    private data class Ticket(val id: String, val loginUrl: String)
+    private data class Ticket(
+        val id: String,
+        val loginUrl: String,
+    )
 
     private fun requestTicket(origin: String): Ticket? {
         val conn = (URL("$origin/auth/cli-login").openConnection() as HttpURLConnection)
@@ -108,32 +117,53 @@ class OidcLoginManager {
         }
     }
 
-    private fun launchTab(activity: Activity, url: String) {
+    private fun launchTab(
+        activity: Activity,
+        url: String,
+    ) {
         // Full system browser (not a Custom Tab): the IdP flow page renders blank
         // in an in-app Custom Tab on some setups but works in the browser. Still
         // RFC 8252 — the system browser is the canonical external user-agent.
         authLog("opening login in browser") // URL carries the one-time ticket — not logged
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
+        val intent =
+            Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse(url),
+            ).addCategory(Intent.CATEGORY_BROWSABLE)
         runCatching { activity.startActivity(intent) }
     }
 
-    private fun pollForToken(origin: String, ticket: String): String? {
+    private fun pollForToken(
+        origin: String,
+        ticket: String,
+    ): String? {
         val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
         val encoded = Uri.encode(ticket)
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
-            val conn = (URL("$origin/auth/cli-poll?ticket=$encoded").openConnection() as HttpURLConnection)
+            val conn = (
+                URL(
+                    "$origin/auth/cli-poll?ticket=$encoded",
+                ).openConnection() as HttpURLConnection
+            )
             conn.requestMethod = "GET"
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
             try {
                 when (conn.responseCode) {
-                    202 -> continue // still pending
+                    202 -> {
+                        continue
+                    }
+
+                    // still pending
                     200 -> {
                         val body = conn.inputStream.bufferedReader().use { it.readText() }
                         return JSONObject(body).optString("token").ifEmpty { null }
                     }
-                    else -> return null // 410 expired/rejected, or other
+
+                    else -> {
+                        return null
+                    } // 410 expired/rejected, or other
                 }
             } catch (_: Throwable) {
                 if (Thread.currentThread().isInterrupted) return null // shutdown mid-request
