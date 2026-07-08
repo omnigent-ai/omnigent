@@ -953,63 +953,59 @@ function ConversationList({
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
     const notArchived = allWithBackfill.filter((c) => c.archived !== true);
-    // Pinning and projects are "My sessions"-only organizational tools, so they
-    // draw from owned sessions alone. Otherwise a shared session the viewer can
-    // pin (localStorage is ownership-agnostic) or file into a project (editable
-    // shared session) would render under Pinned / a project folder on My
-    // sessions AND on the Shared tab. Building both from owned-only keeps the
-    // non-owned sessions on the Shared tab exclusively.
-    const ownedNotArchived = notArchived.filter(isOwnedByViewer);
+    // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
+    // "shared" is the ones others shared with them. The Pinned / Projects /
+    // Sessions structure is then built from that slice, so both tabs reuse the
+    // same section layout with different conversations.
+    const tabScoped =
+      activeTab === "shared"
+        ? notArchived.filter((c) => !isOwnedByViewer(c))
+        : notArchived.filter(isOwnedByViewer);
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
     // strictly by when they were pinned (newest pin at the bottom), not by
     // `updated_at`, so a pinned session doesn't jump when it gets a new message.
+    // Pins are localStorage and ownership-agnostic, so a pinned shared session
+    // floats to Pinned on the Shared tab just like an owned one on My sessions.
     const pinned = orderByPinnedSequence(
-      ownedNotArchived.filter((c) => pinnedSet.has(c.id)),
+      tabScoped.filter((c) => pinnedSet.has(c.id)),
       pinnedConversationIds,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
-    // Projects: each folder holds its non-pinned, non-archived sessions. A
-    // pinned member is excluded here (it lives under Pinned instead), so
-    // pinning a project's last session leaves the folder showing "No chats".
+    // Projects are a "My sessions"-only tool (filing into a project is
+    // owner-only), so the Shared tab renders no folders. On "mine" each folder
+    // holds its non-pinned, non-archived sessions; a pinned member is excluded
+    // (it lives under Pinned), so pinning a project's last session leaves the
+    // folder showing "No chats".
     const filedIds = new Set<string>();
-    const projectGroups: { name: string; conversations: Conversation[] }[] = projectNames.map(
-      (name) => {
-        const inProject = ownedNotArchived.filter(
-          (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
-        );
-        inProject.forEach((c) => filedIds.add(c.id));
-        return { name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
-      },
-    );
+    const projectGroups: { name: string; conversations: Conversation[] }[] =
+      activeTab === "shared"
+        ? []
+        : projectNames.map((name) => {
+            const inProject = tabScoped.filter(
+              (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
+            );
+            inProject.forEach((c) => filedIds.add(c.id));
+            return { name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
+          });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
     // unloaded page. We render it as a folder with a "No chats" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
-    // Chats / Shared: the remainder — not archived, not pinned, and not in any
-    // project.
-    const rest = allConversations.filter(
-      (c) => c.archived !== true && !pinnedIdSet.has(c.id) && !filedIds.has(c.id),
-    );
-    const sessions = sortByUpdatedAtDesc(rest.filter(isOwnedByViewer), activeOverride);
-    // The "Shared with me" tab is a flat list of every non-archived session the
-    // viewer doesn't own — deliberately independent of pinning and projects
-    // (those are "My sessions"-only organizational tools). Computed from
-    // `notArchived`, not `rest`, so a shared session never drops off this tab
-    // just because it was pinned or filed into a project on the other one.
-    const shared = sortByUpdatedAtDesc(
-      notArchived.filter((c) => !isOwnedByViewer(c)),
+    // Sessions: the remainder of the tab's slice — not pinned, not filed.
+    const sessions = sortByUpdatedAtDesc(
+      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
     );
     const archived = sortByUpdatedAtDesc(
       allWithBackfill.filter((c) => c.archived === true),
       activeOverride,
     );
-    return { pinned, sessions, shared, archived, projectGroups };
+    return { pinned, sessions, archived, projectGroups };
   }, [
     allConversations,
     pinnedBackfill,
@@ -1017,6 +1013,7 @@ function ConversationList({
     pinnedConversationIds,
     activeOverride,
     projectNames,
+    activeTab,
   ]);
 
   // Collapsed section titles — persisted like pins so the preference
@@ -1261,35 +1258,22 @@ function ConversationList({
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
     const projectVisible = (name: string, list: readonly Conversation[]) =>
       !projectsCollapsed && expandedProjects.includes(name) ? list : [];
-    // Keyboard nav follows the visible tab: "shared" lists only the flat
-    // shared sessions, "mine" the Pinned / Projects / Chats structure. The
-    // shared tab always renders expanded (no in-list header to collapse), so
-    // don't consult the collapsed set — a stale persisted "Shared with me"
-    // collapse (from the old inline section) must not empty this list.
-    if (activeTab === "shared") {
-      return sections.shared.map((c) => c.id);
-    }
+    // `sections` is already scoped to the active tab, so the same Pinned /
+    // Projects / Sessions walk covers both tabs (Projects is empty on shared).
     return [
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
-  }, [sections, effectiveCollapsedSections, expandedProjects, activeTab]);
+  }, [sections, effectiveCollapsedSections, expandedProjects]);
   // Getter that builds the shift-select visible order on demand (at click
   // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
   // during render — guarantees the project segment is always fresh even when a
   // ProjectFolder re-renders independently (async query resolve, session
-  // re-sort) without triggering a parent re-render. Tab-aware like
-  // orderedConversationIds: the "shared" tab ranges over the flat shared list,
-  // "mine" over Pinned / Projects / Chats.
+  // re-sort) without triggering a parent re-render.
   getVisibleIdsRef.current = () => {
     const vis = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
-    // Shared tab renders expanded regardless of the collapsed set (see above),
-    // so range-select over the full list.
-    if (activeTab === "shared") {
-      return sections.shared.map((c) => c.id);
-    }
     const projCollapsed = effectiveCollapsedSections.includes("Projects");
     return [
       ...vis("Pinned", sections.pinned),
@@ -1353,14 +1337,13 @@ function ConversationList({
   // don't count toward the sidebar's empty-state threshold. Each project
   // counts itself (not just its loaded chats) so an empty project still
   // renders its "Projects" header + "No chats" folder rather than the global
-  // empty-state message. The count is per-tab: "shared" sees only the flat
-  // shared list, "mine" the Pinned / Projects / Chats structure.
-  const totalVisible = showShared
-    ? sections.shared.length
-    : sections.pinned.length +
-      sections.sessions.length +
-      sections.projectGroups.length +
-      sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
+  // empty-state message. `sections` is tab-scoped, so this counts the active
+  // tab only (Projects is empty on the Shared tab).
+  const totalVisible =
+    sections.pinned.length +
+    sections.sessions.length +
+    sections.projectGroups.length +
+    sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
 
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no icons or counts in the headers, no divider
@@ -1401,32 +1384,6 @@ function ConversationList({
                 scrollRoot={scrollContainerRef}
               />
             )}
-          </>
-        ) : showShared ? (
-          <>
-            {/* Shared tab: a flat, headerless list of sessions others shared
-              with the viewer. The "Shared with me" label lives in the tab, so
-              there's no in-list section header; projects and pinning are
-              "My sessions"-only and don't render here. */}
-            <ConversationSection
-              conversations={sections.shared}
-              pinnedConversationIds={pinnedConversationIds}
-              collapsed={false}
-              onToggleCollapsed={() => {}}
-              onRowClick={onRowClick}
-              onTogglePinned={onTogglePinned}
-              selectionMode={selectionMode}
-              selectedIds={selectedIds}
-              onToggleSelected={onToggleSelected}
-            />
-            {/* Shared sessions live on the same paginated list as owned ones,
-              so keep loading more pages while this tab is open. */}
-            <InfiniteScrollSentinel
-              hasMore={hasMorePages}
-              isFetching={isFetchingNextPage}
-              fetchMore={fetchNextPage}
-              scrollRoot={scrollContainerRef}
-            />
           </>
         ) : (
           <>
@@ -1560,8 +1517,9 @@ function ConversationList({
                 />
               </ChatsDropZone>
             )}
-            {/* "Shared with me" sessions now live on their own sidebar tab
-              (see the showShared branch above), not inline under My sessions. */}
+            {/* Both tabs render this same Pinned / Projects / Sessions tree;
+              `sections` is scoped to the active tab's conversations (owned vs.
+              shared), and Projects is empty on the Shared tab. */}
             {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
             {/* Infinite-scroll sentinel for the global list. Pagination extends
@@ -2121,7 +2079,9 @@ function ConversationMenuItems({
           Mark as unread
         </C.Item>
       )}
-      {canEdit && (
+      {/* Projects are a My-sessions-only tool, so filing is owner-only — a
+          shared session (even editable) shows no project affordance. */}
+      {canEdit && isOwner && (
         <C.Sub>
           <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
             <FolderInputIcon className="size-3.5" />

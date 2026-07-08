@@ -423,22 +423,6 @@ describe("Sidebar tabs", () => {
     expect(screen.queryByText("conv_shared")).toBeNull();
   });
 
-  it("does not render project folders on the Shared with me tab", () => {
-    projectsMock.push("Alpha");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Alpha" } }),
-      conv("conv_shared", "Claude Code", { permission_level: 2 }),
-    ]);
-    renderSidebar();
-    // My sessions tab carries the Projects group.
-    expect(screen.getByText("Projects")).toBeInTheDocument();
-
-    // Shared tab is a flat list — projects are a "My sessions"-only tool.
-    showSharedTab();
-    expect(screen.queryByText("Projects")).toBeNull();
-    expect(screen.getByText("conv_shared")).toBeInTheDocument();
-  });
-
   it("hides the tabs on a single-user (local) server and shows only owned sessions", () => {
     // A loopback-only server can't share sessions with anyone, so the tab
     // split is meaningless — collapse to the plain owned-session list.
@@ -455,9 +439,11 @@ describe("Sidebar tabs", () => {
     expect(screen.queryByText("conv_shared")).toBeNull();
   });
 
-  it("keeps a pinned shared session on the Shared tab only, not under Pinned", () => {
-    // Pinning is a My-sessions-only tool: a pinned shared session must not leak
-    // into the owned tab's Pinned section (which would show it in two places).
+  it("gives a pinned shared session a Pinned section on the Shared tab, not My sessions", () => {
+    // Pins are ownership-agnostic (localStorage), so both tabs reuse the same
+    // Pinned section — scoped to that tab's conversations. A pinned shared
+    // session floats to Pinned on the Shared tab and never leaks onto My
+    // sessions (which shows only owned sessions).
     mockConversations([
       conv("conv_mine", "Claude Code"),
       conv("conv_shared", "Claude Code", { permission_level: 2 }),
@@ -465,35 +451,35 @@ describe("Sidebar tabs", () => {
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_shared"]));
     renderSidebar();
 
-    // My sessions tab: no Pinned section leaking the shared row in.
+    // My sessions tab: owned session is unpinned (no Pinned section), and the
+    // pinned shared row doesn't appear here at all.
     expect(screen.queryByText("Pinned")).toBeNull();
     expect(screen.getByText("conv_mine")).toBeInTheDocument();
     expect(screen.queryByText("conv_shared")).toBeNull();
 
-    // The shared session lives only on the Shared tab.
+    // Shared tab: the shared session shows under its own Pinned section.
     showSharedTab();
-    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+    const pinnedSection = screen.getByText("Pinned").closest("section")!;
+    expect(within(pinnedSection).getByText("conv_shared")).toBeInTheDocument();
   });
 
-  it("keeps a project-filed shared session on the Shared tab only, not under Projects", () => {
-    // Filing into a project is a My-sessions-only tool: an editable shared
-    // session filed into a project must not render under a project folder.
+  it("does not render project folders on the Shared tab (projects are owner-only)", () => {
+    // Filing into a project is owner-only, so the Shared tab shows no Projects
+    // group; a shared session that carries a project label just lands in the
+    // flat Sessions list there.
     projectsMock.push("Alpha");
     mockConversations([
-      conv("conv_mine", "Claude Code"),
-      conv("conv_shared", "Claude Code", {
-        permission_level: 2,
-        labels: { omni_project: "Alpha" },
-      }),
+      conv("conv_mine", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_shared", "Claude Code", { permission_level: 2 }),
     ]);
     renderSidebar();
 
-    // My sessions tab: the Alpha folder renders but doesn't hold the shared row.
-    expect(screen.getByText("Alpha")).toBeInTheDocument();
-    expect(screen.queryByText("conv_shared")).toBeNull();
+    // My sessions tab carries the Projects group.
+    expect(screen.getByText("Projects")).toBeInTheDocument();
 
-    // The shared session lives only on the Shared tab.
+    // Shared tab: no Projects group; the shared session shows in Sessions.
     showSharedTab();
+    expect(screen.queryByText("Projects")).toBeNull();
     expect(screen.getByText("conv_shared")).toBeInTheDocument();
   });
 
