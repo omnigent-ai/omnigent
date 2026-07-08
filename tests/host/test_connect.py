@@ -1226,6 +1226,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "LC_CTYPE": "UTF-8",
         "DATABRICKS_CONFIG_PROFILE": "ambient",
         "DATABRICKS_CONFIG_FILE": "/tmp/databrickscfg",
+        "DATABRICKS_AUTH_STORAGE": "plaintext",
         "ANTHROPIC_API_KEY": "sk-harness",
         "IS_SANDBOX": "1",
         "DATABRICKS_TOKEN": "dapi-secret",
@@ -1254,6 +1255,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # the ambient value reaches the runner unmodified (no flag override).
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"
     assert env["DATABRICKS_CONFIG_FILE"] == "/tmp/databrickscfg"
+    # The token-storage backend selector forwards too — without it the runner
+    # falls back to the ~/.databrickscfg default and can read a different token
+    # store than the host/daemon, failing to mint a token (runner tunnel 401).
+    assert env["DATABRICKS_AUTH_STORAGE"] == "plaintext"
     # Harness credentials forward — they exist FOR the runner's
     # harnesses (laptop: exported keys; managed sandbox: the
     # deployment's injected provider secrets).
