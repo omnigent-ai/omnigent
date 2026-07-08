@@ -108,6 +108,7 @@ import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
   type PendingUserMessage,
+  type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
@@ -465,6 +466,27 @@ export function shouldShowAuthorBadge(
   isSessionShared: boolean,
 ): boolean {
   return isSessionShared && author !== undefined && author !== viewerId;
+}
+
+/**
+ * Whether a submitted message should be queued rather than POSTed now.
+ *
+ * Queue when busy, or when this conversation already has a queued message even
+ * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
+ * later direct send could overtake a still-queued earlier one when status
+ * flickers idle mid-queue (cursor-native). A new chat always sends.
+ */
+export function shouldQueueSend(
+  conversationId: string | null,
+  status: "idle" | "streaming",
+  sessionStatus: SessionStatus,
+  queuedMessages: QueuedMessage[],
+): boolean {
+  if (conversationId === null) return false;
+  const isBusy =
+    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  return isBusy || hasQueued;
 }
 
 // Author labels render only in a shared session; ChatPage provides the
@@ -972,15 +994,12 @@ export function ChatPage() {
       setReconnectDialogOpen(true);
       return;
     }
-    // Busy → hold the message in the client-side queue (shown in the strip
-    // above the composer) instead of POSTing now. The queue head is flushed
-    // FIFO when the session next goes idle. Only queue for an already-bound
-    // conversation; a brand-new chat (no conversationId) always sends so the
-    // session gets created.
+    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+    // FIFO immediately when genuinely idle, so nothing stalls.
     const chat = useChatStore.getState();
-    const isBusy =
-      chat.status === "streaming" || ["running", "waiting"].includes(chat.sessionStatus);
-    if (isBusy && chat.conversationId !== null) {
+    if (
+      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
+    ) {
       chat.enqueueMessage(text, files);
       return;
     }
