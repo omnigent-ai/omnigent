@@ -32,9 +32,17 @@ fan-out 前给出建议；Gateway 层自动处理 429、超时、quota 耗尽等
 `model` 作为 `args.model`。例如：
 
 ```
-sys_advise_models([
-  {task_id: "fix-header", agent: "opencode",  model_hint: "gateway/deepseek-v4-flash"},
-  {task_id: "review-header", agent: "pi",     model_hint: "gateway/claude-sonnet-4-6"},
+sys_advise_models(tasks=[
+  {
+    title: "fix-header",
+    agents: [{agent: "opencode", models: ["gateway/deepseek-v4-flash"]}],
+    task: "Fix the header rendering bug in the login page."
+  },
+  {
+    title: "review-header",
+    agents: [{agent: "pi", models: ["gateway/claude-sonnet-4-6"]}],
+    task: "Review the header fix for correctness and style."
+  }
 ])
 ```
 
