@@ -1,0 +1,112 @@
+# LiteLLM Proxy Configuration — Omnigent Polly Gateway
+#
+# This file defines model aliases that the smart-router skill and other
+# Omnigent agents reference via the ``gateway/<name>`` convention.
+# All API keys are read from environment variables — never hardcoded.
+#
+# Usage:
+#   litellm --config litellm-config.yaml
+#
+# See README.md for environment setup and Omnigent integration.
+
+model_list:
+  # ── Google Gemini 3.5 Flash ──────────────────────────────────────────
+  # Fast, cheap, good at structured output and vision.
+  - model_name: gateway/gemini-35-flash
+    litellm_params:
+      model: gemini/gemini-3.5-flash-latest
+      api_key: "os.environ/GEMINI_API_KEY"
+
+  # ── OpenRouter Free Tier ─────────────────────────────────────────────
+  # Best-effort free model endpoint. Rate-limited; fallback handled below.
+  - model_name: gateway/openrouter-free
+    litellm_params:
+      model: openrouter/openrouter/free
+      api_key: "os.environ/OPENROUTER_API_KEY"
+
+  # ── DeepSeek V4 Flash ─────────────────────────────────────────────────
+  # Primary coding / implementation model — fast, strong at multi-file edits.
+  - model_name: gateway/deepseek-v4-flash
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+
+  # ── MiniMax-M3 ────────────────────────────────────────────────────────
+  # Mid-tier implementation / review — good balance of quality and speed.
+  - model_name: gateway/minimax-m3
+    litellm_params:
+      model: openai/Hailuo-M3-0825-1122
+      api_base: https://api.minimax.chat/v1
+      api_key: "os.environ/MINIMAX_API_KEY"
+
+  # ── Claude Sonnet 4-6 (via OpenRouter) ────────────────────────────────
+  # Strongest reasoning / code review model. Used for critical-path
+  # architecture review and hard implementation work.
+  - model_name: gateway/claude-sonnet-4-6
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-4-6
+      api_key: "os.environ/OPENROUTER_API_KEY"
+
+  # ── GLM-5 (for Kiro rapid prototyping) ────────────────────────────────
+  # Zhipu AI's latest. Used by the kiro agent for fast prototypes.
+  - model_name: gateway/glm-5
+    litellm_params:
+      model: openai/glm-5
+      api_base: https://open.bigmodel.cn/api/paas/v4
+      api_key: "os.environ/ZHIPU_API_KEY"
+
+
+# ── Router Settings ─────────────────────────────────────────────────────
+router_settings:
+  # Strategy: "latency-based-routing" picks the fastest responding model;
+  # "usage-based-routing" distributes load; omit for simple round-robin.
+  routing_strategy: latency-based-routing
+
+  # Per-request timeout and retry
+  num_retries: 3
+  request_timeout: 30
+
+  # ── Fallback chain ────────────────────────────────────────────────────
+  # When a model exhausts its quota, returns a 429, or times out, LiteLLM
+  # automatically downgrades through the chain. Order: free → low-cost →
+  # mid-cost → premium.
+  fallbacks:
+    # OpenRouter free → Gemini 3.5 Flash → DeepSeek V4 Flash
+    - model_name: gateway/openrouter-free
+      fallback_models:
+        - gateway/gemini-35-flash
+        - gateway/deepseek-v4-flash
+
+    # Gemini 3.5 Flash → DeepSeek V4 Flash → MiniMax-M3
+    - model_name: gateway/gemini-35-flash
+      fallback_models:
+        - gateway/deepseek-v4-flash
+        - gateway/minimax-m3
+
+    # DeepSeek V4 Flash → MiniMax-M3 → Claude Sonnet 4-6 (paid fallback)
+    - model_name: gateway/deepseek-v4-flash
+      fallback_models:
+        - gateway/minimax-m3
+        - gateway/claude-sonnet-4-6
+
+    # MiniMax-M3 → DeepSeek V4 Flash → Claude Sonnet 4-6
+    - model_name: gateway/minimax-m3
+      fallback_models:
+        - gateway/deepseek-v4-flash
+        - gateway/claude-sonnet-4-6
+
+    # Claude Sonnet 4-6 → MiniMax-M3 (expensive → cheaper)
+    - model_name: gateway/claude-sonnet-4-6
+      fallback_models:
+        - gateway/minimax-m3
+        - gateway/deepseek-v4-flash
+
+    # GLM-5 → DeepSeek V4 Flash → Gemini 3.5 Flash
+    - model_name: gateway/glm-5
+      fallback_models:
+        - gateway/deepseek-v4-flash
+        - gateway/gemini-35-flash
+
+  # Cooldown: if a model fails N times in a window, pause it temporarily
+  cooldown_time: 30  # seconds
+  allowed_fails: 5   # before cooldown kicks in
