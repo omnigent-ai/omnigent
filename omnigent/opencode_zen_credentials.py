@@ -1,8 +1,9 @@
 """Resolution of the OpenCode Zen API key (env → Omnigent keychain).
 
 OpenCode Zen (SST's hosted model gateway, https://opencode.ai/zen) is
-authenticated by an API key. OpenCode itself resolves the key from the
-``OPENCODE_API_KEY`` env var (or its own ``auth.json`` via ``/connect``);
+authenticated by an API key; the same ``OPENCODE_API_KEY`` also authenticates
+the sibling ``opencode-go`` provider (per ``opencode auth list``). OpenCode
+itself resolves the key from the env var (or its own ``auth.json`` via ``/connect``);
 Omnigent can additionally hold the key in its keychain-backed secret store
 (``omnigent setup`` → OpenCode → "Set OpenCode Zen API key") so sessions
 work without any ambient env. This module is the single resolver used by

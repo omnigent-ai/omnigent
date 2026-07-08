@@ -94,10 +94,11 @@ def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[s
     for provider_id, _label, var in _ENV_PROVIDER_VARS:
         if env.get(var, "").strip():
             ids.add(provider_id)
-    # The Zen key (env or Omnigent keychain) authenticates OpenCode's own
-    # ``opencode`` provider, so its models are reachable too.
+    # The Zen key (env or Omnigent keychain) authenticates both of OpenCode's
+    # own gateway providers — ``opencode`` (Zen) and ``opencode-go`` — which
+    # share the ``OPENCODE_API_KEY`` env var, so both model sets are reachable.
     if resolve_opencode_zen_key(environ) is not None:
-        ids.add("opencode")
+        ids.update(("opencode", "opencode-go"))
     return frozenset(ids)
 
 

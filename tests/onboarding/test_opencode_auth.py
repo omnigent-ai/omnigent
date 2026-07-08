@@ -151,15 +151,21 @@ def test_reachable_ids_include_opencode_for_zen_key(
         "omnigent.onboarding.secrets.load_secret",
         lambda name: "sk-vault" if name == "opencode-zen" else None,
     )
-    assert "opencode" in oc.reachable_provider_ids()
+    ids = oc.reachable_provider_ids()
+    assert "opencode" in ids
+    assert "opencode-go" in ids
 
 
 def test_reachable_ids_include_opencode_for_env_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENCODE_API_KEY", "sk-zen")
-    assert "opencode" in oc.reachable_provider_ids()
+    ids = oc.reachable_provider_ids()
+    assert "opencode" in ids
+    assert "opencode-go" in ids
 
 
 def test_reachable_ids_omit_opencode_without_key() -> None:
-    assert "opencode" not in oc.reachable_provider_ids()
+    ids = oc.reachable_provider_ids()
+    assert "opencode" not in ids
+    assert "opencode-go" not in ids
