@@ -21,6 +21,7 @@ import {
   readUiFontFamily,
   readUiFontSizePx,
 } from "./lib/uiFontPreferences";
+import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
 
@@ -58,6 +59,10 @@ initNativeInsets();
 // Apply the saved UI font size and family before first paint so there's no flash.
 applyUiFontScale(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
+
+// Apply the saved color palette (data-theme on <html>) before first paint too,
+// so the app renders in the chosen theme rather than flashing the brand default.
+applyThemePalette(readThemePalette());
 
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the
