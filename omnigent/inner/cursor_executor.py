@@ -466,6 +466,7 @@ class CursorExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        permission_mode: str = "default",
     ) -> None:
         """Create a CursorExecutor.
 
@@ -480,6 +481,13 @@ class CursorExecutor(Executor):
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
         :param agent_name: Optional agent name passed to the SDK.
         :param skills_filter: Accepted for parity; cursor has no skill mechanism here.
+        :param permission_mode: Mirrors :class:`~omnigent.inner.claude_sdk_executor.
+            ClaudeSDKExecutor`'s ``permission_mode``. ``"default"`` (the
+            historical cursor behavior) surfaces a human-consent elicitation
+            card for every Cursor-native tool call, same as an unset
+            ``permission_mode`` always did. ``"auto"`` / ``"bypassPermissions"``
+            skip that elicitation for native tools (Omnigent policy DENY still
+            applies), matching the claude-sdk harness's autonomous mode.
         """
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
@@ -487,6 +495,7 @@ class CursorExecutor(Executor):
         self._api_key = api_key or os.environ.get("CURSOR_API_KEY") or None
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
+        self._permission_mode = permission_mode
         self._skills_filter = skills_filter
         self._session_states: dict[str, _CursorSessionState] = {}
         # Installed by the runtime adapter; routes a bridged-tool call back into
@@ -544,12 +553,18 @@ class CursorExecutor(Executor):
 
         1. **Policy hard-deny**: if the policy evaluator returns
            ``POLICY_ACTION_DENY``, block immediately without prompting the
-           user (the admin already decided).
+           user (the admin already decided). Runs in EVERY permission mode
+           — including ``auto`` / ``bypassPermissions`` — so a configured
+           Omnigent policy can't be skipped by opting into autonomous mode.
 
         2. **Native elicitation**: for any other outcome (ALLOW, ASK, or no
            evaluator wired), invoke ``_elicitation_handler`` so the user can
            review the call and approve or abort the remainder of the turn
-           from the web-UI approval card.
+           from the web-UI approval card. Skipped entirely when
+           ``permission_mode`` is ``"auto"`` or ``"bypassPermissions"`` —
+           mirrors :meth:`ClaudeSDKExecutor._can_use_tool_gate
+           <omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor._can_use_tool_gate>`,
+           which pre-approves autonomously in those modes.
 
         Cursor native tools execute inside the Cursor process, so they have
         already started by the time the executor observes
@@ -566,6 +581,11 @@ class CursorExecutor(Executor):
                     "block": True,
                     "reason": getattr(verdict, "reason", "") or "blocked by policy",
                 }
+
+        if self._permission_mode in ("auto", "bypassPermissions"):
+            # Autonomous mode: policy ALLOW/ASK/unset all fall through with
+            # no human prompt, same as claude-sdk's equivalent modes.
+            return {"block": False, "reason": ""}
 
         # Stage 2 — native elicitation: surface an approval card so the
         # user can decide whether the rest of the turn should continue.

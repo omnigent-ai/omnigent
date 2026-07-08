@@ -44,11 +44,14 @@ def _make_spec(
     model: str | None = "gpt-5",
     name: str = "test-cursor",
     auth: ApiKeyAuth | DatabricksAuth | None = None,
+    permission_mode: str | None = None,
 ) -> AgentSpec:
     """Build a minimal cursor :class:`AgentSpec` for the spawn-env tests."""
     config: dict[str, object] = {"harness": "cursor"}
     if model is not None:
         config["model"] = model
+    if permission_mode is not None:
+        config["permission_mode"] = permission_mode
     return AgentSpec(
         spec_version=1,
         name=name,
@@ -68,6 +71,20 @@ def test_no_model_produces_no_model_env_var() -> None:
     """A spec with no model omits ``HARNESS_CURSOR_MODEL`` (cursor's default applies)."""
     env = _build_cursor_spawn_env(_make_spec(model=None))
     assert "HARNESS_CURSOR_MODEL" not in env
+
+
+def test_permission_mode_threads_into_env_var() -> None:
+    """``executor.config.permission_mode`` is encoded into
+    ``HARNESS_CURSOR_PERMISSION_MODE``, mirroring the claude-sdk builder."""
+    env = _build_cursor_spawn_env(_make_spec(permission_mode="auto"))
+    assert env["HARNESS_CURSOR_PERMISSION_MODE"] == "auto"
+
+
+def test_no_permission_mode_omits_env_var() -> None:
+    """A spec with no ``permission_mode`` omits the env var (wrap defaults to
+    ``"default"`` — always elicit on native tools, the historical behavior)."""
+    env = _build_cursor_spawn_env(_make_spec(permission_mode=None))
+    assert "HARNESS_CURSOR_PERMISSION_MODE" not in env
 
 
 def test_api_key_auth_sets_api_key_env_var() -> None:

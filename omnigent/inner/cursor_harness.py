@@ -32,6 +32,12 @@ Env vars read at startup:
   cursor has no skill mechanism here). Defaults to ``"all"``.
 - ``HARNESS_CURSOR_BUNDLE_DIR`` / ``HARNESS_CURSOR_AGENT_NAME``:
   reserved for future use.
+- ``HARNESS_CURSOR_PERMISSION_MODE``: mirrors
+  ``HARNESS_CLAUDE_SDK_PERMISSION_MODE``. ``None``/unset keeps the
+  historical ``"default"`` behavior (every Cursor-native tool call surfaces
+  a human-consent elicitation card). ``"auto"`` / ``"bypassPermissions"``
+  skip that elicitation for native tools, matching claude-sdk's autonomous
+  modes. A configured Omnigent policy DENY still applies in every mode.
 """
 
 from __future__ import annotations
@@ -57,6 +63,7 @@ _ENV_OS_ENV = "HARNESS_CURSOR_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_CURSOR_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_CURSOR_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_CURSOR_AGENT_NAME"
+_ENV_PERMISSION_MODE = "HARNESS_CURSOR_PERMISSION_MODE"
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -136,6 +143,7 @@ def _build_cursor_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
         skills_filter=_resolve_skills_filter(),
+        permission_mode=os.environ.get(_ENV_PERMISSION_MODE, "").strip() or "default",
     )
 
 

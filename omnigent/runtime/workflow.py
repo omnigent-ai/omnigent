@@ -1696,6 +1696,14 @@ def _build_cursor_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_CURSOR_OS_ENV"] = os_env_payload
+    # Permission mode: controls whether Cursor's native tools (Read/Write/
+    # Bash, executing inside the Cursor process itself) surface a
+    # human-consent elicitation card. Mirrors the claude-sdk builder above.
+    # Omitted when not set — harness falls back to ``"default"`` (always
+    # elicit), the historical cursor behavior.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_CURSOR_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 

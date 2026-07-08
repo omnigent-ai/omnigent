@@ -1519,6 +1519,78 @@ async def test_run_turn_native_tool_ask_user_denies(
     assert not any(isinstance(e, TurnComplete) for e in events)
 
 
+@pytest.mark.parametrize("mode", ["auto", "bypassPermissions"])
+async def test_run_turn_native_tool_auto_mode_skips_elicitation(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """``permission_mode="auto"``/``"bypassPermissions"`` never call the
+    elicitation handler for native tools — policy ALLOW/ASK/unset all fall
+    through autonomously, mirroring ClaudeSDKExecutor's equivalent modes."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x", permission_mode=mode)
+    executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
+
+    handler_called = False
+
+    async def _handler(_name: str, _args: dict[str, Any]) -> bool:
+        nonlocal handler_called
+        handler_called = True
+        return False  # would abort the turn if it were ever invoked
+
+    executor._elicitation_handler = _handler
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert not handler_called, "elicitation handler must not be called in autonomous mode"
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_auto_mode_still_honors_policy_deny(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hard POLICY_ACTION_DENY still blocks the tool call in ``"auto"``
+    mode — autonomous mode only skips human elicitation, not admin policy."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="auto")
+
+    async def _deny_policy(phase: str, _data: dict[str, Any]) -> Any:
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_CALL" else "POLICY_ACTION_ALLOW"
+        return SimpleNamespace(action=action, reason="admin blocked")
+
+    executor._policy_evaluator = _deny_policy
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "admin blocked" in errors[0].message
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
 # ---------------------------------------------------------------------------
 # preToolUse hook: .cursor/hooks.json writing and cleanup
 # ---------------------------------------------------------------------------

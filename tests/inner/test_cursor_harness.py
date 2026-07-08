@@ -88,6 +88,24 @@ def test_executor_factory_unset_optional_env_passes_none(
     assert captured["bundle_dir"] is None
     assert captured["agent_name"] is None
     assert captured["skills_filter"] == "all"
+    assert captured["permission_mode"] == "default"
+
+
+def test_executor_factory_reads_permission_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HARNESS_CURSOR_PERMISSION_MODE", "auto")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.cursor_harness.CursorExecutor.__init__",
+        _fake_init,
+    ):
+        cursor_harness._build_cursor_executor()
+
+    assert captured["permission_mode"] == "auto"
 
 
 def test_executor_factory_decodes_os_env_and_skills(monkeypatch: pytest.MonkeyPatch) -> None:
