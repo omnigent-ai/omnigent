@@ -1436,3 +1436,75 @@ async def test_managed_session_deleted_during_provision_terminates_sandbox(
     # don't surface as unretrieved-exception noise after the test.
     for future in host_futures:
         future.cancel()
+
+
+async def test_bind_fails_launch_when_host_never_registers_tunnel(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provisioned host that never dials back fails the launch, not "ready".
+
+    A managed sandbox (e.g. a Lambda MicroVM) can boot but never register its
+    tunnel on this replica. If the connect-timeout poll gives up, the launch
+    must fail loudly — falling through to ``ready`` with no runner strands the
+    session (the host reads online, so the message-relaunch path won't wake it).
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host_id = "5c0ffee0ffee0ffee0ffee0ffee0ffee"
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-never-registers",
+        user_id=RESERVED_USER_LOCAL,
+        token="tok-never-registers",
+        provider="lambda_microvm",
+        sandbox_id="microvm-never",
+        token_expires_at=9_999_999_999,
+    )
+    conv = conv_store.create_conversation(agent_id=None)
+
+    config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: FakeSandboxLauncher(can_resume=True),
+        token_ttl_s=3600,
+        provider="lambda_microvm",
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+
+    statuses: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda session_id, stage, error=None: statuses.append((stage, error)),
+    )
+    # Collapse the connect budget so the never-registering host times out fast.
+    monkeypatch.setattr(sessions_module, "_MANAGED_HOST_CONNECT_TIMEOUT_S", 0.2)
+
+    # A registry that never has the host — models "host never dialed back".
+    empty_registry = SimpleNamespace(get=lambda _host_id: None)
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=conv.id,
+        managed=ManagedHostLaunch(host_id=host_id, workspace="/root/workspace"),
+        sandbox_config=config,
+        tracker=tracker,
+        conversation_store=conv_store,
+        host_store=host_store,
+        host_registry=empty_registry,  # type: ignore[arg-type]
+        tunnel_registry=None,
+    )
+
+    # The launch is recorded as FAILED (not settled-success), with a clear reason.
+    entry = tracker.get(conv.id)
+    assert entry is not None, "a failed launch is retained on the tracker"
+    assert entry.error is not None and "did not register" in entry.error
+    # The published sandbox status ends on "failed", never "ready".
+    assert ("failed", entry.error) in statuses
+    assert not any(stage == "ready" for stage, _ in statuses)
+    # No runner was written to the session row.
+    updated = conv_store.get_conversation(conv.id)
+    assert updated is not None
+    assert updated.runner_id is None

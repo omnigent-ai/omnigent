@@ -86,6 +86,13 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
+         lambda_microvm:          # optional block (provider: lambda_microvm)
+           region: us-east-1                 # AWS region (default: ambient boto3)
+           image_identifier: omnigent-host   # prebuilt MicroVM image name/ARN
+           image_version: "1.0"              # optional; default: latest
+           execution_role_arn: arn:aws:iam::123:role/omnigent-microvm-exec
+           env: [ANTHROPIC_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+                                                # as MicroVM env
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -101,9 +108,13 @@ stores into ``create_app``):
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
-   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
-   parses but rejects at launch.
+   OpenShell gateway access. The ``lambda_microvm`` launcher reads AWS
+   credentials from the server's ambient boto3 chain (profile /
+   environment / instance role) and needs a prebuilt MicroVM image
+   (``sandbox.lambda_microvm.image_identifier``). ``modal``, ``daytona``,
+   ``boxlite``, ``cwsandbox``, ``islo``, ``e2b``, ``openshell``,
+   ``kubernetes``, and ``lambda_microvm`` have managed-launch support;
+   ``lakebox`` parses but rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -163,10 +174,21 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "lambda_microvm",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+        "lambda_microvm",
+    }
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -862,6 +884,20 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             secret_mounts=secret_mounts,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "lambda_microvm":
+        from omnigent.onboarding.sandboxes.lambda_microvm import managed_token_ttl_s
+
+        launcher_factory = _lambda_microvm_launcher_factory(
+            region=_parse_provider_string(raw, "lambda_microvm", "region"),
+            image_identifier=_parse_provider_string(raw, "lambda_microvm", "image_identifier"),
+            image_version=_parse_provider_string(raw, "lambda_microvm", "image_version"),
+            execution_role_arn=_parse_provider_string(raw, "lambda_microvm", "execution_role_arn"),
+            env=_parse_provider_env(raw, "lambda_microvm"),
+        )
+        # Derived from OMNIGENT_LAMBDA_MICROVM_MAX_LIFETIME_S so the token always
+        # outlives the (operator-overridable) 8 h sandbox lifetime — mirrors the
+        # cwsandbox / e2b path.
+        token_ttl_s = managed_token_ttl_s()
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -2113,6 +2149,47 @@ def _kubernetes_launcher_factory(
             resources=resources,
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
+        )
+
+    return _build
+
+
+def _lambda_microvm_launcher_factory(
+    *,
+    region: str | None,
+    image_identifier: str | None,
+    image_version: str | None,
+    execution_role_arn: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: lambda_microvm`` path.
+
+    :param region: AWS region MicroVMs run in, or ``None`` for the launcher's
+        env-var fallback / ambient boto3 region.
+    :param image_identifier: Prebuilt MicroVM image (name or ARN) the host was
+        built into via ``create-microvm-image``, or ``None`` for the launcher's
+        env-var fallback (required at launch).
+    :param image_version: Specific MicroVM image version, or ``None`` for the
+        account's latest.
+    :param execution_role_arn: IAM role the running MicroVM assumes, or ``None``
+        for the launcher's env-var fallback (required at launch).
+    :param env: Names of server-process environment variables (harness LLM
+        credentials, gateway URLs, ``GIT_TOKEN``) injected into every MicroVM,
+        e.g. ``["ANTHROPIC_API_KEY", "GIT_TOKEN"]``, or ``None``.
+    :returns: A factory producing parameterized Lambda MicroVM launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Lambda MicroVM launcher (lazy boto3 import inside)."""
+        from omnigent.onboarding.sandboxes.lambda_microvm import LambdaMicroVMSandboxLauncher
+
+        return LambdaMicroVMSandboxLauncher(
+            region=region,
+            image_identifier=image_identifier,
+            image_version=image_version,
+            execution_role_arn=execution_role_arn,
+            env=env,
         )
 
     return _build

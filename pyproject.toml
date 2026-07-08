@@ -173,6 +173,11 @@ openshell = ["openshell>=0.0.88,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<37"]
+# AWS Lambda MicroVMs launcher (server-managed `sandbox.provider:
+# lambda_microvm`). The launcher module ships in the base package and imports
+# boto3 lazily, so only users of the provider need this extra. Same boto3 pin as
+# the bedrock/s3 extras.
+lambda-microvm = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # The tracing extra is now a no-op shim kept for backwards compatibility.
 # Tracing is built on OpenTelemetry directly (opentelemetry-exporter-otlp-*
 # are in the default install). `omnigent[tracing]` still works — it just

@@ -214,6 +214,12 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.resources: dict[str, object] | None = None
         self.pvc_mounts: list[dict[str, object]] | None = None
         self.secret_mounts: list[dict[str, object]] | None = None
+        # Lambda MicroVM ctor wiring (captured by
+        # install_fake_lambda_microvm_launcher).
+        self.region: str | None = None
+        self.image_identifier: str | None = None
+        self.image_version: str | None = None
+        self.execution_role_arn: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -563,6 +569,46 @@ def install_fake_kubernetes_launcher(
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
+
+
+def install_fake_lambda_microvm_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``LambdaMicroVMSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``LambdaMicroVMSandboxLauncher(region=…,
+    image_identifier=…, image_version=…, execution_role_arn=…, env=…)``; the shim
+    records those constructor args on the fake and hands it back, so production
+    code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.lambda_microvm as lambda_microvm_mod
+
+    def _ctor(
+        *,
+        region: str | None = None,
+        image_identifier: str | None = None,
+        image_version: str | None = None,
+        execution_role_arn: str | None = None,
+        env: list[str] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.region = region
+        fake.image_identifier = image_identifier
+        fake.image_version = image_version
+        fake.execution_role_arn = execution_role_arn
+        fake.env = env
+        # Report the lambda_microvm provider so managed-host teardown's provider
+        # match (launcher.provider vs host.sandbox_provider) exercises the real
+        # path instead of the FakeSandboxLauncher default ("modal").
+        fake.provider = "lambda_microvm"  # type: ignore[misc]  # shadow ClassVar per-instance
+        return fake
+
+    monkeypatch.setattr(lambda_microvm_mod, "LambdaMicroVMSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(

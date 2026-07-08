@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -1686,6 +1687,169 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertEqual(events_a1[-1].response, "result for hello")
             self.assertEqual(events_b1[-1].response, "result for bonjour")
             self.assertEqual(events_a2[-1].response, "result for hello")
+
+        _run(_t())
+
+    def test_cold_connect_timeout_is_retried_then_succeeds(self):
+        """A first-connect TimeoutError (cold host) is retried once, and the
+        warmed second attempt completes the turn — no cold-start turn loss."""
+        import asyncio as _asyncio
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        connect_attempts = []
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    connect_attempts.append(self)
+                    if len(connect_attempts) == 1:
+                        # Cold host: first connect never completes in time.
+                        raise _asyncio.TimeoutError
+                    return
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [
+                        _ResultMessage(f"claude-{session_id}", f"result for {prompt}")
+                    ]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                session = [{"role": "user", "content": "hi", "session_id": "cold"}]
+                events = [e async for e in executor.run_turn(session, [], "")]
+            # Connected twice (timeout, then success) and the turn completed.
+            self.assertEqual(len(connect_attempts), 2)
+            self.assertEqual(events[-1].response, "result for hi")
+
+        _run(_t())
+
+    def test_control_request_timeout_is_retried_then_succeeds(self):
+        """The SDK's own 'Control request timeout: initialize' (a cold-start
+        handshake timeout, raised as a plain Exception — not asyncio.TimeoutError)
+        is also retried, and the warmed second attempt completes the turn."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        connect_attempts = []
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    connect_attempts.append(self)
+                    if len(connect_attempts) == 1:
+                        # Exactly what the SDK raises on a slow cold init.
+                        raise Exception("Control request timeout: initialize")
+                    return
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [
+                        _ResultMessage(f"claude-{session_id}", f"result for {prompt}")
+                    ]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                session = [{"role": "user", "content": "hi", "session_id": "coldctl"}]
+                events = [e async for e in executor.run_turn(session, [], "")]
+            self.assertEqual(len(connect_attempts), 2)
+            self.assertEqual(events[-1].response, "result for hi")
+
+        _run(_t())
+
+    def test_non_timeout_connect_error_is_not_retried(self):
+        """A hard connect failure (not a timeout) fails immediately — the retry
+        must not mask real errors like a bad CLI option or missing binary."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        connect_attempts = []
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = type("ResultMessage", (), {})
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    connect_attempts.append(self)
+                    raise RuntimeError("unknown option --nope")
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                session = [{"role": "user", "content": "hi", "session_id": "hard"}]
+                # Drain the turn; a hard connect failure surfaces however the
+                # executor reports errors (swallowed into an event or raised) —
+                # the invariant under test is only that it did NOT retry.
+                with contextlib.suppress(Exception):
+                    [e async for e in executor.run_turn(session, [], "")]
+            self.assertEqual(len(connect_attempts), 1)
 
         _run(_t())
 

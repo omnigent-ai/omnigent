@@ -3315,6 +3315,10 @@ islo = [
 kubernetes = [
     { name = "kubernetes" },
 ]
+lambda-microvm = [
+    { name = "boto3" },
+    { name = "botocore" },
+]
 loadtest = [
     { name = "locust" },
 ]
@@ -3348,8 +3352,10 @@ requires-dist = [
     { name = "argon2-cffi", specifier = ">=23.1,<24" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },
     { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.30,<2" },
+    { name = "boto3", marker = "extra == 'lambda-microvm'", specifier = ">=1.30,<2" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },
+    { name = "botocore", marker = "extra == 'lambda-microvm'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 's3'", specifier = ">=1.30,<2" },
     { name = "boxlite", marker = "extra == 'boxlite'", specifier = ">=0.9.5,<1" },
     { name = "cachetools", specifier = ">=5.0,<7" },
@@ -3441,7 +3447,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "memory", "nimble", "slack", "databricks", "loadtest", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "lambda-microvm", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "memory", "nimble", "slack", "databricks", "loadtest", "dev"]
 
 [[package]]
 name = "omnigent-client"
