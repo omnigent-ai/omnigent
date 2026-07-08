@@ -639,6 +639,10 @@ class HostProcess:
         # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
         # because both the mutation and the reaper run on the event loop.
         self._owned_subprocess_ops = 0
+        # Last readiness map sent to the server. Recomputed on connect and
+        # cheap tunnel events so CLI installs after daemon startup reach the
+        # web picker without a daemon restart.
+        self._last_configured_harnesses: dict[str, bool | str] | None = None
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -762,9 +766,10 @@ class HostProcess:
         """
         reaped = 0
         tracked = self._tracked_runner_pids()
+        waitid = os.__dict__["waitid"]
         while True:
             try:
-                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                info = waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             except (ChildProcessError, OSError):
                 break
             if info is None:
@@ -882,6 +887,49 @@ class HostProcess:
             "If this server uses Omnigent accounts or OIDC login, run "
             f"`omnigent login {self._server_url}` to authenticate."
         )
+
+    async def _build_hello(self) -> HostHelloFrame:
+        """Build a hello frame with current host and harness state.
+
+        :returns: A :class:`HostHelloFrame` whose ``configured_harnesses``
+            reflects the current PATH/config, not a daemon-start snapshot.
+        """
+        return HostHelloFrame(
+            version=VERSION,
+            frame_protocol_version=1,
+            name=self._identity.name,
+            runners=self._alive_runner_ids(),
+            configured_harnesses=await asyncio.to_thread(configured_harness_map),
+        )
+
+    async def _send_hello(self, ws: websockets.asyncio.client.ClientConnection) -> HostHelloFrame:
+        """Send a hello frame and remember its readiness map.
+
+        :param ws: The open tunnel connection.
+        :returns: The hello frame that was sent.
+        """
+        hello = await self._build_hello()
+        await ws.send(encode_host_frame(hello))
+        self._last_configured_harnesses = hello.configured_harnesses
+        return hello
+
+    async def _send_hello_if_harnesses_changed(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+    ) -> None:
+        """Refresh the server's readiness snapshot when the map changes.
+
+        Piggybacks on existing tunnel traffic instead of adding a watcher or
+        polling task. ``configured_harness_map`` is cheap and intentionally
+        recomputed so installing a CLI after daemon startup updates the UI.
+
+        :param ws: The open tunnel connection.
+        """
+        hello = await self._build_hello()
+        if hello.configured_harnesses == self._last_configured_harnesses:
+            return
+        await ws.send(encode_host_frame(hello))
+        self._last_configured_harnesses = hello.configured_harnesses
 
     def _fatal_upgrade_error(self, exc: InvalidURI | InvalidStatus) -> HostConnectError | None:
         """Classify a WebSocket-upgrade failure as fatal, or return ``None``.
@@ -1796,18 +1844,11 @@ class HostProcess:
         :raises Exception: On WebSocket disconnect or error — propagated
             to the reconnect loop in :meth:`run`.
         """
-        hello = HostHelloFrame(
-            version=VERSION,
-            frame_protocol_version=1,
-            name=self._identity.name,
-            runners=self._alive_runner_ids(),
-            # Off the event loop: probes PATH (shutil.which) and reads
-            # ~/.omnigent/config.yaml. Recomputed on every (re)connect, so
-            # the server's view refreshes whenever the tunnel does; the
-            # launch-time check above stays the authoritative gate.
-            configured_harnesses=await asyncio.to_thread(configured_harness_map),
-        )
-        await ws.send(encode_host_frame(hello))
+        # Off the event loop: probes PATH (shutil.which) and reads
+        # ~/.omnigent/config.yaml. Refreshed below on existing tunnel
+        # traffic too, so the server/web UI do not keep a daemon-start
+        # snapshot after a CLI is installed.
+        hello = await self._send_hello(ws)
         self._ws = ws
         # Flush exit reports that raced a disconnect: a runner that died
         # while the tunnel was down would otherwise never be reported and
@@ -1859,6 +1900,7 @@ class HostProcess:
                 return
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
+                await self._send_hello_if_harnesses_changed(ws)
             return
         # Handle the frame inside a CONSUMER span parented on the trace
         # context the server stamped into the frame envelope, so the
@@ -1891,6 +1933,7 @@ class HostProcess:
         :returns: None.
         """
         if isinstance(frame, HostLaunchRunnerFrame):
+            await self._send_hello_if_harnesses_changed(ws)
             await ws.send(encode_host_frame(await self._handle_launch(frame)))
         elif isinstance(frame, HostStopRunnerFrame):
             await ws.send(encode_host_frame(self._handle_stop(frame)))

@@ -515,6 +515,41 @@ class HostStore:
                 .values(updated_at=now_epoch())
             )
 
+    def update_configured_harnesses(
+        self,
+        host_id: str,
+        configured_harnesses: dict[str, HarnessAvailability] | None,
+    ) -> None:
+        """
+        Refresh a live host's configured-harness map.
+
+        Called when a connected host sends a later ``host.hello`` after the
+        initial registration. This keeps ``GET /v1/hosts`` aligned with the
+        host's current PATH/config without requiring a daemon reconnect.
+
+        No-op if the host does not exist.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param configured_harnesses: Fresh readiness map from the host, or
+            ``None`` for older/unknown readiness.
+        """
+        harnesses_json = (
+            json.dumps(configured_harnesses) if configured_harnesses is not None else None
+        )
+        with self._session() as session:
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .values(
+                    status=encode_host_status("online"),
+                    updated_at=now_epoch(),
+                    configured_harnesses=harnesses_json,
+                )
+            )
+
     def is_online(self, host_id: str) -> bool:
         """
         Return whether a host is currently live, cross-replica.

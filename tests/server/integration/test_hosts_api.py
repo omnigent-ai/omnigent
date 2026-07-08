@@ -132,6 +132,19 @@ async def _connect_host(
     return comm
 
 
+async def _wait_host_harnesses(
+    store: HostStore,
+    host_id: str,
+    expected: dict[str, bool | str] | None,
+) -> None:
+    """Poll until the host row carries the expected readiness map."""
+    while True:
+        host = store.get_host(host_id)
+        if host is not None and host.configured_harnesses == expected:
+            return
+        await asyncio.sleep(0.01)
+
+
 async def test_list_hosts_empty(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
@@ -275,6 +288,48 @@ async def test_hosts_api_surfaces_configured_harnesses(
     }
     assert single.status_code == 200
     assert single.json()["configured_harnesses"] == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+async def test_hosts_api_refreshes_configured_harnesses_from_later_hello(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A later host.hello refreshes the readiness map surfaced to the picker.
+
+    Reproduces the stale-snapshot bug: the daemon connects with
+    ``opencode-native`` missing, the user installs opencode while the daemon
+    stays alive, and the host sends a later hello with a fresh map. The API the
+    web dialog reads must return the new value without a daemon restart.
+    """
+    app, registry, store, _cs = host_api_app
+    comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"opencode-native": False},
+    )
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(configured_harnesses={"opencode-native": True}),
+        },
+    )
+    await asyncio.wait_for(
+        _wait_host_harnesses(store, _HOST_ID, {"opencode-native": True}),
+        timeout=2.0,
+    )
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    assert conn.hello.configured_harnesses == {"opencode-native": True}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["configured_harnesses"] == {"opencode-native": True}
+    assert single.status_code == 200
+    assert single.json()["configured_harnesses"] == {"opencode-native": True}
 
 
 async def test_hosts_api_configured_harnesses_null_for_older_host(
