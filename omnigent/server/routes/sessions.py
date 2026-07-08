@@ -12247,28 +12247,29 @@ async def _create_session_from_existing_agent(
     # existing_worktree must never be force-removed on failure — it is
     # the user's, not an Omnigent orphan.
     created_worktree_path: str | None = None
-    if body.git is not None and body.git.existing_worktree:
-        # Starting in a pre-existing worktree: no worktree is created, but
-        # record its branch so the sidebar shows it and the opt-in delete
-        # flow can offer to remove it. Validate the name (the host never
-        # runs git for this path, so the server is the only gate).
-        from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+    if body.git is not None:
+        if body.git.existing_worktree:
+            # Starting in a pre-existing worktree: no worktree is created, but
+            # record its branch so the sidebar shows it and the opt-in delete
+            # flow can offer to remove it. Validate the name (the host never
+            # runs git for this path, so the server is the only gate).
+            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
-        try:
-            validate_branch_name(body.git.branch_name)
-        except WorktreeError as exc:
-            raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
-        git_branch = body.git.branch_name
-    elif body.git is not None:
-        created_worktree = await _create_session_worktree(
-            host_id=body.host_id,
-            source_repo=canonical_workspace,
-            git=body.git,
-            request=request,
-        )
-        canonical_workspace = created_worktree.worktree_path
-        git_branch = created_worktree.branch
-        created_worktree_path = created_worktree.worktree_path
+            try:
+                validate_branch_name(body.git.branch_name)
+            except WorktreeError as exc:
+                raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+            git_branch = body.git.branch_name
+        else:
+            created_worktree = await _create_session_worktree(
+                host_id=body.host_id,
+                source_repo=canonical_workspace,
+                git=body.git,
+                request=request,
+            )
+            canonical_workspace = created_worktree.worktree_path
+            git_branch = created_worktree.branch
+            created_worktree_path = created_worktree.worktree_path
 
     # Native-terminal pass-through args.
     #

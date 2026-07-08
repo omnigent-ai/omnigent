@@ -490,53 +490,48 @@ def create_hosts_router(
         # (create mode). Left None in bind mode so the rollback below never
         # force-removes the user's pre-existing worktree.
         worktree = None
-        if body.git is not None and body.git.existing_worktree:
-            # Binding to a pre-existing worktree: no worktree is created, but
-            # record its branch so the sidebar shows it and the opt-in delete
-            # flow can offer to remove it. The host never runs git for this
-            # path, so the server validates the name.
+        if body.git is not None:
             from omnigent.host.git_worktree import (
                 WorktreeError,
                 validate_branch_name,
             )
 
+            # Shared by both modes — the host never runs git in bind mode, so
+            # the server is the only gate on the name there.
             try:
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
-            git_branch = body.git.branch_name
-        elif body.git is not None:
-            from omnigent.host.git_worktree import (
-                WorktreeError,
-                validate_branch_name,
-            )
-            from omnigent.server.routes._host_worktree import (
-                WorktreeHostUnavailableError,
-                WorktreeProxyError,
-                create_worktree_on_host,
-            )
 
-            try:
-                validate_branch_name(body.git.branch_name)
-            except WorktreeError as exc:
-                raise HTTPException(status_code=400, detail=exc.message) from exc
-            try:
-                worktree = await create_worktree_on_host(
-                    host_registry=host_registry,
-                    host_conn=conn,
-                    repo_path=workspace,
-                    branch_name=body.git.branch_name,
-                    base_branch=body.git.base_branch,
+            if body.git.existing_worktree:
+                # Binding to a pre-existing worktree: no worktree is created,
+                # but record its branch so the sidebar shows it and the opt-in
+                # delete flow can offer to remove it.
+                git_branch = body.git.branch_name
+            else:
+                from omnigent.server.routes._host_worktree import (
+                    WorktreeHostUnavailableError,
+                    WorktreeProxyError,
+                    create_worktree_on_host,
                 )
-            except WorktreeHostUnavailableError as exc:
-                # Host offline / unresponsive — infra, not user input.
-                raise HTTPException(status_code=409, detail=exc.message) from exc
-            except WorktreeProxyError as exc:
-                # Host-reported git failure (dup branch, bad base, not a
-                # repo) — user-correctable input.
-                raise HTTPException(status_code=400, detail=exc.message) from exc
-            workspace = worktree.worktree_path
-            git_branch = worktree.branch
+
+                try:
+                    worktree = await create_worktree_on_host(
+                        host_registry=host_registry,
+                        host_conn=conn,
+                        repo_path=workspace,
+                        branch_name=body.git.branch_name,
+                        base_branch=body.git.base_branch,
+                    )
+                except WorktreeHostUnavailableError as exc:
+                    # Host offline / unresponsive — infra, not user input.
+                    raise HTTPException(status_code=409, detail=exc.message) from exc
+                except WorktreeProxyError as exc:
+                    # Host-reported git failure (dup branch, bad base, not a
+                    # repo) — user-correctable input.
+                    raise HTTPException(status_code=400, detail=exc.message) from exc
+                workspace = worktree.worktree_path
+                git_branch = worktree.branch
 
         async def _rollback_worktree() -> None:
             """
