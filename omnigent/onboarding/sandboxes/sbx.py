@@ -47,6 +47,10 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxLauncher,
 )
+from omnigent.opencode_zen_credentials import (
+    OPENCODE_API_KEY_ENV_VAR,
+    resolve_opencode_zen_key,
+)
 
 # ── Constants ──────────────────────────────────────────
 
@@ -59,7 +63,9 @@ SANDBOX_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_SBX_SANDBOX_ENV"
 variables whose values are forwarded into the in-sandbox host process
 (``sbx exec -e NAME=VALUE``) — typically harness LLM credentials
 (``ANTHROPIC_API_KEY``, ``CLAUDE_CODE_OAUTH_TOKEN``, gateway URLs).
-Names, not values: read from the invoking shell at exec time."""
+Names, not values: read from the invoking shell at exec time.
+``OPENCODE_API_KEY`` additionally falls back to the Omnigent-keychain
+OpenCode Zen key when not set locally."""
 
 KITS_ENV_VAR: str = "OMNIGENT_SBX_KITS"
 """Environment variable naming (comma- or whitespace-separated) sbx kit
@@ -425,6 +431,12 @@ class SbxSandboxLauncher(SandboxLauncher):
         resolved: dict[str, str] = {}
         for name in names:
             value = os.environ.get(name)
+            if value is None and name == OPENCODE_API_KEY_ENV_VAR:
+                # The Zen key may live in Omnigent's keychain rather than the
+                # local environment — resolve it before failing loud.
+                zen = resolve_opencode_zen_key()
+                if zen is not None:
+                    value = zen[1]
             if value is None:
                 raise click.ClickException(
                     f"sbx env passthrough names '{name}' but it is not set in the "

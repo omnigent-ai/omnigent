@@ -499,3 +499,34 @@ def test_create_command_forwards_kit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 0, result.output
     assert recorded["provider"] == "sbx"
     assert recorded["kits"] == ("/tmp/sbxkit/claude",)
+
+
+def test_resolve_env_opencode_key_falls_back_to_keychain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        sbxmod, "resolve_opencode_zen_key", lambda environ=None: ("keychain", "sk-vault")
+    )
+    resolved = SbxSandboxLauncher(env=["OPENCODE_API_KEY"])._resolve_env()
+    assert resolved == {"OPENCODE_API_KEY": "sk-vault"}
+
+
+def test_resolve_env_opencode_key_prefers_local_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENCODE_API_KEY", "sk-local")
+    monkeypatch.setattr(
+        sbxmod, "resolve_opencode_zen_key", lambda environ=None: ("keychain", "sk-vault")
+    )
+    resolved = SbxSandboxLauncher(env=["OPENCODE_API_KEY"])._resolve_env()
+    assert resolved == {"OPENCODE_API_KEY": "sk-local"}
+
+
+def test_resolve_env_opencode_key_missing_everywhere_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    monkeypatch.setattr(sbxmod, "resolve_opencode_zen_key", lambda environ=None: None)
+    with pytest.raises(click.ClickException):
+        SbxSandboxLauncher(env=["OPENCODE_API_KEY"])._resolve_env()
