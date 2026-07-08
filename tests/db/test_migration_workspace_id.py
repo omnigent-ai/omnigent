@@ -17,8 +17,12 @@ from omnigent.db.utils import (
     get_or_create_engine,
 )
 
-# Every table and the primary key it had BEFORE the migration. After the
-# migration each key is ``["workspace_id", *original]``.
+# Every table and the primary key it had BEFORE the workspace_id migration
+# (r1a2b3c4d5e6). After that migration each key was ``["workspace_id",
+# *original]``. Subsequent migrations may have changed some PKs further
+# (e.g. v1a2b3c4d5e6 changed hosts to (workspace_id, host_id)), so this
+# map records the pre-r-migration original columns only — not the final
+# head state for every table.
 _ORIGINAL_PKS: dict[str, list[str]] = {
     "agents": ["id"],
     "files": ["id"],
@@ -32,6 +36,16 @@ _ORIGINAL_PKS: dict[str, list[str]] = {
     "policies": ["id"],
     "hosts": ["owner", "name"],
     "user_daily_cost": ["user_id", "day_utc"],
+}
+
+# Tables whose PK was changed again by a migration that came after
+# r1a2b3c4d5e6. The value is the expected PK at the current head.
+# ``test_workspace_id_leads_the_primary_key`` skips these so that later
+# migrations don't break the r-migration test.
+_LATER_PK_OVERRIDES: dict[str, list[str]] = {
+    # v1a2b3c4d5e6 replaced (workspace_id, owner, name) with
+    # (workspace_id, host_id) for the hosts table.
+    "hosts": ["workspace_id", "host_id"],
 }
 
 
@@ -57,9 +71,15 @@ def test_workspace_id_column_exists_and_is_not_nullable(db_engine: Engine, table
 
 @pytest.mark.parametrize("table", sorted(_ORIGINAL_PKS))
 def test_workspace_id_leads_the_primary_key(db_engine: Engine, table: str) -> None:
-    """The primary key becomes ``(workspace_id, *original)`` on every table."""
+    """workspace_id is the leading PK column on every table.
+
+    For tables whose PK was later changed by a post-r-migration (see
+    ``_LATER_PK_OVERRIDES``), the expected value is the override rather than
+    the r-migration result.
+    """
     pk = sa.inspect(db_engine).get_pk_constraint(table)["constrained_columns"]
-    assert pk == ["workspace_id", *_ORIGINAL_PKS[table]]
+    expected = _LATER_PK_OVERRIDES.get(table, ["workspace_id", *_ORIGINAL_PKS[table]])
+    assert pk == expected
 
 
 def test_existing_rows_and_omitted_inserts_default_to_zero(db_engine: Engine) -> None:

@@ -908,9 +908,9 @@ class SqlHost(Base):
         server_default="0",
         default=current_workspace_id,
     )
-    owner: Mapped[str] = mapped_column(String(256), primary_key=True)
-    name: Mapped[str] = mapped_column(String(64), primary_key=True)
-    host_id: Mapped[str] = mapped_column(String(64))
+    host_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(256), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # HOST_STATUS: online=1, offline=2).
     status: Mapped[int] = mapped_column(SmallInteger)
@@ -927,7 +927,10 @@ class SqlHost(Base):
             "status IN (1, 2)",
             name="ck_hosts_status",
         ),
-        UniqueConstraint("host_id", name="uq_hosts_host_id"),
+        # (workspace_id, owner, name) was the old PK; keep it unique so the
+        # upsert-on-connect logic (look up by owner+name to detect host_id
+        # rotation) stays consistent.
+        UniqueConstraint("workspace_id", "owner", "name", name="uq_hosts_workspace_owner_name"),
         UniqueConstraint("token_hash", name="uq_hosts_token_hash"),
     )
 
