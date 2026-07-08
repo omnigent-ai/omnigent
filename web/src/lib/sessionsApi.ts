@@ -584,17 +584,24 @@ export async function launchRunner(
   hostId: string,
   sessionId: string,
   workspace: string,
-  git?: { branchName: string; baseBranch?: string },
+  git?: { branchName: string; baseBranch?: string; existingWorktree?: boolean },
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
     workspace: string;
-    git?: { branch_name: string; base_branch?: string };
+    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean };
   } = { session_id: sessionId, workspace };
   if (git !== undefined) {
+    // `existing_worktree` binds a pre-existing worktree (no worktree is
+    // created; the branch is recorded for the sidebar + delete flow), so it
+    // never carries a base_branch.
     body.git = {
       branch_name: git.branchName,
-      ...(git.baseBranch !== undefined ? { base_branch: git.baseBranch } : {}),
+      ...(git.existingWorktree
+        ? { existing_worktree: true }
+        : git.baseBranch !== undefined
+          ? { base_branch: git.baseBranch }
+          : {}),
     };
   }
   const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/runners`, {

@@ -12263,18 +12263,40 @@ async def _create_session_from_existing_agent(
             request=request,
         )
 
-    # Git worktree creation (optional): the worktree becomes the
-    # stored workspace and its branch is recorded.
+    # Git worktree options (optional). Two modes on body.git:
+    #  - create (default): make a worktree; it becomes the stored
+    #    workspace and its branch is recorded.
+    #  - bind (existing_worktree): workspace already IS the worktree;
+    #    record its branch only, create nothing.
     git_branch: str | None = None
+    # Set to the created worktree path ONLY when Omnigent creates one.
+    # Gates create-rollback: an existing worktree bound via
+    # existing_worktree must never be force-removed on failure — it is
+    # the user's, not an Omnigent orphan.
+    created_worktree_path: str | None = None
     if body.git is not None:
-        created_worktree = await _create_session_worktree(
-            host_id=body.host_id,
-            source_repo=canonical_workspace,
-            git=body.git,
-            request=request,
-        )
-        canonical_workspace = created_worktree.worktree_path
-        git_branch = created_worktree.branch
+        if body.git.existing_worktree:
+            # Starting in a pre-existing worktree: no worktree is created, but
+            # record its branch so the sidebar shows it and the opt-in delete
+            # flow can offer to remove it. Validate the name (the host never
+            # runs git for this path, so the server is the only gate).
+            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+
+            try:
+                validate_branch_name(body.git.branch_name)
+            except WorktreeError as exc:
+                raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+            git_branch = body.git.branch_name
+        else:
+            created_worktree = await _create_session_worktree(
+                host_id=body.host_id,
+                source_repo=canonical_workspace,
+                git=body.git,
+                request=request,
+            )
+            canonical_workspace = created_worktree.worktree_path
+            git_branch = created_worktree.branch
+            created_worktree_path = created_worktree.worktree_path
 
     # Native-terminal pass-through args.
     #
@@ -12337,12 +12359,18 @@ async def _create_session_from_existing_agent(
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
         # cleanup before the error propagates. We re-raise unchanged
-        # below, so nothing is swallowed. git_branch is set only on
-        # worktree success.
-        if git_branch is not None and canonical_workspace is not None and body.host_id is not None:
+        # below, so nothing is swallowed. Gate on created_worktree_path,
+        # NOT git_branch: only a worktree Omnigent created here may be
+        # force-removed. An existing worktree bound via workspace_branch
+        # also sets git_branch but is the user's — never destroy it.
+        if (
+            created_worktree_path is not None
+            and body.host_id is not None
+            and git_branch is not None
+        ):
             await _remove_session_worktree_best_effort(
                 host_id=body.host_id,
-                worktree_path=canonical_workspace,
+                worktree_path=created_worktree_path,
                 branch=git_branch,
                 delete_branch=True,
                 request=request,

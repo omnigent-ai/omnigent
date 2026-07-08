@@ -1146,23 +1146,50 @@ class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
 
-    When present, the server creates a git worktree on the host for a
-    new branch and starts the runner in that worktree instead of the
-    picked directory. Requires ``host_id`` to be set (and therefore
-    ``workspace``, which is interpreted as the source repository
-    directory). See designs/SESSION_GIT_WORKTREE.md.
+    Requires ``host_id`` to be set (and therefore ``workspace``, which
+    is interpreted as the source repository directory). Two modes,
+    selected by ``existing_worktree``:
 
-    :param branch_name: Name of the new branch to create and check
-        out in the worktree, e.g. ``"feature/login"``. Validated
-        against git ref-format rules; invalid names fail with
-        ``invalid_input``.
+    - **create** (default): the server creates a git worktree on the
+      host for a new branch and starts the runner in that worktree
+      instead of the picked directory.
+    - **bind** (``existing_worktree=True``): ``workspace`` already IS a
+      pre-existing worktree; no worktree is created. ``branch_name`` is
+      recorded as the session's ``git_branch`` for display and opt-in
+      cleanup, and ``base_branch`` must not be set.
+
+    See designs/SESSION_GIT_WORKTREE.md.
+
+    :param branch_name: In create mode, the new branch to create and
+        check out, e.g. ``"feature/login"``. In bind mode, the branch
+        already checked out in the existing worktree. Validated against
+        git ref-format rules; invalid names fail with ``invalid_input``.
     :param base_branch: Optional base ref to branch from, e.g.
         ``"main"`` or ``"origin/main"``. ``None`` branches from the
-        source repository's current ``HEAD``.
+        source repository's current ``HEAD``. Create mode only —
+        invalid with ``existing_worktree``.
+    :param existing_worktree: When ``True``, bind to the pre-existing
+        worktree at ``workspace`` instead of creating one (see above).
     """
 
     branch_name: str
     base_branch: str | None = None
+    existing_worktree: bool = False
+
+    @model_validator(mode="after")
+    def _check_existing_worktree(self) -> SessionGitOptions:
+        """Reject ``base_branch`` in bind mode (422).
+
+        ``base_branch`` selects the ref a *new* branch forks from; it is
+        meaningless when binding to a worktree that already exists.
+
+        :returns: The validated instance.
+        :raises ValueError: If ``base_branch`` is set with
+            ``existing_worktree``.
+        """
+        if self.existing_worktree and self.base_branch is not None:
+            raise ValueError("base_branch cannot be set when existing_worktree is true")
+        return self
 
 
 class SessionCreateRequest(BaseModel):

@@ -1736,13 +1736,15 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
-    """Picking an existing worktree starts in its directory with no git opts.
+    """Picking an existing worktree starts in its directory in git bind mode.
 
     The branch chip's input doubles as a combobox: focusing it lists the
     repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
     one must (a) point the workspace at that worktree's directory and
-    (b) send NO ``git`` spec on ``POST /v1/sessions`` — the session starts
-    directly in the existing worktree rather than creating a new one.
+    (b) send the ``git`` spec in bind mode on ``POST /v1/sessions`` —
+    ``existing_worktree: true`` with the worktree's branch as
+    ``branch_name`` — so no worktree is created but the sidebar shows the
+    branch and the delete flow can offer to remove it.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_existing_worktree(base_url, session_id))
@@ -1822,10 +1824,13 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
-            # Workspace is the worktree dir; NO git spec is sent (starting in an
-            # existing worktree creates nothing).
+            # Workspace is the worktree dir; the git spec is in bind mode
+            # (existing_worktree) so no worktree is created, and the worktree's
+            # branch rides along as branch_name so the sidebar shows it and the
+            # delete flow can offer to remove it.
             assert body["workspace"] == "/work/repo-worktrees/feature-x", body
-            assert body.get("git") is None, body
+            assert body["git"]["existing_worktree"] is True, body
+            assert body["git"]["branch_name"] == "feature/x", body
         finally:
             await browser.close()
 

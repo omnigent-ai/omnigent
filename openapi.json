@@ -1699,7 +1699,7 @@
                 "type": "null"
               }
             ],
-            "description": "Optional git worktree options. When set, the server creates a worktree for a new branch off `workspace` on the host and binds the runner to it (the fork-resume path; mirrors `POST /v1/sessions`). `None` binds `workspace` directly. `host_id` is always present (it is in the path), so no host requirement check is needed here."
+            "description": "Optional git worktree options. In create mode the server creates a worktree for a new branch off `workspace` on the host and binds the runner to it (the fork-resume path; mirrors `POST /v1/sessions`). In bind mode (`existing_worktree=True`) `workspace` already IS a worktree \u2014 no worktree is created; `branch_name` is recorded as the session's `git_branch` for display and opt-in cleanup. `None` binds `workspace` directly. `host_id` is always present (it is in the path), so no host check is needed here."
           },
           "session_id": {
             "description": "Session to bind the new runner to, e.g. `\"conv_abc123\"`.",
@@ -3413,7 +3413,7 @@
         "type": "object"
       },
       "SessionGitOptions": {
-        "description": "Git worktree options for `POST /v1/sessions`.\n\nWhen present, the server creates a git worktree on the host for a\nnew branch and starts the runner in that worktree instead of the\npicked directory. Requires `host_id` to be set (and therefore\n`workspace`, which is interpreted as the source repository\ndirectory). See designs/SESSION_GIT_WORKTREE.md.",
+        "description": "Git worktree options for `POST /v1/sessions`.\n\nRequires `host_id` to be set (and therefore `workspace`, which\nis interpreted as the source repository directory). Two modes,\nselected by `existing_worktree`:\n\n- **create** (default): the server creates a git worktree on the\n  host for a new branch and starts the runner in that worktree\n  instead of the picked directory.\n- **bind** (`existing_worktree=True`): `workspace` already IS a\n  pre-existing worktree; no worktree is created. `branch_name` is\n  recorded as the session's `git_branch` for display and opt-in\n  cleanup, and `base_branch` must not be set.\n\nSee designs/SESSION_GIT_WORKTREE.md.",
         "properties": {
           "base_branch": {
             "anyOf": [
@@ -3424,13 +3424,19 @@
                 "type": "null"
               }
             ],
-            "description": "Optional base ref to branch from, e.g. `\"main\"` or `\"origin/main\"`. `None` branches from the source repository's current `HEAD`.",
+            "description": "Optional base ref to branch from, e.g. `\"main\"` or `\"origin/main\"`. `None` branches from the source repository's current `HEAD`. Create mode only \u2014 invalid with `existing_worktree`.",
             "title": "Base Branch"
           },
           "branch_name": {
-            "description": "Name of the new branch to create and check out in the worktree, e.g. `\"feature/login\"`. Validated against git ref-format rules; invalid names fail with `invalid_input`.",
+            "description": "In create mode, the new branch to create and check out, e.g. `\"feature/login\"`. In bind mode, the branch already checked out in the existing worktree. Validated against git ref-format rules; invalid names fail with `invalid_input`.",
             "title": "Branch Name",
             "type": "string"
+          },
+          "existing_worktree": {
+            "default": false,
+            "description": "When `True`, bind to the pre-existing worktree at `workspace` instead of creating one (see above).",
+            "title": "Existing Worktree",
+            "type": "boolean"
           }
         },
         "required": [

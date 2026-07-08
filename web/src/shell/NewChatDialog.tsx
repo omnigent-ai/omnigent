@@ -2557,9 +2557,14 @@ export function NewChatLandingScreen() {
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
+          // Create a new worktree, bind an existing one (records the branch
+          // for the sidebar + delete flow without creating anything), or
+          // neither — mirrored on the `git` block.
           const gitOpts = shouldCreateWorktree
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
-            : undefined;
+            : startInExistingWorktree
+              ? { branchName: trimmedBranch, existingWorktree: true }
+              : undefined;
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
         }
         // Clear pending agent after successful creation.
@@ -2579,9 +2584,14 @@ export function NewChatLandingScreen() {
               : {
                   host_id: selectedHostId,
                   workspace: workspaceTrimmed,
+                  // Create a new worktree, or bind an existing one
+                  // (`existing_worktree` records the branch for the sidebar +
+                  // delete flow without creating anything), or neither.
                   git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : undefined,
+                    : startInExistingWorktree
+                      ? { branch_name: trimmedBranch, existing_worktree: true }
+                      : undefined,
                 }),
             // Native terminal agents open terminal-first: `omnigent.ui:
             // terminal` tells the UI to render the terminal wrapper, and
