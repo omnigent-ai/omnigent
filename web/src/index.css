@@ -747,14 +747,15 @@
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection — brand pink highlight. Light: gentle wash + dark pink
-   * text. Dark: solid brand pink background + white text. */
+  /* Text selection tracks the palette's brand accent so it stays cohesive
+   * across themes (pink on Omni, blue on GitHub, coral on Claude, …). Light:
+   * gentle accent wash + accent-colored text. Dark: solid accent + white. */
   ::selection {
-    background: color-mix(in srgb, #f22286 20%, transparent);
-    color: #f22286;
+    background: color-mix(in srgb, var(--brand-accent) 22%, transparent);
+    color: var(--brand-accent);
   }
   .dark ::selection {
-    background: #f22286;
+    background: var(--brand-accent);
     color: #ffffff;
   }
 }
@@ -1446,4 +1447,327 @@
 /* Cursor when hovering over a resizable column border */
 .tiptap-md-content .resize-cursor {
   cursor: col-resize;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * COLOR PALETTES
+ *
+ * A palette is a second appearance axis, orthogonal to light/dark mode. It is
+ * selected in Appearance settings and applied as `data-theme` on <html> (see
+ * lib/themePalette.ts), re-pointing the same color tokens the whole app already
+ * reads. The default "omni" palette has NO block here — it falls through to the
+ * base `:root` / `.dark` brand tokens above.
+ *
+ * Each palette defines a light block and a dark block:
+ *   - Light: `:root:not(.dark)[data-theme="X"]` — only when the mode class is
+ *     absent, so the light values never leak into dark.
+ *   - Dark:  `.dark[data-theme="X"]` — outspecifies the base `.dark`.
+ * Tokens left unset (status hues, charts, destructive) inherit the base so the
+ * semantic palette stays consistent everywhere. The `.app-shell` canvas
+ * gradient is overridden per palette + mode.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── GitHub — clean neutrals, signal blue, green primary ──────────────────── */
+:root:not(.dark)[data-theme="github"] {
+  --background: #f6f8fa;
+  --foreground: #1f2328;
+  --card: #ffffff;
+  --card-solid: #ffffff;
+  --card-foreground: #1f2328;
+  --tray: #ffffff;
+  --popover: #ffffff;
+  --popover-foreground: #1f2328;
+  --primary: #1f883d;
+  --primary-foreground: #ffffff;
+  --secondary: #eaeef2;
+  --secondary-foreground: #1f2328;
+  --muted: #eaeef2;
+  --muted-foreground: #59636e;
+  --code-bg: #eff1f3;
+  --accent: #ddf4ff;
+  --accent-foreground: #0550ae;
+  --border: #d1d9e0;
+  --border-strong: #afb8c1;
+  --button-border: #d1d9e0;
+  --input: #d1d9e0;
+  --ring: #0969da;
+  --brand-accent: #0969da;
+  --sidebar: #f6f8fa;
+  --sidebar-foreground: #1f2328;
+  --sidebar-primary: #0969da;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ddf4ff;
+  --sidebar-accent-foreground: #0550ae;
+  --sidebar-border: #d1d9e0;
+  --sidebar-ring: #0969da;
+}
+.dark[data-theme="github"] {
+  --background: #0d1117;
+  --foreground: #e6edf3;
+  --card: rgba(22, 27, 34, 0.72);
+  --card-solid: #161b22;
+  --card-foreground: #e6edf3;
+  --tray: rgba(22, 27, 34, 0.72);
+  --popover: rgba(22, 27, 34, 0.9);
+  --popover-foreground: #e6edf3;
+  --primary: #238636;
+  --primary-foreground: #ffffff;
+  --secondary: #21262d;
+  --secondary-foreground: #e6edf3;
+  --muted: #21262d;
+  --muted-foreground: #8b949e;
+  --code-bg: #1c2128;
+  --accent: #121d2f;
+  --accent-foreground: #58a6ff;
+  --border: #30363d;
+  --border-strong: #444c56;
+  --button-border: #30363d;
+  --input: #30363d;
+  --ring: #58a6ff;
+  --brand-accent: #58a6ff;
+  --sidebar: rgba(13, 17, 23, 0.75);
+  --sidebar-foreground: #e6edf3;
+  --sidebar-primary: #58a6ff;
+  --sidebar-primary-foreground: #0d1117;
+  --sidebar-accent: #121d2f;
+  --sidebar-accent-foreground: #58a6ff;
+  --sidebar-border: #30363d;
+  --sidebar-ring: #58a6ff;
+}
+:root:not(.dark)[data-theme="github"] .app-shell {
+  background: linear-gradient(180deg, #fbfcfd 0%, #f6f8fa 100%);
+}
+.dark[data-theme="github"] .app-shell {
+  background: linear-gradient(160deg, #0d1117 0%, #0a0e14 100%);
+}
+
+/* ── Catppuccin — soft pastels (Latte light / Mocha dark) ─────────────────── */
+:root:not(.dark)[data-theme="catppuccin"] {
+  --background: #eff1f5;
+  --foreground: #4c4f69;
+  --card: #ffffff;
+  --card-solid: #ffffff;
+  --card-foreground: #4c4f69;
+  --tray: #ffffff;
+  --popover: #ffffff;
+  --popover-foreground: #4c4f69;
+  --primary: #8839ef;
+  --primary-foreground: #ffffff;
+  --secondary: #e6e9ef;
+  --secondary-foreground: #4c4f69;
+  --muted: #e6e9ef;
+  --muted-foreground: #6c6f85;
+  --code-bg: #e6e9ef;
+  --accent: #ccd0da;
+  --accent-foreground: #8839ef;
+  --border: #ccd0da;
+  --border-strong: #acb0be;
+  --button-border: #ccd0da;
+  --input: #ccd0da;
+  --ring: #8839ef;
+  --brand-accent: #ea76cb;
+  --sidebar: #e6e9ef;
+  --sidebar-foreground: #4c4f69;
+  --sidebar-primary: #8839ef;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ccd0da;
+  --sidebar-accent-foreground: #8839ef;
+  --sidebar-border: #ccd0da;
+  --sidebar-ring: #8839ef;
+}
+.dark[data-theme="catppuccin"] {
+  --background: #1e1e2e;
+  --foreground: #cdd6f4;
+  --card: rgba(49, 50, 68, 0.6);
+  --card-solid: #282938;
+  --card-foreground: #cdd6f4;
+  --tray: rgba(49, 50, 68, 0.6);
+  --popover: rgba(24, 24, 37, 0.92);
+  --popover-foreground: #cdd6f4;
+  --primary: #cba6f7;
+  --primary-foreground: #1e1e2e;
+  --secondary: #313244;
+  --secondary-foreground: #cdd6f4;
+  --muted: #313244;
+  --muted-foreground: #a6adc8;
+  --code-bg: #181825;
+  --accent: #45475a;
+  --accent-foreground: #cba6f7;
+  --border: #45475a;
+  --border-strong: #585b70;
+  --button-border: #45475a;
+  --input: #45475a;
+  --ring: #cba6f7;
+  --brand-accent: #cba6f7;
+  --sidebar: rgba(24, 24, 37, 0.8);
+  --sidebar-foreground: #cdd6f4;
+  --sidebar-primary: #cba6f7;
+  --sidebar-primary-foreground: #1e1e2e;
+  --sidebar-accent: #45475a;
+  --sidebar-accent-foreground: #cba6f7;
+  --sidebar-border: #45475a;
+  --sidebar-ring: #cba6f7;
+}
+:root:not(.dark)[data-theme="catppuccin"] .app-shell {
+  background: linear-gradient(160deg, #f2f3f7 0%, #eff1f5 60%, #e9ecf2 100%);
+}
+.dark[data-theme="catppuccin"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 30%, rgba(203, 166, 247, 0.12) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 20%, rgba(245, 194, 231, 0.08) 0%, transparent 45%),
+    linear-gradient(160deg, #232336 0%, #1e1e2e 60%, #181825 100%);
+}
+
+/* ── Gruvbox — warm retro earth tones ─────────────────────────────────────── */
+:root:not(.dark)[data-theme="gruvbox"] {
+  --background: #fbf1c7;
+  --foreground: #3c3836;
+  --card: #fffdf2;
+  --card-solid: #fffdf2;
+  --card-foreground: #3c3836;
+  --tray: #fffdf2;
+  --popover: #fffdf2;
+  --popover-foreground: #3c3836;
+  --primary: #d65d0e;
+  --primary-foreground: #ffffff;
+  --secondary: #ebdbb2;
+  --secondary-foreground: #3c3836;
+  --muted: #ebdbb2;
+  --muted-foreground: #7c6f64;
+  --code-bg: #ebdbb2;
+  --accent: #f2e5bc;
+  --accent-foreground: #af3a03;
+  --border: #e6d5a8;
+  --border-strong: #bdae93;
+  --button-border: #e6d5a8;
+  --input: #e6d5a8;
+  --ring: #d65d0e;
+  --brand-accent: #d65d0e;
+  --sidebar: #f4e8bc;
+  --sidebar-foreground: #3c3836;
+  --sidebar-primary: #d65d0e;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f2e5bc;
+  --sidebar-accent-foreground: #af3a03;
+  --sidebar-border: #e6d5a8;
+  --sidebar-ring: #d65d0e;
+}
+.dark[data-theme="gruvbox"] {
+  --background: #282828;
+  --foreground: #ebdbb2;
+  --card: rgba(60, 56, 54, 0.6);
+  --card-solid: #32302f;
+  --card-foreground: #ebdbb2;
+  --tray: rgba(60, 56, 54, 0.6);
+  --popover: rgba(29, 32, 33, 0.92);
+  --popover-foreground: #ebdbb2;
+  --primary: #fe8019;
+  --primary-foreground: #282828;
+  --secondary: #3c3836;
+  --secondary-foreground: #ebdbb2;
+  --muted: #3c3836;
+  --muted-foreground: #a89984;
+  --code-bg: #1d2021;
+  --accent: #504945;
+  --accent-foreground: #fe8019;
+  --border: #504945;
+  --border-strong: #665c54;
+  --button-border: #504945;
+  --input: #504945;
+  --ring: #fe8019;
+  --brand-accent: #fe8019;
+  --sidebar: rgba(29, 32, 33, 0.8);
+  --sidebar-foreground: #ebdbb2;
+  --sidebar-primary: #fe8019;
+  --sidebar-primary-foreground: #282828;
+  --sidebar-accent: #504945;
+  --sidebar-accent-foreground: #fe8019;
+  --sidebar-border: #504945;
+  --sidebar-ring: #fe8019;
+}
+:root:not(.dark)[data-theme="gruvbox"] .app-shell {
+  background: linear-gradient(160deg, #fbf3cd 0%, #fbf1c7 55%, #f7ecbb 100%);
+}
+.dark[data-theme="gruvbox"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 30%, rgba(254, 128, 25, 0.1) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 20%, rgba(250, 189, 47, 0.07) 0%, transparent 45%),
+    linear-gradient(160deg, #32302f 0%, #282828 60%, #1d2021 100%);
+}
+
+/* ── Dracula — moody purple, pink pop (dark-first classic) ─────────────────── */
+:root:not(.dark)[data-theme="dracula"] {
+  --background: #f7f5fd;
+  --foreground: #1e1a2b;
+  --card: #ffffff;
+  --card-solid: #ffffff;
+  --card-foreground: #1e1a2b;
+  --tray: #ffffff;
+  --popover: #ffffff;
+  --popover-foreground: #1e1a2b;
+  --primary: #7c3aed;
+  --primary-foreground: #ffffff;
+  --secondary: #efeaf9;
+  --secondary-foreground: #1e1a2b;
+  --muted: #efeaf9;
+  --muted-foreground: #6b6786;
+  --code-bg: #efeaf9;
+  --accent: #f3e8ff;
+  --accent-foreground: #6b21a8;
+  --border: #e6e0f2;
+  --border-strong: #b6abd6;
+  --button-border: #e6e0f2;
+  --input: #e6e0f2;
+  --ring: #7c3aed;
+  --brand-accent: #d6409f;
+  --sidebar: #f3f0fa;
+  --sidebar-foreground: #1e1a2b;
+  --sidebar-primary: #7c3aed;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f3e8ff;
+  --sidebar-accent-foreground: #6b21a8;
+  --sidebar-border: #e6e0f2;
+  --sidebar-ring: #7c3aed;
+}
+.dark[data-theme="dracula"] {
+  --background: #282a36;
+  --foreground: #f8f8f2;
+  --card: rgba(68, 71, 90, 0.5);
+  --card-solid: #343746;
+  --card-foreground: #f8f8f2;
+  --tray: rgba(68, 71, 90, 0.5);
+  --popover: rgba(33, 34, 44, 0.92);
+  --popover-foreground: #f8f8f2;
+  --primary: #bd93f9;
+  --primary-foreground: #282a36;
+  --secondary: #343746;
+  --secondary-foreground: #f8f8f2;
+  --muted: #3b3d4d;
+  --muted-foreground: #b3b8d4;
+  --code-bg: #21222c;
+  --accent: #3b304f;
+  --accent-foreground: #ff79c6;
+  --border: #44475a;
+  --border-strong: #5a5d75;
+  --button-border: #44475a;
+  --input: #44475a;
+  --ring: #bd93f9;
+  --brand-accent: #ff79c6;
+  --sidebar: rgba(33, 34, 44, 0.8);
+  --sidebar-foreground: #f8f8f2;
+  --sidebar-primary: #bd93f9;
+  --sidebar-primary-foreground: #282a36;
+  --sidebar-accent: #3b304f;
+  --sidebar-accent-foreground: #ff79c6;
+  --sidebar-border: #44475a;
+  --sidebar-ring: #bd93f9;
+}
+:root:not(.dark)[data-theme="dracula"] .app-shell {
+  background: linear-gradient(160deg, #faf8ff 0%, #f5f1fd 50%, #f3eefb 100%);
+}
+.dark[data-theme="dracula"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 40%, rgba(189, 147, 249, 0.14) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(255, 121, 198, 0.1) 0%, transparent 45%),
+    linear-gradient(160deg, #2a2c3a 0%, #282a36 55%, #21222c 100%);
 }

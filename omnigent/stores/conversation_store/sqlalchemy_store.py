@@ -2127,28 +2127,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             row.updated_at = now_epoch()
             return _to_conversation(row, _fetch_labels(session, conversation_id))
 
-    def list_conversations_by_host_id(
-        self,
-        host_id: str,
-    ) -> list[Conversation]:
-        """
-        Return all conversations with the given ``host_id``.
-
-        :param host_id: Host identifier, e.g.
-            ``"host_a1b2c3d4..."``.
-        :returns: List of :class:`Conversation` entities.
-        """
-        with self._session() as session:
-            rows = (
-                session.query(SqlConversation)
-                .filter(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == host_id,
-                )
-                .all()
-            )
-            return [_to_conversation(row) for row in rows]
-
     def list_conversations_by_runner_id(
         self,
         runner_id: str,

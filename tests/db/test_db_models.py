@@ -444,7 +444,7 @@ class TestSqlConversationItem:
             session.add(item)
 
         with managed() as session:
-            loaded = session.get(SqlConversationItem, (0, "msg_test1"))
+            loaded = session.get(SqlConversationItem, (0, "conv_test1", "msg_test1"))
             assert loaded is not None
             assert loaded.conversation_id == "conv_test1"
             assert loaded.type == encode_item_type("message")
@@ -489,7 +489,7 @@ class TestSqlConversationItem:
 
         # Without FK cascade the item is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversationItem, (0, "msg_del")) is not None
+            assert session.get(SqlConversationItem, (0, "conv_del", "msg_del")) is not None
 
     def test_multiple_items_ordered_by_position(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
