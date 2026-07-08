@@ -160,7 +160,7 @@ class TestSqlAgentToEntity:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, "ag_dbrt")
+            loaded = session.get(SqlAgent, (0, "ag_dbrt"))
             assert loaded is not None
             result = sql_agent_to_entity(loaded)
 
@@ -189,7 +189,7 @@ class TestSqlAgentToEntity:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, "ag_defver")
+            loaded = session.get(SqlAgent, (0, "ag_defver"))
             assert loaded is not None
             entity = sql_agent_to_entity(loaded)
             assert entity.version == 1

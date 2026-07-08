@@ -4150,7 +4150,7 @@ def _stored_next_position(
     from omnigent.db.db_models import SqlConversation
 
     with conversation_store._session() as session:
-        row = session.get(SqlConversation, conversation_id)
+        row = session.get(SqlConversation, (0, conversation_id))
         assert row is not None
         return row.next_position
 
@@ -4220,7 +4220,7 @@ def test_append_reads_counter_not_max_scan(
     conversation_store.append(conv.id, [_user_message("a"), _user_message("b")])
     # Real max position is 1; jump the counter ahead to 100.
     with conversation_store._session() as session:
-        session.get(SqlConversation, conv.id).next_position = 100
+        session.get(SqlConversation, (0, conv.id)).next_position = 100
 
     conversation_store.append(conv.id, [_user_message("c")])
 
@@ -4246,7 +4246,7 @@ def test_append_falls_back_to_scan_when_counter_null(
         conversation_store.append(conv.id, [_user_message(f"pre{i}") for i in range(preexisting)])
     # Simulate a pre-counter row: clear the maintained counter.
     with conversation_store._session() as session:
-        session.get(SqlConversation, conv.id).next_position = None
+        session.get(SqlConversation, (0, conv.id)).next_position = None
     assert _stored_next_position(conversation_store, conv.id) is None
 
     conversation_store.append(conv.id, [_user_message("new")])

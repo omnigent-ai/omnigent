@@ -20,7 +20,7 @@ from sqlalchemy import Engine, select, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlConversation, SqlHost
+from omnigent.db.db_models import SqlConversation, SqlHost, current_workspace_id
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 
 # A host is considered live only if its row was touched (connect or
@@ -234,7 +234,7 @@ class HostStore:
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
         with self._session() as session:
-            row = session.get(SqlHost, (owner, name))
+            row = session.get(SqlHost, (current_workspace_id(), owner, name))
             if row is None and allow_host_id_reown:
                 reowned = self._reown_host_id(
                     session,
@@ -309,13 +309,19 @@ class HostStore:
         old_host_id = row.host_id
         bound_ids = list(
             session.execute(
-                select(SqlConversation.id).where(SqlConversation.host_id == old_host_id)
+                select(SqlConversation.id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.host_id == old_host_id,
+                )
             ).scalars()
         )
         if bound_ids:
             session.execute(
                 update(SqlConversation)
-                .where(SqlConversation.host_id == old_host_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.host_id == old_host_id,
+                )
                 .values(host_id=None)
             )
             session.flush()
@@ -324,7 +330,10 @@ class HostStore:
         if bound_ids:
             session.execute(
                 update(SqlConversation)
-                .where(SqlConversation.id.in_(bound_ids))
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(bound_ids),
+                )
                 .values(host_id=new_host_id)
             )
             session.flush()
@@ -364,7 +373,9 @@ class HostStore:
             *host_id* (caller falls through to a normal insert).
         """
         existing = session.execute(
-            select(SqlHost).where(SqlHost.host_id == host_id)
+            select(SqlHost).where(
+                SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+            )
         ).scalar_one_or_none()
         if existing is None:
             return None
@@ -372,7 +383,10 @@ class HostStore:
         now = now_epoch()
         session.execute(
             update(SqlHost)
-            .where(SqlHost.host_id == host_id)
+            .where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+            )
             .values(
                 owner=owner,
                 name=name,
@@ -405,7 +419,9 @@ class HostStore:
         """
         with self._session() as session:
             row = session.execute(
-                select(SqlHost).where(SqlHost.host_id == host_id)
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
             ).scalar_one_or_none()
             if row is not None:
                 row.status = "offline"
@@ -431,7 +447,12 @@ class HostStore:
         # pure overhead. A missing host simply matches no rows (a no-op).
         with self._session() as session:
             session.execute(
-                update(SqlHost).where(SqlHost.host_id == host_id).values(updated_at=now_epoch())
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .values(updated_at=now_epoch())
             )
 
     def is_online(self, host_id: str) -> bool:
@@ -478,7 +499,8 @@ class HostStore:
         with self._session() as session:
             rows = session.execute(
                 select(SqlHost.host_id, SqlHost.status, SqlHost.updated_at).where(
-                    SqlHost.host_id.in_(unique_ids)
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id.in_(unique_ids),
                 )
             ).all()
         return {
@@ -501,7 +523,10 @@ class HostStore:
         with self._session() as session:
             rows = (
                 session.query(SqlHost)
-                .filter(SqlHost.owner == owner)
+                .filter(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.owner == owner,
+                )
                 .order_by(SqlHost.updated_at.desc())
                 .all()
             )
@@ -517,7 +542,9 @@ class HostStore:
         """
         with self._session() as session:
             row = session.execute(
-                select(SqlHost).where(SqlHost.host_id == host_id)
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
             ).scalar_one_or_none()
             if row is None:
                 return None
@@ -574,7 +601,9 @@ class HostStore:
         token_hash = hash_host_launch_token(token)
         with self._session() as session:
             existing = session.execute(
-                select(SqlHost).where(SqlHost.host_id == host_id)
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
             ).scalar_one_or_none()
             if existing is not None:
                 if existing.owner != owner:
@@ -627,7 +656,10 @@ class HostStore:
         """
         with self._session() as session:
             row = session.execute(
-                select(SqlHost).where(SqlHost.token_hash == hash_host_launch_token(token))
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.token_hash == hash_host_launch_token(token),
+                )
             ).scalar_one_or_none()
             # token_expires_at is written together with token_hash, so a
             # matched row always carries it; the None arm is mypy
@@ -652,10 +684,18 @@ class HostStore:
         with self._session() as session:
             session.execute(
                 update(SqlConversation)
-                .where(SqlConversation.host_id == host_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.host_id == host_id,
+                )
                 .values(host_id=None)
             )
-            session.execute(sql_delete(SqlHost).where(SqlHost.host_id == host_id))
+            session.execute(
+                sql_delete(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+            )
 
     def revoke_launch_token(self, host_id: str) -> None:
         """
@@ -672,7 +712,9 @@ class HostStore:
         """
         with self._session() as session:
             row = session.execute(
-                select(SqlHost).where(SqlHost.host_id == host_id)
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
             ).scalar_one_or_none()
             if row is None:
                 return

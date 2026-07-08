@@ -33,7 +33,12 @@ import time
 from sqlalchemy import and_, delete, exists, select, update
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import SqlAccountToken, SqlSessionPermission, SqlUser
+from omnigent.db.db_models import (
+    SqlAccountToken,
+    SqlSessionPermission,
+    SqlUser,
+    current_workspace_id,
+)
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -115,7 +120,7 @@ class SqlAlchemyAccountStore:
         """
         now = int(time.time())
         with self._session() as session:
-            existing = session.get(SqlUser, user_id)
+            existing = session.get(SqlUser, (current_workspace_id(), user_id))
             if existing is not None:
                 raise ValueError(f"user {user_id!r} already exists")
             row = SqlUser(
@@ -138,7 +143,7 @@ class SqlAlchemyAccountStore:
     def get_user(self, user_id: str) -> Account | None:
         """Look up a user by id. Returns ``None`` if missing."""
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
             return _to_account(row) if row is not None else None
 
     def is_admin(self, user_id: str) -> bool:
@@ -151,7 +156,7 @@ class SqlAlchemyAccountStore:
         construction (single source of truth: the column).
         """
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row is not None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
@@ -169,7 +174,14 @@ class SqlAlchemyAccountStore:
         :param is_admin: The flag value to set.
         """
         with self._session() as session:
-            session.execute(update(SqlUser).where(SqlUser.id == user_id).values(is_admin=is_admin))
+            session.execute(
+                update(SqlUser)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+                .values(is_admin=is_admin)
+            )
 
     def list_users(self) -> list[Account]:
         """Return all users for the admin members page.
@@ -191,7 +203,13 @@ class SqlAlchemyAccountStore:
         Result is unordered; UI sorts.
         """
         with self._session() as session:
-            rows = session.execute(select(SqlUser)).scalars().all()
+            rows = (
+                session.execute(
+                    select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
+                )
+                .scalars()
+                .all()
+            )
             return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
 
     def delete_user(self, user_id: str) -> bool:
@@ -204,9 +222,17 @@ class SqlAlchemyAccountStore:
         """
         with self._session() as session:
             session.execute(
-                delete(SqlSessionPermission).where(SqlSessionPermission.user_id == user_id)
+                delete(SqlSessionPermission).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                )
             )
-            result = session.execute(delete(SqlUser).where(SqlUser.id == user_id))
+            result = session.execute(
+                delete(SqlUser).where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+            )
             return result.rowcount > 0
 
     def get_password_hash(self, user_id: str) -> str | None:
@@ -218,7 +244,7 @@ class SqlAlchemyAccountStore:
         log, return, or store the value elsewhere.
         """
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row.password_hash if row is not None else None
 
     def update_password(self, user_id: str, password_hash: str) -> None:
@@ -230,7 +256,12 @@ class SqlAlchemyAccountStore:
         """
         with self._session() as session:
             session.execute(
-                update(SqlUser).where(SqlUser.id == user_id).values(password_hash=password_hash)
+                update(SqlUser)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+                .values(password_hash=password_hash)
             )
 
     def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
@@ -242,7 +273,10 @@ class SqlAlchemyAccountStore:
         with self._session() as session:
             session.execute(
                 update(SqlUser)
-                .where(SqlUser.id == user_id)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
                 .values(last_login_at=when_epoch_seconds)
             )
 
@@ -312,6 +346,7 @@ class SqlAlchemyAccountStore:
                 update(SqlAccountToken)
                 .where(
                     and_(
+                        SqlAccountToken.workspace_id == current_workspace_id(),
                         SqlAccountToken.id == token_id,
                         SqlAccountToken.kind == kind,
                         SqlAccountToken.redeemed_at.is_(None),
@@ -322,7 +357,7 @@ class SqlAlchemyAccountStore:
             )
             if result.rowcount == 0:
                 return None
-            row = session.get(SqlAccountToken, token_id)
+            row = session.get(SqlAccountToken, (current_workspace_id(), token_id))
             return _to_account_token(row) if row is not None else None
 
     def purge_expired_tokens(self, now_epoch_seconds: int) -> int:
@@ -337,7 +372,10 @@ class SqlAlchemyAccountStore:
         """
         with self._session() as session:
             result = session.execute(
-                delete(SqlAccountToken).where(SqlAccountToken.expires_at <= now_epoch_seconds)
+                delete(SqlAccountToken).where(
+                    SqlAccountToken.workspace_id == current_workspace_id(),
+                    SqlAccountToken.expires_at <= now_epoch_seconds,
+                )
             )
             return result.rowcount
 
@@ -373,6 +411,7 @@ class SqlAlchemyAccountStore:
                 update(SqlAccountToken)
                 .where(
                     and_(
+                        SqlAccountToken.workspace_id == current_workspace_id(),
                         SqlAccountToken.id == token_id,
                         SqlAccountToken.kind == "invite",
                         SqlAccountToken.redeemed_at.is_(None),
@@ -400,6 +439,7 @@ class SqlAlchemyAccountStore:
                 select(
                     exists().where(
                         and_(
+                            SqlAccountToken.workspace_id == current_workspace_id(),
                             SqlAccountToken.kind == "invite",
                             SqlAccountToken.user_id == email,
                             SqlAccountToken.redeemed_at.is_not(None),

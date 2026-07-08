@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
+from contextvars import ContextVar
+
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -21,6 +25,50 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     """Shared declarative base for all omnigent tables."""
+
+
+# Default workspace id stamped on every row and used as the leading
+# member of every composite primary key. 0 is the single-workspace /
+# unassigned sentinel: with no workspace bound to the request, all rows
+# live in workspace 0.
+DEFAULT_WORKSPACE_ID = 0
+
+# Ambient per-request workspace id. Stores are process-wide singletons, so
+# the active workspace can't ride on the store instance — it lives here.
+# OSS leaves this at the default (single-workspace 0); a multi-tenant
+# deployment (e.g. universe) sets it per request from the authenticated
+# context (via ``workspace_scope`` in middleware). Reads and inserts
+# resolve it through ``current_workspace_id()`` so the same store code
+# scopes to the caller's workspace without threading the id through every
+# signature — keeping this file byte-identical across deployments.
+_current_workspace_id: ContextVar[int] = ContextVar(
+    "omnigent_workspace_id", default=DEFAULT_WORKSPACE_ID
+)
+
+
+def current_workspace_id() -> int:
+    """Return the workspace id bound to the active request/context.
+
+    Defaults to :data:`DEFAULT_WORKSPACE_ID` (0) — the single-workspace OSS
+    deployment. Multi-tenant deployments set it per request so every
+    primary-key lookup, filter, and insert scopes to that workspace.
+    """
+    return _current_workspace_id.get()
+
+
+@contextlib.contextmanager
+def workspace_scope(workspace_id: int) -> Iterator[None]:
+    """Bind *workspace_id* for the duration of the ``with`` block.
+
+    Used by multi-tenant request middleware (and tests) to scope all
+    store access to one workspace; resets to the prior value on exit so
+    nested / concurrent contexts don't leak.
+    """
+    token = _current_workspace_id.set(workspace_id)
+    try:
+        yield
+    finally:
+        _current_workspace_id.reset(token)
 
 
 AGENT_KIND_TEMPLATE = "template"
@@ -56,6 +104,14 @@ class SqlAgent(Base):
 
     __tablename__ = "agents"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(256))
@@ -98,6 +154,14 @@ class SqlFile(Base):
 
     __tablename__ = "files"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     filename: Mapped[str] = mapped_column(String(512))
@@ -138,6 +202,14 @@ class SqlUser(Base):
 
     __tablename__ = "users"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
@@ -180,6 +252,14 @@ class SqlAccountToken(Base):
 
     __tablename__ = "account_tokens"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -218,6 +298,14 @@ class SqlSessionPermission(Base):
 
     __tablename__ = "session_permissions"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     user_id: Mapped[str] = mapped_column(
         String(128),
         primary_key=True,
@@ -313,6 +401,14 @@ class SqlConversation(Base):
 
     __tablename__ = "conversations"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
@@ -477,6 +573,14 @@ class SqlConversationItem(Base):
 
     __tablename__ = "conversation_items"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     conversation_id: Mapped[str] = mapped_column(
         String(64),
@@ -539,6 +643,14 @@ class SqlConversationLabel(Base):
 
     __tablename__ = "conversation_labels"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     conversation_id: Mapped[str] = mapped_column(
         String(64),
         primary_key=True,
@@ -586,6 +698,14 @@ class SqlComment(Base):
 
     __tablename__ = "comments"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     conversation_id: Mapped[str] = mapped_column(String(64))
     path: Mapped[str] = mapped_column(String(4096))
@@ -646,6 +766,14 @@ class SqlPolicy(Base):
 
     __tablename__ = "policies"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(256))
     # Nullable: NULL for server-wide default policies.
@@ -740,6 +868,14 @@ class SqlHost(Base):
 
     __tablename__ = "hosts"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     owner: Mapped[str] = mapped_column(String(256), primary_key=True)
     name: Mapped[str] = mapped_column(String(256), primary_key=True)
     host_id: Mapped[str] = mapped_column(String(64))
@@ -801,6 +937,14 @@ class SqlUserDailyCost(Base):
 
     __tablename__ = "user_daily_cost"
 
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
