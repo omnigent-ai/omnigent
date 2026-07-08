@@ -109,7 +109,9 @@ class SqlAlchemyCommentStore(CommentStore):
         )
         if path is not None:
             stmt = stmt.where(SqlComment.path == path)
-        stmt = stmt.order_by(SqlComment.created_at)
+        # created_at is seconds-granular; id breaks same-second ties so the
+        # listing has a stable, deterministic order.
+        stmt = stmt.order_by(SqlComment.created_at, SqlComment.id)
         with self._session() as session:
             rows = list(session.execute(stmt).scalars().all())
             return [_to_entity(r) for r in rows]
