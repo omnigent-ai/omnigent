@@ -24,7 +24,17 @@
  *   list. Not clickable; each row reveals Delete / Unarchive on hover.
  */
 
-import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  lazy,
+  type ReactNode,
+  Suspense,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ArchiveRestoreIcon,
   KeyRoundIcon,
@@ -45,6 +55,13 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -102,6 +119,7 @@ import {
 } from "@/lib/terminalThemePreferences";
 import {
   applyThemePalette,
+  isThemePalette,
   PALETTES,
   type PaletteSwatch,
   readThemePalette,
@@ -193,57 +211,271 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
 
-function TerminalThemeControl() {
-  const [mode, setMode] = useState(() => readTerminalThemeMode());
-
+/**
+ * Checkmark badge pinned to the top-right corner of a selected card. Shared by
+ * every appearance radiogroup so "selected" reads identically everywhere.
+ */
+function SelectedBadge() {
   return (
-    <div className="flex flex-col gap-3">
-      <span className="text-sm font-medium">Terminal theme</span>
-      <span className="text-sm text-muted-foreground">
-        Use a light or dark terminal, or match the app.
-      </span>
-      <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Terminal theme">
-        {terminalThemeCards.map(({ mode: cardMode, label, icon: Icon }) => {
-          const selected = mode === cardMode;
-          return (
-            <button
-              key={cardMode}
-              type="button"
-              role="radio"
-              aria-checked={selected}
-              data-testid={`terminal-theme-${cardMode}`}
-              onClick={() => {
-                setMode(cardMode);
-                writeTerminalThemeMode(cardMode);
-              }}
-              className={cn(
-                "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
-                selected ? "border-primary bg-primary/5" : "border-border",
-              )}
-            >
-              <Icon className="size-6 text-muted-foreground" />
-              <span className="text-sm font-medium">{label}</span>
-            </button>
-          );
-        })}
+    <span
+      aria-hidden
+      className="absolute right-1.5 top-1.5 flex size-4 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm"
+    >
+      <CheckIcon className="size-3" />
+    </span>
+  );
+}
+
+/**
+ * Shared card styling for the appearance radiogroups. Selected cards carry the
+ * accent border + a subtle accent wash (paired with <SelectedBadge/>); the rest
+ * highlight their border and lift on hover. focus-visible keeps the global
+ * outline ring, so keyboard focus stays visually distinct from selection.
+ */
+function themeCardClass(selected: boolean, layout?: string) {
+  return cn(
+    "relative flex flex-col rounded-lg border-2 transition-[color,background-color,border-color,box-shadow]",
+    selected
+      ? "border-primary bg-primary/5"
+      : "border-border hover:border-border-strong hover:bg-muted hover:shadow-sm",
+    layout,
+  );
+}
+
+/** Centered icon + label body shared by the Mode and Terminal theme cards. */
+function iconCardBody(Icon: typeof SunIcon, label: string) {
+  return (
+    <>
+      <Icon className="size-6 text-muted-foreground" />
+      <span className="text-sm font-medium">{label}</span>
+    </>
+  );
+}
+
+// Neutral light/dark window tones for the Mode preview tiles. These are about
+// light-vs-dark only (not the color theme), so they stay grayscale.
+const LIGHT_MODE_PREVIEW: PaletteSwatch = {
+  bg: "#e9ebee",
+  card: "#ffffff",
+  accent: "#aab2bd",
+  border: "#d7dbe0",
+  text: "#11171c",
+};
+const DARK_MODE_PREVIEW: PaletteSwatch = {
+  bg: "#0d1218",
+  card: "#232a33",
+  accent: "#5b6672",
+  border: "#2b333d",
+  text: "#e6edf3",
+};
+
+/**
+ * Mini app-window mock for a Mode tile, reusing {@link PaletteSwatchPreview}. A
+ * light or dark two-pane window; "system" shows one window split diagonally —
+ * light on the near side, dark on the far — to signal "follow the OS".
+ */
+function ModePreview({ variant }: { variant: ThemeMode }) {
+  if (variant === "light") return <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />;
+  if (variant === "dark") return <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />;
+  return (
+    <div className="relative h-16 w-full">
+      <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />
+      <div
+        aria-hidden
+        className="absolute inset-0"
+        style={{ clipPath: "polygon(62% 0, 100% 0, 100% 100%, 38% 100%)" }}
+      >
+        <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />
       </div>
     </div>
   );
 }
 
+/** Small swatch chip (canvas + accent dot) for the color-theme dropdown. */
+function PaletteChip({ swatch }: { swatch: PaletteSwatch }) {
+  return (
+    <span
+      aria-hidden
+      className="flex size-5 shrink-0 items-center justify-center rounded-md border"
+      style={{ backgroundColor: swatch.bg, borderColor: swatch.border }}
+    >
+      <span className="size-2 rounded-full" style={{ backgroundColor: swatch.accent }} />
+    </span>
+  );
+}
+
+/** One option in a {@link CardRadioGroup}. */
+interface CardRadioOption<T extends string> {
+  value: T;
+  testId: string;
+  body: ReactNode;
+  /** Optional native tooltip (used for the palette blurbs). */
+  title?: string;
+}
+
 /**
- * Color-theme (palette) picker — the second appearance axis, shown under the
- * same "Theme" heading as the mode cards. Renders a swatch grid of the
- * available palettes (see lib/themePalette.ts); selecting one applies it live
- * to <html> via `data-theme`, persists it, and composes with the light/dark
- * mode picker above.
+ * Accessible card radiogroup shared by all three appearance pickers. Implements
+ * the WAI-ARIA radiogroup pattern: a roving tabindex (only the selected card is
+ * tabbable), arrow keys move selection within the group, and Enter/Space select
+ * the focused card. `labelledBy` points at the subsection heading so the group's
+ * accessible name matches its visible label.
+ */
+function CardRadioGroup<T extends string>({
+  labelledBy,
+  value,
+  onSelect,
+  items,
+  className,
+  cardClassName,
+}: {
+  labelledBy: string;
+  value: T;
+  onSelect: (value: T) => void;
+  items: readonly CardRadioOption<T>[];
+  className?: string;
+  cardClassName?: string;
+}) {
+  // Keep a handle on each card so arrow-key navigation can move focus as it
+  // moves selection (selection-follows-focus, per the radiogroup pattern).
+  const refs = useRef(new Map<T, HTMLButtonElement | null>());
+
+  return (
+    <div role="radiogroup" aria-labelledby={labelledBy} className={className}>
+      {items.map((item, index) => {
+        const selected = item.value === value;
+        return (
+          <button
+            key={item.value}
+            ref={(el) => {
+              refs.current.set(item.value, el);
+            }}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            tabIndex={selected ? 0 : -1}
+            title={item.title}
+            data-testid={item.testId}
+            onClick={() => onSelect(item.value)}
+            onKeyDown={(event) => {
+              const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+              const backward = event.key === "ArrowLeft" || event.key === "ArrowUp";
+              if (!forward && !backward) return;
+              event.preventDefault();
+              const nextIndex = (index + (forward ? 1 : -1) + items.length) % items.length;
+              const next = items[nextIndex].value;
+              onSelect(next);
+              refs.current.get(next)?.focus();
+            }}
+            className={themeCardClass(selected, cardClassName)}
+          >
+            {selected && <SelectedBadge />}
+            {item.body}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** A labeled Appearance subsection: heading + one-line helper + its control. */
+function ThemeSubsection({
+  labelId,
+  title,
+  helper,
+  children,
+}: {
+  labelId: string;
+  title: string;
+  helper: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-sm font-medium">
+          {title}
+        </span>
+        <span className="text-sm text-muted-foreground">{helper}</span>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** Appearance mode: System / Light / Dark. */
+function ModeControl() {
+  const { theme, setTheme } = useTheme();
+  const mode = normalizeThemeMode(theme);
+  const labelId = useId();
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Mode"
+      helper="Follow your system, or force light or dark."
+    >
+      <CardRadioGroup<ThemeMode>
+        labelledBy={labelId}
+        value={mode}
+        onSelect={(next) => setTheme(next)}
+        className="grid grid-cols-3 gap-3"
+        cardClassName="gap-2 p-2"
+        items={themeCards.map((card) => ({
+          value: card.mode,
+          testId: `theme-${card.mode}`,
+          body: (
+            <>
+              <ModePreview variant={card.mode} />
+              <span className="text-center text-sm font-medium">{card.label}</span>
+            </>
+          ),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Terminal light/dark/match-app theme — its own section. */
+function TerminalThemeControl() {
+  const [mode, setMode] = useState(() => readTerminalThemeMode());
+  const labelId = useId();
+  const choose = useCallback((next: TerminalThemeMode) => {
+    setMode(next);
+    writeTerminalThemeMode(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Terminal theme"
+      helper="Use a light or dark terminal, or match the app."
+    >
+      <CardRadioGroup<TerminalThemeMode>
+        labelledBy={labelId}
+        value={mode}
+        onSelect={choose}
+        className="grid grid-cols-3 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={terminalThemeCards.map((card) => ({
+          value: card.mode,
+          testId: `terminal-theme-${card.mode}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/**
+ * Color-theme (palette) picker — a dropdown (à la Codex). Each option shows a
+ * swatch chip + name and the trigger mirrors the current selection. Choosing
+ * one applies it live to <html> via `data-theme`, persists it, and composes on
+ * top of the chosen light/dark mode.
  */
 function ColorThemeControl() {
-  // Render each swatch in the currently-resolved mode so the previews match
-  // what the app looks like right now.
+  // Render each chip in the currently-resolved mode so it matches the app now.
   const { resolvedTheme } = useTheme();
   const isDark = normalizeResolvedTheme(resolvedTheme) === "dark";
   const [palette, setPalette] = useState<ThemePalette>(() => readThemePalette());
+  const labelId = useId();
 
   const choose = useCallback((next: ThemePalette) => {
     setPalette(next);
@@ -251,37 +483,40 @@ function ColorThemeControl() {
     applyThemePalette(next);
   }, []);
 
+  const selected = PALETTES.find((p) => p.id === palette) ?? PALETTES[0];
+
   return (
-    <div
-      role="radiogroup"
-      aria-label="Color palette"
-      className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5"
+    <ThemeSubsection
+      labelId={labelId}
+      title="Color theme"
+      helper="Applies on top of your chosen mode."
     >
-      {PALETTES.map((p) => {
-        const selected = palette === p.id;
-        return (
-          <button
-            key={p.id}
-            type="button"
-            role="radio"
-            aria-checked={selected}
-            title={p.blurb}
-            data-testid={`palette-${p.id}`}
-            onClick={() => choose(p.id)}
-            className={cn(
-              "flex flex-col gap-2 rounded-xl border-2 p-2 text-left transition-colors hover:bg-muted",
-              selected ? "border-primary" : "border-border",
-            )}
-          >
-            <PaletteSwatchPreview swatch={isDark ? p.dark : p.light} />
-            <span className="flex items-center justify-between gap-1 px-0.5 text-sm font-medium">
-              {p.label}
-              {selected && <CheckIcon className="size-3.5 text-primary" />}
-            </span>
-          </button>
-        );
-      })}
-    </div>
+      <Select
+        value={palette}
+        onValueChange={(next) => {
+          if (isThemePalette(next)) choose(next);
+        }}
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          data-testid="color-theme-select"
+          className="w-full max-w-xs gap-2"
+        >
+          <SelectValue>
+            <PaletteChip swatch={isDark ? selected.dark : selected.light} />
+            <span>{selected.label}</span>
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {PALETTES.map((p) => (
+            <SelectItem key={p.id} value={p.id} data-testid={`palette-${p.id}`}>
+              <PaletteChip swatch={isDark ? p.dark : p.light} />
+              <span>{p.label}</span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </ThemeSubsection>
   );
 }
 
@@ -330,52 +565,28 @@ function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
 }
 
 function AppearanceSection() {
-  // Embedded: the host owns the theme (embed.tsx forces light), so the
-  // selector would be a no-op — match ThemeModeMenu and hide it.
+  // Embedded: the host owns light/dark, so the Mode and Color theme pickers
+  // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
+  // theme and the font controls are per-device prefs that don't conflict with
+  // host theming, so they stay visible.
   const isEmbedded = useIsEmbedded();
-  const { theme, setTheme } = useTheme();
-  const mode = normalizeThemeMode(theme);
 
   return (
     <Section title="Appearance" description="Choose how Omnigent looks on this device.">
       <div className="flex flex-col gap-8">
-        {/* One "Theme" group: appearance mode (System / Light / Dark) on top,
-            then the color palette swatches. Both are hidden when embedded — the
-            host owns theming there. */}
-        <div className="flex flex-col gap-4">
-          <span className="text-sm font-medium">Theme</span>
-          {isEmbedded ? (
+        {isEmbedded ? (
+          <div className="flex flex-col gap-3">
+            <span className="text-sm font-medium">Theme</span>
             <p className="text-sm text-muted-foreground">
               Theme is controlled by the host application.
             </p>
-          ) : (
-            <>
-              <div className="grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
-                {themeCards.map(({ mode: cardMode, label, icon: Icon }) => {
-                  const selected = mode === cardMode;
-                  return (
-                    <button
-                      key={cardMode}
-                      type="button"
-                      role="radio"
-                      aria-checked={selected}
-                      data-testid={`theme-${cardMode}`}
-                      onClick={() => setTheme(cardMode)}
-                      className={cn(
-                        "flex flex-col items-center gap-2 rounded-lg border-2 p-4 transition-colors hover:bg-muted",
-                        selected ? "border-primary bg-primary/5" : "border-border",
-                      )}
-                    >
-                      <Icon className="size-6 text-muted-foreground" />
-                      <span className="text-sm font-medium">{label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-              <ColorThemeControl />
-            </>
-          )}
-        </div>
+          </div>
+        ) : (
+          <>
+            <ModeControl />
+            <ColorThemeControl />
+          </>
+        )}
 
         <TerminalThemeControl />
 
