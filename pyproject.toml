@@ -144,6 +144,11 @@ cwsandbox = ["cwsandbox>=0.24,<1"]
 # server-managed `sandbox.provider: e2b`).
 # Same lazy-import posture as above.
 e2b = ["e2b>=2.26,<3"]
+# Islo sandbox launcher (`omnigent sandbox --provider islo` and
+# server-managed `sandbox.provider: islo`). The launcher module ships in
+# the base package and imports the SDK lazily, so only users of the
+# provider need this extra.
+islo = ["islo>=0.3.5,<0.4"]
 # NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.

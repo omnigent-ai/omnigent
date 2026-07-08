@@ -11,9 +11,8 @@ running Omnigent hosts, two ways:
   when the session is deleted.
 
 Sandboxes boot from the official prebaked host image, so startup is
-seconds. Unlike Modal and Daytona, the Islo launcher talks to the Islo
-HTTP API directly through `httpx` (already an Omnigent dependency), so
-there is **no provider SDK extra to install** — just an API key.
+seconds. The Islo launcher uses the Islo Python SDK, installed with the
+optional `omnigent[islo]` extra, and authenticates with an API key.
 
 What makes Islo different from the other providers, and shapes the rest
 of this guide:
@@ -31,11 +30,13 @@ of this guide:
 
 ## Prerequisites
 
-Install the [Islo CLI](https://docs.islo.dev) and create an API key, then
-make it available where the launcher runs — your shell for the CLI flow,
-the **server** process for managed sandboxes:
+Install Omnigent with the Islo extra, install the
+[Islo CLI](https://docs.islo.dev), and create an API key. Make the key
+available where the launcher runs — your shell for the CLI flow, the
+**server** process for managed sandboxes:
 
 ```bash
+pip install 'omnigent[islo]'                   # or: uv tool install 'omnigent[islo]'
 curl -fsSL https://islo.dev/install.sh | sh   # install the islo CLI
 islo login                                     # browser OAuth (one-time)
 islo api-key create omnigent --show            # prints an islo_key_… value
@@ -44,9 +45,9 @@ export ISLO_API_KEY=islo_key_…
 # export ISLO_BASE_URL=https://api.islo.dev
 ```
 
-`ISLO_API_KEY` is exchanged for a short-lived session token at
-`POST /auth/token`; the token is cached until shortly before expiry. The
-key is the only required credential — no SDK, no `~/.config` file.
+`ISLO_API_KEY` is exchanged by the SDK for short-lived session tokens and
+refreshed automatically. The key is the only required runtime credential;
+no `~/.config` file is needed where the launcher runs.
 
 > [!NOTE]
 > **Islo cannot forward a local callback port into the sandbox.** The
@@ -95,7 +96,7 @@ pulls the image, not Omnigent).
 Provision a sandbox and ship your local checkout into it:
 
 ```bash
-omnigent sandbox create --provider islo
+omnigent sandbox create --provider islo --server https://your-host
 ```
 
 This pulls the host image, builds wheels from your local checkout, and
@@ -120,6 +121,31 @@ Sandboxes are disposable. When your code changes, create a new one — and
 delete the old one (Islo sandboxes have no lifetime cap, so an abandoned
 sandbox keeps billing until removed via `islo rm <id>` or the
 [dashboard](https://app.islo.dev)).
+
+### Live smoke checklist
+
+Use this checklist before opening a provider-change PR, or when validating
+a new Islo account/key. It assumes your Omnigent server is reachable from
+Islo's cloud at `https://your-host` (for local testing, expose it with a
+tunnel and use the public URL).
+
+```bash
+islo login
+islo api-key create omnigent-smoke --show
+export ISLO_API_KEY=islo_key_...
+omnigent sandbox create --provider islo --server https://your-host
+omnigent sandbox connect --provider islo \
+  --sandbox-id <id-printed-by-create> \
+  --server https://your-host
+islo ls
+islo rm <id-printed-by-create>
+```
+
+Expected result: `create` provisions the sandbox and ships wheels,
+`connect` registers the host with the Omnigent server, `islo ls` shows the
+sandbox while it exists, and `islo rm` deletes it. If `connect` cannot
+reach the server, first verify the `--server` URL from a machine outside
+your laptop network.
 
 To inject LLM/git credentials into a CLI-launched sandbox, set
 `OMNIGENT_ISLO_SANDBOX_ENV` in your shell to a comma-separated list of
@@ -183,6 +209,13 @@ curl -X POST https://your-host/v1/sessions \
 Each managed sandbox authenticates back with a server-minted, per-launch
 token (7-day TTL — see [Lifecycle](#lifecycle-notes)); no user
 credentials enter the sandbox for the server connection.
+
+Managed Islo hosts can also wake paused or stopped sandboxes in place:
+when a session is bound to an offline Islo-managed host, Omnigent resumes
+the same sandbox id, mints a fresh launch token, and restarts
+`omnigent host` against the existing workspace. Deleting the session still
+deletes the sandbox. This does **not** add pause-on-disconnect or idle
+auto-pause; those policies must be implemented separately.
 
 ### Managed hosts and server auth
 
@@ -443,6 +476,10 @@ guide](../modal/README.md#git-credentials-private-repositories).
   override per managed launch with `vcpus` / `memory_mb` / `disk_gb`.
 - **Warm starts.** Set `sandbox.islo.snapshot_name` to boot from a
   prebaked Islo snapshot instead of a cold image pull.
+- **Managed resume.** Paused or stopped server-managed Islo sandboxes can
+  resume in place under the same sandbox id and workspace. Session delete
+  still deletes the sandbox, and Omnigent does not yet pause sandboxes
+  automatically when a host disconnects.
 - **Provider-side lifecycle** (list / status / delete / stop) — use the
   `islo` CLI (`islo ls`, `islo rm <id>`) or the
   [dashboard](https://app.islo.dev) directly.
@@ -485,6 +522,7 @@ free credits. Rates: [islo.dev](https://islo.dev).
 |---|---|---|
 | `ISLO_API_KEY` | CLI machine / server | Islo API credentials (required) |
 | `ISLO_BASE_URL` | CLI machine / server | Non-default Islo API endpoint (default `https://api.islo.dev`) |
+| `ISLO_COMPUTE_URL` | CLI machine / server | Non-default Islo compute endpoint (SDK default is production compute) |
 | `OMNIGENT_ISLO_HOST_IMAGE` | CLI machine / server | Override the host image ref (`sandbox.islo.image` takes precedence for managed) |
 | `OMNIGENT_ISLO_SANDBOX_ENV` | CLI machine / server | Comma-separated launcher-side env var names to inject (`sandbox.islo.env` takes precedence for managed) |
 | `OMNIGENT_RUNNER_ENV_PASSTHROUGH` | inside the sandbox (injected) | Extra env var names the host forwards to runners |
