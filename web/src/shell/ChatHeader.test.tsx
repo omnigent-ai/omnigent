@@ -15,6 +15,7 @@ const mobileMenu = {
   executionLogsOpen: false,
   filesPanelOpen: false,
   subagentsPanelOpen: false,
+  capabilitiesPanelOpen: false,
   shellsPanelOpen: false,
   todosPanelOpen: false,
   hideTerminalsTab: false,
@@ -30,6 +31,7 @@ const mobileMenu = {
   onOpenFiles: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
+  onOpenCapabilities: () => {},
   onOpenTodos: () => {},
   onOpenMainExecutionLog: () => {},
 };

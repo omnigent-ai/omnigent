@@ -1,10 +1,11 @@
-import { BotIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
+import { BlocksIcon, BotIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
+import { CapabilitiesPanel } from "./CapabilitiesPanel";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { TodoPanel } from "./TodoPanel";
@@ -342,6 +343,13 @@ export function WorkspacePanel({
                 {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
               </span>
             </TabsTrigger>
+            <TabsTrigger
+              value="capabilities"
+              className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+            >
+              <BlocksIcon className="size-4" />
+              Capabilities
+            </TabsTrigger>
             {showShellsTab && (
               <TabsTrigger
                 value="terminals"
@@ -425,6 +433,8 @@ export function WorkspacePanel({
           />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+        ) : rightRailTab === "capabilities" ? (
+          <CapabilitiesPanel conversationId={conversationId} />
         ) : rightRailTab === "todos" && isClaudeNative ? (
           <TodoPanel frameless />
         ) : rightRailTab === "terminals" && showShellsTab ? (

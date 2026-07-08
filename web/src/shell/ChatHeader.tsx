@@ -1,4 +1,5 @@
 import {
+  BlocksIcon,
   BotIcon,
   ChevronLeftIcon,
   EllipsisVerticalIcon,
@@ -46,6 +47,8 @@ interface MobileSessionMenuProps {
   filesPanelOpen: boolean;
   /** True while the mobile agents drawer is open. */
   subagentsPanelOpen: boolean;
+  /** True while the mobile capabilities drawer is open. */
+  capabilitiesPanelOpen: boolean;
   /** True while the mobile shells drawer is open. */
   shellsPanelOpen: boolean;
   /** True while the mobile tasks drawer is open. */
@@ -79,6 +82,8 @@ interface MobileSessionMenuProps {
   onOpenShells: () => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
+  /** Open the mobile capabilities drawer. */
+  onOpenCapabilities: () => void;
   /** Open the mobile tasks drawer. */
   onOpenTodos: () => void;
   /** Open the main execution-log push panel. */
@@ -393,6 +398,7 @@ export function ChatHeader({
           !mobileMenu.executionLogsOpen &&
           !mobileMenu.filesPanelOpen &&
           !mobileMenu.subagentsPanelOpen &&
+          !mobileMenu.capabilitiesPanelOpen &&
           !mobileMenu.shellsPanelOpen &&
           !mobileMenu.todosPanelOpen &&
           (hasRailContent || mobileMenu.debugMode) && (
@@ -447,6 +453,16 @@ export function ChatHeader({
                       ? `${mobileMenu.subagentsWorking}/${mobileMenu.agentCount}`
                       : mobileMenu.agentCount}
                   </span>
+                </DropdownMenuItem>
+                {/* Capabilities — always present (read-only view of the
+                    session's bound-agent skills, MCP servers, tools, and
+                    sub-agents; the panel renders empty states per section). */}
+                <DropdownMenuItem
+                  onSelect={mobileMenu.onOpenCapabilities}
+                  className="gap-2.5 px-2.5 py-2 text-base"
+                >
+                  <BlocksIcon className="size-4" />
+                  Capabilities
                 </DropdownMenuItem>
                 {/* Shells — mirrors the desktop rail's Shells tab: visible
                     when a real shell exists, or when the agent spec declares

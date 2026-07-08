@@ -21,6 +21,11 @@ vi.mock("./InlineTerminalsSection", () => ({
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
+vi.mock("./CapabilitiesPanel", () => ({
+  CapabilitiesPanel: ({ conversationId }: { conversationId: string }) => (
+    <div data-testid="capabilities-stub" data-conversation-id={conversationId} />
+  ),
+}));
 vi.mock("./TodoPanel", () => ({
   TodoPanel: () => <div data-testid="todos-stub" />,
 }));
@@ -177,5 +182,19 @@ describe("WorkspacePanel content area", () => {
     // slot and the viewer is unmounted.
     expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+
+  it("renders a Capabilities tab that mounts the CapabilitiesPanel for the active session", () => {
+    renderWorkspace({ rightRailTab: "capabilities", selectedFilePath: null });
+
+    // The tab is always present; selecting it mounts the panel keyed on the
+    // active conversation id (context-aware fetch).
+    expect(screen.getByRole("tab", { name: /Capabilities/i })).toBeInTheDocument();
+    expect(screen.getByTestId("capabilities-stub")).toHaveAttribute(
+      "data-conversation-id",
+      "conv_ws",
+    );
+    // The panel owns the content slot — the Files scope view must not also mount.
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
   });
 });

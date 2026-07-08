@@ -63,6 +63,7 @@ import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { TitleBarServerPicker } from "./TitleBarServerPicker";
 import { SubagentsPanel } from "./SubagentsPanel";
+import { CapabilitiesPanel } from "./CapabilitiesPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
   TerminalFirstContextProvider,
@@ -216,6 +217,7 @@ export function AppShell() {
   // push panel of their own. On desktop these are tabs in the workspace rail;
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
+  const [capabilitiesPanelOpen, setCapabilitiesPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) is open by default and
@@ -457,6 +459,10 @@ export function AppShell() {
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
+        // Capabilities tab is unconditional: the endpoint always resolves
+        // the session's bound agent, and the panel renders sensible empty
+        // states per section, so there's never a dead end.
+        capabilities: true,
         // Shells tab: shown by default when the agent's spec declares
         // shell access (the empty state offers "+ New shell"), or once a
         // shell exists for agents that don't. Inventory view: the
@@ -491,7 +497,7 @@ export function AppShell() {
   // convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "subagents", "terminals", "todos"] as const).find(
+    const next = (["files", "subagents", "capabilities", "terminals", "todos"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -540,6 +546,7 @@ export function AppShell() {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
+    setCapabilitiesPanelOpen(false);
     setShellsPanelOpen(false);
     setTodosPanelOpen(false);
     setFilesPanelShowHidden(false);
@@ -688,12 +695,15 @@ export function AppShell() {
       setExecutionLogsKey(null); // close execution-logs panel
       setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
       setSubagentsPanelOpen(false); // close mobile agents drawer
+      setCapabilitiesPanelOpen(false); // close mobile capabilities drawer
       setTodosPanelOpen(false); // close mobile tasks drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
-      // won't render (Terminals, Subagents, Todos). The Files tab surfaces the
-      // FileViewer inline, so leave it undisturbed.
+      // won't render (Terminals, Subagents, Capabilities, Todos). The Files
+      // tab surfaces the FileViewer inline, so leave it undisturbed.
       setRightRailTab((prev) =>
-        prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
+        prev === "terminals" || prev === "subagents" || prev === "capabilities" || prev === "todos"
+          ? "files"
+          : prev,
       );
       // Reveal the rail so the viewer is actually visible — the rail defaults
       // open but a session the user collapsed restores collapsed, so opening a
@@ -877,6 +887,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setCapabilitiesPanelOpen(false); // close mobile capabilities drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setPanelInitialKey(key);
@@ -888,6 +899,7 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setCapabilitiesPanelOpen(false); // close mobile capabilities drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setExecutionLogsKey(key);
@@ -902,6 +914,7 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setCapabilitiesPanelOpen(false); // close mobile capabilities drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setFilesPanelOpen(true);
@@ -915,9 +928,24 @@ export function AppShell() {
     setPanelInitialKey(null); // close terminals panel
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
+    setCapabilitiesPanelOpen(false); // close mobile capabilities drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setSubagentsPanelOpen(true);
+  }
+
+  // Mobile FAB → "Capabilities" opens the read-only capabilities view (the
+  // desktop rail's Capabilities tab) as a full-screen drawer.
+  function openCapabilitiesPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setTodosPanelOpen(false); // close mobile tasks drawer
+    setCapabilitiesPanelOpen(true);
   }
 
   // Mobile FAB → "Shells" opens the desktop rail's Shells tab content as a
@@ -930,6 +958,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setCapabilitiesPanelOpen(false); // close mobile capabilities drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
     setShellsPanelOpen(true);
   }
@@ -943,6 +972,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setCapabilitiesPanelOpen(false); // close mobile capabilities drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setTodosPanelOpen(true);
   }
@@ -1134,6 +1164,7 @@ export function AppShell() {
                     executionLogsOpen,
                     filesPanelOpen,
                     subagentsPanelOpen,
+                    capabilitiesPanelOpen,
                     shellsPanelOpen,
                     todosPanelOpen,
                     hideTerminalsTab,
@@ -1149,6 +1180,7 @@ export function AppShell() {
                     onOpenFiles: openFilesPanel,
                     onOpenShells: openShellsPanel,
                     onOpenSubagents: openSubagentsPanel,
+                    onOpenCapabilities: openCapabilitiesPanel,
                     onOpenTodos: openTodosPanel,
                     onOpenMainExecutionLog: openMainExecutionLog,
                   }}
@@ -1258,6 +1290,16 @@ export function AppShell() {
                   testId="subagents-panel-drawer"
                 >
                   <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={capabilitiesPanelOpen}
+                  title="Capabilities"
+                  onClose={() => setCapabilitiesPanelOpen(false)}
+                  testId="capabilities-panel-drawer"
+                >
+                  <CapabilitiesPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {conversationId && (

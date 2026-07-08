@@ -148,6 +148,11 @@ vi.mock("./SubagentsPanel", () => ({
     <div data-testid="subagents-panel" data-conversation-id={conversationId} />
   ),
 }));
+vi.mock("./CapabilitiesPanel", () => ({
+  CapabilitiesPanel: ({ conversationId }: { conversationId: string }) => (
+    <div data-testid="capabilities-panel" data-conversation-id={conversationId} />
+  ),
+}));
 vi.mock("./TodoPanel", () => ({
   TodoPanel: () => <div data-testid="todo-panel" />,
 }));
@@ -992,6 +997,27 @@ describe("Subagents tab", () => {
     // Files is the default tab, whose content slot mounts FilesPanel.
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
+  });
+
+  it("shows the Capabilities tab and mounts its panel keyed on the active session", () => {
+    // The Capabilities tab is unconditional — the endpoint always resolves
+    // the session's bound agent. Selecting it mounts CapabilitiesPanel keyed
+    // on the active conversation id so the fetch is context-aware.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc");
+
+    const capabilitiesTab = screen.getByRole("tab", { name: /Capabilities/i });
+    expect(capabilitiesTab).toBeInTheDocument();
+    fireEvent.mouseDown(capabilitiesTab);
+    expect(screen.getByTestId("capabilities-panel")).toHaveAttribute(
+      "data-conversation-id",
+      "conv_abc",
+    );
   });
 
   it("shows the Agents tab and mounts its panel once there's more than one agent", () => {
