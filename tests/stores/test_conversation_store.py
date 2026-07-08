@@ -4387,6 +4387,29 @@ def test_list_projects_excludes_all_archived_projects(
     assert conversation_store.list_projects() == ["Gone", "Mixed"]
 
 
+def test_list_projects_include_archived_keeps_all_archived_projects(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``include_archived=True`` also returns projects whose every member is
+    archived (hidden from the sidebar). Rename validation relies on this so it
+    can't silently merge into a project the sidebar can't show."""
+    solo = conversation_store.create_conversation()
+    mix_archived = conversation_store.create_conversation()
+    mix_active = conversation_store.create_conversation()
+
+    conversation_store.set_labels(solo.id, {"omni_project": "Gone"})
+    conversation_store.set_labels(mix_archived.id, {"omni_project": "Mixed"})
+    conversation_store.set_labels(mix_active.id, {"omni_project": "Mixed"})
+
+    conversation_store.update_conversation(solo.id, archived=True)
+    conversation_store.update_conversation(mix_archived.id, archived=True)
+
+    # Sidebar view drops the all-archived "Gone"; the archived-inclusive view
+    # keeps it so a rename onto "Gone" is still detected as a collision.
+    assert conversation_store.list_projects() == ["Mixed"]
+    assert conversation_store.list_projects(include_archived=True) == ["Gone", "Mixed"]
+
+
 def test_list_projects_scoped_by_accessible_by(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,

@@ -163,6 +163,31 @@ async def test_list_projects_returns_names_sorted(
     assert resp.json() == ["Customer X", "Sprint 42"]
 
 
+async def test_list_projects_include_archived(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?include_archived=true`` also lists projects whose sessions are all
+    archived (hidden from the sidebar) so rename validation can detect a
+    collision against a project the default view omits."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    active = conv_store.create_conversation()
+    archived = conv_store.create_conversation()
+    conv_store.set_labels(active.id, {"omni_project": "Active"})
+    conv_store.set_labels(archived.id, {"omni_project": "Archived"})
+    conv_store.update_conversation(archived.id, archived=True)
+
+    # Default view hides the all-archived project…
+    resp = await client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert resp.json() == ["Active"]
+
+    # …but the opt-in surfaces it.
+    resp = await client.get("/v1/sessions/projects?include_archived=true")
+    assert resp.status_code == 200
+    assert resp.json() == ["Active", "Archived"]
+
+
 # ── GET /v1/sessions?project= (filter) ───────────────────────────────
 
 

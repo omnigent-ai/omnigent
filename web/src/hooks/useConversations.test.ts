@@ -17,6 +17,8 @@ import {
   useBulkStopSessions,
   useConversations,
   useDeleteProject,
+  useRenameProject,
+  ProjectNameTakenError,
   useProjects,
   useProjectSessions,
   useMoveToProject,
@@ -792,6 +794,103 @@ describe("useMoveToProject", () => {
     // section, projects so the sidebar list updates.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+  });
+});
+
+describe("useRenameProject", () => {
+  it("blocks the rename via an archived-inclusive, case-insensitive pre-flight when the target is taken", async () => {
+    // `useProjects` (the dialog's fast check) omits archived-only projects, so
+    // the hook asks the server for the archived-inclusive name list and compares
+    // case-insensitively. Here only an archived-only "beta" exists — renaming to
+    // "Beta" must still be blocked (a case variant of a name the sidebar can't
+    // even show), relabelling nothing.
+    fetchMock.mockResolvedValueOnce(mockResponse(["Alpha", "beta"]));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useRenameProject(), { wrapper });
+
+    result.current.mutate({ from: "Alpha", to: "Beta" });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(result.current.error).toBeInstanceOf(ProjectNameTakenError);
+    expect((result.current.error as ProjectNameTakenError).projectName).toBe("Beta");
+    // Pre-flight hits the archived-inclusive project-name list…
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/projects?include_archived=true");
+    // …and nothing else runs: no enumeration of the source, no PATCH.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows re-casing a project onto itself (case-insensitive self-collision is excluded)", async () => {
+    // Renaming "Work" → "work" is a re-case of the *same* project, not a merge,
+    // so the case-insensitive guard must exclude the source name and proceed.
+    fetchMock.mockResolvedValueOnce(mockResponse(["Work"]));
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [{ id: "conv_w", object: "conversation", title: "W", created_at: 0, updated_at: 1 }],
+        first_id: "conv_w",
+        last_id: "conv_w",
+        has_more: false,
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_w",
+        object: "conversation",
+        title: "W",
+        created_at: 0,
+        updated_at: 2,
+        labels: { omni_project: "work" },
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useRenameProject(), { wrapper });
+
+    result.current.mutate({ from: "Work", to: "work" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [patchUrl, patchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(patchUrl).toBe("/v1/sessions/conv_w");
+    expect(JSON.parse(patchInit.body as string)).toEqual({ labels: { omni_project: "work" } });
+  });
+
+  it("relabels every session to the new name when the target is free", async () => {
+    // 1) pre-flight: archived-inclusive names — "Beta" is not among them → free.
+    fetchMock.mockResolvedValueOnce(mockResponse(["Alpha", "Gamma"]));
+    // 2) enumerate "Alpha" members (archived included).
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 1 }],
+        first_id: "conv_a",
+        last_id: "conv_a",
+        has_more: false,
+      }),
+    );
+    // 3) PATCH that session onto "Beta".
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_a",
+        object: "conversation",
+        title: "A",
+        created_at: 0,
+        updated_at: 2,
+        labels: { omni_project: "Beta" },
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useRenameProject(), { wrapper });
+
+    result.current.mutate({ from: "Alpha", to: "Beta" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [patchUrl, patchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(patchUrl).toBe("/v1/sessions/conv_a");
+    expect(patchInit.method).toBe("PATCH");
+    expect(JSON.parse(patchInit.body as string)).toEqual({ labels: { omni_project: "Beta" } });
   });
 });
 

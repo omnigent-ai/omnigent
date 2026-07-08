@@ -737,6 +737,7 @@ class ConversationStore(ABC):
     def list_projects(
         self,
         accessible_by: str | None = None,
+        include_archived: bool = False,
     ) -> list[str]:
         """
         Return all distinct sidebar "project" names, ordered ascending.
@@ -753,6 +754,9 @@ class ConversationStore(ABC):
             sessions the user has a permission row for (mirrors the
             ``list_conversations`` ACL filter). ``None`` returns
             projects across all sessions.
+        :param include_archived: When ``True``, also return projects
+            whose members are all archived (absent from the sidebar), so
+            rename validation can detect a collision the sidebar can't show.
         :returns: List of project names ordered alphabetically.
         """
         ...

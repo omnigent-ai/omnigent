@@ -661,15 +661,24 @@ export function usePinnedConversationBackfill(
  */
 export const PROJECT_LABEL_KEY = "omni_project";
 
+/**
+ * Fetch all project names from `GET /v1/sessions/projects`. Pass
+ * `includeArchived` to also list projects whose sessions are all archived
+ * (hidden from the sidebar) — used by rename validation so it can't merge into
+ * a project the sidebar can't show.
+ */
+export async function fetchProjectNames(includeArchived = false): Promise<string[]> {
+  const query = includeArchived ? "?include_archived=true" : "";
+  const res = await authenticatedFetch(`/v1/sessions/projects${query}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as string[];
+}
+
 /** Fetch all project names from `GET /v1/sessions/projects`. */
 export function useProjects() {
   return useQuery<string[]>({
     queryKey: ["projects"],
-    queryFn: async () => {
-      const res = await authenticatedFetch("/v1/sessions/projects");
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as string[];
-    },
+    queryFn: () => fetchProjectNames(),
     staleTime: 30_000,
   });
 }
@@ -832,6 +841,72 @@ export function useDeleteProject() {
     onSettled: () => {
       // Refresh regardless of partial failure so the sidebar reflects whatever
       // was actually archived.
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+    },
+  });
+}
+
+/**
+ * Rename a whole project by re-labelling every session filed under `from` to
+ * `to`. The project is implicit (its identity IS the shared `omni_project`
+ * label), so a rename is a bulk relabel — no dedicated project entity to patch.
+ * Archived members are included so a rename doesn't silently split the project
+ * (unarchiving would otherwise restore them under the old name). Throws
+ * `{ failed, succeeded, total }` if any session couldn't be relabelled (e.g. a
+ * shared session the user can't modify), leaving those under the old name.
+ *
+ * The dialog does a synchronous collision check against the sidebar's project
+ * list for instant feedback, but that list is archived-exclusive; this hook adds
+ * an authoritative server-side pre-flight over the archived-inclusive project
+ * list (case-insensitively, excluding the source name) so a rename can't merge
+ * into any existing project — including one whose sessions are all archived and
+ * so never appears in the sidebar. Throws `ProjectNameTakenError` when taken.
+ */
+export class ProjectNameTakenError extends Error {
+  readonly projectName: string;
+  constructor(projectName: string) {
+    super(`A project named "${projectName}" already exists.`);
+    this.name = "ProjectNameTakenError";
+    this.projectName = projectName;
+  }
+}
+
+export function useRenameProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ from, to }: { from: string; to: string }) => {
+      // Authoritative collision guard. The dialog's fast-path check omits
+      // projects whose sessions are all archived, so ask the server for the
+      // archived-inclusive list and compare case-insensitively (excluding the
+      // source name so re-casing a project — "Work" → "work" — is allowed).
+      const existing = await fetchProjectNames(true);
+      const target = to.toLowerCase();
+      if (existing.some((name) => name !== from && name.toLowerCase() === target)) {
+        throw new ProjectNameTakenError(to);
+      }
+      const ids = await fetchAllProjectSessionIds(from);
+      const results = await Promise.allSettled(ids.map((id) => moveConversationToProject(id, to)));
+      const succeeded: string[] = [];
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "fulfilled") {
+          succeeded.push(ids[i]);
+          markConversationSeen(
+            ids[i],
+            (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
+          );
+        } else {
+          failed.push(ids[i]);
+        }
+      }
+      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      return { succeeded, failed };
+    },
+    onSettled: () => {
+      // Refresh regardless of partial failure so the sidebar reflects whatever
+      // was actually relabelled.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
