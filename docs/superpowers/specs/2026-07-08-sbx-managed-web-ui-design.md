@@ -41,10 +41,14 @@ becomes "Sbx Sandbox" once the server advertises sbx as its managed provider.
 2. **Lifecycle: ephemeral per-session.** One fresh sbx sandbox per session,
    bound to it, torn down / relaunched with it — identical to Modal/Daytona.
    The new instance is **not** a reusable pool host.
-3. **Omnigent delivery: prebaked template.** Managed launch does not ship
-   wheels; the sbx sandbox boots from an image that already has omnigent-host
-   installed (`sandbox.sbx.template`). Building that image is **in scope** for
-   this spec.
+3. **Omnigent delivery: prebaked template built on sbx's docker base.** Managed
+   launch does not ship wheels; the sbx sandbox boots from an image that already
+   has omnigent-host installed (`sandbox.sbx.template`). The image is built
+   **`FROM docker/sandbox-templates:shell-docker`** (sbx's own nested-Docker
+   base) with omnigent layered on top — NOT the vanilla `omnigent-host:latest`
+   image, which is `python:slim` with no Docker daemon and would lose sbx's
+   nested-Docker capability (the whole reason to pick sbx). Building that image
+   is **in scope** for this spec.
 4. **Resume: in scope.** `can_resume = True` + a `resume()` implementation, so a
    dormant managed sbx host wakes in place with its workspace.
 
@@ -210,19 +214,31 @@ polish.
 
 ### 4. Prebaked omnigent-host sbx image (in scope)
 
-The heaviest deliverable. Requirements:
+The heaviest deliverable. **Base: `FROM docker/sandbox-templates:shell-docker`**
+— sbx's own nested-Docker template — with omnigent layered on top. This
+guarantees the Docker daemon is present (it ships in the base) instead of hoping
+a `python:slim` image carries it. Explicitly NOT the vanilla `omnigent-host`
+image: that stage is `python:3.x-slim` with no `dockerd`, so it would run
+`omnigent host` but leave the sandbox with no `docker` — removing the reason to
+use sbx at all. Requirements:
 
-- **Bakes omnigent-host** (full install) + git / tmux / the coding-harness CLIs
-  — so managed launch skips any in-box install and registers in seconds.
-- **Retains sbx's nested-Docker daemon.** Build **from sbx's `shell-docker`
-  base template** (`docker/sandbox-templates:shell-docker`), not a bare image,
-  so each managed sbx sandbox keeps its own Docker daemon (the whole point of
-  sbx). Verify the sbx-daemon plumbing survives an added application layer.
+- **Layer the omnigent-host install** onto the base: the venv + full omnigent
+  install, git / tmux, and the coding-harness CLIs (Claude Code, Codex, pi) —
+  reusing the `--target host` stage's install steps
+  (`deploy/docker/Dockerfile`) as the recipe, adapted to the `shell-docker`
+  base's OS (Ubuntu, per the sbx spike) rather than Debian slim. Keeps managed
+  launch install-free so a host registers in seconds.
+- **Preserve the base's Docker daemon + sbx plumbing** — do not strip or
+  override the base's entrypoint/daemon setup. Verify `docker run` still works
+  after the omnigent layer (discovery item #4).
 - Published to a registry the server can `sbx create -t` from, referenced by
   `sandbox.sbx.template`.
-- Lives under `deploy/sbx/` with a README (mirroring `deploy/modal/`,
-  `deploy/daytona/`), including how to build/publish and the required
-  `sbx policy` / `sbx login` server prerequisites.
+- Lives under `deploy/sbx/` with a Dockerfile + README (mirroring
+  `deploy/modal/`, `deploy/daytona/`), including how to build/publish and the
+  required `sbx policy` / `sbx login` server prerequisites.
+- **Verify `sbx create -t <registry-ref>` accepts an arbitrary OCI image** at
+  all (the original spike only exercised sbx's default template) — a quick
+  live probe before the build is finalized.
 
 ## Data flow (create new sbx instance)
 
@@ -294,6 +310,7 @@ Follow TDD (red → green → refactor).
    sufficient for the in-box host to dial back (revisit the
    `host.docker.internal` egress finding from the original sbx design)?
 4. Does an omnigent-host layer built on `shell-docker` **retain the nested
-   Docker daemon**?
+   Docker daemon** (`docker run --rm hello-world` works after the layer), and
+   does `sbx create -t <arbitrary-registry-ref>` accept the image at all?
 5. Exact `resume` mechanics: `sbx start <id>` vs. relying on `exec` auto-start
    before `start_host`.
