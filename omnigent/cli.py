@@ -6031,6 +6031,12 @@ def _dispatch_native_terminal_harness(
         from omnigent.kimi_native import run_kimi_native
 
         run_kimi_native(kimi_args=passthrough, **common)
+    elif native_agent.key == "kiro":
+        from omnigent.kiro_native import run_kiro_native
+
+        # Kiro reads model from the wrapper spec / first-class launch arg, like
+        # Codex and OpenCode, so the generic --model flag is not passthrough.
+        run_kiro_native(kiro_args=(), model=model, prompt=None, **common)
     else:  # pragma: no cover - new native agent added without a dispatch arm
         raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
     return True

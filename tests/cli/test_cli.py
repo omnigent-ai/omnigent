@@ -4653,6 +4653,38 @@ def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
     }
 
 
+def test_dispatch_native_terminal_harness_kiro_launches_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run --harness kiro-native`` dispatches to the Kiro TUI wrapper."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(
+            harness="kiro-native",
+            model="auto",
+            resume_picker=True,
+            auto_open_conversation=True,
+        )
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "http://localhost:0",
+        "session_id": None,
+        "resume_picker": True,
+        "auto_open_conversation": True,
+        "kiro_args": (),
+        "model": "auto",
+        "prompt": None,
+    }
+
+
 def test_dispatch_native_terminal_harness_ignores_non_native(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
