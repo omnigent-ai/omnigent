@@ -124,18 +124,21 @@ jobs:
           IMAGE="ghcr.io/omnigent-ai/omnigent-server"
           HOST_IMAGE="ghcr.io/omnigent-ai/omnigent-host"
           OPENSHELL_IMAGE="ghcr.io/omnigent-ai/omnigent-server-openshell"
+          KUBERNETES_IMAGE="ghcr.io/omnigent-ai/omnigent-server-kubernetes"
           SHORT_SHA=$(git rev-parse --short HEAD)
 
           # Immutable per-commit pin, always.
           TAGS="${IMAGE}:sha-${SHORT_SHA}"
           HOST_TAGS="${HOST_IMAGE}:sha-${SHORT_SHA}"
           OPENSHELL_TAGS="${OPENSHELL_IMAGE}:sha-${SHORT_SHA}"
+          KUBERNETES_TAGS="${KUBERNETES_IMAGE}:sha-${SHORT_SHA}"
 
           # Append a floating/version tag to all images.
           add_tag() {
             TAGS="${TAGS},${IMAGE}:$1"
             HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:$1"
             OPENSHELL_TAGS="${OPENSHELL_TAGS},${OPENSHELL_IMAGE}:$1"
+            KUBERNETES_TAGS="${KUBERNETES_TAGS},${KUBERNETES_IMAGE}:$1"
           }
 
           # Every qualifying main commit moves :latest-dev (bleeding edge).
@@ -175,6 +178,7 @@ jobs:
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"
           echo "openshell_tags=${OPENSHELL_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "kubernetes_tags=${KUBERNETES_TAGS}" >> "$GITHUB_OUTPUT"
 
       # No build-args: the Dockerfile ARGs default to public registries.
       # Multi-arch: each tag publishes as a manifest list spanning amd64 + arm64,
@@ -234,10 +238,32 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           sbom: true
+
+      # Kubernetes server variant: the default server image plus the kubernetes
+      # client extra (OMNIGENT_EXTRAS=kubernetes), so `sandbox.provider:
+      # kubernetes` works without a self-built image. Used by the
+      # deploy/kubernetes/overlays/sandbox-runners kustomize overlay. Reuses
+      # the shared builder-stage layers from the gha cache.
+      - name: Build and push kubernetes server image
+        id: build-kubernetes
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.kubernetes_tags }}
+          build-args: |
+            OMNIGENT_EXTRAS=kubernetes
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: true
     outputs:
       server-digest: ${{ steps.build-server.outputs.digest }}
       host-digest: ${{ steps.build-host.outputs.digest }}
       openshell-digest: ${{ steps.build-openshell.outputs.digest }}
+      kubernetes-digest: ${{ steps.build-kubernetes.outputs.digest }}
 
   generate-sbom:
     # Runs in a separate job with read-only permissions so the Syft
@@ -281,6 +307,13 @@ jobs:
             -o cyclonedx-json=openshell-sbom.cdx.json \
             -o spdx-json=openshell-sbom.spdx.json
 
+      - name: Generate kubernetes server SBOM
+        run: |
+          set -euo pipefail
+          syft "ghcr.io/omnigent-ai/omnigent-server-kubernetes@${{ needs.build-and-push.outputs.kubernetes-digest }}" \
+            -o cyclonedx-json=kubernetes-sbom.cdx.json \
+            -o spdx-json=kubernetes-sbom.spdx.json
+
       - name: Upload SBOMs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -292,6 +325,8 @@ jobs:
             host-sbom.spdx.json
             openshell-sbom.cdx.json
             openshell-sbom.spdx.json
+            kubernetes-sbom.cdx.json
+            kubernetes-sbom.spdx.json
           retention-days: 90
 
   promote-nightly:
@@ -322,7 +357,7 @@ jobs:
           set -euo pipefail
           # crane tag points a new tag at an EXISTING manifest digest without
           # re-serializing it, so :latest-nightly keeps :latest-dev's exact digest.
-          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell; do
+          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell ghcr.io/omnigent-ai/omnigent-server-kubernetes; do
             if crane digest "${img}:latest-dev" >/dev/null 2>&1; then
               crane tag "${img}:latest-dev" latest-nightly
               echo "promoted ${img}:latest-dev -> :latest-nightly ($(crane digest "${img}:latest-nightly"))"
@@ -393,7 +428,7 @@ jobs:
             fi
           }
 
-          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell; do
+          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell ghcr.io/omnigent-ai/omnigent-server-kubernetes; do
             retag "${img}" "latest-rc" "${RC_TAG}"
             retag "${img}" "latest" "${LATEST_TAG}"
           done
