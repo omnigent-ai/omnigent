@@ -8590,6 +8590,8 @@ async def _emit_server_routing_decision(
     conversation_store: ConversationStore,
     model: str,
     verdict: dict[str, Any],
+    *,
+    agent: str | None = None,
 ) -> None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
@@ -8597,6 +8599,9 @@ async def _emit_server_routing_decision(
     to the runner.  The chip shows the judge's model pick at turn start
     — the same UX the runner-side advisor produced, but driven entirely
     by the server.
+
+    :param agent: Sub-agent name to include when mirroring a child
+        session's routing decision into the parent's transcript.
     """
     import uuid
 
@@ -8604,12 +8609,14 @@ async def _emit_server_routing_decision(
 
     tier = verdict.get("tier", "medium")
     rationale = verdict.get("rationale", "")
-    item_data = {
+    item_data: dict[str, Any] = {
         "model": model,
         "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
         "applied": True,
         "rationale": rationale if isinstance(rationale, str) else "",
     }
+    if agent is not None:
+        item_data["agent"] = agent
     try:
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
@@ -8864,6 +8871,18 @@ async def _forward_event_to_runner(
                 _routed_model,
                 _verdict,
             )
+            # Mirror the routing decision into the parent session so the
+            # orchestrator's transcript also shows which model was chosen
+            # for this sub-agent — the decision is otherwise only visible
+            # on the child session screen.
+            if _parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict,
+                    agent=agent_name or "",
+                )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Forward to runner failed for session=%s; "
@@ -9100,6 +9119,14 @@ async def _dispatch_session_event_to_runner(
                 _native_routed_model,
                 _native_verdict,
             )
+            if _native_parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _native_routed_model,
+                    _native_verdict,
+                    agent=agent_name or "",
+                )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,

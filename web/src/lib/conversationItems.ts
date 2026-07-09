@@ -151,6 +151,8 @@ export interface RoutingDecisionItem extends BaseItem {
   applied: boolean;
   /** The router's one-line rationale. */
   rationale: string;
+  /** Sub-agent name when mirrored into the parent session; undefined otherwise. */
+  agent?: string;
 }
 
 export type ConversationItem =

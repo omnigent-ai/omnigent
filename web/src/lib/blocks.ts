@@ -212,6 +212,8 @@ export interface RoutingDecisionBlock {
   applied: boolean;
   /** The router's one-line rationale; empty string when absent. */
   rationale: string;
+  /** Sub-agent name when mirrored into the parent session; undefined otherwise. */
+  agent?: string;
 }
 
 export interface TerminalCommandBlock {

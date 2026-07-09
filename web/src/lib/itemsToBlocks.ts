@@ -277,6 +277,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
     tier: item.tier,
     applied: item.applied,
     rationale: typeof item.rationale === "string" ? item.rationale : "",
+    ...(item.agent !== undefined && { agent: item.agent }),
   };
 }
 

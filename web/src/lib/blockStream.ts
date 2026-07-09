@@ -660,6 +660,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         tier: event.tier,
         applied: event.applied,
         rationale: event.rationale,
+        ...(event.agent !== undefined && { agent: event.agent }),
       } satisfies RoutingDecisionBlock;
       return;
     }

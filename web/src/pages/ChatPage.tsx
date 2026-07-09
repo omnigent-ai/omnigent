@@ -54,7 +54,7 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionChip } from "@/components/blocks/StatusBlocks";
+import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -2828,11 +2828,12 @@ export const BubbleView = memo(
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
       return (
-        <RoutingDecisionChip
+        <RoutingDecisionCard
           model={bubble.model}
           tier={bubble.tier}
           applied={bubble.applied}
           rationale={bubble.rationale}
+          agent={bubble.agent}
         />
       );
     }
