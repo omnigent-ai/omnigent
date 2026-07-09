@@ -8810,7 +8810,15 @@ async def _forward_event_to_runner(
     ) or _parent_routing_on
     _routed_model: str | None = None
     _verdict: dict[str, Any] | None = None
-    if effective_runner_override is None and _routing_enabled and body.type == "message":
+    # For child sessions, route even when the orchestrator specified a model via
+    # sys_session_send (effective_runner_override is already set). Smart routing
+    # always wins over the LLM's own model choice when the parent toggle is on.
+    _should_route = (
+        _routing_enabled
+        and body.type == "message"
+        and (effective_runner_override is None or conv.parent_conversation_id is not None)
+    )
+    if _should_route:
         from omnigent.server.smart_routing import route_turn
 
         _harness = _resolve_harness(conv)
@@ -9051,7 +9059,9 @@ async def _dispatch_session_event_to_runner(
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
-        if conv.model_override is None and _native_routing_enabled:
+        if _native_routing_enabled and (
+            conv.model_override is None or conv.parent_conversation_id is not None
+        ):
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
