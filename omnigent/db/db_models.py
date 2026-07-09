@@ -140,18 +140,13 @@ class SqlAgent(Base):
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),
         Index("ix_agents_created_at", "workspace_id", "created_at", "id"),
         # Template agents have unique names; session-scoped agents (kind=2)
-        # may reuse the same name across conversations. The partial index enforces
-        # uniqueness only within the template set. kind = 1 is the "template" code.
-        # MySQL has no partial index, so the WHERE is dropped there and the
-        # unique spans all kinds (more restrictive; acceptable).
-        Index(
-            "ix_agents_template_name",
-            "workspace_id",
-            "name",
-            unique=True,
-            sqlite_where=text("kind = 1"),
-            postgresql_where=text("kind = 1"),
-        ),
+        # may reuse the same name. That "unique only within the template set"
+        # rule can't be a partial unique index (MySQL has none), so it is
+        # enforced in the store (SqlAlchemyAgentStore.create). This plain index
+        # backs the (workspace_id, name, kind) lookup that check and get_by_name
+        # do — kind is included so the seek skips same-named session copies
+        # straight to the template row.
+        Index("ix_agents_name", "workspace_id", "name", "kind", "id"),
     )
 
 
@@ -558,35 +553,29 @@ class SqlConversation(Base):
         # by runner_id (list_conversations_by_runner_id) on every runner
         # reconnect; index it to avoid a full scan.
         Index("ix_conversations_runner_id", "workspace_id", "runner_id", "id"),
-        # Phase 4: partial unique index on (parent_conversation_id,
-        # title) prevents two same-named children under the same
-        # parent (G36 race protection at the DB layer). The
-        # ``sqlite_where`` / ``postgresql_where`` clauses scope the
-        # index so multiple top-level conversations (NULL parent)
-        # remain valid.
-        # MySQL has no partial index, so the WHERE is dropped there and the
-        # unique spans NULL parents too (more restrictive; acceptable).
+        # Unique index on (parent_conversation_id, title) prevents two
+        # same-named children under the same parent (G36 race protection at
+        # the DB layer). Top-level conversations (NULL parent) are exempt
+        # automatically: NULLs are distinct in a unique index, so no WHERE
+        # predicate is needed — keeping it a plain index MySQL can build.
         Index(
             "ix_conversations_parent_title_unique",
             "workspace_id",
             "parent_conversation_id",
             "title",
             unique=True,
-            sqlite_where=text("parent_conversation_id IS NOT NULL"),
-            postgresql_where=text("parent_conversation_id IS NOT NULL"),
             mysql_length={"title": 512},
         ),
-        # Partial composite index for child-session listing
+        # Composite index for child-session listing
         # (list_conversations(kind="sub_agent", parent_conversation_id=...)).
-        # kind = 2 is the "sub_agent" code (enum_codecs.CONVERSATION_KIND).
+        # Non-unique, so no scoping predicate is required; it simply indexes
+        # every parented row rather than only the sub-agent ones.
         Index(
             "idx_conversations_parent",
             "workspace_id",
             "parent_conversation_id",
             text("created_at DESC"),
             text("id DESC"),
-            sqlite_where=text("kind = 2"),
-            postgresql_where=text("kind = 2"),
         ),
     )
 
@@ -929,18 +918,11 @@ class SqlPolicy(Base):
             name="uq_policies_session_id_name_cksum",
         ),
         # Default policies must have unique names; session-scoped policies
-        # may reuse the same name across conversations. Mirrors
-        # ix_agents_template_name scoping to the 'default' set. scope = 1 is
-        # the "default" code. MySQL has no partial index, so the WHERE is
-        # dropped there and the unique spans all scopes (more restrictive).
-        Index(
-            "ix_policies_default_name_cksum",
-            "workspace_id",
-            "name_cksum",
-            unique=True,
-            sqlite_where=text("scope = 1"),
-            postgresql_where=text("scope = 1"),
-        ),
+        # may reuse the same name. That "unique only within the default set"
+        # rule can't be a partial unique index (MySQL has none), so it is
+        # enforced in the store (add_default / update_default). This plain
+        # index just backs the name_cksum lookup those checks perform.
+        Index("ix_policies_name_cksum", "workspace_id", "name_cksum", "id"),
     )
 
 

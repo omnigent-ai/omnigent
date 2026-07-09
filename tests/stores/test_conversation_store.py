@@ -1753,10 +1753,10 @@ def test_create_null_parent_allows_duplicate_titles(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """Top-level conversations (NULL parent) are NOT subject to the unique constraint."""
-    # Both conversations share title=None and parent=None.
-    # The partial index excludes NULL parents, so two NULL-NULL
-    # rows are valid. Without the WHERE clause on the index,
-    # this would raise.
+    # Both conversations share title="" and parent=None. The unique index on
+    # (parent_conversation_id, title) still allows this: a NULL in any indexed
+    # column makes the key distinct, so top-level rows never collide even
+    # without a WHERE predicate.
     a = conversation_store.create_conversation()
     b = conversation_store.create_conversation()
     assert a.id != b.id

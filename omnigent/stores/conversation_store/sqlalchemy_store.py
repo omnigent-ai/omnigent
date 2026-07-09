@@ -701,7 +701,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # session close.
                 return _to_conversation(row)
         except IntegrityError as exc:
-            # Translate the partial-unique-index violation into a
+            # Translate the unique-index violation into a
             # clean exception type the spawn/send tools can map
             # to a name_already_exists tool error. Other integrity
             # violations (FK, check constraints) re-raise.
@@ -714,10 +714,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # check, which would misclassify any future unique
             # constraint added to the conversations table.
             msg = str(exc).lower()
-            is_partial_index_violation = "ix_conversations_parent_title_unique" in msg or (
+            is_title_unique_violation = "ix_conversations_parent_title_unique" in msg or (
                 "unique" in msg and "parent_conversation_id" in msg and "title" in msg
             )
-            if is_partial_index_violation:
+            if is_title_unique_violation:
                 raise NameAlreadyExistsError(
                     f"sub-agent name already exists under parent "
                     f"{parent_conversation_id!r}: title={title!r}"
