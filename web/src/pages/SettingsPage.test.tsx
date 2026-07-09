@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -122,6 +123,7 @@ beforeEach(() => {
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
+  delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 afterEach(() => {
   cleanup();
@@ -132,7 +134,45 @@ afterEach(() => {
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
+  delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
+
+const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
+  mode: "default",
+  autoInstall: true,
+  skippedVersion: null,
+};
+
+function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
+  let onStatus: Parameters<ElectronUpdateBridge["onStatus"]>[0] | null = null;
+  const bridge: ElectronUpdateBridge = {
+    getConfig: vi.fn().mockResolvedValue(config),
+    getStatus: vi.fn().mockResolvedValue({ state: "idle" }),
+    check: vi.fn().mockResolvedValue(undefined),
+    download: vi.fn().mockResolvedValue(undefined),
+    installNow: vi.fn().mockResolvedValue(undefined),
+    setConfig: vi.fn().mockImplementation((patch: Partial<UpdateConfig>) =>
+      Promise.resolve({
+        ...config,
+        ...patch,
+      }),
+    ),
+    onStatus: vi.fn((cb) => {
+      onStatus = cb;
+      return vi.fn();
+    }),
+  };
+  (window as unknown as Record<string, unknown>).omnigentDesktop = {
+    kind: "electron",
+    setBadgeCount: vi.fn(),
+    notify: vi.fn(),
+    updates: bridge,
+  };
+  return {
+    bridge,
+    emitStatus: (status: UpdateStatus) => onStatus?.(status),
+  };
+}
 
 describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
@@ -428,6 +468,26 @@ describe("SettingsPage", () => {
     mocks.loginUrl = null;
     renderPage("/settings/account");
     expect(screen.queryByText("alice")).toBeNull();
+  });
+
+  it("persists an Updates mode change through the desktop bridge", async () => {
+    const { bridge } = installUpdateBridge();
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    const select = screen.getByTestId("color-theme-select") as HTMLSelectElement;
+    expect(select.value).toBe("default");
+    fireEvent.change(select, { target: { value: "manual" } });
+
+    await waitFor(() => {
+      expect(bridge.setConfig).toHaveBeenCalledWith({ mode: "manual" });
+    });
+  });
+
+  it("hides the Updates section outside the Electron shell", () => {
+    renderPage("/settings/updates");
+    expect(screen.queryByRole("heading", { name: "Updates" })).toBeNull();
   });
 
   it("renders the Account section under OIDC (accounts off, login_url set)", async () => {

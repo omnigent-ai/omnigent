@@ -114,6 +114,8 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
+  /** Desktop auto-update bridge, absent on shells older than the updater work. */
+  updates?: ElectronUpdateBridge;
   /** Current server origin + recent servers, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window to a previously-connected server URL. */
@@ -165,6 +167,50 @@ export interface HostActionResult {
   error?: string;
 }
 
+export type UpdateMode = "none" | "manual" | "start" | "default";
+
+export interface UpdateConfig {
+  mode: UpdateMode;
+  autoInstall: boolean;
+  skippedVersion: string | null;
+}
+
+export type UpdateStatus =
+  | {
+      state: "idle" | "checking" | "none";
+      info?: undefined;
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "available" | "downloaded";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "downloading";
+      info?: { version: string; releaseNotes?: string };
+      progress?: { percent: number };
+      lastError?: string;
+    }
+  | {
+      state: "error-security";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    };
+
+export interface ElectronUpdateBridge {
+  getConfig: () => Promise<UpdateConfig>;
+  getStatus: () => Promise<UpdateStatus>;
+  check: () => Promise<void>;
+  download: () => Promise<void>;
+  installNow: () => Promise<void>;
+  setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
+  onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+}
+
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
@@ -191,6 +237,11 @@ function nativeApi(): NativeShellApi | undefined {
 /** True when running inside the Electron desktop shell. */
 export function isElectronShell(): boolean {
   return electronApi() !== undefined;
+}
+
+/** Desktop auto-update bridge, or undefined outside Electron / older shells. */
+export function updateBridge(): ElectronUpdateBridge | undefined {
+  return electronApi()?.updates;
 }
 
 /**

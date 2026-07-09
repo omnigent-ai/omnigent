@@ -15,6 +15,7 @@ import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/fil
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
+  isElectronShell,
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
@@ -54,6 +55,7 @@ import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { ChatHeader } from "./ChatHeader";
+import { UpdateBanner } from "@/components/UpdateBanner";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
@@ -853,8 +855,8 @@ export function AppShell() {
         return next;
       });
     },
-    [setSearchParams],
-  ); // eslint-disable-line react-hooks/exhaustive-deps
+    [clearFileViewerUrl, setSearchParams],
+  );
 
   // Switch the workspace rail's tab. The side effect (closing any open
   // file + its comments + URL) lives here, not in WorkspacePanel, so the
@@ -1154,6 +1156,7 @@ export function AppShell() {
                   }}
                 />
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                  {isElectronShell() && <UpdateBanner />}
                   <Outlet />
                 </main>
 
