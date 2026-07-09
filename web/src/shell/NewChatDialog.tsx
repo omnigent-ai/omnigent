@@ -2279,6 +2279,16 @@ export function NewChatLandingScreen() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeWorktree?.path]);
+  // Re-sync the base branch to the configured default whenever the worktree
+  // popover opens, unless the user has hand-typed one. A same-tab settings
+  // change (Settings › Git) fires no `storage` event and the composer may stay
+  // mounted, so the mount-time seed alone would show a stale value until a
+  // refresh — reading here keeps the field current the next time it's opened.
+  useEffect(() => {
+    if (worktreePopoverOpen && !baseBranchEdited) {
+      _setBaseBranch(readDefaultBaseBranch() ?? "");
+    }
+  }, [worktreePopoverOpen, baseBranchEdited]);
   // True when the session should start directly in the existing worktree:
   // the workspace is a worktree and the branch field still holds its
   // prefilled branch (the user hasn't edited it to request a new worktree).

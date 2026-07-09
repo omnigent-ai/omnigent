@@ -1126,6 +1126,51 @@ describe("NewChatLandingScreen create flow", () => {
     ).toBe("release/2.0");
   });
 
+  it("picks up a changed default when the worktree popover is reopened (no refresh)", () => {
+    // A same-tab Settings change fires no storage event and the composer stays
+    // mounted, so reopening the popover must re-read the current default rather
+    // than show the value seeded at mount.
+    localStorage.setItem("omnigent:default-base-branch", "main");
+    renderLanding();
+    openWorktree();
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/login" },
+    });
+    expect(
+      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
+    ).toBe("main");
+
+    // Close the popover, change the setting (as the Settings page would), reopen.
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    localStorage.setItem("omnigent:default-base-branch", "develop");
+    openWorktree();
+    expect(
+      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
+    ).toBe("develop");
+  });
+
+  it("does not overwrite a user-typed base when the popover is reopened", () => {
+    // The re-sync only applies while the base is still following the default —
+    // a value the user typed must survive a close/reopen unchanged.
+    localStorage.setItem("omnigent:default-base-branch", "main");
+    renderLanding();
+    openWorktree();
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/login" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+      target: { value: "release/2.0" },
+    });
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    localStorage.setItem("omnigent:default-base-branch", "develop");
+    openWorktree();
+    // Still the typed value — not re-synced to the changed default.
+    expect(
+      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
+    ).toBe("release/2.0");
+  });
+
   it("posts the stored default base branch without the user touching the field", async () => {
     localStorage.setItem("omnigent:default-base-branch", "main");
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
