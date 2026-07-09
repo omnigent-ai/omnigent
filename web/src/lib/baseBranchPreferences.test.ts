@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readDefaultBaseBranch, writeDefaultBaseBranch } from "./baseBranchPreferences";
+import {
+  readDefaultBaseBranch,
+  subscribeDefaultBaseBranch,
+  writeDefaultBaseBranch,
+} from "./baseBranchPreferences";
 
 afterEach(() => {
   localStorage.clear();
@@ -51,5 +55,36 @@ describe("baseBranchPreferences", () => {
     });
     expect(() => writeDefaultBaseBranch("main")).not.toThrow();
     expect(readDefaultBaseBranch()).toBeNull();
+  });
+
+  it("notifies subscribers on a same-tab write and stops after unsubscribe", () => {
+    const onChange = vi.fn();
+    const unsubscribe = subscribeDefaultBaseBranch(onChange);
+
+    // A same-tab write fires no `storage` event, so the subscription is the
+    // only way a mounted composer learns of the change.
+    writeDefaultBaseBranch("main");
+    expect(onChange).toHaveBeenCalledTimes(1);
+
+    writeDefaultBaseBranch("develop");
+    expect(onChange).toHaveBeenCalledTimes(2);
+
+    unsubscribe();
+    writeDefaultBaseBranch("release/1.0");
+    // No further calls once unsubscribed.
+    expect(onChange).toHaveBeenCalledTimes(2);
+  });
+
+  it("notifies subscribers on a cross-tab storage event for this key only", () => {
+    const onChange = vi.fn();
+    subscribeDefaultBaseBranch(onChange);
+
+    // Another tab writing this key surfaces as a `storage` event here.
+    window.dispatchEvent(new StorageEvent("storage", { key: "omnigent:default-base-branch" }));
+    expect(onChange).toHaveBeenCalledTimes(1);
+
+    // An unrelated key must not wake the subscriber.
+    window.dispatchEvent(new StorageEvent("storage", { key: "omnigent:something-else" }));
+    expect(onChange).toHaveBeenCalledTimes(1);
   });
 });

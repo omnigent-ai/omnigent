@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -9,6 +9,7 @@ import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
+import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -1126,49 +1127,81 @@ describe("NewChatLandingScreen create flow", () => {
     ).toBe("release/2.0");
   });
 
-  it("picks up a changed default when the worktree popover is reopened (no refresh)", () => {
-    // A same-tab Settings change fires no storage event and the composer stays
-    // mounted, so reopening the popover must re-read the current default rather
-    // than show the value seeded at mount.
-    localStorage.setItem("omnigent:default-base-branch", "main");
-    renderLanding();
-    openWorktree();
-    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-      target: { value: "feature/login" },
-    });
-    expect(
-      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
-    ).toBe("main");
+  // The four rules governing how the Settings › Git default interacts with the
+  // base-branch field while the composer is mounted. `changeSetting` drives the
+  // change through the real writer the Settings page calls, so the same-tab
+  // change notification path is exercised end to end.
+  describe("base-branch default vs. the settings value", () => {
+    const baseInput = () =>
+      screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement;
+    const nameBranch = () =>
+      fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+        target: { value: "feature/login" },
+      });
+    const changeSetting = (value: string) => act(() => writeDefaultBaseBranch(value));
 
-    // Close the popover, change the setting (as the Settings page would), reopen.
-    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
-    localStorage.setItem("omnigent:default-base-branch", "develop");
-    openWorktree();
-    expect(
-      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
-    ).toBe("develop");
-  });
+    // Rule 1: nothing in settings → no auto-fill; the user can type freely and
+    // it doesn't leak anywhere.
+    it("does not auto-fill when nothing is set, and lets the user type freely", () => {
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      expect(baseInput().value).toBe("");
 
-  it("does not overwrite a user-typed base when the popover is reopened", () => {
-    // The re-sync only applies while the base is still following the default —
-    // a value the user typed must survive a close/reopen unchanged.
-    localStorage.setItem("omnigent:default-base-branch", "main");
-    renderLanding();
-    openWorktree();
-    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-      target: { value: "feature/login" },
-    });
-    fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
-      target: { value: "release/2.0" },
+      fireEvent.change(baseInput(), { target: { value: "whatever" } });
+      expect(baseInput().value).toBe("whatever");
+      // The setting is untouched by typing in the composer.
+      expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
     });
 
-    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
-    localStorage.setItem("omnigent:default-base-branch", "develop");
-    openWorktree();
-    // Still the typed value — not re-synced to the changed default.
-    expect(
-      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
-    ).toBe("release/2.0");
+    // Rule 2: user already filled a base → updating the setting must NOT change
+    // the already-filled value.
+    it("keeps a user-filled base when the setting is updated afterward", () => {
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      fireEvent.change(baseInput(), { target: { value: "release/2.0" } });
+
+      changeSetting("develop");
+      expect(baseInput().value).toBe("release/2.0");
+    });
+
+    // Rule 3: branch named but base left empty → updating the setting auto-fills
+    // the base, and the user can still modify it.
+    it("auto-fills an empty base when the setting is updated, still user-editable", () => {
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      expect(baseInput().value).toBe("");
+
+      changeSetting("develop");
+      expect(baseInput().value).toBe("develop");
+
+      // The user can still override the just-filled value.
+      fireEvent.change(baseInput(), { target: { value: "custom" } });
+      expect(baseInput().value).toBe("custom");
+    });
+
+    // Rule 4: once the user has changed the base at all, later setting changes
+    // must never touch it — even if they blank it back out themselves.
+    it("never overwrites the base after the user has edited it", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      // Starts auto-filled from the default...
+      expect(baseInput().value).toBe("main");
+
+      // ...but once the user edits it, the field is theirs.
+      fireEvent.change(baseInput(), { target: { value: "custom" } });
+      changeSetting("develop");
+      expect(baseInput().value).toBe("custom");
+
+      // Even clearing it themselves doesn't re-arm auto-fill.
+      fireEvent.change(baseInput(), { target: { value: "" } });
+      changeSetting("release/3.0");
+      expect(baseInput().value).toBe("");
+    });
   });
 
   it("posts the stored default base branch without the user touching the field", async () => {
