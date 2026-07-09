@@ -37,15 +37,17 @@ def test_scope_column_exists_and_is_not_nullable(db_engine: Engine) -> None:
     assert not columns["scope"]["nullable"], "policies.scope must be NOT NULL"
 
 
-def test_ix_policies_default_name_index_exists(db_engine: Engine) -> None:
-    """The default-name unique index is present after the migration chain.
+def test_ix_policies_name_cksum_index_exists(db_engine: Engine) -> None:
+    """The default-name lookup index is present after the migration chain.
 
-    At head the index keys on ``name_cksum`` (see x1a2b3c4d5e6), not the raw
-    name — the ``_cksum`` name is what survives the full chain.
+    At head the partial unique index (``ix_policies_default_name_cksum``) has
+    been replaced by a plain non-unique ``name_cksum`` index (see
+    z5a2b3c4d5e6); default-name uniqueness lives in the store.
     """
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("policies")}
-    assert "ix_policies_default_name_cksum" in indexes
-    assert indexes["ix_policies_default_name_cksum"]["unique"]
+    assert "ix_policies_default_name_cksum" not in indexes
+    assert "ix_policies_name_cksum" in indexes
+    assert not indexes["ix_policies_name_cksum"]["unique"]
 
 
 def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> None:
