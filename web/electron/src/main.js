@@ -16,6 +16,7 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   Menu,
   Notification,
   clipboard,
@@ -34,6 +35,9 @@ const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { createBrowserViewBoundsController } = require("./browserViewBounds");
+const { registerBrowserIpc } = require("./browserIpc");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -427,6 +431,8 @@ function applyDockIcon() {
  *   so the OS badge aggregates per distinct ORIGIN (not per window — two
  *   windows on the same server report the same number and must not be
  *   double-counted), then sums across origins.
+ * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
+ *   Per-conversation embedded-browser (Phase 2) view registry for this window.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -893,6 +899,8 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination,
     ephemeral,
     badgeCount: 0,
+    // Per-conversation embedded-browser view registry for this window.
+    browserRegistry: createBrowserRegistryForWindow(win),
   });
   if (destination) {
     void win.loadURL(destination);
@@ -965,6 +973,12 @@ function createWindow(targetUrl, opts = {}) {
   // connect. Connecting is an explicit action from the host menu.
 
   win.on("closed", () => {
+    // Destroy this window's embedded-browser views, else they leak webContents.
+    try {
+      windows.get(win)?.browserRegistry?.closeAll("window-closed");
+    } catch {
+      /* registry already torn down */
+    }
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
@@ -1703,6 +1717,64 @@ function isPinnedOriginSender(event) {
   return originOf(event.sender.getURL()) === pinned;
 }
 
+// ---------------------------------------------------------------------------
+// Embedded browser pane
+//
+// The agent's `browser_*` tools drive a native WebContentsView per conversation,
+// positioned over a placeholder the SPA measures. Each window owns its own
+// registry; child views stay sandboxed (nodeIntegration:false, contextIsolation
+// + sandbox true) and detach — not destroy — on hide.
+//
+// SECURITY (Risk-4): `omnigent:browser-execute` runs JS via executeJavaScript;
+// exposed to preload for the relay's fixed templates only, never a generic
+// agent `evaluate`. See preload.js + README.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the per-conversation WebContentsView registry for a shell window
+ * (positions child views in `win.contentView`, pings back via `win.webContents`).
+ *
+ * @param {BrowserWindow} win The shell window that hosts the browser panes.
+ * @returns {ReturnType<typeof createBrowserViewRegistry>}
+ */
+function createBrowserRegistryForWindow(win) {
+  return createBrowserViewRegistry({
+    WebContentsViewCtor: (opts) => new WebContentsView(opts),
+    createBoundsController: createBrowserViewBoundsController,
+    attachToHost: (view) => win.contentView.addChildView(view),
+    detachFromHost: (view) => win.contentView.removeChildView(view),
+    sendToRenderer: (channel, payload) => {
+      try {
+        win.webContents.send(channel, payload);
+      } catch {
+        /* window torn down */
+      }
+    },
+    // Renderer measures in CSS px; convert to window DIPs using the host
+    // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
+    getHostZoomFactor: () => {
+      try {
+        return win.webContents.getZoomFactor();
+      } catch {
+        return 1;
+      }
+    },
+  });
+}
+
+/**
+ * Look up the browser-view registry for the window that sent an IPC event.
+ * Returns null for unknown windows (torn-down / setup-page senders).
+ *
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @returns {ReturnType<typeof createBrowserViewRegistry> | null}
+ */
+function browserRegistryForSender(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  return windows.get(win)?.browserRegistry ?? null;
+}
+
 function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
@@ -2106,6 +2178,14 @@ function registerIpc() {
   // polling) — the server-management module owns the subprocess and reports
   // lifecycle changes here.
   serverManager.onChange(broadcastHostStatus);
+
+  // Embedded browser pane — the `omnigent:browser-*` surface lives in
+  // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  registerBrowserIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    getRegistryForEvent: browserRegistryForSender,
+  });
 }
 
 // ---------------------------------------------------------------------------

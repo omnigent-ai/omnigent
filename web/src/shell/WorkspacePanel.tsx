@@ -1,7 +1,8 @@
-import { BotIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
+import { BotIcon, FileIcon, GlobeIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
@@ -142,6 +143,12 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files tab is available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
+  /**
+   * Whether the Browser tab is available — true only in the Electron shell,
+   * where the embedded WebContentsView exists. Hidden entirely in a plain web
+   * build (no embedded browser to host).
+   */
+  showBrowserTab: boolean;
   /** Count of changed files, shown as the Files tab badge. */
   changedCount: number;
   /**
@@ -226,6 +233,7 @@ export function WorkspacePanel({
   rightRailTab,
   onRightRailTabChange,
   showFilesPanel,
+  showBrowserTab,
   changedCount,
   showShellsTab,
   terminalsLength,
@@ -370,6 +378,15 @@ export function WorkspacePanel({
                 </span>
               </TabsTrigger>
             )}
+            {showBrowserTab && (
+              <TabsTrigger
+                value="browser"
+                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+              >
+                <GlobeIcon className="size-4" />
+                Browser
+              </TabsTrigger>
+            )}
           </TabsList>
         </Tabs>
         {openFiles.length > 0 && (
@@ -423,6 +440,12 @@ export function WorkspacePanel({
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
           />
+        ) : rightRailTab === "browser" && showBrowserTab ? (
+          // Embedded browser (Electron only). BrowserPane self-gates on
+          // isElectronShell() and measures its container to position the native
+          // WebContentsView; here that container is the rail's content slot, so
+          // the page fills the rail. Empty state until the agent navigates.
+          <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
         ) : rightRailTab === "todos" && isClaudeNative ? (

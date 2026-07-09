@@ -807,6 +807,28 @@ export interface SessionSupersededEvent {
   reason: "clear";
 }
 
+/**
+ * `browser.action_request` — the agent's `browser_*` MCP tool asked the
+ * desktop shell to run a browser action (navigate / snapshot / click / type /
+ * screenshot) against this conversation's embedded WebContentsView.
+ *
+ * The AP route parks a server-side Future and publishes this event on the
+ * conversation's stream; every connected renderer sees it, but the embedded
+ * browser relay (`useBrowserAgentRelay`) CLAIMS the action first (an atomic
+ * check-and-set on the AP) and only the winning renderer executes it, then
+ * POSTs the result back with its claim token. Non-Electron renderers ignore
+ * the event entirely (the hook is gated on `isElectronShell()`).
+ */
+export interface BrowserActionRequestEvent {
+  type: "browser_action_request";
+  /** Server-minted id; echoed on claim + result to resolve the parked Future. */
+  actionId: string;
+  /** The bare verb: "navigate" | "snapshot" | "click" | "type" | "screenshot". */
+  action: string;
+  /** Action-specific args (url, ref, selector, text, …); shape validated per-action. */
+  args: Record<string, unknown>;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -858,4 +880,5 @@ export type StreamEvent =
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
   | SessionModelOptionsEvent
-  | SessionPresenceEvent;
+  | SessionPresenceEvent
+  | BrowserActionRequestEvent;

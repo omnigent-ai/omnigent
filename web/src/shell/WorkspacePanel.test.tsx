@@ -53,6 +53,7 @@ function renderWorkspace(
       rightRailTab={overrides.rightRailTab ?? "files"}
       onRightRailTabChange={onRightRailTabChange}
       showFilesPanel
+      showBrowserTab={false}
       changedCount={0}
       showShellsTab={false}
       terminalsLength={0}

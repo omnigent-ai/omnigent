@@ -1176,6 +1176,10 @@ interface SessionLayoutProps {
  * Inside a conversation: wraps the chat surface. The terminals panel
  * and right rail are managed by AppShell and rendered outside this
  * component as flex siblings.
+ *
+ * The embedded browser pane (Phase 2) is NOT here — it lives as the "Browser"
+ * tab inside the right Workspace rail (WorkspacePanel), so it never floats as a
+ * mid-page column.
  */
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (

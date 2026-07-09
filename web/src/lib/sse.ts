@@ -9,6 +9,7 @@
 // catch — please add an SSE-parser test when you touch this.
 
 import type {
+  BrowserActionRequestEvent,
   ClientTaskCancel,
   CompactionCompleted,
   CompactionFailed,
@@ -756,6 +757,27 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       viewers,
     } satisfies SessionPresenceEvent;
+  }
+
+  // Embedded-browser action request (Phase 2). The agent's browser_* MCP tool
+  // parked a Future on the AP; this event asks the desktop relay to execute the
+  // action against the conversation's WebContentsView. Ignored by non-Electron
+  // renderers (the relay hook is gated on isElectronShell()).
+  if (eventType === "browser.action_request") {
+    const actionId = data.action_id;
+    const action = data.action;
+    if (typeof actionId !== "string" || !actionId) return null;
+    if (typeof action !== "string" || !action) return null;
+    const rawArgs = data.args;
+    return {
+      type: "browser_action_request",
+      actionId,
+      action,
+      args:
+        rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+          ? (rawArgs as Record<string, unknown>)
+          : {},
+    } satisfies BrowserActionRequestEvent;
   }
 
   // MCP-shape elicitation request.

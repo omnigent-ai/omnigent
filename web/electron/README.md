@@ -118,13 +118,16 @@ one `web` bundle works both in a browser and under Electron.
 
 ```
 electron/
-  package.json        # Electron + electron-builder deps and build config
-  src/main.js         # main process: window, settings, menu, IPC, badge, notify
-  src/preload.js      # contextBridge: window.omnigentDesktop + omnigentSetup
-  src/find_preload.js # contextBridge for the find bar: window.omnigentFind
-  setup/index.html    # the bundled "connect to server" setup page
-  find/index.html     # the bundled find-in-page bar (Cmd/Ctrl+F)
-  icons/              # app icons
+  package.json             # Electron + electron-builder deps and build config
+  src/main.js              # main process: window, settings, menu, IPC, badge, notify
+  src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
+  src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
+  src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
+  src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
+  src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
+  setup/index.html         # the bundled "connect to server" setup page
+  find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
+  icons/                   # app icons
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -164,6 +167,121 @@ dismisses.
   - The microphone permission grant is likewise scoped: only the audio set,
     only for pages on an origin some window is pinned to, and only when the
     requesting page is the top-level page — everything else is denied.
+
+## Embedded browser pane (Phase 2)
+
+The desktop shell hosts an **agent-driven embedded browser**: the agent's
+`browser_*` MCP tools (navigate / snapshot / click / type / screenshot) drive a
+real Chromium page the user can watch live. A webview/iframe can't provide
+screenshots, arbitrary in-page JS, or cross-origin navigation, so each browser
+is a native Electron **`WebContentsView`** positioned over a placeholder `<div>`
+the SPA measures — not an in-page element.
+
+**Pieces:**
+
+- `src/browserViewRegistry.js` — a per-**conversation** `Map` of
+  `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
+  and **detaches (does not destroy)** the previous one, so a background
+  conversation's page keeps running when the user switches away; views are
+  destroyed only on explicit close or window teardown. Each child view keeps
+  `nodeIntegration:false, contextIsolation:true, sandbox:true`.
+- `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
+  window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
+- `src/main.js` — instantiates one registry **per shell window** and injects it
+  (plus the `isPinnedOriginSender` trust gate) into `registerBrowserIpc(...)`.
+- `src/browserIpc.js` — the whole `ipcMain.handle('omnigent:browser-*')` surface,
+  extracted out of `main.js` so that file stays bounded:
+  `open-or-navigate`, `set-active`, `resize`, `screenshot`
+  (`capturePage().toPNG()` → base64), `execute`, `has-view`, `close`, plus the
+  toolbar handlers `go-back`, `go-forward`, `reload`, and `open-devtools`
+  (toggle, docked bottom), plus the design-mode handlers
+  `enable-design-mode` / `disable-design-mode` / `signal-design-result`
+  (inject / tear down the in-page element picker and paint result feedback).
+  Every handler is gated on `isPinnedOriginSender` (only
+  the connected server's own page may drive the views) and resolves the *sender
+  window's own* registry, so one window can never manipulate another's panes.
+  On view creation it also wires `did-navigate` / `did-navigate-in-page`
+  listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
+  so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
+  clicks, agent navigation) instead of going stale.
+- `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
+  `Execute/Close` + `browserHasView`, the toolbar methods
+  `browserGoBack/GoForward/Reload` + `openBrowserDevTools`, the design-mode
+  methods `browserEnableDesignMode/DisableDesignMode/SignalDesignResult`, and the
+  subscriptions `onBrowserViewCreated` / `onBrowserHostActiveChanged` /
+  `onBrowserViewClosed` / `onBrowserUrlChanged` / `onBrowserNavState` +
+  `onBrowserElementSelected` / `onBrowserElementPromptSubmit` /
+  `onBrowserElementPromptDismiss` to `window.omnigentDesktop`, each a thin
+  `ipcRenderer.invoke` / `ipcRenderer.on`.
+- Renderer side (in `web/src`): `hooks/useBrowserAgentRelay.ts` receives the
+  `browser.action_request` SSE event, **claims** the action on the server
+  (atomic check-and-set so two windows on one server can't double-execute),
+  runs it via the preload bridge, and POSTs the result back with its claim
+  token; `components/BrowserPane/BrowserPane.tsx` measures the placeholder and
+  keeps the native view positioned over it. Both self-gate on
+  `isElectronShell()`, so a plain browser tab is inert (the action times out on
+  the server with a clean "is the desktop app open?" error).
+
+**First-navigate activation.** The first `browser_navigate` on a conversation
+creates the view **detached** (nothing is active yet), so no
+`browser-host-active-changed` fires. The registry therefore also emits a
+`browser-view-created` event on create; `BrowserPane` listens for it (and
+probes `browserHasView` on remount), mounts its measuring placeholder, and
+calls `browserSetActive(conversationId)` — which attaches the view and starts
+bounds sync. Without this signal the pane would gate itself off forever and the
+embedded browser would stay invisible. (`browserViewRegistry.test.js` locks the
+create-signal → setActive → attached transition.)
+
+**Toolbar.** When a view is attached, `BrowserPane` renders a user-facing
+toolbar above the page: back / forward / reload, a DevTools toggle, and an
+editable URL bar (Enter navigates; the typed value is normalized to add a
+scheme — dotless corp shortnames like `go/foo` get `http://`, everything else
+`https://`). The bar reflects the *real* URL via `onBrowserUrlChanged`, but
+never overwrites what the user is actively typing. The pane is a flex **column**:
+the toolbar is a fixed-height row *above* the measured container, because the
+native `WebContentsView` paints over that container's rect — a toolbar inside it
+would be hidden by the overlay. The URL bar reuses the existing
+`browserOpenOrNavigate(..., {force:true})` path (the same one the relay uses), so
+no separate navigation IPC exists for manual entry.
+
+**Design mode (point-and-prompt).** A toolbar toggle (next to DevTools) injects
+an in-page element picker into the `WebContentsView` via `executeJavaScript`:
+hovering highlights the element under the cursor (overlay + `<Component>`/tag
+label); clicking opens a popup anchored to that element with an input + Send.
+On Send the popup emits a `console.log` marker (the injected script can't
+`require('electron')`), which the per-view console-message listener in
+`browserIpc.js` forwards to the SPA as `browser-element-prompt-submit`
+(carrying the element info; a cropped element screenshot arrives on the earlier
+`browser-element-selected` event). **There is no backend
+design-edit route** — `AppShell` (where the relay is hoisted, so it's listening
+even when the Browser tab isn't mounted) builds a `[Design Mode — …]` prompt,
+attaches the screenshot as a `File`, and sends it through the *normal* chat
+path (`chatStore.send`, targeting the conversation's own bound agent). It then
+calls `browserSignalDesignResult` so the popup paints green/red feedback. The
+picker markers are `__omni_element_select__` / `__omni_element_prompt_submit__`
+/ `__omni_element_dismiss__`, and the per-view
+console listener is stored on the registry entry
+(`designModeListener` / `designModeWebContents`) so `browserViewRegistry`'s
+`close()` detaches it on teardown. Electron-only (needs `executeJavaScript` +
+the native view); no server flag.
+
+**Risk-4 — JS trust boundary (important):** `omnigent:browser-execute` runs
+arbitrary JS in the child view via `executeJavaScript(js, true)`. It is exposed
+to the SPA **only for the relay's own fixed templates** (the DOM-snapshot walk,
+and the click / type element resolvers) — there is deliberately **no
+agent-facing generic `evaluate`**. This keeps the *agent* boundary: the agent
+picks elements by `ref`/`selector` and supplies text, but never ships a raw JS
+string that main will run. (It does not, and is not intended to, defend against
+XSS *within* the visited page — that page runs its own scripts in its own
+sandboxed view regardless.) Preserve this when extending the bridge: add typed,
+argument-shaped actions, not a passthrough JS channel.
+
+**Availability.** The embedded browser is always on in this build — the
+agent-side `browser_*` tools are registered whenever the AP/runner is running,
+and this shell machinery activates the moment a `browser.action_request`
+arrives. No flag to enable it. Outside the Electron shell (a plain browser tab)
+the renderer half is inert, so the tools fail cleanly with a "is the desktop
+app open?" error rather than hanging.
 
 ## Prerequisites
 
