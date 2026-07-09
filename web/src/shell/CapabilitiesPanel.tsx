@@ -7,7 +7,7 @@
 // opening a sub-agent re-fetches and shows THAT agent's capabilities.
 // Read-only — no add / edit / remove controls here.
 //
-// A single panel-level "Only in scope" toggle (default on) governs the
+// A single panel-level "Only show usable" toggle (default on) governs the
 // whole view: it hides skills / tools the agent cannot actually use and,
 // when off, reveals them with explanatory badges. Sub-agents are never
 // gated by it.
@@ -75,7 +75,7 @@ export function CapabilitiesPanel({ conversationId }: CapabilitiesPanelProps) {
       <div className="flex items-center gap-2 border-b border-border px-2.5 py-2">
         <Switch id={toggleId} size="sm" checked={onlyInScope} onCheckedChange={setOnlyInScope} />
         <label htmlFor={toggleId} className="cursor-pointer text-[11px] text-muted-foreground">
-          Only in scope
+          Only show usable
         </label>
       </div>
 

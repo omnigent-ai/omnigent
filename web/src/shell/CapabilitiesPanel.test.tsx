@@ -85,9 +85,9 @@ function renderPanel(
   render(<CapabilitiesPanel conversationId="conv_1" />);
 }
 
-/** Grab the panel-level "Only in scope" toggle switch. */
+/** Grab the panel-level "Only show usable" toggle switch. */
 function scopeToggle(): HTMLElement {
-  return screen.getByRole("switch", { name: /only in scope/i });
+  return screen.getByRole("switch", { name: /only show usable/i });
 }
 
 describe("CapabilitiesPanel loading / error states", () => {
