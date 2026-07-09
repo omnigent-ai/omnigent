@@ -1,0 +1,156 @@
+name: Performance Benchmark
+
+# Nightly run of the HTTP user-journey performance benchmark
+# (dev/benchmarks/omnigent). Seeds a sizeable corpus, boots a real server
+# against it, drives the journeys, and uploads the JSON report as an artifact.
+# Runs a backend matrix — SQLite (in-process) and Postgres (a service
+# container, matching prod's Lakebase/Postgres round-trip + pooling profile).
+# A workspace Databricks notebook pulls these artifacts via the GitHub API into
+# a Delta table for the trend dashboard (see dev/benchmarks/omnigent/README.md)
+# — so this workflow only produces artifacts; it never touches Databricks.
+#
+# Scheduled -> runs on the trusted default branch with the repo GITHUB_TOKEN;
+# it reads no PR-authored code. Also dispatchable for an ad-hoc run.
+
+on:
+  schedule:
+    - cron: "37 7 * * *" # 07:37 UTC nightly (off-peak, off the :00 mark)
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Sequential operations per latency run"
+        required: false
+        default: "200"
+      runs:
+        description: "Timed runs per journey"
+        required: false
+        default: "3"
+      sessions:
+        description: "Seeded sessions"
+        required: false
+        default: "5000"
+      items_per_session:
+        description: "Seeded items per session"
+        required: false
+        default: "50"
+
+permissions:
+  contents: read
+
+env:
+  # No web SPA build during `uv sync` (setup.py _build_web_ui): this job never
+  # serves the bundle, and the build otherwise times out on public npm.
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+  ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '200' }}
+  RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
+  SESSIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.sessions || '5000' }}
+  ITEMS: ${{ github.event_name == 'workflow_dispatch' && inputs.items_per_session || '50' }}
+
+concurrency:
+  # Never cancel a scheduled run mid-flight (each is a distinct data point);
+  # coalesce manual dispatches per ref.
+  group: benchmark-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  benchmark:
+    name: Run benchmark (${{ matrix.backend }})
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, postgres]
+    services:
+      # A Postgres service is defined unconditionally (GitHub Actions has no
+      # per-matrix-value service gating), but only the postgres leg connects to
+      # it — the sqlite leg simply ignores it. postgres:16 mirrors Lakebase's
+      # major version.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: bench
+          POSTGRES_DB: benchdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # `databricks` extra carries psycopg[binary] for the Postgres backend.
+        run: uv sync --extra dev --extra databricks
+
+      # Resolve the DB URI + a stable seed-cache key for this backend. The
+      # cache key binds the DB schema head + seed.py contents + corpus config,
+      # so a schema change or seed edit busts the cache and forces a reseed —
+      # the "you changed the schema, refresh the seed" contract (SQLite only;
+      # the Postgres service is fresh each run so its DB is never cached).
+      - name: Resolve DB target
+        id: db
+        run: |
+          HEAD="$(uv run --no-sync dev/benchmarks/omnigent/seed.py --print-head)"
+          if [[ "${{ matrix.backend }}" == "postgres" ]]; then
+            echo "uri=postgresql+psycopg://postgres:bench@localhost:5432/benchdb" >> "$GITHUB_OUTPUT"
+            echo "cache_path=" >> "$GITHUB_OUTPUT"
+          else
+            echo "uri=sqlite:///$PWD/bench.db" >> "$GITHUB_OUTPUT"
+            echo "cache_path=bench.db" >> "$GITHUB_OUTPUT"
+          fi
+          echo "cache_key=benchdb-${{ matrix.backend }}-$HEAD-${SESSIONS}x${ITEMS}-${{ hashFiles('dev/benchmarks/omnigent/seed.py') }}" >> "$GITHUB_OUTPUT"
+
+      # Reuse a previously-seeded SQLite corpus when schema + seed + config are
+      # unchanged. No-op for the postgres leg (empty path).
+      - name: Restore seeded SQLite corpus
+        if: matrix.backend == 'sqlite'
+        id: seedcache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v4
+        with:
+          path: ${{ steps.db.outputs.cache_path }}
+          key: ${{ steps.db.outputs.cache_key }}
+
+      - name: Seed corpus
+        # Postgres always seeds (fresh service each run); SQLite seeds only on a
+        # cache miss. seed.py is itself idempotent, so a stray hit is harmless.
+        if: matrix.backend == 'postgres' || steps.seedcache.outputs.cache-hit != 'true'
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/seed.py \
+            --database-uri "${{ steps.db.outputs.uri }}" \
+            --sessions "$SESSIONS" --items-per-session "$ITEMS"
+
+      - name: Run benchmark
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/run.py \
+            --database-uri "${{ steps.db.outputs.uri }}" \
+            --iterations "$ITERATIONS" \
+            --runs "$RUNS" \
+            --output "benchmark-results-${{ matrix.backend }}.json"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: benchmark-results-${{ matrix.backend }}-${{ github.run_id }}
+          path: benchmark-results-${{ matrix.backend }}.json
+          retention-days: 90
+          if-no-files-found: warn
