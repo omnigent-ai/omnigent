@@ -81,6 +81,19 @@ _WS_CLOSE_INTERNAL_ERROR: Final[int] = 1011
 _PARTIAL_INTERVAL_S: Final[float] = 0.15
 
 
+#: Strong references to in-flight take closes. asyncio keeps only a weak
+#: reference to a running task, so a close scheduled as its request task is
+#: cancelled could otherwise be garbage-collected before it runs.
+_pending_closes: set[asyncio.Task[None]] = set()
+
+
+def _close_finished(task: asyncio.Task[None]) -> None:
+    """Drop the strong ref and surface a failed close instead of warning."""
+    _pending_closes.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _logger.warning("dictation take failed to close", exc_info=task.exception())
+
+
 def create_dictation_router(
     *,
     auth_provider: AuthProvider | None = None,
@@ -136,14 +149,28 @@ def create_dictation_router(
                     await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
                 return
             # The take MUST be closed on every exit — normal stop, abrupt
-            # browser disconnect, or a crash mid-send. An unclosed remote
-            # take would hold a worker capacity slot forever.
+            # browser disconnect, or a crash mid-send. An unclosed remote take
+            # holds a worker capacity slot until the worker's own ping timeout
+            # reaps it (~20s), so closing promptly matters under concurrency.
             try:
                 await websocket.send_text(json.dumps({"type": "ready"}))
                 await _pump_dictation(websocket, handle)
             finally:
+                # Close must survive cancellation. An ASGI server cancels this
+                # task on shutdown, and CancelledError is a BaseException that
+                # contextlib.suppress(Exception) does not catch — so a plain
+                # `await asyncio.to_thread(handle.close)` here races the
+                # cancellation and skips the close about half the time.
+                # Creating the task before the first await point guarantees the
+                # close is scheduled; shield keeps it running while the
+                # cancellation propagates through us. (A vanished browser is
+                # also reaped by the ASGI server's ping timeout, ~20s; this
+                # releases the take promptly and explicitly instead.)
+                closing = asyncio.create_task(asyncio.to_thread(handle.close))
+                _pending_closes.add(closing)  # strong ref: the loop keeps only a weak one
+                closing.add_done_callback(_close_finished)
                 with contextlib.suppress(Exception):
-                    await asyncio.to_thread(handle.close)
+                    await asyncio.shield(closing)
 
     return router
 

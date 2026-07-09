@@ -150,9 +150,9 @@ class DictationStreamHandle(Protocol):
     def close(self) -> None:
         """Release the take's resources without flushing (client vanished).
 
-        Idempotent, and safe after :meth:`finish`. Critical for the
-        remote engine, where an unclosed take holds a worker capacity
-        slot forever.
+        Idempotent, and safe after :meth:`finish`. Matters most for the
+        remote engine: an unclosed take keeps a worker capacity slot
+        until the worker's ping timeout reaps the socket (~20s).
         """
         ...
 
