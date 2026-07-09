@@ -97,6 +97,7 @@ def _looks_like_missing_file(message: str) -> bool:
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+_AGENT_METHOD_SESSION_CANCEL = "session/cancel"
 
 # Notifications sent *from* the agent to the client.
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -872,6 +873,63 @@ class GooseExecutor(Executor):
         if isinstance(usage.get("totalTokens"), int):
             out["total_tokens"] = usage["totalTokens"]
         return out or None
+
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
+        """Interrupt a running Goose turn, making the web Stop button functional.
+
+        Sends the ACP ``session/cancel`` notification to request a clean stop —
+        Goose ends the in-flight ``session/prompt`` with a ``cancelled`` stop
+        reason, which the ``run_turn`` loop then surfaces as a partial result.
+        ``session/cancel`` is a notification (no ``id``, no reply), so it's sent
+        via ``_send`` rather than ``_rpc``. If no session has been established
+        yet (still in the initialize/session-new handshake) or the send fails,
+        falls back to SIGTERM on the subprocess so the turn always terminates.
+
+        Returns True when any interrupt action was taken (cancel sent or process
+        signalled), False when there is no live process to interrupt.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+
+        session_id = self._session_id
+        if session_id is not None:
+            # Preferred path: ask Goose to cancel cleanly over ACP. The agent
+            # doesn't reply to the notification; it ends the running prompt with
+            # a cancelled stop reason, which run_turn observes.
+            try:
+                await self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": _AGENT_METHOD_SESSION_CANCEL,
+                        "params": {"sessionId": session_id},
+                    }
+                )
+                logger.info("goose interrupt: sent session/cancel for session=%s", session_id)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "goose interrupt: session/cancel failed for session=%s (%s); "
+                    "falling back to SIGTERM",
+                    session_id,
+                    exc,
+                )
+
+        # Fallback: SIGTERM the subprocess (mirrors KimiExecutor).
+        return self._interrupt_proc()
+
+    def _interrupt_proc(self) -> bool:
+        """Send SIGTERM to the goose subprocess, returning True if signalled.
+
+        Safe to call at any time — no-ops when the process has already exited.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+            return True
+        return False
 
     async def run_turn(
         self,
