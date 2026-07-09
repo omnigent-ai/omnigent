@@ -27,6 +27,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from omnigent.db.compression import CompressedText
+
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
@@ -131,7 +133,7 @@ class SqlAgent(Base):
     # AGENT_KIND: template=1, session=2). The store converts to/from the
     # string name at the row↔entity boundary.
     kind: Mapped[int] = mapped_column(SmallInteger)
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
@@ -500,13 +502,13 @@ class SqlConversation(Base):
     # NULL when no policy has written state yet; empty JSON object
     # "{}" is equivalent. Stored as Text (not a native JSON column)
     # for SQLite compatibility.
-    session_state: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-serialized cumulative LLM token usage for policy
     # callables. Shape: {"input_tokens": N, "output_tokens": M,
     # "total_tokens": T, "cache_read_input_tokens": C1,
     # "cache_creation_input_tokens": C2, "total_cost_usd": X}.
     # NULL when no LLM calls have been recorded yet.
-    session_usage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Pass-through CLI args for a native terminal wrapper (claude /
     # codex), JSON-encoded list of strings, e.g.
     # '["--dangerously-skip-permissions"]'. NULL for non-native
@@ -516,7 +518,7 @@ class SqlConversation(Base):
     # here. A flat list (not a dict) is deliberate: there is no key for
     # a user to smuggle internal wiring through. See
     # designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
-    terminal_launch_args: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Absolute path on the host where the runner cd's. Required
     # when host_id is set; CHECK constraint below. When a git worktree
     # was created for the session, this is the worktree directory path.
@@ -781,13 +783,13 @@ class SqlComment(Base):
     path: Mapped[str] = mapped_column(String(4096))
     start_index: Mapped[int] = mapped_column(Integer)
     end_index: Mapped[int] = mapped_column(Integer)
-    body: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(CompressedText)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # COMMENT_STATUS: draft=1, addressed=2).
     status: Mapped[int] = mapped_column(SmallInteger)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(BigInteger)
-    anchor_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (

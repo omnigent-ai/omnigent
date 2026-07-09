@@ -307,3 +307,26 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
         ).one()
         assert result.host_id is None
         assert result.workspace == "/Users/corey/projects/cli-launched"
+
+
+def test_compressed_columns_are_binary_at_head(db_engine: Engine) -> None:
+    """
+    Verify the opaque text columns are binary (``BLOB``/``BYTEA``) at head.
+
+    These columns are stored zstd-compressed by ``omnigent.db.compression``;
+    the compression codec writes raw bytes, so a regression that left any of
+    them as ``TEXT`` would corrupt values on a NUL-rejecting backend
+    (PostgreSQL) the moment a compressed payload contained a NUL byte.
+    """
+    inspector = sa.inspect(db_engine)
+    expected = {
+        "conversations": ["session_usage", "session_state", "terminal_launch_args"],
+        "comments": ["body", "anchor_content"],
+        "agents": ["description"],
+    }
+    for table, columns in expected.items():
+        types = {c["name"]: c["type"] for c in inspector.get_columns(table)}
+        for column in columns:
+            assert isinstance(types[column], sa.LargeBinary), (
+                f"{table}.{column} should be binary at head, got {types[column]!r}."
+            )
