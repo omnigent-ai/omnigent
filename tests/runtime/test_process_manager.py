@@ -98,6 +98,66 @@ async def test_get_client_respawns_only_when_model_changes(
         await final.client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_get_client_any_sentinel_never_respawns_on_model_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``"any"`` sentinel reuses the live subprocess, model env or not.
+
+    ``"any"`` is the harness-agnostic key steering / cancel / interrupt pass
+    to reach an already-running subprocess without knowing its real harness.
+    It carries no harness of its own, so the model-change check must skip it:
+    if that check ever ran a real key lookup and saw a mismatch it would drop
+    the entry and then raise ``NoLiveHarnessError`` on the ``"any"`` branch,
+    turning a harmless reuse call into a mid-turn crash. This drives exactly
+    that shape (a live entry plus an ``"any"`` call whose env carries the
+    running harness's model key set to a *different* model) and asserts it
+    stays a plain cache hit.
+
+    :param monkeypatch: Pytest monkeypatch fixture used to mock the
+        subprocess-spawn boundary.
+    """
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    spawns: list[str | None] = []
+    closes: list[str | None] = []
+
+    async def _fake_spawn(conv: str, harness: str, env: dict[str, str] | None) -> _SubprocessEntry:
+        model = (env or {}).get(_model_env_key(harness))
+        spawns.append(model)
+        return _SubprocessEntry(
+            process=_AliveProc(),  # type: ignore[arg-type]  # stand-in process
+            client=httpx.AsyncClient(),
+            endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake.sock")),
+            harness=harness,
+            model=model,
+        )
+
+    async def _fake_close(entry: _SubprocessEntry) -> None:
+        closes.append(entry.model)
+        await entry.client.aclose()
+
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+
+    conv, harness = "conv_any", "claude-sdk"
+    key = _model_env_key(harness)  # HARNESS_CLAUDE_SDK_MODEL
+
+    first = await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})  # spawn opus
+    # ``"any"`` reuse whose env carries a DIFFERENT model for the running
+    # harness. This must not respawn and must not raise NoLiveHarnessError.
+    reused = await pm.get_client(conv, "any", env={key: "claude-sonnet-4-6"})
+
+    assert spawns == ["claude-opus-4-6"], spawns  # no second spawn
+    assert closes == [], closes  # nothing torn down
+    assert reused is first  # same live client handed back
+
+    final = pm._entries.get(conv)
+    if final is not None:
+        await final.client.aclose()
+
+
 def test_build_harness_spawn_env_strips_binding_token_with_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
