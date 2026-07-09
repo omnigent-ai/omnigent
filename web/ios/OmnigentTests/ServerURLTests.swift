@@ -27,3 +27,17 @@ final class ServerURLTests: XCTestCase {
     }
   }
 }
+
+final class AppPrivacyInfoTests: XCTestCase {
+  func testPrivacyUsageDescriptionsArePresent() throws {
+    for key in [
+      "NSCameraUsageDescription",
+      "NSMicrophoneUsageDescription",
+      "NSSpeechRecognitionUsageDescription",
+    ] {
+      let value = try XCTUnwrap(Bundle.main.object(forInfoDictionaryKey: key) as? String)
+
+      XCTAssertFalse(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+  }
+}
