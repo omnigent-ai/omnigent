@@ -42,6 +42,14 @@ import yaml
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_plugins import (
+    accepted_harnesses,
+    missing_install_packages,
+    valid_harnesses,
+)
+from omnigent.harness_plugins import (
+    harness_aliases as registry_harness_aliases,
+)
 
 if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
@@ -87,10 +95,14 @@ OMNIGENT_HARNESSES = frozenset(
         "codex-native",
         "copilot",
         "cursor",
+        "kimi",
+        "kimi-native",
         "cursor-native",
+        "kiro-native",
         "goose",
         "goose-native",
         "hermes",
+        "hermes-native",
         "openai-agents",
         "open-responses",
         "opencode-native",
@@ -104,19 +116,30 @@ OMNIGENT_HARNESSES = frozenset(
 OMNIGENT_HARNESS_ALIASES = frozenset(
     {
         "claude",
+        "native-kiro",
         "native-pi",
         "native-antigravity",
         "native-goose",
         "openai-agents-sdk",
         "agy",
         "google-antigravity",
+        "kimi-code",
         "qwen-code",
         "opencode",
         "native-opencode",
+        "native-hermes",
         "github-copilot",
+        "native-kimi",
     }
 )
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES
+
+# Dynamic registry overlay. The literals above remain as readable documentation
+# for the built-in set, while the exported constants reflect installed
+# community harness plugins.
+OMNIGENT_HARNESSES = valid_harnesses()
+OMNIGENT_HARNESS_ALIASES = frozenset(registry_harness_aliases())
+_OMNIGENT_ACCEPTED_HARNESSES = accepted_harnesses()
 
 
 # Top-level YAML keys that identify an omnigent single-file
@@ -169,9 +192,14 @@ def validate_omnigent_executor(
             f"must be one of {sorted(_OMNIGENT_ACCEPTED_HARNESSES)}",
         )
     elif canonicalize_harness(harness) not in OMNIGENT_HARNESSES:
+        package = missing_install_packages().get(harness) or missing_install_packages().get(
+            canonicalize_harness(harness) or harness
+        )
+        install_hint = f"; install `{package}` to add this harness" if package else ""
         result.add(
             "executor.config.harness",
-            f"must be one of {sorted(_OMNIGENT_ACCEPTED_HARNESSES)}, got {harness!r}",
+            f"must be one of {sorted(_OMNIGENT_ACCEPTED_HARNESSES)}, got {harness!r}"
+            f"{install_hint}",
         )
 
 

@@ -697,9 +697,12 @@ async def test_single_in_flight_guard_skips_second_interaction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interaction_done_callback_clears_slot() -> None:
+async def test_interaction_done_callback_clears_slot(monkeypatch: pytest.MonkeyPatch) -> None:
     """When an interaction task completes, the slot clears so a later distinct
     interaction can fire."""
+    # The clear now ALSO re-scans the freshest steps (#1472); keep that a no-op here
+    # so this test stays focused on slot-clearing + the manual re-fire.
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [])
     state = reader._ReaderState(
         allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
@@ -736,6 +739,279 @@ async def test_interaction_done_callback_clears_slot() -> None:
     assert second is not None
     await second
     assert len(fired) == 2  # the slot cleared, so the second interaction fired
+    await _drain_interactions(state)  # settle the no-op re-scans both clears scheduled
+
+
+async def _drain_interactions(state: reader._ReaderState) -> None:
+    """Await the interaction bridge + any chained re-scan tasks to quiescence.
+
+    A cleared bridge schedules a re-scan (#1472) that may spawn the next bridge,
+    whose clear re-scans again; this awaits each link (letting done-callbacks run
+    between rounds) so a test ends with no pending interaction tasks. Bounded so a
+    bug that keeps respawning surfaces as a test hang in CI rather than an infinite
+    loop here.
+    """
+    for _ in range(10):
+        inflight = [
+            task
+            for task in (state.interaction_task, *state.interaction_rescans)
+            if task is not None and not task.done()
+        ]
+        if not inflight:
+            return
+        await asyncio.gather(*inflight, return_exceptions=True)
+        await asyncio.sleep(0)  # let each done-callback schedule the next link
+
+
+@pytest.mark.asyncio
+async def test_clear_slot_resurfaces_deferred_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bridge clearing re-scans and surfaces a gate the guard DEFERRED (#1472).
+
+    Models a chained ``a && b`` command where each segment is permission-gated: the
+    first gate surfaces and is answered; the second arrives while the first bridge
+    is still finishing and is skipped by the single-in-flight guard. On the stream
+    path no further frame carries it, so the clear's re-scan is what surfaces it.
+    """
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    gate1 = _load("run_command_waiting")  # stepIndex 6 (the `pwd` segment)
+    gate2 = copy.deepcopy(gate1)  # a distinct later gate (the `ls` segment)
+    gate2["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
+    gate2["runCommand"]["commandLine"] = "ls"
+    # The freshest snapshot the re-scan re-reads. gate1 still reads WAITING here —
+    # the dedup-race case: its verdict landed but the DONE transition has not yet
+    # propagated to the snapshot, so ``state.interacted`` (not status) is what stops
+    # it re-firing. gate2 is the newly-arrived, deferred gate.
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1, gate2])
+
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    reader._maybe_handle_interaction(
+        gate1,
+        key=reader._step_key(gate1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    first = state.interaction_task
+    assert first is not None
+    await first
+    await asyncio.sleep(0)  # let _clear_slot run → schedule the re-scan
+    await _drain_interactions(state)  # re-scan surfaces gate2 → its bridge fires
+
+    assert fired == [6, 8]  # gate1 directly; gate2 via the clear's re-scan
+    assert reader._step_key(gate1) in state.interacted  # gate1 was not re-surfaced
+    assert reader._step_key(gate2) in state.interacted
+
+
+@pytest.mark.asyncio
+async def test_clear_slot_rescan_empty_then_stream_frame_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case B (#1472 review): the clear's re-scan finds NOTHING because gate-2 is
+    not WAITING yet (agy must run segment 1 first). The re-scan must then leave the
+    slot OPEN so gate-2's later live stream frame surfaces it directly — proving the
+    single-shot re-scan does not strand a gate that arrives after it runs.
+    """
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    gate1 = _load("run_command_waiting")  # stepIndex 6
+    gate1_done = copy.deepcopy(gate1)  # answered → DONE, no longer WAITING
+    gate1_done["status"] = "CORTEX_STEP_STATUS_DONE"
+    gate1_done.pop("requestedInteraction", None)
+    gate2 = copy.deepcopy(gate1)  # the next segment — arrives only LATER
+    gate2["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
+    gate2["runCommand"]["commandLine"] = "ls"
+    # Re-scan snapshot: gate-1 resolved (DONE), gate-2 not present yet → the re-scan
+    # surfaces nothing and must leave the slot open.
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1_done])
+
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    reader._maybe_handle_interaction(
+        gate1,
+        key=reader._step_key(gate1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    first = state.interaction_task
+    assert first is not None
+    await first
+    await _drain_interactions(state)  # re-scan runs, finds no pending gate
+
+    assert fired == [6]  # only gate-1 so far
+    assert state.interaction_task is None  # slot OPEN — re-scan neither hung nor held it
+
+    # gate-2 now arrives as a live stream frame: with the slot open the guard passes
+    # and it surfaces directly (the backstop that makes the single-shot re-scan safe).
+    reader._maybe_handle_interaction(
+        gate2,
+        key=reader._step_key(gate2),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    second = state.interaction_task
+    assert second is not None
+    await second
+    await _drain_interactions(state)
+
+    assert fired == [6, 8]  # gate-2 surfaced via the live frame, not lost
+
+
+@pytest.mark.asyncio
+async def test_rescan_skips_auto_allowed_step_and_surfaces_next_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ALREADY-ALLOWED segment in a chain (e.g. ``rm a && echo hi && rm b`` with
+    ``echo`` auto-allowed) runs WITHOUT a gate — a DONE step with no
+    ``requestedInteraction`` — so it must be transparent to the re-scan: skipped (not
+    surfaced), and the NEXT real gate after it still surfaces. Guards the edge case
+    where not every chained command is permission-gated.
+    """
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    gate1 = _load("run_command_waiting")  # stepIndex 6 — the `rm a` gate
+    gate1_done = copy.deepcopy(gate1)
+    gate1_done["status"] = "CORTEX_STEP_STATUS_DONE"
+    gate1_done.pop("requestedInteraction", None)
+    allowed = copy.deepcopy(gate1)  # the auto-allowed `echo hi` — ran, NEVER gated
+    allowed["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 7
+    allowed["runCommand"]["commandLine"] = "echo hi"
+    allowed["status"] = "CORTEX_STEP_STATUS_DONE"
+    allowed.pop("requestedInteraction", None)  # no interaction → never a delivery target
+    gate2 = copy.deepcopy(gate1)  # the next real gate `rm b`
+    gate2["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
+    gate2["runCommand"]["commandLine"] = "rm b"
+    # Re-scan snapshot: gate-1 resolved, the allowed command DONE (no gate), gate-2 WAITING.
+    monkeypatch.setattr(
+        reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1_done, allowed, gate2]
+    )
+
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    reader._maybe_handle_interaction(
+        gate1,
+        key=reader._step_key(gate1),
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    first = state.interaction_task
+    assert first is not None
+    await first
+    await _drain_interactions(state)
+
+    assert fired == [6, 8]  # gate-1, then gate-2 — the allowed step (7) was NEVER surfaced
+    assert reader._step_key(allowed) not in state.interacted  # not an interaction at all
+
+
+@pytest.mark.asyncio
+async def test_resurface_pending_interaction_swallows_poll_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-scan whose steps re-read fails on EVERY bounded attempt is logged and
+    swallowed, not raised — and the read is retried, not given up after one shot
+    (#1472 review: the re-scan is the sole backstop on the healthy-stream path)."""
+    calls = 0
+
+    def _boom(_port: int, _cascade_id: str) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("refused")
+
+    async def _noop_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _boom)
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)  # no real backoff in the test
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    # Must not raise despite the read failing on every attempt.
+    await reader._resurface_pending_interaction(
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+
+    assert calls == reader._INTERACTION_RESCAN_POLL_ATTEMPTS  # retried, not one-shot
+    assert fired == []  # no gate surfaced
+    assert state.interaction_task is None  # no bridge spawned
+
+
+@pytest.mark.asyncio
+async def test_resurface_pending_interaction_retries_transient_poll_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TRANSIENT re-scan poll error is retried and the deferred gate STILL surfaces
+    on a later attempt (#1472 review): the re-scan is the only backstop on the
+    healthy-stream path, so it must not abandon the gate after one failed read."""
+    gate = _load("run_command_waiting")  # stepIndex 6 — the deferred gate
+    failed_once = False
+
+    def _flaky(_port: int, _cascade_id: str) -> list[dict[str, Any]]:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise httpx.ConnectError("refused")  # transient blip on the first read
+        return [gate]
+
+    async def _noop_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _flaky)
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)  # no real backoff in the test
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    fired: list[int] = []
+
+    async def _quick(_cascade_id: str, _port: int, pending: PendingInteraction) -> None:
+        fired.append(pending["step_index"])
+
+    await reader._resurface_pending_interaction(
+        cascade_id=_CASCADE_ID,
+        state=state,
+        on_pending_interaction=cast(Any, _quick),
+    )
+    await _drain_interactions(state)
+
+    assert failed_once  # the first read raised and was retried, not abandoned
+    assert fired == [6]  # the gate surfaced despite the transient blip
 
 
 @pytest.mark.asyncio
@@ -770,6 +1046,278 @@ async def test_reader_teardown_cancels_in_flight_interaction(
 
     assert len(tasks) == 1  # the bridge started
     assert tasks[0].cancelled()  # reader teardown cancelled it
+
+
+# ---------------------------------------------------------------------------
+# #1200 direction 2: withdraw a surfaced elicitation resolved out-of-band
+# ---------------------------------------------------------------------------
+
+
+def _capturing_client() -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
+    """Build a real AsyncClient over a MockTransport that records every POST body.
+
+    ``_post_external_elicitation_resolved`` calls ``client.post`` directly (not
+    the post-retry sink), so a withdraw test needs a usable client. The transport
+    captures the JSON body of each POST and answers 200 so the reader proceeds.
+    """
+    captured: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.content:
+            captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(_handler))
+    return client, captured
+
+
+def _permission_waiting() -> dict[str, Any]:
+    """A WAITING command-permission step (the #1200 fixture)."""
+    return _load("run_command_waiting")
+
+
+def _permission_done() -> dict[str, Any]:
+    """The same permission step advanced to DONE (answered/timed out → no WAITING).
+
+    Built from the WAITING fixture by flipping the status and dropping the
+    ``requestedInteraction`` block, so ``pending_interaction`` returns ``None`` —
+    exactly what the reader sees once the step leaves WAITING.
+    """
+    step = copy.deepcopy(_load("run_command_waiting"))
+    step["status"] = "CORTEX_STEP_STATUS_DONE"
+    step.pop("requestedInteraction", None)
+    return step
+
+
+@pytest.mark.asyncio
+async def test_step_leaving_waiting_withdraws_surfaced_elicitation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A surfaced WAITING step that later is NOT WAITING → withdraw the web card.
+
+    Models the terminal-answered / timed-out case: the reader surfaces the
+    permission elicitation, then on a later poll the step is DONE (no
+    ``requestedInteraction``). The reader must POST exactly one
+    ``external_elicitation_resolved`` for that step's deterministic elicitation id
+    so the lingering web card clears (#1200, direction 2).
+    """
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    done = _permission_done()
+    # WAITING twice (surface + dedup), then DONE (withdraw), then steady DONE.
+    script = _StepScript([[waiting], [waiting], [done], [done]])
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", script)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        # Simulate a long-poll await that the terminal answer / timeout will
+        # short-circuit — it never returns a verdict here.
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(4),
+            ),
+            timeout=5.0,
+        )
+
+    # Exactly one withdraw was posted, for THIS step's deterministic id.
+    expected_traj = waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"]
+    expected_idx = waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"]
+    expected_id = agy_elicitation_id(_CASCADE_ID, expected_traj, expected_idx)
+    withdraws = [body for body in captured if body.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+    assert withdraws[0]["data"]["elicitation_id"] == expected_id
+
+
+@pytest.mark.asyncio
+async def test_still_waiting_does_not_withdraw(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A still-WAITING step is NOT withdrawn (the interaction is still live)."""
+    waiting = _permission_waiting()
+    script = _StepScript([[waiting], [waiting], [waiting]])
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", script)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(3),
+            ),
+            timeout=5.0,
+        )
+
+    withdraws = [body for body in captured if body.get("type") == "external_elicitation_resolved"]
+    assert withdraws == []
+
+
+@pytest.mark.asyncio
+async def test_withdraw_posts_at_most_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Even across many DONE re-reads, the withdraw is posted exactly once.
+
+    The dedup lives in ``surfaced_elicitations`` (popped on first withdraw), so a
+    steady-state poll that keeps returning the DONE step must not re-post.
+    """
+    waiting = _permission_waiting()
+    done = _permission_done()
+    script = _StepScript([[waiting], [done], [done], [done], [done]])
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _RaisingStream(httpx.ConnectError("stream disabled for poll test")),
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", script)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(5),
+            ),
+            timeout=5.0,
+        )
+
+    withdraws = [body for body in captured if body.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+
+
+@pytest.mark.asyncio
+async def test_withdraw_helper_pops_and_posts_once_directly() -> None:
+    """Unit-level: ``_maybe_withdraw_interaction`` posts once then no-ops.
+
+    Drives the helper directly with a surfaced id so the pop/no-double-post
+    contract is asserted without the full supervise loop.
+    """
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    done = _permission_done()
+    key = reader._step_key(waiting)
+    eid = agy_elicitation_id(
+        _CASCADE_ID,
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"],
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
+    )
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    state.surfaced_elicitations[key] = eid
+    client, captured = _capturing_client()
+
+    async with client:
+        # First call on a DONE step → posts the withdraw and pops the entry.
+        await reader._maybe_withdraw_interaction(
+            done, key=key, client=client, session_id=_SESSION_ID, state=state
+        )
+        # Second call → entry gone, no further post.
+        await reader._maybe_withdraw_interaction(
+            done, key=key, client=client, session_id=_SESSION_ID, state=state
+        )
+
+    assert key not in state.surfaced_elicitations
+    withdraws = [b for b in captured if b.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+    assert withdraws[0]["data"]["elicitation_id"] == eid
+
+
+@pytest.mark.asyncio
+async def test_withdraw_helper_noop_while_still_waiting() -> None:
+    """``_maybe_withdraw_interaction`` does nothing while the step is still WAITING."""
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    key = reader._step_key(waiting)
+    eid = agy_elicitation_id(
+        _CASCADE_ID,
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"],
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
+    )
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=_PORT,
+    )
+    state.surfaced_elicitations[key] = eid
+    client, captured = _capturing_client()
+
+    async with client:
+        await reader._maybe_withdraw_interaction(
+            waiting, key=key, client=client, session_id=_SESSION_ID, state=state
+        )
+
+    # Still WAITING → entry retained, nothing posted.
+    assert state.surfaced_elicitations.get(key) == eid
+    assert captured == []
 
 
 # ---------------------------------------------------------------------------
@@ -1434,6 +1982,61 @@ async def test_stream_waiting_frame_invokes_callback_once(
     assert port == _PORT
     assert pending["kind"] == "ask_question"
     assert pending["trajectory_id"] == _CASCADE_ID
+
+
+@pytest.mark.asyncio
+async def test_stream_waiting_then_non_waiting_withdraws_elicitation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Over the STREAM path too, a WAITING step that goes DONE withdraws the card.
+
+    Confirms #1200 direction 2 is covered on the stream-primary path, not just the
+    poll fallback (a permission answered in the TUI / timed out surfaces as a
+    DONE frame after the WAITING frame).
+    """
+    from omnigent.antigravity_native_interactions import agy_elicitation_id
+
+    waiting = _permission_waiting()
+    done = _permission_done()
+    frames = [_frame([waiting]), _frame([done]), _frame([done])]
+    sink = _PostSink()
+    client, captured = _capturing_client()
+
+    monkeypatch.setattr(reader, "stream_agent_state_updates", _FrameScript(frames))
+    monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    async def _on_pending(_cascade_id: str, _port: int, _pending: PendingInteraction) -> None:
+        await asyncio.Event().wait()
+
+    async with client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, _on_pending),
+                poll_interval_s=0.0,
+                stop=_stop_after(1),
+            ),
+            timeout=5.0,
+        )
+
+    expected_id = agy_elicitation_id(
+        _CASCADE_ID,
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["trajectoryId"],
+        waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
+    )
+    withdraws = [b for b in captured if b.get("type") == "external_elicitation_resolved"]
+    assert len(withdraws) == 1
+    assert withdraws[0]["data"]["elicitation_id"] == expected_id
 
 
 # ---------------------------------------------------------------------------

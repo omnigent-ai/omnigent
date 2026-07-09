@@ -11,6 +11,12 @@ resources:
   - sandbox-clusterrole.yaml
   - sandbox-clusterrolebinding.yaml
 
+# Use the server image variant that includes the openshell SDK extra
+# (built by CI with OMNIGENT_EXTRAS=openshell).
+images:
+  - name: ghcr.io/omnigent-ai/omnigent-server
+    newName: ghcr.io/omnigent-ai/omnigent-server-openshell
+
 patches:
   - path: configmap-patch.yaml
   - path: secret-patch.yaml

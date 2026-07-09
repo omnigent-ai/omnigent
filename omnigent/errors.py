@@ -113,3 +113,22 @@ class OmnigentError(Exception):
             Defaults to 500 for unknown codes.
         """
         return _CODE_TO_HTTP_STATUS.get(self.code, 500)
+
+
+class ElicitationDeclinedError(Exception):
+    """Raised when a user explicitly declines an elicitation (action == "decline").
+
+    Distinct from a timeout or cancel: the user made an active choice to
+    refuse. Callers that park on an ASK gate raise this instead of
+    returning ``False`` so the turn loop can abort cleanly rather than
+    feeding a DENY message to the LLM and letting it continue.
+
+    :param message: Human-readable description, typically the policy
+        reason that triggered the elicitation.
+    :param policy_name: Name of the deciding policy, e.g.
+        ``"intent_based_authorization"``. ``None`` when not available.
+    """
+
+    def __init__(self, message: str = "", *, policy_name: str | None = None) -> None:
+        super().__init__(message)
+        self.policy_name = policy_name

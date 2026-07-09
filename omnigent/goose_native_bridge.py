@@ -25,10 +25,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from omnigent._platform import stable_user_id
+
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_GOOSE_NATIVE_BRIDGE_DIR"
 
-_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "goose-native"
+_BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "goose-native"
 _TMUX_FILE = "tmux.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
@@ -350,3 +352,41 @@ def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) 
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+
+
+def capture_goose_pane(bridge_dir: Path) -> str | None:
+    """Return the visible Goose pane text, or ``None`` if the TUI is not running.
+
+    Used by the runner-side approval mirror
+    (:mod:`omnigent.goose_native_permissions`) to detect Goose's in-terminal
+    ``cliclack`` tool-approval prompt. ``None`` (no advertised tmux target, or a
+    dead pane) is distinct from ``""`` (a live but empty capture).
+
+    :param bridge_dir: The goose-native bridge dir holding ``tmux.json``.
+    :returns: The captured pane text, or ``None`` when no live pane exists.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return None
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    if not _session_alive(socket_path, tmux_target):
+        return None
+    return _capture_pane(socket_path, tmux_target)
+
+
+def send_goose_pane_keys(bridge_dir: Path, *keys: str) -> None:
+    """Send one or more keys to the Goose pane (tmux ``send-keys``).
+
+    Used by the approval mirror to drive Goose's ``cliclack`` select from a web
+    verdict, e.g. ``"Enter"`` to choose the highlighted "Allow" or ``"Down"`` to
+    move to "Deny". Each key is a tmux key name/argument (not bracketed-paste
+    data), so multi-byte keys like ``"Enter"`` / ``"Down"`` are interpreted.
+
+    :param bridge_dir: The goose-native bridge dir holding ``tmux.json``.
+    :param keys: tmux key arguments, e.g. ``"Down"`` or ``"Enter"``.
+    :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        raise RuntimeError("goose-native tmux target not advertised")
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)

@@ -1589,3 +1589,153 @@ async def test_multipart_create_with_unknown_parent_404s(
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 404, resp.text
+
+
+async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str, Any]:
+    """
+    Create a claude-native sub-agent child under a fresh parent.
+
+    :param client: The test HTTP client.
+    :param name: Unique parent agent name for this test.
+    :returns: The created child session JSON.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name=name,
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "impl:task-1",
+            "sub_agent_name": "impl",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    return child_resp.json()
+
+
+async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-agent ``idle`` whose direct forward 503s is re-delivered via recovery.
+
+    Reproduces the production hang's server edge: the child's pinned runner is
+    gone (direct ``_forward_session_change_to_runner`` returns ``None``), so the
+    terminal-status branch must invoke
+    ``_recover_subagent_status_forward_via_parent`` and, when it lands, accept
+    the event (``202`` — the parent gets the child result) instead of the old
+    hard ``503`` that left the parent hanging.
+    """
+    child = await _create_native_child(client, name="orch-recover-ok")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Child's pinned runner is unreachable — the direct forward fails."""
+        return
+
+    recovered_for: list[str] = []
+
+    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        """Stand in for recovery: record the child and report a delivered 202."""
+        recovered_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    # 202 Accepted is the endpoint's success code; the body confirms the event
+    # was handled (not the old 503 that stranded the parent).
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    # Recovery was invoked for THIS child (the stale-binding heal path).
+    assert recovered_for == [child["id"]]
+
+
+async def test_subagent_background_task_waiting_delivers_to_parent_as_idle(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sub-agent's background-task ``waiting`` still delivers terminal status.
+
+    Regression for the parent-orchestrator hang: a claude-native sub-agent
+    relabels its ``Stop`` turn-end ``idle`` to ``waiting`` when a background
+    shell lingers. The terminal-delivery branch only fires for
+    ``idle``/``failed``, so an un-collapsed ``waiting`` would skip delivery and
+    the parent would wait forever. The server must collapse the sub-agent's
+    background-task ``waiting`` to ``idle`` so delivery (here, the recovery
+    path) still runs for the child.
+    """
+    child = await _create_native_child(client, name="orch-bg-waiting")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Force the direct forward to miss so delivery takes the recovery path."""
+        return
+
+    recovered_for: list[str] = []
+
+    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        recovered_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "waiting", "background_task_count": 1},
+        },
+    )
+
+    # Delivery fired despite the incoming `waiting`: the collapse to `idle`
+    # let the terminal-status branch run for THIS child (recovery invoked,
+    # 202 Accepted) instead of silently skipping and stranding the parent.
+    assert resp.status_code == 202, resp.text
+    assert recovered_for == [child["id"]]
+
+
+async def test_subagent_idle_forward_503s_when_recovery_also_fails(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When recovery cannot reach a live parent runner either, the 503 is preserved.
+
+    The runner re-posts on a 503, so failing here (rather than acking a
+    delivery that never happened) keeps the at-least-once contract intact.
+    """
+    child = await _create_native_child(client, name="orch-recover-fail")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Both the direct forward and (below) recovery cannot reach a runner."""
+        return
+
+    async def _recover_none(*_args: Any, **_kwargs: Any) -> None:
+        """Recovery also fails to resolve a live parent runner."""
+        return
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_none
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 503, resp.text

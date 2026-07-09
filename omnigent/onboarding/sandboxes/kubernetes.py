@@ -81,7 +81,7 @@ _logger = logging.getLogger(__name__)
 HOST_IMAGE_ENV_VAR: str = "OMNIGENT_KUBERNETES_HOST_IMAGE"
 """Environment variable overriding
 :data:`~omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE` for Kubernetes
-sandbox Pods (amd64-only)."""
+sandbox Pods (published multi-arch: amd64 + arm64)."""
 
 NAMESPACE_ENV_VAR: str = "OMNIGENT_KUBERNETES_NAMESPACE"
 """Environment variable naming the namespace sandbox Pods are created in.
@@ -487,8 +487,8 @@ def build_pod_manifest(
       (runAsNonRoot as the image's ``sandbox`` user :data:`_RUN_AS_UID`, drop ALL
       caps, ``seccompProfile: RuntimeDefault``, no privilege escalation). The
       root filesystem stays writable (the host writes ``/tmp`` + ``~/.omnigent``).
-    - ``kubernetes.io/arch: amd64`` is always enforced (the host image is
-      amd64-only) and CANNOT be overridden by *node_selector*.
+    - ``kubernetes.io/arch: amd64`` is the default; a *node_selector* entry for
+      that key overrides it (e.g. ``arm64`` — the host image is multi-arch).
 
     :param pod_name: DNS-label-safe Pod name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Pod is created in.
@@ -504,7 +504,8 @@ def build_pod_manifest(
     :param env_literals: Literal name → value env entries (the resolved
         server-env passthrough). Secrets ride *harness_secret*, not this map.
     :param node_selector: Extra node selector labels, or ``None``. Merged with
-        the mandatory amd64 constraint, which always wins.
+        a default ``kubernetes.io/arch: amd64``; an operator-supplied
+        ``kubernetes.io/arch`` entry overrides the default.
     :param workspace: Absolute workspace root created by the init container.
     :param clone_dir: Directory the clone lands in, or ``None`` for no clone.
     :param repo_url: Repository clone URL, or ``None`` for an empty workspace.
@@ -562,9 +563,10 @@ def build_pod_manifest(
         "restartPolicy": "Never",
         "automountServiceAccountToken": False,
         "serviceAccountName": service_account,
-        # arch spread LAST so the amd64 invariant always wins — an operator
-        # "kubernetes.io/arch" key cannot drop it (the host image is amd64-only).
-        "nodeSelector": {**(node_selector or {}), "kubernetes.io/arch": "amd64"},
+        # amd64 default first so existing deployments keep their placement; an
+        # operator "kubernetes.io/arch" entry overrides it (e.g. arm64 nodes —
+        # the host image is published multi-arch).
+        "nodeSelector": {"kubernetes.io/arch": "amd64", **(node_selector or {})},
         "securityContext": {
             "runAsNonRoot": True,
             "runAsUser": _RUN_AS_UID,
@@ -776,8 +778,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             literal env. ``None`` resolves :data:`SANDBOX_ENV_PASSTHROUGH_ENV_VAR`.
         :param secret_name: Kubernetes Secret to project via ``envFrom``.
             ``None`` resolves :data:`SANDBOX_SECRET_ENV_VAR` then no Secret.
-        :param node_selector: Extra node selector labels merged with the
-            mandatory ``kubernetes.io/arch: amd64`` constraint.
+        :param node_selector: Extra node selector labels merged with a default
+            ``kubernetes.io/arch: amd64``; a ``kubernetes.io/arch`` entry here
+            overrides the default (e.g. ``arm64``).
         :param service_account: ServiceAccount Pods run as. ``None`` resolves
             :data:`SERVICE_ACCOUNT_ENV_VAR` then :data:`_DEFAULT_SERVICE_ACCOUNT`.
         :param kubeconfig: Kubeconfig path for the out-of-cluster fallback.

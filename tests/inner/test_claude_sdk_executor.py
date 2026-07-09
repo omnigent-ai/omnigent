@@ -758,6 +758,21 @@ class TestConstructor(unittest.TestCase):
 
             self.assertEqual(paths, [config_path])
 
+    def test_claude_internal_write_files_includes_credentials_when_present(self):
+        from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            config_path = home / ".claude.json"
+            config_path.write_text("{}\n", encoding="utf-8")
+            credentials_path = home / ".claude" / ".credentials.json"
+            credentials_path.parent.mkdir(parents=True, exist_ok=True)
+            credentials_path.write_text("{}\n", encoding="utf-8")
+            with patch("omnigent.inner.claude_sdk_executor.pathlib.Path.home", return_value=home):
+                paths = _claude_internal_write_files()
+
+            self.assertEqual(paths, [config_path, credentials_path])
+
 
 # ---------------------------------------------------------------------------
 # Tests: MCP tool building
@@ -1175,6 +1190,96 @@ class TestSystemMessages(unittest.TestCase):
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("authentication failed", events[0].message)
             self.assertIn("401", events[0].message)
+            # Non-gateway executor should suggest checking CLI login, not databrickscfg
+            self.assertIn("claude /status", events[0].message)
+            self.assertNotIn("databrickscfg", events[0].message)
+
+        _run(_t())
+
+    def test_auth_retry_databricks_gateway_mentions_databrickscfg(self):
+        """Databricks-profile gateway auth errors should mention ~/.databrickscfg."""
+        from claude_agent_sdk.types import (
+            ClaudeAgentOptions as SDKClaudeAgentOptions,
+        )
+        from claude_agent_sdk.types import (
+            StreamEvent as SDKStreamEvent,
+        )
+        from claude_agent_sdk.types import (
+            SystemMessage as SDKSystemMessage,
+        )
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        class _Sentinel:
+            pass
+
+        class _FakeSDK:
+            AssistantMessage = _Sentinel
+            ResultMessage = _Sentinel
+            UserMessage = _Sentinel
+            SystemMessage = SDKSystemMessage
+            StreamEvent = SDKStreamEvent
+            ClaudeAgentOptions = SDKClaudeAgentOptions
+            messages = [
+                SDKSystemMessage(
+                    subtype="api_retry",
+                    data={
+                        "type": "system",
+                        "subtype": "api_retry",
+                        "attempt": 1,
+                        "max_retries": 10,
+                        "retry_delay_ms": 500,
+                        "error_status": 401,
+                        "error": "authentication_failed",
+                    },
+                )
+            ]
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            # Create a gateway executor that uses a Databricks profile path.
+            # gateway=True + no host/base_url overrides → _gateway_uses_databricks_profile is True.
+            # Patch _resolve_gateway_env to avoid needing a real ~/.databrickscfg.
+            with patch(
+                "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
+                return_value={
+                    "ANTHROPIC_BASE_URL": "https://host/ai-gateway/anthropic",
+                    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
+                    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                    "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token ...",
+                },
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hello"}],
+                        [],
+                        "",
+                    )
+                ]
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertIn("authentication failed", events[0].message)
+            # Databricks gateway should mention databrickscfg
+            self.assertIn("databrickscfg", events[0].message)
 
         _run(_t())
 
@@ -2863,6 +2968,119 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
     assert turn.usage["total_tokens"] == 1050, (
         f"total_tokens {turn.usage.get('total_tokens')} != 1050 (800+250) — total must "
         "be the cumulative input + output for billing."
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_tokens_emitted_when_turn_ends_without_result_message() -> None:
+    """A turn that never reaches ``ResultMessage`` still reports ``context_tokens``.
+
+    ``context_tokens`` (context-window fill) is normally assembled in the
+    ``ResultMessage`` branch at successful completion. But a turn can end the
+    stream without a ``ResultMessage`` — the CLI can close the stream early,
+    or the turn can be cut short before its final usage is reported. Before
+    this fix the executor yielded ``TurnComplete(usage=None)`` in that case,
+    so the occupancy meter froze at the previous successful turn's value and
+    showed a misleadingly low fill exactly when a session was in trouble
+    (#1533).
+
+    The per-call prompt size is already observed mid-turn from each
+    ``message_start`` event, so when no ``ResultMessage`` arrives the executor
+    must fall back to that observed usage and still emit ``context_tokens``.
+
+    Regression guard: pre-fix ``turn.usage`` is ``None`` here because the
+    stream carries only a ``message_start`` and then stops.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    class _Sentinel:
+        pass
+
+    # The turn opens one API call (carrying its prompt usage) and then the
+    # stream simply ends — no ResultMessage, mirroring an early CLI stream
+    # close or a turn cut short before final usage is reported.
+    message_start = SDKStreamEvent(
+        uuid="u1",
+        session_id="s1",
+        event={
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 400,
+                    "cache_read_input_tokens": 9000,
+                    "cache_creation_input_tokens": 100,
+                }
+            },
+        },
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [message_start]  # note: no ResultMessage
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None, (
+        "TurnComplete.usage is None on a turn that ended without a ResultMessage — "
+        "the observed message_start prompt usage was discarded, so the occupancy "
+        "meter freezes at the last successful turn's value (#1533)."
+    )
+
+    # context_tokens = the observed prompt = input + cache_creation + cache_read
+    # (400 + 100 + 9000), so a failed/early-ending turn still refreshes fill.
+    assert turn.usage["context_tokens"] == 9500, (
+        f"context_tokens {turn.usage.get('context_tokens')} != 9500 (400+100+9000) — "
+        "an incomplete turn must report context_tokens from the last observed "
+        "message_start prompt so the occupancy meter does not freeze."
+    )
+    # output_tokens is unknown on an incomplete turn, so it is reported as 0
+    # rather than guessed; the meaningful field here is context_tokens.
+    assert turn.usage["output_tokens"] == 0, (
+        f"output_tokens {turn.usage.get('output_tokens')} != 0 — output is unknown "
+        "on an incomplete turn and must not be fabricated."
+    )
+    assert "model" in turn.usage, (
+        "TurnComplete.usage is missing the 'model' key on the incomplete-turn path."
     )
 
 

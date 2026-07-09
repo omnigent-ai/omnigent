@@ -161,6 +161,16 @@ def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
             if val is not None:
                 usage[dst] = val
                 break
+    # cursor's inputTokens is INCLUSIVE of cache read + write. compute_llm_cost
+    # expects input_tokens to be the NON-cached portion and prices the cache
+    # buckets additively, so subtract the cached tokens here — otherwise they
+    # are billed twice (once at the full input rate, once at their cache rate).
+    # Mirrors the qwen / antigravity executors. Clamp so a malformed cached >
+    # input never goes negative. total_tokens keeps the reported inclusive total.
+    cached = (usage.get("cache_read_input_tokens") or 0) + (
+        usage.get("cache_creation_input_tokens") or 0
+    )
+    usage["input_tokens"] = max(0, in_tok - cached)
     return usage
 
 
@@ -406,15 +416,14 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     hooks_dir.mkdir(parents=True, exist_ok=True)
     hooks_file = hooks_dir / "hooks.json"
 
-    # Write a wrapper script that sets env vars and execs the hook.
+    # Write a wrapper script that sets env vars and execs the hook. It bakes a
+    # one-shot auth token + workspace-routing header, so it is owner-only
+    # (0o700) — the secret is never world-readable.
+    from omnigent.native_policy_hook import policy_hook_wrapper_script
+
     wrapper = hooks_dir / "omnigent-hook.sh"
-    wrapper.write_text(
-        f"#!/bin/sh\n"
-        f"export _OMNIGENT_SERVER_URL='{server_url}'\n"
-        f"export _OMNIGENT_SESSION_ID='{session_id}'\n"
-        f"exec '{sys.executable}' '{hook_script_path}'\n"
-    )
-    wrapper.chmod(0o755)
+    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.chmod(0o700)
     command = str(wrapper)
     config = {
         "version": 1,
@@ -661,9 +670,12 @@ class CursorExecutor(Executor):
         try:
             from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
         except ImportError as exc:
+            from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
+            from omnigent.onboarding.extra_install import extra_install_display
+
             raise ImportError(
                 "CursorExecutor requires the 'cursor-sdk' package. "
-                "Install it with: uv pip install cursor-sdk"
+                f"Install it with: {extra_install_display(CURSOR_EXTRA)}"
             ) from exc
 
         loop = asyncio.get_running_loop()

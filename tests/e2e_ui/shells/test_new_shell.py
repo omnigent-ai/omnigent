@@ -3,14 +3,14 @@
 The right rail's Shells tab shows by default whenever the session agent
 declares a non-empty ``terminals:`` block — its empty state carries a
 virtual "+ New shell" row (``NewTerminalButton`` in
-``ap-web/src/shell/NewTerminalButton.tsx``). With a single declared
+``web/src/shell/NewTerminalButton.tsx``). With a single declared
 terminal name the row creates the shell directly on click (no dropdown),
 POSTing ``/resources/terminals`` and handing the new terminal's tab key
 to ``onExpand``, which opens it in the main column via
 ``MainTerminalView``. None of this needs an LLM turn — the user, not the
 agent, launches the shell — so these tests never send a chat message.
 
-Two behaviors are covered:
+Three behaviors are covered:
 
 1. **"+ New shell" launches and opens a shell.** Clicking the row creates
    a ``zsh`` shell and replaces the main session view with it: the
@@ -26,6 +26,10 @@ Two behaviors are covered:
    ``files/test_right_panel.py`` only checks ``data-state``), and reading
    it back via a file side-effect proved environment-fragile (the shell's
    cwd and the filesystem-API root coincide locally but not on CI).
+
+3. **The opened shell card lines up with the workspace rail.** The
+   expanded card and the rail both clear the 56px chat header, so their
+   top edges must agree; a clearance mismatch is asserted geometrically.
 
 Both use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
@@ -134,3 +138,38 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     # "terminal session ended". A regression that drops user input or kills
     # the PTY on first keystroke would flip this out of ``connected``.
     expect(terminal_view).to_have_attribute("data-state", "connected")
+
+
+def test_expanded_shell_card_top_aligns_with_workspace_rail(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """The expanded shell card's top edge lines up with the workspace rail.
+
+    Both panels clear the same 56px absolute chat header: the terminal card
+    via ``pt-14`` on ``MainTerminalView``'s wrapper, the rail via ``mt-14``
+    on its ``<aside>``. When the two clearances disagree (the old ``pt-16``
+    left the card 8px lower than the rail) the panel tops read as visibly
+    ragged. Assert the two top edges agree within a hairline tolerance so a
+    future clearance drift is caught geometrically, not just by eye.
+    """
+    base_url, session_id = terminal_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    main_terminal = page.get_by_test_id("main-terminal-view")
+    expect(main_terminal).to_be_visible(timeout=60_000)
+
+    # The bordered card is the wrapper's only child; its top edge is what
+    # the eye reads as the "top of the middle box". The rail's ``<aside>``
+    # is itself the floating card, so its own top edge is the comparison.
+    card = main_terminal.locator("> div").first
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail).to_be_visible()
+
+    card_top = card.evaluate("el => el.getBoundingClientRect().top")
+    rail_top = rail.evaluate("el => el.getBoundingClientRect().top")
+    assert abs(card_top - rail_top) <= 2, (
+        f"terminal card top {card_top}px vs workspace rail top {rail_top}px "
+        "— the expanded shell card is not aligned with the rail"
+    )

@@ -23,11 +23,6 @@ read/control transport only (``StreamAgentStateUpdates`` /
 ``GetAllCascadeTrajectories`` / ``CancelCascadeSteps`` /
 ``HandleCascadeUserInteraction``). The same path serves mid-turn steering.
 
-.. note:: The now-unused RPC-delivery helpers below
-   (``_resolve_ready_cascade_id`` / ``_resolve_plan_model`` / ``_wait_for_state``
-   and the model-resolution module functions) are retained pending a focused
-   follow-up cleanup; the live write path is :meth:`_deliver` → the TUI inject.
-
 Because agy owns its own model loop and emits output via the read path, this
 executor:
 
@@ -53,8 +48,9 @@ stay informational on this write path — agy's own model selection determines t
 turn's model and thinking budget and cannot be overridden from here.
 
 Attachment note: the RPC turn text takes plain text, so an image/file attachment
-on a web turn is reduced to its text part (any prose the user typed). Inline
-image/file bytes are not forwarded to agy through this path.
+on a web turn is materialized to a file under the bridge dir and referenced by
+absolute path (``[Attached: <path>]``) so agy can open it with its Read tool —
+mirroring cursor-native. Any prose the user typed is sent alongside the marker.
 """
 
 from __future__ import annotations
@@ -66,20 +62,15 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-import httpx
-
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
-    AntigravityNativeBridgeState,
     inject_user_message_via_tui,
     is_placeholder_conversation_id,
     read_bridge_state,
 )
 from omnigent.antigravity_native_rpc import (
     cancel_cascade_steps,
-    get_available_models,
-    get_trajectory_steps,
     resolve_language_server_port,
 )
 from omnigent.inner.executor import (
@@ -96,14 +87,6 @@ from omnigent.llms.errors import PermanentLLMError
 from omnigent.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
 
 _logger = logging.getLogger(__name__)
-
-# How long run_turn waits for the bridge state to carry agy's REAL conversation
-# id on the first turn (the runner cold-starts agy + mints the conversation, then
-# the read path persists the real id over the launcher's ``agy_conv_*``
-# placeholder — see Task 11). Mirrors the codex executor's
-# one-second-poll-up-to-60s contract.
-_STATE_WAIT_ATTEMPTS = 60
-_STATE_WAIT_INTERVAL_S = 1.0
 
 # agy step type for a committed user turn; its ``userConfig`` carries the model
 # the user was on for that turn (the tier-1 model-echo source, design §10.4).
@@ -153,7 +136,7 @@ class AntigravityNativeExecutor(Executor):
             when there was no text to send or delivery failed.
         """
         del session_key
-        text = _content_to_text(content)
+        text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
         outcome = await self._deliver(text)
@@ -250,7 +233,7 @@ class AntigravityNativeExecutor(Executor):
             except PermanentLLMError as exc:
                 yield ExecutorError(message=str(exc))
                 return
-        text = _latest_user_text(messages)
+        text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="Antigravity native turn had no user text to send")
             return
@@ -318,109 +301,6 @@ class AntigravityNativeExecutor(Executor):
                 state.session_id,
             )
             return None
-
-    async def _resolve_ready_cascade_id(self, state: AntigravityNativeBridgeState) -> str | None:
-        """
-        Return agy's real conversation/cascade id, waiting on a fresh session.
-
-        On a settled session bridge state already carries agy's real id and this
-        returns it immediately. On a fresh session it still holds the launcher's
-        ``agy_conv_*`` placeholder until the runner cold-starts agy, mints the
-        conversation, and the read path persists the real id; this polls bridge
-        state (:meth:`_wait_for_state`) until that real id appears. The caller
-        holds :attr:`_send_lock`, so a later turn cannot race ahead of this wait.
-
-        :param state: The already-read bridge state for this turn.
-        :returns: agy's real (non-placeholder) conversation id, or ``None`` when a
-            fresh session's real id never appeared within the wait window.
-        """
-        if not is_placeholder_conversation_id(state.conversation_id):
-            return state.conversation_id
-        confirmed = await self._wait_for_state()
-        if confirmed is None or is_placeholder_conversation_id(confirmed.conversation_id):
-            return None
-        _logger.info(
-            "antigravity native first turn: conversation registered as %s",
-            confirmed.conversation_id,
-        )
-        return confirmed.conversation_id
-
-    async def _resolve_plan_model(self, port: int, cascade_id: str) -> str | None:
-        """
-        Resolve the per-turn agy ``planModel`` enum (two-tier; design §10.4).
-
-        ``SendUserCascadeMessage`` requires a ``planModel`` per turn and the enum
-        names are version-volatile, so the model is resolved at runtime:
-
-        1. **Echo agy's current model** — read the latest ``USER_INPUT`` step's
-           ``userInput.userConfig.plannerConfig.planModel`` (a string on the live
-           wire, with the older ``requestedModel.model`` shape as a fallback) from
-           :func:`omnigent.antigravity_native_rpc.get_trajectory_steps`. This
-           reflects the user's TUI ``/model`` choice without new plumbing.
-        2. **Recommended fallback** — when no prior model is observable (a first
-           turn), pick the ``recommended`` entry from
-           :func:`omnigent.antigravity_native_rpc.get_available_models`.
-
-        Both RPC reads are best-effort: a transport/parse failure on either is
-        logged and treated as "no model from this tier", so a flaky read of the
-        trajectory still falls through to the catalog rather than aborting.
-
-        :param port: Validated agy connect-RPC port.
-        :param cascade_id: agy cascade id (equal to the conversation id).
-        :returns: An agy model enum string, or ``None`` when neither tier yields
-            one (the caller surfaces a clear error — a turn cannot omit the
-            model).
-        """
-        # Both RPC reads raise httpx.HTTPError (transport / non-2xx) or ValueError
-        # (a non-JSON 200) per their contracts; either is best-effort here, so a
-        # tier-1 failure falls through to the catalog and a tier-2 failure returns
-        # None (the caller then surfaces a clear "no model" error).
-        try:
-            steps = await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
-        except (httpx.HTTPError, ValueError):
-            _logger.debug(
-                "antigravity native model echo: trajectory read failed for conversation=%s",
-                cascade_id,
-                exc_info=True,
-            )
-            steps = []
-        echoed = _latest_requested_model(steps)
-        if echoed is not None:
-            return echoed
-        try:
-            catalog = await asyncio.to_thread(get_available_models, port)
-        except (httpx.HTTPError, ValueError):
-            _logger.debug(
-                "antigravity native model fallback: catalog read failed for conversation=%s",
-                cascade_id,
-                exc_info=True,
-            )
-            return None
-        return _recommended_model(catalog)
-
-    async def _wait_for_state(self) -> AntigravityNativeBridgeState | None:
-        """
-        Read bridge state, polling until agy's REAL conversation id is known.
-
-        Called by :meth:`_resolve_ready_cascade_id` when the bridge state still
-        holds the launcher's ``agy_conv_*`` placeholder on a fresh session: the
-        runner cold-starts agy + mints the conversation (Task 11), then the read
-        path overwrites the placeholder with agy's real id. This polls until that
-        real id appears. Settled turns read the real id immediately (no
-        placeholder), so this is not on their path.
-
-        :returns: Bridge state carrying a real (non-placeholder) conversation id;
-            the last-read state (possibly a placeholder, or ``None``) when the
-            real id never appeared within the wait window.
-        """
-        state: AntigravityNativeBridgeState | None = None
-        for attempt in range(_STATE_WAIT_ATTEMPTS + 1):
-            state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
-            if state is not None and not is_placeholder_conversation_id(state.conversation_id):
-                return state
-            if attempt < _STATE_WAIT_ATTEMPTS:
-                await asyncio.sleep(_STATE_WAIT_INTERVAL_S)
-        return state
 
 
 def _bridge_dir_from_env() -> Path:
@@ -536,47 +416,60 @@ def _dig(obj: object, *keys: str) -> object:
     return current
 
 
-def _latest_user_text(messages: list[Message]) -> str:
+def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     """
     Extract the latest user message's text from the executor message list.
 
     :param messages: Executor message list.
+    :param bridge_dir: Bridge directory; image/file attachments are
+        materialized underneath it and referenced by path.
     :returns: The user's text (string + content-block shapes flattened), or
         ``""`` when there is no user text to send.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"))
+            return _content_to_text(message.get("content"), bridge_dir)
     return ""
 
 
-def _content_to_text(content: EnqueuedContent) -> str:
+def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     """
     Flatten executor message content into plain text for the agy turn-send.
 
-    The RPC turn text carries only text, so this extracts the textual parts and
-    drops attachments. A plain string passes through. A list of content blocks
-    contributes every ``input_text`` / ``text`` block, joined by newlines;
-    ``input_image`` / ``input_file`` blocks are skipped (their bytes cannot be
-    sent through this path — at minimum the typed text is sent).
+    The RPC turn text carries only text. A plain string passes through. A list
+    of content blocks contributes every ``input_text`` / ``text`` block;
+    ``input_image`` / ``input_file`` blocks carrying a base64 data URI are
+    materialized to the bridge dir and referenced by absolute path
+    (``[Attached: <path>]``) so agy can open them with its Read tool — otherwise
+    web-UI attachments are silently dropped. Mirrors cursor-native.
 
     :param content: Message content — a string, a list of content blocks like
         ``{"type": "input_text", "text": "..."}``, or other.
+    :param bridge_dir: Bridge directory; attachments are materialized underneath
+        it and referenced by path.
     :returns: The flattened text, stripped of leading/trailing whitespace, or
         ``""`` when no text is present.
     """
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        parts: list[str] = []
+        from omnigent.inner.native_attachments import materialize_attachment
+
+        attachment_lines: list[str] = []
+        text_parts: list[str] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") in {"input_text", "text"}:
+            block_type = block.get("type", "")
+            if block_type in ("input_text", "text"):
                 text = block.get("text")
                 if isinstance(text, str) and text:
-                    parts.append(text)
-        return "\n".join(parts).strip()
+                    text_parts.append(text)
+            elif block_type in ("input_image", "input_file"):
+                path = materialize_attachment(block, bridge_dir)
+                if path is not None:
+                    attachment_lines.append(f"[Attached: {path}]")
+        return "\n".join(attachment_lines + text_parts).strip()
     if content is None:
         return ""
     return json.dumps(content, ensure_ascii=True)

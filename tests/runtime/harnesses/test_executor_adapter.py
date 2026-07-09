@@ -1070,6 +1070,26 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
     )
 
 
+def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
+    """A normal internally-handling executor's ``ToolCallComplete`` is
+    suppressed mid-turn (its tools round-trip through dispatch_tool, which
+    emits the output) — the existing dedup contract."""
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._executor = _StubExecutor()  # type: ignore[assignment]
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(
+        ToolCallComplete(name="", status=ToolCallStatus.SUCCESS, result="out", metadata={}),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert ctx.emitted == []
+
+
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
     """
     A ``ToolCallRequest`` with an MCP-prefixed name pushes the
@@ -1959,3 +1979,25 @@ def test_idless_tool_complete_is_suppressed() -> None:
         f"downstream and only ghosts a 'Waiting for output' card); got "
         f"{[e.item.get('type') for e in ctx.emitted]}"
     )
+
+
+async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
+    """With no active turn context (turn-context desync, #1026) the policy
+    evaluator must not blanket-ALLOW. PHASE_TOOL_CALL fails closed (this adapter
+    is the only enforcement point, never re-checked server-side); advisory LLM
+    phases and the post-execution result phase fail open so a transient desync
+    does not needlessly wedge them — matching the runner's phase-aware default.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._current_ctx = None
+
+    tool_verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+    assert tool_verdict.action == "POLICY_ACTION_DENY"
+    assert tool_verdict.reason == "No active turn context; failing closed for PHASE_TOOL_CALL."
+
+    for advisory_phase in ("PHASE_LLM_REQUEST", "PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"):
+        verdict = await adapter._stable_policy_evaluator(advisory_phase, {})
+        assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
+        assert verdict.reason is None, advisory_phase

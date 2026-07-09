@@ -19,8 +19,11 @@ on:
   schedule:
     - cron: "0 9 * * *"
   pull_request:
+    # labeled/unlabeled: kept for the skip-security-scan recovery path
+    # (rerun-security-gate-run.yml falls back to this trigger). The concurrency
+    # group key isolates label events so they never cancel a code-push run.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['ap-web/**', 'tests/e2e_ui/**']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
   workflow_dispatch:
     inputs:
       branch:
@@ -34,15 +37,16 @@ on:
 
 concurrency:
   # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
-  # by SHA so each merge to `main` gets its own run.
-  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
+  # by SHA so each merge to `main` gets its own run. Label events append the
+  # label name so they get an isolated slot and never cancel a code-push run.
+  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name || 'run' }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync`: this job never serves the
+  # No web SPA build during `uv sync`: this job never serves the
   # bundle and the build hits public npm with no registry mirror.
   OMNIGENT_SKIP_WEB_UI: "true"
   # Never let the test server pick up the runner's own credentials.
@@ -54,7 +58,14 @@ env:
 jobs:
   # Security gate: untrusted PRs wait on the deterministic scan
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
+  # Short-circuit for label events that aren't skip-security-scan (e.g.
+  # automerge): those run in their own isolated concurrency slot (above) and
+  # don't need the full suite — just exit fast.
   gate:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
 
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
@@ -122,37 +133,3 @@ jobs:
           num_shards: ${{ matrix.num_shards }}
           parallelism: ${{ github.event.inputs.parallelism || '2' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-
-  # Explicitly re-dispatch Merge Ready for same-repo PRs: the workflow_run hop
-  # is brittle and was dropped on #751/#792. Fork PRs are NOT re-dispatched here
-  # -- their pull_request GITHUB_TOKEN is read-only (actions:write is not
-  # granted), so `gh workflow run` would 403; they re-evaluate via
-  # merge-ready.yml's own workflow_run trigger instead. No checkout,
-  # actions:write only; GITHUB_TOKEN workflow_dispatch is exempt from recursion.
-  merge-ready-rerun:
-    name: Merge Ready rerun
-    needs: e2e
-    if: >-
-      always()
-      && needs.e2e.result != 'skipped'
-      && github.event_name == 'pull_request'
-      && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-    steps:
-      - name: Re-dispatch Merge Ready
-        run: |
-          set -euo pipefail
-          PR="$PR_NUMBER"
-          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
-            echo "::notice::could not resolve PR number; nothing to do."
-            exit 0
-          fi
-          echo "Re-dispatching merge-ready.yml for PR #$PR after $GITHUB_WORKFLOW."
-          gh workflow run merge-ready.yml --repo "$REPO" -f pr="$PR"

@@ -578,10 +578,11 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
 
     # Capture convA's id BEFORE planting B so we get the
     # right one — "newest" walks forward as more
-    # conversations are added.
+    # conversations are added. kind = 1 is the "default" enum code (the
+    # column is a SMALLINT; see omnigent.db.enum_codecs.CONVERSATION_KIND).
     with sqlite3.connect(str(persistent_db)) as conn:
         rows = conn.execute(
-            "SELECT id FROM conversations WHERE kind = 'default' ORDER BY updated_at DESC, id DESC"
+            "SELECT id FROM conversations WHERE kind = 1 ORDER BY updated_at DESC, id DESC"
         ).fetchall()
     assert len(rows) == 1, (
         f"Expected exactly 1 conversation after plant A; got {len(rows)}. "
@@ -621,9 +622,10 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
     )
     assert nonce_b in plant_b.stdout.lower()
 
+    # kind = 1 is the "default" enum code (SMALLINT column).
     with sqlite3.connect(str(persistent_db)) as conn:
         rows = conn.execute(
-            "SELECT id FROM conversations WHERE kind = 'default' ORDER BY updated_at DESC, id DESC"
+            "SELECT id FROM conversations WHERE kind = 1 ORDER BY updated_at DESC, id DESC"
         ).fetchall()
     assert len(rows) == 2, (
         f"Expected exactly 2 conversations after plant B; got {len(rows)}. "

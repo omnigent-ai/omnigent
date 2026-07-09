@@ -40,8 +40,8 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
 
+from omnigent.harness_install_spec import HarnessInstallSpec
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -56,6 +56,15 @@ QWEN_KEY = "qwen"
 # ``CURSOR_API_KEY``) with no provider/gateway credential, and ships via a curl
 # installer rather than npm — so it carries an ``install_hint``, not a ``package``.
 CURSOR_KEY = "cursor"
+
+# Kimi authenticates against Moonshot AI's backend (``kimi login`` OAuth or a
+# Moonshot API key), not via the ambient provider config; like Cursor it ships
+# via a curl installer rather than npm, so it carries an ``install_hint``.
+KIMI_KEY = "kimi"
+
+# Kiro authenticates against its own backend and ships as a standalone native
+# installer, not an npm package managed by ``omnigent setup``.
+KIRO_KEY = "kiro"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -79,52 +88,6 @@ COPILOT_KEY = "copilot"
 # authenticates through its own ``hermes model`` interactive flow (no
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
-
-
-@dataclass(frozen=True)
-class HarnessInstallSpec:
-    """Install + auth metadata for one coding-harness CLI.
-
-    :param display: Human name shown in menus, e.g. ``"Claude"``.
-    :param binary: The CLI executable name looked up on ``PATH``, e.g.
-        ``"claude"``.
-    :param package: The npm package that provides the binary, e.g.
-        ``"@anthropic-ai/claude-code"``; ``None`` for a CLI not installed via
-        npm (use *install_hint* instead).
-    :param login_args: Argv (after *binary*) for the harness's own interactive
-        subscription login, e.g. ``("auth", "login", "--claudeai")`` for Claude
-        or ``("login",)`` for Codex; ``None`` when the harness has no login
-        command (e.g. Pi).
-    :param logout_args: Argv (after *binary*) for the harness's logout, e.g.
-        ``("auth", "logout")`` / ``("logout",)``; ``None`` when none exists.
-    :param status_args: Argv (after *binary*) for the harness's "am I logged
-        in?" status command, e.g. ``("auth", "status")`` (Claude, prints JSON
-        with a ``loggedIn`` field) / ``("login", "status")`` (Codex, exits 0
-        when logged in); ``None`` when the harness has no status command.
-    :param install_hint: Shell command shown to the user to install the CLI
-        when it has no npm *package* (e.g. cursor-agent's curl installer);
-        ``None`` for npm-installable harnesses.
-    :param login_status_key: The boolean field in the status command's JSON
-        output that reports login state, e.g. ``"loggedIn"`` for Claude or
-        ``"isAuthenticated"`` for cursor-agent. ``None`` means the harness has
-        no JSON verdict (Codex / agy print a human line or model list), so the
-        exit code is authoritative and stdout is never parsed.
-    :param auth_hint: Remediation phrase for a CLI whose sign-in is not a
-        ``login_args`` subcommand — agy authenticates by launching its bare TUI
-        once — appended after the install hint, e.g. ``"run `agy` once and
-        complete the browser sign-in"``; ``None`` when ``login_args`` (or
-        nothing) already covers sign-in.
-    """
-
-    display: str
-    binary: str
-    package: str | None
-    login_args: tuple[str, ...] | None = None
-    logout_args: tuple[str, ...] | None = None
-    status_args: tuple[str, ...] | None = None
-    install_hint: str | None = None
-    login_status_key: str | None = None
-    auth_hint: str | None = None
 
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
@@ -179,6 +142,27 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
     ),
+    # Kimi Code CLI ships a single-binary ``kimi`` via a curl installer (no
+    # npm). ``kimi login`` is the interactive provider login (OAuth or a
+    # Moonshot API key). ``status_args`` is intentionally ``None``: kimi has
+    # no first-class "am I logged in?" exit-code probe — login state is
+    # only inspected interactively. With ``None`` the login path runs every
+    # time the operator asks for it (interactive, so they can cancel if
+    # already authenticated).
+    KIMI_KEY: HarnessInstallSpec(
+        "Kimi",
+        "kimi",
+        package=None,
+        login_args=("login",),
+        logout_args=("logout",),
+        install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+    ),
+    KIRO_KEY: HarnessInstallSpec(
+        "Kiro",
+        "kiro-cli",
+        package=None,
+        install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
+    ),
     # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. ``agy`` has
     # no ``login`` / ``logout`` subcommand — the user authenticates via browser
     # OAuth by launching ``agy`` with no arguments on first run — so login_args /
@@ -221,10 +205,11 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # here — the ones that cannot launch without a binary on ``PATH``:
 # ``claude-native`` wraps the ``claude`` CLI, ``codex-native`` the ``codex``
 # CLI, ``pi`` / ``pi-native`` the ``pi`` CLI, ``opencode-native`` the
-# ``opencode`` CLI, ``qwen`` / ``qwen-code`` the ``qwen`` CLI, and
-# ``cursor-native`` / ``native-cursor`` the ``cursor-agent`` CLI (the native
-# Cursor TUI, installed via Cursor's curl installer rather than npm — see its
-# ``install_hint``).
+# ``opencode`` CLI, ``qwen`` / ``qwen-code`` the ``qwen`` CLI,
+# ``cursor-native`` / ``native-cursor`` the ``cursor-agent`` CLI, and
+# ``kiro-native`` / ``native-kiro`` the ``kiro-cli`` CLI. Cursor and Kiro
+# install out-of-band rather than through npm — see their ``install_hint``
+# values.
 # SDK-based harnesses run in-process and are deliberately absent, so they
 # resolve to "no CLI required": ``claude-sdk``, ``codex``, ``openai-agents-sdk``,
 # the in-process ``antigravity`` Gemini SDK harness, and the SDK ``cursor``
@@ -235,8 +220,15 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,
     "pi-native": PI_KEY,
+    # Kimi is multi-provider but binary-gated: cannot launch without the
+    # ``kimi`` CLI on PATH. Listed here so ``required_cli_for_harness``
+    # returns its install spec and ``missing_harness_cli`` fails loud
+    # before a subagent spawn.
+    KIMI_KEY: KIMI_KEY,
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
+    "kiro-native": KIRO_KEY,
+    "native-kiro": KIRO_KEY,
     # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
     # the Gemini family's install spec. (The in-process ``antigravity`` SDK
     # harness is deliberately absent — like the other SDK harnesses it needs no
@@ -248,6 +240,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
     # ``goose`` CLI as the native TUI, so it gates on the same binary.
     GOOSE_KEY: GOOSE_KEY,
+    # Native Kimi TUI harness — same binary gate as the bare ``kimi`` surface.
+    "kimi-native": KIMI_KEY,
+    "native-kimi": KIMI_KEY,
     QWEN_KEY: QWEN_KEY,
     "qwen-code": QWEN_KEY,
     # Native qwen TUI (``qwen-native``) wraps the same ``qwen`` CLI as the ACP
@@ -260,7 +255,28 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "native-opencode": OPENCODE_KEY,
     # Hermes Agent (``harness: hermes``) wraps the ``hermes`` CLI.
     HERMES_KEY: HERMES_KEY,
+    # Native Hermes TUI (``hermes-native``, via ``omni hermes``) wraps the same
+    # ``hermes`` CLI as the headless harness; ``native-hermes`` reversed spelling
+    # gates on the same binary.
+    "hermes-native": HERMES_KEY,
+    "native-hermes": HERMES_KEY,
 }
+
+
+def _all_harness_install() -> dict[str, HarnessInstallSpec]:
+    from omnigent.harness_plugins import install_specs
+
+    merged = dict(_HARNESS_INSTALL)
+    merged.update(install_specs())
+    return merged
+
+
+def _all_harness_name_to_key() -> dict[str, str]:
+    from omnigent.harness_plugins import harness_install_keys
+
+    merged = dict(_HARNESS_NAME_TO_KEY)
+    merged.update(harness_install_keys())
+    return merged
 
 
 def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
@@ -273,8 +289,8 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
         ``PATH`` for *harness* to start; ``None`` for SDK-based / unknown
         harnesses that need no CLI binary.
     """
-    key = _HARNESS_NAME_TO_KEY.get(harness)
-    return _HARNESS_INSTALL.get(key) if key is not None else None
+    key = _all_harness_name_to_key().get(harness)
+    return _all_harness_install().get(key) if key is not None else None
 
 
 def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
@@ -340,7 +356,7 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     :returns: The :class:`HarnessInstallSpec`, or ``None`` for an unknown key
         (e.g. a gateway-only family with no dedicated CLI).
     """
-    return _HARNESS_INSTALL.get(key)
+    return _all_harness_install().get(key)
 
 
 def harness_cli_installed(key: str) -> bool:
@@ -351,11 +367,11 @@ def harness_cli_installed(key: str) -> bool:
     ``claude-sdk`` harness can run without the ``claude`` CLI.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``) or
-        :data:`PI_KEY`.
+        :data:`PI_KEY` / :data:`KIMI_KEY`.
     :returns: ``True`` when the CLI is on ``PATH``; ``False`` when it isn't or
         the key has no associated CLI.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None:
         return False
     return shutil.which(spec.binary) is not None
@@ -372,7 +388,10 @@ def harness_install_command(key: str) -> list[str]:
     :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
         installed out-of-band, e.g. cursor-agent); show its ``install_hint``.
     """
-    package = _HARNESS_INSTALL[key].package
+    spec = harness_install_spec(key)
+    if spec is None:
+        raise KeyError(key)
+    package = spec.package
     if package is None:
         raise ValueError(f"{key!r} has no npm package; show its install_hint instead")
     return ["npm", "install", "-g", package]
@@ -391,7 +410,7 @@ def install_harness_cli(key: str) -> bool:
         present), ``False`` if npm is missing or the install failed.
     :raises KeyError: If *key* has no install spec.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is not None and spec.package is None:
         # Non-npm CLI (e.g. cursor-agent): no auto-install; caller shows install_hint.
         return False
@@ -429,7 +448,7 @@ def harness_cli_logged_in(key: str) -> bool:
         key has no status command, the CLI binary is missing, the status
         process failed to spawn, or the CLI reports no login.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
     if shutil.which(spec.binary) is None:
@@ -479,7 +498,7 @@ def harness_login(key: str) -> bool:
         has no login command, the CLI binary is missing, the login process
         failed to spawn, or the user did not complete the login.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None or spec.login_args is None:
         return False
     if shutil.which(spec.binary) is None:
@@ -530,7 +549,7 @@ def harness_logout(key: str) -> bool:
         ``False`` when the key has no logout command, the binary is missing, the
         process failed to spawn, or a login still resolves afterward.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None or spec.logout_args is None:
         return False
     if shutil.which(spec.binary) is None:

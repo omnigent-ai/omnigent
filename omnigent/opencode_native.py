@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -54,9 +56,12 @@ from omnigent.native_terminal import (
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
 from omnigent.native_terminal import url_component
+from omnigent.opencode_native_state import read_launch_state, write_launch_state
+
+_logger = logging.getLogger(__name__)
 
 # Built-in native-UI agent name (matches the descriptor's
-# ``wrapper_agent_name`` and the ap-web native registry).
+# ``wrapper_agent_name`` and the web native registry).
 _AGENT_NAME = "opencode-native-ui"
 
 
@@ -96,18 +101,9 @@ def _materialize_opencode_agent_spec(
         },
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped opencode (the relay's gate
-        # is a non-empty ``terminals:`` block on this spec).
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # is a non-empty ``terminals:`` block on this spec). Its command
+        # follows the user's ``$SHELL`` (zsh/fish/bash).
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
@@ -223,6 +219,8 @@ def _run_with_remote_server(  # pragma: no cover
         )
         if resolved_session_id is None and resume_picker and session_id is None:
             return
+        if resolved_session_id is not None:
+            _align_working_directory_with_session(resolved_session_id)
 
         async def _drive() -> None:
             with runner_startup_progress(initial_message="Preparing OpenCode...") as progress:
@@ -240,6 +238,8 @@ def _run_with_remote_server(  # pragma: no cover
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
                 )
+            if resolved_session_id is None:
+                _record_launch_for_fresh_session(prepared.session_id)
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
                 base_url=base_url,
@@ -429,6 +429,97 @@ async def _wait_for_opencode_terminal_ready(
     raise click.ClickException(
         f"The runner did not create the OpenCode terminal for {session_id!r} "
         f"within {timeout_s:.0f}s."
+    )
+
+
+# --- Resume workspace alignment: record launch cwd; realign it on resume ---
+
+_RESUME_ACTION_SWITCH = "switch"
+_RESUME_ACTION_CANCEL = "cancel"
+
+
+def _record_launch_for_fresh_session(session_id: str) -> None:
+    """
+    Persist the wrapper's current cwd as the OpenCode session launch state.
+
+    :param session_id: Newly created Omnigent conversation id, e.g.
+        ``"conv_abc123"``.
+    :returns: None.
+    """
+    try:
+        write_launch_state(session_id, str(Path.cwd().resolve()))
+    except OSError:
+        _logger.warning(
+            "failed to record opencode-native launch state for %s",
+            session_id,
+            exc_info=True,
+        )
+
+
+def _align_working_directory_with_session(session_id: str) -> None:
+    """
+    Resolve cwd mismatch before resuming an OpenCode-native session.
+
+    Native OpenCode state is workspace-scoped from the user's point of
+    view: the runner and ``opencode serve`` should reopen from the
+    directory where the session was created. If client-side launch
+    state points at a different existing directory, prompt whether to
+    switch there before the runner and ``opencode serve`` sample cwd.
+
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :returns: None. Side-effect-only; may change process cwd.
+    :raises click.ClickException: If recorded state exists but the
+        recorded directory no longer exists, or if the user cancels.
+    """
+    state = read_launch_state(session_id)
+    if state is None:
+        return
+    current = Path.cwd().resolve()
+    recorded_path = Path(state.working_directory).resolve()
+    if current == recorded_path:
+        return
+    if not recorded_path.is_dir():
+        raise click.ClickException(
+            f"Session {session_id} was created in {recorded_path}, but that "
+            "directory no longer exists. Recreate or move the project back "
+            "before resuming OpenCode."
+        )
+    action = _prompt_opencode_resume_workspace_action(
+        recorded_path=recorded_path,
+        current=current,
+    )
+    if action == _RESUME_ACTION_SWITCH:
+        os.chdir(recorded_path)
+        click.echo(f"Switched to {recorded_path}.", err=True)
+        return
+    raise click.ClickException("Resume cancelled.")
+
+
+def _prompt_opencode_resume_workspace_action(
+    *,
+    recorded_path: Path,
+    current: Path,
+) -> str:
+    """
+    Ask how to handle an OpenCode resume cwd mismatch.
+
+    :param recorded_path: Recorded launch cwd, already resolved.
+    :param current: Current cwd, already resolved.
+    :returns: One of ``"switch"`` or ``"cancel"``.
+    """
+    click.echo(f"\nSession was started in: {recorded_path}", err=True)
+    click.echo(f"Current working directory: {current}", err=True)
+    click.echo("OpenCode resume is workspace-scoped. Choose an action:", err=True)
+    click.echo(
+        f"  {_RESUME_ACTION_SWITCH:<6} - Switch working directory to {recorded_path}", err=True
+    )
+    click.echo(f"  {_RESUME_ACTION_CANCEL:<6} - Cancel resume", err=True)
+    return click.prompt(
+        "Resume action",
+        type=click.Choice([_RESUME_ACTION_SWITCH, _RESUME_ACTION_CANCEL]),
+        default=_RESUME_ACTION_SWITCH,
+        show_choices=True,
+        err=True,
     )
 
 

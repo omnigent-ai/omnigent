@@ -25,7 +25,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL, parse_verdict
 from omnigent.errors import OmnigentError
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -45,6 +44,11 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
+
+# Label key used as a concrete test target for the cost_control.* namespace
+# guard. The full parse/serialize logic was removed with the cost_advisor;
+# the namespace protection in sessions.py still applies to this key.
+COST_CONTROL_PLAN_LABEL = "cost_control.plan"
 
 # The binding token the test runner presents; its token-bound id is what
 # the session's runner_id must equal for the write to be authorized.
@@ -206,7 +210,6 @@ def test_editor_cannot_patch_cost_control_plan(
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
     assert COST_CONTROL_PLAN_LABEL not in conv.labels
-    assert parse_verdict(conv.labels) is None
 
 
 def test_owner_without_runner_proof_cannot_patch_cost_control_plan(
@@ -330,11 +333,8 @@ def test_bound_runner_token_authorizes_plan_write(
     assert resp.status_code == 200
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
-    # The persisted value round-trips through parse_verdict — the full
-    # write→read chain is intact.
-    verdict = parse_verdict(conv.labels)
-    assert verdict is not None
-    assert verdict.tier == "expensive"
+    # The write landed in the store.
+    assert conv.labels.get(COST_CONTROL_PLAN_LABEL) == _FORGED_PLAN
 
 
 def test_allowlisted_pool_token_authorizes_plan_write(
@@ -359,7 +359,7 @@ def test_allowlisted_pool_token_authorizes_plan_write(
     assert resp.status_code == 200
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
-    assert parse_verdict(conv.labels) is not None
+    assert COST_CONTROL_PLAN_LABEL in conv.labels
 
 
 def test_single_user_server_skips_the_gate(
@@ -380,7 +380,7 @@ def test_single_user_server_skips_the_gate(
     assert resp.status_code == 200
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
-    assert parse_verdict(conv.labels) is not None
+    assert COST_CONTROL_PLAN_LABEL in conv.labels
 
 
 # ── Create: no client may seed the namespace ─────────────────────────────────

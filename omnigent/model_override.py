@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_plugins import model_env_keys
 
 # Generous-but-safe upper bound; real ids ("databricks-claude-opus-4-8",
 # "us.anthropic.claude-sonnet-4-6") stay well under it.
@@ -33,11 +34,13 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "openai-agents",
         "cursor",
         "antigravity",
+        "kimi",
         "qwen",
         "goose",
         "copilot",
     }
 )
+_SDK_MODEL_OVERRIDE_HARNESSES = frozenset(model_env_keys())
 
 
 def validate_model_override(value: str) -> str:
@@ -230,7 +233,7 @@ def harness_supports_model_override(harness: str | None) -> bool:
     """
     Return whether *harness* has per-session model-override plumbing.
 
-    Native CLIs (claude-native / codex-native) receive the override as
+    Native CLIs receive the override as
     ``--model`` at terminal launch; the SDK harnesses receive it via
     ``HARNESS_<H>_MODEL`` in the spawn env. Anything else (e.g.
     unknown harnesses) silently ignores the

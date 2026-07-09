@@ -97,6 +97,10 @@ services:
       OMNIGENT_OIDC_SESSION_TTL_HOURS: "${OMNIGENT_OIDC_SESSION_TTL_HOURS:-8}"
       OMNIGENT_OIDC_ALLOWED_DOMAINS: "${OMNIGENT_OIDC_ALLOWED_DOMAINS:-}"
       OMNIGENT_OIDC_LOGOUT_REDIRECT_URI: "${OMNIGENT_OIDC_LOGOUT_REDIRECT_URI:-}"
+      # Skip the email_verified id_token check — for IdPs (e.g. Okta
+      # without API Access Management) that omit the claim for
+      # directory-provisioned users. Off unless set; see .env.example.
+      OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION: "${OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

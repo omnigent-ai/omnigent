@@ -20,9 +20,14 @@ import shutil
 import signal
 import subprocess
 import sys
-import termios
-import tty
 import uuid
+
+# termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
+# which is disabled on Windows. Guard the import (special-cased by mypy, which
+# type-checks on Linux) so importing this module never crashes the CLI there.
+if sys.platform != "win32":
+    import termios
+    import tty
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -56,6 +61,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     augment_claude_args,
@@ -83,6 +89,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -143,6 +150,17 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
+# The 4 family aliases above pin one model ID each. Claude Code has exactly
+# one more independently-selectable /model picker slot beyond those
+# families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
+# as an opt-in *alongside* the "sonnet" alias, which stays pinned to the
+# workspace's existing default Sonnet (4.6). This keeps the default Sonnet
+# unchanged and adds the newer generation as a separate, explicit choice.
+# See https://code.claude.com/docs/en/model-config#custom-model-options
+_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION"
+_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
+_UCODE_CLAUDE_CUSTOM_TIER = "sonnet_5"
+_UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
@@ -1443,6 +1461,10 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
         model_id = workspace_state.claude_models.get(tier)
         if model_id:
             env[env_var] = model_id
+    custom_model_id = workspace_state.claude_models.get(_UCODE_CLAUDE_CUSTOM_TIER)
+    if custom_model_id:
+        env[_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV] = custom_model_id
+        env[_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV] = _UCODE_CLAUDE_CUSTOM_TIER_LABEL
     # When ucode caches no model, default it so Claude Code doesn't fall back
     # to its host-config model (an Anthropic-direct id the gateway rejects).
     return ClaudeNativeUcodeConfig(
@@ -1764,20 +1786,10 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped Claude Code (the
         # relay's gate is a non-empty ``terminals:`` block on this
-        # spec). Caller process / no sandbox matches the ``os_env``
-        # stance above — the native CLI already runs unsandboxed on
-        # the user's workspace.
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # spec). Its command follows the user's ``$SHELL`` (zsh/fish/bash);
+        # caller process / no sandbox matches the ``os_env`` stance above —
+        # the native CLI already runs unsandboxed on the user's workspace.
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     return yaml_path
@@ -2016,7 +2028,7 @@ async def _attach_direct_tmux(
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _tmux_session_alive
+    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive, _tmux_session_alive
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     env = dict(os.environ)
@@ -2034,11 +2046,46 @@ async def _attach_direct_tmux(
         env=env,
     )
     startup_profiler.mark("tmux attach subprocess started")
-    await process.wait()
+
+    # Poll for a dead pane in the background. With ``remain-on-exit on``,
+    # the tmux session outlives the inner CLI, so ``tmux attach`` never exits
+    # on its own — the user sees "Pane is dead" and Ctrl-C is silently
+    # dropped because there is no process to receive the signal. Killing the
+    # attach subprocess forces it to exit so the CLI can tear down cleanly.
+    async def _kill_when_pane_dead() -> None:
+        _POLL_INTERVAL_S = 0.5
+        while True:
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            if process.returncode is not None:
+                return  # already exited naturally
+            is_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+            if is_dead is True:
+                _logger.debug("direct-tmux: pane is dead; killing tmux attach child")
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                return
+
+    watcher = asyncio.create_task(_kill_when_pane_dead(), name="direct-tmux-pane-watcher")
+    try:
+        await process.wait()
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
     startup_profiler.mark("tmux attach subprocess exited")
-    if await _tmux_session_alive(str(socket_path), tmux_target):
-        return _AttachOutcome.DETACHED
-    return _AttachOutcome.EXITED
+    # Use the tri-state probe so a dead pane (session alive, pane_dead=1) is
+    # treated as EXITED rather than DETACHED. With remain-on-exit the session
+    # outlives the inner CLI, so _tmux_session_alive alone would wrongly signal
+    # a user detach and the reconnect loop would re-attach to the dead pane.
+    pane_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+    if pane_dead is True:
+        return _AttachOutcome.EXITED
+    if pane_dead is None:
+        # Inconclusive probe — fall back to session-existence check.
+        if not await _tmux_session_alive(str(socket_path), tmux_target):
+            return _AttachOutcome.EXITED
+    return _AttachOutcome.DETACHED
 
 
 async def _attach_with_transcript_forwarder(
@@ -3456,6 +3503,63 @@ def _claude_transcript_records_from_session_items(
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
     for index, item in enumerate(items):
+        # Compaction items carry the post-compaction context. Replace
+        # all prior records with the compacted messages so the
+        # reconstructed transcript reflects the compacted state.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                records.clear()
+                parent_uuid = None
+                tool_parent_by_call_id.clear()
+                # Emit a compact_boundary system record so Claude
+                # Code recognizes the compaction on resume.
+                boundary_uuid = _synthetic_claude_transcript_uuid(
+                    session_id=session_id,
+                    external_session_id=external_session_id,
+                    item=item,
+                    index=index,
+                )
+                records.append(
+                    {
+                        "parentUuid": None,
+                        "isSidechain": False,
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "content": "Conversation compacted",
+                        "isMeta": False,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "uuid": boundary_uuid,
+                        "level": "info",
+                        # Claude scans every compact_boundary and destructures
+                        # compactMetadata; a missing object crashes /compact
+                        # (and auto-compact) on resume. token_count is the
+                        # post-compaction summary size.
+                        "compactMetadata": {
+                            "trigger": "auto",
+                            "postTokens": item.get("token_count"),
+                        },
+                    }
+                )
+                parent_uuid = boundary_uuid
+                for ci, cm in enumerate(compacted_msgs):
+                    cm_uuid = _synthetic_claude_transcript_uuid(
+                        session_id=session_id,
+                        external_session_id=external_session_id,
+                        item=cm,
+                        index=ci,
+                    )
+                    cm_record = _claude_transcript_record_from_session_item(
+                        cm,
+                        session_id=external_session_id,
+                        record_uuid=cm_uuid,
+                        parent_uuid=parent_uuid,
+                        cwd=cwd,
+                    )
+                    if cm_record is not None:
+                        records.append(cm_record)
+                        parent_uuid = cm_uuid
+            continue
         record_uuid = _synthetic_claude_transcript_uuid(
             session_id=session_id,
             external_session_id=external_session_id,
@@ -3567,7 +3671,7 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        extra["toolUseResult"] = output
+        extra["toolUseResult"] = _json_safe_tool_use_result(output)
     else:
         return None
     return {
@@ -3685,6 +3789,36 @@ def _json_object_from_string(value: object) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_safe_tool_use_result(output: str) -> str:
+    """
+    Return a ``toolUseResult`` value Claude Code can ``JSON.parse``.
+
+    Some built-in result renderers (notably ``TaskOutput``) call
+    ``JSON.parse`` on ``toolUseResult`` when the transcript is resumed.
+    A raw display string such as ``"<retrieval_status>timeout</...>"``
+    throws ``JSON Parse error: Unrecognized token '<'`` at TUI boot,
+    before the input prompt renders — so the whole resume fails and the
+    first web-UI message is never delivered.
+
+    Outputs that are already JSON (e.g. an image content-block array)
+    pass through verbatim; anything else is wrapped as a JSON string
+    literal so the parse always succeeds. The plain-text output still
+    lives verbatim in the ``tool_result`` content block, so this does
+    not change what the model or the web UI sees.
+
+    :param output: The tool result string synthesized for the
+        transcript, e.g. ``"<retrieval_status>timeout</...>"`` or
+        ``'[{"type":"image",...}]'``.
+    :returns: A JSON-parseable string for the record's
+        ``toolUseResult`` field.
+    """
+    try:
+        json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return json.dumps(output)
+    return output
 
 
 def _preflight_local_tools(command: str) -> None:
@@ -3961,6 +4095,10 @@ def _claude_terminal_request(
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
+    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # command/args to wrap the same fully-augmented Claude launch. Identity by
+    # default. See omnigent.claude_launcher.
+    command, args = resolve_claude_launch(command, args)
     spec: dict[str, Any] = {
         "command": command,
         "args": args,

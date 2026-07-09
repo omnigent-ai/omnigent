@@ -20,6 +20,7 @@ import pytest
 from omnigent.runtime.filesystem_registry import (
     AgentEditFilesystemRegistry,
     GitFilesystemRegistry,
+    GitStatusUnavailable,
     _normalize_path,
     _parse_git_porcelain_line,
     _unquote_git_path,
@@ -471,6 +472,158 @@ def test_git_list_changed_files_excludes_terminals_dir(tmp_path: Path) -> None:
         f"Expected no terminals/ paths but got {terminal_paths}. "
         "Terminal output files are leaking into the Files panel."
     )
+
+
+def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
+    """Git-backed changed files must hide temp/editor artifacts.
+
+    The non-git registry already suppresses these names when agent tools record
+    changes.  Git workspaces should behave the same way even though they read
+    from ``git status`` instead of recorded agent events.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    ephemeral_files = [
+        "pyproject.toml.tmp.12345",
+        "pyproject.toml.tmp",
+        "notes.md~",
+        ".main.py.swp",
+        ".main.py.swo",
+        "#README.md#",
+    ]
+    for file_path in ephemeral_files:
+        (tmp_path / file_path).write_text("temporary artifact")
+    (tmp_path / "real_change.py").write_text("agent wrote this")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    results = reg.list_changed_files("any-conv", limit=100)
+
+    paths = [r["path"] for r in results]
+    assert paths == ["real_change.py"], (
+        f"Expected only 'real_change.py', got {paths}. "
+        "Git-backed changed files should suppress temp/editor artifacts."
+    )
+    for file_path in ephemeral_files:
+        result = reg.get_changed_file("any-conv", file_path)
+        assert result is None, (
+            f"Expected get_changed_file to hide {file_path!r}, got {result!r}. "
+            "Direct file lookup should match the changed-files list."
+        )
+
+    real_result = reg.get_changed_file("any-conv", "real_change.py")
+    assert real_result is not None
+    assert real_result["status"] == "created"
+
+
+def test_git_list_changed_files_raises_on_timeout(tmp_path: Path, monkeypatch) -> None:
+    """A ``git status`` timeout must raise, not silently return an empty list.
+
+    The old code swallowed ``TimeoutExpired`` to ``[]``, so the Files panel
+    showed "No workspace changes yet" even with real modifications — a state
+    indistinguishable from a clean tree. The failure must surface so the
+    endpoint can report it and the cause is no longer hidden.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="git status", timeout=5)
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _raise_timeout)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    with pytest.raises(GitStatusUnavailable, match="timed out"):
+        reg.list_changed_files("any-conv", limit=100)
+
+
+def test_git_list_changed_files_raises_on_nonzero_exit(tmp_path: Path, monkeypatch) -> None:
+    """A non-zero ``git status`` exit must raise, not silently return ``[]``.
+
+    e.g. "detected dubious ownership" when the runner uid differs from the
+    checkout owner — previously swallowed to an empty list.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    def _nonzero(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args="git status",
+            returncode=128,
+            stdout=b"",
+            stderr=b"fatal: detected dubious ownership in repository",
+        )
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _nonzero)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    with pytest.raises(GitStatusUnavailable, match="exited 128"):
+        reg.list_changed_files("any-conv", limit=100)
+
+
+def test_git_get_changed_file_raises_on_timeout(tmp_path: Path, monkeypatch) -> None:
+    """A ``git status`` timeout in the single-file lookup must raise, not return ``None``.
+
+    Swallowing it to ``None`` made the diff endpoint answer 404 — a state
+    indistinguishable from "this path has no changes" — for a read that
+    *could not run*. The failure must surface like the list path.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="git status", timeout=5)
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _raise_timeout)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    with pytest.raises(GitStatusUnavailable, match="timed out"):
+        reg.get_changed_file("any-conv", "a.txt")
+
+
+def test_git_get_changed_file_raises_on_nonzero_exit(tmp_path: Path, monkeypatch) -> None:
+    """A non-zero ``git status`` exit in the single-file lookup must raise, not return ``None``."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    def _nonzero(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args="git status",
+            returncode=128,
+            stdout=b"",
+            stderr=b"fatal: detected dubious ownership in repository",
+        )
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _nonzero)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    with pytest.raises(GitStatusUnavailable, match="exited 128"):
+        reg.get_changed_file("any-conv", "a.txt")
+
+
+def test_git_get_changed_file_returns_none_when_unchanged(tmp_path: Path) -> None:
+    """A clean ``git status`` (exit 0, no output) still means "no changes" → ``None``.
+
+    Guards against the raise paths swallowing the legitimate empty case: a
+    tracked, unmodified file must return ``None``, not raise.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "a.txt").write_text("hello\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    assert reg.get_changed_file("any-conv", "a.txt") is None
 
 
 def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> None:

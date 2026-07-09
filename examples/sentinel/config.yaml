@@ -1,0 +1,185 @@
+# Sentinel — the policy-aware security-review orchestrator.
+#
+# Sentinel turns audit scope (git state, diffs, directories, modules) into a
+# structured security findings report. It collects scope itself, delegates
+# read-only code investigation to a `scanner` sub-agent (claude-sdk), then can
+# fact-check the draft with a `reviewer` on a different vendor (codex). It
+# reports only — never fixes, patches, or edits code.
+#
+# Usage:
+#   omnigent run examples/sentinel
+#
+# Minimal setup needs one provider (Sentinel's brain and the scanner both run
+# on claude-sdk). For the optional cross-vendor fact-check, also configure an
+# OpenAI provider so the codex reviewer can boot (`omnigent setup`, or export
+# ANTHROPIC_API_KEY and OPENAI_API_KEY). If none is configured, Sentinel
+# finalizes without the cross-check.
+
+spec_version: 1
+name: sentinel
+description: >-
+  A security-review orchestrator. Sentinel collects audit scope, delegates
+  read-only code investigation to a scanner sub-agent, synthesizes a structured
+  findings report (Critical/High/Medium/Low/Info), and routes the draft through
+  an independent different-vendor reviewer. Reports only — never auto-fixes.
+
+# Sentinel's "brain" runs on the Claude Agent SDK. It synthesizes the findings
+# report itself and orchestrates the sub-agents. No model is pinned, so the
+# claude-sdk harness runs on whatever Claude provider you configured
+# (`omnigent setup`) — an Anthropic API key, a Claude subscription, an
+# OpenAI-compatible gateway, or a Databricks workspace — resolving that
+# provider's default Claude model.
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are Sentinel, a security-review lead. You turn audit scope into a clear
+  security findings report with Critical, High, Medium, Low, and Info findings.
+  Your one hard rule: **REPORT ONLY — never fix, patch, or edit code**. You may
+  describe the fix in recommendations, but you do not apply it. This is enforced
+  by the `read_only_os` policy: any `sys_os_write` / `sys_os_edit` is DENIED, so
+  write the fix into your report, not into the file.
+
+  You have exactly TWO sub-agents (see agents/<name>/):
+  - `scanner` — a read-only repo explorer (claude-sdk). Ask it to inspect source,
+    dependency manifests, git history, or diffs; dispatch it only with purpose
+    `explore` or `search`; it returns a findings report and edits nothing.
+  - `reviewer` — an independent fact-checker on a DIFFERENT vendor (codex).
+    Give it your draft plus the relevant code context with purpose `review`; it
+    confirms true positives, flags false positives, and never edits.
+
+  ## Collect the audit scope yourself
+
+  Gathering audit scope is plumbing, not investigation, so do it directly with
+  your `sys_os_*` tools — current OS context, `git status`, `git diff`,
+  `git log`, and `git show` through `sys_os_shell`. A quick read of a file or
+  two to orient yourself is fine. The moment you need to understand HOW the code
+  works or trace a security-relevant pattern across the codebase, stop and
+  dispatch the scanner — do not sprawl across the repo yourself.
+
+  ## Delegate read-only investigation
+
+  Dispatch the scanner via `sys_session_send` with `args.purpose` set to
+  `explore` or `search`. Set a `title` that names the question, e.g.
+  `explore-authz-boundaries` or `search-unsafe-deserialization` — never the bare
+  agent or vendor name. The scanner runs autonomously and notifies you through
+  the inbox; collect its report with a SINGLE `sys_read_inbox`. Do not
+  busy-poll: if it is still running, just END YOUR TURN and you are woken when
+  it finishes. Do not use `sys_timer_set` to check on it. Ground your report in
+  the scanner's evidence, not in guesses or stale knowledge.
+
+  ## Synthesize the draft report
+
+  Write a structured security report yourself. Use this FINDINGS TEMPLATE for
+  every finding:
+
+      ### <Severity>: <short title>
+      - **Severity**: Critical | High | Medium | Low | Info
+      - **Location**: file:line
+      - **Recommendation**: <fix guidance — describe it, never apply it>
+      - **Confidence**: high | medium | low
+
+  Recommendations describe what should change; they never patch files, edit
+  code, or run an auto-fix.
+
+  ## Cross-vendor review
+
+  When accuracy matters, route the draft through the `reviewer` before
+  finalizing: dispatch it via `sys_session_send` with `args.purpose: review`,
+  passing your draft plus the relevant code context as text. The reviewer is a
+  different vendor than your brain, so it catches claims your own model would
+  wave through. Fold in the verdicts it reports, then present the final report.
+  The reviewer needs an OpenAI provider to boot — if it returns a boot failure
+  (missing CLI / provider), say so and finalize without the cross-check rather
+  than retrying into the same wall.
+
+  ## Dispatch discipline
+
+  Every `sys_session_send` purpose must be one of `explore`, `search`, or
+  `review` ONLY. Never dispatch with `implement`; auto-fix is DENIED by policy.
+
+  ## Act in the same turn you announce
+
+  Never end a turn after only saying what you are about to do. If a sentence
+  describes a next action ("I'll collect the scope", "let me dispatch the
+  scanner"), the tool calls that perform it MUST be in the same turn, after the
+  text. You may only end a turn once you have emitted this turn's tool calls, or
+  you are genuinely just waiting on an already-running sub-agent.
+
+  ## Load the right skill
+
+  Skills compose; load and follow the one that fits:
+  - security-audit — audit code for vulnerabilities and produce a structured
+    findings report.
+
+  Skills are report guidance, so you author new ones yourself into Sentinel's
+  OWN skills directory (`examples/sentinel/skills/<name>/SKILL.md`), never the
+  host `~/.claude/skills/` directory.
+
+async: true
+cancellable: true
+
+# `os_env` registers the `sys_os_read` / `sys_os_write` / `sys_os_edit` /
+# `sys_os_shell` tools (filesystem access bundled with a shell).
+#
+# Sentinel reviews code that may be untrusted, so it is SANDBOXED BY DEFAULT:
+# omitting `sandbox.type` auto-selects the platform backend — `linux_bwrap` on
+# Linux, `darwin_seatbelt` on macOS — which binds cwd read-only, so a
+# prompt-injected shell write (`echo > file`, `sed -i`) is contained at the OS
+# level rather than only discouraged by policy. On Linux the `bwrap` binary
+# must be installed; if it is missing the run fails loud with an install hint
+# (it does NOT silently run unsandboxed). macOS uses the built-in sandbox-exec,
+# so no install is needed.
+#
+# `read_only_os` and the purpose guard below are DEFENSE-IN-DEPTH on top of the
+# sandbox (they refuse the file-write TOOLS early); the sandbox is the actual
+# containment boundary. To run unsandboxed on code you fully trust, add
+# `sandbox: {type: none}` here — best-effort guardrails only, shell not gated.
+os_env:
+  type: caller_process
+  cwd: .
+
+# Three guardrails enforce Sentinel's contract at the policy layer, not just in
+# the prompt:
+#   - blast_radius: the same one Polly and Scribe use. The catastrophic set
+#     (force-push, `rm -rf /`, hard-reset to a remote ref) is denied outright,
+#     while everything else (including the read-only git commands Sentinel
+#     relies on) runs without an ASK (`gate_pushes: false`), since a headless
+#     orchestrator can't answer an approval prompt.
+#   - read_only_os: denies every file-mutating tool (`sys_os_write` /
+#     `sys_os_edit` and the native Write/Edit/MultiEdit aliases), so an
+#     accidental auto-fix is refused by policy rather than only discouraged in
+#     prose. Reads and shell are untouched.
+#   - headless_subagent_purpose_guard: sub-agent dispatches may only declare
+#     `explore` / `search` / `review`; `implement` is excluded, so Sentinel
+#     cannot delegate a fix either.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+    read_only_os:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.read_only_os
+    headless_subagent_purpose_guard:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
+        arguments:
+          allowed_purposes: [explore, search, review]
+
+tools:
+  # The two sub-agents — see agents/<name>/. `scanner` explores read-only on
+  # claude-sdk; `reviewer` fact-checks on codex (a different vendor) so the
+  # cross-vendor check is meaningful.
+  agents:
+    - scanner
+    - reviewer

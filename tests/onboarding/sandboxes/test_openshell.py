@@ -528,8 +528,8 @@ def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
 
     client.execute("box", ["printf", "%s", "$HOME"])
 
-    assert sdk.last_workdir == "/home/sandbox"
-    assert sdk.last_env == {"HOME": "/home/sandbox"}
+    assert sdk.last_workdir == "/sandbox"
+    assert sdk.last_env == {"HOME": "/sandbox"}
 
 
 def test_client_delete_ignores_not_found(sdk: _SDKState) -> None:

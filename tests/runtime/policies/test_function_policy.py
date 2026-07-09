@@ -21,8 +21,6 @@ From ``test_labels_and_policies.py`` (FunctionPolicy-context):
 
 Plus Phase 4 carve-outs:
 - Exception → DENY (fail-closed)
-- Exception with classifier-only action list → ALLOW substituted
-- Action whitelist validation
 - set_labels whitelist filtering
 """
 
@@ -94,7 +92,6 @@ def _spec(
     phase: Phase = Phase.REQUEST,
     tool_name: str | None = None,
     function: FunctionRef | None = None,
-    action: list[PolicyAction] | None = None,
     set_labels: list[str] | None = None,
 ) -> FunctionPolicySpec:
     """Build a FunctionPolicySpec with sensible defaults."""
@@ -102,7 +99,6 @@ def _spec(
         name=name,
         on=[PhaseSelector(phase=phase, tool_name=tool_name)],
         function=function or FunctionRef(path="test_fn_policy_pkg.probe.noop"),
-        action=action,
         set_labels=set_labels,
     )
 
@@ -696,48 +692,6 @@ async def test_function_policy_exception_fails_closed_to_deny(
     # Reason contains both the policy name and the exception.
     assert "crashed" in result.reason
     assert "p" in result.reason  # policy name
-
-
-@pytest.mark.asyncio
-async def test_function_policy_exception_with_classifier_only_substitutes_allow(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """POLICIES.md §13 classifier-only carve-out: when the
-    spec's action list contains no DENY, a raising callable
-    becomes ALLOW instead of DENY. Honors the author's
-    declared 'this policy never blocks' intent."""
-
-    def fn(event: dict) -> PolicyResult:
-        raise RuntimeError("crashed")
-
-    policy = FunctionPolicy(_spec(action=[PolicyAction.ALLOW]), fn)
-    engine = _build_engine(conversation_store, [policy])
-    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="x"))
-    # Engine substituted ALLOW because DENY is not in the
-    # declared action list.
-    assert result.action == PolicyAction.ALLOW
-
-
-@pytest.mark.asyncio
-async def test_function_policy_returns_action_outside_whitelist_fails_closed(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """Callable returns ASK, but the spec declared only
-    [allow, deny] — engine fail-closes to DENY."""
-
-    def fn(event: dict) -> PolicyResult:
-        return PolicyResult(action=PolicyAction.ASK, reason="uncertain")
-
-    policy = FunctionPolicy(
-        _spec(action=[PolicyAction.ALLOW, PolicyAction.DENY]),
-        fn,
-    )
-    engine = _build_engine(conversation_store, [policy])
-    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="x"))
-    assert result.action == PolicyAction.DENY
-    # Reason names the violation explicitly so operators can
-    # debug the misbehaving callable.
-    assert "not in its declared action list" in result.reason
 
 
 @pytest.mark.asyncio

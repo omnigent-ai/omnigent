@@ -19,6 +19,7 @@ from omnigent.llms.types import MessageOutput, OutputText, Response
 from omnigent.runtime.compaction import (
     _BINARY_CONTENT_CLEARED,
     _TOOL_RESULT_CLEARED,
+    _is_summary_auth_error,
     _pair_aware_drop_count,
     _truncate_oldest,
     compact,
@@ -26,7 +27,8 @@ from omnigent.runtime.compaction import (
     count_tokens,
     summarize_history,
 )
-from omnigent.spec.types import CompactionConfig
+from omnigent.runtime.workflow import _route_bare_model_for_compaction
+from omnigent.spec.types import CompactionConfig, LLMConfig
 
 # ---------------------------------------------------------------------------
 # LLM client stubs
@@ -1506,3 +1508,66 @@ async def test_default_window_compacts_same_fill(monkeypatch: pytest.MonkeyPatch
         llm_client=_ReturnsTextClient("Summary of earlier context."),
     )
     assert result.summary_metadata is not None
+
+
+# ---------------------------------------------------------------------------
+# Layer-2 auth-failure detection (don't bury a 401)
+# ---------------------------------------------------------------------------
+
+
+def test_is_summary_auth_error_distinguishes_401_403() -> None:
+    """401/403 (by status code or message) are auth errors; others are not."""
+
+    class _Resp:
+        def __init__(self, code: int) -> None:
+            self.status_code = code
+
+    class _HTTPStatusError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(f"status {code}")
+            self.response = _Resp(code)
+
+    # By response.status_code (as httpx.HTTPStatusError carries it).
+    assert _is_summary_auth_error(_HTTPStatusError(401)) is True
+    assert _is_summary_auth_error(_HTTPStatusError(403)) is True
+    assert _is_summary_auth_error(_HTTPStatusError(500)) is False
+    # By message text (when no structured response is attached).
+    assert _is_summary_auth_error(Exception("Client error '401 Unauthorized'")) is True
+    assert _is_summary_auth_error(Exception("Forbidden")) is True
+    # Non-auth failures fall through to the generic warning path.
+    assert _is_summary_auth_error(Exception("connection reset by peer")) is False
+    assert _is_summary_auth_error(TimeoutError("read timed out")) is False
+
+
+# ---------------------------------------------------------------------------
+# Compaction model routing (issue #1950)
+# ---------------------------------------------------------------------------
+
+
+def test_route_bare_model_prefixes_anthropic_claude() -> None:
+    """A bare ``claude-*`` id must route to Anthropic, not the OpenAI default.
+
+    Regression for #1950: explicit ``/compact`` on a ``claude-sdk`` agent with a
+    pinned bare Anthropic model (e.g. ``claude-haiku-4-5-20251001``) sent the id
+    to ``api.openai.com`` (routing.py defaults prefix-less ids to OpenAI), so the
+    summarization LLM call 500'd. It must be nudged to ``anthropic/…``.
+    """
+    from omnigent.llms.routing import parse_model_string
+
+    out = _route_bare_model_for_compaction(LLMConfig(model="claude-haiku-4-5-20251001"))
+    assert out.model == "anthropic/claude-haiku-4-5-20251001"
+    # And the generic client now routes it to Anthropic rather than OpenAI.
+    assert parse_model_string(out.model).provider == "anthropic"
+
+
+def test_route_bare_model_preserves_databricks_and_prefixed_ids() -> None:
+    """databricks-* still gets the databricks/ prefix; already-routed ids pass through."""
+    assert (
+        _route_bare_model_for_compaction(LLMConfig(model="databricks-claude-sonnet-4")).model
+        == "databricks/databricks-claude-sonnet-4"
+    )
+    # Already provider-prefixed — left untouched (no double prefixing).
+    for prefixed in ("anthropic/claude-haiku-4-5-20251001", "openai/gpt-4o", "databricks/foo"):
+        assert _route_bare_model_for_compaction(LLMConfig(model=prefixed)).model == prefixed
+    # Bare gpt-* is correctly OpenAI already — unchanged.
+    assert _route_bare_model_for_compaction(LLMConfig(model="gpt-4o")).model == "gpt-4o"

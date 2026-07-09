@@ -10,29 +10,18 @@ and deterministic. Integration with the full workflow lives in
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Sequence
-from typing import Any
+from collections.abc import Iterator
 
 import pytest
 from fastapi import FastAPI
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import (
-    ReadableSpan,
-    SimpleSpanProcessor,
-    SpanExporter,
-    SpanExportResult,
-)
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opentelemetry.trace import (
-    NonRecordingSpan,
-    SpanContext,
-    SpanKind,
-    TraceFlags,
-    TraceState,
-    set_span_in_context,
+    StatusCode,
 )
 
 from omnigent.runtime import telemetry
@@ -41,186 +30,55 @@ _RESP_HEX = "d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3"
 _RESP_ID = f"resp_{_RESP_HEX}"
 
 
-class _RecordingSpanExporter(SpanExporter):
-    """
-    Span exporter that records spans without network I/O.
-
-    :param spans: Exported spans.
-    """
-
-    def __init__(self) -> None:
-        """
-        Initialize an empty exporter.
-
-        :returns: ``None``.
-        """
-        self.spans: list[ReadableSpan] = []
-
-    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        """
-        Record a batch of spans.
-
-        :param spans: Finished spans passed by the span processor.
-        :returns: Successful export result.
-        """
-        self.spans.extend(spans)
-        return SpanExportResult.SUCCESS
-
-    def shutdown(self) -> None:
-        """
-        Shut down the exporter.
-
-        :returns: ``None``.
-        """
-
-    def force_flush(self, timeout_millis: int = 30000) -> bool:
-        """
-        Flush pending export work.
-
-        :param timeout_millis: Flush timeout in milliseconds.
-        :returns: ``True`` because this exporter has no buffered work.
-        """
-        return True
-
-
-def _read_attr(span: Any, key: str) -> Any:
-    """
-    Read an attribute from an OTel span and decode MLflow's JSON
-    wrapping.
-
-    MLflow stores span attribute values via ``json.dumps`` so that
-    complex types (dicts, lists, Pydantic models) round-trip
-    through OTel's string-only attribute store. Strings are
-    therefore wrapped in quotes when read back from the raw OTel
-    attributes mapping. This helper decodes the JSON wrapping so
-    tests can assert on the original value.
-
-    :param span: An OTel ``ReadableSpan`` from the exporter.
-    :param key: The attribute key to read.
-    :returns: The decoded attribute value, or ``None`` if not set.
-    """
-    import json
-
-    raw = span.attributes.get(key) if span.attributes else None
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return raw
-    return raw
-
-
-def _install_mlflow_otlp_test_provider(
-    monkeypatch: pytest.MonkeyPatch,
-    exporter: SpanExporter,
-) -> TracerProvider:
-    """
-    Install a fresh OTel provider wired through MLflow's OTLP path.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param exporter: Span exporter MLflow should install on the
-        provider, e.g. ``_RecordingSpanExporter()``.
-    :returns: The installed OpenTelemetry ``TracerProvider``.
-    """
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
-    monkeypatch.setenv("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", "false")
-    monkeypatch.delenv("MLFLOW_TRACE_ENABLE_OTLP_DUAL_EXPORT", raising=False)
-    monkeypatch.setattr(telemetry, "_initialized", False)
-    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
-
-    from mlflow.tracing.provider import provider as mlflow_provider_wrapper
-    from mlflow.tracing.trace_manager import InMemoryTraceManager
-
-    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
-    if trace_manager_instance is not None:
-        trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
-        trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
-
-    provider = TracerProvider()
-    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
-    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
-    mlflow_provider_wrapper._global_provider_init_once._done = False  # type: ignore[attr-defined]
-    monkeypatch.setattr("mlflow.tracing.provider.get_otlp_exporter", lambda: exporter)
-    monkeypatch.setattr("mlflow.tracing.provider.should_export_otlp_metrics", lambda: False)
-    return provider
-
-
-def _assert_otlp_encodable_span_attributes(span: ReadableSpan) -> None:
-    """
-    Assert span attributes can be encoded by the OTLP exporter.
-
-    :param span: Finished OpenTelemetry span to validate.
-    :raises Exception: If OpenTelemetry's OTLP encoder rejects an
-        attribute value, e.g. ``None``.
-    """
-    from opentelemetry.exporter.otlp.proto.common._internal import _encode_attributes
-
-    attributes = span.attributes or {}
-    assert all(value is not None for value in attributes.values()), (
-        f"span {span.name!r} has None-valued attributes: {attributes!r}"
-    )
-    _encode_attributes(attributes)
-
-
 # ── Fixtures ────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _opt_in_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """
+    Telemetry is opt-in (``OMNIGENT_TELEMETRY_ENABLED``, off by default).
+    This module exercises telemetry behavior, so opt in for every test; the
+    opt-out test clears it explicitly. Also resets the session-id contextvar
+    around each test so a ``set_session_id`` / hook call in one test (which
+    deliberately does not reset — prod requests are isolated async tasks)
+    cannot leak into the next.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    token = telemetry._session_id_var.set(None)
+    try:
+        yield
+    finally:
+        telemetry._session_id_var.reset(token)
+        # init()/enable_tracing() in a telemetry test flips global tracing on
+        # and never resets it; clear it so it can't leak "tracing on" into
+        # other suites (e.g. the executor-adapter tests).
+        from omnigent.inner.tracing import disable_tracing
+
+        disable_tracing()
+        telemetry._initialized = False
+
+
 @pytest.fixture
-def in_memory_exporter() -> Iterator[InMemorySpanExporter]:
+def in_memory_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
     """
     Install a fresh SDK TracerProvider with an in-memory exporter
     for the duration of one test.
-
-    Each test that needs to assert on emitted spans uses this
-    fixture to get a clean exporter. The fixture also resets
-    MLflow's ``InMemoryTraceManager`` singleton between tests so
-    previous tests' ``is_remote_trace=True`` registrations don't
-    leak into the new one (which would cause
-    ``register_trace`` to silently no-op on a duplicate).
     """
-    # Force unified mode so MLflow shares the global provider.
-    os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = "false"
-    # Reset the telemetry module's one-shot init guard so each
-    # test gets a fresh MLflow init if it needs one.
-    telemetry._initialized = False  # type: ignore[attr-defined]
-
-    # Reset MLflow's singleton trace manager. Without this, a
-    # previous test's registered trace leaks in and the new
-    # start_span path sees an unexpected pre-existing trace.
-    from mlflow.tracing.trace_manager import InMemoryTraceManager
-
-    trace_manager_instance = getattr(InMemoryTraceManager, "_instance", None)
-    if trace_manager_instance is not None:
-        # Clear the internal dicts so no stale trace state leaks.
-        trace_manager_instance._traces.clear()  # type: ignore[attr-defined]
-        trace_manager_instance._otel_id_to_mlflow_trace_id.clear()  # type: ignore[attr-defined]
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
 
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    # Set via private attribute to bypass OTel's set-once guard
-    # AND force MLflow to re-initialize its global-provider wiring
-    # so its span processors get added to the new provider.
+    # Set via private attribute to bypass OTel's set-once guard.
     otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
     otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
 
-    # Force MLflow to re-register its span processors on the new
-    # provider. Calling ``mlflow.tracing.enable`` again without
-    # clearing its once-flag is a no-op, so we reset the flag.
-    from mlflow.tracing.provider import provider as mlflow_provider_wrapper
-
-    mlflow_provider_wrapper._global_provider_init_once._done = False  # type: ignore[attr-defined]
-
-    import mlflow.tracing
-
-    mlflow.tracing.enable()
-
     yield exporter
 
-    # Clear spans collected by the exporter after the test.
     exporter.clear()
 
 
@@ -342,8 +200,7 @@ def test_should_capture_content_reflects_module_state(
 ) -> None:
     """
     ``should_capture_content()`` reads the module-level flag that
-    :func:`init` populates from the env var. Init is gated so the
-    flag updates even on a second call.
+    :func:`init` populates from the env var.
     """
     monkeypatch.setattr(telemetry, "_capture_content", False)
     assert telemetry.should_capture_content() is False
@@ -362,25 +219,16 @@ def test_trace_context_for_response_root(
     has the trace_id derived from ``response_id`` — the full
     omnigent-to-trace-backend lookup chain works end-to-end.
     """
-    import mlflow
-    from mlflow.entities import SpanType
-
+    tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("invoke_agent", span_type=SpanType.AGENT):
+        with tracer.start_as_current_span("invoke_agent"):
             pass
 
     spans = in_memory_exporter.get_finished_spans()
-    # Exactly one span emitted — the invoke_agent span.
-    assert len(spans) == 1, (
-        f"expected 1 span, got {len(spans)} — extra spans indicate "
-        "MLflow emitted something we didn't request, or spans from a "
-        "previous test leaked into this exporter."
-    )
+    assert len(spans) == 1, f"expected 1 span, got {len(spans)}"
     actual_hex = format(spans[0].context.trace_id, "032x")
     assert actual_hex == _RESP_HEX, (
-        f"trace_id {actual_hex!r} does not match response ID hex "
-        f"{_RESP_HEX!r} — trace_context_for_response did not "
-        "propagate the custom trace ID into MLflow's span creation path."
+        f"trace_id {actual_hex!r} does not match response ID hex {_RESP_HEX!r}"
     )
 
 
@@ -390,18 +238,15 @@ def test_trace_context_for_response_sub_agent(
     """
     When ``root_response_id`` is set, the sub-agent span nests
     under the root's trace, not its own. This proves sub-agent
-    spawn workflows share the root's trace — the whole spawn tree
-    lives in one trace.
+    spawn workflows share the root's trace.
     """
-    import mlflow
-    from mlflow.entities import SpanType
-
+    tracer = otel_trace.get_tracer("test")
     sub_response_id = "resp_" + "a" * 32
     with telemetry.trace_context_for_response(
         response_id=sub_response_id,
         root_response_id=_RESP_ID,
     ):
-        with mlflow.start_span("invoke_agent sub", span_type=SpanType.AGENT):
+        with tracer.start_as_current_span("invoke_agent sub"):
             pass
 
     spans = in_memory_exporter.get_finished_spans()
@@ -409,9 +254,7 @@ def test_trace_context_for_response_sub_agent(
     actual_hex = format(spans[0].context.trace_id, "032x")
     # Sub-agent span has the ROOT response's trace ID, not its own.
     assert actual_hex == _RESP_HEX, (
-        f"sub-agent trace_id {actual_hex!r} should match root "
-        f"response hex {_RESP_HEX!r}, not sub response hex — "
-        "sub-agents must inherit the root's trace."
+        f"sub-agent trace_id {actual_hex!r} should match root response hex {_RESP_HEX!r}"
     )
 
 
@@ -419,29 +262,21 @@ def test_trace_context_for_response_shared_across_children(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:
     """
-    Multiple child spans (MLflow + raw OTel) created inside the
-    same trace context all share one trace ID. This is the
-    hybrid-mode invariant — MLflow and raw OTel spans can mix
-    freely in the same trace tree.
+    Multiple child spans created inside the same trace context all
+    share one trace ID.
     """
-    import mlflow
-    from mlflow.entities import SpanType
-
+    tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("invoke_agent", span_type=SpanType.AGENT):
-            with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL):
+        with tracer.start_as_current_span("invoke_agent"):
+            with tracer.start_as_current_span("chat"):
                 pass
-            raw_tracer = otel_trace.get_tracer("test")
-            with raw_tracer.start_as_current_span("raw-otel-child"):
+            with tracer.start_as_current_span("raw-otel-child"):
                 pass
 
     spans = in_memory_exporter.get_finished_spans()
     trace_ids = {format(s.context.trace_id, "032x") for s in spans}
-    # All spans MUST share exactly one trace_id (the derived hex).
     assert trace_ids == {_RESP_HEX}, (
-        f"expected all spans to share trace_id {_RESP_HEX!r}, "
-        f"got {trace_ids!r}. Mixed trace IDs mean the parent context "
-        "propagation broke between MLflow and raw OTel."
+        f"expected all spans to share trace_id {_RESP_HEX!r}, got {trace_ids!r}"
     )
 
 
@@ -455,11 +290,7 @@ def test_get_traceparent_env_no_span() -> None:
     inheritance when the parent has none.
     """
     env = telemetry.get_traceparent_env()
-    assert env == {}, (
-        f"expected empty env dict outside of any span, got {env!r}. "
-        "A non-empty result means OTel's context API returned a span "
-        "we don't expect."
-    )
+    assert env == {}, f"expected empty env dict outside of any span, got {env!r}"
 
 
 def test_get_traceparent_env_inside_span(
@@ -468,29 +299,19 @@ def test_get_traceparent_env_inside_span(
     """
     Inside an active span, ``get_traceparent_env`` returns a
     ``TRACEPARENT`` env var whose trace_id matches the active
-    span's trace_id. This proves executor subprocess launchers can
-    propagate the parent trace ID to a child process.
+    span's trace_id.
     """
-    import mlflow
-    from mlflow.entities import SpanType
-
+    tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("root", span_type=SpanType.AGENT):
+        with tracer.start_as_current_span("root"):
             env = telemetry.get_traceparent_env()
             assert "TRACEPARENT" in env, f"expected TRACEPARENT key, got {list(env.keys())!r}"
-            # W3C traceparent format: 00-{trace_id}-{span_id}-{flags}
             parts = env["TRACEPARENT"].split("-")
-            assert len(parts) == 4, (
-                f"expected 4 traceparent parts, got {len(parts)}: {env['TRACEPARENT']!r}"
-            )
+            assert len(parts) == 4
             version, trace_id_hex, _span_id_hex, _flags = parts
             assert version == "00"
-            # The trace_id in the env var must match our derived hex
-            # so the child process nests under this trace.
             assert trace_id_hex == _RESP_HEX, (
-                f"traceparent trace_id {trace_id_hex!r} does not match "
-                f"response hex {_RESP_HEX!r} — executor subprocesses "
-                "would end up in a different trace than the parent."
+                f"traceparent trace_id {trace_id_hex!r} does not match response hex {_RESP_HEX!r}"
             )
 
 
@@ -501,18 +322,12 @@ def test_record_llm_usage_basic(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:
     """
-    ``record_llm_usage`` sets the ``mlflow.chat.tokenUsage``
-    attribute with input/output/total tokens. The attribute is
-    what MLflow translates to ``gen_ai.usage.*`` on OTLP export,
-    so getting this right means the token count makes it to the
-    backend.
+    ``record_llm_usage`` sets OTel GenAI semantic convention attributes
+    for input/output/total tokens.
     """
-    import mlflow
-    from mlflow.entities import SpanType
-    from mlflow.tracing.constant import SpanAttributeKey
-
+    tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL) as span:
+        with tracer.start_as_current_span("chat") as span:
             telemetry.record_llm_usage(
                 span,
                 {"input_tokens": 100, "output_tokens": 50},
@@ -520,40 +335,22 @@ def test_record_llm_usage_basic(
 
     spans = in_memory_exporter.get_finished_spans()
     assert len(spans) == 1
-    payload = _read_attr(spans[0], SpanAttributeKey.CHAT_USAGE)
-    # input_tokens/output_tokens must round-trip from the usage
-    # dict verbatim — a wrong value here means record_llm_usage
-    # mangled the input keys or type-coerced them incorrectly.
-    assert payload["input_tokens"] == 100, (
-        f"expected input_tokens=100, got {payload['input_tokens']!r}"
-    )
-    assert payload["output_tokens"] == 50, (
-        f"expected output_tokens=50, got {payload['output_tokens']!r}"
-    )
-    # Total is DERIVED (input + output = 150) because the input
-    # dict did not include a total_tokens field. A wrong value
-    # means the total-derivation logic broke.
-    assert payload["total_tokens"] == 150, (
-        f"expected derived total_tokens = input + output = 150, "
-        f"got {payload.get('total_tokens')!r}"
-    )
+    attrs = spans[0].attributes or {}
+    assert attrs.get("gen_ai.usage.input_tokens") == 100
+    assert attrs.get("gen_ai.usage.output_tokens") == 50
+    # Total is derived (100 + 50 = 150) when not provided.
+    assert attrs.get("gen_ai.usage.total_tokens") == 150
 
 
 def test_record_llm_usage_with_cache(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:
     """
-    Cache breakdown fields are recorded when present. Their absence
-    is meaningful — providers that do not report caching should not
-    show zero-valued cache fields, so we only populate them when
-    the input dict has the keys.
+    Cache breakdown fields are recorded when present.
     """
-    import mlflow
-    from mlflow.entities import SpanType
-    from mlflow.tracing.constant import SpanAttributeKey
-
+    tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL) as span:
+        with tracer.start_as_current_span("chat") as span:
             telemetry.record_llm_usage(
                 span,
                 {
@@ -566,12 +363,12 @@ def test_record_llm_usage_with_cache(
             )
 
     spans = in_memory_exporter.get_finished_spans()
-    payload = _read_attr(spans[0], SpanAttributeKey.CHAT_USAGE)
-    assert payload["input_tokens"] == 1000
-    assert payload["output_tokens"] == 200
-    assert payload["total_tokens"] == 1200
-    assert payload["cache_read_input_tokens"] == 800
-    assert payload["cache_creation_input_tokens"] == 100
+    attrs = spans[0].attributes or {}
+    assert attrs.get("gen_ai.usage.input_tokens") == 1000
+    assert attrs.get("gen_ai.usage.output_tokens") == 200
+    assert attrs.get("gen_ai.usage.total_tokens") == 1200
+    assert attrs.get("gen_ai.usage.cache_read_input_tokens") == 800
+    assert attrs.get("gen_ai.usage.cache_creation_input_tokens") == 100
 
 
 def test_record_llm_usage_without_cache_omits_fields(
@@ -580,23 +377,20 @@ def test_record_llm_usage_without_cache_omits_fields(
     """
     When cache fields are absent from the input dict, they are NOT
     recorded — this prevents masking "caching not reported" as
-    "zero tokens cached", which would mislead cost analysis.
+    "zero tokens cached".
     """
-    import mlflow
-    from mlflow.entities import SpanType
-    from mlflow.tracing.constant import SpanAttributeKey
-
+    tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("chat", span_type=SpanType.CHAT_MODEL) as span:
+        with tracer.start_as_current_span("chat") as span:
             telemetry.record_llm_usage(
                 span,
                 {"input_tokens": 10, "output_tokens": 5},
             )
 
     spans = in_memory_exporter.get_finished_spans()
-    payload = _read_attr(spans[0], SpanAttributeKey.CHAT_USAGE)
-    assert "cache_read_input_tokens" not in payload
-    assert "cache_creation_input_tokens" not in payload
+    attrs = spans[0].attributes or {}
+    assert "gen_ai.usage.cache_read_input_tokens" not in attrs
+    assert "gen_ai.usage.cache_creation_input_tokens" not in attrs
 
 
 # ── record_error / record_cancellation ─────────────────
@@ -606,28 +400,22 @@ def test_record_error_sets_error_type_and_status(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:
     """
-    ``record_error`` marks the span as ERROR and sets an
-    ``error.type`` attribute equal to the exception class name.
-    Operators filter traces by ``error.type`` so this attribute
-    must be populated.
+    ``record_error`` marks the span as ERROR and sets ``error.type``
+    to the exception class name.
     """
-    import mlflow
-    from mlflow.entities import SpanType
+    tracer = otel_trace.get_tracer("test")
 
     class CustomError(Exception):
         pass
 
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("test", span_type=SpanType.AGENT) as span:
+        with tracer.start_as_current_span("test") as span:
             telemetry.record_error(span, CustomError("boom"))
 
     spans = in_memory_exporter.get_finished_spans()
     assert len(spans) == 1
-    assert _read_attr(spans[0], "error.type") == "CustomError"
-    # OTel status code — MLflow's SpanStatusCode.ERROR maps to
-    # OTel StatusCode.ERROR (value = 2).
-    from opentelemetry.trace import StatusCode
-
+    attrs = spans[0].attributes or {}
+    assert attrs.get("error.type") == "CustomError"
     assert spans[0].status.status_code == StatusCode.ERROR
 
 
@@ -636,142 +424,65 @@ def test_record_cancellation_sets_cancelled_error_type(
 ) -> None:
     """
     Cancellation uses ``error.type = "cancelled"`` as the
-    distinguishing marker (neither OTel nor MLflow has a dedicated
-    cancelled status). Operators filter by this attribute to find
-    cancelled traces separately from failures.
+    distinguishing marker.
     """
-    import mlflow
-    from mlflow.entities import SpanType
-
+    tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with mlflow.start_span("test", span_type=SpanType.AGENT) as span:
+        with tracer.start_as_current_span("test") as span:
             telemetry.record_cancellation(span)
 
     spans = in_memory_exporter.get_finished_spans()
-    assert _read_attr(spans[0], "error.type") == "cancelled"
-    from opentelemetry.trace import StatusCode
-
+    attrs = spans[0].attributes or {}
+    assert attrs.get("error.type") == "cancelled"
     assert spans[0].status.status_code == StatusCode.ERROR
 
 
 # ── init() ──────────────────────────────────────────────
 
 
-def test_init_no_endpoint_does_not_enable_otlp(
+def test_init_no_endpoint_does_not_install_otlp_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     When ``OTEL_EXPORTER_OTLP_ENDPOINT`` is unset, ``init`` must
-    NOT flip ``MLFLOW_ENABLE_OTLP_EXPORTER`` — otherwise operators
-    who haven't configured an endpoint would get unexpected OTLP
-    connection attempts.
+    NOT replace the global TracerProvider — callers may have already
+    installed their own.
     """
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
-    monkeypatch.delenv("OTEL_METRICS_EXPORTER", raising=False)
-    monkeypatch.delenv("MLFLOW_ENABLE_OTLP_EXPORTER", raising=False)
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
     monkeypatch.setattr(telemetry, "_initialized", False)
     monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
+
+    before = otel_trace.get_tracer_provider()
     telemetry.init()
-    assert "MLFLOW_ENABLE_OTLP_EXPORTER" not in os.environ, (
-        "init() set MLFLOW_ENABLE_OTLP_EXPORTER with no endpoint "
-        "configured — OTLP export would fail at runtime."
-    )
+    # No new provider installed when no endpoint is configured.
+    assert otel_trace.get_tracer_provider() is before
 
 
-def test_init_with_endpoint_enables_otlp(
+def test_init_with_endpoint_installs_sdk_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set, ``init`` flips
-    ``MLFLOW_ENABLE_OTLP_EXPORTER=true`` so MLflow routes via OTLP
-    instead of its default tracking-server path.
+    When ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set, ``init`` installs a
+    ``TracerProvider`` backed by an OTLP span exporter.
     """
+    from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
     monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
-    monkeypatch.delenv("MLFLOW_ENABLE_OTLP_EXPORTER", raising=False)
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
     monkeypatch.setattr(telemetry, "_initialized", False)
     monkeypatch.setattr(telemetry, "_metrics_initialized", False)
-    telemetry.init()
-    assert os.environ.get("MLFLOW_ENABLE_OTLP_EXPORTER") == "true"
-
-
-def test_init_allows_remote_parent_otel_server_spans(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    MLflow's OTLP processor tolerates server spans with remote parents.
-
-    FastAPI / ASGI auto-instrumentation creates exactly this shape
-    when an incoming request carries a platform ``traceparent``:
-    the first local server span has a parent, but no local MLflow
-    trace has been registered yet. This test proves
-    ``telemetry.init()`` patches MLflow before enablement so such
-    spans are exported instead of crashing request handling.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    from mlflow.entities import SpanType
-    from mlflow.tracing.constant import SpanAttributeKey
-
-    exporter = _RecordingSpanExporter()
-    provider = _install_mlflow_otlp_test_provider(monkeypatch, exporter)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
+    # Reset OTel set-once guard so init() can install a new provider.
+    otel_trace._TRACER_PROVIDER = None  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = False  # type: ignore[attr-defined]
 
     telemetry.init()
 
-    remote_parent = NonRecordingSpan(
-        SpanContext(
-            trace_id=int(_RESP_HEX, 16),
-            span_id=0x1000000000000002,
-            is_remote=True,
-            trace_flags=TraceFlags(TraceFlags.SAMPLED),
-            trace_state=TraceState(),
-        )
-    )
-    tracer = otel_trace.get_tracer("tests.runtime.telemetry")
-    with tracer.start_as_current_span(
-        "GET /health",
-        context=set_span_in_context(remote_parent),
-        kind=SpanKind.SERVER,
-    ):
-        pass
-
-    assert provider.force_flush()
-    assert [span.name for span in exporter.spans] == ["GET /health"]
-    assert exporter.spans[0].kind is SpanKind.SERVER
-    assert _read_attr(exporter.spans[0], SpanAttributeKey.SPAN_TYPE) == SpanType.UNKNOWN
-    _assert_otlp_encodable_span_attributes(exporter.spans[0])
-
-
-def test_init_defaults_raw_otel_root_span_type_for_otlp(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Raw OTel root spans exported through MLflow get a valid span type.
-
-    MLflow 3.11.1 registers raw OpenTelemetry spans by passing
-    ``span_type=None`` into ``create_mlflow_span``. That stores
-    ``mlflow.spanType=None`` and the OTLP exporter rejects the span.
-    This test proves ``telemetry.init()`` patches that path so normal
-    auto-instrumented spans are exportable.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    from mlflow.entities import SpanType
-    from mlflow.tracing.constant import SpanAttributeKey
-
-    exporter = _RecordingSpanExporter()
-    provider = _install_mlflow_otlp_test_provider(monkeypatch, exporter)
-
-    telemetry.init()
-
-    tracer = otel_trace.get_tracer("tests.runtime.telemetry")
-    with tracer.start_as_current_span("GET /health", kind=SpanKind.SERVER):
-        pass
-
-    assert provider.force_flush()
-    assert [span.name for span in exporter.spans] == ["GET /health"]
-    assert _read_attr(exporter.spans[0], SpanAttributeKey.SPAN_TYPE) == SpanType.UNKNOWN
-    _assert_otlp_encodable_span_attributes(exporter.spans[0])
+    assert isinstance(otel_trace.get_tracer_provider(), SdkTracerProvider)
 
 
 def test_init_respects_capture_content_flag(
@@ -779,10 +490,13 @@ def test_init_respects_capture_content_flag(
 ) -> None:
     """
     ``init`` reads ``OMNIGENT_OTEL_CAPTURE_CONTENT`` each call
-    so operators can toggle it after restart. Idempotent re-init
-    refreshes the flag.
+    so operators can toggle it after restart.
     """
     monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
     monkeypatch.setenv("OMNIGENT_OTEL_CAPTURE_CONTENT", "true")
     telemetry.init()
     assert telemetry.should_capture_content() is True
@@ -792,27 +506,256 @@ def test_init_respects_capture_content_flag(
     assert telemetry.should_capture_content() is False
 
 
-def test_instrument_fastapi_app_is_opt_in(
+def test_init_disabled_by_default_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    FastAPI instrumentation stays disabled unless explicitly requested.
+    Telemetry is opt-in: with ``OMNIGENT_TELEMETRY_ENABLED`` unset,
+    ``init`` is a no-op even when an OTLP endpoint is configured — no
+    provider is installed, so a default install pays nothing.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.delenv("OMNIGENT_TELEMETRY_ENABLED", raising=False)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+
+    assert telemetry.telemetry_enabled() is False
+    before = otel_trace.get_tracer_provider()
+    telemetry.init()
+    assert otel_trace.get_tracer_provider() is before
+
+
+def test_fastapi_session_id_hook_stamps_session_id(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    The FastAPI server-request hook tags the server span with the
+    Omnigent session id parsed from a ``/sessions/<conv_…>/`` path, so
+    every session-scoped request span is findable by session.
+
+    :param in_memory_exporter: In-memory span exporter fixture.
+    """
+    tracer = otel_trace.get_tracer("test")
+    span = tracer.start_span("POST /v1/sessions/{id}/events")
+    telemetry._fastapi_session_id_hook(span, {"path": "/v1/sessions/conv_deadbeef/events"})
+    span.end()
+
+    exported = in_memory_exporter.get_finished_spans()
+    assert exported[-1].attributes is not None
+    assert exported[-1].attributes.get("session.id") == "conv_deadbeef"
+
+
+def test_fastapi_session_id_hook_ignores_non_session_paths(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    The hook leaves spans for non-session routes untouched.
+
+    :param in_memory_exporter: In-memory span exporter fixture.
+    """
+    tracer = otel_trace.get_tracer("test")
+    span = tracer.start_span("GET /v1/info")
+    telemetry._fastapi_session_id_hook(span, {"path": "/v1/info"})
+    span.end()
+
+    exported = in_memory_exporter.get_finished_spans()
+    assert "session.id" not in (exported[-1].attributes or {})
+
+
+def test_tracing_context_stamps_session_id_on_agent_span(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    Spans created by a session-scoped ``TracingContext`` carry the
+    ``session.id`` attribute, so agent-turn spans — which can root their
+    own trace — stay groupable by session in the backend.
+
+    :param in_memory_exporter: In-memory span exporter fixture.
+    """
+    from omnigent.inner.tracing import TracingContext
+
+    tctx = TracingContext(session_id="conv_abc123")
+    agent_span = tctx.start_agent_span("my-agent", "hello")
+    tctx.end_agent_span(agent_span, response="hi")
+
+    exported = in_memory_exporter.get_finished_spans()
+    agent_spans = [s for s in exported if s.name == "agent:my-agent"]
+    assert agent_spans, "expected an agent span to be exported"
+    assert agent_spans[-1].attributes.get("session.id") == "conv_abc123"
+
+
+def test_set_session_id_stamps_current_span(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    ``set_session_id`` tags the active span — used by session-creating
+    routes (``POST /v1/sessions``) where the conv id is minted in the body
+    and so is absent from the request path the FastAPI hook reads. A falsy
+    id is a no-op.
+
+    :param in_memory_exporter: In-memory span exporter fixture.
+    """
+    tracer = otel_trace.get_tracer("test")
+    with tracer.start_as_current_span("POST /v1/sessions"):
+        telemetry.set_session_id("conv_cafef00d")
+        telemetry.set_session_id(None)  # no-op, must not raise or clear
+
+    exported = in_memory_exporter.get_finished_spans()
+    assert exported[-1].attributes.get("session.id") == "conv_cafef00d"
+
+
+def test_session_scope_processor_stamps_every_span() -> None:
+    """
+    The generic mechanism: every span created inside ``session_scope`` is
+    tagged with ``session.id`` by ``_SessionIdSpanProcessor`` — no per-span
+    code — and spans outside the scope are left untouched.
+    """
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(telemetry._make_session_id_processor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+
+    with telemetry.session_scope("conv_generic01"):
+        with tracer.start_as_current_span("server.request"):
+            with tracer.start_as_current_span("db.query"):  # child span, never stamped by hand
+                pass
+    with tracer.start_as_current_span("outside.scope"):
+        pass
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert spans["server.request"].attributes.get("session.id") == "conv_generic01"
+    assert spans["db.query"].attributes.get("session.id") == "conv_generic01"
+    assert "session.id" not in (spans["outside.scope"].attributes or {})
+
+
+def test_init_sets_service_name_from_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A passed ``service_name`` becomes ``OTEL_SERVICE_NAME``, overriding
+    any inherited value — so a child process (e.g. the runner spawned by
+    the server) is attributable as its own component rather than
+    inheriting the parent's name.
+    """
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
+    # Simulate an inherited value from a parent process.
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "omni-server")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
+
+    telemetry.init("omni-runner")
+
+    assert os.environ["OTEL_SERVICE_NAME"] == "omni-runner"
+
+
+def test_init_defaults_service_name_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no argument and no operator-set ``OTEL_SERVICE_NAME``, the
+    service name defaults to ``omnigent`` so spans are never anonymous.
+    """
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
+
+    telemetry.init()
+
+    assert os.environ["OTEL_SERVICE_NAME"] == "omnigent"
+
+
+def test_init_honors_operator_service_name_without_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no argument but an operator-set ``OTEL_SERVICE_NAME``, the
+    operator's value is preserved.
+    """
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "my-deployment")
+    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
+    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "none")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    monkeypatch.setattr(telemetry, "_logs_initialized", False)
+
+    telemetry.init()
+
+    assert os.environ["OTEL_SERVICE_NAME"] == "my-deployment"
+
+
+def _stub_fastapi_instrumentor(monkeypatch: pytest.MonkeyPatch) -> list[FastAPI]:
+    """
+    Replace ``FastAPIInstrumentor.instrument_app`` with a recorder.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: A list that accumulates each app passed to the
+        instrumentor — empty means instrumentation was skipped.
     """
     calls: list[FastAPI] = []
-
-    def fake_instrument_app(app: FastAPI) -> None:
-        """
-        Record the app passed to the fake instrumentor.
-
-        :param app: FastAPI app passed by telemetry code.
-        """
-        calls.append(app)
-
-    monkeypatch.delenv("OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION", raising=False)
     monkeypatch.setattr(
         "opentelemetry.instrumentation.fastapi.FastAPIInstrumentor.instrument_app",
-        fake_instrument_app,
+        lambda app, **kwargs: calls.append(app),
     )
+    return calls
+
+
+def test_instrument_fastapi_app_disabled_without_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no flag and no tracing backend configured, FastAPI
+    instrumentation is skipped — bare installs pay no span overhead.
+    """
+    monkeypatch.delenv("OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    calls = _stub_fastapi_instrumentor(monkeypatch)
+
+    telemetry.instrument_fastapi_app(FastAPI())
+
+    assert calls == []
+
+
+def test_instrument_fastapi_app_default_on_with_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With the flag unset, instrumentation defaults ON when an OTLP
+    endpoint is configured — that is when HTTP server spans have
+    somewhere to go and when cross-app trace propagation matters.
+    """
+    monkeypatch.delenv("OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION", raising=False)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    app = FastAPI()
+    calls = _stub_fastapi_instrumentor(monkeypatch)
+
+    telemetry.instrument_fastapi_app(app)
+
+    assert calls == [app]
+
+
+def test_instrument_fastapi_app_explicit_false_overrides_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An explicit ``OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION=false`` wins
+    even when a backend is configured — operators can force it off.
+    """
+    monkeypatch.setenv("OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION", "false")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    calls = _stub_fastapi_instrumentor(monkeypatch)
 
     telemetry.instrument_fastapi_app(FastAPI())
 
@@ -823,43 +766,335 @@ def test_instrument_fastapi_app_calls_instrumentor_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    The opt-in flag installs OpenTelemetry FastAPI instrumentation.
+    The explicit flag installs OpenTelemetry FastAPI instrumentation
+    even with no backend configured (the in-memory-exporter test path).
     """
-    app = FastAPI()
-    calls: list[FastAPI] = []
-
-    def fake_instrument_app(app_to_instrument: FastAPI) -> None:
-        """
-        Record the app passed to the fake instrumentor.
-
-        :param app_to_instrument: FastAPI app passed by telemetry code.
-        """
-        calls.append(app_to_instrument)
-
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     monkeypatch.setenv("OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION", "true")
-    monkeypatch.setattr(
-        "opentelemetry.instrumentation.fastapi.FastAPIInstrumentor.instrument_app",
-        fake_instrument_app,
-    )
+    app = FastAPI()
+    calls = _stub_fastapi_instrumentor(monkeypatch)
 
     telemetry.instrument_fastapi_app(app)
 
     assert calls == [app]
 
 
-def test_init_forces_unified_provider_mode(
+def test_instrument_httpx_wires_global_client() -> None:
+    """
+    ``_instrument_httpx`` installs the global HTTPX instrumentation so
+    outbound httpx requests inject ``traceparent``. Idempotent — a
+    second call must not raise. Uninstruments afterward to avoid
+    leaking global state into other tests.
+    """
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+    instrumentor = HTTPXClientInstrumentor()
+    was_instrumented = instrumentor.is_instrumented_by_opentelemetry
+    try:
+        telemetry._instrument_httpx()
+        assert instrumentor.is_instrumented_by_opentelemetry is True
+        # Idempotent: calling again is a no-op, not an error.
+        telemetry._instrument_httpx()
+        assert instrumentor.is_instrumented_by_opentelemetry is True
+    finally:
+        if not was_instrumented:
+            instrumentor.uninstrument()
+
+
+def test_instrument_sqlalchemy_engine_instruments() -> None:
+    """
+    ``instrument_sqlalchemy_engine`` instruments a real engine so its
+    statements emit spans. Engine-scoped instrumentation does not leak
+    globally, so no teardown is needed.
+    """
+    from sqlalchemy import create_engine
+
+    engine = create_engine("sqlite://")
+    # Must not raise; the call is the contract exercised at engine
+    # creation in ``db.utils.get_or_create_engine``.
+    telemetry.instrument_sqlalchemy_engine(engine)
+
+
+def test_instrument_sqlalchemy_engine_missing_package_is_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``init`` defaults ``MLFLOW_USE_DEFAULT_TRACER_PROVIDER`` to
-    ``"false"`` (unified mode) so MLflow shares the global
-    ``TracerProvider`` with raw OTel instrumentation. Without this,
-    FastAPI auto-instrumentation spans and MLflow spans would live
-    in separate trace trees.
+    When the optional SQLAlchemy instrumentation package is absent,
+    the helper degrades to a no-op rather than raising — bare installs
+    without the tracing extras must still create engines.
     """
-    monkeypatch.delenv("MLFLOW_USE_DEFAULT_TRACER_PROVIDER", raising=False)
-    monkeypatch.setenv("OTEL_METRICS_EXPORTER", "none")
-    monkeypatch.setattr(telemetry, "_initialized", False)
-    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
-    telemetry.init()
-    assert os.environ.get("MLFLOW_USE_DEFAULT_TRACER_PROVIDER") == "false"
+    import sys
+
+    from sqlalchemy import create_engine
+
+    # Force the import inside the helper to fail with ImportError.
+    monkeypatch.setitem(sys.modules, "opentelemetry.instrumentation.sqlalchemy", None)
+    engine = create_engine("sqlite://")
+    # Should not raise despite the missing package.
+    telemetry.instrument_sqlalchemy_engine(engine)
+
+
+def test_inject_extract_frame_round_trip(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A frame injected under a span and consumed via ``consume_frame_span``
+    nests under the same trace — the JSON-frame websocket propagation
+    invariant (host tunnel, session-updates) holds end to end.
+    """
+    tracer = otel_trace.get_tracer("test")
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with tracer.start_as_current_span("producer"):
+            frame = telemetry.inject_trace_context({"kind": "host.launch_runner"})
+    assert "traceparent" in frame
+
+    with telemetry.consume_frame_span("host.launch_runner", frame) as span:
+        consumed_hex = format(span.get_span_context().trace_id, "032x")
+
+    assert consumed_hex == _RESP_HEX, (
+        f"consumer trace {consumed_hex!r} should match producer trace "
+        f"{_RESP_HEX!r} — frame trace-context propagation is broken."
+    )
+
+
+def test_inject_trace_context_noop_without_active_span() -> None:
+    """
+    Outside any span, ``inject_trace_context`` leaves the carrier
+    unchanged so frames stay byte-for-byte wire-compatible.
+    """
+    carrier = {"kind": "host.stat", "request_id": "req_1"}
+    result = telemetry.inject_trace_context(carrier)
+    assert result is carrier
+    assert "traceparent" not in carrier
+
+
+def test_consume_frame_span_roots_new_trace_without_carrier(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A carrier with no trace headers roots a fresh trace rather than
+    raising — a frame from a peer that never injected context is still
+    handled, just without an upstream parent.
+    """
+    with telemetry.consume_frame_span("host.hello", {"kind": "host.hello"}) as span:
+        assert span.get_span_context().trace_id != 0
+
+
+def test_consume_frame_span_omits_payload_when_capture_off(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With content capture off (the default), the frame body is NOT
+    attached to the span — only its structure/metadata is traced.
+    """
+    monkeypatch.setattr(telemetry, "_capture_content", False)
+    with telemetry.consume_frame_span(
+        "host.launch_runner",
+        {"kind": "host.launch_runner", "workspace": "/tmp"},
+    ):
+        pass
+    span = in_memory_exporter.get_finished_spans()[-1]
+    assert "omnigent.message.payload" not in (span.attributes or {})
+
+
+def test_consume_frame_span_records_redacted_payload_when_capture_on(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With content capture on, the received frame body is attached to the
+    span — but secret-looking keys are redacted, the W3C propagation
+    keys are dropped, and benign fields are preserved verbatim.
+    """
+    monkeypatch.setattr(telemetry, "_capture_content", True)
+    with telemetry.consume_frame_span(
+        "host.launch_runner",
+        {
+            "kind": "host.launch_runner",
+            "binding_token": "SUPER_SECRET",
+            "workspace": "/tmp/ws",
+            "traceparent": "00-abc-def-01",
+        },
+    ):
+        pass
+    span = in_memory_exporter.get_finished_spans()[-1]
+    payload = (span.attributes or {})["omnigent.message.payload"]
+    assert "SUPER_SECRET" not in payload
+    assert "[redacted]" in payload
+    assert "traceparent" not in payload
+    assert "/tmp/ws" in payload
+
+
+def test_record_message_payload_truncates(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An oversized payload is capped so the trace backend never becomes a
+    payload store.
+    """
+    monkeypatch.setattr(telemetry, "_capture_content", True)
+    with telemetry.span("x") as span:
+        telemetry.record_message_payload({"blob": "A" * 9000}, span=span)
+    out = in_memory_exporter.get_finished_spans()[-1]
+    payload = (out.attributes or {})["omnigent.message.payload"]
+    assert payload.endswith("…[truncated]")
+    assert len(payload) <= telemetry._CONTENT_MAX_LEN + len("…[truncated]")
+
+
+def test_span_helper_emits_named_span_with_attributes(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    ``telemetry.span`` emits a named child span with the given
+    attributes — the helper used to instrument plain infra boundaries
+    (terminal attach, policy evaluation).
+    """
+    with telemetry.span(
+        "terminal.attach",
+        attributes={"session.id": "s1", "terminal.read_only": True},
+    ):
+        pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name == "terminal.attach"
+    assert spans[0].attributes["session.id"] == "s1"
+    assert spans[0].attributes["terminal.read_only"] is True
+
+
+def test_span_helper_nests_under_active_trace(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A span opened with ``telemetry.span`` nests under the currently
+    active trace context, so infra spans join the request/turn trace
+    rather than rooting their own.
+    """
+    with telemetry.trace_context_for_response(response_id=_RESP_ID):
+        with telemetry.span("policy.evaluate"):
+            pass
+
+    spans = in_memory_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert format(spans[0].context.trace_id, "032x") == _RESP_HEX
+
+
+def test_httpx_to_fastapi_propagates_trace_across_http_hop(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A real HTTP hop continues the caller's trace.
+
+    With HTTPX client instrumentation (inject) and FastAPI server
+    instrumentation (extract) both active, a request made inside a
+    parent span must run its server-side handler in the *same* trace.
+    This is the Phase 1 propagation invariant that makes the
+    server -> runner -> harness HTTP/tunnel mesh render as one trace:
+    httpx injects ``traceparent``, FastAPI extracts it, and the handler
+    nests under the caller rather than rooting a new trace.
+    """
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION", "true")
+
+    app = FastAPI()
+    handler_trace_id: dict[str, str] = {}
+
+    @app.get("/ping")
+    def ping() -> dict[str, bool]:
+        """
+        Record the trace ID active inside the server handler.
+
+        :returns: A trivial JSON body.
+        """
+        ctx = otel_trace.get_current_span().get_span_context()
+        handler_trace_id["value"] = format(ctx.trace_id, "032x")
+        return {"ok": True}
+
+    telemetry.instrument_fastapi_app(app)
+    httpx_instrumentor = HTTPXClientInstrumentor()
+    was_instrumented = httpx_instrumentor.is_instrumented_by_opentelemetry
+    telemetry._instrument_httpx()
+    tracer = otel_trace.get_tracer("test")
+    try:
+        with telemetry.trace_context_for_response(response_id=_RESP_ID):
+            with tracer.start_as_current_span("client-call"):
+                # Starlette's TestClient runs on an instrumented httpx
+                # client, so the outbound request carries traceparent.
+                response = TestClient(app).get("/ping")
+                assert response.status_code == 200
+    finally:
+        if not was_instrumented:
+            httpx_instrumentor.uninstrument()
+        FastAPIInstrumentor.uninstrument_app(app)
+
+    # The server handler ran under the caller's derived trace, proving
+    # the traceparent crossed the HTTP boundary and was extracted.
+    assert handler_trace_id.get("value") == _RESP_HEX, (
+        f"server handler trace_id {handler_trace_id.get('value')!r} does "
+        f"not match caller trace {_RESP_HEX!r} — traceparent did not "
+        "propagate across the HTTP hop (inject or extract is broken)."
+    )
+
+
+def test_instrument_httpx_client_injects_over_custom_transport(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A client on a custom transport propagates only after instrument_client.
+
+    The process-wide httpx instrumentation patches only httpx's *standard*
+    transports, so a client built on a custom ``AsyncBaseTransport`` — the
+    server->runner ``WSTunnelTransport`` — is invisible to it: outbound
+    requests carry no ``traceparent`` and the runner roots a disconnected
+    trace. :func:`telemetry.instrument_httpx_client` wraps the instance to
+    close that gap. This guards the server->runner forward staying in the
+    caller's trace; without the per-client instrumentation the dispatch
+    hop silently splits into two traces again.
+    """
+    import asyncio
+
+    import httpx
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _CapturingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            captured["headers"] = dict(request.headers)
+            return httpx.Response(200, request=request)
+
+    tracer = otel_trace.get_tracer("test")
+
+    async def _call(client: httpx.AsyncClient) -> None:
+        with telemetry.trace_context_for_response(response_id=_RESP_ID):
+            with tracer.start_as_current_span("client-call"):
+                await client.get("http://runner/v1/ping")
+        await client.aclose()
+
+    # Baseline: a custom transport is not reached by the global hook, so no
+    # context rides along regardless of whether global httpx is instrumented.
+    captured.clear()
+    bare = httpx.AsyncClient(transport=_CapturingTransport(), base_url="http://runner")
+    asyncio.run(_call(bare))
+    assert "traceparent" not in captured["headers"], (
+        "a custom-transport client unexpectedly injected traceparent without "
+        "instrument_client — the per-client fix may be unnecessary; re-evaluate."
+    )
+
+    # After instrument_client the traceparent rides the custom transport,
+    # pinned to the caller's response-derived trace.
+    captured.clear()
+    wrapped = httpx.AsyncClient(transport=_CapturingTransport(), base_url="http://runner")
+    telemetry.instrument_httpx_client(wrapped)
+    asyncio.run(_call(wrapped))
+    traceparent = captured["headers"].get("traceparent")
+    assert traceparent is not None and _RESP_HEX in traceparent, (
+        f"traceparent {traceparent!r} missing or not pinned to caller trace "
+        f"{_RESP_HEX!r} after instrument_client — the server->runner forward "
+        "would not stay in the originating trace."
+    )

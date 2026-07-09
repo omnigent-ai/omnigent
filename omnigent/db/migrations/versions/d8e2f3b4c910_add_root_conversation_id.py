@@ -63,27 +63,44 @@ def upgrade() -> None:
     # root_id. Each iteration covers one additional level of the
     # spawn tree; loops until the UPDATE affects zero rows. Bounded
     # by the maximum tree depth, which is small in practice.
+    #
+    # MySQL does not allow referencing the same table in a subquery
+    # inside an UPDATE statement (error 1093). Use a JOIN-based UPDATE
+    # for MySQL and the standard subquery form for SQLite/PostgreSQL.
     bind = op.get_bind()
-    for _ in range(64):
-        result = bind.execute(
-            sa.text(
-                """
-                UPDATE conversations
-                SET root_conversation_id = (
-                    SELECT parent.root_conversation_id
-                    FROM conversations AS parent
-                    WHERE parent.id = conversations.parent_conversation_id
-                )
-                WHERE root_conversation_id IS NULL
-                  AND parent_conversation_id IS NOT NULL
-                  AND (
-                    SELECT parent.root_conversation_id
-                    FROM conversations AS parent
-                    WHERE parent.id = conversations.parent_conversation_id
-                  ) IS NOT NULL
-                """
-            )
+    is_mysql = bind.dialect.name == "mysql"
+    if is_mysql:
+        backfill_sql = sa.text(
+            """
+            UPDATE conversations
+            JOIN conversations AS parent
+              ON parent.id = conversations.parent_conversation_id
+            SET conversations.root_conversation_id = parent.root_conversation_id
+            WHERE conversations.root_conversation_id IS NULL
+              AND conversations.parent_conversation_id IS NOT NULL
+              AND parent.root_conversation_id IS NOT NULL
+            """
         )
+    else:
+        backfill_sql = sa.text(
+            """
+            UPDATE conversations
+            SET root_conversation_id = (
+                SELECT parent.root_conversation_id
+                FROM conversations AS parent
+                WHERE parent.id = conversations.parent_conversation_id
+            )
+            WHERE root_conversation_id IS NULL
+              AND parent_conversation_id IS NOT NULL
+              AND (
+                SELECT parent.root_conversation_id
+                FROM conversations AS parent
+                WHERE parent.id = conversations.parent_conversation_id
+              ) IS NOT NULL
+            """
+        )
+    for _ in range(64):
+        result = bind.execute(backfill_sql)
         if result.rowcount == 0:
             break
 

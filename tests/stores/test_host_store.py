@@ -115,13 +115,13 @@ def test_upsert_persists_configured_harnesses(host_store: HostStore) -> None:
         host_id="host_ch1",
         name="laptop",
         owner="alice@example.com",
-        configured_harnesses={"claude-sdk": True, "codex": False},
+        configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
     )
 
     fetched = host_store.get_host("host_ch1")
     assert fetched is not None
     # Exact equality: the False bit is the actionable "warn" value.
-    assert fetched.configured_harnesses == {"claude-sdk": True, "codex": False}
+    assert fetched.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
 def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
@@ -454,8 +454,8 @@ def test_online_host_ids_returns_only_live_hosts(
     include the stale host; one that dropped the status check would
     include the offline host.
     """
-    # Distinct (host_id, name) per row — the hosts PK is (owner, name),
-    # so reusing one name would collide instead of inserting three rows.
+    # Distinct (host_id, name) per row — the hosts unique constraint is
+    # (workspace_id, owner, name), so reusing one name would collide.
     host_store.upsert_on_connect("host_live", "laptop-live", "alice@example.com")
     host_store.upsert_on_connect("host_stale2", "laptop-stale", "alice@example.com")
     host_store.upsert_on_connect("host_offline", "laptop-off", "alice@example.com")

@@ -21,6 +21,7 @@ from omnigent.tools.builtins import (
     ListCommentsTool,
     LoadSkillTool,
     ReadSkillFileTool,
+    SysAdviseModelsTool,
     SysAgentDownloadTool,
     SysAgentGetTool,
     SysAgentListTool,
@@ -454,6 +455,11 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
+        # Advise-models is registered unconditionally alongside the
+        # dispatch grant — same pattern as sys_list_models. The server's
+        # MCP intercept returns router_on:false when routing is off,
+        # giving the model a clear signal without hiding the tool.
+        self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents
         # by id, or custom bundles via config_path) requires the
@@ -831,11 +837,28 @@ class ToolManager:
         Return OpenAI-format tool schemas for all registered
         tools.
 
+        Each tool's schema is built independently. If a single tool's
+        ``get_schema()`` raises — e.g. a ``type: function`` tool whose
+        dotted ``callable`` path is unimportable — that one tool is
+        skipped with a warning rather than aborting the whole list. This
+        keeps one bad tool from silently dropping the agent's entire tool
+        surface (#378); the remaining, valid tools are still advertised.
+
         :returns: A list of OpenAI tool schema dicts, each
             with ``"type": "function"`` and a ``"function"``
             sub-dict describing the tool.
         """
-        return [tool.get_schema() for tool in self._tools.values()]
+        schemas: list[dict[str, Any]] = []
+        for name, tool in self._tools.items():
+            try:
+                schemas.append(tool.get_schema())
+            except Exception:
+                _logger.warning(
+                    "Skipping tool %r: schema build failed; other tools are unaffected.",
+                    name,
+                    exc_info=True,
+                )
+        return schemas
 
     def get_tool(self, name: str) -> Tool | None:
         """
@@ -891,13 +914,30 @@ class ToolManager:
         sub-agent workflows — the sub-agent's LLM needs the schemas
         so it knows which tools are available.
 
+        Each client tool's schema is built independently. If a single
+        tool's ``get_schema()`` raises, that one tool is skipped with a
+        warning rather than aborting the whole list, mirroring
+        :meth:`get_tool_schemas` (#378). This keeps one bad client tool
+        from silently dropping every client tool propagated to a
+        sub-agent; the remaining, valid tools are still advertised.
+
         :returns: List of tool schema dicts, e.g.
             ``[{"type": "function", "function": {"name": "Read", ...}}]``.
             Empty list if no client tools are registered.
         """
-        return [
-            tool.get_schema() for tool in self._tools.values() if isinstance(tool, ClientSideTool)
-        ]
+        schemas: list[dict[str, Any]] = []
+        for name, tool in self._tools.items():
+            if not isinstance(tool, ClientSideTool):
+                continue
+            try:
+                schemas.append(tool.get_schema())
+            except Exception:
+                _logger.warning(
+                    "Skipping client tool %r: schema build failed; other tools are unaffected.",
+                    name,
+                    exc_info=True,
+                )
+        return schemas
 
     def is_client_side_tool(self, name: str) -> bool:
         """

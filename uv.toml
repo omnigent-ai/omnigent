@@ -20,4 +20,8 @@ exclude-newer = "P7D"
 # - google-antigravity: the SDK the `antigravity` harness drives (the
 #   `antigravity` extra in pyproject), published 2026-06-11. Drop once aged
 #   past P7D.
-exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z" }
+# - cryptography / pydantic-settings: open security advisories. Exempted so the
+#   patched releases (48.0.1 / 2.14.2) are resolvable now rather than after the
+#   P7D window; the bump itself is applied via `/regen upgrade cryptography
+#   pydantic-settings` (uv lock --upgrade-package). Drop once both aged past P7D.
+exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", cryptography = "2026-06-26T00:00:00Z", pydantic-settings = "2026-06-26T00:00:00Z" }

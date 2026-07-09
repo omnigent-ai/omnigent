@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
+from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
 from omnigent.tools.builtins.agents import (
     SysAgentDownloadTool,
     SysAgentGetTool,
@@ -68,6 +69,7 @@ __all__ = [
     "ListCommentsTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
+    "SysAdviseModelsTool",
     "SysAgentDownloadTool",
     "SysAgentGetTool",
     "SysAgentListTool",
@@ -166,6 +168,66 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
+def _require_hindsight() -> None:
+    """
+    Validate that the Hindsight client SDK is installed.
+
+    ``hindsight-client`` is an optional dependency (the ``memory`` extra),
+    so the memory tools probe for it at construction time and fail with an
+    actionable message rather than an opaque ImportError mid-run. Mirrors the
+    Modal sandbox launcher's ``_ensure_sdk``.
+
+    :raises ImportError: When ``hindsight-client`` is not installed.
+    """
+    try:
+        import hindsight_client  # noqa: F401  # presence probe only
+    except ImportError as exc:
+        raise ImportError(
+            "The 'hindsight-client' SDK is required for the Hindsight memory "
+            "tools (hindsight_retain / hindsight_recall / hindsight_reflect). "
+            "Install it with `pip install 'omnigent[memory]'`."
+        ) from exc
+
+
+def _create_hindsight_retain(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HindsightRetainTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A HindsightRetainTool instance.
+    """
+    _require_hindsight()
+    from omnigent.tools.builtins.hindsight import HindsightRetainTool
+
+    return HindsightRetainTool(config=config)
+
+
+def _create_hindsight_recall(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HindsightRecallTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A HindsightRecallTool instance.
+    """
+    _require_hindsight()
+    from omnigent.tools.builtins.hindsight import HindsightRecallTool
+
+    return HindsightRecallTool(config=config)
+
+
+def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HindsightReflectTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A HindsightReflectTool instance.
+    """
+    _require_hindsight()
+    from omnigent.tools.builtins.hindsight import HindsightReflectTool
+
+    return HindsightReflectTool(config=config)
+
+
 # Unified registry for every reserved builtin name. The value
 # is either a factory callable (for user-enablable tools) or
 # ``None`` for framework-owned names that occupy the name-space
@@ -188,6 +250,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
+    # Hindsight long-term memory (optional ``memory`` extra). Each factory
+    # probes for ``hindsight-client`` and fails with an install hint if absent.
+    "hindsight_retain": _create_hindsight_retain,
+    "hindsight_recall": _create_hindsight_recall,
+    "hindsight_reflect": _create_hindsight_reflect,
     # Framework-owned: need runtime context. ``web_fetch`` is
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by
@@ -203,6 +270,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # and intercepted by name in the runner's tool dispatch — reserved
     # here so user specs cannot shadow it.
     "sys_list_models": None,
+    # ``sys_advise_models`` is auto-registered alongside ``sys_list_models``
+    # when ``RuntimeCaps.routing_client`` is configured. Intercepted by
+    # name in the runner's tool dispatch — reserved here so user specs
+    # cannot shadow it.
+    "sys_advise_models": None,
 }
 
 # Canonical set of every reserved builtin name. Derived from

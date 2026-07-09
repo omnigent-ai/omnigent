@@ -34,7 +34,6 @@ import logging
 import os
 import pathlib
 import shutil
-import signal
 import sys
 import tempfile
 import time
@@ -44,6 +43,8 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent._platform import stable_user_id
+from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
@@ -485,27 +486,11 @@ def _sandbox_disabled_by_env() -> bool:
 
 
 def _terminate_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)
 
 
 @contextmanager
@@ -886,7 +871,7 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{os.getuid()}",
+        pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
@@ -896,8 +881,12 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
 def _claude_internal_write_files() -> list[pathlib.Path]:
     """Exact files the Claude CLI updates outside its writable roots."""
 
-    path = pathlib.Path.home() / ".claude.json"
-    return [path] if path.exists() else []
+    # .credentials.json holds the Claude CLI's OAuth token on Linux.
+    candidates = [
+        pathlib.Path.home() / ".claude.json",
+        pathlib.Path.home() / ".claude" / ".credentials.json",
+    ]
+    return [path for path in candidates if path.exists()]
 
 
 def prepare_claude_cli_path(
@@ -1457,8 +1446,9 @@ class ClaudeSDKExecutor(Executor):
         same_loop = state.loop is None or current_loop is state.loop
         same_task = state.task is None or current_task is state.task
         if not (same_loop and same_task):
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different event loop/task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different event loop/task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -1468,8 +1458,9 @@ class ClaudeSDKExecutor(Executor):
         except RuntimeError as exc:
             if "different task" not in str(exc):
                 raise
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -2458,18 +2449,37 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
+                                if self._gateway_uses_databricks_profile:
+                                    auth_hint = "Check your selected ~/.databrickscfg profile."
+                                elif self._gateway:
+                                    auth_hint = (
+                                        "Check your provider's base URL and auth command "
+                                        "(ANTHROPIC_BASE_URL / gateway auth)."
+                                    )
+                                else:
+                                    auth_hint = (
+                                        "Check your Claude CLI login status "
+                                        "(`claude /status`) or API key configuration."
+                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    "Check your selected ~/.databrickscfg profile."
+                                    f"{auth_hint}"
                                 )
                                 break
 
                             if error_status == 404:
+                                if self._gateway:
+                                    endpoint_hint = (
+                                        "Check ANTHROPIC_BASE_URL / gateway endpoint "
+                                        "configuration."
+                                    )
+                                else:
+                                    endpoint_hint = "Check ANTHROPIC_BASE_URL configuration."
                                 terminal_error = (
                                     "Claude SDK provider endpoint was not found "
                                     f"({retry_error}, status={error_status}). "
-                                    "Check ANTHROPIC_BASE_URL / Databricks endpoint configuration."
+                                    f"{endpoint_hint}"
                                 )
                                 break
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
@@ -2512,6 +2522,30 @@ class ClaudeSDKExecutor(Executor):
             yield ExecutorError(message=terminal_error)
             return
 
+        # A turn can finish the stream without ever yielding a
+        # ``ResultMessage`` — the CLI can close the stream early, or the
+        # turn can be cut short before its final usage is reported. In
+        # that case ``turn_usage`` is None and the context-occupancy
+        # meter freezes at the previous successful turn's value, hiding
+        # real window fill exactly when a session is in trouble (#1533).
+        # We already observed the latest prompt size from ``message_start``
+        # (``last_call_usage``), so synthesize a usage dict from it and let
+        # ``TurnComplete`` carry it. ``context_tokens`` (window fill) is the
+        # meaningful field here; ``output_tokens`` is unknown on an
+        # incomplete turn, so report 0 rather than guess. The full
+        # ``ResultMessage`` path above still wins whenever it runs.
+        if turn_usage is None and last_call_usage is not None:
+            ctx_in = last_call_usage.get("input_tokens") or 0
+            ctx_cc = last_call_usage.get("cache_creation_input_tokens") or 0
+            ctx_cr = last_call_usage.get("cache_read_input_tokens") or 0
+            turn_usage = {
+                "input_tokens": ctx_in,
+                "output_tokens": 0,
+                "total_tokens": ctx_in,
+                "context_tokens": ctx_in + ctx_cc + ctx_cr,
+                "model": observed_model or model,
+            }
+
         # ── LLM_RESPONSE policy evaluation ───────────────────────
         # Evaluate after the stream completes but before TurnComplete
         # so a DENY prevents the response from being persisted.
@@ -2550,9 +2584,24 @@ class ClaudeSDKExecutor(Executor):
                     for m in _msgs
                     if isinstance(m.message, dict)
                 ]
+                if not _compacted:
+                    logger.warning(
+                        "Claude post-compaction read returned no messages "
+                        "(session=%s); resume will fall back to the synthetic "
+                        "summary instead of the harness's real compacted state.",
+                        claude_session_id,
+                    )
             except Exception:  # noqa: BLE001
-                logger.debug(
-                    "Failed to read Claude session messages for compaction persist",
+                # WARNING, not DEBUG: a swallowed read here silently degrades
+                # EVERY later resume of this conversation. The runner persists a
+                # compaction item with no ``compacted_messages``, so resume
+                # replays the lossy synthetic-summary pair instead of the
+                # harness's real post-compaction context. Surface it.
+                logger.warning(
+                    "Failed to read Claude post-compaction session messages "
+                    "(session=%s); resume fidelity for this conversation will "
+                    "degrade to the synthetic summary.",
+                    claude_session_id,
                     exc_info=True,
                 )
             yield CompactionComplete(

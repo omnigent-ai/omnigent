@@ -220,11 +220,26 @@ def test_list_for_conversation_isolation(store: SqlAlchemyCommentStore) -> None:
     )
 
 
-def test_list_for_conversation_ordered_by_created_at(store: SqlAlchemyCommentStore) -> None:
+def test_list_for_conversation_ordered_by_created_at(
+    store: SqlAlchemyCommentStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``list_for_conversation`` returns comments in ``created_at`` ascending order.
 
     The oldest comment must come first regardless of path or start_index.
     """
+    # created_at is seconds-granular; advance the clock a second per add so the
+    # two comments get distinct created_at and the chronological assertion does
+    # not hinge on the same-second (id) tiebreaker.
+    from omnigent.stores.comment_store import sqlalchemy_store as _comment_store_mod
+
+    clock_us = [1_700_000_000_000_000]
+
+    def _fake_now_us() -> int:
+        clock_us[0] += 1_000_000
+        return clock_us[0]
+
+    monkeypatch.setattr(_comment_store_mod, "now_epoch_us", _fake_now_us)
+
     c1 = store.add(
         conversation_id="conv_order",
         path="z.py",
@@ -368,12 +383,12 @@ def test_update_comment_status(store: SqlAlchemyCommentStore) -> None:
         end_index=8,
     )
 
-    updated = store.update_comment(comment.id, "conv_upd", status="resolved")
+    updated = store.update_comment(comment.id, "conv_upd", status="addressed")
 
     assert updated is not None, "update_comment must return the updated Comment"
     # Status must be the new value.
-    assert updated.status == "resolved", (
-        f"Expected status 'resolved', got {updated.status!r}. "
+    assert updated.status == "addressed", (
+        f"Expected status 'addressed', got {updated.status!r}. "
         "update_comment is not persisting the status change."
     )
     # Body must be unchanged.
@@ -414,16 +429,16 @@ def test_update_comment_both_fields(store: SqlAlchemyCommentStore) -> None:
         end_index=6,
     )
 
-    updated = store.update_comment(comment.id, "conv_upd_both", status="sent", body="After")
+    updated = store.update_comment(comment.id, "conv_upd_both", status="addressed", body="After")
 
     assert updated is not None
-    assert updated.status == "sent"
+    assert updated.status == "addressed"
     assert updated.body == "After"
 
 
 def test_update_comment_returns_none_for_missing(store: SqlAlchemyCommentStore) -> None:
     """``update_comment`` returns ``None`` when the comment id does not exist."""
-    result = store.update_comment("nonexistent-uuid-xyz", "conv_5c6d7e", status="resolved")
+    result = store.update_comment("nonexistent-uuid-xyz", "conv_5c6d7e", status="addressed")
 
     # Must return None, not raise, for an unknown id.
     assert result is None, f"Expected None for an unknown comment id, got {result!r}"
@@ -444,7 +459,7 @@ def test_update_comment_wrong_conversation_is_noop(store: SqlAlchemyCommentStore
         end_index=8,
     )
 
-    result = store.update_comment(comment.id, "conv_4d5e6f", status="resolved")
+    result = store.update_comment(comment.id, "conv_4d5e6f", status="addressed")
     assert result is None, (
         f"Expected None updating a comment owned by another conversation, got {result!r}. "
         "update_comment must scope by conversation_id."

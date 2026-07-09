@@ -202,6 +202,31 @@ class _DeliverRecorder:
                 raise err
 
 
+class _InjectTuiRecorder:
+    """
+    Records every ``inject_tui`` call's key sequence (and optionally raises).
+
+    Stands in for :func:`_inject_via_tui` so a test can assert the EXACT tmux key
+    sequence the bridge types into the agy TUI pane after a successful RPC
+    delivery (#1200), without a live pane. Mirrors :class:`_DeliverRecorder`.
+    """
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        """
+        :param error: When not ``None``, raised on every call so a test can drive
+            the best-effort "TUI dismissal failed but the verdict still landed"
+            branch.
+        """
+        self.calls: list[list[str]] = []
+        self._error = error
+
+    async def __call__(self, keys: list[str]) -> None:
+        """Record one TUI key sequence, raising the scripted error if set."""
+        self.calls.append(list(keys))
+        if self._error is not None:
+            raise self._error
+
+
 def _steps_returner(*frames: list[dict[str, Any]]) -> Any:
     """
     Build a ``get_steps`` fake that returns successive snapshots per call.
@@ -259,6 +284,7 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
         ElicitationResult(action="accept", content={"0": "Second"})
     )
     deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
 
     await bridge_interaction(
         _CASCADE,
@@ -267,6 +293,7 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
         get_steps=_steps_returner([waiting]),
         request_elicitation=request,
         deliver=deliver,
+        inject_tui=inject_tui,
     )
 
     assert len(deliver.calls) == 1
@@ -279,6 +306,8 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
     # The elicitation was published under the deterministic id for these ids.
     assert len(elicit_calls) == 1
     assert elicit_calls[0][0] == agy_elicitation_id(_CASCADE, _TRAJ, 3)
+    # The TUI prompt was dismissed by typing the selected option id + Enter.
+    assert inject_tui.calls == [["2", "Enter"]]
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +400,7 @@ async def test_permission_accept_delivers_allow_true() -> None:
     waiting = _permission_step(step_index=2)
     request, _ = _elicitation_returner(ElicitationResult(action="accept", content=None))
     deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
 
     await bridge_interaction(
         _CASCADE,
@@ -379,11 +409,94 @@ async def test_permission_accept_delivers_allow_true() -> None:
         get_steps=_steps_returner([waiting]),
         request_elicitation=request,
         deliver=deliver,
+        inject_tui=inject_tui,
     )
 
     assert len(deliver.calls) == 1
     assert deliver.calls[0]["payload"] == {"permission": {"allow": True}}
     assert deliver.calls[0]["step_index"] == 2
+    # #1200: Approve drives agy's TUI prompt to option 1 ("Yes") + Enter, so the
+    # attended terminal advances (the RPC alone leaves the TUI prompt open).
+    assert inject_tui.calls == [["1", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_permission_reject_delivers_allow_false_and_types_no() -> None:
+    """Permission rejected → deliver ``allow: False`` AND type option 4 ("No")."""
+    pending = _pending_permission(step_index=2)
+    waiting = _permission_step(step_index=2)
+    request, _ = _elicitation_returner(ElicitationResult(action="decline", content=None))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls[0]["payload"] == {"permission": {"allow": False}}
+    # #1200: Reject drives agy's TUI prompt to option 4 ("No") + Enter.
+    assert inject_tui.calls == [["4", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_tui_dismissal_failure_does_not_undo_delivered_verdict() -> None:
+    """A TUI send-keys failure is best-effort: the RPC verdict still stands.
+
+    The backend step is already answered by the time the keystroke is typed, so a
+    flaky/exited pane must NOT raise out of ``bridge_interaction`` (which would
+    look like the verdict failed). The delivery is recorded; the TUI error is
+    swallowed (logged).
+    """
+    pending = _pending_permission(step_index=2)
+    waiting = _permission_step(step_index=2)
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content=None))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder(error=RuntimeError("the agy terminal exited"))
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    # The RPC verdict was delivered exactly once and the bridge returned cleanly
+    # despite the TUI keystroke raising.
+    assert len(deliver.calls) == 1
+    assert deliver.calls[0]["payload"] == {"permission": {"allow": True}}
+    assert inject_tui.calls == [["1", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_no_tui_keystroke_when_nothing_delivered() -> None:
+    """When the elicitation returns None (timeout/cancel), no TUI key is typed."""
+    pending = _pending_permission(step_index=2)
+    waiting = _permission_step(step_index=2)
+    request, _ = _elicitation_returner(None)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls == []
+    assert inject_tui.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +523,39 @@ async def test_freshest_waiting_overrides_stale_captured_index() -> None:
 
     assert len(deliver.calls) == 1
     assert deliver.calls[0]["step_index"] == 6  # NOT the stale 5
+
+
+@pytest.mark.asyncio
+async def test_delivery_pins_to_captured_step_over_distinct_higher_gate() -> None:
+    """Captured step STILL WAITING + a DISTINCT higher-index same-kind WAITING gate
+    in the snapshot → deliver to the CAPTURED step, never the higher one.
+
+    Guards the mis-delivery the #1472 review flagged: ``_freshest_waiting`` alone
+    picks the highest index, so verdict-A could land on gate-B if agy ever exposes
+    two same-kind gates at once. The pin (``_waiting_step_at``) keeps the verdict on
+    the gate it was surfaced for. The complementary timeout-retry case — captured
+    gone, deliver to the fresher index — is covered by
+    ``test_freshest_waiting_overrides_stale_captured_index``.
+    """
+    pending = _pending_question(step_index=5)  # the gate we surfaced
+    captured = _question_step(step_index=5)  # still WAITING at verdict time
+    distinct = _question_step(step_index=6)  # a DIFFERENT same-kind gate, higher index
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "First"}))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([captured, distinct]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert len(deliver.calls) == 1
+    assert deliver.calls[0]["step_index"] == 5  # pinned to captured, NOT the higher 6
 
 
 # ---------------------------------------------------------------------------

@@ -104,3 +104,42 @@ def test_image_file_renders_as_img(
     expect(img).to_have_attribute("src", re.compile(r"^blob:"))
     expect(file_viewer.get_by_text("Unable to render image")).to_have_count(0)
     expect(file_viewer.locator("[contenteditable='true']")).to_have_count(0)
+
+
+def test_image_click_opens_zoom_lightbox(
+    page: Page,
+    seeded_image_session: tuple[str, str, str],
+) -> None:
+    """Clicking a previewed image opens the shared full-screen zoom lightbox."""
+    base_url, session_id, _file_path = seeded_image_session
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+
+    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(_IMAGE_FILE_PATH)}\b"))
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(file_viewer).to_be_visible()
+
+    img = file_viewer.locator(f'img[alt="{_IMAGE_FILE_PATH}"]')
+    expect(img).to_be_visible(timeout=10_000)
+
+    # No lightbox until the user clicks the inline image.
+    expect(page.get_by_role("dialog")).to_have_count(0)
+
+    img.click()
+
+    # The Radix dialog now hosts the shared ZoomViewer with its zoom toolbar.
+    dialog = page.get_by_role("dialog")
+    expect(dialog).to_be_visible(timeout=10_000)
+    expect(dialog.get_by_role("button", name="Zoom in")).to_be_visible()
+    expect(dialog.get_by_role("button", name="Zoom out")).to_be_visible()
+
+    # The same SVG is shown in the lightbox, still via its blob URL.
+    expect(dialog.locator(f'img[alt="{_IMAGE_FILE_PATH}"]')).to_have_attribute(
+        "src", re.compile(r"^blob:")
+    )
+
+    # Escape dismisses the lightbox (Radix Dialog default).
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("dialog")).to_have_count(0)
