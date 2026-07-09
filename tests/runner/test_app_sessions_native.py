@@ -6141,8 +6141,10 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         assert not int_task.done(), "interrupt must await the harness forward (forward-first)"
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.
+        # Await directly (no wall-clock bound) — forward-first is proven above, so a
+        # loaded worker can't flake this liveness wait (issue #2241).
         fwd_gate.set()
-        int_resp = await _aio.wait_for(int_task, timeout=15.0)
+        int_resp = await int_task
         assert int_resp.status_code == 204, int_resp.text
         markers = _interrupt_markers(list(_session_histories_ref.get(conv_id, [])))
 
