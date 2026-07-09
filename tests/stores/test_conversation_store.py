@@ -571,6 +571,7 @@ def test_unique_position_constraint(
     from sqlalchemy.exc import IntegrityError
 
     from omnigent.db.db_models import SqlConversationItem
+    from omnigent.db.enum_codecs import encode_item_status, encode_item_type
     from omnigent.db.utils import generate_item_id
 
     conv = conversation_store.create_conversation()
@@ -597,9 +598,9 @@ def test_unique_position_constraint(
                     conversation_id=conv.id,
                     response_id="resp_dup",
                     created_at=0,
-                    status="completed",
+                    status=encode_item_status("completed"),
                     position=0,  # duplicate
-                    type="message",
+                    type=encode_item_type("message"),
                     data='{"role":"user","content":[]}',
                     search_text="",
                 )
@@ -2633,12 +2634,12 @@ def test_set_host_id_no_workspace_fails_when_row_has_none(
     constraint by accident. Callers must pass a workspace when
     binding to a host on a row that doesn't already have one.
     """
-    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.exc import IntegrityError, OperationalError
 
     conv = conversation_store.create_conversation()
     assert conv.workspace is None
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises((IntegrityError, OperationalError)):
         conversation_store.set_host_id(conv.id, "host_no_ws")
 
 
@@ -2702,9 +2703,9 @@ def test_create_conversation_with_host_id_no_workspace_raises(
     constraint surfaces as IntegrityError, callers can catch it,
     and the row is never written.
     """
-    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.exc import IntegrityError, OperationalError
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises((IntegrityError, OperationalError)):
         conversation_store.create_conversation(host_id="host_abc")
 
 

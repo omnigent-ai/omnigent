@@ -1311,23 +1311,32 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "ORDER BY rank LIMIT :limit"
                     )
             else:
-                # PostgreSQL: ILIKE fallback (no FTS5 virtual table).
-                # Full tsvector/tsquery indexing can be added later.
+                # Non-SQLite fallback: LIKE/ILIKE on the data column.
+                # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
+                # MySQL: CONVERT(data USING utf8mb4) + LIKE (case-insensitive
+                #        by default with utf8mb4_unicode_ci collation).
                 like_pattern = f"%{query}%"
+                is_mysql = self._engine.dialect.name == "mysql"
+                if is_mysql:
+                    data_expr = "CONVERT(ci.data USING utf8mb4)"
+                    like_op = "LIKE"
+                else:
+                    data_expr = "ci.data::text"
+                    like_op = "ILIKE"
                 if conversation_id is not None:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.workspace_id = :ws "
-                        "AND ci.conversation_id = :cid "
-                        "AND ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND ci.conversation_id = :cid "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 else:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.workspace_id = :ws "
-                        "AND ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
             params: dict[str, str | int] = {

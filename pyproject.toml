@@ -182,6 +182,7 @@ databricks = [
     "databricks-sdk>=0.56.0,<1",
     "opentelemetry-distro>=0,<1",
     "psycopg[binary]>=3.1,<4",
+    "pymysql>=1.1,<2",
     # Databricks-specific MCP servers. Not imported by core Omnigent
     # code, so it is opt-in here rather than a default dependency.
     "databricks-mcp>=0.1.0",

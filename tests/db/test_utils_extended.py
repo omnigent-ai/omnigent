@@ -132,6 +132,8 @@ class TestManagedSessionMaker:
 
     def test_sqlite_foreign_keys_enabled(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
+        if engine.dialect.name != "sqlite":
+            pytest.skip("PRAGMA foreign_keys is SQLite-only")
         managed = make_managed_session_maker(engine)
 
         with managed() as session:
@@ -194,6 +196,8 @@ class TestFtsHelpers:
 
     def test_insert_and_search_fts(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
+        if engine.dialect.name != "sqlite":
+            pytest.skip("FTS5 virtual table is SQLite-only; no-op on other backends")
         ensure_fts_table(engine)
         managed = make_managed_session_maker(engine)
 
@@ -213,6 +217,8 @@ class TestFtsHelpers:
 
     def test_delete_fts_by_conversation(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
+        if engine.dialect.name != "sqlite":
+            pytest.skip("FTS5 virtual table is SQLite-only; no-op on other backends")
         ensure_fts_table(engine)
         managed = make_managed_session_maker(engine)
 
