@@ -158,9 +158,16 @@ def prepare_vertex_anthropic_body(body: bytes) -> bytes:
     Drops ``model`` (it's part of the URL path on Vertex, not the body)
     and injects ``anthropic_version`` (Vertex expects it in the body; the
     plain Anthropic API takes it as an ``anthropic-version`` header
-    instead). Everything else (``messages``, ``system``, ``max_tokens``,
-    ``tools``, ``tool_choice``, ``stream``, etc.) is Anthropic Messages
-    API-shaped and passed through unchanged.
+    instead). Also drops ``context_management`` — confirmed against a
+    real Vertex project that ``:rawPredict`` rejects it outright with
+    ``400 context_management: Extra inputs are not permitted``, unlike
+    ``api.anthropic.com`` which accepts it; Vertex's schema for this
+    endpoint appears to be a stricter subset of the plain Messages API
+    rather than a true pass-through, so the CLI's auto-compaction context
+    editing feature is unavailable on this path. Everything else
+    (``messages``, ``system``, ``max_tokens``, ``tools``, ``tool_choice``,
+    ``stream``, etc.) is Anthropic Messages API-shaped and passed through
+    unchanged.
 
     Non-object JSON and invalid JSON are returned unchanged rather than
     raising — Vertex owns request validation for malformed bodies, same
@@ -179,6 +186,7 @@ def prepare_vertex_anthropic_body(body: bytes) -> bytes:
     if not isinstance(parsed, dict):
         return body
     parsed.pop("model", None)
+    parsed.pop("context_management", None)
     parsed["anthropic_version"] = ANTHROPIC_VERTEX_VERSION
     return json.dumps(parsed).encode("utf-8")
 
@@ -257,6 +265,14 @@ class GoogleADCTokenCache:
         now_utc_naive = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         margin = datetime.timedelta(seconds=_TOKEN_REFRESH_MARGIN_SECONDS)
         return (expiry - now_utc_naive) < margin
+
+
+# Sent by the CLI as ``ANTHROPIC_API_KEY`` / ``x-api-key`` on the client
+# side of the loopback hop. The shim never reads or validates it — real
+# auth is the GCP access token it attaches to the *upstream* Vertex
+# request (see module docstring) — so this only needs to be a non-empty
+# string that satisfies the CLI's own "are we logged in" check.
+PLACEHOLDER_API_KEY = "vertex-shim-placeholder-not-a-real-key"
 
 
 class VertexAnthropicGatewayShim:

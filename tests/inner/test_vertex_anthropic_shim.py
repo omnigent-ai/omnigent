@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,6 +96,23 @@ def test_prepare_vertex_anthropic_body_drops_model_and_injects_version() -> None
     assert result["anthropic_version"] == ANTHROPIC_VERTEX_VERSION
     assert result["max_tokens"] == 100
     assert result["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_prepare_vertex_anthropic_body_drops_context_management() -> None:
+    """`context_management` is stripped — confirmed against a real Vertex
+    project that `:rawPredict` rejects it with `400 context_management:
+    Extra inputs are not permitted`, unlike api.anthropic.com."""
+    body = json.dumps(
+        {
+            "model": "claude-sonnet-4-5-20250929",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]},
+        }
+    ).encode()
+    result = json.loads(prepare_vertex_anthropic_body(body))
+    assert "context_management" not in result
+    assert result["max_tokens"] == 100
 
 
 @pytest.mark.parametrize(
@@ -577,6 +595,72 @@ async def test_vertex_executor_routes_new_client_through_shim() -> None:
         assert connect_env["ANTHROPIC_BASE_URL"] == executor._vertex_shim.base_url
         # The Databricks/generic gateway shim must never start on this path.
         assert executor._gateway_shim is None
+        # The CLI refuses to run with no key at all ("Not logged in"); the
+        # shim never reads this value (real auth is a GCP token attached
+        # upstream), so a non-empty placeholder must be present.
+        from omnigent.inner.vertex_anthropic_shim import PLACEHOLDER_API_KEY
+
+        assert connect_env["ANTHROPIC_API_KEY"] == PLACEHOLDER_API_KEY
+    finally:
+        if executor._vertex_shim is not None:
+            await executor._vertex_shim.aclose()
+
+
+@pytest.mark.asyncio
+async def test_vertex_executor_connect_strips_ambient_native_vertex_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller whose own shell already has CLAUDE_CODE_USE_VERTEX=1 (e.g. a
+    developer who also uses native Claude-on-Vertex) must not leak that
+    into the CLI subprocess on this path — otherwise the CLI silently
+    prefers its own native Vertex-via-ADC support over our
+    ANTHROPIC_BASE_URL override, defeating the shim's entire purpose of
+    keeping GCP ADC out of the (possibly sandboxed) child process."""
+    from types import SimpleNamespace
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "some-other-ambient-project")
+    monkeypatch.setenv("ANTHROPIC_VERTEX_REGION", "us-east5")
+    monkeypatch.setenv("CLOUD_ML_REGION", "us-east5")
+
+    executor = ClaudeSDKExecutor(vertex_project="test-project", vertex_location="us-east5")
+
+    seen_env_during_connect: dict[str, str] = {}
+
+    class _StubClient:
+        def __init__(self, options) -> None:  # type: ignore[no-untyped-def]
+            self.options = options
+
+        async def connect(self) -> None:
+            # Snapshot os.environ *during* connect — this is the window
+            # the fix under test unsets the ambient vars for.
+            seen_env_during_connect.update(os.environ)
+
+        async def disconnect(self) -> None:
+            """No-op disconnect for teardown."""
+
+    class _StubSDK:
+        ClaudeSDKClient = _StubClient
+
+    options = SimpleNamespace(
+        env={"ANTHROPIC_BASE_URL": "https://vertex-anthropic.invalid"},
+        stderr=None,
+    )
+    try:
+        await executor._get_or_create_client(
+            _StubSDK,  # type: ignore[arg-type]
+            session_key="vertex-env-strip-test",
+            options=options,
+            model="claude-haiku-4-5-20251001",
+        )
+        assert "CLAUDE_CODE_USE_VERTEX" not in seen_env_during_connect
+        assert "ANTHROPIC_VERTEX_PROJECT_ID" not in seen_env_during_connect
+        assert "ANTHROPIC_VERTEX_REGION" not in seen_env_during_connect
+        assert "CLOUD_ML_REGION" not in seen_env_during_connect
+        # Restored afterwards for anything else in the process.
+        assert os.environ["CLAUDE_CODE_USE_VERTEX"] == "1"
     finally:
         if executor._vertex_shim is not None:
             await executor._vertex_shim.aclose()

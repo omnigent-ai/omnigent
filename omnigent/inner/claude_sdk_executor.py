@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
@@ -78,7 +78,7 @@ from .sandbox import (
     with_additional_write_files,
     with_additional_write_roots,
 )
-from .vertex_anthropic_shim import VertexAnthropicGatewayShim
+from .vertex_anthropic_shim import PLACEHOLDER_API_KEY, VertexAnthropicGatewayShim
 
 logger = logging.getLogger(__name__)
 
@@ -1654,6 +1654,14 @@ class ClaudeSDKExecutor(Executor):
             env = getattr(options, "env", None)
             if isinstance(env, dict):
                 env["ANTHROPIC_BASE_URL"] = self._vertex_shim.base_url
+                # The shim never reads this value (its real auth is a GCP
+                # token attached upstream — see PLACEHOLDER_API_KEY docs),
+                # but the CLI itself refuses to run with no key at all and
+                # reports "Not logged in". ANTHROPIC_API_KEY is stripped
+                # from os.environ (not options.env) around the connect
+                # call below, so setting it here — a later merge layer —
+                # survives that strip.
+                env["ANTHROPIC_API_KEY"] = PLACEHOLDER_API_KEY
             return
         if not self._gateway:
             return
@@ -1703,7 +1711,33 @@ class ClaudeSDKExecutor(Executor):
                 # ``options.settings`` explicitly sets apiKeyHelper and
                 # ``options.env`` sets the Databricks base URL, so the
                 # Claude CLI does not need an inherited Anthropic key.
-                with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
+                #
+                # On the vertex-shim path, the three env vars the CLI's own
+                # native Vertex support keys off (CLAUDE_CODE_USE_VERTEX,
+                # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION — see
+                # ``onboarding/ambient.py``'s vertex-claude detection) must
+                # also be absent from the child env, not just left at
+                # whatever the calling process happens to have ambiently
+                # set (e.g. a developer's own shell already configured for
+                # Claude-on-Vertex). If left in place, the CLI ignores our
+                # ``ANTHROPIC_BASE_URL`` sentinel and goes straight to
+                # native Vertex-via-ADC inside the (possibly sandboxed)
+                # child process — silently defeating the entire point of
+                # the shim, which exists specifically to keep GCP ADC out
+                # of that child's reach.
+                with ExitStack() as vertex_env_guard:
+                    vertex_env_guard.enter_context(_unset_env_var("CLAUDECODE"))
+                    vertex_env_guard.enter_context(_unset_env_var("ANTHROPIC_API_KEY"))
+                    if self._vertex_project is not None:
+                        for _native_vertex_var in (
+                            "CLAUDE_CODE_USE_VERTEX",
+                            "ANTHROPIC_VERTEX_PROJECT_ID",
+                            "ANTHROPIC_VERTEX_REGION",
+                            "CLOUD_ML_REGION",
+                        ):
+                            vertex_env_guard.enter_context(
+                                _unset_env_var(_native_vertex_var)
+                            )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 await self._force_close_client(client)
