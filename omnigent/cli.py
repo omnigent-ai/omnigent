@@ -5770,22 +5770,34 @@ def _materialize_harness_launcher_file(
     :raises click.ClickException: If *harness* is unsupported.
     """
     _validate_harness(harness)
-    display_name = harness
-    harness = canonicalize_harness(harness) or harness
+    canonical = canonicalize_harness(harness) or harness
+    # An acp:<slug> harness id carries a colon: it canonicalizes to the base
+    # `acp` harness, but the slug selects a user-configured ACP agent resolved
+    # at spawn and must be preserved. So the effective harness id written to
+    # executor.harness is the FULL acp:<slug> (keep the slug), or the canonical
+    # id for every other harness (so aliases still resolve, e.g. kimi ->
+    # kimi-code). The agent NAME and temp filename must be path-safe /
+    # [a-zA-Z0-9_-]+, so the colon is sanitized there only.
+    effective_harness = harness if canonical == "acp" and ":" in harness else canonical
+    # Name preserves the user's input (matching the pre-acp behavior, e.g.
+    # --harness claude -> name "claude"), sanitized for the colon so acp:<slug>
+    # yields a valid [a-zA-Z0-9_-]+ name. Filename uses the canonical/effective
+    # id (also colon-sanitized) as before.
+    display_name = harness.replace(":", "-")
 
     tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-harness-launcher-"))
-    yaml_path = tmpdir / f"{harness}.yaml"
+    yaml_path = tmpdir / f"{effective_harness.replace(':', '-')}.yaml"
 
-    executor: dict[str, str] = {"harness": harness}
+    executor: dict[str, str] = {"harness": effective_harness}
     if model is not None:
         executor["model"] = model
 
     raw = {
         "name": display_name,
-        "prompt": system_prompt or _default_harness_prompt(harness),
+        "prompt": system_prompt or _default_harness_prompt(canonical),
         "executor": executor,
     }
-    if harness in _OS_ENV_HARNESSES:
+    if canonical in _OS_ENV_HARNESSES:
         raw["os_env"] = {"type": "caller_process", "sandbox": {"type": "none"}}
     yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False))
     return yaml_path
