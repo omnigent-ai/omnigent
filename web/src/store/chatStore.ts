@@ -718,6 +718,12 @@ const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 // instantly.
 const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
+// A reverse proxy serves 404 for the stream route for the ~10-60s a backend
+// container takes to restart (upgrade, config change, re-seed bounce), so a
+// 404 mid-restart must not be treated as permanent. Bound the retries instead
+// of trusting them forever, so a truly deleted/invalid conversation still
+// gives up rather than polling it forever.
+const MAX_TRANSIENT_404_RETRIES = 10;
 
 // Sticky picker prefs — persisted so a new chat inherits the user's
 // last pick across reloads and across sessions.
@@ -2932,6 +2938,10 @@ export async function startStreamPump(
   get: Getter,
 ): Promise<void> {
   let failedOpens = 0;
+  // Consecutive 404s only — reset on any non-404 outcome (success or a
+  // different-status failure), so a 404 has to persist across attempts to
+  // count toward the cap below.
+  let consecutive404s = 0;
   // True once we've had at least one SUCCESSFUL open. Drives reconnect-only
   // behavior (drop in-flight + reconcile), which must NOT run on the first
   // established stream — failed opens leave it false so a recovered first
@@ -2981,13 +2991,33 @@ export async function startStreamPump(
           // Release the unconsumed error-response body so the underlying fetch
           // connection is freed promptly rather than lingering across retries.
           void streamRes.body?.cancel().catch(() => {});
-          // 401/403/404 won't fix themselves by retrying — give up and mark
-          // the session failed so the user isn't left on a silent spinner.
-          if (streamRes.status === 401 || streamRes.status === 403 || streamRes.status === 404) {
+          // 401/403 won't fix themselves by retrying — give up and mark the
+          // session failed so the user isn't left on a silent spinner.
+          if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
             finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
             set({ sessionStatus: "failed", status: "idle" });
             break;
+          }
+          // A reverse proxy routinely serves 404 for the stream route while
+          // the backend container restarts, so treat it like a transient
+          // failure up to a cap — only a 404 that outlives that window (a
+          // truly deleted/invalid conversation) gives up.
+          if (streamRes.status === 404) {
+            consecutive404s += 1;
+            if (consecutive404s > MAX_TRANSIENT_404_RETRIES) {
+              console.warn(
+                `Session ${id}: stream unavailable (404) after ${consecutive404s} attempts, giving up`,
+              );
+              finalizeActive(set, "failed", "stream unavailable (404)", null);
+              set({ sessionStatus: "failed", status: "idle" });
+              break;
+            }
+            console.warn(
+              `Session ${id}: stream open failed (404, attempt ${consecutive404s}/${MAX_TRANSIENT_404_RETRIES}), will retry`,
+            );
+            failedOpens += 1;
+            continue;
           }
           console.warn(`Session ${id}: stream open failed (${streamRes.status}), will retry`);
           failedOpens += 1;
@@ -2997,6 +3027,7 @@ export async function startStreamPump(
         const reconnecting = hasConnected;
         hasConnected = true;
         failedOpens = 0;
+        consecutive404s = 0;
         presenceIdle.noteReported(idle);
         if (reconnecting) {
           dropEphemeralInFlightBlocks(id, set);
