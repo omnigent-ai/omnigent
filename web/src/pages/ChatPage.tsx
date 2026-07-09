@@ -177,6 +177,9 @@ import {
   useCodexGoalState,
   type CodexGoal,
 } from "@/components/codex";
+import { copyText } from "@/lib/clipboard";
+import { showToast } from "@/components/ui/toast";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -2842,6 +2845,52 @@ export const BubbleView = memo(
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
 );
 
+/**
+ * Copy-to-clipboard handler for a message bubble's "Copy" action.
+ *
+ * Uses the shared {@link copyText} helper (async Clipboard API with an
+ * `execCommand` fallback) rather than `navigator.clipboard.writeText`
+ * directly — the latter is undefined in the iOS webview and on non-secure
+ * origins, where a bare guard made the button silently no-op. Drives the
+ * inline check-icon confirmation for 2s, and on mobile (where the desktop
+ * hover affordance and tooltip aren't visible) also fires a toast so the
+ * copy is confirmed.
+ *
+ * @param getText - Produces the text to copy at click time.
+ * @returns `{ isCopied, handleCopy }` for the action button.
+ */
+function useCopyMessage(getText: () => string): {
+  isCopied: boolean;
+  handleCopy: () => void;
+} {
+  const [isCopied, setIsCopied] = useState(false);
+  const timeoutRef = useRef<number>(0);
+  const isMobile = useIsMobileViewport();
+
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  const handleCopy = useCallback(() => {
+    if (isCopied) return;
+    const text = getText();
+    if (!text) return;
+    copyText(text).then(
+      () => {
+        setIsCopied(true);
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
+        if (isMobile) {
+          showToast(<span className="text-sm">Copied to clipboard</span>, { duration: 1500 });
+        }
+      },
+      (error) => {
+        console.warn("Failed to copy message", error);
+      },
+    );
+  }, [getText, isCopied, isMobile]);
+
+  return { isCopied, handleCopy };
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
@@ -2877,20 +2926,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
-  const [isCopied, setIsCopied] = useState(false);
-  const copyTimeoutRef = useRef<number>(0);
-
-  const handleCopy = async () => {
-    if (!text || !navigator?.clipboard?.writeText) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setIsCopied(true);
-      window.clearTimeout(copyTimeoutRef.current);
-      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-    } catch {
-      // ignore clipboard errors
-    }
-  };
+  const { isCopied, handleCopy } = useCopyMessage(() => text);
 
   return (
     <Message
@@ -3028,8 +3064,10 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const [isCopied, setIsCopied] = useState(false);
-  const copyTimeoutRef = useRef<number>(0);
+  // Getter computes the markdown lazily at click time — the hook must run
+  // before the early return below (rules of hooks), but `markdownText` is
+  // derived after it.
+  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
 
@@ -3041,18 +3079,6 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide = hasElicitation || containsMarkdownTable(bubble.items);
-
-  const handleCopy = async () => {
-    if (!markdownText || !navigator?.clipboard?.writeText) return;
-    try {
-      await navigator.clipboard.writeText(markdownText);
-      setIsCopied(true);
-      window.clearTimeout(copyTimeoutRef.current);
-      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-    } catch {
-      // ignore clipboard errors
-    }
-  };
 
   return (
     <>
