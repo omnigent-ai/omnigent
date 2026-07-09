@@ -1145,7 +1145,8 @@ function ConversationList({
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
+      | { label?: string; project?: string | null; isPinned?: boolean }
+      | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
