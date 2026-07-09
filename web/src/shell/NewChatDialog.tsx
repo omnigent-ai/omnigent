@@ -68,6 +68,7 @@ import {
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1859,7 +1860,12 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
-  const [baseBranch, setBaseBranch] = useState<string>(() => landingDraft?.baseBranch ?? "");
+  // Seed the base branch from an in-progress draft, else the user's configured
+  // default (Settings › Git). With no default set the field stays blank, so a
+  // new worktree branches off the current branch.
+  const [baseBranch, setBaseBranch] = useState<string>(
+    () => landingDraft?.baseBranch ?? readDefaultBaseBranch() ?? "",
+  );
   // Branch prefilled from the existing worktree the current workspace points
   // at. When `branchName` still equals this, the session starts directly in
   // that worktree (no git opts). Editing the field away from it means the user
