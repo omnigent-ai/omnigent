@@ -6,9 +6,10 @@ Picks the person on watch for the current day and pings them in Slack at
 function of the date and the person's position in the list — so there is no
 state to store anywhere.
 
-Run hourly (see the GitHub Actions workflow). On each run every person checks
-"is it 08:00 in my timezone right now, and is today my turn?"; at most one
-person matches, and they get the ping.
+The GitHub Actions workflow wakes at a couple of fixed UTC times (one per
+timezone's morning). On each run every person checks "is it ~08:00 in my
+timezone right now, and is today my turn?"; at most one person matches, and
+they get the ping.
 
 Set SLACK_WEBHOOK_URL to post for real. Leave it unset for a dry run that just
 prints what it would do — handy for testing the rotation order without Slack.
@@ -19,6 +20,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
@@ -122,6 +124,10 @@ def whose_turn_now(now_utc: datetime.datetime) -> Person | None:
     return None
 
 
+class SlackPostError(RuntimeError):
+    """Raised when the Slack POST fails, without exposing the webhook URL."""
+
+
 def post_to_slack(webhook_url: str, person: Person) -> None:
     text = (
         f"<@{person.slack_id}> you're on *Discord watch* today \U0001f440 "
@@ -133,8 +139,15 @@ def post_to_slack(webhook_url: str, person: Person) -> None:
         data=payload,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req) as resp:
-        resp.read()
+    # Catch and re-raise without the URL: urllib errors stringify the full
+    # webhook URL, which must never reach the Actions log or error output.
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        raise SlackPostError(f"Slack returned HTTP {exc.code} {exc.reason}") from None
+    except urllib.error.URLError as exc:
+        raise SlackPostError(f"could not reach Slack: {exc.reason}") from None
 
 
 def main() -> None:
