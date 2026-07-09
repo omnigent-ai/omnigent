@@ -11902,6 +11902,172 @@ def debug_migrate_accounts_to_oidc(
         click.echo("\nDone. Flip OMNIGENT_AUTH_PROVIDER=oidc and restart.\n")
 
 
+@debug.command("logs")
+@click.option(
+    "--type",
+    "log_type",
+    type=click.Choice(["runner", "host-runner", "server", "cli"], case_sensitive=False),
+    default="runner",
+    show_default=True,
+    help="Log category: runner (local CLI runner via omnigent run), "
+    "host-runner (runner spawned by a host daemon), "
+    "server (local server), or cli (CLI diagnostics).",
+)
+@click.option(
+    "--session",
+    "session_id",
+    default=None,
+    metavar="SESSION_ID",
+    help="Filter host-runner logs by session id, e.g. conv_abc123. "
+    "Only applies to --type host-runner. Shows all log files for the "
+    "session, oldest first.",
+)
+@click.option(
+    "--list",
+    "list_only",
+    is_flag=True,
+    default=False,
+    help="List available log files with size and timestamp instead of showing content.",
+)
+@click.option(
+    "--lines",
+    "-n",
+    default=50,
+    show_default=True,
+    metavar="N",
+    type=click.IntRange(min=0),
+    help="Lines to show from the end of the log (0 = entire file). "
+    "With --session, applied per file.",
+)
+@click.option(
+    "--follow",
+    "-f",
+    is_flag=True,
+    default=False,
+    help="Follow the latest log file in real-time (like tail -f). "
+    "With --session, follows the most recent file for the session. "
+    "Not supported on Windows.",
+)
+def debug_logs(
+    log_type: str, session_id: str | None, list_only: bool, lines: int, follow: bool
+) -> None:
+    """Show runner, server, or CLI diagnostic logs.
+
+    Prints the tail of the most recent log file for the chosen category.
+    Use ``--list`` to see all available files, or ``--follow`` to stream
+    new output as it is written.
+
+    Pass ``--session SESSION_ID`` (``--type host-runner`` only) to scope
+    output to all log files produced for a specific session across relaunches.
+
+    \b
+    Log locations (relative to ~/.omnigent or $OMNIGENT_DATA_DIR):
+      runner       logs/runner/runner-*.log
+      host-runner  logs/host-runner/runner-*.log
+      server       logs/server/*server*.log
+      cli          logs/cli-*.log
+
+    \b
+    Examples:
+      # Tail the most recent local runner log (default)
+      omnigent debug logs
+      # List all local runner log files with sizes
+      omnigent debug logs --list
+      # Show host-runner logs for a specific session (across relaunches)
+      omnigent debug logs --type host-runner --session conv_abc123
+      # List host-runner log files for a session
+      omnigent debug logs --type host-runner --session conv_abc123 --list
+      # Follow the latest server log in real-time
+      omnigent debug logs --type server --follow
+      # Show the full latest CLI diagnostics log
+      omnigent debug logs --type cli -n 0
+    """
+    import re
+    import subprocess
+
+    from omnigent.host.local_server import _local_data_dir
+
+    if session_id is not None and log_type != "host-runner":
+        raise click.UsageError("--session is only supported with --type host-runner")
+
+    if follow and IS_WINDOWS:
+        raise click.UsageError("--follow is not supported on Windows")
+
+    data_dir = _local_data_dir()
+
+    _log_configs: dict[str, tuple[Path, str]] = {
+        "runner": (data_dir / "logs" / "runner", "runner-*.log"),
+        "host-runner": (data_dir / "logs" / "host-runner", "runner-*.log"),
+        # Covers both server-*.log (omnigent run) and local-server-*.log (daemon).
+        "server": (data_dir / "logs" / "server", "*server*.log"),
+        "cli": (data_dir / "logs", "cli-*.log"),
+    }
+
+    log_dir, pattern = _log_configs[log_type]
+
+    if not log_dir.exists():
+        raise click.ClickException(f"No {log_type} logs found — {log_dir} does not exist.")
+
+    if session_id is not None:
+        # Sanitize the same way connect.py does so the glob matches.
+        slug = re.sub(r"[^\w-]", "", session_id)[:32]
+        pattern = f"runner-{slug}-*.log"
+
+    # Exclude symlinks (e.g. latest-cli.log), sort newest first.
+    log_files = sorted(
+        (f for f in log_dir.glob(pattern) if not f.is_symlink()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not log_files:
+        if session_id is not None:
+            raise click.ClickException(
+                f"No host-runner logs found for session {session_id!r}. "
+                "Session ids appear in filenames only for runners launched "
+                "after this feature was added."
+            )
+        raise click.ClickException(f"No {log_type} log files found in {log_dir}.")
+
+    if list_only:
+        header = (
+            f"host-runner logs for session {session_id!r} in {log_dir}:"
+            if session_id
+            else f"{log_type} logs in {log_dir}:"
+        )
+        click.echo(header)
+        for f in log_files:
+            stat = f.stat()
+            size_kb = stat.st_size / 1024
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
+            click.echo(f"  {mtime}  {size_kb:6.1f} KB  {f.name}")
+        return
+
+    if follow:
+        # Follow the most recent file only (tail -f can only track one file).
+        latest = log_files[0]
+        click.echo(f"# {latest}", err=True)
+        subprocess.run(["tail", "-f", str(latest)])
+        return
+
+    if session_id is not None:
+        # Show all files for the session, oldest first, with separators.
+        for f in reversed(log_files):
+            click.echo(f"# {f}", err=True)
+            content = f.read_text(errors="replace")
+            if lines > 0:
+                content = "\n".join(content.splitlines()[-lines:])
+            click.echo(content)
+            click.echo()
+    else:
+        latest = log_files[0]
+        click.echo(f"# {latest}", err=True)
+        content = latest.read_text(errors="replace")
+        if lines > 0:
+            content = "\n".join(content.splitlines()[-lines:])
+        click.echo(content)
+
+
 def _workspace_mount_probe_matches(candidate: str, probe: httpx.Response) -> bool:
     """Whether a ``/api/2.0/omnigent`` mount probe answered like omnigent.
 

@@ -1055,10 +1055,18 @@ class HostProcess:
         try:
             log_dir = _runner_log_dir()
             log_dir.mkdir(parents=True, exist_ok=True)
+            # Embed the session id so operators can find all logs for a
+            # session with `omnigent debug logs --session <id>`. Cap at 32
+            # chars to keep filenames manageable; strip anything non-word to
+            # guard against unexpected id shapes from older servers.
+            import re
             import tempfile
 
+            _session_slug = (
+                re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
+            )
             _log_fd, _log_name = tempfile.mkstemp(
-                prefix="runner-",
+                prefix=f"runner-{_session_slug}",
                 suffix=".log",
                 dir=log_dir,
             )
