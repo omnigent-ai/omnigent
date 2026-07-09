@@ -1753,10 +1753,10 @@ def test_create_null_parent_allows_duplicate_titles(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """Top-level conversations (NULL parent) are NOT subject to the unique constraint."""
-    # Both conversations share title=None and parent=None.
-    # The partial index excludes NULL parents, so two NULL-NULL
-    # rows are valid. Without the WHERE clause on the index,
-    # this would raise.
+    # Both conversations share title="" and parent=None. The unique index on
+    # (parent_conversation_id, title) still allows this: a NULL in any indexed
+    # column makes the key distinct, so top-level rows never collide even
+    # without a WHERE predicate.
     a = conversation_store.create_conversation()
     b = conversation_store.create_conversation()
     assert a.id != b.id
@@ -4069,35 +4069,6 @@ def test_set_session_usage_overwrites(
     assert fetched.session_usage == {"input_tokens": 200, "output_tokens": 50}
 
 
-# ── list_conversations_by_host_id ─────────────────────────────────────────
-
-
-def test_list_conversations_by_host_id_returns_matching(
-    conversation_store: SqlAlchemyConversationStore,
-    db_uri: str,
-) -> None:
-    """list_conversations_by_host_id returns conversations bound to the host."""
-    _register_host(db_uri, "host_byhost")
-    conv = conversation_store.create_conversation(
-        host_id="host_byhost",
-        workspace="/tmp/ws",
-    )
-    conversation_store.create_conversation()  # no host_id
-
-    result = conversation_store.list_conversations_by_host_id("host_byhost")
-    assert len(result) == 1
-    assert result[0].id == conv.id
-
-
-def test_list_conversations_by_host_id_empty(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """list_conversations_by_host_id returns empty list when no match."""
-    conversation_store.create_conversation()
-    result = conversation_store.list_conversations_by_host_id("host_nonexistent")
-    assert result == []
-
-
 # ── next_position counter (write-path MAX(position) scan removal) ──────
 
 
@@ -4443,3 +4414,68 @@ def test_list_conversations_project_none_disables_filter(
 
     ids = {c.id for c in conversation_store.list_conversations().data}
     assert ids >= {filed.id, unfiled.id}
+
+
+def test_list_projects_owned_by_excludes_shared_only_projects(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``owned_by`` restricts to projects the user OWNS, not ones merely shared
+    with them — so a project whose sessions are only shared to the user (owned
+    by someone else) does not surface as one of their own sidebar folders."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared = conversation_store.create_conversation()
+    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
+    conversation_store.set_labels(shared.id, {"omni_project": "Shared"})
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    # Bob owns both; Alice only gets a read (level 1) grant on the shared one.
+    perms.grant("bob@example.com", mine.id, 4)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", shared.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    # accessible_by would leak "Shared" — Alice can access it. owned_by must not.
+    assert conversation_store.list_projects(accessible_by="alice@example.com") == [
+        "Mine",
+        "Shared",
+    ]
+    assert conversation_store.list_projects(owned_by="alice@example.com") == ["Mine"]
+
+
+def test_list_conversations_owned_by_excludes_shared_sessions(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``owned_by`` on a project filter returns only sessions the user owns; a
+    session shared with them (read grant) under the same project is excluded so
+    it stays out of the owner-only project folder."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared = conversation_store.create_conversation()
+    conversation_store.set_labels(mine.id, {"omni_project": "X"})
+    conversation_store.set_labels(shared.id, {"omni_project": "X"})
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", shared.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            project="X", owned_by="alice@example.com"
+        ).data
+    }
+    assert ids == {mine.id}

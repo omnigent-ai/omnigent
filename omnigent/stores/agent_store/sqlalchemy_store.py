@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
@@ -71,6 +72,21 @@ class SqlAlchemyAgentStore(AgentStore):
             description=description,
         )
         with self._session() as session:
+            # Template names are unique within a workspace. This can't be a
+            # partial unique index (MySQL has none), so enforce it here.
+            conflict = session.execute(
+                select(SqlAgent.id).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.name == name,
+                    SqlAgent.kind == encode_agent_kind("template"),
+                )
+            ).first()
+            if conflict is not None:
+                raise IntegrityError(
+                    "Duplicate template agent name",
+                    params={"name": name},
+                    orig=Exception(f"UNIQUE constraint: name={name!r}"),
+                )
             session.add(row)
             return sql_agent_to_entity(row)
 

@@ -220,11 +220,26 @@ def test_list_for_conversation_isolation(store: SqlAlchemyCommentStore) -> None:
     )
 
 
-def test_list_for_conversation_ordered_by_created_at(store: SqlAlchemyCommentStore) -> None:
+def test_list_for_conversation_ordered_by_created_at(
+    store: SqlAlchemyCommentStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``list_for_conversation`` returns comments in ``created_at`` ascending order.
 
     The oldest comment must come first regardless of path or start_index.
     """
+    # created_at is seconds-granular; advance the clock a second per add so the
+    # two comments get distinct created_at and the chronological assertion does
+    # not hinge on the same-second (id) tiebreaker.
+    from omnigent.stores.comment_store import sqlalchemy_store as _comment_store_mod
+
+    clock_us = [1_700_000_000_000_000]
+
+    def _fake_now_us() -> int:
+        clock_us[0] += 1_000_000
+        return clock_us[0]
+
+    monkeypatch.setattr(_comment_store_mod, "now_epoch_us", _fake_now_us)
+
     c1 = store.add(
         conversation_id="conv_order",
         path="z.py",

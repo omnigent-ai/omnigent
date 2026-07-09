@@ -701,7 +701,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # session close.
                 return _to_conversation(row)
         except IntegrityError as exc:
-            # Translate the partial-unique-index violation into a
+            # Translate the unique-index violation into a
             # clean exception type the spawn/send tools can map
             # to a name_already_exists tool error. Other integrity
             # violations (FK, check constraints) re-raise.
@@ -714,10 +714,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # check, which would misclassify any future unique
             # constraint added to the conversations table.
             msg = str(exc).lower()
-            is_partial_index_violation = "ix_conversations_parent_title_unique" in msg or (
+            is_title_unique_violation = "ix_conversations_parent_title_unique" in msg or (
                 "unique" in msg and "parent_conversation_id" in msg and "title" in msg
             )
-            if is_partial_index_violation:
+            if is_title_unique_violation:
                 raise NameAlreadyExistsError(
                     f"sub-agent name already exists under parent "
                     f"{parent_conversation_id!r}: title={title!r}"
@@ -1591,6 +1591,7 @@ class SqlAlchemyConversationStore(ConversationStore):
     def list_projects(
         self,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
     ) -> list[str]:
         """
         Return all distinct project names, ordered alphabetically.
@@ -1609,8 +1610,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param accessible_by: When set, restrict to sessions that
             ``accessible_by`` has a permission row for (mirrors the
             ``list_conversations`` ACL filter).
+        :param owned_by: When set, restrict to projects that contain at
+            least one session ``owned_by`` owns (an ``owner``-level grant).
+            Filing into a project is owner-only, so the sidebar renders
+            folders only on "My sessions"; scoping by ownership keeps a
+            project shared *with* the user (but owned by someone else) from
+            surfacing as one of their own folders.
         :returns: List of project names ordered ascending.
         """
+        from omnigent.server.auth import LEVEL_OWNER
+
         with self._session() as session:
             # Join to the conversation so archived sessions don't keep an
             # otherwise-empty project alive in the sidebar.
@@ -1635,6 +1644,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(owned_ids))
             return [row[0] for row in session.execute(stmt).all()]
 
     def delete_label(
@@ -1674,6 +1690,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         sort_by: str = "created_at",
         search_query: str | None = None,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
         title: str | None = None,
@@ -1727,9 +1744,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             empty string ``""``, only return sessions with NO project
             label (i.e., unfiled sessions). ``None`` disables the
             filter.
+        :param owned_by: When set, restrict to sessions the user owns
+            (an ``owner``-level grant) — stricter than ``accessible_by``,
+            which also matches sessions merely shared with them. Powers
+            the per-project folder fetch. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
+        from omnigent.server.auth import LEVEL_OWNER
+
         sort_col = self._resolve_sort_column(sort_by)
         with self._session() as session:
             is_desc = order == "desc"
@@ -1771,6 +1794,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversation.id.in_(owned_ids))
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
@@ -2126,28 +2156,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             row.runner_id = None
             row.updated_at = now_epoch()
             return _to_conversation(row, _fetch_labels(session, conversation_id))
-
-    def list_conversations_by_host_id(
-        self,
-        host_id: str,
-    ) -> list[Conversation]:
-        """
-        Return all conversations with the given ``host_id``.
-
-        :param host_id: Host identifier, e.g.
-            ``"host_a1b2c3d4..."``.
-        :returns: List of :class:`Conversation` entities.
-        """
-        with self._session() as session:
-            rows = (
-                session.query(SqlConversation)
-                .filter(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == host_id,
-                )
-                .all()
-            )
-            return [_to_conversation(row) for row in rows]
 
     def list_conversations_by_runner_id(
         self,

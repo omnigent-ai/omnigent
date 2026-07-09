@@ -113,6 +113,14 @@ _INFRA_ERROR_MARKERS: tuple[str, ...] = (
     "provider auth command",
     "empty token",
     "Failed to resolve external API key auth",
+    # Own-auth harness whose vendor CLI is not installed / not logged in (e.g.
+    # an ACP harness like rovo: "Ensure `acli` is installed and you are logged
+    # in"). The vendor process exits before a turn can run — an environment/
+    # login gap, not a capability the harness lacks, so it must SKIP not drift.
+    "are logged in",
+    "AcpProcessExited",
+    "ACP subprocess",
+    "ACP session",
 )
 
 
@@ -159,6 +167,14 @@ def infra_failure_reason(result: TurnResult) -> str | None:
         return (
             "gateway/provider token could not be provisioned for this transport "
             "(environment/auth gap, not a capability the harness lacks)"
+        )
+    if any(
+        marker in text
+        for marker in ("are logged in", "AcpProcessExited", "ACP subprocess", "ACP session")
+    ):
+        return (
+            "vendor CLI not installed or not logged in (own-auth harness); "
+            "the agent process exited before a turn could run"
         )
     if "unexpected status" in text:
         return "gateway returned an unexpected status (environment/auth issue)"

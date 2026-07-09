@@ -7,6 +7,7 @@ behave as expected.
 
 from __future__ import annotations
 
+import hashlib
 import time
 
 import pytest
@@ -443,7 +444,7 @@ class TestSqlConversationItem:
             session.add(item)
 
         with managed() as session:
-            loaded = session.get(SqlConversationItem, (0, "msg_test1"))
+            loaded = session.get(SqlConversationItem, (0, "conv_test1", "msg_test1"))
             assert loaded is not None
             assert loaded.conversation_id == "conv_test1"
             assert loaded.type == encode_item_type("message")
@@ -488,7 +489,7 @@ class TestSqlConversationItem:
 
         # Without FK cascade the item is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversationItem, (0, "msg_del")) is not None
+            assert session.get(SqlConversationItem, (0, "conv_del", "msg_del")) is not None
 
     def test_multiple_items_ordered_by_position(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -694,6 +695,8 @@ class TestSqlPolicy:
             loaded = session.get(SqlPolicy, (0, "pol_test1"))
             assert loaded is not None
             assert loaded.name == "cost-guard"
+            # The column default stamps sha256(name) on INSERT.
+            assert loaded.name_cksum == hashlib.sha256(b"cost-guard").digest()
             assert loaded.type == encode_policy_type("python")
             assert loaded.enabled is True
             assert loaded.session_id is None
