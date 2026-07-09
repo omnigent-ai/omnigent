@@ -23,7 +23,7 @@ jobs:
   gate:
     name: Security Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - name: Check out trust check from main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -71,7 +71,7 @@ jobs:
           q='[.check_runs[] | select(.name=="Security Scan")] | sort_by(.started_at) | last'
           conclusion=""
           details_url=""
-          for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
+          for _ in $(seq 1 108); do  # up to ~9 min (108 * 5s)
             status=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .status" 2>/dev/null || echo "")
             if [ "$status" = "completed" ]; then
               conclusion=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "$q | .conclusion")

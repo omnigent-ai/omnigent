@@ -1,7 +1,6 @@
 """Cursor preToolUse hook script for Omnigent policy enforcement.
 
-Standalone script -- no omnigent imports.  Runs as a subprocess of the
-Cursor SDK bridge process, not the harness.
+Runs as a subprocess of the Cursor SDK bridge process, not the harness.
 
 Reads tool-call info from stdin (Cursor hook protocol), evaluates
 PHASE_TOOL_CALL policy via the Omnigent server, and returns the
@@ -21,8 +20,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
 
 
 def main() -> None:
@@ -45,33 +42,54 @@ def main() -> None:
 
     # Build the evaluation request matching the server's EvaluationRequest
     # schema.
-    eval_body = json.dumps(
-        {
-            "event": {
-                "type": "PHASE_TOOL_CALL",
-                "target": "",
-                "data": {
-                    "name": tool_name,
-                    "arguments": tool_input if isinstance(tool_input, dict) else {},
-                },
-                "context": {},
+    eval_body: dict[str, object] = {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {
+                "name": tool_name,
+                "arguments": tool_input if isinstance(tool_input, dict) else {},
             },
-        }
-    ).encode()
+            "context": {},
+        },
+    }
 
     url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/policies/evaluate"
 
     try:
-        req = urllib.request.Request(
-            url,
-            data=eval_body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        from omnigent.native_policy_hook import (
+            policy_hook_reauth,
+            policy_hook_request_headers,
+            post_evaluate_with_retry,
         )
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            result = json.loads(resp.read())
-    except Exception:  # noqa: BLE001 -- fail open on any error
-        # Network error / timeout / server down -- fail open.
+
+        headers = policy_hook_request_headers()
+        reauth = policy_hook_reauth(server_url, headers)
+        resp, _ = post_evaluate_with_retry(
+            url=url,
+            headers=headers,
+            eval_request=eval_body,
+            # One day — must match the hooks.json ``timeout`` and the
+            # server's ``ask_timeout`` so the hook stays alive while the
+            # human responds to the web-UI approval card.
+            read_timeout=86400.0,
+            hook_label="cursor preToolUse",
+            # Re-mint the baked one-shot token if it lapses mid-session.
+            reauth=reauth,
+        )
+    except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
+        json.dump({"permission": "allow"}, sys.stdout)
+        return
+
+    if resp is None:
+        # Network error / retry budget exhausted -- fail open (allow) so a
+        # transient server outage doesn't block the Cursor turn.
+        json.dump({"permission": "allow"}, sys.stdout)
+        return
+
+    try:
+        result = resp.json()
+    except Exception:  # noqa: BLE001
         json.dump({"permission": "allow"}, sys.stdout)
         return
 
@@ -84,9 +102,11 @@ def main() -> None:
             out["agent_message"] = f"Tool '{tool_name}' denied by Omnigent policy: {reason}"
         json.dump(out, sys.stdout)
     elif action == "POLICY_ACTION_ASK":
-        # ASK means the server already resolved approval (it parks the
-        # HTTP request until the human decides).  If we get ASK here it
-        # means the server couldn't resolve it -- fail closed.
+        # The server resolves ASK by parking the HTTP request until the
+        # human decides via the web-UI approval card and returning a hard
+        # ALLOW/DENY.  Receiving ASK here means the gate was not held
+        # (e.g. read-only caller) — fail closed rather than granting
+        # unreviewed permission.
         out = {"permission": "deny"}
         if reason:
             out["agent_message"] = f"Tool '{tool_name}' requires approval: {reason}"

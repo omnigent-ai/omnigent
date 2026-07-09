@@ -120,6 +120,11 @@ def test_builtin_names_size_matches_registry() -> None:
                 "download_file",
                 "search_conversations",
                 "export_agent",
+                # Hindsight long-term memory tools (optional `hindsight`
+                # extra; factories probe for hindsight-client).
+                "hindsight_retain",
+                "hindsight_recall",
+                "hindsight_reflect",
                 # Framework-owned (need runtime context, not
                 # user-instantiable). Policy ASKs surface as
                 # MCP-shape elicitations on the SSE stream and
@@ -134,11 +139,12 @@ def test_builtin_names_size_matches_registry() -> None:
                 # ToolContext.conversation_id.
                 "list_comments",
                 "update_comment",
-                # sys_list_models: auto-registered by ToolManager
-                # alongside the sub-agent dispatch grant and
-                # intercepted in the runner's tool dispatch. Reserved
-                # so user specs can't shadow it.
+                # sys_list_models / sys_advise_models: auto-registered
+                # by ToolManager alongside the sub-agent dispatch grant.
+                # sys_advise_models is only included when smart routing
+                # is enabled (RuntimeCaps.routing_client is set).
                 "sys_list_models",
+                "sys_advise_models",
             }
         )
         == BUILTIN_NAMES

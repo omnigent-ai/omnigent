@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 from cachetools import TTLCache
 
+from omnigent._platform import default_shell_argv
 from omnigent.model_override import model_family_mismatch
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
@@ -75,7 +76,13 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 # Subscription CLIs expose no listing API: curated ids matching the bundled
 # catalog pin (claude) and the codex ids the codebase already references.
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
-    "claude": ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
+    "claude": (
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ),
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
 }
 
@@ -99,6 +106,19 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "antigravity": "antigravity",
     "agy": "antigravity",
     "google-antigravity": "antigravity",
+    # Kimi Code CLI is multi-provider; it shares no resolution path with an
+    # existing harness. The identity entry keeps callers that iterate this
+    # map (e.g. ``list_models_for_worker``) finding the harness so they
+    # don't fall through to a noisy "unknown harness" branch.
+    "kimi": "kimi",
+    "kimi-code": "kimi",
+    # Native Kimi TUI harness shares the multi-provider kimi resolution path.
+    "kimi-native": "kimi",
+    "qwen": "qwen",
+    # The native agy TUI bridge resolves its provider via the SDK sibling,
+    # mirroring the claude-native -> claude-sdk rule above.
+    "antigravity-native": "antigravity",
+    "native-antigravity": "antigravity",
 }
 
 # Preferred inline family per single-family harness (pi consumes both).
@@ -107,6 +127,7 @@ _KEY_AUTH_FAMILY: dict[str, str] = {
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     "antigravity": OPENAI_FAMILY,
+    "qwen": OPENAI_FAMILY,
 }
 
 # Multi-family providers (pi): anthropic first, matching _apply_provider_to_pi.
@@ -855,7 +876,7 @@ def _resolve_bearer_token(provider: ResolvedModelProvider) -> str:
         # Same trust model as the harness executors, which run the
         # user-configured auth_command to mint gateway tokens.
         result = subprocess.run(
-            ["/bin/sh", "-c", provider.auth_command],
+            default_shell_argv(provider.auth_command),
             capture_output=True,
             text=True,
             timeout=_AUTH_COMMAND_TIMEOUT_S,

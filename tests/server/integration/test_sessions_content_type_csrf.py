@@ -55,6 +55,10 @@ _JSON_ONLY_ENDPOINTS = [
         id="codex_elicitation_request_hook",
     ),
     pytest.param(
+        "/v1/sessions/conv_missing/hooks/antigravity-elicitation-request",
+        id="antigravity_elicitation_request_hook",
+    ),
+    pytest.param(
         "/v1/sessions/conv_missing/policies/evaluate",
         id="evaluate_policy",
     ),

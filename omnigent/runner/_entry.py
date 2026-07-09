@@ -16,14 +16,17 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import httpx
 from fastapi import FastAPI
 
+from omnigent._platform import IS_WINDOWS
+from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from omnigent.runner.app import ResolvedSpec
@@ -31,10 +34,16 @@ if TYPE_CHECKING:
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
 _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
-_RUNNER_VERSION = "0.1.0"
+# The runner advertises the omnigent version it is actually running (shared
+# with the CLI/server/host) instead of a hard-coded placeholder.
+_RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
+# Re-mint a managed runner's owner JWT this many seconds before it
+# expires, so a live session's HTTP callbacks never present an expired
+# token. Well under the server-side token TTL.
+_MANAGED_MINT_REFRESH_SKEW_S = 300.0
 _logger = logging.getLogger(__name__)
 
 
@@ -169,14 +178,23 @@ class _RunnerDatabricksAuth(httpx.Auth):
     unauthenticated servers), the auth flow is a no-op.
     """
 
-    def __init__(self, factory: Callable[[], str | None] | None) -> None:
+    def __init__(
+        self,
+        factory: Callable[[], str | None] | None,
+        server_url: str | None = None,
+    ) -> None:
         """
         :param factory: Sync callable that returns a fresh bearer
             token, e.g. the return value of
             :func:`_make_auth_token_factory`. ``None`` disables
             auth (local unauthenticated servers).
+        :param server_url: Omnigent server URL used to look up the ``?o=``
+            workspace selector for the ``X-Databricks-Org-Id`` routing
+            header. Defaults to ``RUNNER_SERVER_URL`` so existing callers
+            (which pass only the factory) need no change.
         """
         self._factory = factory
+        self._server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
     def auth_flow(
         self,
@@ -205,9 +223,24 @@ class _RunnerDatabricksAuth(httpx.Auth):
         :raises httpx.RequestError: When the factory is configured
             but returns no token.
         """
+        # Workspace routing: name the workspace or the request routes to the
+        # account (the forwarder's POST /events otherwise 403s). Empty when
+        # none recorded. Set once here; it persists across the retry yield.
+        if self._server_url:
+            from omnigent.cli_auth import databricks_request_headers
+
+            request.headers.update(databricks_request_headers(self._server_url))
         if self._factory is not None:
             token = self._factory()
             if not token:
+                if getattr(self._factory, "declined", False):
+                    # The server definitively refuses to mint for this runner
+                    # (managed mint factory hit HTTP 400/404 after install —
+                    # e.g. its construction probe lost a boot race to a
+                    # no-auth server). Bare requests are correct there; do
+                    # NOT fail closed or the runner bricks every callback.
+                    yield request
+                    return
                 raise httpx.RequestError("Databricks token refresh returned no token")
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
@@ -361,13 +394,185 @@ def _make_auth_token_factory(
                 return oidc_token
         return _sdk_token()
 
-    # Probe once to check if credentials are available.
+    # Probe once to check if a user credential is available.
     try:
         if _factory() is not None:
             return _factory
     except (ValueError, OSError, ImportError):
         pass
+
+    # Managed-sandbox fallback: no user credential resolved (no stored
+    # OIDC token, no Databricks config), but a managed runner still holds
+    # its tunnel binding token. Authenticate its HTTP callbacks (and the
+    # tunnel bearer) with a short-lived owner JWT the server mints against
+    # that binding token — refreshed on demand, so there is no static
+    # credential at rest and no fixed session-length cap.
+    if resolved_server_url:
+        try:
+            binding_token = _runner_tunnel_binding_token_from_env()
+        except RuntimeError:
+            binding_token = None
+        if binding_token is not None:
+            return _make_managed_mint_factory(resolved_server_url, binding_token)
     return None
+
+
+def _make_managed_mint_factory(
+    server_url: str,
+    binding_token: str,
+) -> Callable[[], str | None] | None:
+    """Build a token factory that mints a managed runner's owner JWT.
+
+    For a server-managed sandbox runner with no user credential of its
+    own: mint a short-lived owner JWT from ``POST /v1/runners/{id}/token``,
+    authenticated by the runner's tunnel binding token, and cache it in
+    memory. The cached token is reused until it nears expiry, then
+    re-minted — so a managed session runs arbitrarily long without its
+    auth expiring (no fixed session-length cap), and no long-lived
+    credential is ever written to the sandbox environment.
+
+    The same factory feeds both the WS tunnel bearer and the httpx
+    callback client (see :func:`_make_auth_token_factory` callers), so one
+    credential authenticates every runner->server surface.
+
+    :param server_url: Omnigent server base URL, e.g.
+        ``"https://omnigent.example.com"``.
+    :param binding_token: The runner's tunnel binding token (the sandbox's
+        only credential), presented to the mint endpoint.
+    :returns: A sync callable returning a fresh owner JWT, or ``None`` only
+        when the server *definitively* will not mint for this runner (HTTP
+        400 no-auth/header mode, or 404 older server without the endpoint) —
+        the runner then sends unauthenticated requests, as it did before this
+        fallback existed. A *transient* probe failure still installs the
+        factory, which re-mints on the next callback (so a blip at boot does
+        not leave the runner unauthenticated until process restart). If such
+        a post-install mint then gets the definitive 400/404, the factory
+        latches ``declined`` and returns ``None`` thereafter, and
+        :class:`_RunnerDatabricksAuth` falls back to bare requests.
+    """
+    from omnigent.runner.identity import token_bound_runner_id
+
+    runner_id = token_bound_runner_id(binding_token)
+    mint_url = f"{server_url.rstrip('/')}/v1/runners/{runner_id}/token"
+
+    # Construction probe. Decline to install the factory ONLY when the
+    # server definitively will not mint for this runner — HTTP 400 (no auth
+    # provider / header mode) or 404 (an older server without the endpoint).
+    # There the runner falls back to bare requests, which are correct on a
+    # no-auth server. Every other outcome installs the factory: a success
+    # seeds the cache; a transient failure (network blip, 5xx, timeout)
+    # installs it anyway so the next callback re-mints, rather than leaving
+    # the runner unauthenticated until process restart.
+    factory = _ManagedMintTokenFactory(mint_url, server_url, binding_token)
+    factory()
+    if factory.declined:
+        return None
+    return factory
+
+
+class _ManagedMintTokenFactory:
+    """Callable that mints (and caches) a managed runner's owner JWT.
+
+    Each call returns the cached JWT until it nears expiry, then re-mints
+    via :func:`_mint_managed_owner_token`. When a mint gets a *definitive*
+    refusal (HTTP 400 no-auth/header mode, 404 older server), the
+    :attr:`declined` latch is set and every subsequent call returns
+    ``None`` without touching the network —
+    :meth:`_RunnerDatabricksAuth.auth_flow` reads the latch to send bare
+    requests instead of failing closed. The latch matters when the
+    construction probe loses a boot race (a connection error installs the
+    factory, then the first real mint learns the server never mints).
+    """
+
+    def __init__(self, mint_url: str, server_url: str, binding_token: str) -> None:
+        """
+        :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
+        :param server_url: Omnigent server base URL.
+        :param binding_token: The runner's tunnel binding token.
+        """
+        self._mint_url = mint_url
+        self._server_url = server_url
+        self._binding_token = binding_token
+        self._cached_token: str | None = None
+        self._cached_expires_at = 0.0
+        self.declined = False
+
+    def __call__(self) -> str | None:
+        """Return a fresh owner JWT, or ``None``.
+
+        :returns: The cached or freshly-minted JWT; ``None`` after a
+            definitive server decline (sets :attr:`declined`) or on a
+            transient mint failure with no still-valid cached token.
+        """
+        if self.declined:
+            return None
+        now = time.time()
+        if (
+            self._cached_token is not None
+            and now < self._cached_expires_at - _MANAGED_MINT_REFRESH_SKEW_S
+        ):
+            return self._cached_token
+        try:
+            token, expires_at = _mint_managed_owner_token(
+                self._mint_url, self._server_url, self._binding_token
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (400, 404):
+                self.declined = True
+                return None
+            return self._still_valid_cached_token(now)
+        except (httpx.HTTPError, ValueError, KeyError, OSError):
+            # Transient mint failure: keep serving the cached token while
+            # it is still valid; otherwise report "no token" and let the
+            # tunnel's / HTTP client's on-401 retry drive the next mint.
+            return self._still_valid_cached_token(now)
+        self._cached_token = token
+        self._cached_expires_at = expires_at
+        return token
+
+    def _still_valid_cached_token(self, now: float) -> str | None:
+        """Return the cached token if it hasn't expired outright.
+
+        :param now: Current epoch seconds.
+        :returns: The cached token while still valid, else ``None``.
+        """
+        if self._cached_token is not None and now < self._cached_expires_at:
+            return self._cached_token
+        return None
+
+
+def _mint_managed_owner_token(
+    mint_url: str,
+    server_url: str,
+    binding_token: str,
+) -> tuple[str, float]:
+    """Mint one managed-runner owner JWT from the server.
+
+    :param mint_url: Fully-qualified ``/v1/runners/{id}/token`` URL.
+    :param server_url: Server base URL, used for the Databricks workspace
+        routing header (``X-Databricks-Org-Id``) when applicable.
+    :param binding_token: The runner's tunnel binding token, sent as the
+        ``X-Omnigent-Runner-Tunnel-Token`` header to authenticate the mint.
+    :returns: ``(jwt, expires_at_epoch_seconds)``.
+    :raises httpx.HTTPError: On network failure or a non-2xx response.
+    :raises KeyError: If the response is missing the expected fields.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.runner.identity import (
+        OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    headers = {
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
+        **databricks_request_headers(server_url),
+    }
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(mint_url, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+    return payload["token"], float(payload["expires_at"])
 
 
 def _runner_tunnel_binding_token_from_env() -> str | None:
@@ -424,29 +629,33 @@ def _parent_process_is_alive(parent_pid: int) -> bool:
     :returns: ``True`` when the process exists or is not visible due
         to permissions, otherwise ``False``.
     """
-    try:
-        os.kill(parent_pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # Not ``os.kill(parent_pid, 0)``: on Windows that maps to TerminateProcess
+    # and would kill the parent rather than probe it.
+    return _proc.process_alive(parent_pid)
 
 
 def _parent_is_orphaned(parent_pid: int) -> bool:
     """Return whether this process has been orphaned by *parent_pid*.
 
-    The runner is launched as a direct child of ``parent_pid``, so
+    The runner is launched as a direct child of ``parent_pid``, so on POSIX
     ``getppid()`` equals it until the parent dies — at which point the OS
     reparents us to init / a subreaper and ``getppid()`` changes. That
     reparent signal is immune to PID reuse, which can otherwise make the
-    ``os.kill(pid, 0)`` liveness probe succeed against an unrelated process
-    that recycled the dead parent's pid (seen on busy CI hosts).
+    liveness probe succeed against an unrelated process that recycled the
+    dead parent's pid (seen on busy CI hosts).
+
+    Windows has no reparenting, AND ``os.getppid()`` is unreliable there: the
+    interpreter launcher in a venv breaks the parent link, so ``getppid()``
+    does not match the spawning process. Using it would report the runner
+    orphaned the instant it starts, tearing it down immediately. So on Windows
+    rely solely on an explicit liveness probe of the passed-in ``parent_pid``.
 
     :param parent_pid: The launcher's process id, e.g. ``12345``.
     :returns: ``True`` once the parent is gone, otherwise ``False``.
     """
-    return os.getppid() != parent_pid or not _parent_process_is_alive(parent_pid)
+    if not IS_WINDOWS and os.getppid() != parent_pid:
+        return True
+    return not _parent_process_is_alive(parent_pid)
 
 
 def _run_parent_death_killer(
@@ -621,10 +830,17 @@ async def _resolve_agent_spec_from_server(
     # PUT-induced bundle bumps invalidate naturally.
     version = resp.headers.get("X-Agent-Version", "0")
     dest = _agent_cache_dest(spec_cache_root, agent_id, version)
+    # prune_invalid_sub_agents: the server already validated this bundle
+    # before serving it, so a sub-agent that fails validation *here* means
+    # this runner is older than that server and can't run that sub-agent
+    # (e.g. it names a harness this version doesn't know). Drop the
+    # unsupported sub-agent and launch the parent with what this runner
+    # *does* support, rather than failing every dispatch of the agent.
+    # See omnigent.spec.load.
     if not dest.exists():
         dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env)
-    spec = load(dest, expand_env=expand_env)
+        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
@@ -641,9 +857,12 @@ def create_app(
         a second time during runner boot.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
+    from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
         RUNNER_ID_ENV_VAR,
         get_stable_runner_id,
     )
@@ -656,6 +875,14 @@ def create_app(
     # restarts (§5 "Persistence" in RUNNER.md).
     _runner_id = get_stable_runner_id()
     os.environ[RUNNER_ID_ENV_VAR] = _runner_id
+    # Stamp the Omnigent session marker into the runner's environment so
+    # every process this runner spawns can detect it is running inside an
+    # Omnigent agent session, the way Claude Code sets CLAUDE_CODE and
+    # Codex sets CODEX. Harness workers inherit it (the process manager
+    # merges os.environ), native CLI terminals copy os.environ, and the
+    # claude-sdk SDK merges os.environ. The deny-by-default env scrubbers
+    # (os_env, codex, pi) allowlist it so it survives their scrub.
+    os.environ[OMNIGENT_SESSION_ENV_VAR] = OMNIGENT_SESSION_ENV_VALUE
 
     # Keep the harness manager on its default /tmp/omnigent root.
     # Nesting harness UDS paths under caller-provided temp dirs can
@@ -684,7 +911,10 @@ def create_app(
         # — both reached from tool_dispatch over this client) requires a
         # trusted Origin; the runner sends none otherwise, so the sentinel is
         # what lets sys_session_create / sys_upload_file through.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        #
+        # The workspace-routing header (empty unless a ?o= selector was
+        # recorded for this server) routes these callbacks to the workspace.
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
@@ -777,7 +1007,7 @@ def create_app(
     )
 
     async def _start_pm() -> None:
-        """Start harness process manager; kick off MCP prewarm if requested."""
+        """Start harness process manager; register MCP prewarm metadata if requested."""
         await pm.start()
         prewarm_path = os.environ.get(_RUNNER_PREWARM_SPEC_PATH_ENV_VAR)
         if prewarm_path and mcp_manager is not None:
@@ -791,18 +1021,25 @@ def create_app(
                 prewarm_spec = _load_spec(Path(prewarm_path), expand_env=True)
                 await mcp_manager.prewarm(prewarm_spec)
                 _logger.info(
-                    "runner MCP prewarm scheduled for %s (servers=%d)",
+                    "runner MCP prewarm registered for %s (servers=%d)",
                     prewarm_path,
                     len(prewarm_spec.mcp_servers or []),
                 )
             except Exception:
                 _logger.exception("runner MCP prewarm failed for %s", prewarm_path)
+        # Native-pane idle reaper (#1349): reclaims idle native CLI panes.
+        _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if _pane_reaper is not None:
+            await _pane_reaper.start()
 
     async def _stop_pm() -> None:
         """Stop runner-owned resources for graceful process exit.
 
         :returns: None.
         """
+        _pane_reaper = getattr(app.state, "native_pane_reaper", None)
+        if _pane_reaper is not None:
+            await _pane_reaper.shutdown()
         await pm.shutdown()
         await _terminal_registry.shutdown()
         if mcp_manager is not None:
@@ -815,9 +1052,16 @@ def create_app(
 
         shutil.rmtree(_spec_cache_root, ignore_errors=True)
 
-    app.add_event_handler("startup", _start_pm)
-    app.add_event_handler("shutdown", _stop_pm)
+    # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await _start_pm()
+        try:
+            yield
+        finally:
+            await _stop_pm()
 
+    app.router.lifespan_context = _lifespan
     return app
 
 
@@ -836,16 +1080,13 @@ async def _run_tunnel_from_env() -> None:
     parent_pid = _runner_parent_pid_from_env()
     runner_id = get_stable_runner_id()
 
-    # Initialize MLflow tracing in the runner process so the
-    # ExecutorAdapter can emit spans for agent turns, tool calls,
-    # and LLM interactions. No-op when OTEL_EXPORTER_OTLP_ENDPOINT
-    # is unset or mlflow is not installed.
+    # Initialize OTel tracing in the runner process so the ExecutorAdapter
+    # can emit spans for agent turns, tool calls, and LLM interactions.
+    # No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
     try:
         from omnigent.runtime import telemetry
 
-        telemetry.init()
-    except ImportError:
-        _logger.debug("telemetry init skipped in runner (mlflow not installed)")
+        telemetry.init("omni-runner")
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
         _logger.debug("telemetry init failed in runner", exc_info=True)
 
@@ -853,7 +1094,9 @@ async def _run_tunnel_from_env() -> None:
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory)
     idle_timeout_s = _load_runner_idle_timeout_s_from_config()
-    await app.router.startup()
+    # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
+    _lifespan_cm = app.router.lifespan_context(app)
+    await _lifespan_cm.__aenter__()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
@@ -949,7 +1192,7 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
-        await app.router.shutdown()
+        await _lifespan_cm.__aexit__(None, None, None)
 
 
 def _install_signal_handlers(

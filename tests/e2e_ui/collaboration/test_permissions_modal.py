@@ -20,15 +20,27 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import _PUBLIC_LOOPBACK_HOST
 
 # ``__public__`` is the synthetic user id the server stores for a public
 # grant (mirrors ``PUBLIC_USER`` in PermissionsModal.tsx).
 _PUBLIC_USER = "__public__"
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
+_LOCAL_SHARE_DISABLED_REASON = "Sharing is unavailable from a local server."
+
+
+def _public_loopback_url(base_url: str) -> str:
+    """Return *base_url* through the browser's public-looking loopback alias."""
+    parsed = urlsplit(base_url)
+    if parsed.port is None:
+        raise AssertionError(f"e2e base URL missing port: {base_url!r}")
+    return urlunsplit((parsed.scheme, f"{_PUBLIC_LOOPBACK_HOST}:{parsed.port}", "", "", ""))
 
 
 def _permissions(base_url: str, session_id: str) -> dict[str, int]:
@@ -68,9 +80,62 @@ def _open_share_modal(page: Page) -> None:
     """Open the Share modal from the chat header and wait for it to mount."""
     # Desktop viewport: the header renders a labelled Share button directly
     # (the three-dot menu + "Share" menu item is the mobile fallback).
-    page.get_by_role("button", name="Share session").click()
+    share = page.get_by_role("button", name="Share session")
+    expect(share).to_be_enabled(timeout=60_000)
+    share.click()
     expect(page.get_by_role("dialog")).to_be_visible()
     expect(page.get_by_text("Share this session")).to_be_visible()
+
+
+def _install_clipboard_stub(page: Page) -> None:
+    """Provide async clipboard on the public loopback alias.
+
+    Chromium exposes real clipboard access on localhost, but not on the
+    public-looking plain-HTTP alias this test uses to keep Share enabled.
+    """
+    page.add_init_script(
+        """
+        (() => {
+          let text = "";
+          Object.defineProperty(Navigator.prototype, "clipboard", {
+            configurable: true,
+            get() {
+              return {
+                writeText(value) {
+                  text = String(value);
+                  return Promise.resolve();
+                },
+                readText() {
+                  return Promise.resolve(text);
+                },
+              };
+            },
+          });
+        })();
+        """
+    )
+
+
+def test_local_server_disables_share_button_with_tooltip(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A loopback-served SPA explains why session sharing is unavailable."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    share = page.get_by_role("button", name="Share session")
+    expect(share).to_be_visible(timeout=60_000)
+    expect(share).to_be_disabled()
+
+    page.get_by_label(f"Share session disabled: {_LOCAL_SHARE_DISABLED_REASON}").hover()
+    tooltip = page.locator(
+        "[data-slot=tooltip-content]",
+        has_text=_LOCAL_SHARE_DISABLED_REASON,
+    )
+    expect(tooltip).to_be_visible(timeout=5_000)
+    expect(tooltip).to_be_in_viewport()
+    expect(page.get_by_role("dialog")).to_have_count(0)
 
 
 def test_permissions_modal_controls_drive_server_state(
@@ -83,9 +148,10 @@ def test_permissions_modal_controls_drive_server_state(
     pinned against the ``/permissions`` REST state it mutates.
     """
     base_url, session_id = seeded_session
+    public_base_url = _public_loopback_url(base_url)
     grantee = "alice@ui.test"
-    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
-    page.goto(f"{base_url}/c/{session_id}")
+    _install_clipboard_stub(page)
+    page.goto(f"{public_base_url}/c/{session_id}")
 
     _open_share_modal(page)
     dialog = page.get_by_role("dialog")

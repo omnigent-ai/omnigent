@@ -725,7 +725,9 @@ def test_subscription_listing_is_static_and_unverified(
     assert listing.verified is False
     # Exactly the curated claude tiers — these are aliases, not a live list.
     assert [m.id for m in listing.models] == [
+        "claude-fable-5",
         "claude-opus-4-8",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
     ]
@@ -980,7 +982,7 @@ def test_catalog_isolates_per_worker_failures(
     # The subscription rows (claude worker + the claude-sdk brain) are
     # unaffected by the gateway outage.
     assert catalog["worker"]["source"] == "static"
-    assert next(m["id"] for m in catalog["worker"]["models"]) == "claude-opus-4-8"
+    assert next(m["id"] for m in catalog["worker"]["models"]) == "claude-fable-5"
     assert catalog["self"]["source"] == "static"
     # The broken worker degrades informatively instead of crashing the tool.
     assert catalog["codex"]["source"] == "none"

@@ -41,11 +41,11 @@ from omnigent.spec.types import (
     ModalityConfig,
     Phase,
     PhaseSelector,
-    PolicyAction,
     PolicySpec,
     ProviderAuth,
     RetryPolicy,
     SandboxConfig,
+    SharePolicy,
     SkillSpec,
     ToolsConfig,
 )
@@ -89,7 +89,7 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS = frozenset({"cost_optimize"})
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)
@@ -151,7 +151,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     raw_tools = raw.get("tools")
     llm = _parse_llm(raw_llm, expand_env=expand_env)
     interaction = _parse_interaction(raw.get("interaction"))
-    tools_config = _parse_tools_config(raw_tools)
+    tools_config = _parse_tools_config(raw_tools, expand_env=expand_env)
     executor = _parse_executor(raw_executor, expand_env=expand_env)
     # ── Consolidate llm: → executor ────────────────────────────────
     # ``executor.model`` and ``executor.connection`` are the primary
@@ -180,6 +180,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
             model=executor.model or llm.model,
             extra=llm.extra,
             connection=executor.connection,
+            profile=llm.profile,
             request_timeout=llm.request_timeout,
             retry=llm.retry,
         )
@@ -212,6 +213,13 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # the specified sub-agent types. Defaults to False — session
     # reads stay always-on, but every write grant is explicit.
     spawn = bool(raw.get("spawn", False))
+    # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
+    # the ``sys_session_share`` tool, independent of ``spawn`` /
+    # ``tools.agents`` (and unrelated to server-API / CLI sharing).
+    # ``none`` (default) leaves it unregistered; ``non-public`` allows
+    # granting named users; ``public`` also allows ``__public__``
+    # anonymous read.
+    agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -248,6 +256,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         terminals=terminals,
         timers=timers,
         spawn=spawn,
+        agent_session_sharing=agent_session_sharing,
     )
 
 
@@ -337,6 +346,8 @@ def _parse_interaction(
 
 def _parse_tools_config(
     raw: dict[str, Any] | None,
+    *,
+    expand_env: bool = True,
 ) -> ToolsConfig:
     """
     Parse the ``tools:`` block from config.yaml into a
@@ -353,7 +364,7 @@ def _parse_tools_config(
         return ToolsConfig()
     timeout = int(raw["timeout"]) if "timeout" in raw else 60
     retry = _parse_retry(raw.get("retry"))
-    builtins = _parse_builtin_tools(raw.get("builtins", []))
+    builtins = _parse_builtin_tools(raw.get("builtins", []), expand_env=expand_env)
     sandbox = _parse_sandbox_config(raw.get("sandbox"))
     return ToolsConfig(
         agents=raw.get("agents", []),
@@ -399,6 +410,8 @@ def _parse_sandbox_config(
 
 def _parse_builtin_tools(
     raw: list[str | dict[str, Any]],
+    *,
+    expand_env: bool = True,
 ) -> list[BuiltinToolConfig]:
     """
     Parse the ``tools.builtins`` list into
@@ -414,6 +427,8 @@ def _parse_builtin_tools(
             engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
 
     :param raw: The raw ``builtins`` list from config.yaml.
+    :param expand_env: Whether to expand ``${VAR}`` references in
+        tool-specific config fields. ``False`` keeps literals as-is.
     :returns: A list of :class:`BuiltinToolConfig` instances.
     :raises OmnigentError: If a dict entry is missing ``name``.
     """
@@ -429,7 +444,8 @@ def _parse_builtin_tools(
                     code=ErrorCode.INVALID_INPUT,
                 )
             # Everything except 'name' is tool-specific config.
-            config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            raw_config = {str(k): str(v) for k, v in entry.items() if k != "name"}
+            config = expand_env_vars(raw_config) if expand_env else raw_config
             result.append(
                 BuiltinToolConfig(
                     name=str(name),
@@ -503,9 +519,6 @@ def _parse_executor(
     # type. Scalar values are coerced to strings so YAML booleans /
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
-    # Structured keys whose consumer needs the nested shape are kept
-    # verbatim: ``cost_optimize`` is the cost advisor's tier config (a
-    # nested mapping), which ``parse_advisor_config`` reads as a Mapping.
     raw_config = raw.get("config")
     config: dict[str, Any] = {}
     if isinstance(raw_config, dict):
@@ -1733,6 +1746,42 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
     return None
 
 
+def _parse_share_policy(raw: object) -> SharePolicy:
+    """
+    Parse the top-level YAML ``agent_session_sharing:`` field into a
+    :class:`SharePolicy`.
+
+    This flag is the sole enabler of the ``sys_session_share`` tool
+    (independent of ``spawn`` / ``tools.agents``). Sharing mutates
+    access control, so it is off by default and an unrecognized value
+    fails loud rather than silently disabling the feature.
+
+    Supported YAML shapes:
+
+    - field omitted / ``null`` → :attr:`SharePolicy.NONE` (default;
+      tool not registered).
+    - ``"none"`` / ``"non-public"`` / ``"public"`` → the matching
+      :class:`SharePolicy` member.
+
+    :param raw: The raw YAML value (already parsed). ``None`` or one
+        of the three policy strings, e.g. ``"non-public"``.
+    :returns: The resolved :class:`SharePolicy`.
+    :raises OmnigentError: When the value is neither ``None`` nor one
+        of the recognized policy strings (e.g. a boolean, a typo like
+        ``"private"``, or a non-string).
+    """
+    if raw is None:
+        return SharePolicy.NONE
+    try:
+        return SharePolicy(raw)
+    except ValueError:
+        valid = ", ".join(repr(p.value) for p in SharePolicy)
+        raise OmnigentError(
+            f"top-level agent_session_sharing: must be one of {valid}; got {raw!r}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from None
+
+
 def _parse_skills_filter(raw: object) -> str | list[str]:
     """
     Parse the top-level YAML ``skills:`` field into a host-skill
@@ -1896,8 +1945,19 @@ def _discover_skills(
     """
     if not skills_dir.is_dir():
         return []
+    try:
+        entries = sorted(skills_dir.iterdir())
+    except OSError as exc:
+        # Lenient mode (a skipped list was passed, e.g. host/plugin menu
+        # discovery): an unreadable skills dir must not 500 the caller —
+        # log and yield nothing. Strict mode (bundle parse) re-raises.
+        if skipped is None:
+            raise
+        _log.warning("Skipping unreadable skills dir %s: %s", skills_dir, exc)
+        skipped.append(f"{skills_dir}: {exc}")
+        return []
     skills: list[SkillSpec] = []
-    for skill_dir in sorted(skills_dir.iterdir()):
+    for skill_dir in entries:
         if not skill_dir.is_dir():
             continue
         skill_md = skill_dir / "SKILL.md"
@@ -1914,6 +1974,35 @@ def _discover_skills(
             continue
         skills.append(skill)
     return skills
+
+
+# Quoted string spellings treated as boolean false. PyYAML already parses the
+# *bare* YAML 1.1 false words (``false``/``False``/``no``/``off``) to a real
+# ``bool``, caught by the ``raw is False`` branch below; this set only catches
+# the *quoted* forms (e.g. ``user-invocable: "no"``) that arrive as ``str``.
+_FALSEY_STRINGS = frozenset({"false", "no", "off", "0"})
+
+
+def _falsey_flag(raw: object) -> bool:
+    """
+    Return whether a YAML frontmatter flag reads as boolean ``false``.
+
+    Accepts a genuine YAML bool (``raw is False`` — which already covers
+    the bare words ``false``/``no``/``off`` that PyYAML parses to a
+    ``bool``) and the quoted string spellings in :data:`_FALSEY_STRINGS`
+    (case-insensitive, surrounding whitespace ignored) — YAML keeps a
+    quoted value as a ``str``, so the string branch is the one that
+    silently regresses without a test. Every other value (absent ⇒
+    caller's default, ``true``, other strings, ``0`` as int) is not
+    falsey.
+
+    :param raw: The raw frontmatter value, e.g. ``False``, ``"no"``,
+        or ``True``.
+    :returns: ``True`` only when *raw* means boolean false.
+    """
+    if raw is False:
+        return True
+    return isinstance(raw, str) and raw.strip().lower() in _FALSEY_STRINGS
 
 
 def _parse_skill(skill_md: Path) -> SkillSpec:
@@ -1934,7 +2023,11 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     """
     try:
         text = skill_md.read_text()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
+        # OSError — funnel it through OmnigentError too so the lenient
+        # scanner in _discover_skills and the per-skill guards in the menu
+        # providers catch it and skip the file instead of 500-ing the menu.
         raise OmnigentError(
             f"SKILL.md could not be read: {skill_md}: {exc}",
             code=ErrorCode.INVALID_INPUT,
@@ -1970,11 +2063,15 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
             f"SKILL.md frontmatter missing required field 'description': {skill_md}",
             code=ErrorCode.INVALID_INPUT,
         )
+    # ``user-invocable: false`` marks an internal orchestration skill that
+    # the user should not invoke directly; absent/true ⇒ invocable.
+    user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
     return SkillSpec(
         name=str(name),
         description=str(description),
         content=content.strip(),
         skill_dir=skill_md.parent,
+        user_invocable=user_invocable,
     )
 
 
@@ -2136,6 +2233,17 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
+        # Optional per-server tool allow-list (the YAML ``tools:`` whitelist) —
+        # only these tool names are exposed to the model; ``None`` exposes all.
+        # Mirrors ``MCPTool.tools`` and is filtered downstream in
+        # server/mcp_pool.py + runner/mcp_manager.py.
+        raw_allow = val.get("tools")
+        if raw_allow is not None and not isinstance(raw_allow, list):
+            raise OmnigentError(
+                f"Inline MCP server {name!r} 'tools' must be a list of tool names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        tool_allowlist = [str(t) for t in raw_allow] if raw_allow else None
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2150,6 +2258,7 @@ def _parse_inline_mcp_servers(
                 headers=headers,
                 env=env,
                 databricks_profile=databricks_profile,
+                tools=tool_allowlist,
             )
         )
     return servers
@@ -2484,7 +2593,7 @@ def _parse_guardrails(
     :param raw: The ``guardrails:`` mapping from config.yaml,
         or ``None`` when the block was absent. Example:
         ``{"labels": {"integrity": {"initial": "1",
-        "values": ["0", "1"], "monotonic": "decreasing"}},
+        "values": ["0", "1"]}},
         "policies": {"block_canada_input": {"type": "prompt",
         ...}}, "ask_timeout": 30}``.
     :param expand_env: Whether to expand ``${VAR}`` references
@@ -2520,8 +2629,7 @@ def _parse_guardrails_ask_timeout(raw: Any) -> int:
     rejects ``<= 0`` at spec load per POLICIES.md §13. The
     ambiguity between "instant DENY" and "wait forever"
     drove the strict > 0 rule — both intents have explicit
-    paths (omit ASK from action list; use a large finite
-    number).
+    paths (use a large finite number for long waits).
 
     :param raw: Raw ``guardrails.ask_timeout:`` value.
     :returns: Validated timeout in seconds.
@@ -2557,16 +2665,15 @@ def _parse_label_defs(
     - Bare string: ``integrity: "1"`` → schemaless with
       ``initial="1"``.
     - Dict (schema'd with initial):
-      ``{initial: "1", values: [...], monotonic: ...}``.
+      ``{initial: "1", values: [...]}``.
     - Dict (schema'd without initial):
-      ``{values: [...], monotonic: ...}``.
+      ``{values: [...]}``.
 
     :param raw: The ``labels:`` mapping, or ``None``.
     :returns: Dict mapping each label key to its
         :class:`LabelDef`. ``None`` when *raw* is ``None``.
     :raises OmnigentError: On malformed entries — empty
-        dict, ``initial`` not in ``values``, unknown
-        ``monotonic`` direction, etc.
+        dict, ``initial`` not in ``values``, etc.
     """
     if raw is None:
         return None
@@ -2589,7 +2696,7 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         ``"integrity"``.
     :param entry: Either a string (shorthand: value becomes
         ``initial``) or a dict with one or more of
-        ``initial``, ``values``, ``monotonic``.
+        ``initial``, ``values``.
     :returns: A populated :class:`LabelDef`.
     :raises OmnigentError: On any malformed value.
     """
@@ -2610,14 +2717,13 @@ def _parse_single_label_def(key: str, entry: Any) -> LabelDef:
         # Empty-dict typo guard — matches POLICIES.md §13.
         raise OmnigentError(
             f"label {key!r} declares an empty dict — must contain at "
-            f"least one of `initial`, `values`, or `monotonic`",
+            f"least one of `initial` or `values`",
             code=ErrorCode.INVALID_INPUT,
         )
     initial = _coerce_label_initial(entry.get("initial"))
     values = _coerce_label_values(key, entry.get("values"))
-    monotonic = _coerce_label_monotonic(key, entry.get("monotonic"))
-    _validate_label_def_cross_fields(key, initial, values, monotonic)
-    return LabelDef(initial=initial, values=values, monotonic=monotonic)
+    _validate_label_def_cross_fields(key, initial, values)
+    return LabelDef(initial=initial, values=values)
 
 
 def _coerce_label_initial(raw: Any) -> str | None:
@@ -2646,59 +2752,24 @@ def _coerce_label_values(key: str, raw: Any) -> list[str] | None:
     return [str(v) for v in raw]
 
 
-def _coerce_label_monotonic(
-    key: str,
-    raw: Any,
-) -> Literal["increasing", "decreasing"] | None:
-    """
-    Validate a ``monotonic:`` direction.
-
-    :param key: Label key, for error messages.
-    :param raw: Raw ``monotonic:`` value from YAML — must
-        be ``"increasing"``, ``"decreasing"``, or absent.
-    :returns: The validated direction, or ``None`` when
-        *raw* is ``None``.
-    :raises OmnigentError: On any other value.
-    """
-    if raw is None:
-        return None
-    if raw == "increasing":
-        return "increasing"
-    if raw == "decreasing":
-        return "decreasing"
-    raise OmnigentError(
-        f"label {key!r}: `monotonic` must be 'increasing' or 'decreasing', got {raw!r}",
-        code=ErrorCode.INVALID_INPUT,
-    )
-
-
 def _validate_label_def_cross_fields(
     key: str,
     initial: str | None,
     values: list[str] | None,
-    monotonic: Literal["increasing", "decreasing"] | None,
 ) -> None:
     """
     Enforce cross-field constraints on a :class:`LabelDef`.
 
     Per POLICIES.md §13:
 
-    - ``monotonic`` requires ``values`` (no positions to
-      order without them).
     - When both ``initial`` and ``values`` are declared,
       ``initial`` must be in ``values``.
 
     :param key: Label key, for error messages.
     :param initial: Pre-coerced initial value.
     :param values: Pre-coerced values list.
-    :param monotonic: Pre-validated direction.
     :raises OmnigentError: On any cross-field violation.
     """
-    if monotonic is not None and values is None:
-        raise OmnigentError(
-            f"label {key!r}: `monotonic` requires a `values` list to order against",
-            code=ErrorCode.INVALID_INPUT,
-        )
     if initial is not None and values is not None and initial not in values:
         raise OmnigentError(
             f"label {key!r}: `initial` value {initial!r} is not in declared `values` {values!r}",
@@ -2862,7 +2933,6 @@ def _parse_function_policy(
             f"policy {name!r}: `function` policies require a `function:` or `handler:` field",
             code=ErrorCode.INVALID_INPUT,
         )
-    action = _parse_action_list(data["action"], policy_name=name) if "action" in data else None
     set_labels = (
         _parse_writable_labels(data["set_labels"], policy_name=name)
         if "set_labels" in data
@@ -2877,7 +2947,6 @@ def _parse_function_policy(
     return FunctionPolicySpec(
         **base_kwargs,
         function=_parse_function_ref(function_raw, policy_name=name),
-        action=action,
         set_labels=set_labels,
         config=config,
     )
@@ -3050,53 +3119,6 @@ def _parse_condition(
     return coerced
 
 
-def _parse_action_list(
-    raw: Any,
-    *,
-    policy_name: str,
-) -> list[PolicyAction]:
-    """
-    Parse a policy's ``action:`` whitelist into a list of
-    :class:`PolicyAction` enums.
-
-    Accepts a bare string (single-element list sugar) or a
-    list of strings. Validates each entry against the enum.
-
-    :param raw: The ``action:`` value from YAML.
-    :param policy_name: Enclosing policy name for error
-        messages.
-    :returns: List of :class:`PolicyAction` values.
-    :raises OmnigentError: On empty list or unknown
-        action value.
-    """
-    if isinstance(raw, str):
-        strings = [raw]
-    elif isinstance(raw, list):
-        strings = [str(s) for s in raw]
-    else:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` must be a string or "
-            f"list of strings, got {type(raw).__name__}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not strings:
-        raise OmnigentError(
-            f"policy {policy_name!r}: `action:` list must be non-empty",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    actions: list[PolicyAction] = []
-    for s in strings:
-        try:
-            actions.append(PolicyAction(s))
-        except ValueError as exc:
-            raise OmnigentError(
-                f"policy {policy_name!r}: invalid action {s!r} "
-                f"(must be one of 'allow', 'ask', 'deny')",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
-    return actions
-
-
 def _parse_writable_labels(
     raw: Any,
     *,
@@ -3210,7 +3232,7 @@ def _parse_policy_ask_timeout(
     if value <= 0:
         raise OmnigentError(
             f"policy {policy_name!r}: `ask_timeout` must be > 0 "
-            f"(omit ASK from the policy's action list for instant-DENY)",
+            "(use large finite values for long waits)",
             code=ErrorCode.INVALID_INPUT,
         )
     return value

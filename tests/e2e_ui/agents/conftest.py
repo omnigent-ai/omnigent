@@ -88,7 +88,7 @@ prompt: |
   a second `comic_one` or `comic_two`.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   harness: openai-agents
 
 tools:
@@ -96,7 +96,7 @@ tools:
     type: agent
     description: First stand-up comedian. Tells exactly one joke when asked.
     executor:
-      model: databricks-gpt-5-4
+      model: gpt-4o-mini
       harness: openai-agents
     prompt: |
       You are a stand-up comedian. When asked for a joke, reply with
@@ -108,7 +108,7 @@ tools:
     type: agent
     description: Second stand-up comedian. Tells exactly one joke when asked.
     executor:
-      model: databricks-gpt-5-4
+      model: gpt-4o-mini
       harness: openai-agents
     prompt: |
       You are a stand-up comedian. When asked for a joke, reply with

@@ -1,0 +1,105 @@
+{
+  "type": "CORTEX_STEP_TYPE_LIST_DIRECTORY",
+  "status": "CORTEX_STEP_STATUS_DONE",
+  "metadata": {
+    "stepGenerationVersion": 1,
+    "createdAt": "2026-06-23T00:01:18.977374Z",
+    "viewableAt": "2026-06-23T00:01:19.032449Z",
+    "finishedGeneratingAt": "2026-06-23T00:01:19.032449Z",
+    "lastCompletedChunkAt": "2026-06-23T00:01:19.032437Z",
+    "startedAt": "2026-06-23T00:01:19.033205Z",
+    "completedAt": "2026-06-23T00:01:19.036844Z",
+    "source": "CORTEX_STEP_SOURCE_MODEL",
+    "toolCall": {
+      "id": "h510vxi0",
+      "name": "list_dir",
+      "argumentsJson": "{\"DirectoryPath\":\"/Users/bryanli/.gemini/antigravity-cli/scratch\",\"toolAction\":\"Listing scratch directory contents\",\"toolSummary\":\"List scratch directory\"}",
+      "thinkingSignature": "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",
+      "originalName": "list_dir"
+    },
+    "argumentsOrder": [
+      "DirectoryPath",
+      "toolAction",
+      "toolSummary"
+    ],
+    "generatorModel": "MODEL_PLACEHOLDER_M20",
+    "requestedModel": {
+      "model": "MODEL_PLACEHOLDER_M20"
+    },
+    "executionId": "6351e014-60a2-4c2e-a08d-c2d285ad2577",
+    "toolCallOutputTokens": 38,
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "stepIndex": 10,
+      "metadataIndex": 3,
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    },
+    "internalMetadata": {
+      "statusTransitions": [
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_PENDING",
+          "timestamp": "2026-06-23T00:01:19.032537Z"
+        },
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_RUNNING",
+          "timestamp": "2026-06-23T00:01:19.033519Z"
+        },
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_DONE",
+          "timestamp": "2026-06-23T00:01:19.036947Z"
+        }
+      ]
+    },
+    "toolSummary": "List scratch directory",
+    "toolAction": "Listing scratch directory contents"
+  },
+  "listDirectory": {
+    "directoryPathUri": "file:///Users/bryanli/.gemini/antigravity-cli/scratch",
+    "results": [
+      {
+        "name": ".pytest_cache",
+        "isDir": true
+      },
+      {
+        "name": "diff.patch",
+        "sizeBytes": "40083"
+      },
+      {
+        "name": "diff.txt",
+        "sizeBytes": "17782"
+      },
+      {
+        "name": "git_review_info.txt",
+        "sizeBytes": "241671"
+      },
+      {
+        "name": "scratch.py",
+        "sizeBytes": "897"
+      },
+      {
+        "name": "scratch2.py",
+        "sizeBytes": "569"
+      },
+      {
+        "name": "scratch3.py",
+        "sizeBytes": "891"
+      },
+      {
+        "name": "scratch4.py",
+        "sizeBytes": "1103"
+      },
+      {
+        "name": "scratch5.py",
+        "sizeBytes": "1033"
+      },
+      {
+        "name": "scratch6.py",
+        "sizeBytes": "1122"
+      },
+      {
+        "name": "test-repo",
+        "isDir": true
+      }
+    ]
+  }
+}

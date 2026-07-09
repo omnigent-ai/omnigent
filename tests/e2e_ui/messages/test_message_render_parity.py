@@ -38,6 +38,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
+
 _COMPOSER = "Ask the agent anything…"
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
@@ -47,6 +49,9 @@ _TURNS = 5
 
 # A custom openai-agents turn is a single LLM call.
 _CUSTOM_TURN_TIMEOUT_MS = 90_000
+
+# Model name baked into _CUSTOM_AGENT_YAML; used to key the mock fallback.
+_ECHO_PROBE_MODEL = "gpt-4o-mini"
 
 
 def _send(page: Page, text: str) -> None:
@@ -232,6 +237,8 @@ def _run_render_parity_journey(
     session_id: str,
     *,
     per_turn_timeout_ms: int,
+    mock_llm_server_url: str | None = None,
+    mock_model: str | None = None,
 ) -> None:
     """Drive five turns, then assert no-duplicate render + transcript parity.
 
@@ -239,18 +246,46 @@ def _run_render_parity_journey(
     :param base_url: Spawned server base URL.
     :param session_id: The session/conversation id to chat in.
     :param per_turn_timeout_ms: How long to wait for each turn to land.
+    :param mock_llm_server_url: When provided, pre-configure the mock LLM
+        server with per-turn echo responses (content-based routing keyed on
+        the user marker) before any message is sent. Required when the runner
+        routes through the mock rather than a real LLM.
+    :param mock_model: Model name to set as a catch-all fallback on the mock
+        when *mock_llm_server_url* is given. Extra LLM calls from the agent
+        (e.g. tool-schema loading) hit this queue and get an empty reply.
     """
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
 
+    # Pre-generate tokens for all turns so they can be queued in the mock
+    # before any message is sent.
+    nonces = [uuid.uuid4().hex[:8] for _ in range(_TURNS)]
+    all_turns = [(f"usr-{i + 1}-{nonces[i]}", f"ast-{i + 1}-{nonces[i]}") for i in range(_TURNS)]
+
+    # Set model fallback once — survives reset_mock_llm, handles any extra
+    # LLM calls the agent makes that don't match the per-turn content queue.
+    if mock_llm_server_url is not None and mock_model is not None:
+        set_fallback_mock_llm(mock_llm_server_url, mock_model, "")
+
     user_markers: list[str] = []
     assistant_tokens: list[str] = []
-    for index in range(1, _TURNS + 1):
-        nonce = uuid.uuid4().hex[:8]
-        user_marker = f"usr-{index}-{nonce}"
-        assistant_token = f"ast-{index}-{nonce}"
+    for index, (user_marker, assistant_token) in enumerate(all_turns, start=1):
         user_markers.append(user_marker)
         assistant_tokens.append(assistant_token)
+
+        if mock_llm_server_url is not None:
+            # Reset before each turn so only THIS turn's queue is active.
+            # Without this, the openai-agents harness accumulates conversation
+            # history, making previous user markers appear in later requests —
+            # causing the earlier (now empty) queue to match first via
+            # insertion-order tie-breaking and return no response.
+            reset_mock_llm(mock_llm_server_url)
+            configure_mock_llm(
+                mock_llm_server_url,
+                [{"text": assistant_token}],
+                key=user_marker,
+                match=user_marker,
+            )
 
         _send(page, _turn_prompt(index, user_marker, assistant_token))
         # The echoed token in an assistant bubble = the turn produced its
@@ -272,10 +307,16 @@ def _run_render_parity_journey(
 def test_custom_agent_message_render_parity(
     page: Page,
     custom_agent_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     base_url, session_id = custom_agent_session
     _run_render_parity_journey(
-        page, base_url, session_id, per_turn_timeout_ms=_CUSTOM_TURN_TIMEOUT_MS
+        page,
+        base_url,
+        session_id,
+        per_turn_timeout_ms=_CUSTOM_TURN_TIMEOUT_MS,
+        mock_llm_server_url=mock_llm_server_url,
+        mock_model=_ECHO_PROBE_MODEL,
     )
 
 

@@ -24,6 +24,25 @@ def test_pi_harnesses_gate_on_pi_cli(harness: str, monkeypatch: pytest.MonkeyPat
     assert hr.harness_is_configured(harness) is True
 
 
+@pytest.mark.parametrize("harness", ["kiro-native", "native-kiro"])
+def test_kiro_native_harnesses_gate_on_kiro_cli(
+    harness: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native Kiro is gated on the ``kiro-cli`` binary being installed."""
+    calls: list[str] = []
+
+    def _installed(key: str) -> bool:
+        calls.append(key)
+        return False
+
+    monkeypatch.setattr(hr, "harness_cli_installed", _installed)
+    assert hr.harness_is_configured(harness) is False
+    assert calls[-1] == hr.KIRO_KEY
+
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key: True)
+    assert hr.harness_is_configured(harness) is True
+
+
 def test_sdk_and_unknown_harnesses_still_fail_open(monkeypatch: pytest.MonkeyPatch) -> None:
     """SDK and unknown harnesses are never gated, even with no CLI installed.
 
@@ -47,3 +66,11 @@ def test_configured_harness_map_exposes_pi_native(monkeypatch: pytest.MonkeyPatc
     cmap = hr.configured_harness_map()
     assert cmap.get("pi-native") is False
     assert cmap.get("pi") is False
+
+
+def test_configured_harness_map_exposes_kiro_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The readiness map carries Kiro native keys for the web picker lookup."""
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key: False)
+    cmap = hr.configured_harness_map()
+    assert cmap.get("kiro-native") is False
+    assert cmap.get("native-kiro") is False

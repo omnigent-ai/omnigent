@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from omnigent.onboarding import harness_install as hi
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 
 @pytest.mark.parametrize(
@@ -16,6 +16,7 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
         (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
+        (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
@@ -29,6 +30,53 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert spec.binary == binary
     assert spec.package == package
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
+
+
+def test_kimi_install_spec_is_login_only_no_npm() -> None:
+    """Kimi ships via a curl installer (no npm package) and authenticates
+    through its own ``kimi login`` (OAuth or Moonshot API key), so it carries
+    an ``install_hint`` instead of a ``package`` and intentionally has no
+    ``status_args`` (no exit-code "am I logged in?" probe to read).
+    """
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None
+    assert spec.binary == "kimi"
+    assert spec.package is None
+    assert spec.install_hint is not None and "code.kimi.com" in spec.install_hint
+    assert spec.login_args == ("login",)
+    assert spec.logout_args == ("logout",)
+    assert spec.status_args is None
+
+
+def test_kimi_required_cli_returns_install_spec() -> None:
+    """The kimi harness is binary-gated: it cannot launch without ``kimi`` on
+    PATH, so the sub-agent dispatch preflight must surface the install spec."""
+    spec = hi.required_cli_for_harness("kimi")
+    assert spec is not None
+    assert spec.binary == "kimi"
+
+
+def test_kimi_only_upstream_binary_satisfies_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only ``kimi`` (the upstream MoonshotAI/Kimi-Code binary) counts as
+    installed. The legacy pypi ``kimi-cli`` package is intentionally NOT
+    accepted — its command-line surface is incompatible with what the
+    executor drives, so falsely reading it as configured would crash at
+    the first turn."""
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: "/Users/x/.local/bin/kimi-cli" if name == "kimi-cli" else None,
+    )
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is False
+
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: "/Users/x/.kimi-code/bin/kimi" if name == "kimi" else None,
+    )
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -50,15 +98,62 @@ def test_cursor_install_spec_is_login_only_no_npm() -> None:
     assert spec.login_status_key == "isAuthenticated"
 
 
+def test_kiro_install_spec_is_manual_installer_no_npm() -> None:
+    """Kiro ships as a standalone native installer, not an npm package."""
+    spec = hi.harness_install_spec(hi.KIRO_KEY)
+    assert spec is not None
+    assert spec.display == "Kiro"
+    assert spec.binary == "kiro-cli"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://cli.kiro.dev/install | bash"
+
+
+def test_antigravity_install_spec_status_only_no_npm() -> None:
+    """Antigravity (agy) ships via a shell installer (no npm) and has no login
+    subcommand — the user signs in by launching ``agy`` once. It DOES expose a
+    status check (``agy models``), so the spec carries ``status_args`` +
+    ``install_hint`` but no ``package`` / ``login_args`` / ``logout_args``.
+
+    Drift here (a package sneaking in, or losing ``status_args``) would make the
+    setup menu offer a bogus ``npm install`` or fall back to a file-only login
+    check that can't see server-side revocation.
+    """
+    spec = hi.harness_install_spec(GEMINI_FAMILY)
+    assert spec is not None
+    assert spec.binary == "agy"
+    assert spec.package is None
+    assert spec.install_hint is not None
+    assert "antigravity.google/cli/install.sh" in spec.install_hint
+    assert spec.status_args == ("models",)
+    assert spec.login_args is None
+    assert spec.logout_args is None
+    assert spec.login_status_key is None
+    assert spec.auth_hint is not None
+
+
+def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
+    """A not-yet-signed-in agy can't be fixed by ``agy login`` (no such
+    command), so the launch hint names the installer AND the "run agy to sign
+    in" step — otherwise a user who already has agy installed gets a misleading
+    install-only hint.
+    """
+    hint = hi.harness_setup_hint("antigravity-native")
+    assert "antigravity.google/cli/install.sh" in hint
+    assert "agy" in hint
+    assert "sign" in hint.lower()
+
+
 def test_install_command_rejects_non_npm_harness() -> None:
-    """A non-npm harness (cursor) has no npm install command; asking for one is
+    """A non-npm harness has no npm install command; asking for one is
     a loud error so the caller shows its ``install_hint`` instead."""
     with pytest.raises(ValueError):
         hi.harness_install_command(hi.CURSOR_KEY)
+    with pytest.raises(ValueError):
+        hi.harness_install_command(hi.KIRO_KEY)
 
 
 def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``install_harness_cli`` never shells npm for a non-npm CLI (cursor).
+    """``install_harness_cli`` never shells npm for a non-npm CLI.
 
     It returns ``False`` without spawning anything, so the menu falls back to
     the manual ``install_hint`` rather than running a bogus npm command.
@@ -70,6 +165,7 @@ def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
     assert hi.install_harness_cli(hi.CURSOR_KEY) is False
+    assert hi.install_harness_cli(hi.KIRO_KEY) is False
 
 
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
@@ -89,6 +185,8 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         # ``cursor`` harness, which needs no binary — see the test below).
         ("cursor-native", "cursor-agent"),
         ("native-cursor", "cursor-agent"),
+        ("kiro-native", "kiro-cli"),
+        ("native-kiro", "kiro-cli"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
@@ -116,6 +214,15 @@ def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -
     assert "cursor-agent" in hint
     assert "cursor.com/install" in hint
     assert "cursor-agent login" in hint
+    assert "omnigent setup" not in hint
+
+
+@pytest.mark.parametrize("harness", ["kiro-native", "native-kiro"])
+def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> None:
+    """Native Kiro's missing-binary hint names Kiro's installer, not setup."""
+    hint = hi.harness_setup_hint(harness)
+    assert "kiro-cli" in hint
+    assert "cli.kiro.dev/install" in hint
     assert "omnigent setup" not in hint
 
 
@@ -522,6 +629,42 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_logged_in(hi.CURSOR_KEY) is expected
+
+
+@pytest.mark.parametrize(
+    "stdout,returncode,expected",
+    [
+        # ``agy models`` lists models (exit 0) only when signed in.
+        ("Gemini 3.5 Flash (Medium)\nGemini 3.1 Pro (High)\n", 0, True),
+        ("Error: Please sign in to view available models.", 1, False),
+        # Exit code is authoritative for agy (no ``login_status_key``): stdout
+        # that happens to be a JSON object with ``loggedIn`` must NOT override
+        # it, so an exit-0 run still reads as signed in.
+        ('{"loggedIn": false}', 0, True),
+        # Empty stdout (e.g. the list went to stderr) → exit code decides.
+        ("", 0, True),
+        ("", 1, False),
+    ],
+)
+def test_harness_cli_logged_in_agy_uses_exit_code(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, expected: bool
+) -> None:
+    """Antigravity's ``agy models`` is non-JSON, so the exit code is the verdict.
+
+    ``agy`` has no ``login status`` subcommand; ``agy models`` exits 0 only when
+    signed in (else exits non-zero with "Please sign in"). A regression would
+    misread agy login state in the setup menu's ✓/✗ marker.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object):
+        assert argv == ["agy", "models"]  # the status subcommand
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_logged_in(GEMINI_FAMILY) is expected
 
 
 def test_harness_cli_logged_in_false_when_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

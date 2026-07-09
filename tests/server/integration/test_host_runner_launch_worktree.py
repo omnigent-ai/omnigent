@@ -245,14 +245,15 @@ async def _launch(
     client: httpx.AsyncClient,
     session_id: str,
     *,
-    git: dict[str, str] | None = None,
+    git: dict[str, object] | None = None,
 ) -> httpx.Response:
     """POST the dedicated per-session bind+launch endpoint.
 
     :param client: The test HTTP client.
     :param session_id: Existing session to bind.
-    :param git: Optional ``git`` block, e.g.
-        ``{"branch_name": "feature/x"}``.
+    :param git: Optional ``git`` block. Create mode, e.g.
+        ``{"branch_name": "feature/x"}``; bind mode, e.g.
+        ``{"branch_name": "feature/x", "existing_worktree": True}``.
     :returns: The raw HTTP response.
     """
     body: dict[str, object] = {"session_id": session_id, "workspace": _SOURCE_REPO}
@@ -326,6 +327,36 @@ async def test_launch_runner_without_git_binds_source_dir_no_worktree(
     assert conv is not None
     assert conv.workspace == _SOURCE_REPO
     assert conv.git_branch is None
+    assert conv.host_id == _HOST_ID
+
+
+async def test_launch_runner_with_existing_worktree_persists_without_creating(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``git.existing_worktree`` binds the existing worktree dir and records
+    its branch without creating a worktree (the existing-worktree resume path).
+
+    The workspace is already a worktree, so no ``host.create_worktree``
+    frame is sent; ``branch_name`` is persisted as ``git_branch`` so the
+    sidebar shows it and the opt-in delete flow can offer to remove it.
+    """
+    cap = register_host()
+    session_id = await _bare_session(client, "existing-wt-agent")
+
+    resp = await _launch(
+        client,
+        session_id,
+        git={"branch_name": "feature/existing", "existing_worktree": True},
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert cap.create == [], "no worktree should be created for an existing worktree"
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == _SOURCE_REPO
+    assert conv.git_branch == "feature/existing"
     assert conv.host_id == _HOST_ID
 
 

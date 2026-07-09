@@ -45,7 +45,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_body,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+from omnigent.runner.transports.ws_tunnel.limits import (
+    RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -295,6 +299,7 @@ async def serve_tunnel(
             await _serve_tunnel_once(
                 app,
                 tunnel_url=tunnel_url,
+                server_url=server_url,
                 runner_id=runner_id,
                 runner_version=runner_version,
                 auth_token=auth_token,
@@ -494,6 +499,7 @@ async def _serve_tunnel_once(
     app: _ASGIApp,
     *,
     tunnel_url: str,
+    server_url: str,
     runner_id: str,
     runner_version: str,
     auth_token: str | None = None,
@@ -505,6 +511,10 @@ async def _serve_tunnel_once(
     :param app: Runner ASGI application.
     :param tunnel_url: WebSocket URL to connect to, e.g.
         ``"ws://127.0.0.1:6767/v1/runners/runner_abc/tunnel"``.
+    :param server_url: HTTP(S) server base URL the tunnel belongs to,
+        e.g. ``"https://example.databricks.com/api/2.0/omnigent"``. Used
+        to look up the workspace-routing header (keyed by server URL, not
+        the ws tunnel URL).
     :param runner_id: Stable runner id, e.g. ``"runner_abc"``.
     :param runner_version: Runner version string for the hello
         frame, e.g. ``"0.1.0"``.
@@ -525,9 +535,13 @@ async def _serve_tunnel_once(
     # guard (CSWSH protection) allows the handshake — this runner is not a
     # browser and would otherwise rely on the permissive missing-origin
     # branch.
+    # Pair the bearer with the workspace-routing header: the handshake must
+    # name the workspace or it routes to the account. Both empty for
+    # single-workspace hosts / local unauthenticated runs.
+    from omnigent.cli_auth import databricks_request_headers
+
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
+    headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
     async with websockets.connect(
@@ -535,6 +549,11 @@ async def _serve_tunnel_once(
         additional_headers=headers,
         close_timeout=_RUNNER_TUNNEL_CLOSE_TIMEOUT_S,
         max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        # Protocol keepalive aligned to the server's 90 s app-level budget (not the
+        # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
+        # Also the runner's only liveness probe for a silently-dead server.
+        ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+        ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     ) as ws:
         await _send_hello(ws.send, runner_version)
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)

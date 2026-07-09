@@ -76,6 +76,8 @@ from tests.e2e._native_resume_helpers import (
     inject_user_message,
     omnigent_console_script,
     poll_for_assistant_marker,
+    poll_for_pending_elicitation,
+    resolve_elicitation,
     spawn_cli_background,
     wait_for_conversation_id,
     wait_for_terminal_ready,
@@ -113,6 +115,10 @@ _REPLY_TIMEOUT = 180.0
 _COLD_RESUME_HINT = (
     "Terminal not running - starting a fresh Cursor session (prior chat not restored)."
 )
+
+# A per-tool approval prompt surfaces only after cursor cold-starts, runs a
+# turn, and reaches the tool call — give it the same headroom as a reply.
+_ELICITATION_TIMEOUT = 150.0
 
 
 def _write_json_line(stdin, payload: dict[str, object]) -> None:
@@ -573,3 +579,205 @@ def test_cursor_native_cli_mcp_can_call_sys_tool(
                     proc.wait(timeout=5.0)
     finally:
         handle.terminate()
+
+
+def _poll_for_file_marker(path: Path, *, marker: str, timeout: float) -> None:
+    """Poll until *path* contains *marker* (proves the approved command ran)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if marker in path.read_text(encoding="utf-8"):
+                return
+        except OSError:
+            pass
+        time.sleep(0.5)
+    raise AssertionError(
+        f"approved command did not produce {marker!r} in {path} within {timeout}s — "
+        "accepting the web elicitation did not drive the cursor TUI to run the command."
+    )
+
+
+def test_cursor_native_cli_tool_approval_surfaced_as_elicitation(
+    resume_test_server: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A cursor-native tool-approval prompt surfaces as a web elicitation card.
+
+    Unlike the other tests in this module, this launches ``omnigent cursor``
+    **without** the ``-f`` force/trust flag, so ``cursor-agent`` shows its own
+    per-tool approval prompt (the Workspace Trust gate is still auto-dismissed
+    by the inject path's ``_settle_pane``). It then injects (via the server,
+    the web-UI path) a request to run a shell command cursor cannot auto-run —
+    a redirect, which the Cursor backend never auto-approves — and asserts the
+    runner-side TUI-mirror:
+
+    1. the native prompt is surfaced to the web UI as a
+       ``response.elicitation_request`` (it appears in
+       ``SessionResponse.pending_elicitations``), and
+    2. accepting it from the web (``type == "approval"``) drives the cursor TUI
+       to actually run the command — the marker file appears in the launch cwd.
+
+    Without the runner-side TUI-mirror this fails at step 1: cursor blocks on
+    its in-terminal prompt and nothing is ever published. This is the
+    cursor-native analog of the codex MCP-elicitation web mirror.
+
+    :param resume_test_server: Base URL of the allow-list-free test server.
+    :param tmp_path: Per-test temp dir; its ``pwd`` subdir is the launch cwd.
+    :param request: Pytest request — reads ``--profile`` for the test server.
+    """
+    profile = request.config.getoption("--profile")
+    assert profile, "this test requires --profile (e.g. --profile oss) for the test server"
+
+    pwd_dir = tmp_path / "pwd"
+    pwd_dir.mkdir()
+    marker = f"CURSOR_APPROVE_{uuid.uuid4().hex[:8].upper()}"
+    result_file = pwd_dir / "result.txt"
+
+    omni = str(omnigent_console_script())
+    # No _FORCE_FLAG: we WANT cursor's native per-tool approval prompt so the
+    # runner-side TUI-mirror can surface it as a web elicitation.
+    handle = spawn_cli_background(
+        [omni, "cursor", "--server", resume_test_server],
+        env=cli_env(profile=profile),
+        cwd=str(pwd_dir),
+    )
+    try:
+        conversation_id = wait_for_conversation_id(handle, timeout=_CONV_ID_TIMEOUT)
+        with httpx.Client(base_url=resume_test_server, timeout=30) as client:
+            wait_for_terminal_ready(
+                client,
+                conversation_id=conversation_id,
+                harness="cursor",
+                timeout=_TERMINAL_READY_TIMEOUT,
+            )
+            inject_user_message(
+                client,
+                conversation_id=conversation_id,
+                text=(
+                    "Run exactly this shell command and nothing else, do not "
+                    f"explain: echo {marker} > result.txt"
+                ),
+            )
+            elicitation = poll_for_pending_elicitation(
+                client,
+                conversation_id=conversation_id,
+                timeout=_ELICITATION_TIMEOUT,
+            )
+            params = elicitation.get("params") or {}
+            assert isinstance(params, dict) and params.get("message"), (
+                f"surfaced elicitation has no message to render: {elicitation!r}"
+            )
+            elicitation_id = elicitation.get("elicitation_id")
+            assert isinstance(elicitation_id, str) and elicitation_id, (
+                f"surfaced elicitation is missing an elicitation_id: {elicitation!r}"
+            )
+            resolve_elicitation(
+                client,
+                conversation_id=conversation_id,
+                elicitation_id=elicitation_id,
+                action="accept",
+            )
+            try:
+                _poll_for_file_marker(result_file, marker=marker, timeout=_REPLY_TIMEOUT)
+            except AssertionError as exc:
+                raise AssertionError(
+                    f"{exc}\n\nCLI output tail:\n{handle.output()[-2000:]}"
+                ) from exc
+    finally:
+        handle.terminate()
+
+
+def _items_text(client: httpx.Client, conversation_id: str) -> str:
+    """Return the concatenated text of every item in a conversation (``""`` on error)."""
+    resp = client.get(
+        f"/v1/sessions/{conversation_id}/items", params={"limit": 100, "order": "asc"}
+    )
+    if resp.status_code != 200:
+        return ""
+    parts: list[str] = []
+    for item in resp.json().get("data", []):
+        content = item.get("content")
+        if isinstance(content, list):
+            parts.extend(b.get("text", "") for b in content if isinstance(b, dict))
+        elif isinstance(content, str):
+            parts.append(content)
+    return " ".join(parts)
+
+
+def test_cursor_native_cli_same_cwd_launch_does_not_duplicate(
+    resume_test_server: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A second cursor-native launch in the same cwd does not duplicate the chat.
+
+    cursor keeps one chat per working directory, so two ``omnigent cursor``
+    launches from the same dir discover the SAME chat store. The forwarder's
+    per-chat claim must let only ONE session (the earlier-launched one) mirror
+    it; the later session yields. A marker injected into the FIRST session must
+    therefore surface in its transcript but NEVER in the second's — without the
+    claim, both forwarders mirror the one shared chat and the second session is
+    a duplicate of the first. The e2e guard for the duplicate-session bug.
+
+    :param resume_test_server: Base URL of the allow-list-free test server.
+    :param tmp_path: Per-test temp dir; its ``pwd`` subdir is the shared cwd.
+    :param request: Pytest request — reads ``--profile`` for the test server.
+    """
+    profile = request.config.getoption("--profile")
+    assert profile, "this test requires --profile (e.g. --profile oss) for the test server"
+
+    pwd_dir = tmp_path / "pwd"
+    pwd_dir.mkdir()
+    marker = f"DEDUP_{uuid.uuid4().hex[:8].upper()}"
+
+    omni = str(omnigent_console_script())
+    base = [omni, "cursor", "--server", resume_test_server, _FORCE_FLAG]
+    first = spawn_cli_background(base, env=cli_env(profile=profile), cwd=str(pwd_dir))
+    second: PtyHandle | None = None
+    try:
+        conv1 = wait_for_conversation_id(first, timeout=_CONV_ID_TIMEOUT)
+        with httpx.Client(base_url=resume_test_server, timeout=30) as client:
+            wait_for_terminal_ready(
+                client, conversation_id=conv1, harness="cursor", timeout=_TERMINAL_READY_TIMEOUT
+            )
+            # Second launch in the SAME cwd → a distinct conversation, same chat.
+            second = spawn_cli_background(base, env=cli_env(profile=profile), cwd=str(pwd_dir))
+            conv2 = wait_for_conversation_id(second, timeout=_CONV_ID_TIMEOUT)
+            assert conv2 != conv1, "second launch reused the first conversation id"
+            wait_for_terminal_ready(
+                client, conversation_id=conv2, harness="cursor", timeout=_TERMINAL_READY_TIMEOUT
+            )
+
+            inject_user_message(
+                client,
+                conversation_id=conv1,
+                text=f"Reply with ONLY this exact word and nothing else: {marker}",
+            )
+
+            # The marker must reach the FIRST session's transcript (mirroring works)…
+            deadline = time.monotonic() + _REPLY_TIMEOUT
+            while time.monotonic() < deadline:
+                if marker in _items_text(client, conv1):
+                    break
+                time.sleep(2.0)
+            else:
+                raise AssertionError(
+                    f"marker {marker!r} never reached the first session {conv1}; the "
+                    f"forwarder did not mirror it.\n\nCLI tail:\n{first.output()[-1500:]}"
+                )
+
+            # …and must NEVER appear in the SECOND same-cwd session. Poll for a
+            # while so a wrongly-mirroring second forwarder has every chance to
+            # surface it before we conclude it correctly yielded.
+            for _ in range(10):
+                assert marker not in _items_text(client, conv2), (
+                    f"marker {marker!r} from session {conv1} also appeared in the "
+                    f"second same-cwd session {conv2} — both forwarders mirrored the "
+                    "one cursor chat (the duplicate-session bug)."
+                )
+                time.sleep(2.0)
+    finally:
+        if second is not None:
+            second.terminate()
+        first.terminate()

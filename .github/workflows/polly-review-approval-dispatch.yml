@@ -13,9 +13,8 @@ name: Polly Review Approval Dispatch
 # workflow_dispatch entry point) for that PR.
 #
 # Maintainer approval is the trust gate that authorizes spending the LLM gateway
-# secret on fork code -- the same model as the fork-e2e maintainer-approval gate.
-# Polly itself never runs PR code: it reviews the diff fetched via the API from
-# a default-branch checkout.
+# secret on fork code. Polly itself never runs PR code: it reviews the diff
+# fetched via the API from a default-branch checkout.
 #
 # This workflow checks out NO code and runs NO PR code -- it only reads API data
 # and dispatches a workflow, so it is not a "dangerous" workflow_run consumer.
@@ -43,7 +42,7 @@ jobs:
       actions: write        # dispatch polly-review.yml
     steps:
       - name: Download recorded PR number
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');
@@ -72,7 +71,7 @@ jobs:
             echo "No pr_number.zip from the triggering run; nothing to do."
           fi
       - name: Validate (fork + maintainer approval) and dispatch Polly
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');

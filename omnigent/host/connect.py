@@ -9,17 +9,21 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
+from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -32,6 +36,8 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListWorktreesFrame,
+    HostListWorktreesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -45,6 +51,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
+    list_worktrees,
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
@@ -66,6 +73,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.runner.transports.ws_tunnel.limits import (
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+    TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
+from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -113,6 +125,46 @@ _LOG_TAIL_MAX_LINES = 15
 # client's online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
+
+# Cadence of the orphan-reaper sweep. The host installs itself as a child
+# subreaper (Linux — see :func:`_install_child_subreaper`), so a harness's
+# detached tool subprocess (node/npm/chromium/tmux/python) whose runner
+# parent died reparents to the host. With no reaper such an orphan lingers
+# as a ``<defunct>`` zombie; over an overnight blocked run they reached
+# ~900 zombies and OOM'd the box (#1782). A ``WNOHANG`` sweep is a cheap
+# syscall, so 2s keeps zombie lifetime short at negligible cost.
+_ORPHAN_REAP_INTERVAL_S = 2.0
+
+
+def _install_child_subreaper() -> bool:
+    """Make this process reap orphaned descendants (Linux only).
+
+    ``prctl(PR_SET_CHILD_SUBREAPER, 1)`` asks the kernel to reparent any
+    orphaned descendant — e.g. a harness's detached tool subprocess whose
+    runner parent exited — to THIS process instead of PID 1, so the host's
+    orphan reaper can ``wait()`` on it even when the host is not itself
+    PID 1 (e.g. ``omni host --server`` launched under a shell). When the
+    host already IS PID 1 (container entrypoint) orphans reparent here
+    regardless and this call is a harmless no-op.
+
+    Complements — does not replace — the per-runner ``_watch_runner``
+    reaping of the host's own direct children.
+
+    :returns: ``True`` if the subreaper bit was set; ``False`` on non-Linux
+        or if ``prctl`` is unavailable. Both are non-fatal: direct-child
+        reaping and the PID-1 case still work; only the non-PID-1 orphan
+        case degrades.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        _PR_SET_CHILD_SUBREAPER = 36
+        return libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
 
 
 def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
@@ -230,6 +282,15 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # executor.profile propagated into the daemon's env).
         "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_CONFIG_FILE",
+        # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
+        # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
+        # Without it a runner falls back to the ~/.databrickscfg [__settings__]
+        # auth_storage default and can resolve a DIFFERENT token store than the
+        # host/daemon (which inherits it via the daemon env's DATABRICKS_ prefix
+        # in cli.py). That mismatch makes the runner read an empty/stale store
+        # and fail to mint a token — the runner tunnel is rejected with HTTP 401
+        # even though the host authenticated fine.
+        "DATABRICKS_AUTH_STORAGE",
         # Runtime config/data-dir selection. These are filesystem PATHS, not
         # secrets, so they're safe to propagate to the host owner's own
         # daemon/runner subprocesses. They MUST propagate so the whole local
@@ -279,19 +340,62 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
+        # Native-Claude launcher plugin selector: the entry-point NAME of a
+        # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
+        # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
+        # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
+        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # The daemon→runner env strip would otherwise drop it, leaving the
+        # runner on the default launch. Safe to propagate: not a secret, just a
+        # plugin name.
+        "OMNIGENT_CLAUDE_LAUNCHER",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",
+        # Claude Code's Bedrock-mode switch: a non-secret boolean flag that
+        # turns on AWS Bedrock / Bedrock-compatible gateway mode. The matching
+        # credential (AWS_BEARER_TOKEN_BEDROCK) and endpoint
+        # (ANTHROPIC_BEDROCK_BASE_URL) are NOT here: they are credentials and
+        # live in HARNESS_CREDENTIAL_ENV_VARS, mirroring ANTHROPIC_API_KEY /
+        # ANTHROPIC_BASE_URL. Safe to propagate: not a secret.
+        "CLAUDE_CODE_USE_BEDROCK",
+        # Claude Code's Bedrock-auth-skip switch: a non-secret boolean flag
+        # that disables AWS SigV4 auth so Claude Code can talk to a LiteLLM
+        # proxy fronting Bedrock. Without it the runner attempts native AWS
+        # auth, which fails for non-AWS proxies. Same rationale as
+        # CLAUDE_CODE_USE_BEDROCK above. Safe to propagate: not a secret.
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        # Kubernetes config path. A filesystem path (typically
+        # ``~/.kube/config``), not a bearer secret — the file *contains*
+        # cluster certs/tokens but the env var is just a path string,
+        # analogous to ``HOME``. Without it, ``kubectl`` / helm / k9s
+        # inside the agent's shell fall back to the default path which may
+        # not match what the host owner configured (e.g. a non-standard
+        # kubeconfig location or a colon-separated multi-file list).
+        "KUBECONFIG",
+        # Telemetry master opt-in. MUST propagate, or the daemon-spawned runner
+        # (and the harness it spawns) never see OMNIGENT_TELEMETRY_ENABLED, so
+        # telemetry.init() no-ops there and omni-runner / omni-harness export
+        # nothing — inheriting OTEL_* alone is no longer enough now that
+        # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
+        # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
+        "OMNIGENT_TELEMETRY_ENABLED",
     }
+    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
+    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
+    | set(WINDOWS_ENV_PASSTHROUGH)
 )
-# Locale family (``LC_ALL``, ``LC_CTYPE``, …) — allowed by prefix.
-_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")
+# Allowed by prefix: locale family (``LC_*``), MLflow, and OpenTelemetry config —
+# both the standard ``OTEL_*`` vars and Omnigent's ``OMNIGENT_OTEL_*`` knobs
+# (capture-content, FastAPI toggle) so they reach the runner/harness too.
+_RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "OMNIGENT_OTEL_")
 
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
 # ANTHROPIC_* for claude-sdk / pi (claude-code also honors
-# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways, and
-# CLAUDE_CODE_OAUTH_TOKEN for `claude setup-token` subscription auth),
+# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways,
+# AWS_BEARER_TOKEN_BEDROCK + ANTHROPIC_BEDROCK_BASE_URL for Bedrock mode,
+# and CLAUDE_CODE_OAUTH_TOKEN for `claude setup-token` subscription auth),
 # OPENAI_* for codex / openai-agents (CODEX_ACCESS_TOKEN is the codex
 # CLI's headless ChatGPT-workspace credential, minted in the ChatGPT
 # admin console — Business/Enterprise plans), GEMINI_API_KEY for the
@@ -304,11 +408,13 @@ _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_")
 # on a server-managed sandbox: the deployment's injected provider
 # secrets) — forwarding them is the intent, not a leak. Vars absent
 # from the host env are simply not set.
-HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
+_BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
     {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
@@ -317,6 +423,11 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GIT_TOKEN",
         "GIT_USERNAME",
     }
+)
+HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
+    name
+    for canonical in _BASE_HARNESS_CREDENTIAL_ENV_VARS
+    for name in env_names_with_omnigent_prefix(canonical)
 )
 
 # Comma-separated EXTRA env var names to forward host→runner, beyond
@@ -527,6 +638,202 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
+        # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
+        self._reaper_task: asyncio.Task[None] | None = None
+        # Number of host-owned ``subprocess`` operations (e.g. the git worktree
+        # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
+        # The orphan reaper skips its sweep while this is >0 so it never
+        # ``wait()``s a child that ``subprocess.run`` is about to reap itself —
+        # stealing it would corrupt that command's returncode to 0 (#1782).
+        # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
+        # because both the mutation and the reaper run on the event loop.
+        self._owned_subprocess_ops = 0
+
+    def _tracked_runner_pids(self) -> set[int]:
+        """PIDs of runners this host spawned and still tracks directly.
+
+        The orphan reaper must NOT ``wait()`` these: their exit status is
+        owned by their :class:`subprocess.Popen` (read via ``poll()`` /
+        ``.returncode`` for the ``host.runner_exited`` report). Reaping one
+        out from under ``Popen`` makes ``poll()`` either spin forever
+        (``while poll() is None`` in ``_watch_runner``) or report a bogus
+        exit 0 for a crash — so the reaper skips these and lets
+        ``_watch_runner`` / ``_handle_stop`` own them.
+
+        :returns: Set of live tracked runner OS pids.
+        """
+        return {h.proc.pid for h in self._runners.values()}
+
+    async def _orphan_reaper_loop(self) -> None:
+        """Reap orphaned descendant processes reparented to this host.
+
+        A harness spawns its tool subprocesses detached
+        (``start_new_session=True`` — ``omnigent.inner._proc.spawn_kwargs``),
+        so when the runner that owns them dies, those grandchildren
+        (``node`` / ``npm`` / ``chromium`` / ``tmux`` / ``python``) are
+        orphaned and reparented to this host (it is PID 1 in a container, or
+        a child subreaper otherwise — see :func:`_install_child_subreaper`).
+        Nothing ``wait()``s them, so each becomes a permanent ``<defunct>``
+        zombie; a blocked overnight run accumulated ~900 and OOM'd the box
+        (#1782).
+
+        This loop periodically reaps any ready-to-reap child that is NOT a
+        Popen-tracked runner (:meth:`_tracked_runner_pids`), draining zombies
+        without disturbing runner exit reporting. Non-Linux (no reparenting)
+        and the "no orphans yet" case both make this a cheap no-op sweep.
+
+        :returns: None. Runs until cancelled on shutdown.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_ORPHAN_REAP_INTERVAL_S)
+                self._reap_orphans_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a reaper must never die on a stray error
+                _logger.debug("orphan reaper sweep failed", exc_info=True)
+
+    def _reap_orphans_once(self) -> int:
+        """Reap ready orphaned children without corrupting runner exits.
+
+        The hazard: the host reads each runner's exit status through its
+        :class:`subprocess.Popen` (``poll()`` / ``.returncode``) for the
+        ``host.runner_exited`` report. A blind ``waitpid(-1)`` reaper that
+        consumes a just-crashed tracked runner makes ``Popen.poll()`` report
+        a bogus exit 0 (verified) — the crash cause is lost. So the reaper
+        must drain orphans while leaving tracked runners' status intact.
+
+        Two implementations, same guarantee:
+
+        * **Linux/POSIX with** ``os.waitid`` — *peek* at the next reapable
+          child with ``WNOWAIT`` (does not consume). Reap it only if it is
+          not a tracked runner; if it is, stop the sweep and let the runner's
+          own Popen reaper (``_watch_runner``) consume it. Cleanest: a tracked
+          runner's status is never touched.
+        * **Platforms without** ``os.waitid`` **(e.g. macOS)** — ``waitpid``
+          has no peek, so reap with ``WNOHANG`` and, if the reaped pid is a
+          tracked runner, re-inject its exit status onto the ``Popen`` so
+          ``_watch_runner`` still reports the true code. Safe because
+          ``_reap_orphans_once`` runs to completion on the event loop without
+          awaiting, so it cannot interleave with ``_watch_runner`` /
+          ``_handle_stop``.
+
+        This runs only when the host is PID 1 (container) or a child
+        subreaper (:func:`_install_child_subreaper`); otherwise no orphan
+        ever reparents here and every sweep is a no-op.
+
+        :returns: Count of orphan (non-runner) processes reaped this sweep.
+        """
+        if self._owned_subprocess_ops > 0:
+            # A host-owned subprocess (e.g. a git worktree command) is running
+            # in a worker thread. Its child is a DIRECT child of this process
+            # but NOT a tracked runner, so it is indistinguishable from an
+            # orphan to the reaper — reaping it would steal it from
+            # ``subprocess.run``'s own ``wait()`` and corrupt that command's
+            # returncode to 0 (CPython swallows the ECHILD and reports 0).
+            # Skip this sweep; a later one drains any real orphans once the op
+            # finishes. A worktree op can hold this off for up to
+            # ``_GIT_TIMEOUT_S`` (120s) per git command, so real orphans can
+            # linger that long in the rare case a runner dies mid-worktree-op —
+            # acceptable, since the leak this guards against accrues over hours,
+            # not a two-minute worst case.
+            return 0
+        if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
+            return self._reap_orphans_waitid()
+        return self._reap_orphans_waitpid()
+
+    @contextlib.contextmanager
+    def _host_subprocess_op(self) -> Iterator[None]:
+        """Mark a host-owned ``subprocess`` operation as in flight.
+
+        Wrap any host-owned :mod:`subprocess` call (or the ``to_thread`` that
+        runs it) in this so the orphan reaper pauses and cannot ``wait()`` the
+        child out from under ``subprocess``'s own reaping — see
+        :meth:`_reap_orphans_once` for why that would corrupt the command's
+        exit code (#1782).
+
+        Increment/decrement run on the event loop (the reaper does too), so a
+        plain counter needs no lock. Re-entrant and exception-safe: the
+        decrement is in a ``finally``.
+
+        :returns: A context manager; the body runs with the reaper paused.
+        """
+        self._owned_subprocess_ops += 1
+        try:
+            yield
+        finally:
+            self._owned_subprocess_ops -= 1
+
+    def _reap_orphans_waitid(self) -> int:
+        """Peek-and-reap using ``os.waitid(WNOWAIT)`` (Linux/POSIX).
+
+        :returns: Count of orphan processes reaped.
+        """
+        reaped = 0
+        tracked = self._tracked_runner_pids()
+        while True:
+            try:
+                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except (ChildProcessError, OSError):
+                break
+            if info is None:
+                break  # children exist but none ready to reap
+            pid = info.si_pid
+            if pid in tracked:
+                # Leave it for _watch_runner's Popen to reap+report. Break, not
+                # continue: WNOWAIT keeps returning the same head pid, so
+                # continuing would spin. The runner is reaped within ~0.5s and
+                # the next sweep proceeds past it.
+                break
+            try:
+                os.waitpid(pid, 0)  # consume the orphan
+                reaped += 1
+            except ChildProcessError:
+                break
+        if reaped:
+            _logger.debug("orphan reaper reaped %d process(es)", reaped)
+        return reaped
+
+    def _reap_orphans_waitpid(self) -> int:
+        """Reap with ``waitpid(WNOHANG)``, re-injecting tracked-runner status.
+
+        Fallback for platforms without ``os.waitid`` (no peek). See
+        :meth:`_reap_orphans_once` for why re-injection is race-free.
+
+        :returns: Count of orphan (non-runner) processes reaped.
+        """
+        reaped = 0
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                break
+            if pid == 0:
+                break  # children exist but none ready
+            handle = self._runner_handle_for_pid(pid)
+            if handle is not None:
+                # A tracked runner — do NOT count it as an orphan. Re-inject
+                # the status so its Popen (and thus _watch_runner) reports the
+                # true exit code instead of ECHILD → bogus 0.
+                if handle.proc.returncode is None:
+                    handle.proc.returncode = os.waitstatus_to_exitcode(status)
+                continue
+            reaped += 1
+        if reaped:
+            _logger.debug("orphan reaper reaped %d process(es)", reaped)
+        return reaped
+
+    def _runner_handle_for_pid(self, pid: int) -> _RunnerHandle | None:
+        """Return the tracked runner handle owning *pid*, or ``None``.
+
+        :param pid: An OS process id observed by the reaper.
+        :returns: The matching :class:`_RunnerHandle`, or ``None`` if *pid*
+            is not a tracked runner (i.e. an orphan to reap).
+        """
+        for handle in self._runners.values():
+            if handle.proc.pid == pid:
+                return handle
+        return None
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -677,6 +984,17 @@ class HostProcess:
                 "(the /v1/hosts tunnel route). Confirm you have access and that "
                 "the server is up to date, then retry. " + self._login_fix_hint()
             )
+        if status == 409:
+            return HostConnectError(
+                "Connection refused (HTTP 409): this machine is already "
+                "registered to a different account on this server, so the "
+                "account you authenticated as cannot claim it. This usually "
+                "means the host was first registered under another identity "
+                "(e.g. the single-user 'local' owner before the server "
+                "switched to accounts auth). Ask an administrator to remove "
+                "the existing host registration, or reset this machine's host "
+                "id, then retry. " + self._login_fix_hint()
+            )
         return HostConnectError(
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
@@ -737,10 +1055,18 @@ class HostProcess:
         try:
             log_dir = _runner_log_dir()
             log_dir.mkdir(parents=True, exist_ok=True)
+            # Embed the session id so operators can find all logs for a
+            # session with `omnigent debug logs --session <id>`. Cap at 32
+            # chars to keep filenames manageable; strip anything non-word to
+            # guard against unexpected id shapes from older servers.
+            import re
             import tempfile
 
+            _session_slug = (
+                re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
+            )
             _log_fd, _log_name = tempfile.mkstemp(
-                prefix="runner-",
+                prefix=f"runner-{_session_slug}",
                 suffix=".log",
                 dir=log_dir,
             )
@@ -791,9 +1117,11 @@ class HostProcess:
         # Print the exact runner log file (not just the dir): a foreground
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
+        session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
         print(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
-            f"    log: {_display_log_path(log_path)}",
+            f"    log: {_display_log_path(log_path)}"
+            f"{session_line}",
             flush=True,
         )
         return HostLaunchRunnerResultFrame(
@@ -1147,12 +1475,17 @@ class HostProcess:
             success, or ``status: "failed"`` with an error message.
         """
         try:
-            created = await asyncio.to_thread(
-                create_worktree,
-                repo_path=frame.repo_path,
-                branch_name=frame.branch_name,
-                base_branch=frame.base_branch,
-            )
+            # Pause the orphan reaper: create_worktree runs git via
+            # subprocess.run, whose children are direct children of this host
+            # but not tracked runners — the reaper must not wait() them out
+            # from under subprocess (#1782).
+            with self._host_subprocess_op():
+                created = await asyncio.to_thread(
+                    create_worktree,
+                    repo_path=frame.repo_path,
+                    branch_name=frame.branch_name,
+                    base_branch=frame.base_branch,
+                )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
                 request_id=frame.request_id,
@@ -1185,12 +1518,15 @@ class HostProcess:
             ``status: "failed"`` with an error message.
         """
         try:
-            await asyncio.to_thread(
-                remove_worktree,
-                worktree_path=frame.worktree_path,
-                branch=frame.branch,
-                delete_branch=frame.delete_branch,
-            )
+            # Pause the orphan reaper while remove_worktree runs git — see
+            # _handle_create_worktree above and _reap_orphans_once (#1782).
+            with self._host_subprocess_op():
+                await asyncio.to_thread(
+                    remove_worktree,
+                    worktree_path=frame.worktree_path,
+                    branch=frame.branch,
+                    delete_branch=frame.delete_branch,
+                )
         except WorktreeError as exc:
             return HostRemoveWorktreeResultFrame(
                 request_id=frame.request_id,
@@ -1208,6 +1544,47 @@ class HostProcess:
             status="ok",
         )
 
+    async def _handle_list_worktrees(
+        self,
+        frame: HostListWorktreesFrame,
+    ) -> HostListWorktreesResultFrame:
+        """Handle a ``host.list_worktrees`` request from the server.
+
+        Runs the blocking git work in a worker thread so the tunnel
+        loop keeps servicing pings.
+
+        :param frame: The list-worktrees request frame.
+        :returns: Result frame with the worktrees on success, or
+            ``status: "failed"`` with an error message.
+        """
+        try:
+            # Pause the orphan reaper while git runs — see
+            # _handle_create_worktree above and _reap_orphans_once.
+            with self._host_subprocess_op():
+                worktrees = await asyncio.to_thread(
+                    list_worktrees,
+                    repo_path=frame.repo_path,
+                )
+        except WorktreeError as exc:
+            return HostListWorktreesResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        return HostListWorktreesResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            worktrees=[
+                {
+                    "path": wt.path,
+                    "branch": wt.branch,
+                    "is_main": wt.is_main,
+                    "detached": wt.detached,
+                }
+                for wt in worktrees
+            ],
+        )
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -1217,6 +1594,15 @@ class HostProcess:
 
         :returns: None. Runs until the process is terminated.
         """
+        # Reap orphaned harness/tool grandchildren that reparent here when a
+        # runner dies (this host is PID 1 in a container, or a subreaper
+        # otherwise). Without this they pile up as <defunct> zombies and can
+        # OOM the box on a long-blocked run (#1782).
+        if _install_child_subreaper():
+            _logger.debug("installed PR_SET_CHILD_SUBREAPER; host will reap orphans")
+        self._reaper_task = asyncio.create_task(
+            self._orphan_reaper_loop(), name="host-orphan-reaper"
+        )
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -1288,7 +1674,14 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            if self._reaper_task is not None:
+                self._reaper_task.cancel()
+                self._reaper_task = None
             self._cleanup_runners()
+            # Final drain: _cleanup_runners has just reaped the tracked
+            # runners via Popen, so any of their still-orphaned tool
+            # grandchildren are now reapable and no tracked pid can be stolen.
+            self._reap_orphans_once()
 
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.
@@ -1321,6 +1714,12 @@ class HostProcess:
                 url,
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
+                # Align the host->server tunnel's protocol keepalive to the same
+                # 90 s app-level budget as the runner tunnel (not the 20 s library
+                # default that drops a busy-but-healthy tunnel with 1011 — #1116).
+                # Symmetric with serve.py's runner-side connect().
+                ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+                ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             )
             ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:
@@ -1374,6 +1773,12 @@ class HostProcess:
         # is not a browser. Seeded before either auth branch so it is sent
         # on both the managed-token and Bearer paths.
         headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        # Workspace routing: the tunnel handshake must name the workspace or
+        # it routes to the account. Empty for single-workspace and managed
+        # hosts (no recorded selector), so neither is affected.
+        from omnigent.cli_auth import databricks_request_headers
+
+        headers.update(databricks_request_headers(self._server_url))
 
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
@@ -1409,7 +1814,7 @@ class HostProcess:
             to the reconnect loop in :meth:`run`.
         """
         hello = HostHelloFrame(
-            version="0.1.0",
+            version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
@@ -1472,7 +1877,22 @@ class HostProcess:
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
             return
-        await self._dispatch_host_frame(ws, frame)
+        # Handle the frame inside a CONSUMER span parented on the trace
+        # context the server stamped into the frame envelope, so the
+        # host's work (and the result frame it sends back) nests under
+        # the server request that triggered it.
+        from omnigent.runtime import telemetry
+
+        try:
+            carrier = json.loads(raw)
+        except ValueError:
+            carrier = {}
+        if not isinstance(carrier, dict):
+            carrier = {}
+        raw_kind = carrier.get("kind")
+        kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
+        with telemetry.consume_frame_span(kind, carrier):
+            await self._dispatch_host_frame(ws, frame)
 
     async def _dispatch_host_frame(
         self,
@@ -1501,6 +1921,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
+        elif isinstance(frame, HostListWorktreesFrame):
+            await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
 
 
 def run_host_process(
@@ -1520,6 +1942,14 @@ def run_host_process(
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
+    # Initialize tracing so the host daemon exports its own spans
+    # (e.g. handling launch_runner / stat / list_dir frames) into the
+    # same distributed trace as the server that requested them. The
+    # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
+    from omnigent.runtime import telemetry
+
+    telemetry.init("omni-host")
+
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH

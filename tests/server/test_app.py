@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import httpx
@@ -34,15 +33,20 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_returns_installed_package_version(
+async def test_version_returns_source_of_truth_version(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /api/version returns the installed omnigent package version.
+    """GET /api/version returns ``omnigent.version.VERSION``.
 
-    Compares the endpoint response against ``importlib.metadata.version``
-    directly — confirms the handler forwards the real installed version
-    rather than a hard-coded string.
+    The endpoint surfaces the shared source-of-truth constant, authoritative
+    regardless of how the package was installed. We deliberately do NOT assert
+    against ``importlib.metadata.version`` here: that is a frozen build-time
+    snapshot which can legitimately differ from ``VERSION`` (stale editable
+    install, or ``"source"`` placeholder metadata) — asserting equality would
+    re-couple to exactly the metadata this change moved off of.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/api/version")
     assert resp.status_code == 200
     body = resp.json()
@@ -50,15 +54,16 @@ async def test_version_returns_installed_package_version(
     # "version" key must be present — a missing key means the UI's
     # fetchVersion() falls back to "unknown" in every bug report.
     assert "version" in body
-
-    expected = _pkg_version("omnigent")
-    # Exact match against the installed version — confirms the endpoint
-    # calls importlib.metadata.version("omnigent"), not a constant.
-    assert body["version"] == expected, (
-        f"Expected version {expected!r} from importlib.metadata, "
-        f"got {body['version']!r}. If the handler hard-codes a version, "
-        "bug reports will always show the wrong version string."
+    assert body["version"] == VERSION, (
+        f"Expected version {VERSION!r} from omnigent.version.VERSION, got {body['version']!r}."
     )
+
+
+def test_server_version_reads_version_constant() -> None:
+    """The server version is the shared ``omnigent.version.VERSION`` constant."""
+    from omnigent.version import VERSION
+
+    assert server_app._server_version() == VERSION
 
 
 class _StubWebSocket:
@@ -229,25 +234,55 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
     assert body["status"] == "ok"
     sessions = body["sessions"]
 
+    # host_version is None for every row here: the hosts are seeded in the
+    # host_store (DB) for the online gate but have no live tunnel in the
+    # in-memory host_registry, which is the only source of the version (the
+    # cross-replica / DB-only degradation path). The live-registry path is
+    # covered by test_health_reports_host_version_from_live_registry.
+    #
     # (a) Live runner tunnel ⇒ reachable. host_online None (no host_id).
     # A failure here means the strict _runner_up check stopped reading the
     # tunnel registry, or the registration path changed.
-    assert sessions[runner_up.id] == {"runner_online": True, "host_online": None}
+    assert sessions[runner_up.id] == {
+        "runner_online": True,
+        "host_online": None,
+        "host_version": None,
+    }
     # (b) Dead runner, live host: strict runner_online is False (no
     # host-relaunch optimism), but host_online surfaces the live host so
     # the open view can offer "send a message to wake the runner". A True
     # runner_online here would be the old conflated behavior regressing.
-    assert sessions[runner_down_host_up.id] == {"runner_online": False, "host_online": True}
+    assert sessions[runner_down_host_up.id] == {
+        "runner_online": False,
+        "host_online": True,
+        "host_version": None,
+    }
     # (c) Dead runner, offline host ⇒ both False.
-    assert sessions[runner_down_host_down.id] == {"runner_online": False, "host_online": False}
+    assert sessions[runner_down_host_down.id] == {
+        "runner_online": False,
+        "host_online": False,
+        "host_version": None,
+    }
     # (d) Dead runner, no host ⇒ runner_online False, host_online None.
-    assert sessions[runner_down_no_host.id] == {"runner_online": False, "host_online": None}
+    assert sessions[runner_down_no_host.id] == {
+        "runner_online": False,
+        "host_online": None,
+        "host_version": None,
+    }
     # Stopped + live host: NOT special-cased — reads exactly like (b). If
     # this regressed to False/True-with-stopped-collapse, the stopped marker
     # would still be leaking into liveness (it must not — WS-S2 retires it).
-    assert sessions[stopped.id] == {"runner_online": False, "host_online": True}
+    assert sessions[stopped.id] == {
+        "runner_online": False,
+        "host_online": True,
+        "host_version": None,
+    }
     # Unknown id (no conversation row) ⇒ reachable, no host.
-    assert sessions["conv_unknown"] == {"runner_online": True, "host_online": None}
+    assert sessions["conv_unknown"] == {
+        "runner_online": True,
+        "host_online": None,
+        "host_version": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -276,14 +311,82 @@ async def test_health_single_session_reports_both_liveness_fields(
 
     assert resp.status_code == 200
     body = resp.json()
-    # The single object echoes the id and both fields — strict runner_online
-    # False with host_online True. A missing host_online key would mean the
-    # single-id branch wasn't updated alongside the batch branch.
+    # The single object echoes the id and the liveness fields — strict
+    # runner_online False with host_online True. host_version is None: the
+    # host is online in the DB store but has no live tunnel in the in-memory
+    # registry the version is read from. A missing host_online/host_version
+    # key would mean the single-id branch wasn't updated with the batch one.
     assert body["session"] == {
         "id": conv.id,
         "runner_online": False,
         "host_online": True,
+        "host_version": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_health_reports_host_version_from_live_registry(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    ``GET /health`` surfaces the bound host's version when that host has a
+    live tunnel on this replica.
+
+    ``host_version`` is read from the in-memory host registry (the host's
+    ``host.hello`` frame), not the hosts table — so a session bound to a
+    host with a live local tunnel reports that host's version, which the
+    session info popover renders next to the server version. This is the
+    non-``None`` counterpart to the DB-only rows in the batch test.
+    """
+    from omnigent.host.frames import HostHelloFrame
+
+    wired = _build_liveness_app(db_uri, tmp_path)
+    app = wired.app
+    # host_live is already online in the host_store (DB) via the builder;
+    # registering it in the in-memory registry is what carries the version.
+    app.state.host_registry.register(
+        "host_live",
+        _StubWebSocket(),
+        HostHelloFrame(version="9.9.9-test", frame_protocol_version=1, name="laptop"),
+        "alice@example.com",
+    )
+    conv = wired.conversation_store.create_conversation(
+        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_id={conv.id}")
+
+    assert resp.status_code == 200
+    # host_online True (DB store) AND host_version from the live registry.
+    assert resp.json()["session"] == {
+        "id": conv.id,
+        "runner_online": False,
+        "host_online": True,
+        "host_version": "9.9.9-test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_info_includes_server_version(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/info`` includes ``server_version`` — the shared ``VERSION``
+    constant (same source as ``/api/version``) — so the web UI can show it
+    in the session info popover's version footer without a second fetch.
+    """
+    from omnigent.version import VERSION
+
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    body = resp.json()
+    # Matches the source-of-truth constant, not importlib.metadata: the latter
+    # is a frozen build-time snapshot that can drift from VERSION in a stale
+    # editable or "source"-placeholder install.
+    assert body["server_version"] == VERSION
 
 
 @pytest.mark.asyncio
@@ -498,6 +601,48 @@ def test_ensure_extra_builtin_agents_skips_bad_path_and_seeds_good(
     assert seed_stores.agent_store.get_by_name("does-not-exist") is None
 
 
+def test_ensure_default_qwen_agent_seeds_card(seed_stores: _SeedStores) -> None:
+    """
+    Seeding registers qwen-native-ui as a built-in the picker can render.
+
+    The new-session picker reads built-ins from ``GET /v1/agents``; without this
+    seeder Qwen Code only appears after the ``omnigent qwen`` CLI first registers
+    it, so it was absent from the Web UI dropdown.
+    """
+    server_app._ensure_default_qwen_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+    assert seeded is not None, "qwen-native-ui was not registered"
+    assert seeded.name == "qwen-native-ui"
+    # The bundle must be retrievable, not just referenced.
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_qwen_agent_is_idempotent(seed_stores: _SeedStores) -> None:
+    """A second seed call is a no-op — startup runs the seeder every boot."""
+    server_app._ensure_default_qwen_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    first = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+    assert first is not None
+    server_app._ensure_default_qwen_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    page = seed_stores.agent_store.list(limit=100)
+    qwen_rows = [a for a in page.data if a.name == "qwen-native-ui"]
+    assert len(qwen_rows) == 1
+    assert qwen_rows[0].id == first.id
+    assert qwen_rows[0].version == first.version == 1
+
+
 def test_ensure_default_polly_agent_seeds_card(seed_stores: _SeedStores) -> None:
     """
     Seeding registers polly as a built-in the picker can render.
@@ -517,6 +662,54 @@ def test_ensure_default_polly_agent_seeds_card(seed_stores: _SeedStores) -> None
     assert seeded.name == "polly"
     # The bundle must be retrievable, not just referenced.
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -> None:
+    """
+    Seeding registers antigravity-native-ui as a built-in the picker renders.
+
+    This is what makes "Antigravity" launchable from the web-UI new-session
+    picker next to Claude Code and Codex. The agent must be session-scope
+    NULL (a built-in) and carry the ``antigravity-native`` harness so the
+    runner boots the agy native terminal rather than an SDK harness.
+    """
+    server_app._ensure_default_antigravity_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME)
+    assert seeded is not None, "antigravity-native-ui was not registered"
+    assert seeded.name == "antigravity-native-ui"
+    # Built-ins are session-scope NULL so ``GET /v1/agents`` (which filters on
+    # ``session_id IS NULL``) returns them to the picker.
+    assert seeded.session_id is None
+    # The bundle must be retrievable, not just referenced.
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+    # The materialized spec must carry the native harness — the contract the
+    # server's _native_terminal_runtime + runner auto-create key off.
+    loaded = seed_stores.agent_cache.load(seeded.id, seeded.bundle_location, expand_env=False)
+    assert loaded.spec.executor.config.get("harness") == "antigravity-native"
+
+
+def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) -> None:
+    """
+    The startup seeder registers the antigravity built-in alongside the others.
+
+    ``_ensure_default_agents`` is the single call the server lifespan makes; a
+    regression that drops the antigravity line would silently remove it from the
+    picker even though its helper still works.
+    """
+    server_app._ensure_default_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    assert (
+        seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
+    )
 
 
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
@@ -799,3 +992,74 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     )
 
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
+
+
+def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """Build an app with the web UI bundle ABSENT (the API-only branch).
+
+    The dev checkout has a built ``static/web-ui`` (so ``create_app`` would
+    mount the SPA), so point ``_WEB_UI_DIST`` at an empty path to force the
+    API-only fallback branch under test.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    monkeypatch.setattr(server_app, "_WEB_UI_DIST", tmp_path / "no-web-ui")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_serves_html_200_to_any_client(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a no-web-UI server, ``GET /`` always returns the HTML explainer with a
+    200 — no content negotiation. A browser navigation and a plain JSON client
+    get the same page (``/`` is not used for anything else)."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for headers in ({"accept": "text/html"}, {"accept": "application/json"}):
+            resp = await c.get("/", headers=headers)
+            assert resp.status_code == 200, headers
+            assert resp.headers["content-type"].startswith("text/html"), headers
+            assert "web UI" in resp.text
+            assert "OMNIGENT_SKIP_WEB_UI" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_api_only_unknown_path_gets_json_404(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown path still returns the exact default ``404 {"detail": "Not
+    Found"}`` for every client — the landing is served only at ``/``, never as a
+    catch-all, so API consumers that parse that body are unaffected."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for headers in ({"accept": "text/html"}, {"accept": "application/json"}):
+            resp = await c.get("/c/conv_abc", headers=headers)
+            assert resp.status_code == 404, headers
+            assert resp.json() == {"detail": "Not Found"}, headers
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_does_not_shadow_real_routes(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``/`` landing is an exact-path route, so real routes like ``/health``
+    still serve their normal JSON even when the client prefers HTML."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/health", headers={"accept": "text/html"})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}

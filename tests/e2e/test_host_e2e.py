@@ -22,7 +22,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -32,6 +31,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,
     configure_mock_llm,
@@ -112,8 +112,13 @@ def _spawn_host_daemon(
     daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.host._daemon_entry", "--server", live_server],
-            env=env,
+            # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),
+            # else the test process's python. apply_runner_env drops the inherited
+            # worktree PYTHONPATH in that mode; the old host launches old runners
+            # (colocated) from its own venv.
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
         )
@@ -700,8 +705,13 @@ def _spawn_host_daemon_for_mock_claude(
     daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.host._daemon_entry", "--server", live_server],
-            env=env,
+            # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),
+            # else the test process's python. apply_runner_env drops the inherited
+            # worktree PYTHONPATH in that mode; the old host launches old runners
+            # (colocated) from its own venv.
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
         )

@@ -2,21 +2,26 @@
 #
 # The agent accrues a risk score as it acts, and once the score crosses a
 # threshold, sensitive actions (sending mail, sharing files) flip from ALLOW to
-# ASK so a human has to approve them. Risk comes from two sources:
-#   * each web_search adds 10 points;
-#   * reading a doc whose result is tagged "Highly Confidential" / "RESTRICTED"
-#     adds 30 points (the label is read out of the tool result, so it works for
-#     any Google MCP server).
+# ASK so a human has to approve them.
+#
+# Risk comes from two independent sources — this demo drives the threshold using
+# the first one, which works with no special tool support:
+#   * each web_search adds 10 points (per-tool-call scoring via tool_points);
+#   * OPTIONALLY, reading a result annotated with a data-classification label
+#     adds points (sensitive_labels). This only fires if your MCP server tags
+#     its results with a classification field — many do not. It is shown here
+#     commented out; enable it and set the label values your server actually
+#     emits if you have one.
 #
 # The running score persists across turns via session_state, so a session that
-# has touched enough sensitive material stays gated.
+# has taken enough risky actions stays gated.
 #
 # Usage:
 #   export DATABRICKS_CONFIG_PROFILE=<your-profile>
 #   python -m omnigent tests/resources/examples/risk_score_agent.yaml \
 #       --prompt "Search the web for our competitors, then email a summary."
-#   # The web searches raise the score; the gmail_message_send is escalated to
-#   # ASK once the score reaches the threshold.
+#   # Five web searches raise the score to the threshold; the gmail_message_send
+#   # is then escalated to ASK.
 
 name: risk_score_agent
 prompt: |
@@ -49,13 +54,17 @@ policies:
     handler: omnigent.policies.builtins.risk_score.risk_score_policy
     factory_params:
       threshold: 50
-      # Each of these tool calls adds risk.
+      # Each of these tool calls adds risk. This is the portable path: it needs
+      # no special support from any tool, so the demo drives the threshold here
+      # (5 x 10 = 50).
       tool_points:
         web_search: 10
-      # Reading a result tagged with one of these classifications adds risk.
-      sensitive_labels:
-        "Highly Confidential": 30
-        RESTRICTED: 30
+      # OPTIONAL: score results that carry a data-classification label. Only
+      # uncomment this if your MCP server annotates results with a classification
+      # field, and set the label values it actually emits. (There is no portable,
+      # cross-server classification field, so this is left off by default.)
+      # sensitive_labels:
+      #   confidential: 30
       # Once the score reaches the threshold, these tools require approval.
       guarded_tools:
         - gmail_message_send

@@ -84,8 +84,11 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
 
 
 async def test_me_returns_null_user_without_auth(client: httpx.AsyncClient) -> None:
-    """Without auth, /v1/me returns user_id null."""
+    """Without auth, /v1/me returns user_id null and is_admin false."""
     resp = await client.get("/v1/me")
     assert resp.status_code == 200
     data = resp.json()
     assert data["user_id"] is None
+    # is_admin is always present (mode-agnostic admin signal) and false
+    # for an unauthenticated / no-permission-store caller.
+    assert data["is_admin"] is False

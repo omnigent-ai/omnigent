@@ -1,0 +1,73 @@
+{
+  "type": "CORTEX_STEP_TYPE_USER_INPUT",
+  "status": "CORTEX_STEP_STATUS_DONE",
+  "metadata": {
+    "createdAt": "2026-06-22T23:57:36.256051Z",
+    "source": "CORTEX_STEP_SOURCE_USER_EXPLICIT",
+    "executionId": "1df76a5f-0318-4c71-b31d-7e3b51a3d981",
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    },
+    "internalMetadata": {
+      "statusTransitions": [
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_DONE",
+          "timestamp": "2026-06-22T23:57:36.269569Z"
+        }
+      ]
+    }
+  },
+  "userInput": {
+    "items": [
+      {
+        "text": "Say hello in one short sentence."
+      }
+    ],
+    "userResponse": "Say hello in one short sentence.",
+    "activeUserState": {},
+    "userConfig": {
+      "plannerConfig": {
+        "conversational": {
+          "agenticMode": false
+        },
+        "customizationConfig": {
+          "customizationDiscoveryConfig": {
+            "skills": {
+              "inheritUser": true,
+              "skillsPaths": [
+                {
+                  "absolute": "/Users/bryanli/.gemini/antigravity-cli/skills"
+                },
+                {
+                  "absolute": "/Users/bryanli/.gemini/skills"
+                }
+              ]
+            }
+          },
+          "enableJsonHooks": true,
+          "workspacePaths": {}
+        },
+        "toolConfig": {
+          "runCommand": {
+            "autoCommandConfig": {
+              "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_OFF"
+            },
+            "enableTerminalSandbox": false
+          },
+          "notifyUser": {
+            "artifactReviewMode": "ARTIFACT_REVIEW_MODE_ALWAYS"
+          },
+          "permissionConfig": {
+            "enterpriseConfig": {
+              "enforceWorkspaceValidation": true
+            },
+            "effectiveGrants": {}
+          }
+        },
+        "planModel": "MODEL_PLACEHOLDER_M20",
+        "useAiCredits": false
+      }
+    }
+  }
+}

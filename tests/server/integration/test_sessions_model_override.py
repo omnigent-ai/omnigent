@@ -11,6 +11,7 @@ runner-path forwarding is verified here by stubbing
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -44,7 +45,7 @@ async def test_patch_model_override_round_trips_through_snapshot(
 ) -> None:
     """PATCH writes the column and ``GET`` returns the same value.
 
-    This is the contract the ap-web picker and the REPL's ``/model``
+    This is the contract the web picker and the REPL's ``/model``
     command depend on for cross-surface sync: writing through one
     surface must be visible to the other on the very next snapshot.
     """
@@ -75,7 +76,7 @@ async def test_patch_model_override_clear_alias_resets(
     """``model_override: "default"`` is the explicit clear alias.
 
     Mirrors the REPL's ``/model default | off | reset`` semantics so
-    that ap-web's "clear" path and the REPL converge on the same wire
+    that web's "clear" path and the REPL converge on the same wire
     representation.
     """
     agent = await create_test_agent(client)
@@ -235,6 +236,58 @@ async def test_create_session_rejects_malformed_model_override(
     )
     assert resp.status_code == 400, (
         f"model_override {bad_model!r} should 400, got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_create_session_with_reasoning_effort_persists(
+    client: httpx.AsyncClient,
+) -> None:
+    """Create-time ``reasoning_effort`` lands on the row and the snapshot.
+
+    This is the seam the web new-session model/effort picker relies on:
+    the value must be persisted before the runner fetches the session
+    snapshot (native Claude Code reads it as ``--effort`` at terminal
+    launch).
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "reasoning_effort": "high",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    # The create response itself must carry the effort — the runner's
+    # launch-config fetch consumes this exact snapshot shape.
+    assert created["reasoning_effort"] == "high"
+
+    get = await client.get(f"/v1/sessions/{created['id']}")
+    assert get.status_code == 200
+    assert get.json()["reasoning_effort"] == "high"
+
+
+async def test_create_session_rejects_invalid_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """Create-time ``reasoning_effort`` outside the effort vocabulary 400s.
+
+    Validated before any row exists so a bad value never creates an orphan
+    session, mirroring the ``model_override`` charset guard.
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "reasoning_effort": "turbo",
+        },
+    )
+    assert resp.status_code == 400, (
+        f"reasoning_effort 'turbo' should 400, got {resp.status_code}: {resp.text}"
     )
 
 
@@ -419,12 +472,69 @@ async def test_context_window_uses_effective_model(
     )
 
 
+async def test_context_window_override_bypasses_declared_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec-declared ``executor.context_window`` is bypassed by an override.
+
+    Anti-drift guarantee for the shared resolver: the ring and the runner's
+    compaction budget are now computed by the SAME
+    ``resolve_effective_context_window``, so a declared 1M window can't mask a
+    small override model. With no override the declared window wins (no catalog
+    lookup); with an override active the ring sizes against the override
+    model's real window instead. Before the shared resolver these two paths
+    drifted (PR #769).
+    """
+    from omnigent.llms import context_window as context_window_mod
+
+    lookup_calls: list[str] = []
+
+    def _stub(model: str) -> int:
+        lookup_calls.append(model)
+        return 200_000
+
+    monkeypatch.setattr(context_window_mod, "get_model_context_window", _stub)
+
+    agent = await create_test_agent(
+        client,
+        name="declared-window-agent",
+        executor={"type": "omnigent", "context_window": 1_000_000},
+    )
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    # No override: the declared 1M window wins and short-circuits the catalog.
+    lookup_calls.clear()
+    baseline = await client.get(f"/v1/sessions/{sid}")
+    assert baseline.status_code == 200
+    assert baseline.json()["context_window"] == 1_000_000
+    assert lookup_calls == [], (
+        f"A declared window must short-circuit the catalog lookup; got {lookup_calls!r}."
+    )
+
+    # Override active: the declared 1M is bypassed; the ring sizes against the
+    # override model's real (stubbed 200K) window.
+    await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": "claude-opus-4-7"},
+    )
+    lookup_calls.clear()
+    after = await client.get(f"/v1/sessions/{sid}")
+    assert after.status_code == 200
+    assert after.json()["context_window"] == 200_000, (
+        "An active override must bypass the declared 1M window and size the "
+        "ring against the override model's real window."
+    )
+    assert "claude-opus-4-7" in lookup_calls
+
+
 async def test_silent_patch_skips_claude_native_forward(
     client: httpx.AsyncClient,
 ) -> None:
     """``silent: true`` persists but doesn't inject ``/model`` into tmux.
 
-    Without this, the ap-web sticky-pref handoff on a fresh session
+    Without this, the web sticky-pref handoff on a fresh session
     would render a leading "Command model X" slash-command item
     before the user has sent anything — the bug a user reported.
 
@@ -571,4 +681,76 @@ async def test_per_event_model_override_wins_over_persisted(
     assert captured.get("body", {}).get("model_override") == "claude-sonnet-4-6", (
         f"Per-event model_override should win; runner body had "
         f"{captured.get('body', {}).get('model_override')!r}."
+    )
+
+
+async def test_smart_routing_overrides_orchestrator_model_for_child_session(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Smart routing wins over the orchestrator's model choice for child sessions.
+
+    When sys_session_send passes ``model`` for a child session, the server
+    creates the child with that as ``model_override``. Previously the routing
+    gate (``effective_runner_override is None``) would then skip the judge
+    call entirely, silently letting the LLM's choice beat smart routing.
+
+    Now, when the parent session has the routing toggle on, the judge runs
+    regardless — and the routing verdict replaces the orchestrator's model
+    in the runner body and in the persisted ``model_override``.
+    """
+    captured = _stub_runner_client(monkeypatch)
+
+    # Stub route_turn to return a deterministic verdict, bypassing the real LLM.
+    routed_model = "databricks-claude-haiku-4-5"
+
+    async def _fake_route_turn(*_: Any, **__: Any) -> tuple[str, dict[str, Any]]:
+        return routed_model, {"rationale": "trivial task — cheap model suffices"}
+
+    # Patch the module where route_turn is defined so the lazy import inside
+    # _forward_event_to_runner picks up the stub.
+    with patch("omnigent.server.smart_routing.route_turn", _fake_route_turn):
+        agent = await create_test_agent(client)
+
+        # Parent session with routing toggle on.
+        parent_resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+        )
+        assert parent_resp.status_code == 201, parent_resp.text
+        parent_id = parent_resp.json()["id"]
+
+        # Child session with a model the orchestrator chose (simulates
+        # sys_session_send with model="databricks-claude-opus-4-8").
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent_id,
+                "model_override": "databricks-claude-opus-4-8",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child_id = child_resp.json()["id"]
+
+        # First message to the child — routing should fire and override.
+        event_resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "what is 2+2?"}],
+                },
+            },
+        )
+        assert event_resp.status_code == 202, event_resp.text
+
+    assert captured.get("body") is not None, (
+        "Runner client was never POSTed to — _forward_event_to_runner did not run."
+    )
+    assert captured["body"].get("model_override") == routed_model, (
+        f"Smart routing should have replaced the orchestrator's model with "
+        f"{routed_model!r}; runner body had "
+        f"{captured['body'].get('model_override')!r}."
     )

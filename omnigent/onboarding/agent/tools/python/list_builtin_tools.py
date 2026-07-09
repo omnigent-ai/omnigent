@@ -19,6 +19,9 @@ from omnigent_client import tool
 _TOOL_CLASSES: dict[str, tuple[str, str]] = {
     "download_file": ("omnigent.tools.builtins.download_file", "DownloadFileTool"),
     "export_agent": ("omnigent.tools.builtins.export_agent", "ExportAgentTool"),
+    "hindsight_recall": ("omnigent.tools.builtins.hindsight", "HindsightRecallTool"),
+    "hindsight_reflect": ("omnigent.tools.builtins.hindsight", "HindsightReflectTool"),
+    "hindsight_retain": ("omnigent.tools.builtins.hindsight", "HindsightRetainTool"),
     "list_files": ("omnigent.tools.builtins.list_files", "ListFilesTool"),
     "search_conversations": (
         "omnigent.tools.builtins.search_conversations",

@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, model_validator
 
+from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Comment
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
@@ -149,6 +150,23 @@ def create_comments_router(
         raise ValueError("conversation_store is required when permission_store is provided")
     router = APIRouter()
 
+    async def _require_session_access(user_id: str | None, session_id: str, level: int) -> None:
+        """Require access and a real session before comment store mutations.
+
+        :param user_id: The authenticated caller, or the single-user sentinel.
+        :param session_id: The session to check, e.g. ``"conv_abc123"``.
+        :param level: Required permission level for auth-enabled servers.
+        :raises OmnigentError: 404 when the session does not exist, or the
+            auth helper's 401/403/404 when permission enforcement is active.
+        """
+        if permission_store is not None:
+            assert conversation_store is not None
+            await require_access(user_id, session_id, level, permission_store, conversation_store)
+        if conversation_store is not None:
+            conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conversation is None:
+                raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+
     async def _require_comment_author(
         user_id: str | None, comment_id: str, session_id: str
     ) -> None:
@@ -204,10 +222,7 @@ def create_comments_router(
         :raises OmnigentError: 401/403/404 if the user lacks edit permission.
         """
         user_id = get_user_id(request, auth_provider)
-        if permission_store is not None and conversation_store is not None:
-            await require_access(
-                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-            )
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
         comment = store.add(
             conversation_id=session_id,
             path=body.path,
@@ -242,10 +257,7 @@ def create_comments_router(
         :raises OmnigentError: 401/403/404 if the user lacks read permission.
         """
         user_id = get_user_id(request, auth_provider)
-        if permission_store is not None and conversation_store is not None:
-            await require_access(
-                user_id, session_id, LEVEL_READ, permission_store, conversation_store
-            )
+        await _require_session_access(user_id, session_id, LEVEL_READ)
         comments = store.list_for_conversation(session_id, path=path)
         return [asdict(c) for c in comments]
 
@@ -274,15 +286,25 @@ def create_comments_router(
             or 404 if the comment is not found.
         """
         user_id = get_user_id(request, auth_provider)
-        if permission_store is not None and conversation_store is not None:
-            await require_access(
-                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-            )
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        if permission_store is not None:
             # Rewriting comment text is author-only; a status-only change is a
             # shared review-workflow action that any editor (and the agent's
             # update_comment tool) may perform.
             if body.body is not None:
                 await _require_comment_author(user_id, comment_id, session_id)
+        # Validate the status only after existence/ownership checks, so a
+        # request targeting a comment the caller can't see still returns 404
+        # (not a 400 that would leak the comment's existence). The check keeps
+        # an unknown status out of the store, where the enum codec would raise
+        # into an opaque 500; the column is a closed enum (draft/addressed).
+        if body.status is not None and body.status not in COMMENT_STATUS:
+            if store.get(comment_id, session_id) is None:
+                raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+            raise OmnigentError(
+                f"invalid status {body.status!r}; must be one of {sorted(COMMENT_STATUS)}",
+                code=ErrorCode.INVALID_INPUT,
+            )
         comment = store.update_comment(comment_id, session_id, status=body.status, body=body.body)
         if comment is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
@@ -309,10 +331,8 @@ def create_comments_router(
             comment is not found or does not belong to this session.
         """
         user_id = get_user_id(request, auth_provider)
-        if permission_store is not None and conversation_store is not None:
-            await require_access(
-                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-            )
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        if permission_store is not None:
             await _require_comment_author(user_id, comment_id, session_id)
         deleted = store.delete(comment_id, session_id)
         if deleted is None:
@@ -344,10 +364,7 @@ def create_comments_router(
             this session.
         """
         user_id = get_user_id(request, auth_provider)
-        if permission_store is not None and conversation_store is not None:
-            await require_access(
-                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-            )
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
 
         # Fetch + mark-addressed for every requested comment runs N sync
         # DB gets + N sync updates. Do the whole batch in one worker-thread

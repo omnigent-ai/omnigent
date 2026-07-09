@@ -58,7 +58,7 @@ _E2E_PROMPT_POLICY_DIR = (
 _LABEL_GATE_EXTRA_CONFIG: dict = {
     "labels": {"tainted": "0"},
     "label_schema": {
-        "tainted": {"values": ["0", "1"], "monotonic": "max"},
+        "tainted": {"values": ["0", "1"]},
     },
     "policies": {
         "taint_on_banana": {
@@ -611,6 +611,11 @@ def test_prompt_policy_allow_path_reaches_llm(
     assert "[Denied by policy" not in text
 
 
+# Synchronous prompt-policy DENY (short-circuit, no queued item) is server-side
+# behavior that shipped after v0.2.0 — a v0.2.0 server returns {queued: True}
+# instead, so main's test fails against it (co-evolution, not a regression).
+# Skip against servers < 0.3.0; runs on main + the gate.
+@pytest.mark.min_server_version("0.3.0")
 def test_prompt_policy_deny_path_short_circuits(
     http_client: httpx.Client,
     live_runner_id: str,

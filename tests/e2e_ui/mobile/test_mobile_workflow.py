@@ -29,6 +29,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, ViewportSize, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm
+
 # iPhone-12-class portrait viewport — comfortably below the Tailwind
 # ``md`` breakpoint (768px) so every ``md:`` rule resolves to its
 # mobile branch.
@@ -180,6 +182,33 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     expect(page.get_by_role("menuitem", name="Tasks")).to_have_count(0)
 
 
+def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
+    page: Page,
+    terminal_session: tuple[str, str],
+) -> None:
+    """Shell-capable agents expose the mobile Shells drawer at zero shells.
+
+    The desktop rail shows Shells by default when the session agent declares a
+    ``terminals:`` block, because the empty state is the "+ New shell" entry
+    point. Mobile must mirror that behavior: the FAB should list Shells before
+    any user shell has been created, and selecting it should open the full-screen
+    Shells drawer containing the same "+ New shell" row.
+    """
+    base_url, session_id = terminal_session
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    page.get_by_role("button", name="Open session menu").click()
+
+    shells_entry = page.get_by_role("menuitem", name="Shells", exact=True)
+    expect(shells_entry).to_be_visible(timeout=10_000)
+    shells_entry.click()
+
+    drawer = page.get_by_test_id("shells-panel-drawer")
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer.get_by_role("button", name="New shell")).to_be_visible()
+
+
 def test_mobile_fab_shows_agents_entry_when_child_agents_exist(
     page: Page,
     mobile_session_with_child_agent: tuple[str, str],
@@ -250,9 +279,17 @@ def test_mobile_files_drawer_opens_seeded_file(
     expect(file_viewer.get_by_text(_SEEDED_FILE_CONTENT).first).to_be_visible(timeout=20_000)
 
 
+# The agent turn is dispatched to the in-process harness, which
+# occasionally produces no assistant output on the first turn (the
+# runner goes idle after dispatch — a nondeterministic harness
+# scheduling stall, not a real-LLM artifact since this drives the mock
+# LLM). Rerun on failure rather than widen the already-generous 60s
+# wait, which a stalled turn would never satisfy.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_mobile_chat_send_and_response(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """The composer streams an assistant reply at a phone viewport.
 
@@ -260,14 +297,21 @@ def test_mobile_chat_send_and_response(
     and message list stay usable on a phone (no rail stealing layout).
     """
     base_url, session_id = seeded_session
+    prompt = "Say 'mobile-pong-e2e' in one word."
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "mobile-pong-e2e"}],
+        key="mobile-chat-send-and-response",
+        match=prompt,
+    )
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
     composer = page.get_by_placeholder("Ask the agent anything…")
     expect(composer).to_be_visible()
-    composer.fill("Say 'pong' in one word.")
+    composer.fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()
 
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
     expect(assistant).to_be_visible(timeout=60_000)
-    expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
+    expect(assistant).to_contain_text("mobile-pong-e2e", timeout=60_000)

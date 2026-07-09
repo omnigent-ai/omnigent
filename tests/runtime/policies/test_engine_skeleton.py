@@ -291,7 +291,7 @@ def test_stores_label_defs_and_timeout(
     """Non-default `label_defs` and `ask_timeout` are held
     on the engine intact — later phases read these."""
     conv = conversation_store.create_conversation()
-    defs = {"integrity": LabelDef(initial="1", values=["0", "1"], monotonic="decreasing")}
+    defs = {"integrity": LabelDef(initial="1", values=["0", "1"])}
     eng = PolicyEngine(
         policies=[],
         label_defs=defs,

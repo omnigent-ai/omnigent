@@ -220,6 +220,45 @@ def load_databricks_org_id(server_url: str) -> str | None:
     return org_id if isinstance(org_id, str) and org_id else None
 
 
+# Workspace-routing header. When a Databricks host fronts many workspaces
+# under one hostname, the bare host is the account; the API proxy routes a
+# workspace request by this header (equivalently to the ``?o=`` query param).
+DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
+
+
+def databricks_request_headers(
+    server_url: str, *, bearer_token: str | None = None
+) -> dict[str, str]:
+    """Build the headers for a request to a Databricks-fronted server.
+
+    The single source of truth for server-request headers. It always
+    includes the :data:`DATABRICKS_ORG_ID_HEADER` workspace-routing header
+    when ``omnigent login https://<host>/?o=<id>`` recorded a selector, and
+    adds ``Authorization`` when a bearer is supplied. Folding both into one
+    builder makes routing travel with auth: a caller that has a token gets
+    routing for free, and a caller whose credential is set elsewhere (an
+    httpx ``Auth`` that mints per request, or the managed-host token header)
+    omits the token and still gets routing.
+
+    Both values are omitted when absent, so single-workspace and
+    local-unauthenticated callers get ``{}`` and are unaffected.
+
+    :param server_url: The server URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :param bearer_token: The workspace bearer token, or ``None`` when the
+        credential is supplied by a separate mechanism (or there is none).
+    :returns: A header dict carrying ``Authorization`` and/or
+        ``X-Databricks-Org-Id`` as available, possibly empty.
+    """
+    headers: dict[str, str] = {}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    org_id = load_databricks_org_id(server_url)
+    if org_id:
+        headers[DATABRICKS_ORG_ID_HEADER] = org_id
+    return headers
+
+
 def clear_token(server_url: str) -> None:
     """Remove a stored token for a server.
 
