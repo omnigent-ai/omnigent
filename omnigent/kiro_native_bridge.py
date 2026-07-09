@@ -17,7 +17,8 @@ from typing import Any
 KIRO_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_KIRO_NATIVE_BRIDGE_DIR"
 KIRO_ACP_RECORD_PATH_ENV_VAR = "KIRO_ACP_RECORD_PATH"
 
-_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "kiro-native"
+_USER_ID = os.getuid() if hasattr(os, "getuid") else os.getlogin()
+_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{_USER_ID}" / "kiro-native"
 _TMUX_FILE = "tmux.json"
 _FORWARDER_READY_FILE = "kiro_session_forwarder_ready.json"
 _ACP_RECORD_FILE = "kiro_acp_record.jsonl"
