@@ -61,6 +61,33 @@ stdout report drops the grid and prints only the legend + notes -- no duplicate
 table. When stdout is redirected to a file, the report keeps the full grid so
 the file is self-contained.
 
+### Example output
+
+A live `--rich` run of the four SDK harnesses on the `oss` profile:
+
+```console
+$ uv run --no-sync python -m tests.harness_bench --profile oss --rich \
+    --harness claude-sdk --harness codex --harness pi --harness openai-agents
+
+                              Harness capability matrix (live)
+┌───────────────────────────┬────────────┬───────────┬──────────────┬─────────────┬────────────────┬───────────┐
+│ Harness                   │ Basic turn │ Streaming │ Tool calling │ Policy DENY │ Model override │ Interrupt │
+├───────────────────────────┼────────────┼───────────┼──────────────┼─────────────┼────────────────┼───────────┤
+│ claude-sdk  [full-server] │     ✓      │     ✓     │      ✓       │     ✓       │       ✓        │     ✓     │
+│ codex       [full-server] │     ✓      │     ✓     │      ✓       │     ·       │       ✓        │     ✓     │
+│ pi          [full-server] │     ✓      │     ✓     │      ✓       │     ✓       │       ✓        │     ✓     │
+│ openai-agents [full-server] │   ✓      │     ✓     │      ✓       │     ✓       │       ✓        │     ✓     │
+└───────────────────────────┴────────────┴───────────┴──────────────┴─────────────┴────────────────┴───────────┘
+Legend: `✓` SUPPORTED · `~` PARTIAL · `✗` UNSUPPORTED · `—` NOT_APPLICABLE · `?` UNKNOWN · `·` SKIPPED · `!!` DRIFT
+
+Notes:
+- codex / Policy DENY: · model never attempted the tool; tool-call DENY path not exercised
+```
+
+The `·` in codex / Policy DENY is a clean SKIP, not a failure: the model simply
+never reached for the gated tool, so the deny path had nothing to block (see the
+Notes line). Every non-`✓` cell gets a matching Notes entry.
+
 ## Transport selection
 
 A profile's `transport` field is the harness *family* marker, not the literal
@@ -76,9 +103,22 @@ driver the run uses:
 
 ## What it reports (P0 dimensions)
 
-`basic_turn`, `streaming`, `tool_calling`, `interrupt`, `policy_deny`,
-`model_override`. Verdicts map to the support-matrix glyphs
-(`✓ ~ ✗ — ?`), plus `·` skipped and `!! DRIFT`.
+The six P0 dimensions are `basic_turn`, `streaming`, `tool_calling`,
+`policy_deny`, `model_override`, `interrupt`. Each probe drives one real turn
+and watches what the harness does:
+
+| Probe | In plain terms |
+| --- | --- |
+| **Basic turn** | Can it hold a conversation at all? Asks it to echo a marker and checks the marker comes back -- the "is it alive" test. |
+| **Streaming** | Does the answer arrive incrementally (word-by-word) or all at once at the end? Counts the token-level chunks. |
+| **Tool calling** | Can it use a tool (run a command, read a file) mid-answer, not just chat? |
+| **Policy DENY** | If a policy says "block that tool", does the harness actually enforce it? |
+| **Model override** | If you ask for a specific model, does it actually run that one? |
+| **Interrupt** | If you stop it mid-answer, does it actually stop? |
+
+Each cell is a verdict: **✓** works, **✗** doesn't, **·** couldn't be tested
+here (see below), **!!** the harness *declared* it works but the probe observed
+otherwise (drift).
 
 A `·` always means "the bench did not measure this here", never "the harness
 lacks it". In particular Tool calling and Policy DENY only get a real verdict
