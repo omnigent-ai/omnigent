@@ -2810,8 +2810,19 @@
         "type": "object"
       },
       "RoutingDecisionData": {
-        "description": "Data payload for an intelligent model-router decision item.\n\nEmitted by the runner's per-turn cost advisor at the START of an\nadvised turn (see `omnigent.runner.cost_advisor`) and persisted\nas a display-only transcript item so the model the router chose shows\nin the conversation flow the moment the turn begins. Listed in\n`NON_CONTENT_ITEM_TYPES` so the agent loop's history filter\nskips it \u2014 the brain never sees (or answers) its own router note. The\nrunner's harness-input builder also drops every non\nmessage/function_call type, a second guarantee it stays out of the\nmodel's context.",
+        "description": "Data payload for an intelligent model-router decision item.\n\nEmitted by the server-side smart routing path at the START of an\nadvised turn and persisted\nas a display-only transcript item so the model the router chose shows\nin the conversation flow the moment the turn begins. Listed in\n`NON_CONTENT_ITEM_TYPES` so the agent loop's history filter\nskips it \u2014 the brain never sees (or answers) its own router note. The\nrunner's harness-input builder also drops every non\nmessage/function_call type, a second guarantee it stays out of the\nmodel's context.",
         "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent"
+          },
           "applied": {
             "description": "`True` when the brain actually ran on `model` this turn (optimize mode, no user pin); `False` when the router only WOULD have picked it (advise/shadow mode, or a user model pin won) \u2014 the UI renders \"would have picked\".",
             "title": "Applied",
@@ -2826,21 +2837,10 @@
             "description": "The router's one-line explanation, shown as muted secondary text, e.g. `\"Multi-file refactor needs deep reasoning.\"`.",
             "title": "Rationale",
             "type": "string"
-          },
-          "tier": {
-            "description": "The difficulty tier the router assigned, one of `\"cheap\"` / `\"medium\"` / `\"expensive\"`, e.g. `\"expensive\"`.",
-            "enum": [
-              "cheap",
-              "medium",
-              "expensive"
-            ],
-            "title": "Tier",
-            "type": "string"
           }
         },
         "required": [
           "model",
-          "tier",
           "applied",
           "rationale"
         ],

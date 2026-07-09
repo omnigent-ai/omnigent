@@ -239,6 +239,12 @@ def _resolve_module_path(harness: str) -> str:
     module_path = _HARNESS_MODULES.get(harness)
     if module_path is not None:
         return module_path
+    # Generic-ACP ids (``acp:<slug>``) all resolve to the base ``acp`` module;
+    # the slug selecting the concrete agent is read from the spec at spawn.
+    if harness.startswith("acp:"):
+        acp_module = _HARNESS_MODULES.get("acp")
+        if acp_module is not None:
+            return acp_module
     package = missing_install_packages().get(harness)
     if package:
         raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")

@@ -598,7 +598,9 @@ def _assistant_row_has_tool_calls(tool_calls: object) -> bool:
     return isinstance(calls, list) and len(calls) > 0
 
 
-def _count_completed_turns(db_path: Path, hermes_session_id: str) -> int:
+def _count_completed_turns(
+    db_path: Path, hermes_session_id: str, max_id: int | None = None
+) -> int:
     """Count completed turns for *hermes_session_id* (0 on unreadable/empty).
 
     A completed turn is an ``assistant`` row with no ``tool_calls`` — the agentic
@@ -607,16 +609,22 @@ def _count_completed_turns(db_path: Path, hermes_session_id: str) -> int:
     (sets ``active = 0``) rather than deleting rows, so ignoring it keeps the
     count monotonic and append-only — the dedup baseline can then only grow, never
     drop below the posted-count and falsely re-arm an idle post for an old turn.
+
+    With *max_id*, only rows at or below that id are counted. The idle check
+    passes the mirror's high-water mark here so a terminal row that lands while
+    a batch is still being POSTed cannot be counted — and ring the parent-waking
+    idle edge — before the row itself has been mirrored.
     """
     con = _connect_ro(db_path)
     if con is None:
         return 0
+    query = "SELECT tool_calls FROM messages WHERE session_id = ? AND role = 'assistant'"
+    params: tuple[object, ...] = (hermes_session_id,)
+    if max_id is not None:
+        query += " AND id <= ?"
+        params = (hermes_session_id, max_id)
     try:
-        rows = con.execute(
-            "SELECT tool_calls FROM messages "
-            "WHERE session_id = ? AND role = 'assistant' ORDER BY id",
-            (hermes_session_id,),
-        ).fetchall()
+        rows = con.execute(query + " ORDER BY id", params).fetchall()
     except sqlite3.Error as exc:
         _warn_sqlite_once("turn-end count", exc)
         return 0
@@ -940,13 +948,16 @@ async def forward_hermes_store_to_session(
                         # status never does). A completed turn is an assistant row
                         # with no tool_calls (the agentic loop's terminal step);
                         # posted only AFTER its messages are mirrored above so the
-                        # parent sees the content before the completion. Deduped
+                        # parent sees the content before the completion — the
+                        # count is bounded by the mirrored high-water mark, so a
+                        # terminal row landing while this poll's batch was being
+                        # POSTed waits for the next poll to mirror it. Deduped
                         # against a persisted posted-count so a supervisor restart
                         # never re-wakes the parent for a turn it already reported.
                         # Best-effort: a failed post raises into the outer handler
                         # and leaves the count unadvanced, so the next poll retries.
                         completed_turns = await asyncio.to_thread(
-                            _count_completed_turns, db, hermes_session_id
+                            _count_completed_turns, db, hermes_session_id, last_id
                         )
                         if completed_turns > await asyncio.to_thread(
                             hermes_native_status.read_posted_count, bridge_dir

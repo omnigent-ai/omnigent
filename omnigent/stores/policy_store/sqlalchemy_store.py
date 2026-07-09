@@ -266,9 +266,9 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 return None
             changed = False
             if name is not None and row.name != name:
-                # Explicit uniqueness check for the application layer;
-                # the partial index ix_policies_default_name_cksum is the
-                # DB-layer guard, but checking here gives a cleaner error.
+                # Default-policy name uniqueness is enforced here in the
+                # application layer (no partial unique index — MySQL has
+                # none), so this check is the guard, not just a nicer error.
                 conflict = (
                     session.execute(
                         select(SqlPolicy)

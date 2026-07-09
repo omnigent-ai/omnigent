@@ -146,6 +146,29 @@ def test_tool_turn_deny_attaches_policy_and_observes_denied_event() -> None:
     assert '"result": "DENY"' in expr
 
 
+def test_tool_turn_deny_observes_denied_event_after_terminal() -> None:
+    """A policy_denied that lands AFTER output_item.done is still caught.
+
+    On a live deny turn the tool can run anyway (vendor doesn't enforce), so the
+    turn's output_item.done arrives first and response.policy_denied lands just
+    after. The reader must keep watching past the terminal event on a deny turn
+    (the grace window), not stop on output_item.done and miss the deny.
+    """
+    client = _FakeClient(
+        items=[_function_call_item("Bash")],  # tool ran (vendor didn't enforce)
+        stream_events=[
+            "response.output_item.done",  # terminal — but not the end on a deny turn
+            "session.heartbeat",
+            "response.policy_denied",  # lands just after
+        ],
+    )
+    driver = _driver_with_fake("claude-native", client)
+
+    result = driver._drive_tool_turn(deny=True)
+
+    assert result.tool_call_denied  # caught despite arriving after the terminal event
+
+
 def test_tool_turn_deny_skips_when_policy_enforcement_inactive() -> None:
     """Fail-open (policy hook disabled) -> SKIP, never a false UNSUPPORTED."""
     client = _FakeClient()

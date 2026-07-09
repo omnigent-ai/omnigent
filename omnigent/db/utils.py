@@ -831,11 +831,9 @@ def extract_search_text(item: NewConversationItem) -> str:
             part for part in (data.get("input") or "", data.get("stdout") or "") if part
         )
     if item.type == "routing_decision":
-        # Index model + tier + rationale so FTS can find a router
-        # verdict by the model it picked or its one-line explanation.
-        return " ".join(
-            part for part in (data.get("model"), data.get("tier"), data.get("rationale")) if part
-        )
+        # Index model + rationale so FTS can find a router verdict by
+        # the model it picked or its one-line explanation.
+        return " ".join(part for part in (data.get("model"), data.get("rationale")) if part)
     raise ValueError(f"unknown item type: {item.type!r}")
 
 

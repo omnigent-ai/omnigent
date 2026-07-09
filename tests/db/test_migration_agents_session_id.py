@@ -9,7 +9,6 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import (
     _build_alembic_config,
@@ -55,11 +54,19 @@ def test_ix_conversations_agent_id_added(db_engine: Engine) -> None:
     assert "ix_conversations_agent_id" in index_names
 
 
-def test_agents_name_unique_index_exists(db_engine: Engine) -> None:
-    """ix_agents_template_name unique index must still exist."""
+def test_agents_name_index_exists(db_engine: Engine) -> None:
+    """The template-name partial unique index is replaced by a plain name index.
+
+    Template-name uniqueness now lives in the store (MySQL has no partial
+    indexes); the DB keeps only a non-unique lookup index on
+    ``(workspace_id, name, kind, id)`` — kind is included so the template
+    lookup seeks past same-named session copies.
+    """
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("agents")}
-    assert "ix_agents_template_name" in indexes
-    assert indexes["ix_agents_template_name"]["unique"]
+    assert "ix_agents_template_name" not in indexes
+    assert "ix_agents_name" in indexes
+    assert not indexes["ix_agents_name"]["unique"]
+    assert indexes["ix_agents_name"]["column_names"] == ["workspace_id", "name", "kind", "id"]
 
 
 def test_template_agent_kind_stored_and_read(db_engine: Engine) -> None:
@@ -142,26 +149,35 @@ def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None
         conn.execute(sa.text("DELETE FROM conversations WHERE id = 'conv_missing'"))
 
 
-def test_agents_template_name_unique_index_rejects_duplicate_template(
+def test_agents_allow_duplicate_template_names_at_db_layer(
     db_engine: Engine,
 ) -> None:
-    """Two template agents may not share the same name (ix_agents_template_name)."""
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                    " VALUES (:id1, :ts, 'dup-template', :loc1, 1, 1),"
-                    "        (:id2, :ts, 'dup-template', :loc2, 1, 1)"
-                ),
-                {
-                    "id1": "ag_dup1",
-                    "id2": "ag_dup2",
-                    "ts": 1700000001,
-                    "loc1": "ag_dup1/bundle",
-                    "loc2": "ag_dup2/bundle",
-                },
-            )
+    """The DB no longer rejects duplicate template names.
+
+    Uniqueness moved from a partial unique index to the store layer (MySQL
+    has no partial indexes), so a raw double-insert succeeds; the guard lives
+    in ``SqlAlchemyAgentStore.create`` (see tests/stores/test_agent_store.py).
+    """
+    with db_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
+                " VALUES (:id1, :ts, 'dup-template', :loc1, 1, 1),"
+                "        (:id2, :ts, 'dup-template', :loc2, 1, 1)"
+            ),
+            {
+                "id1": "ag_dup1",
+                "id2": "ag_dup2",
+                "ts": 1700000001,
+                "loc1": "ag_dup1/bundle",
+                "loc2": "ag_dup2/bundle",
+            },
+        )
+        count = conn.execute(
+            sa.text("SELECT COUNT(*) FROM agents WHERE name = 'dup-template'")
+        ).scalar_one()
+        assert count == 2
+        conn.execute(sa.text("DELETE FROM agents WHERE name = 'dup-template'"))
 
 
 def test_agents_session_id_allows_duplicate_names_for_distinct_sessions(

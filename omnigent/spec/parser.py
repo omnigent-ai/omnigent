@@ -89,7 +89,7 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS = frozenset({"cost_optimize"})
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)
@@ -519,9 +519,6 @@ def _parse_executor(
     # type. Scalar values are coerced to strings so YAML booleans /
     # numbers round-trip as their string form (the omnigent
     # harness/profile fields are both strings in the source YAML).
-    # Structured keys whose consumer needs the nested shape are kept
-    # verbatim: ``cost_optimize`` is the cost advisor's tier config (a
-    # nested mapping), which ``parse_advisor_config`` reads as a Mapping.
     raw_config = raw.get("config")
     config: dict[str, Any] = {}
     if isinstance(raw_config, dict):

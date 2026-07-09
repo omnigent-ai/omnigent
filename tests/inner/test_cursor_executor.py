@@ -1625,13 +1625,13 @@ async def test_hooks_json_cleaned_up_on_close(
 
 
 def _fake_evaluate_response(result_action: str, reason: str = "") -> Any:
-    """Build a fake httpx.Response-like object for post_evaluate_with_retry mocks."""
+    """Build a fake (response, error) tuple for post_evaluate_with_retry mocks."""
     payload = {"result": result_action}
     if reason:
         payload["reason"] = reason
     resp = SimpleNamespace()
     resp.json = lambda: payload
-    return resp
+    return resp, None
 
 
 def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1708,7 +1708,7 @@ def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyP
         patch.object(sys, "stdout", stdout),
         patch(
             "omnigent.native_policy_hook.post_evaluate_with_retry",
-            return_value=None,
+            return_value=(None, "connection error: simulated"),
         ),
     ):
         cursor_policy_hook.main()

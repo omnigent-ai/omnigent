@@ -2,10 +2,11 @@ name: CI
 
 # Unit-test pytest matrix on every non-draft PR and on push to main. Tests are
 # split across directory-based matrix groups (runtime-*, server-*, inner-rest,
-# tools, repl-sdk, spec-llms, misc) so slow files don't bottleneck one runner;
-# the slowest groups use `--dist=worksteal` to fan tests out within a file. The
-# `misc` group is a catch-all so new top-level tests/<dir>/ are picked up
-# automatically. Draft PRs are skipped (ready_for_review re-fires the workflow).
+# tools, repl-sdk, spec-llms, runner-app, stores, misc) so slow files don't
+# bottleneck one runner; the slowest groups use `--dist=worksteal` to fan tests
+# out within a file. The `misc` group is a catch-all so new top-level
+# tests/<dir>/ are picked up automatically (it ignores the dirs that have their
+# own group). Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
 on:
@@ -94,7 +95,21 @@ jobs:
           - group: integration-mock
             paths: tests/integration
             workers: "0"
+          # Carved out of misc: runner + stores were ~68% of misc's cpu and
+          # under loadfile a single 500s+ file (test_app_sessions_native) pinned
+          # one worker and set the whole misc wall time. worksteal fans each
+          # dir's tests across workers (biggest single test is ~40s / ~5s, so
+          # the floor drops from ~500s to ~100s). Both dirs' conftests are
+          # function-scoped, so splitting a file across workers is safe.
+          - group: runner-app
+            paths: tests/runner
+            dist: worksteal
+          - group: stores
+            paths: tests/stores
+            dist: worksteal
           # Catch-all so new top-level tests/<dir>/ are covered automatically.
+          # worksteal keeps the biggest remaining file (the benchmark smoke
+          # test, ~58s) from re-pinning one worker as this catch-all grows.
           - group: misc
             paths: >-
               tests
@@ -112,6 +127,9 @@ jobs:
               --ignore=tests/spec
               --ignore=tests/llms
               --ignore=tests/codex_parity
+              --ignore=tests/runner
+              --ignore=tests/stores
+            dist: worksteal
           # Databricks-coupled tests (Lakebase token engine, psycopg). This is
           # the only lane that installs the `databricks` extra; the
           # @pytest.mark.databricks marker keeps these tests off the lean lanes
@@ -203,6 +221,100 @@ jobs:
           path: artifacts/
           retention-days: 14
           include-hidden-files: true  # the per-shard .coverage.<group> dotfile
+
+  stores-postgres:
+    name: Pytest (stores-postgres)
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: omnigent
+          POSTGRES_DB: omnigent_root
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version-file: ".python-version"
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --extra all --extra dev --extra databricks
+      - name: Run store + DB tests against PostgreSQL
+        env:
+          OMNIGENT_TEST_DB_URI: postgresql+psycopg://postgres:omnigent@localhost:5432/omnigent_root
+        run: |
+          uv run pytest tests/stores tests/db \
+            -m "not databricks" \
+            -n 4 \
+            --dist=loadfile \
+            --timeout=300 \
+            --junitxml=artifacts/pytest-stores-postgres.xml
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pytest-stores-postgres-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 14
+
+  stores-mysql:
+    name: Pytest (stores-mysql)
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: omnigent
+          MYSQL_DATABASE: omnigent_root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -pomnigent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version-file: ".python-version"
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        with:
+          enable-cache: true
+      - name: Install system MySQL client library
+        run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
+      - name: Install dependencies
+        run: uv sync --locked --extra all --extra dev --extra databricks && uv pip install mysqlclient
+      - name: Run store + DB tests against MySQL
+        env:
+          OMNIGENT_TEST_DB_URI: mysql+mysqldb://root:omnigent@127.0.0.1:3306/omnigent_root
+        run: |
+          uv run pytest tests/stores tests/db \
+            -m "not databricks" \
+            -n 4 \
+            --dist=loadfile \
+            --timeout=300 \
+            --junitxml=artifacts/pytest-stores-mysql.xml
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pytest-stores-mysql-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 14
 
   codex-parity:
     name: Pytest (codex-parity)

@@ -2,7 +2,7 @@
 
 The theme control lives on the Settings page (``pages/SettingsPage.tsx``,
 ``AppearanceSection``): three radio cards — System / Light / Dark — under a
-``role="radiogroup"`` labelled "Theme". Each card sets the chosen mode directly
+``role="radiogroup"`` labelled "Mode". Each card sets the chosen mode directly
 (``onClick={() => setTheme(mode)}``); ``aria-checked`` reflects the current
 selection. Unlike the previous sidebar cycle-button, every mode is selectable
 directly regardless of the OS preference (no skipped "redundant" step).
@@ -33,10 +33,10 @@ def _stored_theme(page: Page) -> str | None:
 
 
 def _theme_radiogroup(page: Page) -> Locator:
-    """The app-theme radiogroup, matched exactly so it can't also resolve the
-    Appearance page's "Terminal theme" radiogroup, whose name contains "Theme"
-    and whose cards reuse the Light/Dark labels."""
-    return page.get_by_role("radiogroup", name="Theme", exact=True)
+    """The appearance-mode radiogroup ("Mode"). Matched exactly so it can't also
+    resolve the "Color theme" / "Terminal theme" radiogroups, whose cards reuse
+    the Light/Dark labels."""
+    return page.get_by_role("radiogroup", name="Mode", exact=True)
 
 
 def _open_appearance(page: Page, base_url: str) -> None:

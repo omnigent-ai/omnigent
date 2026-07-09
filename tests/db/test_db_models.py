@@ -11,7 +11,7 @@ import hashlib
 import time
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from omnigent.db.db_models import (
     SqlAccountToken,
@@ -319,7 +319,7 @@ class TestSqlAccountToken:
             created_at=now,
             expires_at=now + 3600,
         )
-        with pytest.raises(IntegrityError):
+        with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
                 session.add(token)
 
@@ -371,7 +371,7 @@ class TestSqlConversation:
         conv = _make_conversation()
         # An out-of-range int code must be rejected by ck_conversations_kind.
         conv.kind = 99
-        with pytest.raises(IntegrityError):
+        with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
                 session.add(conv)
 
@@ -602,7 +602,7 @@ class TestSqlSessionPermission:
             conversation_id="conv_test1",
             level=99,
         )
-        with pytest.raises(IntegrityError):
+        with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
                 session.add(perm)
 
