@@ -982,17 +982,14 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   }
 
   if (itemType === "routing_decision") {
-    // Drop a malformed frame (empty model / unknown tier) rather than
-    // rendering a broken chip — the relay also persists nothing for it.
+    // Drop a malformed frame (empty model) rather than rendering a broken chip.
     const model = typeof rec.model === "string" ? rec.model : "";
-    const tier = rec.tier;
-    if (!model || (tier !== "cheap" && tier !== "medium" && tier !== "expensive")) {
+    if (!model) {
       return null;
     }
     return {
       type: "routing_decision",
       model,
-      tier,
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
       ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),

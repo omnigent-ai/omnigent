@@ -119,7 +119,6 @@ export function CompactionMarker() {
 
 interface RoutingDecisionChipProps {
   model: string;
-  tier: "cheap" | "medium" | "expensive";
   applied: boolean;
   rationale: string;
 }
@@ -154,7 +153,6 @@ export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisi
 
 interface RoutingDecisionCardProps {
   model: string;
-  tier: "cheap" | "medium" | "expensive";
   applied: boolean;
   rationale: string;
   /** Sub-agent name when this card is shown in the parent session. */
@@ -173,7 +171,6 @@ interface RoutingDecisionCardProps {
  */
 export function RoutingDecisionCard({
   model,
-  tier,
   applied,
   rationale,
   agent,
@@ -181,8 +178,8 @@ export function RoutingDecisionCard({
   const short = shortModelName(model);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
-    () => JSON.stringify({ model, tier, applied, rationale, ...(agent ? { agent } : {}) }, null, 2),
-    [model, tier, applied, rationale, agent],
+    () => JSON.stringify({ model, applied, rationale, ...(agent ? { agent } : {}) }, null, 2),
+    [model, applied, rationale, agent],
   );
   return (
     <Collapsible

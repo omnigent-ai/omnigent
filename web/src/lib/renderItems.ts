@@ -148,7 +148,6 @@ export type Bubble =
       kind: "routing_decision";
       itemId: string;
       model: string;
-      tier: "cheap" | "medium" | "expensive";
       applied: boolean;
       rationale: string;
       agent?: string;
@@ -448,7 +447,6 @@ function walkBubbles(
         kind: "routing_decision",
         itemId: b.ctx.itemId ?? `routing_${i}`,
         model: b.model,
-        tier: b.tier,
         applied: b.applied,
         rationale: b.rationale,
         ...(b.agent !== undefined && { agent: b.agent }),

@@ -657,7 +657,6 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         type: "routing_decision",
         ctx: ctx(state, event.itemId || null, event.responseId || null),
         model: event.model,
-        tier: event.tier,
         applied: event.applied,
         rationale: event.rationale,
         ...(event.agent !== undefined && { agent: event.agent }),

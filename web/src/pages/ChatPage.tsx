@@ -2833,7 +2833,6 @@ export const BubbleView = memo(
       return (
         <RoutingDecisionCard
           model={bubble.model}
-          tier={bubble.tier}
           applied={bubble.applied}
           rationale={bubble.rationale}
           agent={bubble.agent}
