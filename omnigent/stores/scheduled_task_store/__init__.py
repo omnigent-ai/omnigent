@@ -1,0 +1,209 @@
+"""Scheduled-task store — persists scheduled tasks and their run history.
+
+A scheduled task is a saved instruction that fires an agent session on a
+schedule (recurring cron or one-shot). This store owns the ``scheduled_tasks``
+table and its ``scheduled_task_runs`` history table. No scheduler consumes these
+rows yet — this is the persistence layer only.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+from omnigent.entities import ScheduledTask, ScheduledTaskRun
+
+
+class ScheduledTaskStore(ABC):
+    """
+    Abstract base for scheduled-task persistence.
+
+    Manages the lifecycle of scheduled tasks (CRUD) and their run history. The
+    ``list_active`` read path — active tasks ordered by ``(created_at, id)`` —
+    is what the future scheduler polls.
+    """
+
+    def __init__(self, storage_location: str) -> None:
+        """
+        Initialize the scheduled-task store.
+
+        :param storage_location: Backend-specific storage URI,
+            e.g. ``"sqlite:///chat.db"`` for SQLAlchemy.
+        """
+        self.storage_location = storage_location
+
+    # ── Scheduled tasks ──────────────────────────────────────────
+
+    @abstractmethod
+    def create(
+        self,
+        scheduled_task_id: str,
+        name: str,
+        prompt: str,
+        owner_user_id: str,
+        agent_id: str,
+        timezone: str,
+        *,
+        cron_expression: str | None = None,
+        run_at_ms: int | None = None,
+        plugins: list[str] | None = None,
+        harness_override: str | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        base_branch: str | None = None,
+        sandbox_target: str | None = None,
+        state: str = "active",
+        metadata: dict[str, Any] | None = None,
+    ) -> ScheduledTask:
+        """
+        Insert a new scheduled task.
+
+        Exactly one of ``cron_expression`` / ``run_at_ms`` must be set — the
+        ``ScheduleTrigger`` oneof. Passing both or neither raises ``ValueError``.
+
+        :param scheduled_task_id: Pre-generated unique task id, e.g. ``"st_..."``.
+        :param name: Human-readable task name.
+        :param prompt: The instruction dispatched to the agent on each firing.
+        :param owner_user_id: User the task belongs to and fires as.
+        :param agent_id: The agent bound to this task.
+        :param timezone: IANA timezone the trigger is evaluated in.
+        :param cron_expression: Single cron string for a recurring task.
+            Mutually exclusive with ``run_at_ms``.
+        :param run_at_ms: One-shot fire time in epoch milliseconds. Mutually
+            exclusive with ``cron_expression``.
+        :param plugins: Optional plugin references
+            (``"plugin-name@marketplace"``); defaults to an empty list.
+        :param harness_override: Optional brain-harness override.
+        :param model_override: Optional LLM model override.
+        :param reasoning_effort: Optional reasoning-effort hint.
+        :param workspace: Optional runner start path (source repo / working dir).
+        :param base_branch: Optional git base ref to branch from at fire time.
+        :param sandbox_target: Optional compute-target hint.
+        :param state: Lifecycle state — ``active``/``paused``/``deleted``/
+            ``completed``. Defaults to ``"active"``.
+        :param metadata: Optional free-form metadata dict.
+        :returns: The newly created :class:`ScheduledTask`.
+        :raises ValueError: If not exactly one trigger field is set, or if
+            ``state`` is not a recognized value.
+        """
+        ...
+
+    @abstractmethod
+    def get(self, scheduled_task_id: str) -> ScheduledTask | None:
+        """
+        Return a scheduled task by id, or ``None`` if not found.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :returns: The :class:`ScheduledTask` if found, else ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def list(self) -> list[ScheduledTask]:
+        """
+        List all scheduled tasks ordered by ``created_at ASC, id ASC``.
+
+        :returns: List of :class:`ScheduledTask` instances.
+        """
+        ...
+
+    @abstractmethod
+    def list_active(self) -> list[ScheduledTask]:
+        """
+        List active scheduled tasks ordered by ``created_at ASC, id ASC``.
+
+        This is the read path the future scheduler polls.
+
+        :returns: List of :class:`ScheduledTask` instances in state ``active``.
+        """
+        ...
+
+    @abstractmethod
+    def update(
+        self,
+        scheduled_task_id: str,
+        *,
+        name: str | None = None,
+        prompt: str | None = None,
+        cron_expression: str | None = None,
+        run_at_ms: int | None = None,
+        plugins: list[str] | None = None,
+        timezone: str | None = None,
+        harness_override: str | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        base_branch: str | None = None,
+        sandbox_target: str | None = None,
+        state: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        last_run_at: int | None = None,
+        last_run_conversation_id: str | None = None,
+    ) -> ScheduledTask | None:
+        """
+        Update mutable fields of a task. ``None`` leaves a field unchanged.
+
+        The trigger is a oneof: passing ``cron_expression`` or ``run_at_ms``
+        switches the trigger to that kind (and clears the other); passing both
+        raises ``ValueError``; passing neither leaves the trigger untouched.
+
+        Returns ``None`` if the task does not exist.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :returns: The updated :class:`ScheduledTask`, or ``None`` if not found.
+        :raises ValueError: If both trigger fields are supplied.
+        """
+        ...
+
+    @abstractmethod
+    def delete(self, scheduled_task_id: str) -> bool:
+        """
+        Delete a scheduled task. Idempotent.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :returns: ``True`` if removed; ``False`` if not found.
+        """
+        ...
+
+    # ── Runs ─────────────────────────────────────────────────────
+
+    @abstractmethod
+    def create_run(
+        self,
+        run_id: str,
+        scheduled_task_id: str,
+        status: str,
+        scheduled_at: int,
+        *,
+        conversation_id: str | None = None,
+        fired_at: int | None = None,
+        finished_at: int | None = None,
+        error: str | None = None,
+    ) -> ScheduledTaskRun:
+        """
+        Insert a new scheduled-task-run row.
+
+        :param run_id: Pre-generated unique run id, e.g. ``"sr_..."``.
+        :param scheduled_task_id: The task this run belongs to.
+        :param status: One of ``scheduled``/``running``/``succeeded``/
+            ``failed``/``skipped``.
+        :param scheduled_at: Unix epoch seconds the firing was scheduled for.
+        :param conversation_id: Optional conversation created by this firing.
+        :param fired_at: Optional Unix epoch seconds dispatch began.
+        :param finished_at: Optional Unix epoch seconds of terminal state.
+        :param error: Optional failure detail.
+        :returns: The newly created :class:`ScheduledTaskRun`.
+        """
+        ...
+
+    @abstractmethod
+    def list_runs(self, scheduled_task_id: str) -> list[ScheduledTaskRun]:
+        """
+        List runs for a task ordered by ``scheduled_at DESC, id DESC``
+        (most recent first).
+
+        :param scheduled_task_id: The task whose runs to return.
+        :returns: List of :class:`ScheduledTaskRun` instances.
+        """
+        ...

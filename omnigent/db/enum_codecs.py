@@ -3,7 +3,9 @@
 Several low-cardinality closed-set columns (``conversations.kind``,
 ``conversation_items.type``/``status``, ``comments.status``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
-``hosts.status``, ``agents.kind``) are stored as integer codes rather
+``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
+``scheduled_task_runs.status``) are stored as
+integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
 free ``VARCHAR``. The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
@@ -84,6 +86,21 @@ AGENT_KIND: dict[str, int] = {
 POLICY_SCOPE: dict[str, int] = {
     "default": 1,
     "session": 2,
+}
+
+SCHEDULED_TASK_STATE: dict[str, int] = {
+    "active": 1,
+    "paused": 2,
+    "deleted": 3,
+    "completed": 4,
+}
+
+SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
+    "scheduled": 1,
+    "running": 2,
+    "succeeded": 3,
+    "failed": 4,
+    "skipped": 5,
 }
 
 
@@ -247,3 +264,23 @@ def encode_policy_scope(name: str) -> int:
 def decode_policy_scope(code: int) -> str:
     """Decode a ``policies.scope`` int code to its name."""
     return _decode(POLICY_SCOPE, code, field="policies.scope")
+
+
+def encode_scheduled_task_state(name: str) -> int:
+    """Encode a ``scheduled_tasks.state`` name to its int code."""
+    return _encode(SCHEDULED_TASK_STATE, name, field="scheduled_tasks.state")
+
+
+def decode_scheduled_task_state(code: int) -> str:
+    """Decode a ``scheduled_tasks.state`` int code to its name."""
+    return _decode(SCHEDULED_TASK_STATE, code, field="scheduled_tasks.state")
+
+
+def encode_scheduled_task_run_status(name: str) -> int:
+    """Encode a ``scheduled_task_runs.status`` name to its int code."""
+    return _encode(SCHEDULED_TASK_RUN_STATUS, name, field="scheduled_task_runs.status")
+
+
+def decode_scheduled_task_run_status(code: int) -> str:
+    """Decode a ``scheduled_task_runs.status`` int code to its name."""
+    return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")

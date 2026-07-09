@@ -1068,3 +1068,217 @@ class SqlUserDailyCost(Base):
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)
+
+
+class SqlScheduledTask(Base):
+    """
+    SQLAlchemy model for the ``scheduled_tasks`` table.
+
+    A scheduled task is a saved, scheduled instruction that fires an agent
+    session — either recurring (``cron_expression``) or one-shot
+    (``run_at_ms``). This PR persists the definition only — no scheduler reads
+    or dispatches these rows yet.
+
+    The entity mirrors the internal Isaac ``ScheduledTask`` spec (fields
+    ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``/``plugins``;
+    a ``ScheduleTrigger`` ``cron_expression | run_at_ms`` oneof; a ``state`` enum
+    ``active``/``paused``/``deleted``/``completed``) so a future merge is a
+    column mapping rather than a rewrite.
+
+    :param id: Opaque PK, e.g. ``"st_a1b2c3..."``.
+    :param name: Human-readable task name, e.g. ``"nightly triage"``.
+    :param prompt: The instruction dispatched to the agent on each firing.
+    :param cron_expression: A single cron string for a recurring task, e.g.
+        ``"0 9 * * *"``. Mutually exclusive with ``run_at_ms`` — exactly one is
+        set (enforced by ``ck_scheduled_tasks_trigger_exactly_one``).
+    :param run_at_ms: One-shot fire time as Unix epoch **milliseconds**.
+        Mutually exclusive with ``cron_expression`` — exactly one is set.
+    :param plugins: JSON-encoded ``list[str]`` of plugin references, each of the
+        form ``"plugin-name@marketplace"`` (format not validated here). Defaults
+        to ``"[]"``.
+    :param owner_user_id: User the task belongs to and fires as — the
+        identity anchor for unattended dispatch, e.g. ``"alice@example.com"``.
+        Required.
+    :param agent_id: The agent bound to this task (relates to
+        ``agents.id``). Cascade cleanup on agent deletion is application-owned
+        — there is no DB-level foreign key (schema Rule R032).
+    :param harness_override: Per-task brain-harness override, e.g. ``"pi"``.
+        ``None`` means use the agent default. Mirrors
+        ``conversations.harness_override``.
+    :param model_override: Per-task LLM model override, e.g.
+        ``"claude-opus-4-7"``. ``None`` means use the agent default.
+    :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
+        ``None`` means use the agent default.
+    :param workspace: Absolute path on disk where a fired session's runner
+        should start (the source repo / working dir). ``None`` when unset.
+    :param base_branch: Git base ref a firing branches FROM when it creates a
+        worktree at fire time (maps 1:1 to Harry's ``base_branch`` and to
+        session-create's ``git.base_branch`` input). Pairs with ``workspace``:
+        ``workspace`` is where, ``base_branch`` is what to branch from. ``None``
+        when unset. The per-run *output* branch is not stored on the definition.
+    :param sandbox_target: Nullable compute-target hint naming where a firing
+        should run (a provider name such as ``"local"``, ``"isaac"``, or
+        ``"e2b"`` may live here in a later PR). Persisted only — there is no
+        resolution logic in this PR.
+    :param timezone: IANA timezone the trigger is evaluated in, e.g.
+        ``"America/Los_Angeles"``.
+    :param state: Lifecycle state — ``active``/``paused``/``deleted``/
+        ``completed``. The (future) scheduler only considers ``active`` tasks.
+        Stored as a stable int code (see omnigent.db.enum_codecs
+        SCHEDULED_TASK_STATE); the store converts to/from the string name at the
+        row↔entity boundary. Defaults to ``active``.
+    :param last_run_at: Unix epoch seconds of the most recent firing, or
+        ``None`` if it has never fired.
+    :param last_run_conversation_id: The conversation created by the most recent
+        firing (relates to ``conversations.id``). ``None`` if never fired or the
+        referenced conversation was deleted (application-owned SET-NULL cleanup;
+        no DB foreign key).
+    :param scheduled_task_metadata: JSON-encoded free-form metadata object.
+        Mapped to the column named ``metadata`` (the bare ``metadata`` attribute
+        is reserved on the declarative base). Defaults to ``"{}"``.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
+        row has never been updated.
+    """
+
+    __tablename__ = "scheduled_tasks"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # Trigger: a cron_expression | run_at_ms oneof matching Harry's
+    # ScheduleTrigger. Exactly one is non-NULL
+    # (ck_scheduled_tasks_trigger_exactly_one). cron_expression = a single cron
+    # string (recurring); run_at_ms = one-shot fire time in epoch milliseconds.
+    cron_expression: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    run_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # JSON-encoded list[str] of plugin references ("plugin-name@marketplace").
+    # Stored as Text (not a native JSON column) for SQLite/MySQL parity; the
+    # store json.loads/dumps it. Defaults to an empty list.
+    plugins: Mapped[str] = mapped_column(Text, nullable=False, server_default="[]")
+    # Required identity anchor. Indexed, so kept at 255 (<= the indexed-string
+    # length ceiling) rather than the wider 256 used for non-indexed owners.
+    owner_user_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
+    agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Per-task overrides — None means fall back to the agent default. Widths
+    # mirror the matching conversations.* override columns.
+    harness_override: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    workspace: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Git base ref a firing branches from when it creates a worktree at fire
+    # time (mirrors session-create's git.base_branch input). None when unset.
+    base_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Nullable compute-target hint (provider name). Persisted only in this PR —
+    # no resolution logic. A single nullable string, not an enum.
+    sandbox_target: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3, completed=4). The
+    # store converts to/from the string name at the row↔entity boundary.
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    last_run_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Relates to conversations.id. No DB foreign key (Rule R032); the
+    # application nulls this out when the referenced conversation is deleted.
+    last_run_conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Free-form JSON metadata. The Python attribute is ``scheduled_task_metadata``
+    # because ``metadata`` is reserved on DeclarativeBase; the column is
+    # ``metadata``. Stored as Text; the store json.loads/dumps it.
+    scheduled_task_metadata: Mapped[str] = mapped_column("metadata", Text, server_default="{}")
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        # Trigger oneof: exactly one of cron_expression / run_at_ms is set.
+        # Boolean XOR via `<>` on two `IS NOT NULL` predicates is portable
+        # across SQLite, PostgreSQL, and MySQL.
+        CheckConstraint(
+            "(cron_expression IS NOT NULL) <> (run_at_ms IS NOT NULL)",
+            name="ck_scheduled_tasks_trigger_exactly_one",
+        ),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_state"),
+        Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
+        Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
+        Index("ix_scheduled_tasks_agent_id", "workspace_id", "agent_id", "id"),
+        # Covers the future scheduler's read path:
+        # WHERE workspace_id + state ORDER BY created_at, id.
+        Index("ix_scheduled_tasks_state", "workspace_id", "state", "created_at", "id"),
+    )
+
+
+class SqlScheduledTaskRun(Base):
+    """
+    SQLAlchemy model for the ``scheduled_task_runs`` table.
+
+    One row per firing of a scheduled task — the run history. Recorded and
+    advanced by the (future) scheduler as a firing moves through its lifecycle;
+    this PR persists the shape only.
+
+    :param id: Opaque PK, e.g. ``"sr_a1b2c3..."``.
+    :param scheduled_task_id: The task this run belongs to (relates to
+        ``scheduled_tasks.id``). Indexed for per-task history listing. Cascade
+        cleanup on task deletion is application-owned — no DB foreign key
+        (Rule R032).
+    :param conversation_id: The conversation created by this firing (relates to
+        ``conversations.id``). ``None`` before dispatch, or after the referenced
+        conversation is deleted (application-owned SET-NULL; no DB foreign key).
+    :param status: Lifecycle state —
+        ``scheduled``/``running``/``succeeded``/``failed``/``skipped``. Stored
+        as a stable int code (see omnigent.db.enum_codecs
+        SCHEDULED_TASK_RUN_STATUS); the store converts to/from the string name
+        at the row↔entity boundary.
+    :param scheduled_at: Unix epoch seconds the firing was scheduled for.
+    :param fired_at: Unix epoch seconds dispatch actually began, or ``None`` if
+        it has not fired yet.
+    :param finished_at: Unix epoch seconds the run reached a terminal state, or
+        ``None`` if still pending/running.
+    :param error: Failure detail when ``status = 'failed'``; ``None`` otherwise.
+    """
+
+    __tablename__ = "scheduled_task_runs"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # Relates to scheduled_tasks.id. No DB foreign key (Rule R032); cascade is
+    # app-owned.
+    scheduled_task_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Relates to conversations.id. No DB foreign key; app nulls on delete.
+    conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3, failed=4,
+    # skipped=5). The store converts to/from the string name at the
+    # row↔entity boundary.
+    status: Mapped[int] = mapped_column(SmallInteger)
+    scheduled_at: Mapped[int] = mapped_column(Integer)
+    fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN (1, 2, 3, 4, 5)",
+            name="ck_scheduled_task_runs_status",
+        ),
+        Index(
+            "ix_scheduled_task_runs_scheduled_task_id",
+            "workspace_id",
+            "scheduled_task_id",
+            "id",
+        ),
+    )
