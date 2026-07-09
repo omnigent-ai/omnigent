@@ -529,7 +529,10 @@ class ToolManager:
         When a pre-resolved :class:`OSEnvironment` was provided to
         the constructor (from ``SessionResourceRegistry``), that
         shared instance is used directly. Otherwise, falls back to
-        creating a new instance via ``create_os_environment()``.
+        creating a new instance via ``create_os_environment()``,
+        resolving a relative ``os_env.cwd`` against ``workdir`` so it
+        never depends on the process cwd (which for runner subprocesses
+        historically inherited the host daemon's cwd).
 
         When the spec declares no os_env and no pre-resolved env
         was provided, this is a no-op.
@@ -546,7 +549,7 @@ class ToolManager:
             os_env_spec_obj = self._spec.os_env
             if os_env_spec_obj is None:
                 return
-            os_env = create_os_environment(os_env_spec_obj)
+            os_env = create_os_environment(os_env_spec_obj, base_cwd=self._workdir)
             if os_env is None:
                 return
 

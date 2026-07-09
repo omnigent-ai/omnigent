@@ -995,6 +995,7 @@ def test_start_cli_runner_process_uses_token_bound_runner_id(
         def __init__(self, args: list[str], *, env: dict[str, str], **_kwargs: object) -> None:
             captured["args"] = args
             captured["env"] = env
+            captured["cwd"] = _kwargs.get("cwd")
 
         def poll(self) -> None:
             """Report the runner process as still alive.
@@ -1022,6 +1023,38 @@ def test_start_cli_runner_process_uses_token_bound_runner_id(
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "bind-token"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == str(os.getpid())
     assert env[RUNNER_WORKSPACE_ENV_VAR] == str(workspace.resolve())
+    # The runner must start inside the workspace so relative os_env cwd
+    # values never resolve against the parent process's cwd.
+    assert captured["cwd"] == str(workspace.resolve())
+
+
+def test_start_cli_runner_process_rejects_missing_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A missing workspace fails with a clear error before spawning.
+
+    The workspace becomes the runner subprocess's cwd, so spawning
+    would otherwise die with an uncaught FileNotFoundError from Popen.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temporary directory fixture.
+    :returns: None.
+    """
+    spawned: list[object] = []
+    monkeypatch.setattr(
+        "omnigent.cli.subprocess.Popen",
+        lambda *args, **kwargs: spawned.append((args, kwargs)),
+    )
+
+    with pytest.raises(ClickException) as excinfo:
+        _start_cli_runner_process(
+            server_url="http://127.0.0.1:8000",
+            workspace_cwd=tmp_path / "gone",
+        )
+
+    assert "Runner workspace does not exist" in excinfo.value.message
+    assert not spawned, "Popen must not be called for a missing workspace"
 
 
 def test_start_cli_runner_process_binds_stable_local_runner_to_generated_token(

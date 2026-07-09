@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import base64
 import shutil
+import sys
 import tracemalloc
 from pathlib import Path
 
-from omnigent.inner.os_env import _read_impl, _shell_impl, build_helper_env
+import pytest
+
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.os_env import (
+    _read_impl,
+    _shell_impl,
+    build_helper_env,
+    create_os_environment,
+)
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VALUE,
@@ -294,3 +303,109 @@ def test_read_impl_nul_byte_file_classified_binary(tmp_path: Path) -> None:
 
     assert result["encoding"] == "base64"
     assert result["total_bytes"] == 10
+
+
+def _caller_process_spec(cwd: str | None) -> OSEnvSpec:
+    """A minimal unsandboxed caller_process spec for cwd-resolution tests.
+
+    :param cwd: The spec's ``cwd`` value, e.g. ``"."`` or ``None``.
+    :returns: An :class:`OSEnvSpec` with ``sandbox.type: none``.
+    """
+    return OSEnvSpec(
+        type="caller_process",
+        cwd=cwd,
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+
+
+def _created_cwd(spec: OSEnvSpec, base_cwd: Path | None) -> Path:
+    """Create an environment and return its resolved cwd.
+
+    :param spec: The environment spec under test.
+    :param base_cwd: The base directory passed to
+        :func:`create_os_environment`.
+    :returns: The environment's resolved ``cwd``.
+    """
+    env = create_os_environment(spec, base_cwd=base_cwd)
+    assert env is not None
+    try:
+        return env.cwd
+    finally:
+        env.close()
+
+
+def test_create_os_environment_placeholder_cwd_uses_base_cwd(tmp_path: Path) -> None:
+    """``os_env.cwd: "."`` resolves to the base cwd, not the process cwd.
+
+    Agent configs use ``cwd: .`` as a workspace placeholder; it must
+    anchor to the session/runner workspace the caller passes in.
+
+    :returns: None.
+    """
+    assert _created_cwd(_caller_process_spec("."), tmp_path) == tmp_path.resolve()
+
+
+def test_create_os_environment_relative_cwd_joins_base_cwd(tmp_path: Path) -> None:
+    """A relative ``os_env.cwd`` resolves under the base cwd.
+
+    :returns: None.
+    """
+    expected = (tmp_path / "sub").resolve()
+    assert _created_cwd(_caller_process_spec("sub"), tmp_path) == expected
+
+
+def test_create_os_environment_absolute_cwd_ignores_base_cwd(tmp_path: Path) -> None:
+    """An absolute ``os_env.cwd`` wins over the base cwd.
+
+    :returns: None.
+    """
+    absolute = tmp_path / "explicit"
+    absolute.mkdir()
+    base = tmp_path / "base"
+    base.mkdir()
+    assert _created_cwd(_caller_process_spec(str(absolute)), base) == absolute.resolve()
+
+
+def test_create_os_environment_unset_cwd_uses_base_cwd(tmp_path: Path) -> None:
+    """An unset ``os_env.cwd`` falls back to the base cwd when given.
+
+    :returns: None.
+    """
+    assert _created_cwd(_caller_process_spec(None), tmp_path) == tmp_path.resolve()
+
+
+def test_create_os_environment_without_base_cwd_uses_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a base cwd the process cwd remains the fallback.
+
+    :returns: None.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert _created_cwd(_caller_process_spec("."), None) == tmp_path.resolve()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="cannot delete the cwd on Windows")
+def test_create_os_environment_survives_deleted_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted process cwd must not break base-cwd resolution.
+
+    Runner subprocesses historically inherited the host daemon's cwd;
+    when that directory had been deleted, ``os.getcwd()`` raised
+    ``FileNotFoundError`` during turn setup even though the session
+    workspace existed. With a base cwd supplied, resolution must never
+    consult the process cwd.
+
+    :returns: None.
+    """
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(doomed)
+    doomed.rmdir()
+
+    assert _created_cwd(_caller_process_spec("."), workspace) == workspace.resolve()
