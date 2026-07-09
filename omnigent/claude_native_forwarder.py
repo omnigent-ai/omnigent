@@ -521,6 +521,12 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Response id of the last turn-start ``running`` status POSTed, so the
+    # id-bearing running edge fires exactly once per turn even when an
+    # assistant item is held across polls for delta ordering (which leaves
+    # ``state.current_response_id`` unadvanced). ``None`` until the first
+    # turn-start edge. Reset on /clear and /fork like the other baselines.
+    posted_running_response_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -916,6 +922,14 @@ async def forward_claude_transcript_to_session(
                         task_subjects=task_subjects,
                         task_statuses=task_statuses,
                         task_order=task_order,
+                        # The turn-end edges (Stop→idle / StopFailure→failed)
+                        # carry the turn's response id so ap-web can CLOSE the
+                        # streaming ``activeResponse`` opened by the turn-start
+                        # ``running`` edge (_forward_available_items). The
+                        # transcript forwarder ran just above, so
+                        # ``state.current_response_id`` is the active turn's id
+                        # (the user-message reset only fires on the next turn).
+                        response_id=state.current_response_id,
                     )
                     subagent_state = await _forward_available_subagents(
                         client=client,
@@ -2510,6 +2524,7 @@ async def _forward_available_status_events(
     task_subjects: dict[str, str],
     task_statuses: dict[str, str],
     task_order: list[str],
+    response_id: str | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -2544,6 +2559,11 @@ async def _forward_available_status_events(
     :param task_order: Mutable ordered list of task ids in creation order,
         e.g. ``["1", "2", "3"]``. Appended in-place from ``TaskCreated``
         events. Used to render the task list in a stable order.
+    :param response_id: Active turn's response id, stamped on the
+        ``Stop``→``idle`` / ``StopFailure``→``failed`` edges so ap-web
+        closes the streaming ``activeResponse`` opened by the matching
+        turn-start ``running`` edge. ``None`` when no turn id is known
+        (the status still posts, just without a turn association).
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -2706,6 +2726,7 @@ async def _forward_available_status_events(
                 client,
                 session_id=session_id,
                 status=effective_status,
+                response_id=response_id,
                 # Only the ``Stop`` (idle/waiting) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # ``StopFailure`` (failed) clears it on the server regardless, so
@@ -2734,6 +2755,7 @@ async def _forward_available_status_events(
                         session_id=session_id,
                         bridge_dir=bridge_dir,
                         reason=f"hook status {status} rejected",
+                        response_id=response_id,
                     )
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
@@ -2817,6 +2839,31 @@ async def _ensure_state_for_transcript(
     return state
 
 
+def _turn_has_assistant_output(items: list[ClaudeTranscriptItem], response_id: str) -> bool:
+    """
+    Whether ``response_id`` has assistant-generated output among ``items``.
+
+    The turn-start ``running`` edge should open a streaming turn only for an id
+    that a later ``Stop``/``StopFailure`` hook will close — i.e. one produced by
+    an actual LLM turn. Assistant text (``message`` with ``role=assistant``) and
+    tool calls (``function_call``) qualify; a ``slash_command`` (``/model``,
+    ``/effort``) or ``terminal_command`` (``!cmd``) item opens an id with no LLM
+    turn behind it, so it must not.
+
+    :param items: Transcript items read this poll.
+    :param response_id: The current turn's response id.
+    :returns: ``True`` when an assistant-output item carries ``response_id``.
+    """
+    for item in items:
+        if item.response_id != response_id:
+            continue
+        if item.item_type == "function_call":
+            return True
+        if item.item_type == "message" and item.data.get("role") == "assistant":
+            return True
+    return False
+
+
 async def _forward_available_items(
     *,
     client: httpx.AsyncClient,
@@ -2866,6 +2913,49 @@ async def _forward_available_items(
     # never fired ``UserPromptSubmit``). PTY-activity status makes it
     # obsolete: the pane keeps changing through a mid-turn compaction, so
     # the runner's watcher holds the session ``running`` directly.
+    #
+    # Turn-start edge: the first time we see a turn's response id, publish a
+    # ``running`` status carrying it. The PTY watcher already drives the
+    # running/idle BADGE with a bare (id-less) status; this id-bearing edge is
+    # what lets ap-web open a *streaming* ``activeResponse`` for the turn, so
+    # the forwarded tool-call cards (which carry the same response id) render
+    # LIVE — spinner + elapsed timer — instead of as static completed cards.
+    # Deduped on the persistent ``dedupe`` baseline (NOT ``state``): when an
+    # assistant item is held across polls for delta ordering, this function
+    # early-returns with ``state`` unadvanced, so a ``state``-based guard would
+    # re-fire ``running`` every poll of the hold window. Best-effort — a failed
+    # status post must not abort item forwarding (the items below are the
+    # primary payload); the turn-end idle/failed edge still carries the id to
+    # close the lifecycle, and the badge is unaffected either way.
+    #
+    # Only open the streaming turn for an id that has ASSISTANT output in this
+    # poll's items. A surfaced CLI built-in (``/model``, ``/effort``) or a
+    # ``!cmd`` becomes a slash_command / terminal_command item that opens its
+    # own response id but runs no LLM turn, so no ``Stop`` hook ever fires to
+    # close it — a ``running`` opened for it would strand the web composer in
+    # its "Stop"/busy state until the next real message. A skill that DOES
+    # trigger an LLM turn shares its id with the assistant text it produces, so
+    # ``running`` still fires — one poll later, when that output appears.
+    if (
+        current_response_id is not None
+        and dedupe.posted_running_response_id != current_response_id
+        and _turn_has_assistant_output(items, current_response_id)
+    ):
+        try:
+            await post_external_session_status(
+                client,
+                session_id=session_id,
+                status="running",
+                response_id=current_response_id,
+            )
+            dedupe.posted_running_response_id = current_response_id
+        except httpx.HTTPError:
+            _logger.warning(
+                "Failed to forward Claude turn-start running status; session=%s response_id=%s",
+                session_id,
+                current_response_id,
+                exc_info=True,
+            )
     updated = state
     for item in items:
         if item.source_id in seen:
@@ -2924,6 +3014,7 @@ async def _forward_available_items(
                     session_id=session_id,
                     bridge_dir=bridge_dir,
                     reason=f"transcript item {item.source_id} rejected",
+                    response_id=current_response_id,
                 )
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
@@ -3555,22 +3646,29 @@ def _model_alias_for(model: str | None) -> str | None:
     Collapse a concrete Claude model id to the picker's tier alias.
 
     The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``); the
+    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
+    extra concrete-id slot ``"sonnet_5"`` (see
+    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the newer
+    Sonnet generation offered alongside the default ``"sonnet"`` tier; the
     transcript records the resolved concrete id (e.g.
-    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``).
+    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-5"``).
     Mapping to the tier keeps the mirrored value in the picker's
-    vocabulary and makes a web→TUI round-trip a no-op.
+    vocabulary and makes a web→TUI round-trip a no-op. The older Sonnet
+    (``sonnet-4-6``) collapses to the generic ``"sonnet"`` alias — it is the
+    default that row is bound to.
 
     :param model: Concrete model id from the transcript, e.g.
         ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``
-        when the id carries a known tier token, else ``None`` (the
-        caller skips the post rather than surface an id the picker
+    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_5"`` /
+        ``"haiku"`` when the id carries a known tier token, else ``None``
+        (the caller skips the post rather than surface an id the picker
         can't render).
     """
     if not model:
         return None
     lowered = model.lower()
+    if "sonnet-5" in lowered or "sonnet_5" in lowered:
+        return "sonnet_5"
     for tier in ("fable", "opus", "sonnet", "haiku"):
         if tier in lowered:
             return tier
@@ -3888,6 +3986,7 @@ async def _post_forwarder_failed_status(
     session_id: str,
     bridge_dir: Path,
     reason: str,
+    response_id: str | None = None,
 ) -> None:
     """
     Best-effort publish a failed status after dropping a poison event.
@@ -3897,11 +3996,19 @@ async def _post_forwarder_failed_status(
     :param bridge_dir: Native Claude bridge directory.
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
+    :param response_id: Active turn's response id, so this ``failed``
+        edge closes the streaming ``activeResponse`` for the matching
+        turn rather than leaving its tool cards spinning. ``None`` when
+        no turn id is known.
     :returns: None.
     """
     try:
         await post_external_session_status(
-            client, session_id=session_id, status="failed", output=reason
+            client,
+            session_id=session_id,
+            status="failed",
+            output=reason,
+            response_id=response_id,
         )
     except httpx.HTTPError:
         _logger.warning(

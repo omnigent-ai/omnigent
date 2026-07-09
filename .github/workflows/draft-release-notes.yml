@@ -7,9 +7,9 @@ name: Draft release notes
 #   1. Open a PR to omnigent/main updating the granular CHANGELOG.md (harvested
 #      from each merged PR's "## Changelog" section), so the draft's
 #      "Full Changelog" link resolves before the release goes public.
-#   2. Synthesize concise, curated two-section release notes (an Omnigent agent
-#      collapses the merged PRs into ~4-5 themed highlights per section) and drop
-#      them into the GitHub Release DRAFT body for the coordinator to edit.
+#   2. Synthesize concise, curated release notes (an Omnigent agent collapses the
+#      merged PRs into ~4-5 themed highlights per section) and drop them into the
+#      GitHub Release DRAFT body for the coordinator to edit.
 #
 # Why `workflow_run` (not extending github-release.yml): that workflow is
 # deliberately minimal — it runs NO project code, only `gh release create`, so a

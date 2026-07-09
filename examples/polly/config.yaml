@@ -273,12 +273,21 @@ os_env:
   sandbox:
     type: none
 
-# Generic shell terminal for long-running processes (dev servers, watchers, log
+# Generic shell terminals for long-running processes (dev servers, watchers, log
 # tails) and ad-hoc shell when sys_os_shell's blocking model doesn't fit. NOT
 # for launching coding agents / sub-agents — those go through sys_session_send.
+# bash and zsh are both offered; the "+ New shell" affordance picks between them.
 terminals:
   shell:
     command: bash
+    allow_cwd_override: true
+    os_env:
+      type: caller_process
+      cwd: .
+      sandbox:
+        type: none
+  zsh:
+    command: zsh
     allow_cwd_override: true
     os_env:
       type: caller_process

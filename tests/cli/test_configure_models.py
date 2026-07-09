@@ -1638,7 +1638,7 @@ def _overview_row_names(options: list[str], selectable: list[bool]) -> list[str]
 def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeypatch) -> None:
     """The overview shows every harness on one compact row, in 0.3 priority order.
 
-    No "More" folding: all twelve harnesses are visible at once, followed by
+    No "More" folding: all thirteen harnesses are visible at once, followed by
     Quit. A regression that hides a harness, reorders the core six, or
     reintroduces a collapse row fails here. The menu also opts into the compact
     top-level rendering.
@@ -1659,6 +1659,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Copilot",
         "Kiro",
         "Kimi Code",
+        "Custom ACP agent",
         "Quit",
     ]
     assert _overview_row_names(options, selectable) == expected
@@ -1677,6 +1678,38 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
     for row in expected:
         assert row in rendered
     assert "more" not in rendered.lower()
+
+
+def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypatch) -> None:
+    """Each configured ACP agent gets its own top-level overview row.
+
+    Promotes the generic-ACP agents out of the drill-in so they sit alongside
+    the built-in harnesses (matching the web picker, which lists each
+    ``acp:<slug>``), followed by an "Add custom ACP agent" row. A regression that
+    re-buries them under a single opaque "Custom ACP agent" row fails here.
+    """
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
+                        {"name": "My Goose", "command": "goose acp"},
+                    ]
+                }
+            },
+            f,
+        )
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    names = _overview_row_names(options, selectable)
+    assert "Gemini CLI" in names
+    assert "My Goose" in names
+    assert "Add custom ACP agent" in names
+    # Once agents exist, the single opaque "Custom ACP agent" row is gone.
+    assert "Custom ACP agent" not in names
 
 
 def test_overview_rows_are_single_line(isolated_config, monkeypatch) -> None:
@@ -1827,6 +1860,7 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("10", "_manage_copilot_harness"),
         ("11", "_manage_kiro_harness"),
         ("12", "_manage_kimi_harness"),
+        ("13", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -2521,19 +2555,18 @@ def test_cursor_overview_install_command_is_selection_only(
 ) -> None:
     """With the cursor extra absent, the Cursor row's install command is its description.
 
-    The exact ``pip install "omnigent[cursor]"`` (brackets included) is the
-    selection-only hint — the selector's per-row description, shown when the row
-    is highlighted — and is NOT baked into the always-visible row label. This is
-    the "tooltip only on selection" behavior.
+    The install command (dynamically computed) is the selection-only hint —
+    the selector's per-row description, shown when the row is highlighted —
+    and is NOT baked into the always-visible row label.
     """
     from rich.text import Text
 
     options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     cursor = names.index("Cursor")
-    assert 'pip install "omnigent[cursor]"' in Text.from_markup(descriptions[cursor]).plain
+    assert "omnigent[cursor]" in Text.from_markup(descriptions[cursor]).plain
     # The command lives in the description only — never the always-visible row.
-    assert "pip install" not in Text.from_markup(options[cursor]).plain
+    assert "omnigent[cursor]" not in Text.from_markup(options[cursor]).plain
 
 
 def test_cursor_drillin_offers_install_when_sdk_missing(
@@ -2550,7 +2583,7 @@ def test_cursor_drillin_offers_install_when_sdk_missing(
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
-    assert 'pip install "omnigent[cursor]"' in out
+    assert "omnigent[cursor]" in out
 
 
 def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absent) -> None:
@@ -2587,7 +2620,8 @@ def test_cursor_install_now_invokes_runner_without_index(
         calls.append(argv)
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr("omnigent.onboarding.cursor_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.extra_install._is_uv_tool_install", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.cursor_auth.subprocess.run", _run)
 
     # L1 3=Cursor → install offer 1=install now → key menu q=back → L1 q.
@@ -2765,19 +2799,17 @@ def test_antigravity_overview_install_command_is_selection_only(
 ) -> None:
     """With the antigravity extra absent, the Antigravity row's install command is its description.
 
-    The exact ``pip install "omnigent[antigravity]"`` (brackets included) is the
-    selection-only hint — the selector's per-row description — not baked into the
-    always-visible row. Without the SDK-detection branch the hint never appears.
+    The install command (dynamically computed) is the selection-only hint —
+    the selector's per-row description — not baked into the always-visible row.
+    Without the SDK-detection branch the hint never appears.
     """
     from rich.text import Text
 
     options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
     antigravity = names.index("Antigravity")
-    assert (
-        'pip install "omnigent[antigravity]"' in Text.from_markup(descriptions[antigravity]).plain
-    )
-    assert "pip install" not in Text.from_markup(options[antigravity]).plain
+    assert "omnigent[antigravity]" in Text.from_markup(descriptions[antigravity]).plain
+    assert "omnigent[antigravity]" not in Text.from_markup(options[antigravity]).plain
 
 
 @pytest.fixture()
@@ -2865,7 +2897,7 @@ def test_antigravity_drillin_offers_install_when_sdk_missing(
     assert result.exit_code == 0, result.output
     out = result.output
     assert "isn't installed" in out
-    assert 'pip install "omnigent[antigravity]"' in out
+    assert "omnigent[antigravity]" in out
 
 
 def test_antigravity_key_settable_when_sdk_missing(
@@ -2904,7 +2936,8 @@ def test_antigravity_install_now_invokes_runner_without_index(
         calls.append(argv)
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
-    monkeypatch.setattr("omnigent.onboarding.antigravity_auth.shutil.which", lambda name: None)
+    monkeypatch.setattr("omnigent.onboarding.extra_install._is_uv_tool_install", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.antigravity_auth.subprocess.run", _run)
 
     # L1 7=Antigravity → install offer 1=install now →

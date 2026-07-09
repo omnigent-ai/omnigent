@@ -54,12 +54,13 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionChip } from "@/components/blocks/StatusBlocks";
+import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
+import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
@@ -107,6 +108,7 @@ import {
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
   type PendingUserMessage,
+  type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
@@ -136,6 +138,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
 import {
@@ -174,6 +177,9 @@ import {
   useCodexGoalState,
   type CodexGoal,
 } from "@/components/codex";
+import { copyText } from "@/lib/clipboard";
+import { showToast } from "@/components/ui/toast";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -463,6 +469,27 @@ export function shouldShowAuthorBadge(
   isSessionShared: boolean,
 ): boolean {
   return isSessionShared && author !== undefined && author !== viewerId;
+}
+
+/**
+ * Whether a submitted message should be queued rather than POSTed now.
+ *
+ * Queue when busy, or when this conversation already has a queued message even
+ * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
+ * later direct send could overtake a still-queued earlier one when status
+ * flickers idle mid-queue (cursor-native). A new chat always sends.
+ */
+export function shouldQueueSend(
+  conversationId: string | null,
+  status: "idle" | "streaming",
+  sessionStatus: SessionStatus,
+  queuedMessages: QueuedMessage[],
+): boolean {
+  if (conversationId === null) return false;
+  const isBusy =
+    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  return isBusy || hasQueued;
 }
 
 // Author labels render only in a shared session; ChatPage provides the
@@ -968,6 +995,15 @@ export function ChatPage() {
     // a void.
     if (urlConvId && isUnreachable) {
       setReconnectDialogOpen(true);
+      return;
+    }
+    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+    // FIFO immediately when genuinely idle, so nothing stalls.
+    const chat = useChatStore.getState();
+    if (
+      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
+    ) {
+      chat.enqueueMessage(text, files);
       return;
     }
     void useChatStore.getState().send(text, agentId, files, {
@@ -1555,10 +1591,10 @@ function MainAgentSurface({
     [onSendSlashCommand, isNativeWrapper],
   );
 
-  // "Working…" is shown when the main session is busy, including after a
-  // reload that hydrates `running` before any bubbles exist locally. Streaming
-  // assistant content and compaction spinners own the in-progress slot once
-  // they have rendered.
+  // "Working…" stays lit for the whole busy turn — through streaming text,
+  // tool runs, and reasoning gaps — including after a reload that hydrates
+  // `running` before any bubbles exist locally. Only a trailing compaction
+  // spinner suppresses it (that bubble owns the slot with its own animation).
   const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
   if (showTerminal && conversationId) {
@@ -1657,10 +1693,11 @@ function MainAgentSurface({
                     </MessageContent>
                   </Message>
                 ))}
-                {/* Working… shimmer between send and first rendered block.
-                    Suppressed when the last bubble is a compaction spinner —
-                    that bubble already owns the "in-progress" slot. aria-hidden:
-                    the pinned pill owns the single aria-live region (see WorkingStatusPin). */}
+                {/* Working… shimmer, lit for the whole busy turn so the user
+                    always sees the session is still going. Suppressed when the
+                    last bubble is a compaction spinner — that bubble already
+                    owns the "in-progress" slot. aria-hidden: the pinned pill
+                    owns the single aria-live region (see WorkingStatusPin). */}
                 {showWorkingIndicator && <WorkingIndicator />}
                 {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
@@ -1817,6 +1854,8 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
  */
 function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
   const { isAtBottom } = useStickToBottomContext();
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const tick = useWorkingLabelTick();
   const visible = show && !isAtBottom && !suppress;
   return (
     <div
@@ -1830,18 +1869,23 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
         visible ? "opacity-100" : "opacity-0",
       )}
     >
+      {/* The single announced string. Held stable at "Working…" so the rotating
+          tab text below never re-announces every few seconds. Present whenever
+          the agent is working, so it announces whether the tab is painted
+          (scrolled up) or collapsed (at the bottom, where the inline shimmer
+          owns the visuals). */}
+      {show && <span className="sr-only">Working…</span>}
       {/* Mirror the conversation content column (mx-auto + px-6 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
       <div className={cn("mx-auto w-full px-6", CHAT_COLUMN_WIDTH)}>
-        {/* Gated on `show` (not `visible`) so the aria-live region always holds
-            the "Working…" text while the agent is working — that's what gets
-            announced. When at the bottom (`!visible`) the inline shimmer owns
-            the visuals, so the pill collapses to sr-only: still announced, but
-            not painted. Scrolled up, it renders as the visible tab. */}
         {show && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
-          // its flat bottom edge merges into the chat box.
+          // its flat bottom edge merges into the chat box. aria-hidden: the
+          // sr-only span above owns the announcement, so the rotating label
+          // here stays silent to screen readers. Collapses to sr-only when at
+          // the bottom (`!visible`) — the inline shimmer paints there instead.
           <div
+            aria-hidden="true"
             className={cn(
               "flex w-fit items-center gap-1.5 rounded-t-lg border border-b-0 border-border bg-card px-3 pt-1 pb-1.5",
               !visible && "sr-only",
@@ -1849,7 +1893,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-xs font-mono" duration={1.5}>
-              Working…
+              {workingIndicatorLabel(bgCount, tick)}
             </Shimmer>
           </div>
         )}
@@ -2288,47 +2332,40 @@ function bubbleKey(bubble: Bubble): string {
 }
 
 /**
- * True when there's an assistant bubble whose stream is still in
- * progress (lifecycle "streaming", at least one item rendered). Used
- * to suppress the "Working…" shimmer once content starts arriving.
+ * Playful labels the idle-but-busy indicator rotates through (one per
+ * `ROTATE_MS`). Index 0 MUST stay "Working…": it's the label a fresh tick
+ * (and every unit test) lands on. Keep each entry a single short word +
+ * ellipsis — `Shimmer` scales its sweep width to the text length, so uniform
+ * lengths keep the animation steady across rotations.
  */
-function hasInProgressAssistantBubble(bubbles: Bubble[]): boolean {
-  return bubbles.some(
-    (b) => b.kind === "assistant" && b.lifecycle === "streaming" && b.items.length > 0,
-  );
-}
+export const WORKING_MESSAGES = [
+  "Working…",
+  "Cooking…",
+  "Crunching…",
+  "Tinkering…",
+  "Pondering…",
+  "Brewing…",
+] as const;
 
 /**
- * Decide whether to render the main chat's "Working…" indicator.
- *
- * A reload can hydrate a custom-agent session as ``running`` before any
- * committed or pending bubble is available locally — keep the indicator
- * visible in that empty-but-busy state.
- *
- * @param showsWorking - True when the session snapshot or local response
- *   state says the main session is still working.
- * @param bubbles - Rendered chat bubbles currently hydrated in the main
- *   session, e.g. assistant, user, or compaction-loading bubbles.
- * @returns True when the standalone working indicator should render; false
- *   when the session is idle, a streaming assistant bubble has rendered at
- *   least one item, or a compaction-loading bubble already represents the
- *   busy state.
- */
-/**
  * The label shown next to the working spinner. When background shells outlive
- * the turn (`bgCount > 0`) it names how many are still running; otherwise it's
- * the plain "Working…" string.
+ * the turn (`bgCount > 0`) it names how many are still running (the tick is
+ * ignored — that count is information, not decoration). Otherwise it rotates
+ * through `WORKING_MESSAGES` by wall-clock `tick`.
  */
-export function workingIndicatorLabel(bgCount: number): string {
-  if (bgCount <= 0) return "Working…";
-  return bgCount === 1
-    ? "1 background task still running"
-    : `${bgCount} background tasks still running`;
+export function workingIndicatorLabel(bgCount: number, tick = 0): string {
+  if (bgCount > 0) {
+    return bgCount === 1
+      ? "1 background task still running"
+      : `${bgCount} background tasks still running`;
+  }
+  return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
 
 function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const label = workingIndicatorLabel(bgCount);
+  const tick = useWorkingLabelTick();
+  const label = workingIndicatorLabel(bgCount, tick);
   return (
     <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
       <MessageContent>
@@ -2343,9 +2380,25 @@ function WorkingIndicator() {
   );
 }
 
+/**
+ * Decide whether to render the main chat's "Working…" indicator.
+ *
+ * Lit for the whole busy turn — through streaming text, tool runs, and
+ * reasoning gaps — so the user always sees the session is still going. A
+ * reload can hydrate a custom-agent session as ``running`` before any bubble
+ * exists locally; the indicator stays visible in that empty-but-busy state
+ * too.
+ *
+ * @param showsWorking - True when the session snapshot or local response
+ *   state says the main session is still working.
+ * @param bubbles - Rendered chat bubbles currently hydrated in the main
+ *   session, e.g. assistant, user, or compaction-loading bubbles.
+ * @returns True when the standalone working indicator should render; false
+ *   when the session is idle, or a compaction-loading bubble is last and
+ *   already represents the busy state with its own animation.
+ */
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
-  if (hasInProgressAssistantBubble(bubbles)) return false;
   return bubbles[bubbles.length - 1]?.kind !== "compaction_loading";
 }
 
@@ -2778,11 +2831,11 @@ export const BubbleView = memo(
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
       return (
-        <RoutingDecisionChip
+        <RoutingDecisionCard
           model={bubble.model}
-          tier={bubble.tier}
           applied={bubble.applied}
           rationale={bubble.rationale}
+          agent={bubble.agent}
         />
       );
     }
@@ -2790,6 +2843,52 @@ export const BubbleView = memo(
   },
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
 );
+
+/**
+ * Copy-to-clipboard handler for a message bubble's "Copy" action.
+ *
+ * Uses the shared {@link copyText} helper (async Clipboard API with an
+ * `execCommand` fallback) rather than `navigator.clipboard.writeText`
+ * directly — the latter is undefined in the iOS webview and on non-secure
+ * origins, where a bare guard made the button silently no-op. Drives the
+ * inline check-icon confirmation for 2s, and on mobile (where the desktop
+ * hover affordance and tooltip aren't visible) also fires a toast so the
+ * copy is confirmed.
+ *
+ * @param getText - Produces the text to copy at click time.
+ * @returns `{ isCopied, handleCopy }` for the action button.
+ */
+function useCopyMessage(getText: () => string): {
+  isCopied: boolean;
+  handleCopy: () => void;
+} {
+  const [isCopied, setIsCopied] = useState(false);
+  const timeoutRef = useRef<number>(0);
+  const isMobile = useIsMobileViewport();
+
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  const handleCopy = useCallback(() => {
+    if (isCopied) return;
+    const text = getText();
+    if (!text) return;
+    copyText(text).then(
+      () => {
+        setIsCopied(true);
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
+        if (isMobile) {
+          showToast(<span className="text-sm">Copied to clipboard</span>, { duration: 1500 });
+        }
+      },
+      (error) => {
+        console.warn("Failed to copy message", error);
+      },
+    );
+  }, [getText, isCopied, isMobile]);
+
+  return { isCopied, handleCopy };
+}
 
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
@@ -2826,6 +2925,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
+  const { isCopied, handleCopy } = useCopyMessage(() => text);
+
   return (
     <Message
       from="user"
@@ -2945,6 +3046,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
+      {text && (
+        <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <MessageAction tooltip="Copy" onClick={handleCopy}>
+            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+          </MessageAction>
+        </MessageActions>
+      )}
     </Message>
   );
 }
@@ -2955,8 +3063,10 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const [isCopied, setIsCopied] = useState(false);
-  const copyTimeoutRef = useRef<number>(0);
+  // Getter computes the markdown lazily at click time — the hook must run
+  // before the early return below (rules of hooks), but `markdownText` is
+  // derived after it.
+  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
 
@@ -2968,18 +3078,6 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide = hasElicitation || containsMarkdownTable(bubble.items);
-
-  const handleCopy = async () => {
-    if (!markdownText || !navigator?.clipboard?.writeText) return;
-    try {
-      await navigator.clipboard.writeText(markdownText);
-      setIsCopied(true);
-      window.clearTimeout(copyTimeoutRef.current);
-      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-    } catch {
-      // ignore clipboard errors
-    }
-  };
 
   return (
     <>
@@ -3613,6 +3711,34 @@ export function Composer({
   // module scope (not useRef) because Composer unmounts during the
   // loading gate between session switches.
   const conversationId = useChatStore((s) => s.conversationId);
+  const queuedMessages = useChatStore((s) => s.queuedMessages);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
+  const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
+  const dequeueMessage = useChatStore((s) => s.dequeueMessage);
+  const steerMessage = useChatStore((s) => s.steerMessage);
+  const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  // Drain the queue whenever idle with a waiting head — level-triggered so a
+  // message queued right after the turn ended (or after an SSE reconnect that
+  // carries no fresh idle transition) still sends instead of stranding. Hold
+  // while unreachable: flushing would POST into a void (no executor / no host
+  // to wake), bypassing onSend's reconnect dialog. The next reachable render
+  // re-fires this effect and drains. `boundAgentId` is a dep because the flush
+  // needs it: on navigate-back the binding lands after the status settles, and
+  // without this dep the effect wouldn't re-fire to drain a queue for the
+  // returned-to conversation.
+  useEffect(() => {
+    if (unreachable) return;
+    maybeFlushQueuedHead();
+  }, [
+    status,
+    sessionStatus,
+    queuedMessages,
+    conversationId,
+    flushBoundAgentId,
+    unreachable,
+    maybeFlushQueuedHead,
+  ]);
   const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
     conversationId,
     showCodexGoal,
@@ -4300,6 +4426,28 @@ export function Composer({
           }
         }}
       />
+      {/* Queued messages — peeks above the card like the sub-agent tray.
+          Lists follow-ups held while the agent is busy; drains FIFO on idle.
+          Scope to this conversation so a queue held elsewhere never leaks in. */}
+      <QueuedMessagesStrip
+        messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
+        onDelete={dequeueMessage}
+        onEdit={(queueId) => {
+          // Pull the queued message back into the composer for editing:
+          // replace the composer's text + attachments with the queued
+          // message's, remove it from the queue, and focus the textarea.
+          // Re-sending re-queues it (busy) or sends it (idle).
+          const target = queuedMessages.find((m) => m.queueId === queueId);
+          if (!target) return;
+          setValue(target.text);
+          setFiles(target.files ?? []);
+          dequeueMessage(queueId);
+          textareaRef.current?.focus();
+        }}
+        onSteer={(queueId) => steerMessage(queueId)}
+        onReorder={reorderQueuedMessage}
+        widthClassName={CHAT_COLUMN_WIDTH}
+      />
       {/* Sub-agent context tray — peeks above the card; reserves its own
           layout slot so the card sits below it (see SubagentComposerTray).
           Truthy (not just non-null) so an empty label never peeks a
@@ -4972,9 +5120,18 @@ export function shouldShowCodexGoalControl(
  * Highlight a model row when ``selectedModel`` is null by matching the
  * bound spec ``llmModel`` to its tier alias (e.g.
  * ``"anthropic/claude-opus-4-8"`` matches ``"opus"``).
+ *
+ * Sonnet 5 is special-cased both ways: its concrete id ("...-sonnet-5")
+ * would otherwise substring-match the generic "sonnet" row (since "sonnet"
+ * is itself a substring), and its own opt-in row id ("sonnet_5") never
+ * literally appears in a hyphenated concrete id. The default "sonnet" row
+ * stays bound to the older Sonnet (4.6), which collapses to it normally.
  */
 export function isModelImplicitlySelected(modelId: string, llmModel: string | null): boolean {
   if (!llmModel) return false;
+  const isSonnet5 = llmModel.includes("sonnet-5") || llmModel.includes("sonnet_5");
+  if (modelId === "sonnet_5") return isSonnet5;
+  if (modelId === "sonnet" && isSonnet5) return false;
   return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
 }
 

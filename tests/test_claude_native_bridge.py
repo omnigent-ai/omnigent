@@ -4852,6 +4852,85 @@ def test_claude_prompt_rendered_sees_prompt_above_default_footer() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_above_running_turn_footer() -> None:
+    """
+    The readiness scan reaches the prompt above a tall running-turn footer.
+
+    When a web-UI message is injected while Claude is mid-turn, the footer
+    grows extra status rows below the input box — a running-subagent line
+    (``○ Explore …``) on top of the usual box rule, model, auto-mode, and
+    branch rows. That pushes the live ``❯`` row to the 6th non-empty line
+    from the bottom, one past the old 5-line window, so the readiness gate
+    timed out and the web UI rendered a spurious "did not become ready"
+    runtime-error card even though the terminal was healthy.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live prompt row (6th non-empty line from bottom)
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | thinking medium",  # model + effort line
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",  # permission-mode hint
+            "  main",  # branch label
+            "  ○ Explore  Find session sidebar state… 1m 4s",  # subagent status
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_above_subagent_fanout_footer() -> None:
+    """
+    The readiness scan reaches the prompt above an unbounded subagent footer.
+
+    A subagent fan-out renders one ``○ Explore …`` row per concurrent
+    subagent, so the running-turn footer height is unbounded. Here five
+    subagents plus the model/auto-mode/branch rows push the live ``❯`` row
+    to the 12th non-empty line from the bottom — far past any fixed scan
+    window. The box rule below ``❯`` (the input box's closing frame) is
+    what admits it, so the scan must reach the glyph at this depth and the
+    web UI must NOT render a spurious "did not become ready" card.
+    """
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",  # input box top rule
+            "❯ Press up to edit queued messages",  # the live prompt row
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | thinking medium | 398.1k/1M (39%)",
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+            "  main",
+            "  ○ Explore  Angle A: line-by-line diff scan   1m 35s",
+            "  ○ Explore  Angle C: cross-file tracer         56s",
+            "  ○ Explore  Angle D: reuse                      46s",
+            "  ○ Explore  Angle F: efficiency                 31s",
+            "  ○ Explore  Angle G: altitude                   21s",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
+    """
+    A glyph in the wider window without a box rule below is not trusted.
+
+    The framed window that lets the scan reach a prompt under a tall
+    running-turn footer must not resurrect the scrollback false positive:
+    a ``❯`` echoed into prior output sits in the wider window too, but
+    without the input box's closing ``────`` rule beneath it. Only plain
+    output follows here, so the gate must still report "not ready".
+    """
+    pane = "\n".join(
+        [
+            "❯ old prompt echo",  # 6th non-empty line from bottom, no rule below
+            "output line 1",
+            "output line 2",
+            "output line 3",
+            "output line 4",
+            "output line 5",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
     """
     Append raw JSONL lines to the bridge deltas file.
@@ -5239,6 +5318,84 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     assert "did not become ready" in message
     assert "Last terminal output:" in message
     assert "JSON Parse error: Unrecognized token '<'" in message
+
+
+def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A timeout where every capture came back empty says so in the error.
+
+    An empty ``capture-pane`` (a torn read under a busy mid-turn repaint,
+    not a boot crash) leaves no tail to attach. Without the poll/empty
+    counts the error is indistinguishable from "Claude never rendered a
+    prompt", which is what sent triage down the wrong path. The counts make
+    the two failure modes tell themselves apart.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._capture_pane",
+        lambda socket_path, tmux_target: "",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "did not become ready" in message
+    # One poll happened (do-while), and it was empty.
+    assert "1 polls, 1 empty captures" in message
+    # No pane text to surface when every capture was empty.
+    assert "Last terminal output:" not in message
+
+
+def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The attached tail is a capture the loop saw, not a post-timeout one.
+
+    The bug this guards: attaching a fresh capture taken *after* the
+    deadline can show a healthier frame (e.g. the input box repainting as
+    the turn settles) than any decision the loop actually made, so the
+    error misrepresents why the gate failed. The tail must come from a
+    capture observed while the loop was still deciding. A box-less capture
+    followed by a box-present one that arrives only after the deadline
+    proves the point: the box-present frame must NOT leak into the error.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    observed = "  ✱ Working…\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    # A frame that would satisfy the readiness check, but only ever returned
+    # after the deadline has passed — mimicking the box repainting late.
+    late_ready = "────────────────\n❯ \n────────────────\n  Opus 4.8\n"
+    calls = {"n": 0}
+
+    def fake_capture(socket_path: str, tmux_target: str) -> str:
+        calls["n"] += 1
+        # First (and only, at timeout_s=0) in-loop capture: no box.
+        # Any later capture would be the box-present frame — which the
+        # rewritten gate must never fetch, since it does not re-capture.
+        return observed if calls["n"] == 1 else late_ready
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._capture_pane", fake_capture)
+    with pytest.raises(RuntimeError) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    # The tail reflects what the loop observed, and the late box-present
+    # frame never appears — proving no post-deadline re-capture happened.
+    assert "auto mode on" in message
+    assert "❯" not in message
+    assert calls["n"] == 1
 
 
 # ── _hook_record_from_jsonl_record: background_task_count ────────────────────

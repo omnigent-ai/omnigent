@@ -33,6 +33,7 @@ import {
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { coercePolicyParams } from "@/lib/policyParams";
 
 // ---------------------------------------------------------------------------
@@ -52,6 +53,7 @@ function AddDefaultPolicyDialog({
 }) {
   const [selected, setSelected] = useState<string>("");
   const [filter, setFilter] = useState("");
+  const [policyName, setPolicyName] = useState<string>("");
   const [factoryParams, setFactoryParams] = useState<Record<string, string>>({});
   const [paramError, setParamError] = useState<string | null>(null);
   const addPolicy = useAddDefaultPolicy();
@@ -78,8 +80,10 @@ function AddDefaultPolicyDialog({
   const paramKeys = Object.keys(properties);
 
   function handleSelect(handler: string) {
+    const e = registry.find((r) => r.handler === handler);
     setSelected(handler);
     setFilter("");
+    setPolicyName(e ? e.name.toLowerCase().replace(/\s+/g, "_") : "");
     setFactoryParams({});
     setParamError(null);
   }
@@ -100,7 +104,7 @@ function AddDefaultPolicyDialog({
       entry.kind === "factory" ? { factory_params: parsedParams ?? {} } : {};
     addPolicy.mutate(
       {
-        name: entry.name.toLowerCase().replace(/\s+/g, "_"),
+        name: policyName || entry.name.toLowerCase().replace(/\s+/g, "_"),
         type: "python",
         handler: entry.handler,
         ...includeFactoryParams,
@@ -108,6 +112,7 @@ function AddDefaultPolicyDialog({
       {
         onSuccess: () => {
           setSelected("");
+          setPolicyName("");
           setFactoryParams({});
           onOpenChange(false);
         },
@@ -116,13 +121,25 @@ function AddDefaultPolicyDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        // Reset to the policy list on close so reopening never lands mid-config.
+        if (!next) {
+          setSelected("");
+          setPolicyName("");
+          setFactoryParams({});
+          setParamError(null);
+        }
+        onOpenChange(next);
+      }}
+    >
       <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Add Global Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply globally to all sessions.</DialogDescription>
         </DialogHeader>
-        <div className="space-y-3 pt-1">
+        <div className="min-w-0 space-y-3 pt-1">
           {!selected &&
             (() => {
               const available = registry.filter((r) => !appliedHandlers.has(r.handler));
@@ -180,6 +197,7 @@ function AddDefaultPolicyDialog({
                   type="button"
                   onClick={() => {
                     setSelected("");
+                    setPolicyName("");
                     setFactoryParams({});
                     setParamError(null);
                   }}
@@ -191,6 +209,19 @@ function AddDefaultPolicyDialog({
               {entry.description && (
                 <p className="text-xs text-muted-foreground">{entry.description}</p>
               )}
+            </div>
+          )}
+          {entry && (
+            <div>
+              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">name</span>
+              </label>
+              <input
+                type="text"
+                value={policyName}
+                onChange={(e) => setPolicyName(e.target.value)}
+                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+              />
             </div>
           )}
           {entry?.kind === "factory" && paramKeys.length > 0 && (
@@ -214,7 +245,9 @@ function AddDefaultPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="text-[11px] text-muted-foreground">{prop.description}</p>
+                      <p className="break-all text-[11px] text-muted-foreground">
+                        {prop.description}
+                      </p>
                     )}
                     {prop?.type === "boolean" ? (
                       <select
@@ -325,7 +358,17 @@ function AddDefaultPolicyDialog({
           <div className="flex justify-end gap-2 pt-1">
             <button
               type="button"
-              onClick={() => onOpenChange(false)}
+              onClick={() => {
+                // With a policy selected, Cancel steps back to the list so the
+                // user can pick another; only close the dialog from the list.
+                if (selected) {
+                  setSelected("");
+                  setFactoryParams({});
+                  setParamError(null);
+                } else {
+                  onOpenChange(false);
+                }
+              }}
               className="rounded px-3 py-1.5 text-xs hover:bg-muted"
             >
               Cancel
@@ -350,6 +393,15 @@ function AddDefaultPolicyDialog({
 // ---------------------------------------------------------------------------
 
 export function PoliciesPage() {
+  const info = useServerInfo();
+  // Plain header/single-user mode: no auth endpoints exist. server_version
+  // distinguishes a live single-user server from a failed /v1/info probe
+  // (which uses the same accounts_enabled:false / login_url:null sentinel).
+  const isSingleUser =
+    info !== "loading" &&
+    !info.accounts_enabled &&
+    info.login_url === null &&
+    info.server_version !== null;
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const { data: policies = [], refetch } = useDefaultPolicies();
   const { data: registry = [] } = usePolicyRegistry();
@@ -368,17 +420,18 @@ export function PoliciesPage() {
   }, [refetch]);
 
   // Admin probe via the mode-agnostic `/v1/me` identity (works under OIDC
-  // too, unlike the accounts-only `/auth/me`). resolveIdentity handles the
-  // login redirect when unauthenticated, so we only set the admin flag here.
+  // too, unlike the accounts-only `/auth/me`). Skipped in single-user mode
+  // because no auth endpoints exist and the backend skips admin enforcement.
   useEffect(() => {
+    if (isSingleUser) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
     })();
-  }, []);
+  }, [isSingleUser]);
 
-  if (meIsAdmin === null) {
+  if (!isSingleUser && meIsAdmin === null) {
     return (
       <div className="flex min-h-full items-center justify-center text-sm text-muted-foreground">
         Loading...
@@ -386,7 +439,7 @@ export function PoliciesPage() {
     );
   }
 
-  if (meIsAdmin === false) {
+  if (!isSingleUser && meIsAdmin === false) {
     return (
       <div className="mx-auto w-full max-w-2xl px-6 py-12">
         <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>

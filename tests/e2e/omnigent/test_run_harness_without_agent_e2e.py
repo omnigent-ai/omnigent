@@ -177,6 +177,11 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``HARNESS_GOOSE_GATEWAY*`` vars for this matrix to drive. Its live round-trip
     is covered by the dedicated ``test_goose_acp_e2e.py`` suite.
 
+    ``acp`` (the generic ACP harness) is excluded because it has no fixed binary
+    or command of its own — it drives whatever ACP-agent command the user
+    registers in the ``acp:`` config block, so there is nothing for this
+    binary-less no-agent matrix to probe.
+
     ``goose-native`` is excluded for the same reason as ``claude-native`` /
     ``cursor-native``: it is a terminal-first TUI launched via ``omni goose``
     (tmux pane + bridge dir), not ``omnigent run --harness goose-native``.
@@ -222,6 +227,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     approval-mirror unit tests.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
+        "acp",
         "claude-native",
         "codex-native",
         "pi-native",

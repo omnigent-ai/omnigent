@@ -75,6 +75,7 @@ def test_create_returns_policy_with_correct_fields(
 
     assert policy.id == "pol_test1"
     assert policy.session_id == session_id
+    assert policy.scope == "session"
     assert policy.name == "block_push"
     assert policy.type == "python"
     assert policy.handler == "github_mcp_policy.block_push"
@@ -405,6 +406,7 @@ def test_create_default_returns_policy(store: SqlAlchemyPolicyStore) -> None:
     )
     assert policy.id == "dpol_1"
     assert policy.session_id is None
+    assert policy.scope == "default"
     assert policy.name == "default_block"
     assert policy.type == "python"
     assert policy.handler == "mod.default_handler"

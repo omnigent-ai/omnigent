@@ -29,7 +29,11 @@
     "               (auto-assign-reviewer.fixture.json), so ownership changes here",
     "               do not churn them. areas.test.js validates this file (every",
     "               owner in MAINTAINER, real comp:* label, 2+ owners, path",
-    "               resolution)."
+    "               resolution).",
+    "  owners_paused - optional. Owners temporarily benched (e.g. OOO). Ignored by",
+    "               every reader -- only `owners` is used for routing -- so this is",
+    "               the 'commented out, not deleted' form: to re-activate someone,",
+    "               move their login from owners_paused back into owners."
   ],
   "areas": [
     {
@@ -93,12 +97,14 @@
       ],
       "owners": [
         "dhruv0811",
-        "dbczumar",
         "TomeHirata",
         "SabhyaC26",
         "bbqiu",
         "fanzeyi",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -110,10 +116,12 @@
       ],
       "owners": [
         "dhruv0811",
-        "dbczumar",
         "bbqiu",
         "fanzeyi",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -125,10 +133,12 @@
       ],
       "owners": [
         "dhruv0811",
-        "dbczumar",
         "bbqiu",
         "fanzeyi",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -140,12 +150,14 @@
       ],
       "owners": [
         "dhruv0811",
-        "dbczumar",
         "TomeHirata",
         "SabhyaC26",
         "bbqiu",
         "fanzeyi",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -181,10 +193,12 @@
         "omnigent/spec/"
       ],
       "owners": [
-        "dbczumar",
         "TomeHirata",
         "SabhyaC26",
         "bbqiu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -210,8 +224,10 @@
       "owners": [
         "fanzeyi",
         "dhruv0811",
-        "dbczumar",
         "bbqiu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -223,7 +239,9 @@
       ],
       "owners": [
         "SabhyaC26",
-        "fanzeyi",
+        "fanzeyi"
+      ],
+      "owners_paused": [
         "dbczumar"
       ]
     },
@@ -237,10 +255,12 @@
       "owners": [
         "bbqiu",
         "aravind-segu",
-        "dbczumar",
         "fanzeyi",
         "dhruv0811",
         "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -253,13 +273,15 @@
       "owners": [
         "bbqiu",
         "aravind-segu",
-        "dbczumar",
         "fanzeyi",
         "dhruv0811",
         "SabhyaC26",
         "serena-ruan",
         "daniellok-db",
         "TomeHirata"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -270,12 +292,14 @@
         "omnigent/terminals/"
       ],
       "owners": [
-        "dbczumar",
         "fanzeyi",
         "dhruv0811",
         "aravind-segu",
         "bbqiu",
         "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -287,12 +311,14 @@
       ],
       "owners": [
         "dhruv0811",
-        "dbczumar",
         "TomeHirata",
         "SabhyaC26",
         "bbqiu",
         "fanzeyi",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -318,7 +344,9 @@
         "dhruv0811",
         "fanzeyi",
         "serena-ruan",
-        "daniellok-db",
+        "daniellok-db"
+      ],
+      "owners_paused": [
         "dbczumar"
       ]
     },
@@ -345,8 +373,10 @@
       "owners": [
         "dhruv0811",
         "PattaraS",
-        "dbczumar",
         "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -359,11 +389,13 @@
       "owners": [
         "dhruv0811",
         "fanzeyi",
-        "dbczumar",
         "SabhyaC26",
         "TomeHirata",
         "bbqiu",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -376,12 +408,14 @@
       ],
       "owners": [
         "dhruv0811",
-        "dbczumar",
         "TomeHirata",
         "SabhyaC26",
         "bbqiu",
         "fanzeyi",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -396,12 +430,14 @@
       ],
       "owners": [
         "dhruv0811",
-        "dbczumar",
         "TomeHirata",
         "SabhyaC26",
         "bbqiu",
         "fanzeyi",
         "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {
@@ -414,6 +450,9 @@
       ],
       "owners": [
         "SabhyaC26",
+        "dhruv0811"
+      ],
+      "owners_paused": [
         "dbczumar"
       ]
     },
@@ -502,8 +541,10 @@
         "dhruv0811",
         "PattaraS",
         "TomeHirata",
-        "dbczumar",
         "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
       ]
     },
     {

@@ -36,6 +36,8 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListWorktreesFrame,
+    HostListWorktreesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -49,6 +51,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
+    list_worktrees,
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
@@ -279,6 +282,15 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # executor.profile propagated into the daemon's env).
         "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_CONFIG_FILE",
+        # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
+        # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
+        # Without it a runner falls back to the ~/.databrickscfg [__settings__]
+        # auth_storage default and can resolve a DIFFERENT token store than the
+        # host/daemon (which inherits it via the daemon env's DATABRICKS_ prefix
+        # in cli.py). That mismatch makes the runner read an empty/stale store
+        # and fail to mint a token — the runner tunnel is rejected with HTTP 401
+        # even though the host authenticated fine.
+        "DATABRICKS_AUTH_STORAGE",
         # Runtime config/data-dir selection. These are filesystem PATHS, not
         # secrets, so they're safe to propagate to the host owner's own
         # daemon/runner subprocesses. They MUST propagate so the whole local
@@ -1043,10 +1055,18 @@ class HostProcess:
         try:
             log_dir = _runner_log_dir()
             log_dir.mkdir(parents=True, exist_ok=True)
+            # Embed the session id so operators can find all logs for a
+            # session with `omnigent debug logs --session <id>`. Cap at 32
+            # chars to keep filenames manageable; strip anything non-word to
+            # guard against unexpected id shapes from older servers.
+            import re
             import tempfile
 
+            _session_slug = (
+                re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
+            )
             _log_fd, _log_name = tempfile.mkstemp(
-                prefix="runner-",
+                prefix=f"runner-{_session_slug}",
                 suffix=".log",
                 dir=log_dir,
             )
@@ -1097,9 +1117,11 @@ class HostProcess:
         # Print the exact runner log file (not just the dir): a foreground
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
+        session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
         print(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
-            f"    log: {_display_log_path(log_path)}",
+            f"    log: {_display_log_path(log_path)}"
+            f"{session_line}",
             flush=True,
         )
         return HostLaunchRunnerResultFrame(
@@ -1522,6 +1544,47 @@ class HostProcess:
             status="ok",
         )
 
+    async def _handle_list_worktrees(
+        self,
+        frame: HostListWorktreesFrame,
+    ) -> HostListWorktreesResultFrame:
+        """Handle a ``host.list_worktrees`` request from the server.
+
+        Runs the blocking git work in a worker thread so the tunnel
+        loop keeps servicing pings.
+
+        :param frame: The list-worktrees request frame.
+        :returns: Result frame with the worktrees on success, or
+            ``status: "failed"`` with an error message.
+        """
+        try:
+            # Pause the orphan reaper while git runs — see
+            # _handle_create_worktree above and _reap_orphans_once.
+            with self._host_subprocess_op():
+                worktrees = await asyncio.to_thread(
+                    list_worktrees,
+                    repo_path=frame.repo_path,
+                )
+        except WorktreeError as exc:
+            return HostListWorktreesResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=exc.message,
+            )
+        return HostListWorktreesResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            worktrees=[
+                {
+                    "path": wt.path,
+                    "branch": wt.branch,
+                    "is_main": wt.is_main,
+                    "detached": wt.detached,
+                }
+                for wt in worktrees
+            ],
+        )
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -1858,6 +1921,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
+        elif isinstance(frame, HostListWorktreesFrame):
+            await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
 
 
 def run_host_process(

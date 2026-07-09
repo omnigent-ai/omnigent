@@ -188,6 +188,9 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
+        # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
+        "acp",
     }
     assert set(result) == expected_keys
 
@@ -251,9 +254,9 @@ def test_configured_harness_map_all_true_with_clis(
 
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
     cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, copilot
-    (token-gated) by a ``GH_TOKEN``, and antigravity-native (binary + credential
-    gated) by a detected Gemini OAuth credential — so nothing is reported
-    unconfigured.
+    (token-gated) by a ``GH_TOKEN``, antigravity-native (binary + credential
+    gated) by a detected Gemini OAuth credential, and the generic ACP harness
+    (config-gated) by a registered agent — so nothing is reported unconfigured.
     """
     import omnigent.onboarding.gemini_auth as _ga
 
@@ -266,6 +269,9 @@ def test_configured_harness_map_all_true_with_clis(
     # antigravity-native also needs a credential (not just the ``agy`` binary).
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
+    # The generic ACP harness is config-gated (≥1 registered agent), not
+    # CLI-gated — satisfy it so it isn't the lone unconfigured entry here.
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
     result = configured_harness_map()
     assert all(result.values())
 

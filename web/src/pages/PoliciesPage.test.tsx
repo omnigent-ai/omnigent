@@ -15,6 +15,20 @@ import * as identity from "@/lib/identity";
 import * as defaultPolicies from "@/hooks/useDefaultPolicies";
 import * as policies from "@/hooks/usePolicies";
 
+const serverInfoMocks = vi.hoisted(() => ({
+  accountsEnabled: true,
+  loginUrl: null as string | null,
+  serverVersion: "0.3.0.dev0" as string | null,
+}));
+
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({
+    accounts_enabled: serverInfoMocks.accountsEnabled,
+    login_url: serverInfoMocks.loginUrl,
+    server_version: serverInfoMocks.serverVersion,
+  }),
+}));
+
 const addMutate = vi.fn();
 const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
@@ -73,6 +87,9 @@ function renderPage() {
 }
 
 beforeEach(() => {
+  serverInfoMocks.accountsEnabled = true;
+  serverInfoMocks.loginUrl = null;
+  serverInfoMocks.serverVersion = "0.3.0.dev0";
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   setPolicies([]);
@@ -192,5 +209,87 @@ describe("PoliciesPage actions", () => {
       { name: "block_canada", type: "python", handler: "omnigent.policies.block_canada" },
       expect.anything(),
     );
+  });
+
+  it("Cancel steps back to the policy list after a policy is selected", async () => {
+    // WHY: once a policy is selected the dialog shows its config; Cancel must
+    // return to the list so the user can pick a different policy (not close).
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+        {
+          handler: "omnigent.policies.rate_limit",
+          kind: "callable",
+          name: "Rate Limit",
+          description: "Cap request rate.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Block Canada"));
+    expect(within(dialog).queryByPlaceholderText("Filter policies...")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(within(dialog).getByPlaceholderText("Filter policies...")).toBeInTheDocument();
+    expect(within(dialog).getByText("Block Canada")).toBeInTheDocument();
+    expect(within(dialog).getByText("Rate Limit")).toBeInTheDocument();
+    expect(addMutate).not.toHaveBeenCalled();
+  });
+
+  it("Cancel from the policy list closes the dialog", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+});
+
+describe("PoliciesPage single-user mode", () => {
+  beforeEach(() => {
+    serverInfoMocks.accountsEnabled = false;
+    serverInfoMocks.loginUrl = null;
+    serverInfoMocks.serverVersion = "0.3.0.dev0";
+  });
+
+  it("shows the full page without the admin gate (empty state)", async () => {
+    renderPage();
+    expect(await screen.findByText(/No global policies configured/)).toBeInTheDocument();
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("You don't have permission to manage global policies."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows policies list directly without probing identity", async () => {
+    setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
+    renderPage();
+    expect(await screen.findByText("block_canada")).toBeInTheDocument();
+    expect(identity.resolveIdentity).not.toHaveBeenCalled();
   });
 });

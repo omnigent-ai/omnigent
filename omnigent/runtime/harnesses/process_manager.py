@@ -239,6 +239,12 @@ def _resolve_module_path(harness: str) -> str:
     module_path = _HARNESS_MODULES.get(harness)
     if module_path is not None:
         return module_path
+    # Generic-ACP ids (``acp:<slug>``) all resolve to the base ``acp`` module;
+    # the slug selecting the concrete agent is read from the spec at spawn.
+    if harness.startswith("acp:"):
+        acp_module = _HARNESS_MODULES.get("acp")
+        if acp_module is not None:
+            return acp_module
     package = missing_install_packages().get(harness)
     if package:
         raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")
@@ -895,12 +901,23 @@ class HarnessProcessManager:
         """
         self._in_flight_response_ids.pop(conversation_id, None)
 
-    async def release(self, conversation_id: str) -> None:
+    async def release(
+        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+    ) -> None:
         """
         Terminate and unregister the subprocess for a conversation.
 
         Called when the conversation reaches a terminal state. No-op
         if no subprocess is registered for the id.
+
+        ``only_if_idle_cutoff`` (the idle reaper's pass cutoff) makes the
+        release conditional: the entry is torn down only if it is still
+        idle — untouched since the cutoff and with no turn in flight.
+        The check happens under the registry lock, atomically with the
+        unregister, so a turn that starts while an earlier entry in the
+        same reaper pass tears down can never be killed mid-flight
+        (mirrors ``pane_reaper``'s busy re-check immediately before
+        teardown).
 
         Note: ``_spawn_locks[conversation_id]`` is intentionally NOT
         removed here. If we removed it, a concurrent caller already
@@ -917,6 +934,19 @@ class HarnessProcessManager:
         :param conversation_id: AP-allocated conversation id.
         """
         async with self._registry_lock:
+            if only_if_idle_cutoff is not None:
+                current = self._entries.get(conversation_id)
+                if (
+                    current is None
+                    or current.last_used_at > only_if_idle_cutoff
+                    or conversation_id in self._in_flight_response_ids
+                ):
+                    _logger.info(
+                        "skipping idle reap for conversation %s: entry became "
+                        "active or was already released during the pass",
+                        conversation_id,
+                    )
+                    return
             entry = self._entries.pop(conversation_id, None)
             # NOTE: ``_spawn_locks[conversation_id]`` intentionally
             # NOT popped — see this method's docstring for the
@@ -1192,7 +1222,11 @@ class HarnessProcessManager:
                     conv_id,
                 )
                 try:
-                    await self.release(conv_id)
+                    # Teardown of earlier entries in this pass yields the
+                    # loop, so the snapshot above can be stale by the time
+                    # this entry's turn comes — release re-checks idleness
+                    # atomically with the unregister.
+                    await self.release(conv_id, only_if_idle_cutoff=cutoff)
                 except Exception:
                     # A release failure (e.g. ``client.aclose()`` on a broken
                     # transport, or ``process.wait()`` raising) must not escape
@@ -1356,13 +1390,16 @@ async def _pids_holding_socket(socket_path: Path) -> list[int]:
     :returns: List of holding PIDs (often a single one — the
         bound runner).
     """
-    proc = await asyncio.create_subprocess_exec(
-        "lsof",
-        "-t",
-        str(socket_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "lsof",
+            "-t",
+            str(socket_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return []
     stdout, _ = await proc.communicate()
     if proc.returncode != 0:
         return []

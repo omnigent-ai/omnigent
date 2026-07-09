@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, model_validator
 
+from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Comment
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
@@ -292,6 +293,18 @@ def create_comments_router(
             # update_comment tool) may perform.
             if body.body is not None:
                 await _require_comment_author(user_id, comment_id, session_id)
+        # Validate the status only after existence/ownership checks, so a
+        # request targeting a comment the caller can't see still returns 404
+        # (not a 400 that would leak the comment's existence). The check keeps
+        # an unknown status out of the store, where the enum codec would raise
+        # into an opaque 500; the column is a closed enum (draft/addressed).
+        if body.status is not None and body.status not in COMMENT_STATUS:
+            if store.get(comment_id, session_id) is None:
+                raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+            raise OmnigentError(
+                f"invalid status {body.status!r}; must be one of {sorted(COMMENT_STATUS)}",
+                code=ErrorCode.INVALID_INPUT,
+            )
         comment = store.update_comment(comment_id, session_id, status=body.status, body=body.body)
         if comment is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)

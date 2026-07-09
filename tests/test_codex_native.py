@@ -35,9 +35,25 @@ def _write_codex_auth(path: Path, payload: object) -> None:
 
 
 def _point_codex_auth_check_at(
-    monkeypatch: pytest.MonkeyPatch, auth_path: Path, *, binary_present: bool
+    monkeypatch: pytest.MonkeyPatch,
+    auth_path: Path,
+    *,
+    binary_present: bool,
+    launch: Any | None = None,
 ) -> None:
-    """Redirect Codex availability checks away from the real machine state."""
+    """Redirect Codex availability checks away from the real machine state.
+
+    ``launch`` pins what :func:`resolve_native_codex_launch` returns; the default
+    is the defer-to-Codex-login shape (``profile=None``, ``model_provider`` not
+    set → resolves to ``"openai"``), which is exactly the case where
+    ``auth.json`` is the credential that decides availability. Provider-routed
+    tests pass an explicit launch.
+    """
+    if launch is None:
+        launch = codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[], model=None, profile=None
+        )
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", lambda model=None: launch)
     monkeypatch.setattr(
         codex_native,
         "_resolve_codex_auth_source",
@@ -135,6 +151,53 @@ def test_codex_auth_unavailable_reason_malformed_auth_needs_auth(
     auth_path.parent.mkdir(parents=True, exist_ok=True)
     auth_path.write_text("{not json", encoding="utf-8")
 
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_databricks_profile_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Databricks-profile launch is available even with an EMPTY auth.json.
+
+    The reported bug: the launch mints its bearer via ``databricks auth token``
+    and never reads ``auth.json``, so gating on it is a false negative. auth.json
+    is deliberately absent here — availability must come from the launch.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=[], model=None, profile="my-profile"
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_provider_override_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch pinning a non-openai model_provider is available sans auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="omnigent_databricks"'], model=None, profile=None
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resolver blow-up fails safe onto the auth.json check (never raises)."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+
+    def _boom(model: object = None) -> object:
+        raise RuntimeError("corrupt config")
+
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _boom)
+
+    # No auth.json → falls through to needs-auth rather than propagating.
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
@@ -572,12 +635,18 @@ def _elicitation_tracker() -> codex_native_forwarder._CodexElicitationTaskTracke
     return codex_native_forwarder._CodexElicitationTaskTracker()
 
 
-def test_materialize_codex_agent_spec_uses_codex_native_harness(tmp_path: Path) -> None:
+def test_materialize_codex_agent_spec_uses_codex_native_harness(
+    tmp_path: Path, monkeypatch
+) -> None:
     """
     The generated wrapper spec is self-contained and selects the
     isolated ``codex-native`` harness rather than the existing
     non-TUI ``codex`` harness.
     """
+    # Pin the host shells so the declared terminals are deterministic
+    # ($SHELL=bash → the default/first terminal is ``bash``).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/bash")
     spec_path = codex_native._materialize_codex_agent_spec(
         tmp_path,
         model="gpt-test",
@@ -619,13 +688,12 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
     # via ToolManager, so a dropped flag silently removes
     # sys_session_create/send/close from the native CLI.
     assert spec.spawn is True
-    # The native wrapper declares a default shell terminal so the
-    # relay advertises the sys_terminal_* family to the wrapped
-    # codex (the relay gate is a non-empty ``terminals:`` block on
-    # this spec); a dropped block silently removes the terminal
-    # tools from the native CLI.
+    # The native wrapper declares one terminal per installed shell so the
+    # relay advertises the sys_terminal_* family to the wrapped codex (the
+    # relay gate is a non-empty ``terminals:`` block on this spec); a
+    # dropped block silently removes the terminal tools from the native CLI.
     assert spec.terminals is not None
-    assert spec.terminals["shell"].command == "bash"
+    assert spec.terminals["bash"].command == "bash"
 
 
 @pytest.mark.parametrize(

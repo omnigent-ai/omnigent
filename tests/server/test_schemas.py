@@ -610,6 +610,52 @@ def test_session_create_git_with_host_id_ok() -> None:
     assert req.git.branch_name == "feature/x"
 
 
+def test_session_git_existing_worktree_still_requires_host_id() -> None:
+    """``git`` in bind mode without ``host_id`` is rejected (422).
+
+    ``existing_worktree`` records the branch as the session's
+    ``git_branch``, which is only meaningful for a host-bound session —
+    so the ``git`` → ``host_id`` requirement applies to bind mode too.
+    """
+    from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
+
+    with pytest.raises(ValidationError, match="git worktree creation requires host_id"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            workspace="/repo/worktrees/feature-x",
+            git=SessionGitOptions(branch_name="feature/x", existing_worktree=True),
+        )
+
+
+def test_session_git_existing_worktree_rejects_base_branch() -> None:
+    """Bind mode + ``base_branch`` is contradictory and rejected (422).
+
+    ``base_branch`` selects the ref a *new* branch forks from; it is
+    meaningless when binding to a worktree that already exists.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="base_branch cannot be set when existing_worktree is true"
+    ):
+        SessionGitOptions(branch_name="feature/x", base_branch="main", existing_worktree=True)
+
+
+def test_session_git_existing_worktree_with_host_id_ok() -> None:
+    """Bind mode with ``host_id`` and no ``base_branch`` validates cleanly."""
+    from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
+
+    req = SessionCreateRequest(
+        agent_id="ag_x",
+        host_id="host_abc",
+        workspace="/repo/worktrees/feature-x",
+        git=SessionGitOptions(branch_name="feature/x", existing_worktree=True),
+    )
+    assert req.git is not None
+    assert req.git.existing_worktree is True
+    assert req.git.branch_name == "feature/x"
+
+
 def test_session_create_host_type_defaults_external() -> None:
     """
     ``host_type`` defaults to ``"external"`` — the pre-existing

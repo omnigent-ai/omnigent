@@ -76,7 +76,13 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 # Subscription CLIs expose no listing API: curated ids matching the bundled
 # catalog pin (claude) and the codex ids the codebase already references.
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
-    "claude": ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
+    "claude": (
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ),
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
 }
 

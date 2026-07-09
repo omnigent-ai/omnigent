@@ -93,3 +93,52 @@ def config_str_list(value: Any) -> list[str]:
         return []
     items = value if isinstance(value, list) else [value]
     return [str(item).strip() for item in items if str(item).strip()]
+
+
+def _config_positive_int(key: str, default: int) -> int:
+    """Read a positive-int setting from the server config, else *default*.
+
+    A missing, non-numeric, or non-positive value falls back to *default*
+    rather than crashing — the config file is operator-editable and a typo
+    should degrade to the safe built-in limit, not take the server down.
+
+    :param key: Top-level config key, e.g. ``"copy_max_files"``.
+    :param default: Value used when the key is absent or invalid.
+    :returns: The configured positive int, or *default*.
+    """
+    raw = load_server_config().get(key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("server config %s=%r is not an int — using default %d", key, raw, default)
+        return default
+    if value <= 0:
+        logger.warning(
+            "server config %s=%d is not positive — using default %d", key, value, default
+        )
+        return default
+    return value
+
+
+def copy_file_count_limit() -> int:
+    """Max number of files a single copy-at-spawn request may copy.
+
+    Config key ``copy_max_files``; defaults to
+    :data:`omnigent.runtime.content_resolver.MAX_COPY_FILES`.
+    """
+    from omnigent.runtime.content_resolver import MAX_COPY_FILES
+
+    return _config_positive_int("copy_max_files", MAX_COPY_FILES)
+
+
+def copy_total_bytes_limit() -> int:
+    """Max summed byte size a single copy-at-spawn request may copy.
+
+    Config key ``copy_max_total_bytes``; defaults to
+    :data:`omnigent.runtime.content_resolver.MAX_COPY_TOTAL_BYTES`.
+    """
+    from omnigent.runtime.content_resolver import MAX_COPY_TOTAL_BYTES
+
+    return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)

@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
 import StarterKit from "@tiptap/starter-kit";
-import { extractAlert, GitHubAlertBlockquote } from "./TipTapGitHubAlert";
+import { extractAlert, GitHubAlertBlockquote, toBlockContent } from "./TipTapGitHubAlert";
 
 let editor: Editor | null = null;
 afterEach(() => {
@@ -78,6 +78,42 @@ describe("extractAlert", () => {
       extractAlert([{ type: "paragraph", content: [{ type: "text", text: "see [!NOTE] inline" }] }])
         .alertType,
     ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// toBlockContent — keeps blockquote content valid (block+).
+// ---------------------------------------------------------------------------
+
+describe("toBlockContent", () => {
+  it("wraps a lone inline image in a paragraph", () => {
+    const image = { type: "image", attrs: { src: "x.png" } };
+    expect(toBlockContent([image])).toEqual([{ type: "paragraph", content: [image] }]);
+  });
+
+  it("returns one empty paragraph for empty content (empty blockquote)", () => {
+    expect(toBlockContent([])).toEqual([{ type: "paragraph" }]);
+  });
+
+  it("passes block children through untouched", () => {
+    const blocks = [
+      { type: "paragraph", content: [{ type: "text", text: "a" }] },
+      { type: "bulletList", content: [] },
+    ];
+    expect(toBlockContent(blocks)).toEqual(blocks);
+  });
+
+  it("coalesces a run of inline nodes into a single paragraph", () => {
+    const a = { type: "text", text: "a" };
+    const img = { type: "image", attrs: { src: "x.png" } };
+    const b = { type: "text", text: "b" };
+    expect(toBlockContent([a, img, b])).toEqual([{ type: "paragraph", content: [a, img, b] }]);
+  });
+
+  it("splits inline runs around interleaved blocks", () => {
+    const img = { type: "image", attrs: { src: "x.png" } };
+    const para = { type: "paragraph", content: [{ type: "text", text: "body" }] };
+    expect(toBlockContent([img, para])).toEqual([{ type: "paragraph", content: [img] }, para]);
   });
 });
 

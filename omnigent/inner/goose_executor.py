@@ -40,6 +40,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -239,6 +240,12 @@ class GooseExecutor(Executor):
         # which case permission falls back to allow. See :meth:`_decide_permission`.
         self._policy_evaluator: Any | None = None  # type: ignore[explicit-any]
         self._elicitation_handler: Any | None = None  # type: ignore[explicit-any]
+        # Adapter-injected tool bridge + the Omnigent-tool MCP relay it backs.
+        # Exposes Omnigent builtin tools to goose via session/new.mcpServers
+        # (the shared serve-mcp relay); goose keeps its own developer tools.
+        self._tool_executor: Any | None = None  # type: ignore[explicit-any]
+        self._mcp = OmnigentAcpMcp(label="goose")
+        self._omnigent_tools: list[Any] = []  # type: ignore[explicit-any]
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
@@ -479,9 +486,14 @@ class GooseExecutor(Executor):
         if self._session_id is not None:
             return self._session_id
 
+        mcp_servers = self._mcp.session_new_servers(
+            tools=self._omnigent_tools,
+            tool_executor=getattr(self, "_tool_executor", None),
+            loop=asyncio.get_event_loop(),
+        )
         resp = await self._rpc(
             _AGENT_METHOD_SESSION_NEW,
-            {"cwd": self._cwd, "mcpServers": []},
+            {"cwd": self._cwd, "mcpServers": mcp_servers},
             timeout=_INIT_TIMEOUT_SECONDS,
         )
         if "error" in resp:
@@ -864,7 +876,7 @@ class GooseExecutor(Executor):
     async def run_turn(
         self,
         messages: list[Message],
-        tools: list[Any],  # type: ignore[explicit-any]  # noqa: ARG002 — goose runs its own tool registry
+        tools: list[Any],  # type: ignore[explicit-any]  # goose runs its own tools; used for the Omnigent MCP relay
         system_prompt: str,
         config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the interface
     ) -> AsyncIterator[ExecutorEvent]:
@@ -875,6 +887,8 @@ class GooseExecutor(Executor):
         final response (``stopReason``) arrives — then yields ``TurnComplete``
         with token usage.
         """
+        # Captured for the Omnigent MCP relay set up lazily at session/new.
+        self._omnigent_tools = tools or []
         try:
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
@@ -1029,6 +1043,8 @@ class GooseExecutor(Executor):
 
     async def close(self) -> None:
         """Terminate the goose subprocess and clean up."""
+        with contextlib.suppress(Exception):
+            self._mcp.close()
         if self._reader_task:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

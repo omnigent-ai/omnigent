@@ -23,7 +23,21 @@ import type { Comment } from "@/hooks/useComments";
 // ── Mock heavy child components ───────────────────────────────────────────────
 
 vi.mock("./CodeViewer", () => ({
-  CodeViewer: () => <div data-testid="code-viewer" />,
+  // Expose the resolved viewMode so tests can assert which surface FileViewer
+  // routed to (preview / editor / source) without mounting the real viewer.
+  // The "make dirty" button lets a test drive the editor's unsaved-edits signal
+  // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
+  CodeViewer: ({
+    viewMode,
+    onDirtyChange,
+  }: {
+    viewMode: string;
+    onDirtyChange?: (dirty: boolean) => void;
+  }) => (
+    <div data-testid="code-viewer" data-view-mode={viewMode}>
+      <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
+    </div>
+  ),
 }));
 
 vi.mock("./CommentsPanel", () => ({
@@ -118,6 +132,7 @@ import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
+import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
@@ -890,6 +905,206 @@ describe("FileViewer view-preference persistence across refresh", () => {
     // storage (which holds false). If the URL override were dropped the viewer
     // would be absent.
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+  });
+});
+
+// ── Markdown preview / edit / source modes ──────────────────────────────────
+//
+// HTML has always had a rendered "preview" pane; markdown had editor ↔ source.
+// A read-only rendered preview was added for markdown as a third mode: markdown
+// opens in the rich-text editor by default, with the preview and raw source one
+// tap away in the "View mode" dropdown.
+
+describe("FileViewer markdown preview/edit/source modes", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+
+  // Markdown's three modes live behind a single "View mode" dropdown (the
+  // toolbar was too full for three side-by-side buttons). Open it, then click
+  // the wanted option. Radix menus open on pointerdown, not click.
+  const openModeMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+  const selectMode = (mode: "Preview" | "Edit" | "Source") => {
+    openModeMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: mode }));
+  };
+
+  it("opens a markdown file in the rich-text editor by default", () => {
+    // notes.md is not a changed file, so no diff view competes — the default
+    // previewable mode ("editor") must reach CodeViewer for markdown. Preview
+    // and source are reachable from the toolbar dropdown, not the default.
+    renderViewer({ open: true, path: "notes.md" });
+    expect(viewModeOf()).toBe("editor");
+  });
+
+  it("offers Preview, Edit, and Source options in the view-mode menu", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    openModeMenu();
+    expect(screen.getByRole("menuitem", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Source" })).toBeInTheDocument();
+  });
+
+  it("switches markdown to the rich-text editor when Edit is chosen", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("editor");
+  });
+
+  it("switches markdown to raw source when Source is chosen", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Source");
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("returns markdown to the preview from another mode", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Source");
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("does not offer the markdown view-mode menu for HTML files", () => {
+    // HTML has no rich-text editor — only a single preview ↔ source toggle, not
+    // the markdown tri-state picker. The "View mode" dropdown must not appear.
+    renderViewer({ open: true, path: "page.html" });
+    expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
+  });
+
+  it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
+    renderViewer({ open: true, path: "page.html" });
+    expect(viewModeOf()).toBe("preview");
+    // In preview, the single toggle switches to source (existing behavior).
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("editor");
+    // Mark the editor dirty (the mock forwards onDirtyChange).
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    // Leaving the editor with unsaved edits must NOT switch immediately — it
+    // pops the discard confirmation and stays in the editor.
+    selectMode("Source");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(viewModeOf()).toBe("editor");
+    // Confirming the discard performs the deferred switch.
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("switches out of a clean markdown editor immediately, with no discard dialog", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("editor");
+    // No dirty signal — switching is immediate and raises no dialog.
+    selectMode("Preview");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("does not pop a discard dialog when re-selecting the active markdown mode while dirty", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    // Choosing the mode you are already on is a no-op — it must not run the
+    // dirty guard (which would otherwise confusingly offer to discard edits).
+    selectMode("Edit");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    expect(viewModeOf()).toBe("editor");
+  });
+
+  it("reaches HTML source in a single click even when the shared preference is 'editor'", () => {
+    // A user who picked the markdown rich-text editor leaves "editor" in the
+    // shared preference. Opening an HTML file resolves that to preview (HTML has
+    // no editor); the source toggle must reach source on the FIRST click, not
+    // no-op because the raw stored value isn't "preview".
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "editor",
+      hideWhitespace: false,
+    });
+    renderViewer({ open: true, path: "page.html" });
+    expect(viewModeOf()).toBe("preview");
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("falls back to preview (not editor) for HTML when the shared preference is 'editor'", () => {
+    // HTML has no rich-text editor, so a carried-over "editor" preference must
+    // resolve to the rendered preview and never offer an Edit toggle.
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "editor",
+      hideWhitespace: false,
+    });
+    renderViewer({ open: true, path: "page.html" });
+    expect(viewModeOf()).toBe("preview");
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("restores the chosen markdown mode across a remount (persistence)", () => {
+    // Mirror the diff/layout refresh test for the tri-state previewable mode:
+    // pick Source, tear the tree down, remount with no URL params, and confirm
+    // the seed-on-mount read restores Source rather than the preview default.
+    const first = render(viewerTree({ open: true, path: "notes.md" }));
+    selectMode("Source");
+    expect(viewModeOf()).toBe("source");
+    first.unmount();
+    render(viewerTree({ open: true, path: "notes.md" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it.each(["preview", "source"] as const)(
+    "forces the editor on a ?comment= deep link even when the preference is %s",
+    (pref) => {
+      // Following a comment link must land on the rich-text editor so the
+      // comment's anchor highlight is visible — that's the whole point of the
+      // link. This holds regardless of the user's sticky preference: Preview
+      // can't render the highlight at all, and even Source is overridden so the
+      // deep link is consistent. Seed a non-editor preference so the bias (not
+      // the default) is what's under test.
+      writeFileViewPreferences({
+        diffActive: false,
+        diffLayout: "unified",
+        previewableViewMode: pref,
+        hideWhitespace: false,
+      });
+      useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+      renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+      expect(viewModeOf()).toBe("editor");
+      // Once the user explicitly picks a mode, the deep-link bias is dropped.
+      selectMode("Preview");
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
+
+  it("keeps a dirty deep-linked editor when the discard dialog is cancelled", () => {
+    // The bias must only drop when the switch actually proceeds: cancelling the
+    // discard prompt has to leave the editor (and its unsaved edits) intact, not
+    // fall through to preview. Seed Preview so the bias (not the default) is
+    // what puts us in the editor.
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+    });
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+    expect(viewModeOf()).toBe("editor");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(viewModeOf()).toBe("editor");
   });
 });
 

@@ -7,9 +7,10 @@ also tells a reader whether a red row is "this harness is broken" versus
 
 from __future__ import annotations
 
-from tests.harness_bench.driver import SdkInprocDriver, infra_failure_reason
+from tests.harness_bench.driver import infra_failure_reason
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict
 
 
@@ -19,10 +20,8 @@ class BasicTurnProbe(CapabilityProbe):
     priority = Priority.P0
     applies_to = Applicability.BOTH
 
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
-        result = await driver.run_turn(
-            f"Reply with exactly the literal string {profile.marker} and nothing else."
-        )
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
+        result = await driver.run_basic_turn(profile.marker)
         if result.timed_out:
             # A timeout on the prerequisite turn is almost always a hung
             # environment, not a capability fact — do not call it UNSUPPORTED.

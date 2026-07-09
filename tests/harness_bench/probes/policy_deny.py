@@ -14,28 +14,10 @@ was actually surfaced and that the DENY landed on ``PHASE_TOOL_CALL``.
 
 from __future__ import annotations
 
-from tests.harness_bench.driver import PHASE_TOOL_CALL, SdkInprocDriver
 from tests.harness_bench.probes.base import CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.transport import Driver
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict
-
-_TOOL_NAME = "bench_forbidden"
-_TOOL_SPEC = [
-    {
-        "type": "function",
-        "function": {
-            "name": _TOOL_NAME,
-            "description": "A tool the policy engine will deny. Call it when asked.",
-            "parameters": {
-                "type": "object",
-                "properties": {"arg": {"type": "string"}},
-                "required": ["arg"],
-            },
-        },
-    }
-]
-
-_DENY_REASON = "bench-policy-deny"
 
 
 class PolicyDenyProbe(CapabilityProbe):
@@ -44,16 +26,11 @@ class PolicyDenyProbe(CapabilityProbe):
     priority = Priority.P0
     applies_to = Applicability.BOTH
 
-    async def run(self, driver: SdkInprocDriver, profile: BenchProfile) -> ProbeResult:
-        result = await driver.run_turn(
-            f"Call the {_TOOL_NAME} tool with arg='go'. It is required.",
-            tools=_TOOL_SPEC,
-            deny_phases=frozenset({PHASE_TOOL_CALL}),
-            policy_reason=_DENY_REASON,
-            # No auto tool output: a correctly-enforced DENY means the tool
-            # never runs, so there is no result to return.
-            timeout=150.0,
-        )
+    async def run(self, driver: Driver, profile: BenchProfile) -> ProbeResult:
+        # The driver owns the deny mechanism (a tool_call-phase verdict on the
+        # wrap path, a spec-baked deny policy on full-server); the probe only
+        # cares whether a surfaced tool call was actually blocked.
+        result = await driver.run_tool_turn(deny=True)
         detail = {
             "policy_actions": result.policy_actions,
             "tool_call_denied": result.tool_call_denied,
@@ -61,45 +38,52 @@ class PolicyDenyProbe(CapabilityProbe):
             "completed": result.completed,
         }
 
+        # A confirmed tool-call DENY is enforcement, whether or not a
+        # ``function_call`` item persisted. On full-server the denied call still
+        # surfaces an item (with a blocked output); on native-tui the deny is
+        # decided at the vendor hook *before* the tool runs, so no item persists
+        # and the only signal is the server's ``response.policy_denied`` event.
+        # Check the deny signal first so the native path is not swallowed by the
+        # "no tool call" guard below.
+        if result.tool_call_denied:
+            if result.completed or result.failed:
+                return ProbeResult(
+                    Verdict.SUPPORTED,
+                    note="tool-call DENY delivered and enforced; turn advanced past the block",
+                    detail=detail,
+                )
+            if result.timed_out:
+                return ProbeResult(
+                    Verdict.UNSUPPORTED,
+                    note="turn stalled after tool-call DENY (blocked call not handled)",
+                    detail=detail,
+                )
+            return ProbeResult(
+                Verdict.SUPPORTED,
+                note="tool-call DENY delivered and enforced",
+                detail=detail,
+            )
+
         if not result.tool_calls:
-            # The model never tried the tool, so the tool-call DENY path was
-            # never exercised — cannot conclude anything about enforcement.
+            # No deny signal AND no tool call: the model never tried the tool, so
+            # the tool-call DENY path was never exercised. (On native this also
+            # covers a turn where the vendor simply didn't call the tool.)
             return ProbeResult(
                 Verdict.SKIPPED,
                 note="model never attempted the tool; tool-call DENY path not exercised",
                 detail=detail,
             )
-        if not result.tool_call_denied:
-            # A tool call happened but no PHASE_TOOL_CALL evaluation was
-            # surfaced to deny. Policy evaluation is normally driven by the
-            # server / runner; in this wrap-direct transport some harnesses
-            # (e.g. codex) dispatch the tool without a tool-call evaluation
-            # hook, so we cannot exercise DENY here. That is a transport
-            # limitation, not proof the harness ignores policy — report
-            # SKIPPED and let the full-server transport assert enforcement.
-            return ProbeResult(
-                Verdict.SKIPPED,
-                note=(
-                    "tool call not routed through a tool-call policy evaluation "
-                    "(wrap-direct limitation)"
-                ),
-                detail=detail,
-            )
-        # A DENY landed on the tool-call phase and the turn advanced (to
-        # completion or a clean end) without hanging on the blocked call —
-        # the harness accepted and enforced the tool-call DENY.
-        if result.completed or result.failed:
-            return ProbeResult(
-                Verdict.SUPPORTED,
-                note="tool-call DENY delivered and enforced; blocked call did not stall the turn",
-                detail=detail,
-            )
-        if result.timed_out:
-            return ProbeResult(
-                Verdict.UNSUPPORTED,
-                note="turn stalled after tool-call DENY (blocked call not handled)",
-                detail=detail,
-            )
+        # A tool call happened but no DENY was surfaced. Policy evaluation is
+        # normally driven by the server / runner; in the wrap-direct transport
+        # some harnesses (e.g. codex) dispatch the tool without a tool-call
+        # evaluation hook, so we cannot exercise DENY here. That is a transport
+        # limitation, not proof the harness ignores policy — report SKIPPED and
+        # let the full-server / native transport assert enforcement.
         return ProbeResult(
-            Verdict.UNKNOWN, note="tool-call DENY delivered; outcome inconclusive", detail=detail
+            Verdict.SKIPPED,
+            note=(
+                "tool call not routed through a tool-call policy evaluation "
+                "(wrap-direct limitation)"
+            ),
+            detail=detail,
         )

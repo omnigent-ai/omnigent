@@ -14,6 +14,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -298,6 +299,14 @@ export class TerminalSession {
   private lastUserInputAt = 0;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
   private disposed = false;
+  /**
+   * Last ``cols×rows`` actually sent to the server, or ``null`` before the
+   * first resize. {@link sendResize} skips a send when the fitted dimensions
+   * are unchanged so the WS-open + ResizeObserver double-fire on mount (and a
+   * transient re-fit) don't emit a redundant resize — which, on the tmux
+   * control transport, would otherwise be an avoidable ``refresh-client -C``.
+   */
+  private lastSentSize: { cols: number; rows: number } | null = null;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -312,6 +321,12 @@ export class TerminalSession {
    *     server. This is a best-effort UI activity signal, not a shell
    *     job-state oracle.
    * :param onInput: Called when user input is sent to the terminal.
+   * :param nativeSelection: When ``true`` (control-mode transport), xterm
+   *     owns the character buffer and mouse, so plain click-drag selects and
+   *     the browser's own copy works — the ``macOptionClickForcesSelection``
+   *     workaround and the custom ``copy`` listener are skipped. When
+   *     ``false`` (PTY transport, the default), tmux runs with ``mouse on``
+   *     and captures drags, so both workarounds stay wired.
    */
   constructor(
     container: HTMLElement,
@@ -320,14 +335,16 @@ export class TerminalSession {
     isDark = false,
     onActivity?: TerminalActivityListener,
     onInput?: TerminalInputListener,
+    nativeSelection = false,
   ) {
+    // Read the user's code-font preference (Settings → Appearance) at
+    // construction; a mid-session change is applied live via setFont(). The
+    // xterm.js defaults (15px, no theme) feel out of place inside the app
+    // chrome, so an unset family falls back to the shared mono stack.
+    const { sizePx, family } = readCodeFont();
     this.term = new Terminal({
-      // Match the system mono stack at the configured base size. The
-      // xterm.js defaults (15px, no theme) feel out of place inside the
-      // app chrome.
-      fontFamily:
-        "'Geist Mono Variable', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace",
-      fontSize: 13,
+      fontFamily: codeFontFamilyForEditor(family),
+      fontSize: sizePx,
       scrollback: 20000,
       cursorBlink: true,
       theme: terminalTheme(isDark),
@@ -337,17 +354,14 @@ export class TerminalSession {
       // cell's foreground luminance only when it lacks contrast against
       // its actual background.
       minimumContrastRatio: 4.5,
-      // The attached tmux session runs with `mouse on` (terminal.py) so
-      // the wheel pages through scrollback. The downside is tmux then
+      // PTY transport only: the attached tmux session runs with `mouse on`
+      // (terminal.py) so the wheel pages through scrollback, but tmux then
       // captures every mouse drag for its own copy-mode, so a plain
-      // click-drag never produces a browser text selection — the user
-      // can't select-and-copy. xterm's escape hatch is
-      // `shouldForceSelection`: on non-Mac it honors Shift-drag for
-      // free, but on Mac it forces a native selection only when
-      // `macOptionClickForcesSelection` is enabled AND the user holds
-      // Option. Without this flag Mac users have no way to select at
-      // all. Enabling it lets ⌥-drag select, then ⌘-C copies.
-      macOptionClickForcesSelection: true,
+      // click-drag never produces a browser text selection. xterm's escape
+      // hatch `macOptionClickForcesSelection` lets Mac users ⌥-drag to select,
+      // then ⌘-C copies. In control mode xterm owns the mouse and plain drag
+      // selects natively, so the forced-selection workaround is unnecessary.
+      macOptionClickForcesSelection: !nativeSelection,
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
     });
@@ -487,6 +501,21 @@ export class TerminalSession {
   }
 
   /**
+   * Update the terminal's code font (size + family) without reconnecting —
+   * mirrors {@link setTheme}, mutating options in place. A new glyph size
+   * changes the character-cell dimensions, so this re-fits the grid to the
+   * container and pushes the resulting cols×rows to tmux via {@link sendResize}
+   * (which no-ops the send while the socket is down; the reconnect re-fits on
+   * open). An empty family falls back to the shared mono stack. Safe to call at
+   * any point after construction.
+   */
+  setFont(sizePx: number, family: string): void {
+    this.term.options.fontFamily = codeFontFamilyForEditor(family);
+    this.term.options.fontSize = sizePx;
+    this.sendResize();
+  }
+
+  /**
    * Tear down the bridge. Order matters: abort listeners FIRST so
    * the cleanup's ``ws.close()`` can't fire a stale ``close``
    * event into the next mount.
@@ -546,6 +575,15 @@ export class TerminalSession {
     } catch {
       return;
     }
-    this.ws.send(JSON.stringify({ type: "resize", cols: this.term.cols, rows: this.term.rows }));
+    const { cols, rows } = this.term;
+    // Skip a no-op resize: the WS-open handler and the ResizeObserver both
+    // call this on mount, and a transient re-fit can land the same size. On
+    // the control transport an unchanged size is a wasted round-trip (tmux
+    // recomputes layout for the new value regardless), so dedupe here.
+    if (this.lastSentSize && this.lastSentSize.cols === cols && this.lastSentSize.rows === rows) {
+      return;
+    }
+    this.lastSentSize = { cols, rows };
+    this.ws.send(JSON.stringify({ type: "resize", cols, rows }));
   }
 }

@@ -24,6 +24,7 @@ import logging
 # has heterogeneous values.
 from typing import Any
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -33,6 +34,11 @@ from omnigent.spec.types import (
 from omnigent.tools.base import Tool
 
 _logger = logging.getLogger(__name__)
+
+# ``ExecutorSpec.type`` defaults to this. It is an executor type, never a
+# registered harness, so a spec whose ``harness_kind`` resolves to it cannot be
+# spawned — the runner aborts with ``unknown harness 'omnigent'``.
+_UNBOOTABLE_DEFAULT_HARNESS: str = "omnigent"
 
 # Internal sub-agent name. Double-underscore prefix prevents
 # collision with user-declared sub-agent names (which use
@@ -97,10 +103,18 @@ loop endlessly. If nothing works, say so.
 
 def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
     """
-    Build the ``__web_researcher`` AgentSpec using the parent's LLM config.
+    Build the ``__web_researcher`` AgentSpec from the parent's spec.
 
     The researcher gets:
     - The parent's ``llm`` config (model + connection + extras)
+    - The parent executor's harness (``config``), ``auth``, ``model``, and
+      ``connection`` (with ``max_iterations`` capped low) — the researcher
+      runs on the SAME harness leg as its parent and routes through the
+      parent's provider. Without this the child defaults to ``type="omnigent"``
+      with no harness, which the runner rejects as ``unknown harness
+      'omnigent'`` before any model routing (Layer 1), and even past that
+      a gateway model loses its provider and hits the native router's
+      ``Unknown provider`` (Layer 2).
     - An ``os_env`` block — registers ``sys_os_shell`` for one-shot
       bash commands (curl, python3 one-liners). The previous
       implementation used ``terminal_run``; that family was deleted
@@ -120,6 +134,8 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
 
     :param parent_spec: The parent agent's parsed spec.
     :returns: A complete AgentSpec for the web researcher sub-agent.
+    :raises OmnigentError: If the parent declares no bootable harness, so the
+        researcher would spawn the unspawnable literal harness ``"omnigent"``.
     """
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -136,6 +152,44 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         sandbox=parent_os_env.sandbox if parent_os_env is not None else None,
     )
 
+    # Inherit the parent leg's routing-relevant executor fields (harness, model,
+    # auth, connection, type) so the researcher runs on the SAME harness with the
+    # SAME credentials and model. The prior code built a bare
+    # ``ExecutorSpec(max_iterations=5)``, which defaults to the unspawnable
+    # ``type="omnigent"`` harness and strips the parent's provider. Drop
+    # ``context_window`` (auto-detected), ``profile`` (deprecated, subsumed by
+    # ``auth``), and the inline ``config["os_env"]`` (superseded by ``os_env``
+    # below) — none are routing inputs.
+    parent_executor = parent_spec.executor
+    child_executor_config = {
+        key: value for key, value in parent_executor.config.items() if key != "os_env"
+    }
+    child_executor = ExecutorSpec(
+        type=parent_executor.type,
+        max_iterations=5,  # one-shot: 1 fetch + 1 retry + final response
+        config=child_executor_config,
+        model=parent_executor.model,
+        connection=parent_executor.connection,
+        auth=parent_executor.auth,
+    )
+
+    # Fail loud if the inherited executor still has no bootable harness. The
+    # child is spawned solely from this static spec (no per-session
+    # ``harness_override`` is threaded here), so a harness that lives only in
+    # resolved session state can't be recovered — better an actionable
+    # build-time error naming the parent than a cryptic runner-side crash.
+    if child_executor.harness_kind == _UNBOOTABLE_DEFAULT_HARNESS:
+        raise OmnigentError(
+            f"web_fetch cannot build its {RESEARCHER_NAME} sub-agent: parent agent "
+            f"{parent_spec.name or '<unnamed>'!r} declares no bootable harness "
+            f"(executor.type={parent_executor.type!r} with no "
+            f"executor.config['harness']), so the researcher would spawn the "
+            f"unknown harness 'omnigent'. Set executor.config.harness on the parent "
+            f"(e.g. 'claude-sdk', 'codex', or 'pi') so the researcher runs on the "
+            f"parent's harness.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
     return AgentSpec(
         spec_version=1,
         name=RESEARCHER_NAME,
@@ -145,10 +199,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         tools=ToolsConfig(),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,
-        # Low max_iterations to keep the sub-agent fast.
-        # 1 fetch + 1 retry = 2 tool calls max, plus the
-        # final response = ~3 iterations.
-        executor=ExecutorSpec(max_iterations=5),
+        executor=child_executor,
     )
 
 

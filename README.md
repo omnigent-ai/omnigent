@@ -179,7 +179,7 @@ mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 also launches a local web UI at `http://localhost:6767` that shows the same
 session in the browser, or on a phone on your network (step 4). The
 [desktop app](https://omnigent.ai/docs/interact/desktop) wraps that same UI
-in a native window and adds OS notifications and a dock badge —
+in a native window and adds OS notifications (with a configurable sound) and a dock badge —
 [download it for macOS](https://omnigent.ai/download/mac).
 
 > [!NOTE]

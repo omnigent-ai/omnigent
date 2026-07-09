@@ -212,6 +212,12 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  /**
+   * Response id of the turn currently in flight, or absent/null when
+   * idle. Lets a client reconnecting mid-turn reopen a streaming
+   * `activeResponse` (the turn-start `running` SSE edge is not replayed).
+   */
+  active_response_id?: string | null;
 }
 
 interface SessionItemsResponseWire {
@@ -298,6 +304,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    activeResponseId: wire.active_response_id ?? null,
   };
 }
 
@@ -487,24 +494,14 @@ export async function createBundledSession(
  * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
  *   set, the fork copies history only up to and including that response
  *   ("fork from here"); omitted, the full history is copied.
- * @param modelOverride - Optional model id to launch the fork on, e.g.
- *   "databricks-gpt-5-4-mini" — the "restart with model" path. Overrides
- *   the model the fork would inherit from the source; the server validates
- *   and family-checks it. Omitted → keep the source's model.
  */
 export async function forkSession(
   sourceId: string,
   title?: string,
   agentId?: string,
   upToResponseId?: string,
-  modelOverride?: string,
 ): Promise<Session> {
-  const body: {
-    title?: string;
-    agent_id?: string;
-    up_to_response_id?: string;
-    model_override?: string;
-  } = {};
+  const body: { title?: string; agent_id?: string; up_to_response_id?: string } = {};
   if (title !== undefined) {
     body.title = title;
   }
@@ -513,9 +510,6 @@ export async function forkSession(
   }
   if (upToResponseId !== undefined) {
     body.up_to_response_id = upToResponseId;
-  }
-  if (modelOverride !== undefined) {
-    body.model_override = modelOverride;
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
@@ -577,17 +571,24 @@ export async function launchRunner(
   hostId: string,
   sessionId: string,
   workspace: string,
-  git?: { branchName: string; baseBranch?: string },
+  git?: { branchName: string; baseBranch?: string; existingWorktree?: boolean },
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
     workspace: string;
-    git?: { branch_name: string; base_branch?: string };
+    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean };
   } = { session_id: sessionId, workspace };
   if (git !== undefined) {
+    // `existing_worktree` binds a pre-existing worktree (no worktree is
+    // created; the branch is recorded for the sidebar + delete flow), so it
+    // never carries a base_branch.
     body.git = {
       branch_name: git.branchName,
-      ...(git.baseBranch !== undefined ? { base_branch: git.baseBranch } : {}),
+      ...(git.existingWorktree
+        ? { existing_worktree: true }
+        : git.baseBranch !== undefined
+          ? { base_branch: git.baseBranch }
+          : {}),
     };
   }
   const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/runners`, {

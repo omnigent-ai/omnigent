@@ -161,7 +161,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Sidebar shift-click selection", () => {
-  it("shift-click selects range between anchor and target within Chats", async () => {
+  it("shift-click selects range between anchor and target within Sessions", async () => {
     const sessions = [conv("s1"), conv("s2"), conv("s3"), conv("s4")];
     mockConversations(sessions);
     renderSidebar();
@@ -184,7 +184,7 @@ describe("Sidebar shift-click selection", () => {
     });
   });
 
-  it("shift-click does not select project sessions when selecting within Chats", async () => {
+  it("shift-click does not select project sessions when selecting within Sessions", async () => {
     // Set up project "Alpha" with 2 sessions, plus 3 unfiled chat sessions
     projectsMock.push("Alpha");
     const sessions = [

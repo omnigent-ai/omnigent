@@ -173,24 +173,28 @@ def render_section(tag: str, date: str, results: list[HarvestResult]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-# Two-section draft for the GitHub Release body: the Type-of-change tags collapse
-# into the two buckets the release coordinator curates by hand (see RELEASING.md /
+# Multi-section draft for the GitHub Release body: the Type-of-change tags collapse
+# into the sections the release coordinator curates by hand (see RELEASING.md /
 # the release-notes-drafter agent). This is the deterministic scaffold — the AI
 # drafter refines it, and it is also the fallback when the LLM is unavailable.
 # Values are "Type of change" checkbox labels (see _md.TYPE_TAGS).
 DRAFT_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Major new features", ("Feature", "UI / frontend change")),
-    ("Bug fixes & hardening", ("Bug fix", "Breaking change")),
+    ("Breaking changes", ("Breaking change",)),
+    ("Bug fixes", ("Bug fix",)),
 )
 
 
 def render_draft_notes(results: list[HarvestResult], repo: str) -> str:
-    """Render the two-section curated-draft scaffold for the GitHub Release body.
+    """Render the curated-draft scaffold for the GitHub Release body.
 
-    Groups documented PRs into "Major new features" and "Bug fixes & hardening"
-    by their Type-of-change labels, sorted by PR number, and appends the
-    CHANGELOG.md link. Empty sections keep their heading with a placeholder so
-    the coordinator sees what to fill in.
+    Groups documented PRs into the DRAFT_SECTIONS buckets (Major new features /
+    Breaking changes / Bug fixes) by their Type-of-change labels, sorted by PR
+    number, and appends the CHANGELOG.md link. The Bug fixes bucket is a raw
+    superset seeded from every "Bug fix"-tagged PR; the AI drafter curates it
+    down to user-facing fixes only, dropping security and CI/internal fixes
+    (which share the same tag). Empty sections keep their heading with a
+    placeholder so the coordinator sees what to fill in.
     """
     included = [r for r in results if r.status == "included"]
 
@@ -348,7 +352,7 @@ def main() -> int:
     parser.add_argument(
         "--draft-notes-out",
         default=None,
-        help="optional path to write the two-section curated-draft scaffold "
+        help="optional path to write the curated-draft scaffold "
         "(the GitHub Release body seed / LLM fallback)",
     )
     parser.add_argument(

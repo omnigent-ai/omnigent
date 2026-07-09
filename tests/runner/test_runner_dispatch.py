@@ -2248,6 +2248,9 @@ class _StubTerminalInstance:
         self.os_env = None
         self.socket_path = Path("/tmp/omnigent-test-tmux.sock")
         self.tmux_target = "main"
+        # ``terminal_resource_view`` reads this to project the effective
+        # web-attach transport into metadata; ``None`` => the global default.
+        self.terminal_transport = None
         # Records on_activity callbacks the dispatch wires up so a fresh
         # launch's pane-activity watcher start is observable (and so the
         # call doesn't AttributeError against this stub).
@@ -3622,7 +3625,9 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     # The curated claude aliases survive the claude-family filter — the
     # exact ids an orchestrator may pass back as args.model.
     assert [m["id"] for m in worker["models"]] == [
+        "claude-fable-5",
         "claude-opus-4-8",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
     ]
@@ -7107,3 +7112,82 @@ async def test_approval_event_without_content_flattened() -> None:
     assert resp.status_code == 204
     assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
     ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_cancels_losing_future_no_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_spawn_async_tool`` races the tool coro against ``cancel_event.wait()``
+    via ``asyncio.wait(FIRST_COMPLETED)``. The losing future must be cancelled
+    in BOTH branches, otherwise every ``sys_call_async`` permanently leaks one
+    pending task (the orphaned ``cancel_event.wait()`` on success, or the
+    orphaned tool coro on cancel).
+    """
+    from omnigent.runner import tool_dispatch
+
+    spawn_kw: dict[str, Any] = {
+        "server_client": None,
+        "terminal_registry": None,
+        "resource_registry": None,
+        "agent_spec": None,
+        "conversation_id": "conv_leak",
+        "task_id": None,
+        "agent_id": None,
+        "agent_name": None,
+        "runner_workspace": None,
+        "mcp_manager": None,
+        "filesystem_registry": None,
+    }
+
+    def _leaked(before: set[asyncio.Task[Any]]) -> list[str]:
+        cur = asyncio.current_task()
+        return [
+            t.get_name()
+            for t in asyncio.all_tasks()
+            if t not in before and t is not cur and not t.done()
+        ]
+
+    # Success path: tool finishes first, so cancel_event.wait() is the loser.
+    async def _fast(**_kw: Any) -> str:
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fast)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    before = set(asyncio.all_tasks())
+    tool_dispatch._spawn_async_tool(
+        {"tool": "noop", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    bg_task, _evt = next(iter(tasks.values()))
+    await bg_task
+    await asyncio.sleep(0)  # let the .cancel() propagate to the losing future
+    assert inbox.get_nowait()["status"] == "completed"
+    assert _leaked(before) == []
+
+    # Cancel path: cancel_event fires first, so the tool coro is the loser.
+    async def _slow(**_kw: Any) -> str:
+        await asyncio.sleep(30)
+        return "late"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _slow)
+    inbox = asyncio.Queue()
+    tasks = {}
+    before = set(asyncio.all_tasks())
+    tool_dispatch._spawn_async_tool(
+        {"tool": "slow", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    bg_task, evt = next(iter(tasks.values()))
+    await asyncio.sleep(0)  # let _bg reach asyncio.wait
+    evt.set()
+    await bg_task
+    await asyncio.sleep(0)
+    assert inbox.get_nowait()["status"] == "cancelled"
+    assert _leaked(before) == []

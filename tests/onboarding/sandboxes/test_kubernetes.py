@@ -133,13 +133,19 @@ def test_build_pod_manifest_omits_envfrom_without_harness_secret() -> None:
     assert "envFrom" not in manifest["spec"]["containers"][0]
 
 
-def test_build_pod_manifest_amd64_invariant_cannot_be_overridden() -> None:
-    """A node_selector cannot drop the mandatory amd64 constraint."""
+def test_build_pod_manifest_defaults_to_amd64_node_selector() -> None:
+    """No node_selector → Pods keep the amd64 default placement."""
+    manifest = build_pod_manifest(**{**_MANIFEST_KW, "node_selector": None})
+    assert manifest["spec"]["nodeSelector"] == {"kubernetes.io/arch": "amd64"}
+
+
+def test_build_pod_manifest_node_selector_can_override_arch() -> None:
+    """An operator kubernetes.io/arch entry overrides the amd64 default."""
     manifest = build_pod_manifest(
         **{**_MANIFEST_KW, "node_selector": {"disktype": "ssd", "kubernetes.io/arch": "arm64"}}
     )
     selector = manifest["spec"]["nodeSelector"]
-    assert selector["kubernetes.io/arch"] == "amd64"
+    assert selector["kubernetes.io/arch"] == "arm64"
     assert selector["disktype"] == "ssd"
 
 

@@ -18,6 +18,8 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListWorktreesFrame,
+    HostListWorktreesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -116,12 +118,14 @@ def test_launch_runner_frame_round_trip() -> None:
         request_id="req_001",
         binding_token="secret_token_xyz",
         workspace="/Users/corey/projects/frontend",
+        session_id="conv_abc123",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
     assert decoded.request_id == "req_001"
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
+    assert decoded.session_id == "conv_abc123"
 
 
 def test_launch_runner_result_frame_success_round_trip() -> None:
@@ -271,6 +275,7 @@ def test_launch_runner_frame_legacy_payload_decodes_harness_none() -> None:
     )
     decoded = decode_host_frame(legacy)
     assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.session_id is None
     assert decoded.harness is None
 
 
@@ -835,6 +840,70 @@ def test_remove_worktree_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostRemoveWorktreeResultFrame)
     assert decoded == original
+
+
+# ── host.list_worktrees frames ──────────────────────────
+
+
+def test_list_worktrees_frame_round_trip() -> None:
+    """Verify HostListWorktreesFrame survives encode → decode.
+
+    A garbled repo_path would list the wrong repository's worktrees.
+    """
+    original = HostListWorktreesFrame(
+        request_id="req_wt_ls_1",
+        repo_path="/Users/alice/myrepo",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostListWorktreesFrame)
+    assert decoded == original
+
+
+def test_list_worktrees_result_frame_round_trip() -> None:
+    """Verify HostListWorktreesResultFrame survives encode → decode.
+
+    The worktree dicts feed the picker; a dropped or reshaped field
+    would break branch prefill / start-in-worktree selection.
+    """
+    original = HostListWorktreesResultFrame(
+        request_id="req_wt_ls_1",
+        status="ok",
+        worktrees=[
+            {"path": "/Users/alice/myrepo", "branch": "main", "is_main": True, "detached": False},
+            {
+                "path": "/Users/alice/myrepo-worktrees/feature-login",
+                "branch": "feature/login",
+                "is_main": False,
+                "detached": False,
+            },
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostListWorktreesResultFrame)
+    assert decoded == original
+
+
+def test_list_worktrees_result_frame_failure_round_trip() -> None:
+    """Verify a failed list-worktrees result carries its error and null list."""
+    original = HostListWorktreesResultFrame(
+        request_id="req_wt_ls_1",
+        status="failed",
+        error="not a git repository",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostListWorktreesResultFrame)
+    assert decoded.worktrees is None
+    assert decoded.error == "not a git repository"
+
+
+def test_list_worktrees_result_frame_rejects_non_list() -> None:
+    """A non-list ``worktrees`` field is rejected, not coerced."""
+    bad = (
+        '{"kind": "host.list_worktrees_result", "request_id": "r", '
+        '"status": "ok", "worktrees": "nope"}'
+    )
+    with pytest.raises(ValueError, match="worktrees"):
+        decode_host_frame(bad)
 
 
 # ── host.create_dir frames ──────────────────────────────
