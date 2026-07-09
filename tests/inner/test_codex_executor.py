@@ -2158,6 +2158,26 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
+def test_populate_codex_home_config_shares_only_plugin_cache(tmp_path: Path) -> None:
+    """Private homes reuse plugin downloads but keep plugin runtime state local."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source_cache = source / "plugins" / "cache"
+    source_cache.mkdir(parents=True)
+    (source_cache / "cached-plugin").mkdir()
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    target_cache = target / "plugins" / "cache"
+    assert target_cache.is_symlink()
+    assert target_cache.resolve() == source_cache.resolve()
+    assert (target_cache / "cached-plugin").is_dir()
+    assert not (target / "plugins" / ".plugin-appserver").exists()
+
+
 def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path) -> None:
     """Writing to the session's ``config.toml`` copy does not affect the source.
 

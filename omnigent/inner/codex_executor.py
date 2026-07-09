@@ -110,6 +110,12 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
 
+# Cache directories shared with the real CODEX_HOME. Codex's plugin cache is
+# designed for concurrent CLI processes that use one home, while Omnigent's
+# private homes otherwise force every session to clone remote plugins again.
+# Keep session-local plugin metadata private; only the reusable cache is shared.
+_CODEX_HOME_SYMLINK_DIRS = (Path("plugins/cache"),)
+
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
 # command writes only to the session's own private copy and never touches the
@@ -699,6 +705,8 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
+    - ``plugins/cache`` is **symlinked** so each private session reuses the
+      shared Codex plugin cache instead of cloning remote plugins at startup.
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
@@ -730,6 +738,24 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
                 exc,
             )
             shutil.copy2(source_file, link_path)
+
+    for relative_path in _CODEX_HOME_SYMLINK_DIRS:
+        source_path = source_dir / relative_path
+        if not source_path.is_dir():
+            continue
+        link_path = target_dir / relative_path
+        if link_path.exists() or link_path.is_symlink():
+            continue
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            link_path.symlink_to(source_path.resolve(), target_is_directory=True)
+        except OSError as exc:
+            logger.warning(
+                "could not symlink %r into %s (%s); using a private cache",
+                str(relative_path),
+                target_dir,
+                exc,
+            )
 
     for filename in _CODEX_HOME_COPY_FILES:
         source_file = source_dir / filename
