@@ -1344,6 +1344,101 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("loadHistoryUntilUserMessages pages older history until the target user count", async () => {
+    // Dense turns: each turn is one user message followed by several
+    // non-user items (assistant + tool call), so a page spans many items per
+    // user prompt — the case the eager loader's large page size targets.
+    // 15 turns × 3 items = 45 items, comfortably past the initial window so
+    // the eager loader genuinely pages older history rather than no-opping.
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `t_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(nativeToolItem(rid));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_dense", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_dense", items);
+
+    await useChatStore.getState().switchTo("conv_dense");
+    // The initial window holds only the newest slice of items, so far fewer
+    // than TURNS user prompts are loaded — the stub the eager loader fills in.
+    const initialUsers = useChatStore
+      .getState()
+      .blocks.filter((b) => b.type === "user_message").length;
+    expect(initialUsers).toBeLessThan(TURNS);
+
+    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
+
+    const state = useChatStore.getState();
+    // Reached (at least) the requested user count and ran history dry.
+    expect(state.blocks.filter((b) => b.type === "user_message")).toHaveLength(TURNS);
+    expect(state.hasMoreHistory).toBe(false);
+    expect(state.loadingMoreHistory).toBe(false);
+  });
+
+  it("loadHistoryUntilUserMessages keeps items in chronological order", async () => {
+    // Regression: the eager loader used to prepend each fetched block
+    // one-by-one, which reversed every page's internal order and scrambled
+    // the transcript (a mid-conversation prompt would surface at the top).
+    // Dense turns force multi-item pages so any per-page reversal shows up.
+    // 15 turns × 3 items is well past the initial window, so the eager loader
+    // pages a real multi-item older window (where the reversal manifested).
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `o_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(nativeToolItem(rid));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_order", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_order", items);
+
+    await useChatStore.getState().switchTo("conv_order");
+    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
+
+    // The loaded blocks must match the seeded chronological order exactly.
+    const loadedIds = useChatStore
+      .getState()
+      .blocks.map((b) => b.ctx.itemId)
+      .filter((iid): iid is string => Boolean(iid));
+    expect(loadedIds).toEqual(items.map((item) => item.id));
+    // And user prompts read oldest-first (prompt 0 before prompt 1 …).
+    const userIds = useChatStore
+      .getState()
+      .blocks.filter((b): b is UserMessageBlock => b.type === "user_message")
+      .map((b) => b.ctx.itemId);
+    const seededUserIds = items
+      .filter((item) => item.type === "message" && item.role === "user")
+      .map((item) => item.id);
+    expect(userIds).toEqual(seededUserIds);
+  });
+
+  it("loadHistoryUntilUserMessages no-ops when the target is already met", async () => {
+    const items = Array.from({ length: SESSION_HISTORY_PAGE_SIZE }, (_, idx) =>
+      userMessage(`m_${idx.toString().padStart(3, "0")}`, `m ${idx}`),
+    );
+    seedSession("conv_met", items);
+
+    await useChatStore.getState().switchTo("conv_met");
+    const before = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    const itemFetchesBefore = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_met/items"),
+    ).length;
+
+    // The window already holds SESSION_HISTORY_PAGE_SIZE user prompts, so a
+    // smaller target must not fetch or mutate anything.
+    await useChatStore.getState().loadHistoryUntilUserMessages(2);
+
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(before);
+    const itemFetchesAfter = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_met/items"),
+    ).length;
+    expect(itemFetchesAfter).toBe(itemFetchesBefore);
+  });
+
   it("does not run flat session items through the nested snapshot flattener", async () => {
     seedSessionSnapshot("conv_native", []);
     seedSessionItems("conv_native", [nativeToolItem("resp_native")]);

@@ -646,6 +646,14 @@ export interface ChatState {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: () => Promise<void>;
+  /**
+   * Page older history back-to-back until at least `minUserMessages` user
+   * prompts are loaded (or history runs out), committing all pages in ONE
+   * update. Used by the turn rail so it lands with its initial run of ticks
+   * in a single render instead of growing page-by-page. No-op if the target
+   * is already met or a fetch is already in flight.
+   */
+  loadHistoryUntilUserMessages: (minUserMessages: number) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -1841,6 +1849,82 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Disable further fetches on error — a persistent server failure
       // would otherwise re-trigger the scroll listener on every scroll event.
       set({ loadingMoreHistory: false, hasMoreHistory: false });
+    }
+  },
+
+  loadHistoryUntilUserMessages: async (minUserMessages) => {
+    const start = get();
+    if (start.loadingMoreHistory) return;
+    const countUsers = (blocks: AnyBlock[]): number =>
+      blocks.reduce((n, b) => n + (b.type === "user_message" ? 1 : 0), 0);
+    if (countUsers(start.blocks) >= minUserMessages) return;
+
+    const { conversationId, historyGeneration } = start;
+    if (!conversationId) return;
+    const stale = (): boolean =>
+      get().conversationId !== conversationId || get().historyGeneration !== historyGeneration;
+
+    // Page older windows into a local buffer, then commit ONCE so the rail
+    // (and transcript) jump straight to the initial run of turns rather than
+    // growing one page per render. Large per-page limit because turns can span
+    // many items (tool calls, reasoning) — a turn here averages well over the
+    // default 20-item page, so small pages would need a dozen+ round-trips to
+    // reach the target. Bounded page count is a backstop against a pathological
+    // single turn.
+    const EAGER_PAGE_LIMIT = 200;
+    const MAX_EAGER_PAGES = 10;
+    set({ loadingMoreHistory: true });
+    let cursor = start.oldestItemId;
+    let hasMore = start.hasMoreHistory;
+    const older: AnyBlock[] = [];
+    const seenNew = new Set<string>();
+    // Commit whatever pages we gathered, even on a mid-loop error — discarding
+    // the buffer would lose progress AND leave turns.length unchanged, so the
+    // rail's eager-load effect (keyed on it) would never re-fire and the rail
+    // would wedge at a partial, unscrollable set of ticks.
+    const commit = () => {
+      set((state) => {
+        const seen = new Set(
+          state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        );
+        const unique = older.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+        return {
+          blocks: [...unique, ...state.blocks],
+          hasMoreHistory: hasMore,
+          oldestItemId: cursor ?? state.oldestItemId,
+          loadingMoreHistory: false,
+        };
+      });
+    };
+    try {
+      for (let pages = 0; pages < MAX_EAGER_PAGES && hasMore && cursor; pages++) {
+        const page = await fetchSessionItemsPage(conversationId, {
+          olderThan: cursor,
+          limit: EAGER_PAGE_LIMIT,
+        });
+        if (stale()) return;
+        hasMore = page.hasMore;
+        cursor = page.items[0]?.id ?? cursor;
+        // Each page is chronological (oldest→newest) and older than the last.
+        // Collect this page's new blocks in order, then prepend the whole page
+        // as a group — prepending item-by-item would reverse each page's
+        // internal order, scrambling the transcript.
+        const pageBlocks: AnyBlock[] = [];
+        for (const b of itemsToBlocks(page.items)) {
+          const iid = b.ctx.itemId;
+          if (iid && seenNew.has(iid)) continue;
+          if (iid) seenNew.add(iid);
+          pageBlocks.push(b);
+        }
+        older.unshift(...pageBlocks);
+        if (countUsers(older) >= minUserMessages) break;
+        if (!page.items[0]?.id) break;
+      }
+      commit();
+    } catch {
+      if (stale()) return;
+      // Keep hasMore true so scroll-up can retry the rest; commit progress.
+      commit();
     }
   },
 }));
