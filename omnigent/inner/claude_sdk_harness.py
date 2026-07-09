@@ -81,6 +81,17 @@ Env vars read at startup:
   stable plugin name (so bundled skills show as
   ``<agent>:<skill>`` rather than the bundle's tmpdir
   basename).
+- ``HARNESS_CLAUDE_SDK_VERTEX_PROJECT``: GCP project id with
+  Claude enabled on Vertex AI. When set, routes through
+  :class:`omnigent.inner.vertex_anthropic_shim.VertexAnthropicGatewayShim`
+  instead of the gateway transport — mutually exclusive with
+  ``HARNESS_CLAUDE_SDK_GATEWAY`` (the inner executor's
+  constructor rejects both being set). Authenticated by GCP
+  Application Default Credentials resolved in this process; the
+  sandboxed Claude CLI subprocess never sees a GCP credential.
+- ``HARNESS_CLAUDE_SDK_VERTEX_LOCATION``: Vertex location, e.g.
+  ``"global"`` or ``"us-east5"``. Defaults to ``"global"``.
+  Ignored unless ``HARNESS_CLAUDE_SDK_VERTEX_PROJECT`` is set.
 """
 
 from __future__ import annotations
@@ -117,6 +128,11 @@ _ENV_AGENT_NAME = "HARNESS_CLAUDE_SDK_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+# GCP project/location for Claude on Vertex AI — mutually exclusive with the
+# gateway env vars above (validated by ClaudeSDKExecutor.__init__). See
+# vertex_anthropic_shim.py and the module docstring's Vertex AI entry.
+_ENV_VERTEX_PROJECT = "HARNESS_CLAUDE_SDK_VERTEX_PROJECT"
+_ENV_VERTEX_LOCATION = "HARNESS_CLAUDE_SDK_VERTEX_LOCATION"
 # Shell command the Claude CLI invokes to retrieve a bearer token.
 # Set by the Omnigent workflow layer when executor.auth: {type: api_key, …} is
 # declared.  Passed into ClaudeSDKExecutor.api_key_helper so it reaches
@@ -291,6 +307,8 @@ def _build_claude_sdk_executor() -> Executor:
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
         or None,
+        vertex_project=os.environ.get(_ENV_VERTEX_PROJECT) or None,
+        vertex_location=os.environ.get(_ENV_VERTEX_LOCATION) or "global",
         retry_policy=_resolve_retry_policy(),
         bundle_dir=bundle_dir,
         agent_name=agent_name,
