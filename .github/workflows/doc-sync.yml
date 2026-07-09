@@ -598,6 +598,22 @@ jobs:
           m = re.search(r"<!--\s*DOC_DRAFT_SUMMARY\s*-->", raw)
           summary = raw[m.end():].strip() if m else "_(drafter produced edits but no summary)_"
 
+          # Title the docs PR after the DOCS change, not the source PR number (which
+          # already appears in the body). Prefer the drafter's DOC_PR_TITLE line; fall
+          # back to the source PR title, then to the old "document #N" form. LLM output
+          # is untrusted, so sanitize: first line only, strip control chars, collapse
+          # whitespace, drop a stray leading "docs:" (added below), and cap length.
+          mt = re.search(r"^\s*DOC_PR_TITLE:\s*(.+?)\s*$", raw, re.MULTILINE)
+          # Collapse whitespace (incl. tabs) to single spaces FIRST, so a stray tab
+          # separates words rather than being stripped and joining them, then drop
+          # any remaining non-whitespace control chars.
+          draft_title = re.sub(r"\s+", " ", mt.group(1) if mt else "").strip()
+          draft_title = re.sub(r"[\x00-\x1f\x7f]", "", draft_title)
+          draft_title = re.sub(r"^docs:\s*", "", draft_title, flags=re.IGNORECASE).strip()[:60].strip()
+          pr_title = f"docs: {draft_title or title or f'document {code}#{pr}'}"
+          pathlib.Path("/tmp/site_pr_title.txt").write_text(pr_title)
+          print(f"pr_title={pr_title!r}")
+
           # Tag the maintainer who MERGED the PR — the author may be an outside
           # contributor with no site access, but a maintainer always merges. Fall back
           # to the author when there's no usable merger (e.g. a manual run on an
@@ -644,6 +660,10 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="auto/docs/pr-${PR_NUMBER}"
+          # Descriptive PR/commit title from the sitepr step (drafter's DOC_PR_TITLE,
+          # else the source PR title, else "docs: document #N"). The PR number lives
+          # in the body, so it's kept out of the title.
+          PR_TITLE="$(cat /tmp/site_pr_title.txt)"
           git config user.name  "omnigent-ci[bot]"
           git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
           # Credentials are NOT persisted in .git/config (so the unsandboxed drafter
@@ -686,7 +706,7 @@ jobs:
 
           git checkout -B "$BRANCH"
           git add -A
-          git commit -m "docs: document ${CODE_REPO}#${PR_NUMBER}"
+          git commit -m "$PR_TITLE"
           # --force is safe here: the guard above ensured the branch carries only
           # bot commits.
           git push --force "$PUSH_URL" "$BRANCH"
@@ -705,12 +725,13 @@ jobs:
             # --add-label backfills PRs opened before the label existed; it's a no-op
             # when already present.
             gh pr edit "$EXISTING" --repo "$SITE_REPO_SLUG" \
+              --title "$PR_TITLE" \
               --add-label "automated-docs" --add-label "$VERSION_LABEL" \
               --body-file /tmp/site_pr_body.md || true
             echo "Updated site PR #$EXISTING."
           else
             if gh pr create --repo "$SITE_REPO_SLUG" --base "$DOCS_BRANCH" --head "$BRANCH" \
-                --title "docs: document ${CODE_REPO}#${PR_NUMBER}" \
+                --title "$PR_TITLE" \
                 --label automated-docs --label "$VERSION_LABEL" --body-file /tmp/site_pr_body.md; then
               EXISTING="$(gh pr list --repo "$SITE_REPO_SLUG" --head "$BRANCH" --state open \
                   --json number --jq '.[0].number // empty' 2>/dev/null || true)"
