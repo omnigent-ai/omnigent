@@ -410,7 +410,7 @@ function registerSessionExpiryAccess() {
   registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
     const now = Date.now();
     for (const [win, state] of windows) {
-      if (state.origin !== origin) continue;
+      if (state.origin !== origin || win.isDestroyed()) continue;
       const last = _lastExpiryReloadAt.get(win) ?? 0;
       if (now - last < _EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
       _lastExpiryReloadAt.set(win, now);
