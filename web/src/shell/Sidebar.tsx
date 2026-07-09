@@ -2794,9 +2794,12 @@ function ConversationRow({
             </DialogDescription>
           </DialogHeader>
           {stopSession.isError && (
-            // 503 = runner couldn't deliver the kill; keep the dialog open.
             <p className="text-sm text-destructive" role="alert">
-              Couldn't stop the session — it may still be running. Try again in a moment.
+              Couldn't stop the session
+              {stopSession.error instanceof Error && stopSession.error.message
+                ? `: ${stopSession.error.message}`
+                : " — it may still be running"}
+              . Try again in a moment.
             </p>
           )}
           <DialogFooter>
