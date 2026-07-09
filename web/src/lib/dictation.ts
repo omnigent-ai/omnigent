@@ -148,7 +148,9 @@ let _workletUrl: string | null = null;
 
 function workletUrl(): string {
   if (_workletUrl === null) {
-    _workletUrl = URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "application/javascript" }));
+    _workletUrl = URL.createObjectURL(
+      new Blob([WORKLET_SOURCE], { type: "application/javascript" }),
+    );
   }
   return _workletUrl;
 }

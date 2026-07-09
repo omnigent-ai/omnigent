@@ -11,7 +11,10 @@ import { describe, expect, it } from "vitest";
 import { useDictationInsert } from "./useDictationInsert";
 
 /** Harness pairing the hook with the same useState shape the composers use. */
-function renderDictation(initial = "", wrapper?: ({ children }: { children: ReactNode }) => ReactNode) {
+function renderDictation(
+  initial = "",
+  wrapper?: ({ children }: { children: ReactNode }) => ReactNode,
+) {
   return renderHook(
     () => {
       const [value, setValue] = useState(initial);
