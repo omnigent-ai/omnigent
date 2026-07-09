@@ -515,6 +515,10 @@ class RoutingDecisionData(BaseModel):
     tier: Literal["cheap", "medium", "expensive"]
     applied: bool
     rationale: str
+    #: Sub-agent name when this decision was made for a child session and the
+    #: item is being mirrored into the parent's transcript, e.g. ``"claude_code"``.
+    #: ``None`` for session-local routing decisions (the usual case).
+    agent: str | None = None
 
     @field_validator("model")
     @classmethod

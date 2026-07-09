@@ -151,6 +151,7 @@ export type Bubble =
       tier: "cheap" | "medium" | "expensive";
       applied: boolean;
       rationale: string;
+      agent?: string;
     };
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
@@ -450,6 +451,7 @@ function walkBubbles(
         tier: b.tier,
         applied: b.applied,
         rationale: b.rationale,
+        ...(b.agent !== undefined && { agent: b.agent }),
       });
       i += 1;
       continue;

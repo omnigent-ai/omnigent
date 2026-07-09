@@ -8590,6 +8590,8 @@ async def _emit_server_routing_decision(
     conversation_store: ConversationStore,
     model: str,
     verdict: dict[str, Any],
+    *,
+    agent: str | None = None,
 ) -> None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
@@ -8597,6 +8599,9 @@ async def _emit_server_routing_decision(
     to the runner.  The chip shows the judge's model pick at turn start
     — the same UX the runner-side advisor produced, but driven entirely
     by the server.
+
+    :param agent: Sub-agent name to include when mirroring a child
+        session's routing decision into the parent's transcript.
     """
     import uuid
 
@@ -8604,12 +8609,14 @@ async def _emit_server_routing_decision(
 
     tier = verdict.get("tier", "medium")
     rationale = verdict.get("rationale", "")
-    item_data = {
+    item_data: dict[str, Any] = {
         "model": model,
         "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
         "applied": True,
         "rationale": rationale if isinstance(rationale, str) else "",
     }
+    if agent is not None:
+        item_data["agent"] = agent
     try:
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
@@ -8864,6 +8871,18 @@ async def _forward_event_to_runner(
                 _routed_model,
                 _verdict,
             )
+            # Mirror the routing decision into the parent session so the
+            # orchestrator's transcript also shows which model was chosen
+            # for this sub-agent — the decision is otherwise only visible
+            # on the child session screen.
+            if _parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict,
+                    agent=agent_name or "",
+                )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Forward to runner failed for session=%s; "
@@ -9100,6 +9119,14 @@ async def _dispatch_session_event_to_runner(
                 _native_routed_model,
                 _native_verdict,
             )
+            if _native_parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _native_routed_model,
+                    _native_verdict,
+                    agent=agent_name or "",
+                )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,
@@ -14321,9 +14348,13 @@ def create_sessions_router(
         :returns: List of project names.
         """
         user_id = _require_user(request, auth_provider)
+        # Filing into a project is owner-only, so the sidebar renders project
+        # folders only on "My sessions". Scope to owned sessions so a project
+        # owned by someone else (with a session shared to this user) doesn't
+        # surface as one of their own folders.
         return await asyncio.to_thread(
             conversation_store.list_projects,
-            accessible_by=user_id,
+            owned_by=user_id,
         )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
@@ -14556,6 +14587,12 @@ def create_sessions_router(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # A specific project folder ("My sessions"-only) must show only the
+        # viewer's own sessions — a session shared with them but filed under a
+        # like-named project belongs on "Shared with me", not in this folder.
+        # The flat list (project=None) and Unfiled (project="") stay unscoped so
+        # shared sessions still surface for the "Shared with me" tab.
+        owned_by = user_id if project else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -14564,6 +14601,7 @@ def create_sessions_router(
             agent_id=agent_id,
             agent_name=agent_name,
             accessible_by=user_id,
+            owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
             # spells that ``kind=any`` to keep the param required-ish

@@ -1,38 +1,53 @@
-//! omnidev — a per-repo dev pod supervisor TUI for the Omnigent repo.
+//! omnidev — dev tooling for Omnigent.
 //!
-//! Manages one isolated dev instance (its own state dir + ports) and its three
-//! processes (server, host, vite), restarting the backend on Python changes
-//! while Vite handles frontend HMR itself.
+//! Two independent capabilities in one binary:
+//! - **pod supervisor** (bare `omnidev`): manages an isolated dev instance for
+//!   the current checkout — server/host/vite, restarting the backend on Python
+//!   changes while Vite handles frontend HMR.
+//! - **install management** (`omnidev install`/`update`/`check`/…): install and
+//!   keep a git-based omnigent up to date. These need no checkout and run
+//!   anywhere.
 
+mod install;
 mod lock;
 mod logs;
 mod paths;
 mod pod;
 mod ports;
 mod process;
+mod shellhook;
 mod state;
 mod supervisor;
 mod tui;
+mod update_check;
 mod watcher;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 
+use install::InstallConfig;
 use pod::Pod;
 use ports::Ports;
 use state::Shared;
 use supervisor::{Cmd, Supervisor};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "omnidev",
-    about = "Isolated dev pod supervisor for the Omnigent repo"
-)]
+#[command(name = "omnidev", about = "Dev tooling for Omnigent", version)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+/// Flags for the default (no-subcommand) pod-supervisor run.
+#[derive(clap::Args, Debug)]
+struct RunArgs {
     /// Force the backend server port (default: probe from 6767).
     #[arg(long)]
     server_port: Option<u16>,
@@ -54,10 +69,78 @@ struct Args {
     clean: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Install omnigent from git (defaults to the databricks extra, main).
+    Install {
+        /// Git ref (branch/tag/sha) to track.
+        #[arg(long, default_value = install::DEFAULT_REF)]
+        r#ref: String,
+        /// Extra to include (repeatable). Defaults to `databricks`.
+        #[arg(long = "extra")]
+        extras: Vec<String>,
+        /// Omit the default databricks extra (install with no extras).
+        #[arg(long)]
+        no_default_extra: bool,
+        /// Git repo URL.
+        #[arg(long, default_value = install::DEFAULT_REPO)]
+        repo: String,
+    },
+    /// Reinstall the latest of the tracked ref/extras.
+    Update,
+    /// Check for an omnigent update (the shell hook calls this).
+    Check {
+        /// Print nothing when already up to date.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Refresh the update-check cache from the network (usually run detached).
+    Refresh,
+    /// Print a shell snippet to eval from .zshrc/.bashrc for daily checks.
+    ShellHook,
+}
+
+fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Install-management subcommands manage a global tool and must work from
+    // anywhere — dispatch them before any checkout discovery.
+    match args.command {
+        Some(Command::Install {
+            r#ref,
+            extras,
+            no_default_extra,
+            repo,
+        }) => {
+            let extras = if !extras.is_empty() {
+                extras
+            } else if no_default_extra {
+                vec![]
+            } else {
+                vec![install::DEFAULT_EXTRA.to_string()]
+            };
+            let config = InstallConfig {
+                repo,
+                git_ref: r#ref,
+                extras,
+            };
+            install::install(&config)
+        }
+        Some(Command::Update) => install::update(),
+        Some(Command::Check { quiet }) => update_check::check(quiet),
+        Some(Command::Refresh) => update_check::refresh(),
+        Some(Command::ShellHook) => {
+            shellhook::print();
+            Ok(())
+        }
+        None => run_supervisor(args.run),
+    }
+}
+
+/// Default path: the pod supervisor for the current checkout. This is the only
+/// path that requires an Omnigent checkout.
+#[tokio::main]
+async fn run_supervisor(args: RunArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = paths::find_repo_root(&cwd)?;
     let pod_dir = match &args.pod_dir {

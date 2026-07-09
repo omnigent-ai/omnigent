@@ -329,6 +329,11 @@ export interface RoutingDecision {
   applied: boolean;
   /** The router's one-line rationale. */
   rationale: string;
+  /**
+   * Sub-agent name when this decision is mirrored into the parent session,
+   * e.g. `"claude_code"`. Absent for session-local routing decisions.
+   */
+  agent?: string;
   itemId: string;
   responseId: string;
 }

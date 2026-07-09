@@ -42,15 +42,25 @@ def test_name_indexes_key_on_checksum(db_engine: Engine) -> None:
     inspector = sa.inspect(db_engine)
 
     indexes = {i["name"]: i for i in inspector.get_indexes("policies")}
-    assert "ix_policies_default_name_cksum" in indexes
-    assert indexes["ix_policies_default_name_cksum"]["unique"]
-    assert indexes["ix_policies_default_name_cksum"]["column_names"] == ["name_cksum"]
+    # At head the partial unique index is replaced by a plain name_cksum
+    # lookup index (see z5a2b3c4d5e6); default-name uniqueness lives in the
+    # store. It still keys on name_cksum, not the raw name.
+    assert "ix_policies_default_name_cksum" not in indexes
+    assert "ix_policies_name_cksum" in indexes
+    assert not indexes["ix_policies_name_cksum"]["unique"]
+    # Leads with workspace_id (PK inclusion), keys on name_cksum, ends with id.
+    assert indexes["ix_policies_name_cksum"]["column_names"] == [
+        "workspace_id",
+        "name_cksum",
+        "id",
+    ]
     # The old raw-name index is gone.
     assert "ix_policies_default_name" not in indexes
 
     uniques = {u["name"]: u for u in inspector.get_unique_constraints("policies")}
     assert "uq_policies_session_id_name_cksum" in uniques
     assert uniques["uq_policies_session_id_name_cksum"]["column_names"] == [
+        "workspace_id",
         "session_id",
         "name_cksum",
     ]

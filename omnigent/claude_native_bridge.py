@@ -281,11 +281,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(kiro_root.parent.parent)
 
+    # Headless ACP harnesses (acp / goose / qwen) put their Omnigent-MCP relay
+    # bridge below ``$TMPDIR/omnigent-<uid>/acp-mcp`` (same uid-scoped shape as
+    # cursor/qwen/hermes-native), so trust the uid-scoped temp dir's parent.
+    acp_root = _absolute_syntactic_path(acp_mcp_bridge_root())
+    if target.is_relative_to(acp_root):
+        return _absolute_syntactic_path(acp_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s})"
+        f"{kiro_root!s}, {acp_root!s})"
     )
 
 
@@ -702,6 +709,38 @@ def _ensure_secure_dir(target: Path) -> None:
             )
         if (st.st_mode & 0o077) != 0:
             os.chmod(ancestor, 0o700)
+
+
+def acp_mcp_bridge_root() -> Path:
+    """Bridge root for the headless ACP harnesses' Omnigent-MCP relay.
+
+    Shares the uid-scoped temp parent with claude-native
+    (``$TMPDIR/omnigent-<uid>/acp-mcp``). Used by the acp / goose / qwen
+    executors' ``OmnigentAcpMcp`` relay so ``serve-mcp``'s bridge dir passes the
+    :func:`_trusted_parent_for_bridge_dir` secure-root check.
+
+    :returns: The ACP-MCP bridge root directory (not created here).
+    """
+    return _BRIDGE_ROOT_PARENT / "acp-mcp"
+
+
+def prepare_acp_mcp_bridge_dir() -> Path:
+    """Create a fresh, secure per-relay bridge dir for an ACP harness.
+
+    Returns a unique owner-only directory under :func:`acp_mcp_bridge_root` with
+    a minimal token-only ``bridge.json`` — so the shared ``serve-mcp`` serves
+    ONLY the relay tools (no raw ``sys_os_*`` filesystem tools; the ACP agent
+    owns those). The caller's relay writes ``tool_relay.json`` here and points
+    ``serve-mcp`` at the directory.
+
+    :returns: The prepared bridge directory path.
+    """
+    bridge_dir = acp_mcp_bridge_root() / secrets.token_hex(8)
+    _ensure_secure_dir(bridge_dir)
+    config_path = bridge_dir / _CONFIG_FILE
+    if not config_path.exists():
+        _write_json_file(config_path, {"token": secrets.token_urlsafe(32)})
+    return bridge_dir
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -2991,25 +3030,47 @@ def _wait_for_claude_prompt_ready(
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries the
-        tail of the captured pane (see :func:`_format_terminal_failure_tail`)
-        so Claude Code's own startup output surfaces in the caller's error.
+        *timeout_s* (Claude failed to boot). The message carries a poll
+        count, how many of those polls saw an empty capture, and the tail
+        of the last non-empty capture the loop actually observed (see
+        :func:`_format_terminal_failure_tail`) so the true failure mode —
+        a startup crash, a torn/empty capture under a mid-turn repaint, or
+        a box that never appeared — is diagnosable from the error alone.
     """
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
+    polls = 0
+    empty_polls = 0
+    # Keep the last non-empty capture the loop actually saw, not a fresh
+    # capture taken after the deadline. A post-timeout re-capture can show
+    # a different (often healthier-looking) frame than any decision the
+    # loop made — e.g. the input box repainting just as the turn settles —
+    # which misrepresents why the gate failed. Attaching what was observed
+    # while it mattered keeps the error honest.
+    last_nonempty = ""
+    # Poll at least once even at timeout_s=0: a single readiness check is
+    # still meaningful, and it guarantees a capture to attach on failure.
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        if pane.strip():
+            last_nonempty = pane
+        else:
+            empty_polls += 1
+        if _claude_prompt_rendered(pane):
             return
+        if time.monotonic() >= deadline:
+            break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    # Timed out: Claude Code never rendered its input prompt. Capture the
-    # pane one last time and attach its tail so the real cause — often a
-    # startup crash like a ``JSON Parse error`` — surfaces in the web UI
-    # error banner this raises into, instead of only a generic timeout
-    # the user has to open the terminal to diagnose.
-    pane = _capture_pane(socket_path, tmux_target)
+    # Timed out. The poll/empty-capture counts separate the failure modes:
+    # mostly-empty captures point at a torn read under a busy repaint (the
+    # session is alive but capture-pane came back blank); non-empty captures
+    # with no box point at Claude never rendering the prompt (a boot crash,
+    # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
-        "(input prompt never rendered). The message was not delivered."
-        + _format_terminal_failure_tail(pane)
+        f"(input prompt never rendered in {polls} polls, "
+        f"{empty_polls} empty captures). The message was not delivered."
+        + _format_terminal_failure_tail(last_nonempty)
     )
 
 

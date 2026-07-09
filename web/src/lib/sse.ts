@@ -995,6 +995,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       tier,
       applied: rec.applied === true,
       rationale: typeof rec.rationale === "string" ? rec.rationale : "",
+      ...(typeof rec.agent === "string" && rec.agent.length > 0 && { agent: rec.agent }),
       itemId,
       responseId,
     } satisfies RoutingDecision;

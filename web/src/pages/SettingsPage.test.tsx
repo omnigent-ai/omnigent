@@ -6,6 +6,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -59,6 +60,33 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+// Radix Select uses a portal + pointer events jsdom can't drive, so stub it to
+// a native <select>; lets the color-theme dropdown be exercised via change.
+vi.mock("@/components/ui/select", () => ({
+  Select: ({
+    value,
+    onValueChange,
+    children,
+  }: {
+    value: string;
+    onValueChange: (v: string) => void;
+    children: ReactNode;
+  }) => (
+    <select
+      data-testid="color-theme-select"
+      value={value}
+      onChange={(e) => onValueChange(e.target.value)}
+    >
+      {children}
+    </select>
+  ),
+  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectValue: () => null,
+  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+    <option value={value}>{children}</option>
+  ),
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -101,6 +129,9 @@ afterEach(() => {
   // don't leak persisted state or the --ui-font-scale variable into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--ui-font-scale");
+  // The palette picker sets data-theme on <html>; clear it so a palette
+  // selected in one test doesn't leak into the next.
+  document.documentElement.removeAttribute("data-theme");
 });
 
 describe("SettingsPage", () => {
@@ -141,6 +172,36 @@ describe("SettingsPage", () => {
     renderPage("/settings/appearance");
     expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+
+    const select = screen.getByTestId("color-theme-select") as HTMLSelectElement;
+    // Nothing stored → the default (Omnigent) palette is selected and no
+    // data-theme override is applied to the document.
+    expect(select.value).toBe("omni");
+    expect(document.documentElement.getAttribute("data-theme")).toBeNull();
+
+    // Choosing a palette applies it live to <html> and persists it.
+    fireEvent.change(select, { target: { value: "github" } });
+    expect(select.value).toBe("github");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("github");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+  });
+
+  it("moves the mode selection with arrow keys (radiogroup keyboard nav)", () => {
+    renderPage("/settings/appearance");
+
+    // Arrow keys move within the mode radiogroup and select as focus moves (the
+    // WAI-ARIA radiogroup pattern). themeCards order is System / Light / Dark,
+    // so ArrowRight from System selects Light.
+    const system = screen.getByTestId("theme-system");
+    system.focus();
+    fireEvent.keyDown(system, { key: "ArrowRight" });
+
+    expect(mocks.setTheme).toHaveBeenCalledWith("light");
   });
 
   it("shows the default UI font size and steps it up, persisting the choice", () => {
