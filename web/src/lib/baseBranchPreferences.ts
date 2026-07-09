@@ -12,12 +12,15 @@ const STORAGE_KEY = "omnigent:default-base-branch";
 /**
  * Read the user's default base branch: the stored branch name, or `null` when
  * nothing is stored, on a server render (no `window`), or when storage is
- * inaccessible — never throws.
+ * inaccessible — never throws. Trims on read and treats a blank/whitespace-only
+ * value as unset, so a hand-edited or stale entry can't display un-normalized.
  */
 export function readDefaultBaseBranch(): string | null {
   if (typeof window === "undefined") return null;
   try {
-    return window.localStorage.getItem(STORAGE_KEY);
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    const trimmed = stored?.trim() ?? "";
+    return trimmed === "" ? null : trimmed;
   } catch {
     return null;
   }
