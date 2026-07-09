@@ -3142,7 +3142,7 @@ function ProjectPickerMenu({
       </div>
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((name) => (
-          <C.Item key={name} onSelect={() => onSelect(name)}>
+          <C.Item key={name} className="px-2 py-1" onSelect={() => onSelect(name)}>
             <span className="flex-1 truncate text-left">{name}</span>
             {currentProject === name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
@@ -3177,6 +3177,7 @@ function ProjectPickerMenu({
           </div>
         ) : (
           <C.Item
+            className="px-2 py-1"
             // Keep the menu open so the inline input can take over in place.
             onSelect={(e) => {
               e.preventDefault();
@@ -3188,7 +3189,7 @@ function ProjectPickerMenu({
           </C.Item>
         )}
         {currentProject && (
-          <C.Item onSelect={() => onSelect("")}>
+          <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
