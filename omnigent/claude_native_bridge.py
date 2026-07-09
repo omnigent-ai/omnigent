@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -57,6 +57,7 @@ from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
 if TYPE_CHECKING:
     from omnigent.llms.context_window import ModelPricing
+    from omnigent.spec.types import MCPServerConfig
 
 from omnigent.inner.bundle_skills import claude_native_skill_args
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -1046,6 +1047,59 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
     }
 
 
+def build_claude_mcp_block(
+    servers: Sequence[MCPServerConfig],
+) -> dict[str, dict[str, Any]]:
+    """
+    Translate Omnigent MCP server declarations into Claude Code ``mcpServers`` entries.
+
+    Mirrors :func:`omnigent.opencode_native_provider.build_opencode_mcp_block`, but
+    emits Claude Code's ``--mcp-config`` shapes: ``stdio`` → ``{command, args, env}``
+    (``env`` only when non-empty, matching how the Omnigent relay entry is written);
+    ``http`` → ``{type:"http", url, headers}`` (``headers`` only when non-empty). A
+    ``databricks_profile`` resolves a bearer token into the ``Authorization`` header
+    at build time, re-resolved on resume. Entries Claude can't represent (stdio
+    without a command, http without a url) are skipped.
+
+    :param servers: The agent spec's ``mcp_servers``.
+    :returns: A Claude ``mcpServers`` block keyed by server name (empty when none
+        are representable).
+    """
+    block: dict[str, dict[str, Any]] = {}
+    for server in servers:
+        name = getattr(server, "name", None)
+        if not name:
+            continue
+        if getattr(server, "transport", "http") == "stdio":
+            command = getattr(server, "command", None)
+            if not command:
+                continue
+            entry: dict[str, Any] = {
+                "command": command,
+                "args": list(getattr(server, "args", []) or []),
+            }
+            env = dict(getattr(server, "env", {}) or {})
+            if env:
+                entry["env"] = env
+        else:
+            url = getattr(server, "url", None)
+            if not url:
+                continue
+            headers = dict(getattr(server, "headers", {}) or {})
+            profile = getattr(server, "databricks_profile", None)
+            if profile and "Authorization" not in headers:
+                from omnigent.opencode_native_provider import _databricks_bearer_token
+
+                token = _databricks_bearer_token(profile)
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            entry = {"type": "http", "url": url}
+            if headers:
+                entry["headers"] = headers
+        block[str(name)] = entry
+    return block
+
+
 def build_hook_settings(
     bridge_dir: Path,
     *,
@@ -1312,6 +1366,7 @@ def augment_claude_args(
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    mcp_servers: Sequence[MCPServerConfig] = (),
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1344,9 +1399,19 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
+    :param mcp_servers: The agent spec's ``mcp_servers``, registered directly in
+        Claude's ``--mcp-config`` alongside the Omnigent relay (parity with the
+        opencode-native ``mcp`` block). An agent server named ``omnigent`` cannot
+        shadow the reserved relay entry. Defaults to none.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
+    for name, entry in build_claude_mcp_block(mcp_servers).items():
+        # Never let an agent-declared server overwrite the reserved Omnigent
+        # relay, which is what surfaces the sys_* builtin tool surface.
+        if name == _MCP_SERVER_NAME:
+            continue
+        mcp_config["mcpServers"][name] = entry
     hook_settings = build_hook_settings(
         bridge_dir,
         python_executable=python_executable,

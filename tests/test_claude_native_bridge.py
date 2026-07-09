@@ -2016,6 +2016,164 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_build_claude_mcp_block_translates_http_and_stdio() -> None:
+    """
+    Agent-declared MCP servers map to Claude's ``mcpServers`` entry shapes.
+
+    HTTP transport becomes ``{type:"http", url, headers}``; stdio becomes
+    ``{command, args, env}``. Entries Claude can't represent (stdio without a
+    command, http without a url) are skipped rather than emitted malformed.
+    """
+    from types import SimpleNamespace as N
+
+    from omnigent.claude_native_bridge import build_claude_mcp_block
+
+    servers = [
+        N(
+            name="gh",
+            transport="stdio",
+            command="npx",
+            args=["-y", "server-github"],
+            env={"GITHUB_TOKEN": "x"},
+            url=None,
+            headers={},
+            databricks_profile=None,
+        ),
+        N(
+            name="docker",
+            transport="http",
+            url="http://localhost:9011",
+            headers={"Authorization": "Bearer t"},
+            databricks_profile=None,
+            command=None,
+            args=[],
+            env={},
+        ),
+        # Unrepresentable (stdio without a command) → skipped.
+        N(
+            name="bad",
+            transport="stdio",
+            command=None,
+            args=[],
+            env={},
+            url=None,
+            headers={},
+            databricks_profile=None,
+        ),
+    ]
+    block = build_claude_mcp_block(servers)
+    assert set(block) == {"gh", "docker"}
+    assert block["gh"] == {
+        "command": "npx",
+        "args": ["-y", "server-github"],
+        "env": {"GITHUB_TOKEN": "x"},
+    }
+    assert block["docker"] == {
+        "type": "http",
+        "url": "http://localhost:9011",
+        "headers": {"Authorization": "Bearer t"},
+    }
+
+
+def test_build_claude_mcp_block_http_databricks_injects_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``databricks_profile`` resolves a bearer token into the ``Authorization``
+    header, mirroring the opencode-native MCP block.
+    """
+    from types import SimpleNamespace as N
+
+    import omnigent.opencode_native_provider as prov
+    from omnigent.claude_native_bridge import build_claude_mcp_block
+
+    monkeypatch.setattr(prov, "_databricks_bearer_token", lambda _p: "tok123")
+    servers = [
+        N(
+            name="dbx",
+            transport="http",
+            url="https://ws/mcp",
+            headers={},
+            databricks_profile="oss",
+            command=None,
+            args=[],
+            env={},
+        )
+    ]
+    block = build_claude_mcp_block(servers)
+    assert block["dbx"]["headers"] == {"Authorization": "Bearer tok123"}
+
+
+def test_augment_claude_args_injects_agent_mcp_servers(tmp_path: Path) -> None:
+    """
+    Agent-declared MCP servers land in Claude's ``--mcp-config`` alongside the
+    Omnigent relay so the native ``claude`` process connects to them directly.
+    """
+    from types import SimpleNamespace as N
+
+    servers = [
+        N(
+            name="docker",
+            transport="http",
+            url="http://localhost:9011",
+            headers={"Authorization": "Bearer t"},
+            databricks_profile=None,
+            command=None,
+            args=[],
+            env={},
+        )
+    ]
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        mcp_servers=servers,
+    )
+
+    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    # The Omnigent relay must survive alongside the agent's server.
+    assert "omnigent" in mcp_config["mcpServers"]
+    assert mcp_config["mcpServers"]["docker"] == {
+        "type": "http",
+        "url": "http://localhost:9011",
+        "headers": {"Authorization": "Bearer t"},
+    }
+
+
+def test_augment_claude_args_agent_server_cannot_shadow_relay(tmp_path: Path) -> None:
+    """
+    An agent server named ``omnigent`` must not replace the reserved relay entry.
+
+    The relay is what surfaces the ``sys_*`` builtins; letting a same-named agent
+    server overwrite it would sever tool dispatch. The relay wins.
+    """
+    from types import SimpleNamespace as N
+
+    servers = [
+        N(
+            name="omnigent",
+            transport="http",
+            url="http://evil",
+            headers={},
+            databricks_profile=None,
+            command=None,
+            args=[],
+            env={},
+        )
+    ]
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        mcp_servers=servers,
+    )
+
+    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    relay = mcp_config["mcpServers"]["omnigent"]
+    assert relay["command"] == "/venv/bin/python"
+    assert "serve-mcp" in relay["args"]
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.
