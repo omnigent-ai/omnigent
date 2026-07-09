@@ -11,13 +11,23 @@ pub struct Pod {
     pub repo_root: PathBuf,
     pub dir: PathBuf,
     pub ports: Ports,
+    pub vite_host: String,
+    /// LAN origins to trust for device testing (`--trust-lan-origins`); empty
+    /// otherwise. Fed to the server as `OMNIGENT_WS_ALLOWED_ORIGINS`.
+    pub trusted_origins: Vec<String>,
 }
 
 impl Pod {
     /// Create the pod directory tree (idempotent) and return the pod handle.
     /// Only omnigent's own state is isolated (DB, artifacts, logs); the pod
     /// otherwise inherits your real home, credentials, config, and caches.
-    pub fn create(repo_root: PathBuf, dir: PathBuf, ports: Ports) -> Result<Pod> {
+    pub fn create(
+        repo_root: PathBuf,
+        dir: PathBuf,
+        ports: Ports,
+        vite_host: String,
+        trusted_origins: Vec<String>,
+    ) -> Result<Pod> {
         for sub in ["data/omnigent", "artifacts", "logs"] {
             let p = dir.join(sub);
             std::fs::create_dir_all(&p)
@@ -27,6 +37,8 @@ impl Pod {
             repo_root,
             dir,
             ports,
+            vite_host,
+            trusted_origins,
         })
     }
 
@@ -99,11 +111,40 @@ impl Pod {
     /// `web/vite.config.ts` reads to point its proxy at this pod's backend.
     pub fn env(&self) -> Vec<(String, String)> {
         let d = |p: &str| self.dir.join(p).display().to_string();
-        vec![
+        let mut env = vec![
             ("OMNIGENT_DATA_DIR".into(), d("data/omnigent")),
             ("OMNIGENT_DATABASE_URI".into(), self.db_uri()),
             ("OMNIGENT_URL".into(), self.server_url()),
-        ]
+        ];
+        if let Some(allowed) = self.allowed_origins_env() {
+            env.push(("OMNIGENT_WS_ALLOWED_ORIGINS".into(), allowed));
+        }
+        env
+    }
+
+    /// The `OMNIGENT_WS_ALLOWED_ORIGINS` value to inject, or `None` to leave it
+    /// untouched. Merges the trusted LAN origins onto any value inherited from
+    /// the parent environment (comma-separated, order-preserving, deduped) so a
+    /// developer's own allowlist survives. Returns `None` when there are no LAN
+    /// origins to add — then the parent's value (if any) simply passes through.
+    fn allowed_origins_env(&self) -> Option<String> {
+        if self.trusted_origins.is_empty() {
+            return None;
+        }
+        let inherited = std::env::var("OMNIGENT_WS_ALLOWED_ORIGINS").unwrap_or_default();
+        let mut merged: Vec<String> = Vec::new();
+        let parts = inherited
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .chain(self.trusted_origins.iter().cloned());
+        for part in parts {
+            if !merged.contains(&part) {
+                merged.push(part);
+            }
+        }
+        Some(merged.join(","))
     }
 }
 

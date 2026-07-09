@@ -62,6 +62,9 @@ pub struct Supervisor {
     shared: Arc<Mutex<Shared>>,
     env: Vec<(String, String)>,
     vite_enabled: bool,
+    /// Whether `--trust-lan-origins` was requested, so we can warn if it was
+    /// asked for but no LAN interface turned up any origins to trust.
+    trust_lan_origins: bool,
     slots: [Slot; 3],
     /// Generations we stopped on purpose — their exits are not crashes.
     expected_stops: HashSet<(usize, u64)>,
@@ -71,7 +74,12 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(pod: Arc<Pod>, shared: Arc<Mutex<Shared>>, vite_enabled: bool) -> Supervisor {
+    pub fn new(
+        pod: Arc<Pod>,
+        shared: Arc<Mutex<Shared>>,
+        vite_enabled: bool,
+        trust_lan_origins: bool,
+    ) -> Supervisor {
         let env = pod.env();
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
         Supervisor {
@@ -79,6 +87,7 @@ impl Supervisor {
             shared,
             env,
             vite_enabled,
+            trust_lan_origins,
             slots: Default::default(),
             expected_stops: HashSet::new(),
             gen_counter: 0,
@@ -104,6 +113,14 @@ impl Supervisor {
             self.pod.ports.server,
             self.pod.ports.vite
         ));
+        if !self.pod.trusted_origins.is_empty() {
+            self.event(format!(
+                "trusting LAN origins for device testing: {}",
+                self.pod.trusted_origins.join(", ")
+            ));
+        } else if self.trust_lan_origins {
+            self.event("--trust-lan-origins: no LAN interface found; no extra origins trusted");
+        }
 
         self.start_backend().await;
         if self.vite_enabled {
