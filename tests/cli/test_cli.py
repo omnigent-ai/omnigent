@@ -1086,6 +1086,7 @@ def test_start_cli_runner_process_binds_stable_local_runner_to_generated_token(
         def __init__(self, args: list[str], *, env: dict[str, str], **_kwargs: object) -> None:
             captured["args"] = args
             captured["env"] = env
+            captured["cwd"] = _kwargs.get("cwd")
 
         def poll(self) -> None:
             """Report the runner process as still alive.
@@ -1110,6 +1111,8 @@ def test_start_cli_runner_process_binds_stable_local_runner_to_generated_token(
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "local-bind-token"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == str(os.getpid())
     assert "OMNIGENT_RUNNER_TUNNEL_TOKEN" not in env
+    # No workspace_cwd → the runner inherits the CLI's cwd (unchanged).
+    assert captured["cwd"] is None
 
 
 def test_start_cli_runner_process_reports_captured_log_path(

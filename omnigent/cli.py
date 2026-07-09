@@ -2685,6 +2685,10 @@ def _start_cli_runner_process(
             stderr=log_fh,
             **_proc.spawn_kwargs(),
         )
+    except OSError as exc:
+        # E.g. the workspace vanished between the is_dir check and the
+        # spawn; surface a CLI error instead of a raw traceback.
+        raise click.ClickException(f"Failed to spawn runner: {exc}") from exc
     finally:
         if log_fh is not None:
             log_fh.close()

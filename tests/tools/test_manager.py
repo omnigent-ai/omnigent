@@ -1165,3 +1165,63 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+# ── os_env cwd anchoring ──────────────────────────────────────────────
+
+
+def _os_env_spec(cwd: str) -> AgentSpec:
+    """An AgentSpec declaring an unsandboxed os_env with the given cwd.
+
+    :param cwd: The ``os_env.cwd`` value, e.g. ``"."``.
+    :returns: An ``AgentSpec`` with ``spec_version=1``.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    return AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=cwd,
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+
+def _manager_os_env_cwd(mgr: ToolManager) -> Path:
+    """Return the manager's os_env cwd, shutting the manager down.
+
+    :param mgr: A manager built from a spec that declares ``os_env``.
+    :returns: The resolved cwd of the environment the manager created.
+    """
+    try:
+        assert mgr._os_env is not None, "spec declares os_env; expected an environment"
+        return mgr._os_env.cwd
+    finally:
+        mgr.shutdown()
+
+
+def test_os_env_relative_cwd_resolves_against_workdir(tmp_path: Path) -> None:
+    """``os_env.cwd: "."`` anchors to ``workdir``, not the process cwd.
+
+    Runner subprocesses historically inherited the host daemon's cwd;
+    resolving against the process cwd pointed OS tools at an unrelated
+    (possibly deleted) directory.
+    """
+    mgr = ToolManager(_os_env_spec("."), workdir=tmp_path)
+    assert _manager_os_env_cwd(mgr) == tmp_path.resolve()
+
+
+def test_os_env_base_cwd_wins_over_workdir(tmp_path: Path) -> None:
+    """``os_env_base_cwd`` (the workspace) beats ``workdir`` (agent image).
+
+    The schema-building path passes both; the os_env must anchor to the
+    session workspace, not the extracted agent image directory.
+    """
+    image_dir = tmp_path / "image"
+    image_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    mgr = ToolManager(_os_env_spec("."), workdir=image_dir, os_env_base_cwd=workspace)
+    assert _manager_os_env_cwd(mgr) == workspace.resolve()

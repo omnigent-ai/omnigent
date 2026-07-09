@@ -1034,7 +1034,10 @@ class HostProcess:
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
 
-        workspace = Path(frame.workspace).expanduser()
+        # Resolve before the is_dir check and the spawn: a relative or
+        # symlinked workspace must not be interpreted against the
+        # daemon's own (possibly deleted) cwd.
+        workspace = Path(frame.workspace).expanduser().resolve(strict=False)
         if not workspace.is_dir():
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,

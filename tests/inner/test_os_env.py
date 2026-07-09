@@ -386,6 +386,52 @@ def test_create_os_environment_without_base_cwd_uses_process_cwd(
     assert _created_cwd(_caller_process_spec("."), None) == tmp_path.resolve()
 
 
+def test_create_os_environment_empty_cwd_uses_base_cwd(tmp_path: Path) -> None:
+    """An empty-string ``os_env.cwd`` is a placeholder, like unset.
+
+    Matches the placeholder set the runner dispatch layer treats as
+    "use the workspace" (``None``, ``""``, ``"."``, ``"./"``).
+
+    :returns: None.
+    """
+    assert _created_cwd(_caller_process_spec(""), tmp_path) == tmp_path.resolve()
+
+
+def test_create_os_environment_empty_cwd_without_base_uses_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a base cwd, empty-string ``cwd`` keeps the old fallback.
+
+    :returns: None.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert _created_cwd(_caller_process_spec(""), None) == tmp_path.resolve()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="cannot delete the cwd on Windows")
+def test_create_os_environment_absolute_cwd_survives_deleted_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absolute ``os_env.cwd`` never consults the process cwd.
+
+    Callers without a ``base_cwd`` (resource registry, runner dispatch)
+    always pass an absolute cwd; they must stay immune to a deleted
+    process cwd.
+
+    :returns: None.
+    """
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    monkeypatch.chdir(doomed)
+    doomed.rmdir()
+
+    assert _created_cwd(_caller_process_spec(str(target)), None) == target.resolve()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="cannot delete the cwd on Windows")
 def test_create_os_environment_survives_deleted_process_cwd(
     tmp_path: Path,
