@@ -3172,7 +3172,7 @@
             "type": "string"
           },
           "local_tools": {
-            "description": "The agent's effective local/builtin function tools, name + description only.",
+            "description": "The agent's effective local/builtin function tools (name + description + policy `blocked` flag).",
             "items": {
               "$ref": "#/components/schemas/SessionCapabilityTool"
             },
@@ -3180,7 +3180,7 @@
             "type": "array"
           },
           "mcp_servers": {
-            "description": "The agent's MCP server config (secret fields omitted). Each carries a deferred, empty `tools` list.",
+            "description": "The agent's MCP server config (secret fields omitted). Each carries its discovered `tools` list (with a per-tool `blocked` flag) and a per-server connection `status` / `error`.",
             "items": {
               "$ref": "#/components/schemas/SessionCapabilityMCPServer"
             },
@@ -3199,9 +3199,9 @@
             "type": "string"
           },
           "skills": {
-            "description": "The merged (bundled + host-discovered) skill list, from the same runner-owned source as the session snapshot.",
+            "description": "The full (bundled + host-discovered) skill list from the runner, each enriched with `source` provenance, an `in_scope` flag (whether `skills_filter` admits it), and a `blocked` flag (whether a session policy would deny loading it).",
             "items": {
-              "$ref": "#/components/schemas/SkillSummary"
+              "$ref": "#/components/schemas/SkillCapability"
             },
             "title": "Skills",
             "type": "array"
@@ -3235,7 +3235,7 @@
         "type": "object"
       },
       "SessionCapabilityMCPServer": {
-        "description": "An MCP server's config plus a (deferred) per-server tool list.\n\nReuses the secret-free `MCPServerSummary` shape (name,\ntransport, description, url, command, args) and adds `tools`.\nPer-server tool discovery needs a runner round-trip (`tools/list`\nagainst the live MCP connection), so it is deferred \u2014 this field is\nalways empty in this slice.",
+        "description": "An MCP server's config plus its discovered per-server tool list.\n\nReuses the secret-free `MCPServerSummary` shape (name,\ntransport, description, url, command, args) and adds the live\n`tools` list plus a per-server connection `status` / `error`,\nread from the runner's MCP state via a bounded `tools/list`\nround-trip against the live connection.",
         "properties": {
           "args": {
             "items": {
@@ -3266,12 +3266,30 @@
             ],
             "title": "Description"
           },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The connect error the runner reported for a `\"failed\"` server, e.g. `\"ConnectError: refused\"`; `None` otherwise.",
+            "title": "Error"
+          },
           "name": {
             "title": "Name",
             "type": "string"
           },
+          "status": {
+            "default": "unknown",
+            "description": "Per-server connection status \u2014 `\"connected\"` (the runner reported this server's tool surface), `\"failed\"` (the runner could not connect; see `error`), or `\"unknown\"` (the runner/MCP state was unavailable, so discovery did not run).",
+            "title": "Status",
+            "type": "string"
+          },
           "tools": {
-            "description": "Discovered MCP tools for this server. Always `[]` for now (Slice D: per-server tool discovery via the runner).",
+            "description": "Discovered MCP tools for this server (name + description + policy `blocked` flag). Empty when the server exposes no tools, failed to connect, or the runner is unavailable.",
             "items": {
               "$ref": "#/components/schemas/SessionCapabilityTool"
             },
@@ -3304,6 +3322,12 @@
       "SessionCapabilityTool": {
         "description": "Safe summary of a single function tool for the capabilities view.\n\nSurfaces only the name and one-line description so the panel can\nlist which tools an agent can call without leaking the full\nparameter schema.",
         "properties": {
+          "blocked": {
+            "default": false,
+            "description": "Whether a session policy would DENY calling this tool by name (read-only, name-based deny rules only \u2014 the same LLM-excluded probe the skills `blocked` flag uses). Local tools are always in scope (allow-list config), so `blocked` is the only gate that applies to them.",
+            "title": "Blocked",
+            "type": "boolean"
+          },
           "description": {
             "anyOf": [
               {
@@ -5407,6 +5431,45 @@
           "objective"
         ],
         "title": "SetCodexGoalRequest",
+        "type": "object"
+      },
+      "SkillCapability": {
+        "description": "A discovered skill enriched with provenance and policy state.\n\nThe Capabilities panel's richer view of `SkillSummary`: on top\nof `name` + `description` it carries where the skill came from\n(`source`), whether the agent's `skills_filter` admits it\n(`in_scope`), and whether a session policy would deny loading it by\nname (`blocked`). The full skill `content` is still omitted.",
+        "properties": {
+          "blocked": {
+            "default": false,
+            "description": "Whether a session `block_skills` (or equivalent) policy would DENY loading this skill by name.",
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "description": {
+            "description": "One-line summary from the SKILL.md frontmatter.",
+            "title": "Description",
+            "type": "string"
+          },
+          "in_scope": {
+            "default": true,
+            "description": "Whether the agent can actually load this skill given its `skills_filter`. Bundled skills are always in scope; a host/plugin skill is in scope iff it passes the filter.",
+            "title": "In Scope",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Skill identifier, e.g. `\"code-review\"` (host plugin skills are namespaced `\"<plugin>:<skill>\"`).",
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "default": "unknown",
+            "description": "Provenance label \u2014 one of `\"bundle\"` (shipped with the agent), `\"workspace\"` (project `.claude` / `.agents`), `\"user\"` (`~/.claude` / `~/.agents`), `\"plugin\"` (a Claude plugin), `\"codex\"` / `\"cursor\"` (host-specific), or `\"unknown\"`.",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ],
+        "title": "SkillCapability",
         "type": "object"
       },
       "SkillSummary": {
@@ -8062,7 +8125,7 @@
     },
     "/v1/sessions/{session_id}/capabilities": {
       "get": {
-        "description": "Return the consolidated capabilities of the session's agent.\n\nRead-only observability view over the agent bound to\n*session_id*. Resolves the agent the same way as\n`GET /sessions/{id}/agent` (under `LEVEL_READ`, no\ntop-level assertion), so it works identically for a top\nagent's conversation and a sub-agent's child conversation.\nFor an omnigent-spawned named sub-agent child the capabilities\nare context-aware \u2014 resolved from the child's `sub_agent_name`\nagainst the parent spec.\n\nFour groups:\n\n* `skills` \u2014 the merged (bundled + host-discovered) skill\n  list, from the same runner-owned source as the session\n  snapshot (best-effort; empty until the runner fetch warms).\n* `mcp_servers` \u2014 the agent's MCP server config\n  (secret-free). Per-server `tools` is deferred and left\n  empty (Slice D needs a runner `tools/list` round-trip).\n* `local_tools` \u2014 the agent's effective local/builtin\n  function tools (name + description).\n* `sub_agents` \u2014 the declared sub-agent tree from the spec.\n\n**Returns:** The session's `SessionCapabilities`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, or the session has no agent binding.",
+        "description": "Return the consolidated capabilities of the session's agent.\n\nRead-only observability view over the agent bound to\n*session_id*. Resolves the agent the same way as\n`GET /sessions/{id}/agent` (under `LEVEL_READ`, no\ntop-level assertion), so it works identically for a top\nagent's conversation and a sub-agent's child conversation.\nFor an omnigent-spawned named sub-agent child the capabilities\nare context-aware \u2014 resolved from the child's `sub_agent_name`\nagainst the parent spec.\n\nFour groups:\n\n* `skills` \u2014 the merged (bundled + host-discovered) skill\n  list, from the same runner-owned source as the session\n  snapshot (best-effort; empty until the runner fetch warms).\n* `mcp_servers` \u2014 the agent's MCP server config\n  (secret-free), each enriched with its discovered per-server\n  `tools` (name + description + policy `blocked`) and a\n  connection `status` / `error` read from the runner's live\n  MCP state via a bounded `tools/list` round-trip.\n* `local_tools` \u2014 the agent's effective local/builtin\n  function tools (name + description + policy `blocked`).\n* `sub_agents` \u2014 the declared sub-agent tree from the spec.\n\n**Returns:** The session's `SessionCapabilities`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, or the session has no agent binding.",
         "operationId": "get_session_capabilities_v1_sessions__session_id__capabilities_get",
         "parameters": [
           {
