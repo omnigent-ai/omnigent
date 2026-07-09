@@ -1179,6 +1179,14 @@ async def _auto_create_opencode_terminal(
     # remote runner (no local auth.json) / Databricks-gateway path.
     seed_opencode_auth(bridge_dir)
 
+    # An Omnigent-stored OpenCode Zen key rides the spawn env so the server
+    # can authenticate the ``opencode`` provider. Ambient OPENCODE_API_KEY is
+    # inherited via filtered_server_env regardless; the resolver returns the
+    # ambient value first, so this only adds a key the env doesn't carry.
+    from omnigent.opencode_zen_credentials import zen_spawn_env
+
+    policy_env.update(zen_spawn_env())
+
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
     # ``tool_relay.json`` exists when opencode launches the ``serve-mcp`` MCP
     # server and lists its tools (the sys_*/load_skill/web_fetch surface). The

@@ -109,3 +109,39 @@ def test_set_default_model_no_models_short_circuits(monkeypatch: pytest.MonkeyPa
     status = _set_opencode_default_model(current=None)
     assert status is not None and status.startswith("✗")
     assert called is False  # never prompts when there's nothing to pick
+
+
+# ── Zen key paste/clear ──────────────────────────────────────────────────────
+
+
+def test_prompt_zen_key_stores_stripped_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    stored: dict[str, str] = {}
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.store_secret",
+        lambda name, value: stored.update({name: value}),
+    )
+    monkeypatch.setattr("omnigent.onboarding.secrets.active_backend", lambda: "keyring")
+    monkeypatch.setattr(
+        "omnigent.onboarding.interactive.prompt_text", lambda *a, **k: " sk-zen-123 \n"
+    )
+    status = cli._prompt_opencode_zen_key()
+    assert stored == {"opencode-zen": "sk-zen-123"}
+    assert status == "✓ Zen key stored (keyring)"
+
+
+def test_prompt_zen_key_empty_cancels(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.store_secret",
+        lambda name, value: calls.append(name),
+    )
+    monkeypatch.setattr("omnigent.onboarding.interactive.prompt_text", lambda *a, **k: "  ")
+    assert cli._prompt_opencode_zen_key() is None
+    assert calls == []
+
+
+def test_clear_zen_key_deletes_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    deleted: list[str] = []
+    monkeypatch.setattr("omnigent.onboarding.secrets.delete_secret", deleted.append)
+    assert cli._clear_opencode_zen_key() == "✓ Zen key cleared"
+    assert deleted == ["opencode-zen"]
