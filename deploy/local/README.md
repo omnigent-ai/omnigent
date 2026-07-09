@@ -27,11 +27,51 @@ the tooling won't find it and will spawn a competing second server.
 The defaults are already what you want (`127.0.0.1:6767`, shared
 `chat.db` and artifacts under the data dir).
 
+## The wrapper script (both platforms)
+
+One wrinkle: when the supervisor replaces a running server, the new
+process can start while the old one is still draining connections (or
+its sockets sit in `TIME_WAIT`). The server's port probe then finds 6767
+busy and silently binds a free port instead. Discovery still works —
+everything finds the server through the pidfile, not the port — but
+anything of yours that hardcodes `http://127.0.0.1:6767` breaks until
+the next restart. In practice this happens on *most* restarts once the
+desktop app or web UI holds long-lived WebSocket connections.
+
+The fix is a short wait before the server starts. Save this as
+`~/.omnigent/omnigent-server-wrapper.sh` and `chmod +x` it; both
+recipes below run the server through it:
+
+```sh
+#!/bin/sh
+# Wait (max 60s) for the previous server to release port 6767, then exec
+# the foreground server so it reclaims its preferred port instead of
+# falling back to a random one. The bind probe matches the one the
+# server itself uses. exec keeps the server as the supervisor's direct
+# child, so restart-on-failure still works.
+python3 - <<'EOF'
+import socket, time
+for _ in range(60):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 6767))
+        s.close()
+        break
+    except OSError:
+        s.close()
+        time.sleep(1)
+EOF
+exec "$HOME/.local/bin/omnigent" server
+```
+
+Adjust the `omnigent` path to `which omnigent` on your machine. Any
+Python 3 works for the probe; omnigent installs one you can point at if
+`python3` isn't on the service's PATH.
+
 ## macOS: launchd
 
 Save as `~/Library/LaunchAgents/ai.omnigent.server.plist`, replacing
-`YOU` with your username (find your `omnigent` path with
-`which omnigent`):
+`YOU` with your username:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,8 +82,8 @@ Save as `~/Library/LaunchAgents/ai.omnigent.server.plist`, replacing
     <string>ai.omnigent.server</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOU/.local/bin/omnigent</string>
-        <string>server</string>
+        <string>/bin/sh</string>
+        <string>/Users/YOU/.omnigent/omnigent-server-wrapper.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -78,7 +118,7 @@ omnigent server stop
 
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.omnigent.server.plist
 
-# Verify
+# Verify (first boot takes ~10-15s)
 launchctl list | grep ai.omnigent.server   # shows a PID
 omnigent server status
 ```
@@ -92,7 +132,9 @@ launchctl bootout gui/$(id -u)/ai.omnigent.server        # stop for real (unload
 
 Note that `omnigent server stop` (and crashes, and plain `kill`) no
 longer stop the server for long — `KeepAlive` restarts it. To actually
-take it down, unload the job with `bootout`.
+take it down, unload the job with `bootout`. On restart, expect a pause
+while the wrapper waits for the previous instance to drain its
+connections and release the port.
 
 ## Linux: systemd user unit
 
@@ -104,7 +146,7 @@ Description=Omnigent local server
 After=network.target
 
 [Service]
-ExecStart=%h/.local/bin/omnigent server
+ExecStart=/bin/sh %h/.omnigent/omnigent-server-wrapper.sh
 Restart=always
 RestartSec=10
 
@@ -121,6 +163,11 @@ systemctl --user enable --now omnigent-server
 systemctl --user status omnigent-server
 ```
 
+(`systemctl --user restart` waits for the old process to exit before
+starting the new one, so the port race is narrower than on launchd —
+but `TIME_WAIT` sockets from a crashed instance can still trigger the
+fallback, and the wrapper costs nothing when the port is already free.)
+
 By default user units only run while you're logged in. To keep the
 server up across logouts (headless boxes, SSH targets):
 
@@ -128,14 +175,12 @@ server up across logouts (headless boxes, SSH targets):
 sudo loginctl enable-linger "$USER"
 ```
 
-## Crash-restart port fallback
+## If you skip the wrapper
 
-If the server is restarted within a second or two of a crash, the OS may
-not have released port 6767 yet, and the respawn logs
-`port 6767 is busy — using <other> instead.` and binds a free port. This
-is safe: discovery goes through the pidfile, not the port, so
-`omnigent run`, the daemon, and the desktop app still find it. Anything
-of yours that hardcodes `http://127.0.0.1:6767` won't, though — check
-`omnigent server status` for the live URL, and restart the service once
-the old socket is gone to get 6767 back. The 10-second restart delay in
-both recipes above makes this rare in practice.
+Running bare `omnigent server` as the supervised command still gives you
+crash recovery and start-at-login — rules 1 and 2 are what matter for
+correctness. You just lose the stable port: restarts that overlap the
+old instance log `port 6767 is busy — using <other> instead.` and bind a
+free port. That is safe by design (discovery goes through the pidfile;
+check `omnigent server status` for the live URL), but hardcoded-6767
+clients won't find the server until a later restart reclaims the port.
