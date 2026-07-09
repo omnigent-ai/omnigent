@@ -2038,9 +2038,8 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     assert exit_code == 0
     result = json.loads(captured.out)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert (
-        result["hookSpecificOutput"]["permissionDecisionReason"]
-        == native_policy_hook._EVAL_UNAVAILABLE_REASON
+    assert result["hookSpecificOutput"]["permissionDecisionReason"].startswith(
+        native_policy_hook._EVAL_UNAVAILABLE_REASON
     )
 
 

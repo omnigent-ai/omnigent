@@ -78,7 +78,8 @@ def main() -> None:
         )
 
         headers = policy_hook_request_headers()
-        resp = post_evaluate_with_retry(
+        reauth = policy_hook_reauth(server_url, headers)
+        resp, api_error = post_evaluate_with_retry(
             url=url,
             headers=headers,
             eval_request=eval_body,
@@ -87,7 +88,7 @@ def main() -> None:
             read_timeout=86400.0,
             hook_label="hermes pre_tool_call",
             # Re-mint the baked one-shot token if it lapses mid-session.
-            reauth=policy_hook_reauth(server_url, headers),
+            reauth=reauth,
         )
     except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
         json.dump({}, sys.stdout)
@@ -96,8 +97,16 @@ def main() -> None:
     if resp is None:
         # Network error / retry budget exhausted -- fail closed so a
         # transient server outage doesn't let unreviewed tools through.
+        detail = api_error or reauth.failure_reason
         json.dump(
-            {"decision": "block", "reason": "Policy evaluation unavailable"},
+            {
+                "decision": "block",
+                "reason": (
+                    f"Policy evaluation unavailable: {detail}"
+                    if detail
+                    else "Policy evaluation unavailable"
+                ),
+            },
             sys.stdout,
         )
         return
