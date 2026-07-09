@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -8,7 +8,8 @@ import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { NewChatLandingScreen, sanitizeInitialPrompt } from "./NewChatDialog";
+import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
+import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -181,6 +182,9 @@ beforeEach(() => {
   navigateMock.mockReset();
   setPendingInitialPromptMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  // Clear the module-level landing draft so a base branch (or other field)
+  // left behind by an unmounting test doesn't seed the next one.
+  resetLandingDraft();
   localStorage.clear();
   // Seed host_1's recent so the working directory pre-fills deterministically
   // (the create body must carry SEEDED_WORKSPACE through).
@@ -1045,6 +1049,126 @@ describe("NewChatLandingScreen create flow", () => {
       target: { value: "feature/login" },
     });
     expect(screen.getByTestId("new-chat-landing-base-branch-input")).toBeInTheDocument();
+  });
+
+  // The base branch auto-fills from the Settings › Git default when the user
+  // names a new-worktree branch, and is then left to the user: any edit
+  // (including clearing it) stands, even when the dropdown is reopened. Only
+  // clearing the branch name — starting the worktree over — re-arms the
+  // auto-fill so the next named branch seeds from the current default again.
+  describe("base-branch field seeding", () => {
+    const baseInput = () =>
+      screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement;
+    const setBranch = (value: string) =>
+      fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+        target: { value },
+      });
+    // The chip toggles the popover; two clicks close-then-reopen it.
+    const reopen = () => {
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    };
+
+    it("auto-fills from the stored default when a branch is named", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      setBranch("feature/login");
+      expect(baseInput().value).toBe("main");
+    });
+
+    it("leaves the field blank when no default is stored, and lets the user type", () => {
+      renderLanding();
+      openWorktree();
+      setBranch("feature/login");
+      expect(baseInput().value).toBe("");
+
+      // The user can type freely; it doesn't touch the setting.
+      fireEvent.change(baseInput(), { target: { value: "whatever" } });
+      expect(baseInput().value).toBe("whatever");
+      expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
+    });
+
+    it("keeps a base the user CLEARED, even after reopening the dropdown", () => {
+      // The reported bug: explicitly emptying the base must stick — reopening
+      // the dropdown must not re-fill it from the default.
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      setBranch("feature/login");
+      expect(baseInput().value).toBe("main");
+
+      fireEvent.change(baseInput(), { target: { value: "" } });
+      expect(baseInput().value).toBe("");
+
+      reopen();
+      expect(baseInput().value).toBe("");
+    });
+
+    it("keeps a base the user typed, even after reopening the dropdown", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      setBranch("feature/login");
+      fireEvent.change(baseInput(), { target: { value: "release/2.0" } });
+
+      reopen();
+      // The user's choice stands — not re-seeded from the default.
+      expect(baseInput().value).toBe("release/2.0");
+    });
+
+    it("re-arms auto-fill when the branch name is cleared and re-entered", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      setBranch("feature/login");
+      fireEvent.change(baseInput(), { target: { value: "custom" } });
+      expect(baseInput().value).toBe("custom");
+
+      // Clear the branch name (start the worktree over) — the base field goes
+      // away and the auto-fill re-arms.
+      setBranch("");
+      // Name a branch again: seeds fresh from the current default.
+      setBranch("feature/other");
+      expect(baseInput().value).toBe("main");
+    });
+
+    it("seeds from the current default after it changes, on a re-entered branch", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      setBranch("feature/login");
+      expect(baseInput().value).toBe("main");
+
+      // Change the setting, then start the worktree over.
+      act(() => writeDefaultBaseBranch("develop"));
+      setBranch("");
+      setBranch("feature/other");
+      expect(baseInput().value).toBe("develop");
+    });
+  });
+
+  it("posts the stored default base branch without the user touching the field", async () => {
+    localStorage.setItem("omnigent:default-base-branch", "main");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openWorktree();
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/login" },
+    });
+    typeMessage("start the branch");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    // The auto-filled default reaches the server just like a typed base would.
+    const body = JSON.parse(init.body as string);
+    expect(body.git).toEqual({ branch_name: "feature/login", base_branch: "main" });
   });
 
   it("posts git.branch_name and git.base_branch when both are provided", async () => {

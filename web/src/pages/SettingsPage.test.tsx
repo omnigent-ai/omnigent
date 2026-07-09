@@ -474,6 +474,39 @@ describe("SettingsPage", () => {
     expect(screen.queryByRole("link", { name: /Policies/ })).toBeNull();
   });
 
+  it("shows an empty default base branch by default and persists a typed value", () => {
+    localStorage.clear();
+    renderPage("/settings/git");
+    expect(screen.getByRole("heading", { name: "Git" })).toBeInTheDocument();
+    const input = screen.getByTestId("settings-default-base-branch-input") as HTMLInputElement;
+    // Nothing stored → blank field, so the composer won't auto-fill.
+    expect(input.value).toBe("");
+
+    fireEvent.change(input, { target: { value: "main" } });
+    expect(input.value).toBe("main");
+    // The choice persists so the composer can read it on the next new branch.
+    expect(localStorage.getItem("omnigent:default-base-branch")).toBe("main");
+  });
+
+  it("reflects a stored default base branch on mount", () => {
+    localStorage.setItem("omnigent:default-base-branch", "develop");
+    renderPage("/settings/git");
+    const input = screen.getByTestId("settings-default-base-branch-input") as HTMLInputElement;
+    expect(input.value).toBe("develop");
+  });
+
+  it("clears the default base branch preference when emptied", () => {
+    localStorage.setItem("omnigent:default-base-branch", "main");
+    renderPage("/settings/git");
+    const input = screen.getByTestId("settings-default-base-branch-input") as HTMLInputElement;
+    expect(input.value).toBe("main");
+
+    // Emptying the field turns auto-fill off — the key is removed, not stored blank.
+    fireEvent.change(input, { target: { value: "" } });
+    expect(input.value).toBe("");
+    expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
+  });
+
   it("lists archived sessions and unarchives on click", () => {
     mocks.conversations = [
       conv("conv_active"),

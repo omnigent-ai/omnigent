@@ -11,6 +11,8 @@
  *
  * - **Appearance** — theme mode (System / Light / Dark). This is the new
  *   home of the theme control that used to sit in the sidebar header.
+ * - **Git** — Git behavior, e.g. the default base branch pre-filled when
+ *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
@@ -117,6 +119,7 @@ import {
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   applyThemePalette,
   isThemePalette,
@@ -172,6 +175,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
@@ -603,6 +607,55 @@ function AppearanceSection() {
         <UiCodeFontFamilyControl />
       </div>
     </Section>
+  );
+}
+
+/** Git behavior settings. */
+function GitSection() {
+  return (
+    <Section title="Git" description="Configure how Omnigent works with Git.">
+      <div className="flex flex-col gap-8">
+        <DefaultBaseBranchControl />
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * Default base branch for new worktrees. When set, the new-session composer
+ * pre-fills the base-branch field as you name a new branch, so the worktree
+ * branches off it. Leave blank to keep the field empty (worktrees default to
+ * the current branch).
+ */
+function DefaultBaseBranchControl() {
+  const [branch, setBranch] = useState(() => readDefaultBaseBranch() ?? "");
+
+  const update = useCallback((next: string) => {
+    setBranch(next);
+    writeDefaultBaseBranch(next);
+  }, []);
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Default base branch</span>
+        <span className="text-sm text-muted-foreground">
+          Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill.
+        </span>
+      </div>
+      <Input
+        type="text"
+        aria-label="Default base branch"
+        data-testid="settings-default-base-branch-input"
+        placeholder="e.g. main"
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        className="h-9 w-56 shrink-0"
+        value={branch}
+        onChange={(e) => update(e.target.value)}
+      />
+    </div>
   );
 }
 
