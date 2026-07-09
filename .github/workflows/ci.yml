@@ -2,10 +2,11 @@ name: CI
 
 # Unit-test pytest matrix on every non-draft PR and on push to main. Tests are
 # split across directory-based matrix groups (runtime-*, server-*, inner-rest,
-# tools, repl-sdk, spec-llms, misc) so slow files don't bottleneck one runner;
-# the slowest groups use `--dist=worksteal` to fan tests out within a file. The
-# `misc` group is a catch-all so new top-level tests/<dir>/ are picked up
-# automatically. Draft PRs are skipped (ready_for_review re-fires the workflow).
+# tools, repl-sdk, spec-llms, runner-app, stores, misc) so slow files don't
+# bottleneck one runner; the slowest groups use `--dist=worksteal` to fan tests
+# out within a file. The `misc` group is a catch-all so new top-level
+# tests/<dir>/ are picked up automatically (it ignores the dirs that have their
+# own group). Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
 on:
@@ -94,7 +95,21 @@ jobs:
           - group: integration-mock
             paths: tests/integration
             workers: "0"
+          # Carved out of misc: runner + stores were ~68% of misc's cpu and
+          # under loadfile a single 500s+ file (test_app_sessions_native) pinned
+          # one worker and set the whole misc wall time. worksteal fans each
+          # dir's tests across workers (biggest single test is ~40s / ~5s, so
+          # the floor drops from ~500s to ~100s). Both dirs' conftests are
+          # function-scoped, so splitting a file across workers is safe.
+          - group: runner-app
+            paths: tests/runner
+            dist: worksteal
+          - group: stores
+            paths: tests/stores
+            dist: worksteal
           # Catch-all so new top-level tests/<dir>/ are covered automatically.
+          # worksteal keeps the biggest remaining file (the benchmark smoke
+          # test, ~58s) from re-pinning one worker as this catch-all grows.
           - group: misc
             paths: >-
               tests
@@ -112,6 +127,9 @@ jobs:
               --ignore=tests/spec
               --ignore=tests/llms
               --ignore=tests/codex_parity
+              --ignore=tests/runner
+              --ignore=tests/stores
+            dist: worksteal
           # Databricks-coupled tests (Lakebase token engine, psycopg). This is
           # the only lane that installs the `databricks` extra; the
           # @pytest.mark.databricks marker keeps these tests off the lean lanes
