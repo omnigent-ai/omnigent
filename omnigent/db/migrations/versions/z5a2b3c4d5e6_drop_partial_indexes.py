@@ -67,7 +67,9 @@ def upgrade() -> None:
 
     # agents: uniqueness moves to the store; keep a plain lookup index.
     op.drop_index("ix_agents_template_name", table_name="agents")
-    op.create_index("ix_agents_name", "agents", ["workspace_id", "name", "id"], unique=False)
+    op.create_index(
+        "ix_agents_name", "agents", ["workspace_id", "name", "kind", "id"], unique=False
+    )
 
     # policies: uniqueness already enforced in the store; keep a plain lookup.
     op.drop_index("ix_policies_default_name_cksum", table_name="policies")

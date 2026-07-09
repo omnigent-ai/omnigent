@@ -143,8 +143,10 @@ class SqlAgent(Base):
         # may reuse the same name. That "unique only within the template set"
         # rule can't be a partial unique index (MySQL has none), so it is
         # enforced in the store (SqlAlchemyAgentStore.create). This plain index
-        # just backs the name lookup used by that check and by get_by_name.
-        Index("ix_agents_name", "workspace_id", "name", "id"),
+        # backs the (workspace_id, name, kind) lookup that check and get_by_name
+        # do — kind is included so the seek skips same-named session copies
+        # straight to the template row.
+        Index("ix_agents_name", "workspace_id", "name", "kind", "id"),
     )
 
 

@@ -59,13 +59,14 @@ def test_agents_name_index_exists(db_engine: Engine) -> None:
 
     Template-name uniqueness now lives in the store (MySQL has no partial
     indexes); the DB keeps only a non-unique lookup index on
-    ``(workspace_id, name, id)``.
+    ``(workspace_id, name, kind, id)`` — kind is included so the template
+    lookup seeks past same-named session copies.
     """
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("agents")}
     assert "ix_agents_template_name" not in indexes
     assert "ix_agents_name" in indexes
     assert not indexes["ix_agents_name"]["unique"]
-    assert indexes["ix_agents_name"]["column_names"] == ["workspace_id", "name", "id"]
+    assert indexes["ix_agents_name"]["column_names"] == ["workspace_id", "name", "kind", "id"]
 
 
 def test_template_agent_kind_stored_and_read(db_engine: Engine) -> None:
