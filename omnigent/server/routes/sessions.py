@@ -559,6 +559,7 @@ _CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
+_CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
@@ -11917,16 +11918,37 @@ def _spec_config_flag_explicitly_disabled(spec: AgentSpec, key: str) -> bool:
     return isinstance(value, str) and value.strip().lower() == "false"
 
 
+def _spec_config_flag_explicitly_enabled(spec: AgentSpec, key: str) -> bool:
+    """
+    Return whether an ``executor.config`` flag is explicitly set true.
+
+    Mirror of :func:`_spec_config_flag_explicitly_disabled` for opt-IN
+    semantics (see the cursor-native branch of
+    :func:`_derive_terminal_launch_args_from_spec`). The spec parser
+    stringifies config values, so ``yolo: true`` arrives as ``"True"``.
+
+    :param spec: A parsed sub-agent spec.
+    :param key: The ``executor.config`` key to read, e.g. ``"yolo"``.
+    :returns: ``True`` only when the value is the boolean ``True`` or the
+        string ``"true"`` (case-insensitive); ``False`` otherwise
+        (including when the key is absent).
+    """
+    value = spec.executor.config.get(key)
+    if isinstance(value, bool):
+        return value is True
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
 def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | None:
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
-    polly's native workers (claude-native / codex-native) launch in a
-    headless pane where no human can answer an ApprovalCard, so every
-    Edit/Write/Bash that prompts stalls the worker. This translates a
+    polly's native workers (claude-native / codex-native / cursor-native)
+    launch in a headless pane where no human can answer an ApprovalCard, so
+    every Edit/Write/Bash that prompts stalls the worker. This translates a
     worker bundle's declared full-bypass intent into the per-session
     ``terminal_launch_args`` the runner already appends to the claude /
-    codex argv:
+    codex / cursor argv:
 
     - claude-native + ``executor.config.permission_mode`` set ->
       ``["--permission-mode", "<value>"]``. The value is passed through
@@ -11943,12 +11965,17 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
       ``executor.config.yolo: false`` opts back out for a read-only / must
       -keep-prompting sub-agent. See issue #171.
+    - cursor-native + ``executor.config.yolo: true`` -> ``["--yolo"]``
+      (alias for ``cursor-agent --force`` / Run Everything). Opt-in, not a
+      default: cursor's own approval gate is the source of truth unless the
+      worker bundle explicitly asks to bypass it. Without the flag, Omnigent
+      mirrors cursor's pending tool calls as ApprovalCards.
 
-    Only the two native harnesses are translated; for any other harness
-    (e.g. ``claude-sdk``, whose bypass is set via the SDK ``permissionMode``
-    spawn env, not a terminal flag) this returns ``None`` so no terminal
-    args are set. ``None`` is also returned when the relevant field is
-    absent / falsey.
+    Only the three native harnesses above are translated; for any other
+    harness (e.g. ``claude-sdk``, whose bypass is set via the SDK
+    ``permissionMode`` spawn env, not a terminal flag) this returns ``None``
+    so no terminal args are set. ``None`` is also returned when the relevant
+    field is absent / falsey.
 
     :param sub_spec: The trusted child sub-agent spec, resolved from the
         server-loaded parent bundle via :func:`_resolve_subagent_spec`.
@@ -11975,6 +12002,16 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
+    if harness == _CURSOR_NATIVE_HARNESS:
+        # Opt-in full bypass. cursor-agent gates tools in its own TUI;
+        # Omnigent mirrors those gates as ApprovalCards unless --yolo /
+        # --force is on the launch argv. A piloted worker cannot answer
+        # those cards, so worker bundles that need unattended runs must
+        # declare ``yolo: true``. Absent / false keeps the default
+        # prompting stance (matches the web UI's Cursor "Default" mode).
+        if not _spec_config_flag_explicitly_enabled(sub_spec, "yolo"):
+            return None
+        return _validate_terminal_launch_args(["--yolo"])
     return None
 
 
@@ -12311,12 +12348,13 @@ async def _create_session_from_existing_agent(
     # from the trusted, server-loaded sub-spec only — any caller-supplied
     # ``body.terminal_launch_args`` is ignored. This is the YOLO seam:
     # claude-native maps ``permission_mode`` to ``--permission-mode``,
-    # while codex-native defaults to full bypass
+    # codex-native defaults to full bypass
     # (``--dangerously-bypass-approvals-and-sandbox``) so a headless
     # codex worker can edit/run unattended without stalling on codex's
-    # on-request approval default (opt out with ``yolo: false``). A
-    # caller cannot inject launch wiring by smuggling args through the
-    # spawn body.
+    # on-request approval default (opt out with ``yolo: false``), and
+    # cursor-native maps ``yolo: true`` to ``--yolo`` (opt-in; absent
+    # keeps cursor's own approval prompts). A caller cannot inject
+    # launch wiring by smuggling args through the spawn body.
     #
     # Sessions that resolve their own agent (top-level sessions and the
     # manual Add Agent child flow where ``sub_agent_name`` is null) keep

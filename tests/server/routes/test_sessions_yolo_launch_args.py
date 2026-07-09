@@ -1,12 +1,13 @@
 """Unit tests for native-worker YOLO ``terminal_launch_args`` derivation.
 
-Nessie's native sub-agent workers (claude-native / codex-native) launch
-in a headless pane where no human can answer an approval prompt. The
-server translates a worker's bypass stance into the per-session
-``terminal_launch_args`` the runner appends to the claude / codex argv:
-claude-native opts in via ``permission_mode``, while codex-native
-defaults to full bypass (issue #171) because the headless seam has no
-safe non-bypass default, with ``yolo: false`` as the opt-out.
+Nessie's native sub-agent workers (claude-native / codex-native /
+cursor-native) launch in a headless pane where no human can answer an
+approval prompt. The server translates a worker's bypass stance into the
+per-session ``terminal_launch_args`` the runner appends to the claude /
+codex / cursor argv: claude-native opts in via ``permission_mode``,
+codex-native defaults to full bypass (issue #171) because the headless
+seam has no safe non-bypass default, with ``yolo: false`` as the
+opt-out, and cursor-native opts in via ``yolo: true`` -> ``--yolo``.
 
 These tests exercise the pure translation helper
 ``_derive_terminal_launch_args_from_spec`` directly with real
@@ -139,6 +140,45 @@ def test_codex_native_yolo_false_string_opts_out_of_bypass() -> None:
     assert _derive_terminal_launch_args_from_spec(spec) is None
 
 
+def test_cursor_native_yolo_string_true_translates_to_yolo_flag() -> None:
+    """
+    cursor-native + ``yolo`` (string ``"True"``) -> ``--yolo``.
+
+    The spec parser stringifies ``yolo: true`` into ``"True"``, so this is
+    the value the server actually sees in production. A failure means a
+    piloted cursor worker would launch without ``--yolo`` / ``--force`` and
+    stall on cursor-agent's own approval prompts (mirrored as Omnigent
+    ApprovalCards).
+    """
+    spec = _spec_with_config({"harness": "cursor-native", "yolo": "True"})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--yolo"]
+
+
+def test_cursor_native_without_yolo_field_returns_none() -> None:
+    """
+    cursor-native without ``yolo`` keeps the default prompting stance.
+
+    Unlike codex-native, cursor bypass is opt-in: absent ``yolo`` must not
+    emit ``--yolo``, so interactive / web-launched cursor sessions still
+    surface ApprovalCards unless the worker bundle explicitly asks for
+    full bypass.
+    """
+    cursor = _spec_with_config({"harness": "cursor-native"})
+    assert _derive_terminal_launch_args_from_spec(cursor) is None
+
+
+def test_cursor_native_yolo_false_string_returns_none() -> None:
+    """
+    ``yolo: false`` on cursor-native must not emit ``--yolo``.
+
+    Guards the same ``bool("False") is True`` trap as the codex opt-out:
+    a naive truthiness check would incorrectly treat the stringified
+    ``"False"`` as enabled and launch with full bypass.
+    """
+    spec = _spec_with_config({"harness": "cursor-native", "yolo": "False"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
 @pytest.mark.parametrize(
     "harness",
     ["claude-sdk", "codex", "openai-agents"],
@@ -147,7 +187,7 @@ def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
     """
     Non-native harnesses never get terminal args, even with bypass fields.
 
-    ``terminal_launch_args`` is a native-terminal (claude/codex TUI)
+    ``terminal_launch_args`` is a native-terminal (claude/codex/cursor TUI)
     concept; a claude-sdk worker sets bypass via the SDK ``permissionMode``
     spawn env, not a CLI flag. Translating these fields for a non-native
     harness would emit a flag the runner has no terminal to apply it to.
