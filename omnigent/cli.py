@@ -18,9 +18,9 @@ import time
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from importlib import resources
+from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
 
 import click
 import yaml
@@ -5902,6 +5902,79 @@ def _build_resume_parts() -> list[str]:
     return parts
 
 
+@dataclass(frozen=True)
+class _NativeTerminalDispatchSpec:
+    module: str
+    function: str
+    args_param: str
+    model_strategy: Literal["passthrough", "first_class"] = "passthrough"
+    prompt_none: bool = False
+
+
+_NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
+    "claude": _NativeTerminalDispatchSpec(
+        module="omnigent.claude_native",
+        function="run_claude_native",
+        args_param="claude_args",
+    ),
+    "codex": _NativeTerminalDispatchSpec(
+        module="omnigent.codex_native",
+        function="run_codex_native",
+        args_param="codex_args",
+        model_strategy="first_class",
+    ),
+    "pi": _NativeTerminalDispatchSpec(
+        module="omnigent.pi_native",
+        function="run_pi_native",
+        args_param="pi_args",
+    ),
+    "opencode": _NativeTerminalDispatchSpec(
+        module="omnigent.opencode_native",
+        function="run_opencode_native",
+        args_param="opencode_args",
+        model_strategy="first_class",
+    ),
+    "cursor": _NativeTerminalDispatchSpec(
+        module="omnigent.cursor_native",
+        function="run_cursor_native",
+        args_param="cursor_args",
+    ),
+    "kimi": _NativeTerminalDispatchSpec(
+        module="omnigent.kimi_native",
+        function="run_kimi_native",
+        args_param="kimi_args",
+    ),
+    "kiro": _NativeTerminalDispatchSpec(
+        module="omnigent.kiro_native",
+        function="run_kiro_native",
+        args_param="kiro_args",
+        model_strategy="first_class",
+        prompt_none=True,
+    ),
+    "goose": _NativeTerminalDispatchSpec(
+        module="omnigent.goose_native",
+        function="run_goose_native",
+        args_param="goose_args",
+    ),
+    "antigravity": _NativeTerminalDispatchSpec(
+        module="omnigent.antigravity_native",
+        function="run_antigravity_native",
+        args_param="antigravity_args",
+        model_strategy="first_class",
+    ),
+    "qwen": _NativeTerminalDispatchSpec(
+        module="omnigent.qwen_native",
+        function="run_qwen_native",
+        args_param="qwen_args",
+    ),
+    "hermes": _NativeTerminalDispatchSpec(
+        module="omnigent.hermes_native",
+        function="run_hermes_native",
+        args_param="hermes_args",
+    ),
+}
+
+
 def _dispatch_native_terminal_harness(
     *,
     harness: str,
@@ -5930,7 +6003,8 @@ def _dispatch_native_terminal_harness(
     terminal-mirror sessions whose turns originate in the TUI, so dispatch
     straight to the native wrapper (the same code ``omnigent cursor`` /
     ``omnigent claude`` / etc. run), keeping the TUI the single source of
-    turns. A top-level ``--model`` is forwarded as a passthrough CLI flag.
+    turns. A top-level ``--model`` is forwarded in the shape each wrapper
+    expects.
 
     ``--continue`` is honored (not rejected): it resolves to this harness's
     most-recent conversation and hands that off to the wrapper, matching the
@@ -6004,41 +6078,21 @@ def _dispatch_native_terminal_harness(
         "resume_picker": resume_picker,
         "auto_open_conversation": auto_open_conversation,
     }
-    if native_agent.key == "claude":
-        from omnigent.claude_native import run_claude_native
-
-        run_claude_native(claude_args=passthrough, **common)
-    elif native_agent.key == "codex":
-        from omnigent.codex_native import run_codex_native
-
-        # Codex takes its model as a first-class arg, not a passthrough flag.
-        run_codex_native(codex_args=(), model=model, **common)
-    elif native_agent.key == "pi":
-        from omnigent.pi_native import run_pi_native
-
-        run_pi_native(pi_args=passthrough, **common)
-    elif native_agent.key == "cursor":
-        from omnigent.cursor_native import run_cursor_native
-
-        run_cursor_native(cursor_args=passthrough, **common)
-    elif native_agent.key == "opencode":
-        from omnigent.opencode_native import run_opencode_native
-
-        # OpenCode pins its model on the wrapper spec (like Codex), so it takes
-        # ``model`` first-class rather than via a ``--model`` passthrough arg.
-        run_opencode_native(opencode_args=(), model=model, **common)
-    elif native_agent.key == "kimi":
-        from omnigent.kimi_native import run_kimi_native
-
-        run_kimi_native(kimi_args=passthrough, **common)
-    elif native_agent.key == "kiro":
-        from omnigent.kiro_native import run_kiro_native
-
-        # Kiro reads model from the wrapper spec / first-class launch arg, like
-        # Codex and OpenCode, so the generic --model flag is not passthrough.
-        run_kiro_native(kiro_args=(), model=model, prompt=None, **common)
-    else:  # pragma: no cover - new native agent added without a dispatch arm
+    spec = _NATIVE_TERMINAL_DISPATCH_SPECS.get(native_agent.key)
+    if spec is None:  # pragma: no cover - new native agent added without a dispatch spec
         raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
+
+    launcher_kwargs = dict(common)
+    if spec.model_strategy == "first_class":
+        launcher_kwargs[spec.args_param] = ()
+        launcher_kwargs["model"] = model
+    else:
+        launcher_kwargs[spec.args_param] = passthrough
+    if spec.prompt_none:
+        launcher_kwargs["prompt"] = None
+
+    launcher = getattr(import_module(spec.module), spec.function)
+    launcher(**launcher_kwargs)
     return True
 
 
