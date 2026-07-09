@@ -1693,6 +1693,7 @@ type LandingDraft = {
   workspace: string;
   branchName: string;
   baseBranch: string;
+  baseBranchEdited: boolean;
   prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
@@ -1860,12 +1861,24 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
-  // Seed the base branch from an in-progress draft, else the user's configured
-  // default (Settings › Git). With no default set the field stays blank, so a
-  // new worktree branches off the current branch.
-  const [baseBranch, setBaseBranch] = useState<string>(
-    () => landingDraft?.baseBranch ?? readDefaultBaseBranch() ?? "",
+  // The base branch follows the user's configured default (Settings › Git)
+  // until they type their own value — only then does it pin. This flag tracks
+  // that hand-off so an auto-filled default isn't preserved across an unmount
+  // as if it were a deliberate choice (which would ignore a later change or
+  // clear of the setting).
+  const [baseBranchEdited, setBaseBranchEdited] = useState<boolean>(
+    () => landingDraft?.baseBranchEdited ?? false,
   );
+  // Seed a user-edited base branch from the draft; otherwise mirror the live
+  // default. With no default set the field stays blank, so a new worktree
+  // branches off the current branch.
+  const [baseBranch, _setBaseBranch] = useState<string>(() =>
+    landingDraft?.baseBranchEdited ? landingDraft.baseBranch : (readDefaultBaseBranch() ?? ""),
+  );
+  const setBaseBranch = useCallback((next: string) => {
+    _setBaseBranch(next);
+    setBaseBranchEdited(true);
+  }, []);
   // Branch prefilled from the existing worktree the current workspace points
   // at. When `branchName` still equals this, the session starts directly in
   // that worktree (no git opts). Editing the field away from it means the user
@@ -1968,6 +1981,7 @@ export function NewChatLandingScreen() {
     workspace,
     branchName,
     baseBranch,
+    baseBranchEdited,
     prefilledBranch,
     permissionMode,
     approvalMode,

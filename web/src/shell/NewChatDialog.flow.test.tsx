@@ -1075,6 +1075,57 @@ describe("NewChatLandingScreen create flow", () => {
     expect(baseInput.value).toBe("");
   });
 
+  it("stops auto-filling once the default is cleared, even after an unmount", () => {
+    // Regression: the composer snapshots its fields on unmount (landingDraft).
+    // An auto-filled default must NOT be preserved as if the user chose it —
+    // otherwise clearing the setting leaves the stale value auto-filling.
+    localStorage.setItem("omnigent:default-base-branch", "main");
+    renderLanding();
+    openWorktree();
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/login" },
+    });
+    expect(
+      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
+    ).toBe("main");
+
+    // Navigate away (unmount snapshots the draft), then clear the setting.
+    cleanup();
+    localStorage.removeItem("omnigent:default-base-branch");
+
+    // Back on the composer: the field must now be blank, not the stale "main".
+    renderLanding();
+    openWorktree();
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/login" },
+    });
+    expect(
+      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
+    ).toBe("");
+  });
+
+  it("preserves a user-typed base branch across an unmount", () => {
+    // The counterpart to the regression above: a base the user typed IS a
+    // deliberate choice and must survive a nav-away, independent of the setting.
+    renderLanding();
+    openWorktree();
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/login" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+      target: { value: "release/2.0" },
+    });
+
+    cleanup();
+
+    renderLanding();
+    openWorktree();
+    // branchName was also drafted, so the base field is visible immediately.
+    expect(
+      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
+    ).toBe("release/2.0");
+  });
+
   it("posts the stored default base branch without the user touching the field", async () => {
     localStorage.setItem("omnigent:default-base-branch", "main");
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
