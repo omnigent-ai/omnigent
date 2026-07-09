@@ -701,7 +701,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # session close.
                 return _to_conversation(row)
         except IntegrityError as exc:
-            # Translate the partial-unique-index violation into a
+            # Translate the unique-index violation into a
             # clean exception type the spawn/send tools can map
             # to a name_already_exists tool error. Other integrity
             # violations (FK, check constraints) re-raise.
@@ -714,10 +714,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # check, which would misclassify any future unique
             # constraint added to the conversations table.
             msg = str(exc).lower()
-            is_partial_index_violation = "ix_conversations_parent_title_unique" in msg or (
+            is_title_unique_violation = "ix_conversations_parent_title_unique" in msg or (
                 "unique" in msg and "parent_conversation_id" in msg and "title" in msg
             )
-            if is_partial_index_violation:
+            if is_title_unique_violation:
                 raise NameAlreadyExistsError(
                     f"sub-agent name already exists under parent "
                     f"{parent_conversation_id!r}: title={title!r}"
@@ -1311,23 +1311,32 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "ORDER BY rank LIMIT :limit"
                     )
             else:
-                # PostgreSQL: ILIKE fallback (no FTS5 virtual table).
-                # Full tsvector/tsquery indexing can be added later.
+                # Non-SQLite fallback: LIKE/ILIKE on the data column.
+                # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
+                # MySQL: CONVERT(data USING utf8mb4) + LIKE (case-insensitive
+                #        by default with utf8mb4_unicode_ci collation).
                 like_pattern = f"%{query}%"
+                is_mysql = self._engine.dialect.name == "mysql"
+                if is_mysql:
+                    data_expr = "CONVERT(ci.data USING utf8mb4)"
+                    like_op = "LIKE"
+                else:
+                    data_expr = "ci.data::text"
+                    like_op = "ILIKE"
                 if conversation_id is not None:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.workspace_id = :ws "
-                        "AND ci.conversation_id = :cid "
-                        "AND ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND ci.conversation_id = :cid "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 else:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.workspace_id = :ws "
-                        "AND ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
             params: dict[str, str | int] = {
@@ -1591,6 +1600,7 @@ class SqlAlchemyConversationStore(ConversationStore):
     def list_projects(
         self,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
     ) -> list[str]:
         """
         Return all distinct project names, ordered alphabetically.
@@ -1609,8 +1619,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param accessible_by: When set, restrict to sessions that
             ``accessible_by`` has a permission row for (mirrors the
             ``list_conversations`` ACL filter).
+        :param owned_by: When set, restrict to projects that contain at
+            least one session ``owned_by`` owns (an ``owner``-level grant).
+            Filing into a project is owner-only, so the sidebar renders
+            folders only on "My sessions"; scoping by ownership keeps a
+            project shared *with* the user (but owned by someone else) from
+            surfacing as one of their own folders.
         :returns: List of project names ordered ascending.
         """
+        from omnigent.server.auth import LEVEL_OWNER
+
         with self._session() as session:
             # Join to the conversation so archived sessions don't keep an
             # otherwise-empty project alive in the sidebar.
@@ -1635,6 +1653,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(owned_ids))
             return [row[0] for row in session.execute(stmt).all()]
 
     def delete_label(
@@ -1674,6 +1699,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         sort_by: str = "created_at",
         search_query: str | None = None,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
         title: str | None = None,
@@ -1727,9 +1753,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             empty string ``""``, only return sessions with NO project
             label (i.e., unfiled sessions). ``None`` disables the
             filter.
+        :param owned_by: When set, restrict to sessions the user owns
+            (an ``owner``-level grant) — stricter than ``accessible_by``,
+            which also matches sessions merely shared with them. Powers
+            the per-project folder fetch. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
+        from omnigent.server.auth import LEVEL_OWNER
+
         sort_col = self._resolve_sort_column(sort_by)
         with self._session() as session:
             is_desc = order == "desc"
@@ -1771,6 +1803,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversation.id.in_(owned_ids))
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)

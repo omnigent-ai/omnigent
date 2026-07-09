@@ -2,6 +2,7 @@ import * as React from "react";
 import { Dialog as DialogPrimitive } from "radix-ui";
 
 import { getEmbedRoot } from "@/lib/host";
+import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { XIcon } from "lucide-react";
@@ -48,10 +49,30 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  style,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
 }) {
+  // On the iOS shell the layout viewport stays full-height when the soft
+  // keyboard opens (the native shell keeps the WKWebView full via
+  // `.ignoresSafeArea(.keyboard)`), so a modal centered on `50%` and capped at
+  // `85vh` sizes and positions against the whole screen — its lower half (and a
+  // focused field) sit behind the keyboard. `useIOSViewportLock` publishes the
+  // keyboard-aware visible height as `--omnigent-viewport-height` on :root, so
+  // pin both the centering origin and the height cap to it (less the safe-area
+  // insets) via inline style — inline beats callers' `max-h-[85vh]`/`top`
+  // Tailwind classes (which `cn`'s twMerge would otherwise keep). No-op off iOS.
+  const iosViewportStyle: React.CSSProperties = isIOSShell()
+    ? {
+        // Center within the visible viewport (not the full layout height).
+        top: "calc(var(--omnigent-viewport-height, 100lvh) / 2)",
+        // Cap to the visible area less both safe insets and a small margin, so
+        // the modal can never extend behind the keyboard, notch, or home bar.
+        maxHeight:
+          "calc(var(--omnigent-viewport-height, 100lvh) - var(--omnigent-safe-top, 0px) - var(--omnigent-safe-bottom, 0px) - 1rem)",
+      }
+    : {};
   return (
     <DialogPortal>
       <DialogOverlay />
@@ -61,6 +82,7 @@ function DialogContent({
           "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className,
         )}
+        style={{ ...iosViewportStyle, ...style }}
         {...props}
       >
         {children}

@@ -24,8 +24,12 @@
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Omnigent uses the camera when you choose to take a photo for an attachment.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Omnigent uses the microphone for voice dictation in the message composer.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Omnigent uses speech recognition to turn voice dictation into message text.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchScreen</key>

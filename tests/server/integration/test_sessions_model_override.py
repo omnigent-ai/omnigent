@@ -11,6 +11,7 @@ runner-path forwarding is verified here by stubbing
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -680,4 +681,76 @@ async def test_per_event_model_override_wins_over_persisted(
     assert captured.get("body", {}).get("model_override") == "claude-sonnet-4-6", (
         f"Per-event model_override should win; runner body had "
         f"{captured.get('body', {}).get('model_override')!r}."
+    )
+
+
+async def test_smart_routing_overrides_orchestrator_model_for_child_session(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Smart routing wins over the orchestrator's model choice for child sessions.
+
+    When sys_session_send passes ``model`` for a child session, the server
+    creates the child with that as ``model_override``. Previously the routing
+    gate (``effective_runner_override is None``) would then skip the judge
+    call entirely, silently letting the LLM's choice beat smart routing.
+
+    Now, when the parent session has the routing toggle on, the judge runs
+    regardless — and the routing verdict replaces the orchestrator's model
+    in the runner body and in the persisted ``model_override``.
+    """
+    captured = _stub_runner_client(monkeypatch)
+
+    # Stub route_turn to return a deterministic verdict, bypassing the real LLM.
+    routed_model = "databricks-claude-haiku-4-5"
+
+    async def _fake_route_turn(*_: Any, **__: Any) -> tuple[str, dict[str, Any]]:
+        return routed_model, {"rationale": "trivial task — cheap model suffices"}
+
+    # Patch the module where route_turn is defined so the lazy import inside
+    # _forward_event_to_runner picks up the stub.
+    with patch("omnigent.server.smart_routing.route_turn", _fake_route_turn):
+        agent = await create_test_agent(client)
+
+        # Parent session with routing toggle on.
+        parent_resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+        )
+        assert parent_resp.status_code == 201, parent_resp.text
+        parent_id = parent_resp.json()["id"]
+
+        # Child session with a model the orchestrator chose (simulates
+        # sys_session_send with model="databricks-claude-opus-4-8").
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent_id,
+                "model_override": "databricks-claude-opus-4-8",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child_id = child_resp.json()["id"]
+
+        # First message to the child — routing should fire and override.
+        event_resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "what is 2+2?"}],
+                },
+            },
+        )
+        assert event_resp.status_code == 202, event_resp.text
+
+    assert captured.get("body") is not None, (
+        "Runner client was never POSTed to — _forward_event_to_runner did not run."
+    )
+    assert captured["body"].get("model_override") == routed_model, (
+        f"Smart routing should have replaced the orchestrator's model with "
+        f"{routed_model!r}; runner body had "
+        f"{captured['body'].get('model_override')!r}."
     )

@@ -5,7 +5,11 @@
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
-  "author": "Databricks, Inc.",
+  "homepage": "https://omnigent.ai",
+  "author": {
+    "name": "Databricks, Inc.",
+    "email": "support@omnigent.ai"
+  },
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
@@ -85,6 +89,7 @@
     "linux": {
       "icon": "icons/icon.png",
       "category": "Development",
+      "maintainer": "Databricks, Inc. <support@omnigent.ai>",
       "target": [
         "AppImage",
         "deb"

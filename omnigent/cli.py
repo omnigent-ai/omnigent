@@ -5770,22 +5770,34 @@ def _materialize_harness_launcher_file(
     :raises click.ClickException: If *harness* is unsupported.
     """
     _validate_harness(harness)
-    display_name = harness
-    harness = canonicalize_harness(harness) or harness
+    canonical = canonicalize_harness(harness) or harness
+    # An acp:<slug> harness id carries a colon: it canonicalizes to the base
+    # `acp` harness, but the slug selects a user-configured ACP agent resolved
+    # at spawn and must be preserved. So the effective harness id written to
+    # executor.harness is the FULL acp:<slug> (keep the slug), or the canonical
+    # id for every other harness (so aliases still resolve, e.g. kimi ->
+    # kimi-code). The agent NAME and temp filename must be path-safe /
+    # [a-zA-Z0-9_-]+, so the colon is sanitized there only.
+    effective_harness = harness if canonical == "acp" and ":" in harness else canonical
+    # Name preserves the user's input (matching the pre-acp behavior, e.g.
+    # --harness claude -> name "claude"), sanitized for the colon so acp:<slug>
+    # yields a valid [a-zA-Z0-9_-]+ name. Filename uses the canonical/effective
+    # id (also colon-sanitized) as before.
+    display_name = harness.replace(":", "-")
 
     tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-harness-launcher-"))
-    yaml_path = tmpdir / f"{harness}.yaml"
+    yaml_path = tmpdir / f"{effective_harness.replace(':', '-')}.yaml"
 
-    executor: dict[str, str] = {"harness": harness}
+    executor: dict[str, str] = {"harness": effective_harness}
     if model is not None:
         executor["model"] = model
 
     raw = {
         "name": display_name,
-        "prompt": system_prompt or _default_harness_prompt(harness),
+        "prompt": system_prompt or _default_harness_prompt(canonical),
         "executor": executor,
     }
-    if harness in _OS_ENV_HARNESSES:
+    if canonical in _OS_ENV_HARNESSES:
         raw["os_env"] = {"type": "caller_process", "sandbox": {"type": "none"}}
     yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False))
     return yaml_path
@@ -10134,6 +10146,83 @@ def _manage_goose_harness() -> None:
             status = None
 
 
+def _print_acp_examples() -> None:
+    """Print example ACP-agent commands (Omnigent stores no credential)."""
+    from omnigent.onboarding.interactive import console
+
+    console.print(
+        "\n  [bold]Custom ACP agents[/bold] — connect any agent that speaks the "
+        "Agent Client Protocol ([underline]agentclientprotocol.com[/underline]).\n"
+        "  Omnigent stores no credential — log into each agent via its own CLI first.\n\n"
+        "  Example commands to paste:\n"
+        "    • Gemini CLI     [bold]gemini --experimental-acp[/bold]\n"
+        "    • Qwen Code      [bold]qwen --acp[/bold]\n"
+        "    • Goose          [bold]goose acp[/bold]\n"
+        "    • Claude Code    [bold]npx -y @zed-industries/claude-code-acp[/bold]\n"
+    )
+
+
+def _add_acp_agent() -> None:
+    """Prompt for a new ACP agent and append it to the ``acp:`` config block.
+
+    Reached straight from the "Add custom ACP agent" overview row (no
+    intermediate menu). Prints the paste-ready examples first, then prompts for
+    name / command / optional model.
+    """
+    from omnigent.onboarding.acp_auth import (
+        AcpAgentEntry,
+        acp_agents,
+        acp_agents_settings,
+        slugify,
+    )
+    from omnigent.onboarding.interactive import console, prompt_text
+
+    _print_acp_examples()
+    name = prompt_text("Agent name (e.g. Gemini CLI)").strip()
+    if not name:
+        console.print("  [yellow]No name entered — nothing added.[/yellow]")
+        return
+    command = prompt_text("Command to launch (e.g. gemini --experimental-acp)").strip()
+    if not command:
+        console.print("  [yellow]No command entered — nothing added.[/yellow]")
+        return
+    model = (prompt_text("Model (optional — Enter to skip)", default="") or "").strip() or None
+
+    entries = list(acp_agents())
+    entries.append(AcpAgentEntry(slug=slugify(name), name=name, command=command, model=model))
+    _save_global_config(acp_agents_settings(entries))
+    console.print(f"  ✓ Added {name}")
+
+
+def _manage_acp_agent(slug: str) -> None:
+    """Per-agent drill-in for one configured ACP agent: remove it.
+
+    Reached by selecting the agent's own row in the configure-harnesses overview.
+    A single-shot menu (Remove / Back) — Omnigent stores no credential, so there
+    is nothing else to manage per agent yet.
+
+    :param slug: The agent's slug (see :func:`omnigent.onboarding.acp_auth.slugify`).
+    """
+    from omnigent.onboarding.acp_auth import acp_agents, acp_agents_settings
+    from omnigent.onboarding.interactive import console, select
+
+    agents = list(acp_agents())
+    agent = next((a for a in agents if a.slug == slug), None)
+    if agent is None:
+        return
+    suffix = f"  ·  {agent.model}" if agent.model else ""
+    header = f"{agent.name} — {agent.command}{suffix}"
+    rows: list[_HarnessMenuRow] = [
+        _HarnessMenuRow("Remove this agent", action="remove"),
+        _HarnessMenuRow("← Back", action="back"),
+    ]
+    idx = select(header, [r.label for r in rows], clear_on_exit=True)
+    if idx < 0 or rows[idx].action == "back":
+        return
+    _save_global_config(acp_agents_settings([a for a in agents if a.slug != slug]))
+    console.print(f"  ✓ Removed {agent.name}")
+
+
 def _manage_hermes_harness() -> None:
     """Run the level-2 loop for Hermes: ensure the CLI is installed.
 
@@ -11151,14 +11240,26 @@ def _run_configure_harnesses_interactive() -> None:
     # / ``kimi provider add`` → ~/.kimi/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
+    # Sentinels for the generic-ACP rows. Each configured agent gets its own row
+    # (``_ACP_AGENT_PREFIX + slug`` → per-agent remove drill-in); a single
+    # ``_ACP_ADD`` row jumps straight into the add flow. Not a provider family —
+    # each ACP agent owns its own auth.
+    _ACP_ADD = "\x00acp-add"
+    _ACP_AGENT_PREFIX = "\x00acp-agent:"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
 
     # Status glyph + Rich color per readiness kind: "ready" is a configured,
     # launchable harness (green ✓); "missing" is an absent CLI/SDK (red ✗);
     # "warn" is installed-but-unconfigured (yellow ✗ — present, not usable
-    # yet). The glyph leads the status, which sits in a left-aligned column
-    # right of the names, so every ✓/✗ lines up in a single column.
-    status_styles = {"ready": ("✓", "green"), "missing": ("✗", "red"), "warn": ("✗", "yellow")}
+    # yet); "action" is a do-something row (e.g. Add) with no status glyph. The
+    # glyph leads the status, which sits in a left-aligned column right of the
+    # names, so every ✓/✗ lines up in a single column.
+    status_styles = {
+        "ready": ("✓", "green"),
+        "missing": ("✗", "red"),
+        "warn": ("✗", "yellow"),
+        "action": ("", "cyan"),
+    }
 
     def _install_hint(command: str) -> str:
         # Selection-only tooltip. The command is escaped so a bracketed extra
@@ -11419,6 +11520,34 @@ def _run_configure_harnesses_interactive() -> None:
             kimi_spec = harness_install_spec(KIMI_KEY)
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
             rows.append((_KIMI, "Kimi Code", "Not installed", "missing", _install_hint(kimi_hint)))
+
+        # Custom ACP agents — the generic `acp` harness driving any user-configured
+        # ACP-agent command. Each configured agent gets its own overview row
+        # (select → per-agent remove drill-in) so it sits alongside the built-in
+        # harnesses, followed by an "Add" row that jumps straight into the add
+        # flow. Not gated on a binary — each agent owns its own install.
+        from omnigent.onboarding.acp_auth import acp_config_summary
+
+        acp_summary = acp_config_summary()
+        for agent in acp_summary.agents:
+            rows.append(
+                (
+                    _ACP_AGENT_PREFIX + agent.slug,
+                    agent.name,
+                    f"ACP · {agent.command}",
+                    "ready",
+                    "Select to remove this ACP agent.",
+                )
+            )
+        rows.append(
+            (
+                _ACP_ADD,
+                "Add custom ACP agent" if acp_summary.configured else "Custom ACP agent",
+                "" if acp_summary.configured else "None configured",
+                "action",
+                "Add an ACP agent (gemini, qwen, goose, …).",
+            )
+        )
         return rows
 
     while True:
@@ -11477,6 +11606,10 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_opencode_harness()
         elif target == _GOOSE:
             _manage_goose_harness()
+        elif target == _ACP_ADD:
+            _add_acp_agent()
+        elif isinstance(target, str) and target.startswith(_ACP_AGENT_PREFIX):
+            _manage_acp_agent(target[len(_ACP_AGENT_PREFIX) :])
         elif target == _HERMES:
             _manage_hermes_harness()
         elif target == _KIRO:
@@ -11779,6 +11912,172 @@ def debug_migrate_accounts_to_oidc(
         click.echo("\nThis was a dry run. Re-run with --commit to apply.\n")
     else:
         click.echo("\nDone. Flip OMNIGENT_AUTH_PROVIDER=oidc and restart.\n")
+
+
+@debug.command("logs")
+@click.option(
+    "--type",
+    "log_type",
+    type=click.Choice(["runner", "host-runner", "server", "cli"], case_sensitive=False),
+    default="runner",
+    show_default=True,
+    help="Log category: runner (local CLI runner via omnigent run), "
+    "host-runner (runner spawned by a host daemon), "
+    "server (local server), or cli (CLI diagnostics).",
+)
+@click.option(
+    "--session",
+    "session_id",
+    default=None,
+    metavar="SESSION_ID",
+    help="Filter host-runner logs by session id, e.g. conv_abc123. "
+    "Only applies to --type host-runner. Shows all log files for the "
+    "session, oldest first.",
+)
+@click.option(
+    "--list",
+    "list_only",
+    is_flag=True,
+    default=False,
+    help="List available log files with size and timestamp instead of showing content.",
+)
+@click.option(
+    "--lines",
+    "-n",
+    default=50,
+    show_default=True,
+    metavar="N",
+    type=click.IntRange(min=0),
+    help="Lines to show from the end of the log (0 = entire file). "
+    "With --session, applied per file.",
+)
+@click.option(
+    "--follow",
+    "-f",
+    is_flag=True,
+    default=False,
+    help="Follow the latest log file in real-time (like tail -f). "
+    "With --session, follows the most recent file for the session. "
+    "Not supported on Windows.",
+)
+def debug_logs(
+    log_type: str, session_id: str | None, list_only: bool, lines: int, follow: bool
+) -> None:
+    """Show runner, server, or CLI diagnostic logs.
+
+    Prints the tail of the most recent log file for the chosen category.
+    Use ``--list`` to see all available files, or ``--follow`` to stream
+    new output as it is written.
+
+    Pass ``--session SESSION_ID`` (``--type host-runner`` only) to scope
+    output to all log files produced for a specific session across relaunches.
+
+    \b
+    Log locations (relative to ~/.omnigent or $OMNIGENT_DATA_DIR):
+      runner       logs/runner/runner-*.log
+      host-runner  logs/host-runner/runner-*.log
+      server       logs/server/*server*.log
+      cli          logs/cli-*.log
+
+    \b
+    Examples:
+      # Tail the most recent local runner log (default)
+      omnigent debug logs
+      # List all local runner log files with sizes
+      omnigent debug logs --list
+      # Show host-runner logs for a specific session (across relaunches)
+      omnigent debug logs --type host-runner --session conv_abc123
+      # List host-runner log files for a session
+      omnigent debug logs --type host-runner --session conv_abc123 --list
+      # Follow the latest server log in real-time
+      omnigent debug logs --type server --follow
+      # Show the full latest CLI diagnostics log
+      omnigent debug logs --type cli -n 0
+    """
+    import re
+    import subprocess
+
+    from omnigent.host.local_server import _local_data_dir
+
+    if session_id is not None and log_type != "host-runner":
+        raise click.UsageError("--session is only supported with --type host-runner")
+
+    if follow and IS_WINDOWS:
+        raise click.UsageError("--follow is not supported on Windows")
+
+    data_dir = _local_data_dir()
+
+    _log_configs: dict[str, tuple[Path, str]] = {
+        "runner": (data_dir / "logs" / "runner", "runner-*.log"),
+        "host-runner": (data_dir / "logs" / "host-runner", "runner-*.log"),
+        # Covers both server-*.log (omnigent run) and local-server-*.log (daemon).
+        "server": (data_dir / "logs" / "server", "*server*.log"),
+        "cli": (data_dir / "logs", "cli-*.log"),
+    }
+
+    log_dir, pattern = _log_configs[log_type]
+
+    if not log_dir.exists():
+        raise click.ClickException(f"No {log_type} logs found — {log_dir} does not exist.")
+
+    if session_id is not None:
+        # Sanitize the same way connect.py does so the glob matches.
+        slug = re.sub(r"[^\w-]", "", session_id)[:32]
+        pattern = f"runner-{slug}-*.log"
+
+    # Exclude symlinks (e.g. latest-cli.log), sort newest first.
+    log_files = sorted(
+        (f for f in log_dir.glob(pattern) if not f.is_symlink()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not log_files:
+        if session_id is not None:
+            raise click.ClickException(
+                f"No host-runner logs found for session {session_id!r}. "
+                "Session ids appear in filenames only for runners launched "
+                "after this feature was added."
+            )
+        raise click.ClickException(f"No {log_type} log files found in {log_dir}.")
+
+    if list_only:
+        header = (
+            f"host-runner logs for session {session_id!r} in {log_dir}:"
+            if session_id
+            else f"{log_type} logs in {log_dir}:"
+        )
+        click.echo(header)
+        for f in log_files:
+            stat = f.stat()
+            size_kb = stat.st_size / 1024
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
+            click.echo(f"  {mtime}  {size_kb:6.1f} KB  {f.name}")
+        return
+
+    if follow:
+        # Follow the most recent file only (tail -f can only track one file).
+        latest = log_files[0]
+        click.echo(f"# {latest}", err=True)
+        subprocess.run(["tail", "-f", str(latest)])
+        return
+
+    if session_id is not None:
+        # Show all files for the session, oldest first, with separators.
+        for f in reversed(log_files):
+            click.echo(f"# {f}", err=True)
+            content = f.read_text(errors="replace")
+            if lines > 0:
+                content = "\n".join(content.splitlines()[-lines:])
+            click.echo(content)
+            click.echo()
+    else:
+        latest = log_files[0]
+        click.echo(f"# {latest}", err=True)
+        content = latest.read_text(errors="replace")
+        if lines > 0:
+            content = "\n".join(content.splitlines()[-lines:])
+        click.echo(content)
 
 
 def _workspace_mount_probe_matches(candidate: str, probe: httpx.Response) -> bool:

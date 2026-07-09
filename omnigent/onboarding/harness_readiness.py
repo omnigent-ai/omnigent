@@ -191,6 +191,17 @@ def harness_is_configured(harness: str) -> bool:
         harness's binary is missing from ``PATH``.
     """
     canonical = _canonical_harness(harness)
+    if canonical == "acp":
+        # The generic ACP harness has no fixed binary — "configured" means at
+        # least one agent is registered in the ``acp:`` config block. Each
+        # agent's own binary is a soft PATH hint surfaced in setup, not a hard
+        # gate. A malformed block reads as not-configured rather than raising.
+        try:
+            from omnigent.onboarding.acp_auth import acp_agents
+
+            return bool(acp_agents())
+        except Exception:
+            return False
     if canonical in _SDK_HARNESSES:
         return True
     if canonical in _CURSOR_NATIVE_HARNESSES:

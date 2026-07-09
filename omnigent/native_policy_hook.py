@@ -130,42 +130,64 @@ def policy_hook_wrapper_script(server_url: str, session_id: str, hook_script_pat
     )
 
 
-def policy_hook_reauth(
-    server_url: str, headers: dict[str, str]
-) -> Callable[[], dict[str, str] | None]:
-    """Build a callable that re-mints the Omnigent bearer for *server_url*.
+class PolicyHookReauth:
+    """Callable that re-mints the Omnigent bearer for a policy hook subprocess.
 
     The baked one-shot token dies with the ~1h Databricks OAuth lifetime; on a
     lapsed-token signal (401 or Apps ``302→/oidc/``) ``post_evaluate_with_retry``
     calls this once to mint a fresh bearer through the same factory the
     refresh-capable runtime auth uses, keeping the other headers (e.g.
-    ``X-Databricks-Org-Id``) so routing survives. Returns ``None`` when no
-    refresh mechanism is available, so the caller fails closed.
+    ``X-Databricks-Org-Id``) so routing survives.
+
+    The ``failure_reason`` attribute is set to a short diagnostic string when
+    the re-mint fails so callers can surface it in the fail-closed message shown
+    to the user — stderr from hook subprocesses is discarded by the harness, so
+    this is the only channel that reaches the UI.
+    """
+
+    failure_reason: str | None
+
+    def __init__(self, server_url: str, headers: dict[str, str]) -> None:
+        self._server_url = server_url
+        self._headers = headers
+        self.failure_reason = None
+
+    def __call__(self) -> dict[str, str] | None:
+        # Lazy import: paid only on the rare re-auth path, off the hot path.
+        try:
+            from omnigent.runner._entry import _make_auth_token_factory
+        except Exception as exc:  # noqa: BLE001 — best-effort; fail closed if unavailable
+            self.failure_reason = f"auth factory unavailable: {exc}"
+            return None
+        factory = _make_auth_token_factory(self._server_url)
+        if factory is None:
+            self.failure_reason = (
+                "no credential resolved "
+                f"(no stored token and no Databricks SDK auth for {self._server_url!r})"
+            )
+            return None
+        try:
+            token = factory()
+        except Exception as exc:  # noqa: BLE001 — transient mint failure; fail closed
+            self.failure_reason = f"token mint failed: {exc}"
+            return None
+        if not token:
+            self.failure_reason = "auth factory returned empty token"
+            return None
+        self.failure_reason = None
+        return {**self._headers, "Authorization": f"Bearer {token}"}
+
+
+def policy_hook_reauth(server_url: str, headers: dict[str, str]) -> PolicyHookReauth:
+    """Build a :class:`PolicyHookReauth` callable for *server_url*.
 
     :param server_url: Omnigent server base URL the hook POSTs to.
     :param headers: Current (lapsed) headers; the fresh bearer is merged over
         a copy so routing headers survive.
-    :returns: A zero-arg callable returning fresh headers, or ``None``.
+    :returns: A :class:`PolicyHookReauth` instance. Call it to attempt a
+        re-mint; check ``.failure_reason`` afterwards when it returns ``None``.
     """
-
-    def _reauth() -> dict[str, str] | None:
-        # Lazy import: paid only on the rare re-auth path, off the hot path.
-        try:
-            from omnigent.runner._entry import _make_auth_token_factory
-        except Exception:  # noqa: BLE001 — best-effort; fail closed if unavailable
-            return None
-        factory = _make_auth_token_factory(server_url)
-        if factory is None:
-            return None
-        try:
-            token = factory()
-        except Exception:  # noqa: BLE001 — transient mint failure; fail closed
-            return None
-        if not token:
-            return None
-        return {**headers, "Authorization": f"Bearer {token}"}
-
-    return _reauth
+    return PolicyHookReauth(server_url, headers)
 
 
 def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
@@ -380,7 +402,9 @@ def evaluation_response_to_hook_output(
     return None
 
 
-def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
+def fail_closed_hook_output(
+    hook_event: str, detail: str | None = None
+) -> dict[str, object] | None:
     """
     Build the fail-closed hook output for an unobtainable policy verdict.
 
@@ -411,22 +435,34 @@ def fail_closed_hook_output(hook_event: str) -> dict[str, object] | None:
       an already-incurred side effect.
 
     :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
+    :param detail: Optional short diagnostic string appended to the reason
+        shown in the UI, e.g. a reauth failure message from
+        :attr:`PolicyHookReauth.failure_reason`. Omit when no detail is
+        available.
     :returns: A ``permissionDecision: "deny"`` hook output for
         ``PreToolUse``; a ``decision: "block"`` output for
         ``UserPromptSubmit``; ``None`` for every other event (fail open).
     """
+    tool_reason = (
+        f"{_EVAL_UNAVAILABLE_REASON} Detail: {detail}" if detail else _EVAL_UNAVAILABLE_REASON
+    )
+    request_reason = (
+        f"{_EVAL_UNAVAILABLE_REQUEST_REASON} Detail: {detail}"
+        if detail
+        else _EVAL_UNAVAILABLE_REQUEST_REASON
+    )
     if hook_event == _PRE_TOOL_USE:
         return {
             "hookSpecificOutput": {
                 "hookEventName": _PRE_TOOL_USE,
                 "permissionDecision": "deny",
-                "permissionDecisionReason": _EVAL_UNAVAILABLE_REASON,
+                "permissionDecisionReason": tool_reason,
             },
         }
     if hook_event == _USER_PROMPT_SUBMIT:
         return {
             "decision": "block",
-            "reason": _EVAL_UNAVAILABLE_REQUEST_REASON,
+            "reason": request_reason,
         }
     return None
 
@@ -438,7 +474,7 @@ def post_evaluate_with_retry(
     read_timeout: float,
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
-) -> httpx.Response | None:
+) -> tuple[httpx.Response, None] | tuple[None, str]:
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
 
@@ -480,8 +516,9 @@ def post_evaluate_with_retry(
         ``None`` (the default) keeps the legacy behavior for callers that have
         no token source. Returning ``None`` from it falls through to the
         normal failure handling (the caller fails closed).
-    :returns: Successful :class:`httpx.Response`, or ``None`` when retries
-        are exhausted or the error is non-retryable.
+    :returns: ``(response, error)`` — on success, ``(response, None)``; on
+        failure, ``(None, short_error_string)`` describing the last error so
+        callers can surface it in the deny/block reason shown to the user.
     """
     # Mint one stable id for the whole retry sequence. Each retry re-sends
     # it so the server can re-park the SAME elicitation rather than opening
@@ -493,6 +530,7 @@ def post_evaluate_with_retry(
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
+    last_error: str = "unknown error"
     while True:
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
@@ -521,21 +559,26 @@ def post_evaluate_with_retry(
                         )
                         continue
                 resp.raise_for_status()
-                return resp
+                return resp, None
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code < 500:
-                body_preview = exc.response.text[:200] if exc.response.content else ""
+            status = exc.response.status_code
+            body_preview = exc.response.text[:200] if exc.response.content else ""
+            last_error = f"server returned {status}" + (
+                f": {body_preview}" if body_preview else ""
+            )
+            if status < 500:
                 print(
-                    f"omnigent {hook_label}: Omnigent returned {exc.response.status_code}"
+                    f"omnigent {hook_label}: Omnigent returned {status}"
                     + (f": {body_preview}" if body_preview else ""),
                     file=sys.stderr,
                 )
-                return None
+                return None, last_error
             print(
-                f"omnigent {hook_label}: Omnigent returned {exc.response.status_code}; retrying",
+                f"omnigent {hook_label}: Omnigent returned {status}; retrying",
                 file=sys.stderr,
             )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_error = f"connection error: {exc}"
             print(
                 f"omnigent {hook_label}: Omnigent request failed; retrying: {exc}",
                 file=sys.stderr,
@@ -544,17 +587,18 @@ def post_evaluate_with_retry(
             # Other HTTP errors (ReadTimeout while a long ASK poll is in flight,
             # etc.) are not retried — retrying a severed ASK would open a new
             # elicitation and prompt the human twice.
+            last_error = f"request error: {exc}"
             print(
                 f"omnigent {hook_label}: Omnigent request failed: {exc}",
                 file=sys.stderr,
             )
-            return None
+            return None, last_error
         if time.monotonic() + backoff_s >= deadline:
             print(
                 f"omnigent {hook_label}: retry budget exhausted",
                 file=sys.stderr,
             )
-            return None
+            return None, f"retry budget exhausted (last error: {last_error})"
         # Two-step backoff; not worth a retry library in this dependency-light hook.
         time.sleep(backoff_s)
         backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)

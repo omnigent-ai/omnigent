@@ -64,7 +64,8 @@ def main() -> None:
         )
 
         headers = policy_hook_request_headers()
-        resp = post_evaluate_with_retry(
+        reauth = policy_hook_reauth(server_url, headers)
+        resp, _ = post_evaluate_with_retry(
             url=url,
             headers=headers,
             eval_request=eval_body,
@@ -74,7 +75,7 @@ def main() -> None:
             read_timeout=86400.0,
             hook_label="cursor preToolUse",
             # Re-mint the baked one-shot token if it lapses mid-session.
-            reauth=policy_hook_reauth(server_url, headers),
+            reauth=reauth,
         )
     except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
         json.dump({"permission": "allow"}, sys.stdout)

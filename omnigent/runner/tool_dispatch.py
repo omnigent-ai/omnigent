@@ -89,6 +89,12 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalReadTool,
     SysTerminalSendTool,
 )
+from omnigent.tools.builtins.timer import (
+    # Shared with the in-process sys_timer_set tool so the runner's firing
+    # loop validates the same argument shape and delay ceiling the LLM-facing
+    # schema advertises.
+    validate_timer_set_args,
+)
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 
@@ -2661,8 +2667,9 @@ def _has_subagent(
 
 
 # ── Timer dispatch (RUNNER_TIMER_DISPATCH.md) ─────────────────
-
-_MAX_TIMER_SECONDS = 1_000_000.0
+# Argument validation and the delay ceiling live in the timer builtin
+# (``validate_timer_set_args``) so this firing path and the LLM-facing
+# schema stay in lockstep.
 
 
 async def _execute_timer_set(
@@ -2683,20 +2690,10 @@ async def _execute_timer_set(
     """
     from omnigent.runner import app as _app
 
-    seconds_raw = args.get("seconds")
-    if not isinstance(seconds_raw, (int, float)) or isinstance(seconds_raw, bool):
-        return json.dumps({"error": "seconds must be a number"})
-    seconds = float(seconds_raw)
-    if seconds < 0:
-        return json.dumps({"error": "seconds must be non-negative"})
-    if seconds > _MAX_TIMER_SECONDS:
-        return json.dumps({"error": f"seconds must be <= {_MAX_TIMER_SECONDS}"})
-    repeat = args.get("repeat", False)
-    if not isinstance(repeat, bool):
-        return json.dumps({"error": "repeat must be a boolean"})
-    note: str | None = args.get("note")
-    if note is not None and not isinstance(note, str):
-        return json.dumps({"error": "note must be a string"})
+    validated = validate_timer_set_args(args)
+    if isinstance(validated, str):
+        return json.dumps({"error": validated})
+    seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
 

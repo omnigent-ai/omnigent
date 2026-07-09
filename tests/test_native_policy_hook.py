@@ -468,7 +468,7 @@ def test_post_evaluate_with_retry_reauths_on_login_redirect(
         reauth_calls.append(1)
         return {"Authorization": "Bearer fresh", "X-Databricks-Org-Id": "o1"}
 
-    resp = post_evaluate_with_retry(
+    resp, error = post_evaluate_with_retry(
         "https://ap/x",
         {"Authorization": "Bearer stale"},
         {"event": {}},
@@ -478,6 +478,7 @@ def test_post_evaluate_with_retry_reauths_on_login_redirect(
     )
 
     assert resp is ok
+    assert error is None
     assert reauth_calls == [1]  # re-minted exactly once
     assert seen_headers[0]["Authorization"] == "Bearer stale"  # first attempt: lapsed token
     assert seen_headers[1]["Authorization"] == "Bearer fresh"  # retry: fresh token
@@ -505,8 +506,11 @@ def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
         "Client",
         _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
     )
-    resp = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "evaluate-policy hook")
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 5.0, "evaluate-policy hook"
+    )
     assert resp is None
+    assert error is not None
     assert len(seen_headers) == 1  # one attempt; a 302 is not retried without reauth
 
 
@@ -532,7 +536,7 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
         "Client",
         _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
     )
-    resp = post_evaluate_with_retry(
+    resp, error = post_evaluate_with_retry(
         "https://ap/x",
         {"Authorization": "Bearer stale"},
         {"event": {}},
@@ -541,6 +545,7 @@ def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
         reauth=lambda: None,
     )
     assert resp is None
+    assert error is not None
     assert len(seen_headers) == 1  # one attempt only; no retry loop
 
 

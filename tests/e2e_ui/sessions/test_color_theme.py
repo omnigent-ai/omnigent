@@ -1,9 +1,9 @@
 """E2E: the Settings → Appearance color-palette picker skins the app and persists.
 
-Alongside the light/dark **mode** cards, ``AppearanceSection``
-(``pages/SettingsPage.tsx``) renders a second ``role="radiogroup"`` labelled
-"Color palette" — one card per palette (Omnigent, Nord, Monokai, Solarized,
-Dracula). Selecting one calls ``applyThemePalette`` (``lib/themePalette.ts``),
+Alongside the light/dark **mode** tiles, ``AppearanceSection``
+(``pages/SettingsPage.tsx``) renders a "Color theme" dropdown (a shadcn
+``Select``) — one option per palette (Omnigent, Dracula, GitHub, Catppuccin,
+Gruvbox). Choosing one calls ``applyThemePalette`` (``lib/themePalette.ts``),
 which sets ``data-theme`` on ``<html>`` and persists the id to
 ``localStorage["omnigent:ui-theme-palette"]``. The default "Omnigent" palette
 carries no override, so choosing it removes the attribute and clears the key.
@@ -37,16 +37,27 @@ def _html_has_dark(page: Page) -> bool:
 
 
 def _theme_radiogroup(page: Page) -> Locator:
-    """The app-theme (mode) radiogroup, matched exactly so it can't also resolve
-    the "Terminal theme" radiogroup (its name contains "Theme" and its cards
-    reuse the Light/Dark labels)."""
-    return page.get_by_role("radiogroup", name="Theme", exact=True)
+    """The appearance-mode radiogroup ("Mode"). Matched exactly so it can't also
+    resolve the "Color theme" / "Terminal theme" radiogroups, whose cards reuse
+    the Light/Dark labels."""
+    return page.get_by_role("radiogroup", name="Mode", exact=True)
+
+
+def _color_theme_select(page: Page) -> Locator:
+    """The color-theme dropdown trigger."""
+    return page.get_by_test_id("color-theme-select")
+
+
+def _pick_palette(page: Page, name: str) -> None:
+    """Open the color-theme dropdown and choose the option with the given name."""
+    _color_theme_select(page).click()
+    page.get_by_role("option", name=name).click()
 
 
 def _open_appearance(page: Page, base_url: str) -> None:
-    """Navigate to the Settings Appearance section and wait for the palette group."""
+    """Navigate to the Settings Appearance section, wait for the color-theme dropdown."""
     page.goto(f"{base_url}/settings/appearance")
-    expect(page.get_by_role("radiogroup", name="Color palette")).to_be_visible(timeout=30_000)
+    expect(_color_theme_select(page)).to_be_visible(timeout=30_000)
 
 
 def test_color_palette_applies_persists_and_resets(
@@ -54,7 +65,7 @@ def test_color_palette_applies_persists_and_resets(
 ) -> None:
     """Selecting a palette skins ``<html>`` + persists; the default clears it.
 
-    Fresh load is the default "Omnigent" (its card checked, nothing stored, no
+    Fresh load is the default "Omnigent" (its name shown, nothing stored, no
     ``data-theme``). Picking GitHub sets ``data-theme="github"`` and persists it —
     and survives a reload (re-applied at boot). Returning to Omnigent removes the
     attribute and clears the stored key.
@@ -62,31 +73,29 @@ def test_color_palette_applies_persists_and_resets(
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
 
-    # Fresh context → default "Omnigent" palette: card checked, no override, no
-    # persisted preference.
-    expect(page.get_by_role("radio", name="Omnigent")).to_have_attribute("aria-checked", "true")
+    # Fresh context → default "Omnigent": the trigger shows it, no override, and
+    # nothing persisted.
+    expect(_color_theme_select(page)).to_contain_text("Omnigent")
     assert _data_theme(page) is None, "expected no data-theme override on a fresh load"
     assert _stored_palette(page) is None, "expected no persisted palette on a fresh load"
 
     # → GitHub: the data-theme attribute lands on <html> and the choice persists.
-    github = page.get_by_role("radio", name="GitHub")
-    github.click()
-    expect(github).to_have_attribute("aria-checked", "true")
+    _pick_palette(page, "GitHub")
+    expect(_color_theme_select(page)).to_contain_text("GitHub")
     assert _data_theme(page) == "github", "data-theme=github not set after selecting GitHub"
     assert _stored_palette(page) == '"github"'
 
     # Reload: the saved palette is re-applied before first paint (main.tsx), so
-    # <html> still carries data-theme=github and the card stays selected.
+    # <html> still carries data-theme=github and the trigger stays on GitHub.
     page.reload()
-    expect(page.get_by_role("radiogroup", name="Color palette")).to_be_visible(timeout=30_000)
+    expect(_color_theme_select(page)).to_be_visible(timeout=30_000)
     assert _data_theme(page) == "github", "saved palette not re-applied after reload"
-    expect(page.get_by_role("radio", name="GitHub")).to_have_attribute("aria-checked", "true")
+    expect(_color_theme_select(page)).to_contain_text("GitHub")
 
     # → back to Omnigent (the default): the override is removed and the stored
     # key cleared, since the default reverts to the base brand tokens.
-    omnigent = page.get_by_role("radio", name="Omnigent")
-    omnigent.click()
-    expect(omnigent).to_have_attribute("aria-checked", "true")
+    _pick_palette(page, "Omnigent")
+    expect(_color_theme_select(page)).to_contain_text("Omnigent")
     assert _data_theme(page) is None, "<html> kept data-theme after returning to Omnigent"
     assert _stored_palette(page) is None, "the palette key was not cleared for the default"
 
@@ -105,10 +114,8 @@ def test_color_palette_composes_with_dark_mode(
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
 
-    # Pick a palette, then Dark mode; the two controls are independent.
-    catppuccin = page.get_by_role("radio", name="Catppuccin")
-    catppuccin.click()
-    expect(catppuccin).to_have_attribute("aria-checked", "true")
+    # Pick a palette (dropdown), then Dark mode (radiogroup) — independent axes.
+    _pick_palette(page, "Catppuccin")
 
     dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
     dark.click()

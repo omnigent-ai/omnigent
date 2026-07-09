@@ -481,6 +481,7 @@ class ConversationStore(ABC):
         sort_by: str = "created_at",
         search_query: str | None = None,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
         title: str | None = None,
@@ -563,6 +564,12 @@ class ConversationStore(ABC):
             a UNION subquery: sessions the user has a direct
             grant on, plus sessions with a ``"__public__"`` grant.
             ``None`` disables the filter (returns all sessions).
+        :param owned_by: When set, filter to sessions the user
+            *owns* (an ``owner``-level grant), a stricter form of
+            ``accessible_by`` that excludes sessions merely shared
+            with them. Powers the per-project folder fetch, since
+            projects only ever hold the owner's own sessions.
+            ``None`` disables the filter.
         :param include_archived: When ``False`` (default), archived
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
@@ -737,6 +744,7 @@ class ConversationStore(ABC):
     def list_projects(
         self,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
     ) -> list[str]:
         """
         Return all distinct sidebar "project" names, ordered ascending.
@@ -753,6 +761,11 @@ class ConversationStore(ABC):
             sessions the user has a permission row for (mirrors the
             ``list_conversations`` ACL filter). ``None`` returns
             projects across all sessions.
+        :param owned_by: When set, restrict to projects that contain at
+            least one session the user owns (an ``owner``-level grant).
+            Projects are a "My sessions"-only surface, so this keeps a
+            project owned by someone else — but with a session shared to
+            the user — from appearing as one of the user's own folders.
         :returns: List of project names ordered alphabetically.
         """
         ...

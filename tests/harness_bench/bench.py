@@ -29,6 +29,7 @@ from tests.harness_bench.events import (
 from tests.harness_bench.full_server import SharedFullServer
 from tests.harness_bench.probes import ALL_PROBES, CapabilityProbe
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.runtime_env import bench_creds_skip_reason, resolve_bench_env
 from tests.harness_bench.transport import resolve_driver_class, resolve_transport_name
 from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Verdict, reconcile
 
@@ -229,7 +230,9 @@ async def run_harness(
             transport=resolved_transport,
         )
 
-    assert databricks_profile is not None  # guaranteed by the unavailable() check
+    # databricks_profile may be None here — the driver derives creds like
+    # `omni run` (config profile / ambient OPENAI_*); the unavailable() check
+    # above already confirmed creds are resolvable.
     _emit(sink, HarnessStarted(profile.harness, driver_cls.transport, profile.model))
     cells: list[CellResult] = []
     # Only the full-server driver accepts a shared server; pass it through when
@@ -394,14 +397,17 @@ async def _maybe_shared_full_server(
     run still owns its own server, unchanged).
     """
     shared = None
-    if live and jobs > 1 and databricks_profile is not None:
+    if live and jobs > 1:
         full = [
             p
             for p in profiles
             if resolve_driver_class(p, override=transport, fast=fast).transport == "full-server"
         ]
-        if len(full) > 1:
-            shared = SharedFullServer(databricks_profile)
+        # Only stand one up when creds are actually resolvable (a --profile, a
+        # configured ~/.omnigent profile, or ambient OPENAI_*); otherwise let
+        # each harness's unavailable() report the clean no-creds skip.
+        if len(full) > 1 and bench_creds_skip_reason(databricks_profile) is None:
+            shared = SharedFullServer(resolve_bench_env(databricks_profile))
             await asyncio.to_thread(shared.__enter__)
     try:
         yield shared

@@ -274,9 +274,9 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
     type: "routing_decision",
     ctx: ctxFor(item),
     model: item.model,
-    tier: item.tier,
     applied: item.applied,
     rationale: typeof item.rationale === "string" ? item.rationale : "",
+    ...(item.agent !== undefined && { agent: item.agent }),
   };
 }
 
