@@ -27,6 +27,8 @@ _SMOKE_JOURNEYS = [
     "get_session",
     "load_conversation_history",
     "search_sessions",
+    "fork_session",
+    "add_comment",
 ]
 
 
@@ -177,7 +179,13 @@ async def test_benchmark_smoke_threshold_failure_exits_nonzero() -> None:
 
 # ── runner (full-turn) journeys ──────────────────────────────
 
-_RUNNER_JOURNEYS = ["session_cold_start", "warm_turn", "time_to_first_token", "interrupt"]
+_RUNNER_JOURNEYS = [
+    "session_cold_start",
+    "warm_turn",
+    "time_to_first_token",
+    "interrupt",
+    "read_runner_file",
+]
 
 
 @pytest.mark.timeout(300)

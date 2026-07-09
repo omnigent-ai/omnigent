@@ -57,6 +57,8 @@ latency run), `--requests N` / `--concurrency N` (throughput), `--runs N`,
 | `get_session` | `GET /v1/sessions/{id}` — single-session snapshot | (O(1)) |
 | `load_conversation_history` | `GET /v1/sessions/{id}/items` — history read | items/session |
 | `search_sessions` | `GET /v1/sessions?search_query=` — unindexed `LIKE` | total item count |
+| `fork_session` | `POST /v1/sessions/{id}/fork` — fork (deep-copy items); forks deleted in teardown, untimed | items/session |
+| `add_comment` | `POST /v1/sessions/{id}/comments` — create a review comment | write path |
 
 Read journeys target a **pre-seeded** session when the DB has a corpus; against
 an empty DB they self-seed a small fallback session over HTTP (the
@@ -83,6 +85,12 @@ drift negligible (~2 ms/turn).
 | `warm_turn` | Drive a turn on an already-warm session — steady-state dispatch overhead |
 | `time_to_first_token` | Post a turn; time to the first streamed `output_text` delta |
 | `interrupt` | Interrupt a running (gated) turn; time to cancellation |
+| `read_runner_file` | `GET .../environments/default/filesystem/{path}` — server → runner filesystem read proxy |
+
+`read_runner_file` needs a runner but does **not** drive a turn or call the LLM:
+its setup plants a file via `PUT`, and the timed op is the proxied read (a
+localhost round-trip). Being far cheaper than a turn, it uses a higher iteration
+cap (50) than the full-turn journeys.
 
 **Only measure what we control.** Full-turn journeys always use the
 **`openai-agents`** SDK harness, which runs **in-process** (a call into the
@@ -212,6 +220,14 @@ seeding.
 
 ## Follow-ups
 
+- **Subagent spawn.** A planned full-turn journey (`needs_runner=True`): the
+  parent agent emits a `sys_session_send` tool call, the runner dispatches a
+  child session, and the parent auto-wakes with the collected result. It's
+  fully mockable with the zero-latency mock LLM (no real model) — script the
+  parent's queue to emit the tool call and the child's queue to return a short
+  reply, then poll for the child's marker. It needs the parent bundle to declare
+  a sub-agent under `tools:` (extend `_agent_bundle`); the pattern is in
+  `tests/e2e/test_coder_subagent.py`.
 - **Excluded journeys** (agent-behaviour-dependent, deliberately not measured):
   multi-turn and tool-calling turns (dominated by the agent's own choices) and
   large-history turns (the O(N) `history_to_input_items` conversion is real app
