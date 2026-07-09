@@ -1,16 +1,17 @@
 """Shared full-server infrastructure: spawn a real Omnigent server + runner.
 
 Split from :mod:`tests.harness_bench.full_server_driver` so the *server
-lifecycle* (spawning the server/runner, minting a bearer, registering bench
-agents + sessions) lives apart from the *driver* that runs probes against it.
-Two consumers use this:
+lifecycle* (spawning the server/runner, registering bench agents + sessions)
+lives apart from the *driver* that runs probes against it. Credentials come from
+:func:`tests.harness_bench.runtime_env.resolve_bench_env` (the same layering
+``omni run`` uses), not a bench-local bearer mint. Two consumers use this:
 
 - :class:`~tests.harness_bench.full_server_driver.FullServerDriver` — one
   harness per :class:`SharedFullServer` (solo run), or several harnesses on one
   shared server (parallel run; see ``bench.run_bench``).
 - :mod:`tests.harness_bench.native_tui_driver` reuses the lower-level spawn
-  helpers (:func:`spawn_omnigent_server`, :func:`_mint_bearer`,
-  :func:`_find_free_port`) for its own server + host-daemon topology.
+  helpers (:func:`spawn_omnigent_server`, :func:`_find_free_port`) for its own
+  server + host-daemon topology.
 """
 
 from __future__ import annotations
@@ -40,8 +41,8 @@ from tests._helpers.compat import (
     runner_executable,
     server_executable,
 )
-from tests.e2e.helpers import lookup_databricks_host
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.runtime_env import BenchRuntimeEnv
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 _HEALTH_TIMEOUT_S = 90.0
@@ -58,27 +59,6 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
-
-
-def _mint_bearer(profile: str) -> str:
-    """Mint a Databricks bearer for *profile* via the CLI (isolated from ambient token env).
-
-    ``env -u DATABRICKS_TOKEN -u DATABRICKS_BEARER`` guards against a stale
-    ambient credential shadowing profile auth (see omnigent issue #1781).
-    """
-    proc = subprocess.run(
-        ["databricks", "auth", "token", "--profile", profile, "--output", "json"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
-        env={
-            k: v
-            for k, v in os.environ.items()
-            if k not in ("DATABRICKS_TOKEN", "DATABRICKS_BEARER")
-        },
-    )
-    return str(json.loads(proc.stdout)["access_token"])
 
 
 def spawn_omnigent_server(
@@ -162,7 +142,7 @@ def _wait_server_runner_ready(base_url: str, runner_id: str) -> None:
 
 
 def _build_bench_agent_config(
-    profile: BenchProfile, db_profile: str, *, deny: bool
+    profile: BenchProfile, db_profile: str | None, *, deny: bool
 ) -> dict[str, Any]:
     """The agent spec for a bench harness: the harness + the read-only builtin,
     plus (when *deny*) a baked tool_call-phase deny on that builtin."""
@@ -171,16 +151,21 @@ def _build_bench_agent_config(
     # the real id so the runner resolves the right ACP agent at spawn.
     safe_harness = profile.harness.replace(":", "-")
     name = f"bench-{safe_harness}" + ("-deny" if deny else "")
+    executor: dict[str, Any] = {
+        "type": "omnigent",
+        "model": profile.model,
+        "config": {"harness": profile.harness},
+    }
+    # Omit executor.profile when auth comes from the ambient env (no derived
+    # profile), so the runner uses the OPENAI_* already in its env instead of
+    # trying to resolve a profile that may not exist.
+    if db_profile:
+        executor["profile"] = db_profile
     config: dict[str, Any] = {
         "spec_version": 1,
         "name": name,
         "prompt": "You are a helpful assistant used for capability testing.",
-        "executor": {
-            "type": "omnigent",
-            "model": profile.model,
-            "profile": db_profile,
-            "config": {"harness": profile.harness},
-        },
+        "executor": executor,
         # A read-only builtin the server dispatches (and gates at the tool_call
         # phase). The tool/policy probes drive a call to it; harmless for basic
         # turns (the model just won't call it).
@@ -233,8 +218,9 @@ class SharedFullServer:
     are the per-harness operations a ``FullServerDriver`` calls against it.
     """
 
-    def __init__(self, db_profile: str) -> None:
-        self._db_profile = db_profile
+    def __init__(self, env: BenchRuntimeEnv) -> None:
+        self._env = env
+        self._db_profile = env.db_profile
         self._proc: subprocess.Popen[bytes] | None = None
         self._runner: subprocess.Popen[bytes] | None = None
         self.client: httpx.Client | None = None
@@ -244,19 +230,13 @@ class SharedFullServer:
 
     def __enter__(self) -> SharedFullServer:
         self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
-        host = lookup_databricks_host(self._db_profile)
-        assert host is not None
-        bearer = _mint_bearer(self._db_profile)
         port = _find_free_port()
         self.base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
         self.runner_id = token_bound_runner_id(binding_token)
-        base_env = {
-            **os.environ,
-            "OPENAI_API_KEY": bearer,
-            "OPENAI_BASE_URL": f"{host}/serving-endpoints",
-            "DATABRICKS_CONFIG_PROFILE": self._db_profile,
-        }
+        # Credentials/profile were derived the way ``omni run`` does (ambient
+        # OPENAI_* wins, else resolve_databricks_workspace) in resolve_bench_env.
+        base_env = dict(self._env.base_env)
         apply_server_env(base_env, _REPO_ROOT)
         self._proc = spawn_omnigent_server(self._tmp, port, base_env, binding_token)
         self._runner = _spawn_bench_runner(

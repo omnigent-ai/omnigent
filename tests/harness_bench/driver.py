@@ -28,6 +28,7 @@ import httpx
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.runtime_env import bench_creds_skip_reason, resolve_bench_env
 
 
 class ProvisioningError(RuntimeError):
@@ -248,7 +249,7 @@ class SdkInprocDriver:
 
     transport = "sdk-inproc"
 
-    def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+    def __init__(self, profile: BenchProfile, *, databricks_profile: str | None) -> None:
         self._profile = profile
         self._databricks_profile = databricks_profile
         self._pm: HarnessProcessManager | None = None
@@ -259,20 +260,22 @@ class SdkInprocDriver:
     def unavailable(profile: BenchProfile, *, databricks_profile: str | None) -> str | None:
         """Return a skip reason if this driver cannot run *profile*, else ``None``.
 
-        Checks, in order: the profile's transport matches this driver, a
-        supplied Databricks profile (no gateway route without one), and a
-        runnable harness CLI binary. Mirrors the e2e suite's gating so the
-        bench skips — rather than errors — in environments missing creds or
-        a vendor CLI, or when a profile declares a transport this driver
-        does not implement (e.g. a native/community harness).
+        Checks, in order: the profile's transport matches this driver,
+        resolvable gateway credentials (``--profile``, a configured
+        ``~/.omnigent`` profile, or ambient ``OPENAI_*`` — like ``omni run``),
+        and a runnable harness CLI binary. Mirrors the e2e suite's gating so the
+        bench skips — rather than errors — in environments missing creds or a
+        vendor CLI, or when a profile declares a transport this driver does not
+        implement (e.g. a native/community harness).
         """
         if profile.transport != SdkInprocDriver.transport:
             return (
                 f"transport {profile.transport!r} not supported by the "
                 f"{SdkInprocDriver.transport!r} driver"
             )
-        if not databricks_profile:
-            return "no --profile / databricks profile provided; live probes need a gateway route"
+        creds_skip = bench_creds_skip_reason(databricks_profile)
+        if creds_skip is not None:
+            return creds_skip
         if profile.cli_binary is not None:
             reason = cli_unavailable_reason(profile.cli_binary)
             if reason is not None:
@@ -285,15 +288,17 @@ class SdkInprocDriver:
         self._pm = HarnessProcessManager(tmp_parent=self._tmp_parent)
         await self._pm.start()
         p = self._profile
-        self._client = await self._pm.get_client(
-            _CONV_ID,
-            p.harness,
-            env={
-                f"{p.env_prefix}GATEWAY": "true",
-                f"{p.env_prefix}DATABRICKS_PROFILE": self._databricks_profile,
-                f"{p.env_prefix}MODEL": p.model,
-            },
-        )
+        # Resolve the effective profile the way `omni run` does (the --profile
+        # override, else the config-derived one). May be None when auth comes
+        # from ambient OPENAI_*, in which case the wrap inherits that env.
+        resolved = resolve_bench_env(self._databricks_profile)
+        wrap_env = {
+            f"{p.env_prefix}GATEWAY": "true",
+            f"{p.env_prefix}MODEL": p.model,
+        }
+        if resolved.db_profile:
+            wrap_env[f"{p.env_prefix}DATABRICKS_PROFILE"] = resolved.db_profile
+        self._client = await self._pm.get_client(_CONV_ID, p.harness, env=wrap_env)
         return self
 
     async def __aexit__(self, *exc: object) -> None:

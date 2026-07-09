@@ -54,15 +54,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--profile",
         metavar="NAME",
         default=None,
-        help="Databricks gateway profile. Enables the live layer; without "
-        "it the bench renders the declared matrix offline.",
+        help="Databricks gateway profile override. Optional: without it the "
+        "bench derives creds the way `omni run` does (a configured "
+        "~/.omnigent profile or ambient OPENAI_*). The live layer turns on "
+        "whenever creds are resolvable; use --no-live for the offline matrix.",
     )
     parser.add_argument(
         "--live",
         dest="live",
         action="store_true",
         default=None,
-        help="Force the live layer (requires --profile).",
+        help="Force the live layer (needs resolvable creds: --profile, a "
+        "configured ~/.omnigent profile, or ambient OPENAI_*).",
     )
     parser.add_argument(
         "--no-live",
@@ -169,10 +172,15 @@ def main(argv: list[str] | None = None) -> int:
         print("--jobs must be >= 1", file=sys.stderr)
         return 2
 
-    # Live if explicitly forced, or implied by a supplied profile.
-    live = args.live if args.live is not None else bool(args.profile)
-    if live and not args.profile:
-        print("--live requires --profile <name>", file=sys.stderr)
+    # Live layer: derive creds the way `omni run` does — a --profile, a
+    # configured ~/.omnigent profile, or ambient OPENAI_*. So a live run no
+    # longer requires --profile; it is implied whenever creds are resolvable.
+    from tests.harness_bench.runtime_env import bench_creds_skip_reason
+
+    creds_skip = bench_creds_skip_reason(args.profile)
+    live = args.live if args.live is not None else creds_skip is None
+    if live and creds_skip is not None:
+        print(f"--live needs resolvable gateway creds: {creds_skip}", file=sys.stderr)
         return 2
 
     # Progress sink: only for a live run (offline is instant). Prefer the rich
