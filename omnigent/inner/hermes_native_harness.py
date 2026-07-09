@@ -10,11 +10,12 @@ injects web-UI messages into the running ``hermes`` TUI (launched by
 ``omnigent hermes`` in the session terminal) via tmux. The bridge dir is read from
 :data:`~omnigent.hermes_native_bridge.BRIDGE_DIR_ENV_VAR` in the spawn env.
 
-Tool policies: Omnigent's PreToolUse/PostToolUse policy gates (which the headless
-``hermes`` harness enforces via Hermes' ``pre_tool_call`` shell hook) do NOT apply
-to hermes-native — ``hermes`` runs its tools inside its own TUI and gates them with
-its own in-terminal approval prompts, which Omnigent does not intercept. Treat the
-Hermes TUI's own approval as the sole tool gate (same stance as goose-native).
+Tool policies: Omnigent policies are enforced via a per-session ``HERMES_HOME``
+that registers a ``pre_tool_call`` shell hook (the same hook the headless
+``hermes`` harness uses). The runner writes this before launching the TUI (see
+:func:`omnigent.hermes_native_bridge.write_policy_hook_config`). Hermes' own
+in-terminal approval prompt still fires for dangerous commands and is mirrored
+to the web UI by :mod:`omnigent.hermes_native_permissions`.
 """
 
 from __future__ import annotations

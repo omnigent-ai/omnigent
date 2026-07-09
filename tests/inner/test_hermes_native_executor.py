@@ -67,3 +67,22 @@ async def test_enqueue_session_message_injects(tmp_path: Path, monkeypatch) -> N
     assert seen == ["steer"]
     # Empty content is a no-op (no injection).
     assert await ex.enqueue_session_message("main", "") is False
+
+
+async def test_interrupt_session_success(tmp_path: Path, monkeypatch) -> None:
+    called: list[Path] = []
+    monkeypatch.setattr(
+        hne, "inject_interrupt", lambda bridge_dir, **kw: called.append(bridge_dir)
+    )
+    ex = hne.HermesNativeExecutor(bridge_dir=tmp_path)
+    assert await ex.interrupt_session("main") is True
+    assert called == [tmp_path]
+
+
+async def test_interrupt_session_failure(tmp_path: Path, monkeypatch) -> None:
+    def _fail(bridge_dir, **kw):
+        raise RuntimeError("tmux not available")
+
+    monkeypatch.setattr(hne, "inject_interrupt", _fail)
+    ex = hne.HermesNativeExecutor(bridge_dir=tmp_path)
+    assert await ex.interrupt_session("main") is False

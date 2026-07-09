@@ -40,3 +40,10 @@ allowed_domains:
 # Extra Python modules scanned for POLICY_REGISTRY lists at startup.
 # policy_modules:
 #   - myorg.policies.safety
+
+# Copy-at-spawn limits. When a parent agent forwards files to a subagent,
+# the server copies them through the destination session. These bound a
+# single copy request so it can't spike shared-server memory; omit to use
+# the built-in defaults (20 files / 256 MiB total).
+# copy_max_files: 20
+# copy_max_total_bytes: 268435456

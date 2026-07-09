@@ -24,6 +24,7 @@ def _valid_body(
     type_checkboxes: str = """
 - [x] Bug fix
 - [ ] Feature
+- [ ] UI / frontend change
 - [ ] Refactor / chore
 - [ ] Docs
 - [ ] Test / CI
@@ -38,8 +39,12 @@ def _valid_body(
 - [ ] Not applicable
 """,
     coverage_notes: str | None = None,
+    demo: str | None = None,
+    changelog: str | None = "Stale polling no longer blocks the REPL handoff",
 ) -> str:
     notes_section = "" if coverage_notes is None else f"\n## Coverage notes\n\n{coverage_notes}\n"
+    demo_section = "" if demo is None else f"\n## Demo\n\n{demo}\n"
+    changelog_section = "" if changelog is None else f"\n## Changelog\n\n{changelog}\n"
     return f"""
 ## Summary
 
@@ -48,11 +53,33 @@ def _valid_body(
 ## Test Plan
 
 {test_plan}
-
+{demo_section}
 ## Type of change
 {type_checkboxes}
 ## Test coverage
-{test_checkboxes}{notes_section}"""
+{test_checkboxes}{notes_section}{changelog_section}"""
+
+
+_BREAKING_TYPE = """
+- [ ] Bug fix
+- [ ] Feature
+- [ ] UI / frontend change
+- [ ] Refactor / chore
+- [ ] Docs
+- [ ] Test / CI
+- [x] Breaking change
+"""
+
+
+_UI_CHANGE = """
+- [ ] Bug fix
+- [ ] Feature
+- [x] UI / frontend change
+- [ ] Refactor / chore
+- [ ] Docs
+- [ ] Test / CI
+- [ ] Breaking change
+"""
 
 
 _MANUAL_ONLY = """
@@ -194,3 +221,80 @@ def test_not_applicable_with_empty_coverage_notes_after_comment_is_rejected() ->
     result = module.validate_pr_body(body)
     assert not result.ok
     assert any(error.startswith("Coverage notes are required") for error in result.errors)
+
+
+def test_demo_optional_for_non_ui_change() -> None:
+    # Default body is a bug fix with no Demo section.
+    result = module.validate_pr_body(_valid_body())
+    assert result.ok, result.errors
+
+
+def test_ui_change_requires_demo() -> None:
+    body = _valid_body(type_checkboxes=_UI_CHANGE)
+    result = module.validate_pr_body(body)
+    assert not result.ok
+    assert any(error.startswith("Demo is required") for error in result.errors)
+
+
+def test_ui_change_with_empty_demo_after_comment_is_rejected() -> None:
+    body = _valid_body(
+        type_checkboxes=_UI_CHANGE,
+        demo="<!-- nothing meaningful here -->",
+    )
+    result = module.validate_pr_body(body)
+    assert not result.ok
+    assert any(error.startswith("Demo is required") for error in result.errors)
+
+
+def test_ui_change_with_demo_passes() -> None:
+    body = _valid_body(
+        type_checkboxes=_UI_CHANGE,
+        demo="![new settings panel](https://github.com/org/repo/assets/1/screenshot.png)",
+    )
+    result = module.validate_pr_body(body)
+    assert result.ok, result.errors
+
+
+def test_changelog_free_text_line_is_valid() -> None:
+    body = _valid_body(changelog="`--watch` reruns an agent when files change")
+    result = module.validate_pr_body(body)
+    assert result.ok, result.errors
+
+
+def test_changelog_section_is_optional() -> None:
+    # A non-breaking PR may omit the Changelog section entirely.
+    result = module.validate_pr_body(_valid_body(changelog=None))
+    assert result.ok, result.errors
+
+
+def test_changelog_placeholder_left_in_is_allowed_for_non_breaking() -> None:
+    # Leaving the untouched placeholder is treated like deleting the section.
+    body = _valid_body(changelog="<Add a line to describe the change, else delete this section>")
+    result = module.validate_pr_body(body)
+    assert result.ok, result.errors
+
+
+def test_breaking_change_requires_a_description() -> None:
+    body = _valid_body(type_checkboxes=_BREAKING_TYPE, changelog=None)
+    result = module.validate_pr_body(body)
+    assert not result.ok
+    assert any(error.startswith("A Breaking change must describe") for error in result.errors)
+
+
+def test_breaking_change_with_placeholder_is_rejected() -> None:
+    body = _valid_body(
+        type_checkboxes=_BREAKING_TYPE,
+        changelog="<Add a line to describe the change, else delete this section>",
+    )
+    result = module.validate_pr_body(body)
+    assert not result.ok
+    assert any(error.startswith("A Breaking change must describe") for error in result.errors)
+
+
+def test_breaking_change_with_description_passes() -> None:
+    body = _valid_body(
+        type_checkboxes=_BREAKING_TYPE,
+        changelog="Dropped the deprecated `--legacy` flag",
+    )
+    result = module.validate_pr_body(body)
+    assert result.ok, result.errors

@@ -125,6 +125,23 @@ def close(conversation_id: str) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, _DONE)
 
 
+def shutdown_all() -> None:
+    """Signal all active subscribers across every conversation to exit.
+
+    Broadcasts the end-of-stream sentinel to every queued subscriber so
+    SSE generators return at their next iteration without waiting for a
+    heartbeat timeout or forced task cancellation. Called from the asyncio
+    event loop (``_ShutdownSignalingServer.shutdown`` in ``cli.py``) before
+    uvicorn's graceful-shutdown wait starts, so streams drain within the
+    window rather than being force-cancelled. Sync callers should use
+    :func:`close` per-conversation instead.
+    """
+    with _lock:
+        all_subs = [entry for subs in _subscribers.values() for entry in subs]
+    for queue, _ in all_subs:
+        queue.put_nowait(_DONE)
+
+
 async def subscribe(
     conversation_id: str,
     *,

@@ -8,7 +8,6 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec.parser import discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
@@ -204,6 +203,49 @@ def test_parse_llm_connection_unresolved_var_raises(
         parse(tmp_path)
 
 
+def test_parse_inline_mcp_tools_whitelist(tmp_path: Path) -> None:
+    """A per-server ``tools:`` whitelist on an inline MCP tool propagates to
+    ``MCPServerConfig.tools`` (regression: it was silently dropped, so the
+    documented allow-list was a no-op and all tools were exposed)."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "github": {
+                "type": "mcp",
+                "command": "npx",
+                "args": ["-y", "server-github"],
+                "tools": ["search_issues", "get_pull_request"],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    cfg = next(m for m in spec.mcp_servers if m.name == "github")
+    assert cfg.tools == ["search_issues", "get_pull_request"]
+
+
+def test_parse_inline_mcp_tools_absent_is_none(tmp_path: Path) -> None:
+    """Omitting ``tools:`` leaves the allow-list as ``None`` (expose all)."""
+    config = {
+        "spec_version": 1,
+        "tools": {"github": {"type": "mcp", "command": "npx", "args": []}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    cfg = next(m for m in parse(tmp_path).mcp_servers if m.name == "github")
+    assert cfg.tools is None
+
+
+def test_parse_inline_mcp_tools_non_list_raises(tmp_path: Path) -> None:
+    """A non-list ``tools:`` value is a clear error, not a silent type bug."""
+    config = {
+        "spec_version": 1,
+        "tools": {"github": {"type": "mcp", "command": "npx", "tools": "search_issues"}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"'tools' must be a list"):
+        parse(tmp_path)
+
+
 def test_parse_expand_env_false_keeps_var_references(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -226,6 +268,84 @@ def test_parse_expand_env_false_keeps_var_references(
     spec = parse(tmp_path, expand_env=False)
     assert spec.llm is not None
     assert spec.llm.connection == {"api_key": "${MY_API_KEY}"}
+
+
+def test_parse_builtin_tool_config_expands_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``${VAR}`` references in builtin tool config values are expanded."""
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-redacted-test-key")
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    builtin = spec.tools.builtins[0]
+    assert builtin.name == "web_search"
+    assert builtin.config == {
+        "search_provider": "perplexity",
+        "api_key": "pplx-redacted-test-key",
+    }
+
+
+def test_parse_builtin_tool_config_expand_env_false_keeps_literals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``expand_env=False`` keeps builtin tool ``${VAR}`` config literal."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path, expand_env=False)
+
+    assert spec.tools.builtins[0].config == {
+        "search_provider": "perplexity",
+        "api_key": "${PERPLEXITY_API_KEY}",
+    }
+
+
+def test_parse_builtin_tool_config_unresolved_var_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolved ``${VAR}`` in builtin tool config raises clearly."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {"name": "web_search", "api_key": "${PERPLEXITY_API_KEY}"},
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
+        parse(tmp_path)
 
 
 def test_parse_instructions_multiline_inline(tmp_path: Path) -> None:
@@ -408,6 +528,61 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.description == "Search the web for sources."
     assert skill.content == "When asked to research, use search.web."
     assert skill.skill_dir == skill_dir
+    # Absent ``user-invocable`` frontmatter defaults to invocable.
+    assert skill.user_invocable is True
+
+
+def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:
+    """``user-invocable: false`` frontmatter parses to ``user_invocable=False``."""
+    skill_dir = agent_dir / "skills" / "internal-hook"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: internal-hook\n"
+        "description: Internal orchestration skill.\n"
+        "user-invocable: false\n"
+        "---\n"
+        "Body."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "internal-hook")
+    assert skill.user_invocable is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Quoted-string spellings (YAML keeps these as ``str``, not bool) —
+        # the string branch of _falsey_flag, never exercised by the bare forms.
+        ('"false"', False),
+        ('"False"', False),
+        ('"FALSE"', False),
+        ('" false "', False),
+        ('"no"', False),  # extended false spellings (quoted → str)
+        ('"off"', False),
+        ('"0"', False),
+        ('"true"', True),
+        ('"yes"', True),  # not in the false set
+        ('"maybe"', True),
+        # Genuine YAML booleans — PyYAML parses bare false/no/off to ``bool``.
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        ("true", True),
+    ],
+)
+def test_parse_skill_user_invocable_string_and_bool_spellings(
+    agent_dir: Path, raw: str, expected: bool
+) -> None:
+    """Both the YAML bool ``false`` and the quoted string ``"false"`` parse falsey."""
+    skill_dir = agent_dir / "skills" / "flag-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: flag-skill\ndescription: d\nuser-invocable: {raw}\n---\nBody."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "flag-skill")
+    assert skill.user_invocable is expected
 
 
 def test_parse_skill_missing_frontmatter(agent_dir: Path) -> None:
@@ -431,6 +606,20 @@ def test_parse_skill_missing_description(agent_dir: Path) -> None:
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: no-desc\n---\nContent.")
     with pytest.raises(OmnigentError, match=r"missing required field 'description'"):
+        parse(agent_dir)
+
+
+def test_parse_skill_non_utf8_raises_omnigent_error(agent_dir: Path) -> None:
+    """
+    A non-UTF-8 SKILL.md must funnel through OmnigentError (not escape as a
+    bare UnicodeDecodeError) so the lenient scanner / menu providers can
+    catch it and skip the file instead of crashing.
+    """
+    skill_dir = agent_dir / "skills" / "bad-bytes"
+    skill_dir.mkdir(parents=True)
+    # 0xff is invalid UTF-8 — read_text() raises UnicodeDecodeError.
+    (skill_dir / "SKILL.md").write_bytes(b"---\nname: bad-bytes\ndescription: \xff\n---\nx")
+    with pytest.raises(OmnigentError, match=r"could not be read"):
         parse(agent_dir)
 
 
@@ -1402,53 +1591,6 @@ def test_parse_os_env_caller_process(tmp_path: Path) -> None:
     assert spec.os_env.fork is False
 
 
-def test_parse_os_env_createos_populates_provider_fields(tmp_path: Path) -> None:
-    """The native parser wires the createos provider keys into the
-    ``createos_*`` fields, in lockstep with the legacy loader.
-
-    What breaks if this fails: an agent loaded via native YAML gets
-    ``type='createos'`` but base_url/api_key/shape/rootfs are silently
-    dropped, so the provider falls back to env vars / defaults only.
-    """
-    config = {
-        "spec_version": 1,
-        "name": "with-createos",
-        "os_env": {
-            "type": "createos",
-            "base_url": "https://api.example.test",
-            "api_key": "sk-test",
-            "shape": "small",
-            "rootfs": "ubuntu-22.04",
-        },
-    }
-    (tmp_path / "config.yaml").write_text(yaml.dump(config))
-    spec = parse(tmp_path)
-    assert isinstance(spec.os_env, OSEnvSpec)
-    assert spec.os_env.type == "createos"
-    assert spec.os_env.createos_base_url == "https://api.example.test"
-    assert spec.os_env.createos_api_key == "sk-test"
-    assert spec.os_env.createos_shape == "small"
-    assert spec.os_env.createos_rootfs == "ubuntu-22.04"
-
-
-def test_parse_os_env_createos_fields_default_none(tmp_path: Path) -> None:
-    """Absent createos keys leave the ``createos_*`` fields ``None`` so
-    the provider falls back to env vars / defaults.
-    """
-    config = {
-        "spec_version": 1,
-        "name": "createos-bare",
-        "os_env": {"type": "createos"},
-    }
-    (tmp_path / "config.yaml").write_text(yaml.dump(config))
-    spec = parse(tmp_path)
-    assert isinstance(spec.os_env, OSEnvSpec)
-    assert spec.os_env.createos_base_url is None
-    assert spec.os_env.createos_api_key is None
-    assert spec.os_env.createos_shape is None
-    assert spec.os_env.createos_rootfs is None
-
-
 def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:
     """The nested ``sandbox:`` block parses into a real
     :class:`OSEnvSandboxSpec` with all its fields.
@@ -1895,6 +2037,35 @@ def test_parse_llm_timeout_defaults(tmp_path: Path) -> None:
     # Default retry max_retries is 7 per RetryPolicy dataclass.
     # Failure means the parser produces a non-default retry config.
     assert spec.llm.retry.max_retries == 7
+
+
+def test_parse_llm_profile_survives_consolidation(tmp_path: Path) -> None:
+    """``llm.profile`` must survive the llm/executor consolidation rebuild.
+
+    When an ``llm:`` block is present, ``parse`` rebuilds ``LLMConfig`` to
+    keep model/connection in sync with the authoritative executor fields.
+    That rebuild used to omit ``profile``, silently dropping the credentials
+    profile. Downstream, the policy/guardrail builder resolves a Databricks
+    workspace connection from ``spec.llm.profile``
+    (``omnigent/runtime/policies/builder.py``), so losing it makes those
+    paths fall back to env/default auth instead of the declared profile.
+
+    Regression guard: pre-fix ``spec.llm.profile`` is ``None`` here.
+    """
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "databricks/databricks-claude-sonnet-4",
+            "profile": "my-workspace",
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+    assert spec.llm.profile == "my-workspace", (
+        f"spec.llm.profile is {spec.llm.profile!r}, expected 'my-workspace' — the "
+        "consolidation rebuild dropped the declared credentials profile."
+    )
 
 
 def test_parse_tools_global_timeout_and_retry(tmp_path: Path) -> None:

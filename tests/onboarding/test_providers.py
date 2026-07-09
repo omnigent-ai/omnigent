@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from omnigent.onboarding import providers as _providers_mod
 from omnigent.onboarding.providers import (
     ModelInfo,
     ProviderConfig,
@@ -11,6 +14,79 @@ from omnigent.onboarding.providers import (
     get_models,
     get_provider_config,
 )
+
+# Minimal catalog fixture that mirrors the real MLflow JSON schema.
+# Keyed by provider name; each value is what _fetch_provider_catalog returns
+# (the full parsed dict with a "models" key).
+_FAKE_CATALOG: dict[str, dict] = {
+    "anthropic": {
+        "models": {
+            "claude-opus-4-8": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 200000, "max_output": 32000},
+            },
+            "claude-sonnet-4-6": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 200000, "max_output": 8192},
+            },
+            "claude-haiku-4-5": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 200000, "max_output": 8192},
+            },
+            "claude-3-embedding": {
+                "mode": "embedding",
+                "capabilities": {},
+            },
+        }
+    },
+    "openai": {
+        "models": {
+            "gpt-5.5-audio-preview-2026-06-01": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+            "gpt-5.5": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+            "gpt-4.1": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 128000, "max_output": 16384},
+            },
+            "gpt-3.5-turbo": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 16385, "max_output": 4096},
+            },
+        }
+    },
+    "gemini": {
+        "models": {
+            "gemini/gemini-2.5-flash": {
+                "mode": "chat",
+                "capabilities": {"function_calling": True},
+                "context_window": {"max_input": 1000000, "max_output": 8192},
+            },
+        }
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def mock_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch _fetch_provider_catalog to return fixture data without network calls."""
+    monkeypatch.setattr(
+        _providers_mod,
+        "_fetch_provider_catalog",
+        lambda provider: _FAKE_CATALOG.get(provider, {}),
+    )
+
 
 # ── get_all_providers ──────────────────────────────────────
 

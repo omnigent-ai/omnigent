@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 from cachetools import TTLCache
 
+from omnigent._platform import default_shell_argv
 from omnigent.model_override import model_family_mismatch
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
@@ -75,7 +76,13 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 # Subscription CLIs expose no listing API: curated ids matching the bundled
 # catalog pin (claude) and the codex ids the codebase already references.
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
-    "claude": ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
+    "claude": (
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ),
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
 }
 
@@ -869,7 +876,7 @@ def _resolve_bearer_token(provider: ResolvedModelProvider) -> str:
         # Same trust model as the harness executors, which run the
         # user-configured auth_command to mint gateway tokens.
         result = subprocess.run(
-            ["/bin/sh", "-c", provider.auth_command],
+            default_shell_argv(provider.auth_command),
             capture_output=True,
             text=True,
             timeout=_AUTH_COMMAND_TIMEOUT_S,

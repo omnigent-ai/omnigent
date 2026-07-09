@@ -298,14 +298,10 @@ def _parse_agent_def(
     # Label schema
     from .datamodel import LabelSchemaRule
 
-    _MONOTONIC_ALIASES = {"up": "max", "down": "min"}
     for ls_name, ls_data in data.get("label_schema", {}).items():
         if isinstance(ls_data, dict):
-            raw_monotonic = str(ls_data.get("monotonic", "none"))
-            monotonic = _MONOTONIC_ALIASES.get(raw_monotonic, raw_monotonic)
             agent.label_schema[str(ls_name)] = LabelSchemaRule(
                 values=[str(v) for v in ls_data.get("values", [])],
-                monotonic=monotonic,
             )
 
     # Policy transparency
@@ -683,10 +679,6 @@ def _parse_os_env_spec(data: YamlData | str | bool | None) -> OSEnvSpec | None:
         sandbox=sandbox,
         fork=fork,
         start_in_scratch=start_in_scratch,
-        createos_base_url=str(data["base_url"]) if data.get("base_url") else None,
-        createos_api_key=str(data["api_key"]) if data.get("api_key") else None,
-        createos_shape=str(data["shape"]) if data.get("shape") else None,
-        createos_rootfs=str(data["rootfs"]) if data.get("rootfs") else None,
     )
 
 

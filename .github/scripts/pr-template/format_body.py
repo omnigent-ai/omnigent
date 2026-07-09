@@ -48,6 +48,12 @@ def format_body(body: str) -> str:
     )
     body = _append_section(
         body,
+        "Demo",
+        "<!-- Video or images demonstrating the change. Mandatory for UI / "
+        "frontend changes; use 'N/A' otherwise. -->",
+    )
+    body = _append_section(
+        body,
         "ELI5",
         "<!-- Optional: explain the change in plain language. -->",
     )
@@ -63,6 +69,14 @@ def format_body(body: str) -> str:
         "Coverage notes",
         "<!-- Optional; required if you checked 'Manual verification completed' "
         "or 'Not applicable' above. -->",
+    )
+    body = _append_section(
+        body,
+        "Changelog",
+        "<!-- One line, in the user's voice, describing the user-facing change; "
+        "the category comes from the 'Type of change' boxes above. DELETE this "
+        "section if the change isn't noteworthy (a Breaking change must keep it). "
+        "-->\n\n<Add a line to describe the change, else delete this section>",
     )
     return body.rstrip() + "\n"
 

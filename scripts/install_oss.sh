@@ -615,10 +615,10 @@ print_next_steps() {
   printf '  %somnigent claude          # Claude Code\n' "$command_prefix"
   printf '  %somnigent codex           # Codex\n\n' "$command_prefix"
   printf 'Manage model credentials any time:\n'
-  printf '  %somnigent configure harness\n\n' "$command_prefix"
+  printf '  %somnigent setup\n\n' "$command_prefix"
   printf '%sUsing a Databricks workspace as your model provider? Install the\n' "$DIM"
   printf 'Databricks CLI (https://docs.databricks.com/aws/en/dev-tools/cli/install)\n'
-  printf 'and add it via: omnigent configure harness -> Databricks.%s\n' "$RESET"
+  printf 'and add it via: omnigent setup -> Databricks.%s\n' "$RESET"
 }
 
 main() {

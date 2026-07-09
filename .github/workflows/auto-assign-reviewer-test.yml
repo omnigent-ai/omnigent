@@ -1,9 +1,9 @@
 name: Auto-assign Reviewer Test
 
 # Offline unit test for the reviewer-assignment logic: runs
-# auto-assign-reviewer.test.js (mocked GitHub client, real .github/reviewers +
+# auto-assign-reviewer.test.js (mocked GitHub client, real .github/areas.json +
 # .github/MAINTAINER). Triggers only when the assigner, its test, or the
-# reviewers map change. Runs on `pull_request` (PR head checkout)
+# area/codeowner map change. Runs on `pull_request` (PR head checkout)
 # so it tests the PR's own version. No secrets, no network.
 
 on:
@@ -11,7 +11,7 @@ on:
     paths:
       - .github/workflows/auto-assign-reviewer.js
       - .github/workflows/auto-assign-reviewer.test.js
-      - .github/reviewers
+      - .github/areas.json
   workflow_dispatch:
 
 permissions:
@@ -29,5 +29,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
+      - name: Check areas.json integrity
+        run: node .github/workflows/areas.test.js
       - name: Run reviewer-assignment unit test
         run: node .github/workflows/auto-assign-reviewer.test.js

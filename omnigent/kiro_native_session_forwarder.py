@@ -106,18 +106,66 @@ def _same_workspace(left: object, right: str) -> bool:
         return left == right
 
 
+# Competing-candidate sets already warned about, so the ambiguous branch logs
+# once per distinct collision instead of every poll tick for the session's life.
+# ponytail: grows by one entry per distinct concurrent collision — too rare to
+# bound; add a cap only if a pathological churn ever shows up.
+_ambiguous_discovery_warned: set[frozenset[str]] = set()
+
+
+def _warn_ambiguous_discovery(workspace: str, session_ids: list[str]) -> None:
+    """Warn once per distinct set of competing same-workspace Kiro sessions.
+
+    Discovery returns ``None`` for both "no candidate yet" (transient) and ">=2
+    candidates" (won't ever bind until one goes away). This makes the latter
+    diagnosable without flooding logs on every ~0.7s poll.
+    """
+    key = frozenset(session_ids)
+    if key in _ambiguous_discovery_warned:
+        return
+    _ambiguous_discovery_warned.add(key)
+    _logger.warning(
+        "kiro session discovery ambiguous; %d same-workspace sessions above the "
+        "launch floor, binding none to avoid cross-talk; workspace=%s sessions=%s",
+        len(session_ids),
+        workspace,
+        sorted(session_ids),
+    )
+
+
 def _discover_kiro_session_jsonl(
     *,
     workspace: str,
     launch_epoch_ms: int,
     sessions_dir: Path | None = None,
 ) -> tuple[str, Path] | None:
-    """Find this Omnigent session's Kiro JSONL file."""
+    """Find this Omnigent session's Kiro JSONL file — only when it's unambiguous.
+
+    Candidates are Kiro sessions in the same workspace (``cwd``) with a parseable
+    ``created_at`` at/after the launch floor (``launch_epoch_ms`` minus a small
+    skew, which already drops pre-existing sessions). We bind **only when exactly
+    one** session qualifies.
+
+    Each Kiro session is its own JSONL keyed by Kiro's minted id, so two fresh
+    sessions launched in the same workspace within the skew window both qualify.
+    Picking newest-by-``updated_at`` (the old behaviour) would latch onto
+    whichever session most recently emitted a turn — i.e. it can bind the *other*
+    session's transcript and silently cross-talk it into this conversation. With
+    two or more candidates we can't tell which JSONL is ours, so we return
+    ``None`` and retry rather than guess (logged once via
+    :func:`_warn_ambiguous_discovery` so the ambiguous case is distinct from "not
+    written yet"). A brief delay is safe; mirroring the wrong conversation is not.
+    Mirrors cursor-native's "bind only when exactly one chat qualifies"
+    (:func:`omnigent.cursor_native_forwarder._discover_store`).
+
+    The resume/fork path doesn't reach here: when the Kiro id is already known the
+    caller binds it directly via :func:`_kiro_session_jsonl_for_id`.
+    """
     root = sessions_dir or _kiro_cli_sessions_dir()
     if not root.is_dir():
         return None
     floor_ms = max(0, launch_epoch_ms - _DISCOVERY_SKEW_MS)
-    best: tuple[int, str, Path] | None = None
+    candidates: list[tuple[str, Path]] = []
     for metadata_path in root.glob("*.json"):
         session_id = metadata_path.stem
         jsonl_path = root / f"{session_id}.jsonl"
@@ -130,15 +178,17 @@ def _discover_kiro_session_jsonl(
         if not isinstance(metadata, dict) or not _same_workspace(metadata.get("cwd"), workspace):
             continue
         created_ms = _parse_iso_epoch_ms(metadata.get("created_at"))
-        updated_ms = _parse_iso_epoch_ms(metadata.get("updated_at"))
-        if created_ms and created_ms < floor_ms:
+        # Require a parseable created_at at/after the floor. A fresh session always
+        # stamps created_at, so a missing/garbled one can't be confirmed in-window;
+        # dropping it stops an undateable straggler from poisoning the "exactly one"
+        # count and silently blocking discovery forever.
+        if not created_ms or created_ms < floor_ms:
             continue
-        sort_ms = updated_ms or created_ms
-        if best is None or sort_ms > best[0]:
-            best = (sort_ms, session_id, jsonl_path)
-    if best is None:
+        candidates.append((session_id, jsonl_path))
+    if len(candidates) > 1:
+        _warn_ambiguous_discovery(workspace, [session_id for session_id, _ in candidates])
         return None
-    return best[1], best[2]
+    return candidates[0] if candidates else None
 
 
 def _kiro_session_jsonl_for_id(
@@ -270,24 +320,6 @@ async def _post_conversation_message(
     resp.raise_for_status()
 
 
-async def _post_session_status(
-    client: httpx.AsyncClient,
-    *,
-    session_id: str,
-    status: str,
-    response_id: str | None = None,
-) -> None:
-    """POST one Kiro turn-status edge as an external session status."""
-    data: dict[str, str] = {"status": status}
-    if response_id is not None:
-        data["response_id"] = response_id
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": data},
-    )
-    resp.raise_for_status()
-
-
 async def _patch_external_session_id(
     client: httpx.AsyncClient,
     *,
@@ -312,6 +344,149 @@ async def _patch_external_session_id(
         return
 
 
+def _read_kiro_cumulative_credits(metadata_path: Path) -> tuple[float | None, str | None]:
+    """Sum the per-turn credit metering from a Kiro session ``.json`` snapshot.
+
+    kiro-cli meters in credits, not tokens: each turn under
+    ``session_state.conversation_metadata.user_turn_metadatas`` carries a
+    ``metering_usage`` list of ``{"value": <float>, "unit": "credit"}`` entries
+    (token counts are 0), and the CLI shows a per-turn ``Credits:`` line. The
+    cumulative session cost is the sum of every turn's credit values. This data
+    lives only in the ``.json`` snapshot, not the ``.jsonl`` transcript the
+    forwarder tails.
+
+    :returns: ``(cumulative_credits, model_id)``, or ``(None, None)`` when the
+        file is missing/unparseable or carries no metering yet.
+    """
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    session_state = data.get("session_state")
+    if not isinstance(session_state, dict):
+        return None, None
+    conversation_metadata = session_state.get("conversation_metadata")
+    turns = (
+        conversation_metadata.get("user_turn_metadatas")
+        if isinstance(conversation_metadata, dict)
+        else None
+    )
+    if not isinstance(turns, list):
+        return None, None
+    total = 0.0
+    saw_credit = False
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        metering = turn.get("metering_usage")
+        if not isinstance(metering, list):
+            continue
+        for entry in metering:
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get("value")
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                total += float(value)
+                saw_credit = True
+    if not saw_credit:
+        return None, None
+    model_id: str | None = None
+    rts_model_state = session_state.get("rts_model_state")
+    if isinstance(rts_model_state, dict):
+        model_info = rts_model_state.get("model_info")
+        if isinstance(model_info, dict):
+            candidate = model_info.get("model_id")
+            if isinstance(candidate, str) and candidate:
+                model_id = candidate
+    return total, model_id
+
+
+def _read_kiro_current_model(metadata_path: Path) -> str | None:
+    """Return kiro's current model id from the session ``.json`` snapshot.
+
+    Reads ``session_state.rts_model_state.model_info.model_id`` (e.g. ``"auto"``
+    or ``"claude-haiku-4.5"``), independent of the metering read above so it is
+    available at launch before any turn. kiro updates it in place on a ``/model``
+    switch, so polling it mirrors both the launched model and live TUI switches.
+
+    :returns: The model id, or ``None`` when the file is missing/unparseable or
+        carries no model state yet.
+    """
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    session_state = data.get("session_state")
+    if not isinstance(session_state, dict):
+        return None
+    rts_model_state = session_state.get("rts_model_state")
+    if not isinstance(rts_model_state, dict):
+        return None
+    model_info = rts_model_state.get("model_info")
+    if not isinstance(model_info, dict):
+        return None
+    model_id = model_info.get("model_id")
+    return model_id if isinstance(model_id, str) and model_id else None
+
+
+async def _post_external_model_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    model: str,
+) -> None:
+    """Mirror kiro's current model to the web as ``external_model_change``.
+
+    The server persists this as ``model_override`` (so the picker shows the real
+    model instead of falling back to the harness name) and deliberately does NOT
+    forward a ``/model`` back to the runner, so mirroring the model the TUI is
+    already on cannot loop. Mirrors cursor-native's terminal->web model mirror.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_model_change", "data": {"model": model}},
+    )
+    resp.raise_for_status()
+
+
+async def _post_session_cost(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    cumulative_cost_usd: float,
+    model: str | None,
+) -> None:
+    """POST Kiro's cumulative credit spend as authoritative session cost.
+
+    kiro-cli reports cost in credits and there is no credit->USD conversion
+    available, so credits are forwarded 1:1 into ``cumulative_cost_usd`` (the
+    same convention the Copilot relay uses for its AI-credit total). The server
+    treats this value as authoritative and monotonic, in preference to
+    token x catalog pricing, via the ``external_session_usage`` event used by
+    the claude-/codex-native forwarders.
+    """
+    data: dict[str, object] = {"cumulative_cost_usd": cumulative_cost_usd}
+    if model:
+        data["model"] = model
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_usage", "data": data},
+    )
+    resp.raise_for_status()
+
+
 async def forward_kiro_session_to_omnigent(
     *,
     base_url: str,
@@ -330,6 +505,8 @@ async def forward_kiro_session_to_omnigent(
     jsonl_path: Path | None = None
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     mirrored_external_session_id: str | None = None
+    last_posted_cost: float | None = None
+    last_posted_model: str | None = None
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -371,29 +548,53 @@ async def forward_kiro_session_to_omnigent(
                         state.byte_offset,
                     )
                     for message in messages:
+                        # Mirror the transcript only. Running/idle status for
+                        # kiro-native is owned by the PTY watcher's ``emit_status``
+                        # (``runner/resource_registry.py``), matching the other
+                        # forwarder-backed native harnesses (goose/qwen/hermes),
+                        # whose forwarders mirror the transcript, not the
+                        # running/idle session status. Posting status here too
+                        # double-sourced it (#1137).
                         await _post_conversation_message(
                             client,
                             session_id=session_id,
                             agent_name=agent_name,
                             message=message,
                         )
-                        if message.role == "user":
-                            await _post_session_status(
-                                client,
-                                session_id=session_id,
-                                status="running",
-                            )
-                        elif message.role == "assistant":
-                            await _post_session_status(
-                                client,
-                                session_id=session_id,
-                                status="idle",
-                                response_id=f"kiro:{message.message_id}",
-                            )
                     if byte_offset != state.byte_offset:
                         state.byte_offset = byte_offset
                         _write_state(bridge_dir, state)
                     write_forwarder_ready(bridge_dir)
+                    # Forward kiro's credit metering as authoritative session
+                    # cost. It lives in the ``.json`` snapshot (sibling of the
+                    # tailed ``.jsonl``), not the transcript, and is cumulative;
+                    # the server treats ``cumulative_cost_usd`` as monotonic, so
+                    # only post when it advances.
+                    cumulative_cost, cost_model = await asyncio.to_thread(
+                        _read_kiro_cumulative_credits, jsonl_path.with_suffix(".json")
+                    )
+                    if cumulative_cost is not None and (
+                        last_posted_cost is None or cumulative_cost > last_posted_cost
+                    ):
+                        await _post_session_cost(
+                            client,
+                            session_id=session_id,
+                            cumulative_cost_usd=cumulative_cost,
+                            model=cost_model,
+                        )
+                        last_posted_cost = cumulative_cost
+                    # Mirror kiro's current model so the web picker shows the real
+                    # model (not the harness name) at launch and after a live
+                    # ``/model`` switch. Read independently of metering so it is
+                    # available before the first turn; posted only when it changes.
+                    current_model = await asyncio.to_thread(
+                        _read_kiro_current_model, jsonl_path.with_suffix(".json")
+                    )
+                    if current_model is not None and current_model != last_posted_model:
+                        await _post_external_model_change(
+                            client, session_id=session_id, model=current_model
+                        )
+                        last_posted_model = current_model
             except asyncio.CancelledError:
                 raise
             except Exception:

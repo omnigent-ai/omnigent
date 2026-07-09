@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Brand palette ported from the iOS shell's DesignTokens (light scheme) so the
+  Connect screen matches the iOS setup screen and the web UI. Dark values live
+  in values-night/colors.xml.
+-->
+<resources>
+    <!-- App-icon background: the brand dark-navy (iOS Icon Composer gradient). -->
+    <color name="ic_launcher_background">#1E2742</color>
+
+    <color name="brand_background">#FFFFFF</color>
+    <color name="brand_foreground">#11171C</color>
+    <color name="brand_muted_foreground">#6F6F6F</color>
+    <color name="brand_border">#E8ECF0</color>
+    <color name="brand_primary">#11171C</color>
+    <color name="brand_on_primary">#FFFFFF</color>
+    <color name="brand_error">#C8324C</color>
+</resources>

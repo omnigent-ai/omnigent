@@ -249,14 +249,14 @@ class ShellResult:
 
     :param stdout: Standard output of the command.
     :param stderr: Standard error of the command.
-    :param exit_code: Process exit code.
+    :param exit_code: Process exit code, or ``None`` when no status exists.
     :param timed_out: Whether the command was killed by timeout.
     :param cwd: Working directory the command ran in, if known.
     """
 
     stdout: str
     stderr: str
-    exit_code: int
+    exit_code: int | None
     timed_out: bool
     cwd: str | None = None
 

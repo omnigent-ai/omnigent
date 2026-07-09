@@ -25,6 +25,7 @@ from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.timer import (
     SysTimerCancelTool,
     SysTimerSetTool,
+    validate_timer_set_args,
 )
 from omnigent.tools.manager import ToolManager
 
@@ -167,6 +168,67 @@ def test_set_missing_conversation_id_returns_error() -> None:
     result = json.loads(result_json)
     assert "error" in result
     assert "conversation" in result["error"].lower()
+
+
+def test_set_valid_args_in_process_reports_no_schedule() -> None:
+    """
+    Fully valid args off the runner dispatch path return a structured
+    error, never a raise or a false success.
+
+    The runner intercepts ``sys_timer_set`` before this builtin is
+    reached (see ``tool_dispatch._execute_timer_set``). This guards the
+    in-process fallback: a future non-runner caller must fail cleanly
+    with no ``timer_id`` (there is no scheduled timer to cancel), rather
+    than hit the old ``NotImplementedError`` trap.
+    """
+    result_json = SysTimerSetTool().invoke('{"seconds": 5, "note": "x"}', _STUB_CTX)
+    result = json.loads(result_json)
+    assert "error" in result
+    assert "timer_id" not in result
+    assert result.get("status") != "scheduled"
+
+
+# ─── Shared validation helper ────────────────────────────────
+
+
+def test_validate_timer_set_args_accepts_valid_shapes() -> None:
+    """
+    ``validate_timer_set_args`` returns ``(seconds, repeat, note)`` for
+    valid input — the tuple the runner firing loop and the builtin both
+    consume.
+
+    This is the single contract both surfaces share; a drift here would
+    desync the runner path from the LLM-facing schema.
+    """
+    assert validate_timer_set_args({"seconds": 5}) == (5.0, False, None)
+    assert validate_timer_set_args({"seconds": 5, "repeat": True, "note": "x"}) == (
+        5.0,
+        True,
+        "x",
+    )
+
+
+@pytest.mark.parametrize(
+    "args,expected_error_substring",
+    [
+        ({}, "seconds must be a number"),
+        ({"seconds": -1}, "seconds must be non-negative"),
+        ({"seconds": 10_000_000}, "seconds must be <="),
+        ({"seconds": True}, "seconds must be a number"),
+        ({"seconds": 1, "repeat": "yes"}, "repeat must be a boolean"),
+        ({"seconds": 1, "note": 5}, "note must be a string"),
+    ],
+)
+def test_validate_timer_set_args_rejects_bad_shapes(
+    args: dict[str, object], expected_error_substring: str
+) -> None:
+    """
+    Each malformed shape yields an error message (a ``str``), not a
+    tuple — the same messages both timer surfaces return to the LLM.
+    """
+    result = validate_timer_set_args(args)
+    assert isinstance(result, str)
+    assert expected_error_substring in result
 
 
 # ─── SysTimerCancelTool argument validation ──────────────────

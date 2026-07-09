@@ -28,9 +28,9 @@ data:
         # ServiceAccount the runner Pods run as (deliberately powerless).
         service_account: omnigent-runner
         # ── all optional below ──
-        # image: ghcr.io/your-org/omnigent-host:latest  # default: official amd64 host image
+        # image: ghcr.io/your-org/omnigent-host:latest  # default: official multi-arch (amd64/arm64) host image
         # env: [PROXY_URL]           # SERVER env vars injected as literal Pod env (prefer secret_name for creds)
-        # node_selector:             # extra node labels, merged with the mandatory kubernetes.io/arch: amd64
+        # node_selector:             # extra node labels; default kubernetes.io/arch: amd64, override to arm64 to run there
         #   disktype: ssd
         # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi)
         #   requests: {cpu: "500m", memory: "1Gi"}

@@ -14,7 +14,6 @@ import logging
 import os
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -56,6 +55,7 @@ from omnigent._wrapper_labels import (
 from omnigent.conversation_browser import open_conversation_link_if_enabled
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.spec import load as load_spec
@@ -620,23 +620,38 @@ def _remote_headers(
         stored OIDC tokens, e.g. ``"http://localhost:6767"``.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
+    # Resolve the bearer in the documented precedence order (one credential
+    # source per branch), then merge the workspace-routing header.
+    headers: dict[str, str] = {}
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if token and (token := token.strip()):
-        return {"Authorization": f"Bearer {token}"}
-    # Check stored OIDC token from `omnigent login`.
-    if server_url:
+        # 1. Explicit env-var token.
+        headers["Authorization"] = f"Bearer {token}"
+    elif server_url:
         from omnigent.cli_auth import load_token
 
+        # 2. Stored OIDC session token from `omnigent login`.
         oidc_token = load_token(server_url)
         if oidc_token:
-            return {"Authorization": f"Bearer {oidc_token}"}
-        record_token = _stored_databricks_record_token(server_url)
-        if record_token:
-            return {"Authorization": f"Bearer {record_token}"}
-    creds = _read_databrickscfg(None)
-    if creds is None or not creds.token:
-        return {}
-    return {"Authorization": f"Bearer {creds.token}"}
+            headers["Authorization"] = f"Bearer {oidc_token}"
+        else:
+            # 3. Databricks Apps pointer record → mint a fresh workspace token.
+            record_token = _stored_databricks_record_token(server_url)
+            if record_token:
+                headers["Authorization"] = f"Bearer {record_token}"
+    if "Authorization" not in headers:
+        # 4. Ambient ~/.databrickscfg credentials.
+        creds = _read_databrickscfg(None)
+        if creds is not None and creds.token:
+            headers["Authorization"] = f"Bearer {creds.token}"
+    # Workspace routing: when a ?o= selector was recorded at login, name the
+    # workspace or the request routes to the account. Merged onto the result
+    # because these ad-hoc requests carry no httpx Auth.
+    if server_url:
+        from omnigent.cli_auth import databricks_request_headers
+
+        headers.update(databricks_request_headers(server_url))
+    return headers
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -746,11 +761,19 @@ class _DatabricksTokenAuth(httpx.Auth):
 
         Static env-var token takes precedence, then stored OIDC token,
         then the reused Databricks SDK auth (which refreshes expired
-        OAuth tokens transparently).
+        OAuth tokens transparently). The stored ``X-Databricks-Org-Id``
+        selector (if any) is set first so the request routes to the
+        workspace, regardless of which credential branch sets the bearer.
 
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
+        # Workspace routing (empty when none recorded); independent of the
+        # credential branch below.
+        if self._server_url:
+            from omnigent.cli_auth import databricks_request_headers
+
+            request.headers.update(databricks_request_headers(self._server_url))
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
             yield request
@@ -3563,7 +3586,7 @@ def _start_local_server(
             env=child_env,
             stdout=log_fh,
             stderr=log_fh,
-            start_new_session=True,
+            **_proc.spawn_kwargs(),
         )
     finally:
         log_fh.close()
@@ -3685,14 +3708,11 @@ def _stop_server(proc: subprocess.Popen[bytes]) -> None:
     :param proc: The server subprocess.
     """
     if proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=5)
+        _proc.terminate_tree(proc, grace=5)
+        if proc.poll() is None:
+            _proc.kill_tree(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
 
 
 def _stop_local_server(server: LocalServer) -> None:

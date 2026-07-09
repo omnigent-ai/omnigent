@@ -61,6 +61,15 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
     }
 )
 
+# opencode-native permission CATEGORIES (the ``permission`` field of a
+# ``permission.asked`` event, mapped to the policy-event tool name by the SSE
+# forwarder — live-verified against 1.17.7). opencode collapses write/edit/patch
+# into ``edit``; ``bash`` is its shell tool (``ShellID.ToolID``). ``bash`` /
+# ``read`` / ``edit`` overlap the lowercase pi set above, but list them
+# explicitly so opencode coverage does not silently depend on that set, and add
+# the file-search categories (``grep`` / ``glob``) pi lacks.
+_OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
+
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
 
@@ -126,6 +135,10 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
+    - **opencode native tools** (``bash``, ``edit``, ``read``,
+      ``grep``, ``glob``) — opencode's permission CATEGORIES, surfaced
+      via the SSE forwarder's ``permission.asked`` → policy-evaluate
+      path. opencode collapses write/edit/patch into ``edit``.
 
     Returns ASK so the user sees an approval prompt before the tool
     executes.
@@ -147,13 +160,14 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         | _PI_NATIVE_OS_TOOLS
         | _HERMES_OS_TOOLS
         | _GOOSE_NATIVE_OS_TOOLS
+        | _OPENCODE_NATIVE_OS_TOOLS
     )
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
         if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
             preview = args.get("command", "") if isinstance(args, dict) else ""
-        elif tool in ("Grep", "Glob", "search_files"):
+        elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
         elif tool == "execute_code":
             preview = args.get("code", "")[:80] if isinstance(args, dict) else ""
@@ -565,6 +579,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "description": "Asks for user approval before any file or shell tool call — "
         "covers Omnigent sys_os_* tools, Claude Code native tools "
         "(Bash, Read, Write, Edit, Glob, Grep), Codex native tools, "
+        "opencode native tools (bash, edit, read, grep, glob), "
         "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,
     },

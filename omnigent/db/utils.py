@@ -308,6 +308,9 @@ def get_or_create_engine(db_uri: str) -> Engine:
             if db_uri not in _engine_cache:
                 engine = _create_engine(db_uri)
                 _initialize_or_verify_schema(engine, db_uri)
+                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+
+                instrument_sqlalchemy_engine(engine)
                 _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]
 
@@ -572,6 +575,7 @@ _ITEM_TYPE_PREFIX: dict[str, str] = {
     "resource_event": "rse_",
     "slash_command": "sc_",
     "terminal_command": "tc_",
+    "routing_decision": "rd_",
 }
 
 
@@ -770,7 +774,8 @@ def extract_search_text(item: NewConversationItem) -> str:
         ``type`` is one of ``"message"``, ``"function_call"``,
         ``"function_call_output"``, ``"reasoning"``,
         ``"compaction"``, ``"native_tool"``, ``"resource_event"``,
-        ``"slash_command"``, or ``"terminal_command"``.
+        ``"slash_command"``, ``"terminal_command"``, or
+        ``"routing_decision"``.
     :returns: A single plain-text string suitable for FTS indexing.
     :raises ValueError: If *item.type* is not a recognised type.
     """
@@ -825,6 +830,10 @@ def extract_search_text(item: NewConversationItem) -> str:
         return " ".join(
             part for part in (data.get("input") or "", data.get("stdout") or "") if part
         )
+    if item.type == "routing_decision":
+        # Index model + rationale so FTS can find a router verdict by
+        # the model it picked or its one-line explanation.
+        return " ".join(part for part in (data.get("model"), data.get("rationale")) if part)
     raise ValueError(f"unknown item type: {item.type!r}")
 
 

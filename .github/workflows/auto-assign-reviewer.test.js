@@ -1,8 +1,19 @@
 // Local unit test for auto-assign-reviewer.js -- mocks the GitHub client and
-// runs the real decision logic against the real .github/reviewers and
-// .github/MAINTAINER (cwd must be the repo root). No network. Loads are made
-// distinct so picks are deterministic.
+// runs the real decision logic against a FROZEN owner fixture
+// (auto-assign-reviewer.fixture.json) + the real .github/MAINTAINER (cwd must be
+// the repo root). No network. Loads are made distinct so picks are
+// deterministic.
+//
+// The fixture -- not the live .github/areas.json -- backs these tests on
+// purpose: real ownership changes often, and pinning logic assertions to it
+// would make them churn/flake. areas.test.js validates the real file instead.
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
+// Point the script at the frozen fixture for every run in this file.
+process.env.REVIEWER_AREAS_FILE = path.resolve(
+  ".github/workflows/auto-assign-reviewer.fixture.json"
+);
 const script = require(path.resolve(".github/workflows/auto-assign-reviewer.js"));
 
 function mkOpenPRs(loadMap) {
@@ -15,14 +26,46 @@ function mkOpenPRs(loadMap) {
 
 // author defaults to a non-maintainer; fork defaults to true -- so the scope
 // guard passes and the selection logic runs (the cases that assert on picks).
-async function run({ files, load = {}, current = [], currentAssignees = [], author = "someexternaldev", fork = true }) {
+// `linkedIssues` is [{ number, assignees: [logins], repo? }] -- the PR's
+// "closes #N" references, served back through the mocked GraphQL endpoint.
+async function run({
+  files, load = {}, current = [], currentAssignees = [],
+  author = "someexternaldev", fork = true, linkedIssues = [],
+  rank = null, // LLM area-fit ranking (array of logins) or null for none
+}) {
+  // Point the script at a per-run rank file so real /tmp state can't leak in.
+  // `rank: null` writes no file -> the script's fallback (pure load) is tested,
+  // which is what the load-only cases below assert.
+  const rankFile = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "rank-")), "reviewer_rank.json"
+  );
+  if (rank) fs.writeFileSync(rankFile, JSON.stringify(rank));
+  process.env.REVIEWER_RANK_FILE = rankFile;
   const listFiles = () => {}; listFiles._tag = "files";
   const list = () => {}; list._tag = "open";
-  const added = [], removed = [], assigned = [], unassigned = [];
+  const PR_NUMBER = 1;
+  const added = [], removed = [], unassigned = [];
+  // PR-assignee changes (issue_number === PR) vs linked-issue assignments are
+  // tracked separately so tests can assert the push-down direction in isolation.
+  const assigned = [];                 // assignees added to the PR itself
+  const issueAssigned = {};            // { issueNumber: [logins] } for linked issues
   const github = {
     paginate: async (fn) => (fn._tag === "files"
       ? files.map((f) => ({ filename: f }))
       : mkOpenPRs(load)),
+    graphql: async () => ({
+      repository: {
+        pullRequest: {
+          closingIssuesReferences: {
+            nodes: linkedIssues.map((li) => ({
+              number: li.number,
+              repository: { nameWithOwner: li.repo || "omnigent-ai/omnigent" },
+              assignees: { nodes: (li.assignees || []).map((login) => ({ login })) },
+            })),
+          },
+        },
+      },
+    }),
     rest: {
       pulls: {
         listFiles, list,
@@ -30,7 +73,10 @@ async function run({ files, load = {}, current = [], currentAssignees = [], auth
         removeRequestedReviewers: async ({ reviewers }) => removed.push(...reviewers),
       },
       issues: {
-        addAssignees: async ({ assignees }) => assigned.push(...assignees),
+        addAssignees: async ({ issue_number, assignees }) => {
+          if (issue_number === PR_NUMBER) assigned.push(...assignees);
+          else (issueAssigned[issue_number] ||= []).push(...assignees);
+        },
         removeAssignees: async ({ assignees }) => unassigned.push(...assignees),
       },
     },
@@ -38,7 +84,7 @@ async function run({ files, load = {}, current = [], currentAssignees = [], auth
   const context = {
     repo: { owner: "omnigent-ai", repo: "omnigent" },
     payload: { pull_request: {
-      number: 1, draft: false,
+      number: PR_NUMBER, draft: false,
       user: { login: author },
       // precise fork detection compares head vs base full_name
       head: { repo: { full_name: fork ? "external-contributor/omnigent" : "omnigent-ai/omnigent" } },
@@ -47,9 +93,14 @@ async function run({ files, load = {}, current = [], currentAssignees = [], auth
       assignees: currentAssignees.map((l) => ({ login: l })),
     } },
   };
-  const core = { info: () => {}, warning: (m) => console.log("WARN", m) };
+  const warnings = [];
+  const core = { info: () => {}, warning: (m) => warnings.push(m) };
   await script({ github, context, core });
-  return { added: added.sort(), removed: removed.sort(), assigned: assigned.sort(), unassigned: unassigned.sort() };
+  return {
+    added: added.sort(), removed: removed.sort(),
+    assigned: assigned.sort(), unassigned: unassigned.sort(),
+    issueAssigned, warnings,
+  };
 }
 
 function assert(name, cond, detail) {
@@ -140,4 +191,143 @@ function assert(name, cond, detail) {
   // 9. scope guard: fork PR authored by a maintainer -> nothing assigned.
   r = await run({ files: ["omnigent/inner/foo.py"], author: "dhruv0811" });
   assert("maintainer-authored fork PR is skipped", r.added.length === 0 && r.removed.length === 0, JSON.stringify(r));
+
+  // 10. linked issue ALREADY assigned to a maintainer -> adopted as reviewer,
+  //     overriding the area pick (dhruv0811 would otherwise win on load here).
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    linkedIssues: [{ number: 42, assignees: ["TomeHirata"] }],
+  });
+  assert("linked-issue maintainer assignee is adopted as reviewer",
+    JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]), JSON.stringify(r));
+  assert("adopted reviewer also mirrored onto the PR assignees",
+    JSON.stringify(r.assigned) === JSON.stringify(["TomeHirata"]), JSON.stringify(r));
+  assert("already-assigned linked issue is NOT re-assigned",
+    Object.keys(r.issueAssigned).length === 0, JSON.stringify(r.issueAssigned));
+
+  // 11. linked issue with NO assignee -> normal area pick, then pushed down onto
+  //     the issue so it inherits the PR's reviewer.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    linkedIssues: [{ number: 77, assignees: [] }],
+  });
+  assert("unassigned linked issue: reviewer is the area pick",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+  assert("unassigned linked issue inherits the chosen reviewer",
+    JSON.stringify(r.issueAssigned[77]) === JSON.stringify(["dhruv0811"]), JSON.stringify(r.issueAssigned));
+
+  // 12. linked issue assigned to a NON-maintainer -> not adopted (area pick
+  //     stands) and not re-assigned (it already has an assignee).
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    linkedIssues: [{ number: 88, assignees: ["someexternaldev"] }],
+  });
+  assert("non-maintainer issue assignee is NOT adopted as reviewer",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+  assert("issue with a (non-maintainer) assignee is left untouched",
+    Object.keys(r.issueAssigned).length === 0, JSON.stringify(r.issueAssigned));
+
+  // 13. two linked issues -- one assigned to a maintainer, one unassigned: the
+  //     maintainer is adopted AND mirrored onto the unassigned sibling.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    linkedIssues: [
+      { number: 10, assignees: ["TomeHirata"] },
+      { number: 11, assignees: [] },
+    ],
+  });
+  assert("two issues: maintainer adopted as reviewer",
+    JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]), JSON.stringify(r));
+  assert("two issues: unassigned sibling inherits the same reviewer",
+    JSON.stringify(r.issueAssigned[11]) === JSON.stringify(["TomeHirata"]) &&
+    !(10 in r.issueAssigned), JSON.stringify(r.issueAssigned));
+
+  // 14. cross-repo linked issue is ignored (different nameWithOwner).
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    linkedIssues: [{ number: 99, assignees: ["TomeHirata"], repo: "other-org/other-repo" }],
+  });
+  assert("cross-repo linked issue does not affect the reviewer pick",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+  assert("cross-repo linked issue is not assigned",
+    Object.keys(r.issueAssigned).length === 0, JSON.stringify(r.issueAssigned));
+
+  // 15. linked issue assigned to a maintainer who is NOT in the reviewers pool
+  //     (hzub is in .github/MAINTAINER but not .github/areas.json): NOT adopted
+  //     (adoption is restricted to the managed pool so the reviewer stays
+  //     removable), so the normal area pick stands. The issue already has an
+  //     assignee, so no push-down.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    linkedIssues: [{ number: 55, assignees: ["hzub"] }],
+  });
+  assert("non-pool maintainer issue assignee is NOT adopted as reviewer",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+  assert("non-pool maintainer issue is left untouched",
+    Object.keys(r.issueAssigned).length === 0, JSON.stringify(r.issueAssigned));
+
+  // 16. push-down is capped: 7 unassigned linked issues -> only MAX_PUSHDOWN (5)
+  //     get the reviewer; the overflow is logged, not silently dropped.
+  const manyIssues = [201, 202, 203, 204, 205, 206, 207].map((n) => ({ number: n, assignees: [] }));
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    linkedIssues: manyIssues,
+  });
+  assert("push-down capped at 5 issues",
+    Object.keys(r.issueAssigned).length === 5, JSON.stringify(Object.keys(r.issueAssigned)));
+  assert("capped overflow is warned",
+    r.warnings.some((w) => /capping push-down/.test(w)), JSON.stringify(r.warnings));
+
+  // 17. Load beats LLM rank: dhruv0811 has the lowest load (0) and wins even
+  //     though the rank prefers dbczumar (rank 0 but load 1).
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    rank: ["dbczumar", "TomeHirata", "SabhyaC26", "dhruv0811"],
+  });
+  assert("load beats LLM rank within the area pool",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+
+  // 18. Allowlist enforcement: a rank naming someone who does NOT own the touched
+  //     area (PattaraS is a maintainer + pool member, but not an inner owner) is
+  //     ignored; the ranking only reorders actual candidates. Load is primary, so
+  //     dhruv0811 (load 0) wins over dbczumar (load 1) -- never PattaraS.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1, PattaraS: 0 },
+    rank: ["PattaraS", "dbczumar", "TomeHirata", "SabhyaC26", "dhruv0811"],
+  });
+  assert("LLM rank cannot route outside the area owners",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]) && !r.added.includes("PattaraS"),
+    JSON.stringify(r));
+
+  // 19. Load is primary even when only one candidate is ranked: rank lists only
+  //     SabhyaC26 (load 5); dhruv0811 is unranked but has load 0, so dhruv0811
+  //     wins. Confirms the load-primary / rank-secondary ordering.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    rank: ["SabhyaC26"],
+  });
+  assert("unranked low-load owner beats ranked high-load owner",
+    JSON.stringify(r.added) === JSON.stringify(["dhruv0811"]), JSON.stringify(r));
+
+  // 20. Adoption still overrides the LLM rank: a linked-issue maintainer assignee
+  //     (TomeHirata) is adopted as reviewer even when the rank prefers someone
+  //     else -- the issue owner reviews the fix.
+  r = await run({
+    files: ["omnigent/inner/foo.py"],
+    load: { SabhyaC26: 5, TomeHirata: 4, dhruv0811: 0, dbczumar: 1 },
+    rank: ["dbczumar", "dhruv0811"],
+    linkedIssues: [{ number: 42, assignees: ["TomeHirata"] }],
+  });
+  assert("linked-issue adoption overrides the LLM rank",
+    JSON.stringify(r.added) === JSON.stringify(["TomeHirata"]), JSON.stringify(r));
 })();

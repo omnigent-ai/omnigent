@@ -72,10 +72,8 @@ def test_native_coding_agent_resolves() -> None:
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.native_coding_agents import (
-        HERMES_NATIVE_CODING_AGENT,
-        native_coding_agent_for_harness,
-    )
+    from omnigent.harness_plugins import HERMES_NATIVE_CODING_AGENT
+    from omnigent.native_coding_agents import native_coding_agent_for_harness
 
     agent = native_coding_agent_for_harness("native-hermes")
     assert agent is HERMES_NATIVE_CODING_AGENT
@@ -97,15 +95,22 @@ def test_create_app_builds() -> None:
 # --- CLI orchestration helpers (no server/daemon needed) ----------------------
 
 
-def test_materialize_agent_spec_is_terminal_first_hermes_native(tmp_path) -> None:
+def test_materialize_agent_spec_is_terminal_first_hermes_native(tmp_path, monkeypatch) -> None:
     import yaml
 
+    # Pin the host shells so the declared terminals are deterministic: zsh is
+    # $SHELL (default, first), bash/fish resolve on PATH.
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
     spec_path = hn._materialize_hermes_agent_spec(tmp_path)
     raw = yaml.safe_load(spec_path.read_text())
     assert raw["name"] == "hermes-native-ui"
     assert raw["executor"] == {"harness": "hermes-native"}
     assert raw["spawn"] is True
-    assert "shell" in raw["terminals"]
+    # One terminal per installed shell, $SHELL first — a non-empty block also
+    # gates the MCP relay's sys_terminal_* advertisement.
+    assert list(raw["terminals"]) == ["zsh", "bash", "fish"]
+    assert raw["terminals"]["zsh"]["command"] == "zsh"
 
 
 def test_configured_hermes_command_default_and_override() -> None:

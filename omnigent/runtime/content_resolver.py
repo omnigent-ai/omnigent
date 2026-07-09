@@ -99,11 +99,24 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 # pages, and ~32 MB per request total. The per-type caps below keep a
 # single attachment usable across a multi-turn conversation; the global
 # ceiling backstops the total request size after base64 inflation (~1.33x).
-# Mirrored client-side in ap-web/src/lib/attachments.ts — keep in sync.
+# Mirrored client-side in web/src/lib/attachments.ts — keep in sync.
 MAX_IMAGE_UPLOAD_BYTES: int = 5 * 1024 * 1024
 MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
 MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
 MAX_ATTACHMENT_UPLOAD_BYTES: int = 25 * 1024 * 1024
+
+# Copy-at-spawn limits (see the ``files:copy`` endpoint). A parent forwarding
+# files to a subagent copies them through the server, which reads each source
+# blob to re-store it under the child. Bounding the count and the summed
+# ``StoredFile.bytes`` — checked against metadata BEFORE any blob is read —
+# stops a single send from spiking shared-server memory. Defaults are the
+# floor; a deployment can raise or lower them via ``server_config`` (see
+# :func:`omnigent.server.server_config.copy_file_count_limit` and
+# :func:`~omnigent.server.server_config.copy_total_bytes_limit`). For
+# reference, OpenAI caps code-interpreter at 20 files, Anthropic Files at
+# 500 MB/file.
+MAX_COPY_FILES: int = 20
+MAX_COPY_TOTAL_BYTES: int = 256 * 1024 * 1024
 
 # ``application/*`` MIME types we treat as text-like. The rest of the
 # text-like surface is ``text/*`` (covered by the prefix check) — these
@@ -152,7 +165,7 @@ def attachment_upload_limit(content_type: str) -> int | None:
 # declared MIME mislabels them as binary — e.g. a ``.csv`` tagged
 # ``application/vnd.ms-excel`` on Windows, or a ``.ts`` tagged
 # ``video/mp2t``. Mirrors TEXT_CODE_EXTENSIONS in
-# ap-web/src/lib/attachments.ts — keep in sync.
+# web/src/lib/attachments.ts — keep in sync.
 _TEXT_CODE_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".txt",

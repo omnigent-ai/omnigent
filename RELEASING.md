@@ -4,7 +4,7 @@ omnigent ships **three PyPI packages that version-lock together**:
 
 | Package | What it is |
 | --- | --- |
-| `omnigent` | core wheel (bundles the `ap-web` web UI) |
+| `omnigent` | core wheel (bundles the `web` web UI) |
 | `omnigent-client` | Python client SDK |
 | `omnigent-ui-sdk` | terminal UI SDK |
 
@@ -45,6 +45,27 @@ never double-publishes. Use the secure repo for real releases.
 - Releases are cut on **per-minor release branches** (`branch-X.Y`) and tagged
   there (`vX.Y.Z`); patches (`vX.Y.1`, `vX.Y.2`, …) are cherry-picked onto the
   same `branch-X.Y`. `main` is never tagged.
+
+## Docs staging
+
+Because `main` carries the **next** version, the docs generated from merged PRs
+describe a release that isn't out yet — so they must **not** deploy to the live
+site on merge. Two workflows enforce this by staging onto a **per-minor docs
+branch** on `omnigent-site` instead of `main`:
+
+- **`doc-sync.yml`** — drafts prose docs for each merged PR that needs them.
+- **`sync-openapi-to-site.yml`** — syncs the API reference (`openapi.json`).
+
+Both derive the branch name from `omnigent/version.py` (`0.5.0.dev0` → `0.5-docs`)
+and create it off site `main` the first time a doc PR lands in the cycle. All docs
+for the `0.5` line — including patches — accumulate on `0.5-docs`. Each PR still
+gets its own review, but merging one only lands it on the staging branch, not the
+live site.
+
+At release, publishing the GitHub Release fires `publish-changelog.yml`, which
+opens the **`0.5-docs → main`** PR (see step 5). Merging that publishes the whole
+cycle's docs at once. Nothing to create or retarget by hand — the branch name
+tracks `main`'s version automatically.
 
 ---
 
@@ -89,6 +110,11 @@ git commit -m "release: v0.2.0"
 git tag v0.2.0
 git push -u origin branch-0.2 v0.2.0        # explicit tag, NOT --tags; pushing the tag drafts the GitHub Release (step 5)
 ```
+
+> Pushing the tag also kicks off the **changelog automation** (see step 5):
+> `github-release.yml` drafts the Release, then `draft-release-notes.yml` opens a
+> `CHANGELOG.md` PR and fills the draft with curated notes — both ready by the time
+> you get to step 5.
 
 Keep `main` from re-freezing — bump it to the next dev marker and push:
 
@@ -163,17 +189,45 @@ uv tool install omnigent==0.2.0        # final sanity from real PyPI
 
 ### 5. Publish the GitHub Release — `omnigent-ai/omnigent` (OSS account)
 
-Pushing the `v0.2.0` tag (step 1) triggered `.github/workflows/github-release.yml`,
-which created a **draft** release with auto-generated notes (PRs since the
-previous tag). Now:
+Pushing the `v0.2.0` tag (step 1) set the **changelog automation** in motion —
+two workflows have already done the prep for you:
 
-1. Open <https://github.com/omnigent-ai/omnigent/releases> and find the `v0.2.0`
-   draft.
-2. **Verify and edit the notes** — lead with user-facing highlights, call out
-   breaking changes and any upgrade steps, and trim noise from the auto-generated
-   list. The notes are a draft, not the final word.
+- `github-release.yml` created a **draft** release.
+- `draft-release-notes.yml` (fires right after) then:
+  1. opened a **`CHANGELOG.md` PR to `main`** — the granular, feature-level log,
+     harvested mechanically from each merged PR's `## Changelog` section; and
+  2. **filled the draft's body** with concise, curated notes (Major new features /
+     Breaking changes / Bug fixes — user-facing only), synthesized by an agent from
+     the merged PRs, with the original auto-notes tucked into a collapsed
+     `<details>` for reference. Security and CI/internal fixes are deliberately left
+     out of the highlights.
+
+Now:
+
+1. **Merge the `CHANGELOG.md` PR** as part of cutting the release, so the draft's
+   `Full Changelog` link (which points at `CHANGELOG.md` on `main`) resolves.
+2. Open <https://github.com/omnigent-ai/omnigent/releases>, find the `v0.2.0`
+   draft, and **review/trim the curated notes** — they're a strong starting point,
+   not the final word. Lead with user-facing highlights; call out breaking changes.
+   Whatever you leave here becomes the website post, so curate it well.
 3. **Publish the release** (ideally only after the prod PyPI publish in step 4 has
    succeeded, so you never advertise a version that isn't installable).
+
+Publishing a **final** release fires `.github/workflows/publish-changelog.yml`,
+which opens **two** PRs to review and merge (pre-releases are skipped):
+
+- **`omnigent-site` `/releases/<version>`** — a per-version post mirroring the
+  notes you just curated (PR refs and angle/brace characters are made MDX-safe for
+  you). Targets `main`.
+- **`omnigent-site` `X.Y-docs → main`** — publishes the docs staged this cycle
+  (see [Docs staging](#docs-staging) below). Skipped if that branch doesn't exist
+  or has nothing beyond `main`. Review the batch and merge to take the version's
+  docs live.
+
+To re-run either half for an already-cut tag: dispatch `draft-release-notes.yml`
+with the `tag` (re-opens the CHANGELOG PR; it leaves the notes alone once the
+release is published), or `publish-changelog.yml` with the `tag` (re-opens the
+site post PR).
 
 If the draft wasn't created (e.g. the workflow was disabled), do it manually:
 

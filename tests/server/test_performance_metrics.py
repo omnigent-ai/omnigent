@@ -22,6 +22,9 @@ from omnigent.server.performance_metrics import (
     SystemLoadAverage,
     publish_server_metrics_periodically,
     set_request_duration_for_access_log,
+    set_request_id_for_access_log,
+    set_request_session_id_for_access_log,
+    set_request_user_agent_for_access_log,
 )
 
 
@@ -389,6 +392,290 @@ def test_request_duration_access_formatter_appends_individual_duration() -> None
         )
     finally:
         set_request_duration_for_access_log(None)
+
+
+def _make_access_record() -> logging.LogRecord:
+    """
+    Build a minimal Uvicorn-style access log record.
+
+    :returns: A ``LogRecord`` matching the shape Uvicorn's access
+        logger emits.
+    """
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(
+            "10.0.0.1:0",
+            "GET",
+            "/v1/sessions/conv_abc/events",
+            "1.1",
+            200,
+        ),
+        exc_info=None,
+    )
+
+
+def _make_formatter() -> RequestDurationAccessFormatter:
+    """
+    Create a formatter with colours disabled for deterministic assertions.
+
+    :returns: Configured ``RequestDurationAccessFormatter``.
+    """
+    return RequestDurationAccessFormatter(
+        fmt='%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+        use_colors=False,
+    )
+
+
+def test_access_formatter_includes_request_id() -> None:
+    """Request ID appears in the access log when set."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_id_for_access_log("aabbccdd11223344")
+    try:
+        output = formatter.format(record)
+        assert "rid=aabbccdd11223344" in output
+    finally:
+        set_request_id_for_access_log(None)
+
+
+def test_access_formatter_includes_user_agent() -> None:
+    """User-Agent header appears quoted in the access log when set."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_user_agent_for_access_log("python-httpx/0.27")
+    try:
+        output = formatter.format(record)
+        assert 'ua="python-httpx/0.27"' in output
+    finally:
+        set_request_user_agent_for_access_log(None)
+
+
+def test_access_formatter_truncates_long_user_agent() -> None:
+    """User-Agent values longer than 80 characters are truncated."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    long_ua = "A" * 120
+    set_request_user_agent_for_access_log(long_ua)
+    try:
+        output = formatter.format(record)
+        assert f'ua="{"A" * 80}"' in output
+        assert "A" * 81 not in output
+    finally:
+        set_request_user_agent_for_access_log(None)
+
+
+def test_access_formatter_sanitizes_user_agent_control_chars() -> None:
+    """A crafted User-Agent cannot inject newlines or terminal escapes."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    # CRLF log-forging attempt plus an ANSI escape sequence.
+    set_request_user_agent_for_access_log(
+        'evil\r\n10.0.0.1 - "GET /admin" 200\x1b[2J',
+    )
+    try:
+        output = formatter.format(record)
+        # The whole access line stays on one physical line.
+        assert "\n" not in output
+        assert "\r" not in output
+        assert "\x1b" not in output
+        # Sanitized field is present with control chars replaced by '?'.
+        assert "ua=" in output
+    finally:
+        set_request_user_agent_for_access_log(None)
+
+
+def test_access_formatter_sanitizes_quote_in_user_agent() -> None:
+    """An embedded double quote cannot break out of the quoted ua field."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_user_agent_for_access_log('foo" bar')
+    try:
+        output = formatter.format(record)
+        # Exactly one opening and one closing quote around the field.
+        assert 'ua="foo? bar"' in output
+    finally:
+        set_request_user_agent_for_access_log(None)
+
+
+def test_access_formatter_sanitizes_session_id_control_chars() -> None:
+    """Control chars surviving URL parsing are stripped from the sid field."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    # \x1b (ANSI ESC) survives Starlette's URL path parsing; ensure it
+    # cannot reach the log line unescaped.
+    set_request_session_id_for_access_log("conv_abc\x1b[31m")
+    try:
+        output = formatter.format(record)
+        assert "\x1b" not in output
+        assert "sid=conv_abc?[31m" in output
+    finally:
+        set_request_session_id_for_access_log(None)
+
+
+def test_access_formatter_includes_session_id() -> None:
+    """Session ID appears in the access log when set."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_session_id_for_access_log("conv_abc")
+    try:
+        output = formatter.format(record)
+        assert "sid=conv_abc" in output
+    finally:
+        set_request_session_id_for_access_log(None)
+
+
+def test_access_formatter_includes_all_fields() -> None:
+    """All enrichment fields appear together in the expected order."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_duration_for_access_log(0.005)
+    set_request_id_for_access_log("deadbeef")
+    set_request_user_agent_for_access_log("curl/8.0")
+    set_request_session_id_for_access_log("conv_xyz")
+    try:
+        output = formatter.format(record)
+        assert "5.0ms" in output
+        assert "rid=deadbeef" in output
+        assert 'ua="curl/8.0"' in output
+        assert "sid=conv_xyz" in output
+        # Verify ordering: duration before rid before ua before sid.
+        dur_pos = output.index("5.0ms")
+        rid_pos = output.index("rid=")
+        ua_pos = output.index("ua=")
+        sid_pos = output.index("sid=")
+        assert dur_pos < rid_pos < ua_pos < sid_pos
+    finally:
+        set_request_duration_for_access_log(None)
+        set_request_id_for_access_log(None)
+        set_request_user_agent_for_access_log(None)
+        set_request_session_id_for_access_log(None)
+
+
+def test_access_formatter_clears_context_after_format() -> None:
+    """Context variables are cleared after formatting so they don't leak."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_id_for_access_log("first_req")
+    set_request_user_agent_for_access_log("test-agent/1.0")
+    set_request_session_id_for_access_log("conv_123")
+
+    first = formatter.format(record)
+    assert "rid=first_req" in first
+    assert 'ua="test-agent/1.0"' in first
+    assert "sid=conv_123" in first
+
+    second = formatter.format(record)
+    assert "rid=" not in second
+    assert "ua=" not in second
+    assert "sid=" not in second
+
+
+def test_access_formatter_omits_absent_fields() -> None:
+    """Fields not set via context variables are omitted, not blank."""
+    formatter = _make_formatter()
+    record = _make_access_record()
+
+    set_request_id_for_access_log("only_rid")
+    try:
+        output = formatter.format(record)
+        assert "rid=only_rid" in output
+        assert "ua=" not in output
+        assert "sid=" not in output
+    finally:
+        set_request_id_for_access_log(None)
+
+
+@pytest.mark.asyncio
+async def test_middleware_sets_request_id_header_and_access_log_context(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The metrics middleware sets X-Request-Id on responses and populates
+    access log context variables for request ID, User-Agent, and
+    session ID.
+    """
+    from omnigent.server import app as server_app
+
+    captured_ids: list[str | None] = []
+    captured_uas: list[str | None] = []
+    captured_sids: list[str | None] = []
+
+    _original_set_rid = set_request_id_for_access_log
+    _original_set_ua = set_request_user_agent_for_access_log
+    _original_set_sid = set_request_session_id_for_access_log
+
+    def spy_rid(v: str | None) -> None:
+        captured_ids.append(v)
+        _original_set_rid(v)
+
+    def spy_ua(v: str | None) -> None:
+        captured_uas.append(v)
+        _original_set_ua(v)
+
+    def spy_sid(v: str | None) -> None:
+        captured_sids.append(v)
+        _original_set_sid(v)
+
+    monkeypatch.setattr(server_app, "set_request_id_for_access_log", spy_rid)
+    monkeypatch.setattr(server_app, "set_request_user_agent_for_access_log", spy_ua)
+    monkeypatch.setattr(server_app, "set_request_session_id_for_access_log", spy_sid)
+
+    resp = await client.get("/health")
+
+    assert resp.status_code == 200
+    assert "x-request-id" in resp.headers
+    assert len(resp.headers["x-request-id"]) == 32  # uuid4 hex
+
+    assert len(captured_ids) == 1
+    assert captured_ids[0] == resp.headers["x-request-id"]
+
+    assert len(captured_uas) == 1
+    assert captured_uas[0] is not None  # httpx sends a User-Agent
+
+    assert len(captured_sids) == 1
+    assert captured_sids[0] is None  # /health has no session ID
+
+
+@pytest.mark.asyncio
+async def test_middleware_extracts_session_id_from_path(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The middleware extracts the session ID from session-scoped URL paths.
+    """
+    from omnigent.server import app as server_app
+
+    captured_sids: list[str | None] = []
+    _original = set_request_session_id_for_access_log
+
+    def spy_sid(v: str | None) -> None:
+        captured_sids.append(v)
+        _original(v)
+
+    monkeypatch.setattr(server_app, "set_request_session_id_for_access_log", spy_sid)
+
+    # This will 404 but the middleware still runs and extracts the ID.
+    await client.get("/v1/sessions/conv_test123/events")
+
+    assert len(captured_sids) == 1
+    assert captured_sids[0] == "conv_test123"
 
 
 def test_otel_publisher_emits_snapshot_values_and_counter_deltas() -> None:

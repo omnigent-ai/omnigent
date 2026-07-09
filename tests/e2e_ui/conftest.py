@@ -1,4 +1,4 @@
-"""Fixtures for browser-driven e2e tests of the ap-web SPA.
+"""Fixtures for browser-driven e2e tests of the web SPA.
 
 The suite spawns a real ``omnigent server --agent`` subprocess against
 ``examples/hello_world.yaml`` and drives the rendered SPA with
@@ -17,7 +17,7 @@ Local usage::
     uv run pytest tests/e2e_ui -v
 
     # iterate against an already-running server (dev hosts/ports need opt-in)
-    cd ap-web && npm run dev &
+    cd web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
     OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
       uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
@@ -34,7 +34,10 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
+import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -50,12 +53,20 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
+from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
+from tests.codex_parity.sidecar_harness import (
+    CodexResponsesSidecar,
+    build_sidecar_bin,
+    start_codex_responses_sidecar,
+)
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
+_CODEX_GOAL_MIN_VERSION = (0, 139, 0)
+_PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
 
 def open_right_rail(page: Page) -> None:
@@ -81,11 +92,28 @@ def open_right_rail(page: Page) -> None:
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
 
 
+def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
+    """Switch a markdown FileViewer to Preview / Edit / Source via the toolbar.
+
+    Markdown files default to the rendered Preview pane; the three modes live
+    behind a single "View mode" dropdown in the toolbar. Open that dropdown and
+    pick the option. The menu renders in a portal (outside ``file_viewer``), so
+    the menuitem is queried off ``page``, not the viewer locator.
+
+    :param page: Playwright page with the file viewer open.
+    :param file_viewer: The visible ``[data-testid="file-viewer"]`` locator.
+    :param mode: One of ``"Preview"``, ``"Edit"``, ``"Source"``.
+    :returns: None.
+    """
+    file_viewer.get_by_role("button", name=re.compile(r"^View mode")).first.click()
+    page.get_by_role("menuitem", name=mode, exact=True).click()
+
+
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
 _server_state: dict[str, int | str] = {}
-_AP_WEB_DIR = _REPO_ROOT / "ap-web"
+_WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
 # ``omnigent server --agent`` runs the spec through the strict
@@ -260,6 +288,10 @@ def browser_type_launch_args(
         launch_args["headless"] = True
     elif not pytestconfig.getoption("--headed", default=False):
         launch_args.setdefault("headless", True)
+    launch_args["args"] = [
+        *launch_args.get("args", []),
+        f"--host-resolver-rules=MAP {_PUBLIC_LOOPBACK_HOST} 127.0.0.1",
+    ]
     # The pinned Playwright Docker image (the visual-snapshot renderer, both in
     # ui-snapshot.yml and the local regen script) runs as root, where Chromium
     # refuses to start without --no-sandbox; --disable-dev-shm-usage avoids the
@@ -549,15 +581,89 @@ def set_fallback_mock_llm(
     resp.raise_for_status()
 
 
+def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
+    """Return whether the installed Codex CLI has app-server goal APIs."""
+    version = subprocess.run(
+        [codex_path, "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if version.returncode != 0:
+        return False
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", f"{version.stdout}\n{version.stderr}")
+    if not match:
+        return False
+    return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
+
+
+def _assert_pwa_build(build_output: Path) -> None:
+    """Fail if the built SPA is missing the PWA outputs or the SW won't update.
+
+    The standalone build must ship the installable-PWA assets, and the
+    hand-rolled service worker must (a) embed the per-build fingerprint so its
+    bytes change every deploy — or the update prompt never fires — and (b) NOT
+    cache or serve the app shell: Omnigent is a cloud app, so a stale cached
+    shell would white-screen users after every deploy.
+    """
+    for name in ("index.html", "sw.js", "manifest.webmanifest", "version.json"):
+        if not (build_output / name).is_file():
+            pytest.fail(f"SPA build is missing {name} at {build_output}")
+    build = json.loads((build_output / "version.json").read_text(encoding="utf-8")).get("build")
+    sw = (build_output / "sw.js").read_text(encoding="utf-8")
+    if not build or build not in sw:
+        pytest.fail(
+            "sw.js does not embed the version.json build fingerprint — the PWA "
+            "update prompt would never fire on a JS-only deploy"
+        )
+    # Installability-only contract — enforce the *dangerous* direction too, not
+    # just "the fingerprint is present". The service worker must NOT precache or
+    # serve the app shell or intercept navigations; otherwise a deploy
+    # white-screens users behind a stale shell. Strip line comments first so
+    # prose that mentions these tokens can neither fake nor mask a regression.
+    sw_code = re.sub(r"//[^\n]*", "", sw)
+    if "index.html" in sw_code:
+        pytest.fail("sw.js references index.html — it must not cache or serve the app shell")
+    shell_precache = re.search(r"(?:cache\.add|addAll|precache)[^\n]*\.(?:js|html)\b", sw_code)
+    if shell_precache is not None:
+        pytest.fail(
+            f"sw.js precaches an app-shell asset ({shell_precache.group(0)}) — "
+            "it must precache only version.json"
+        )
+    # The architecture rests on "navigations always hit the network". Enforce it
+    # by marker AND structurally: the SW must call respondWith() exactly once,
+    # inside the /version.json branch. A fetch handler that serves navigations or
+    # the shell from cache would pass every check above yet white-screen users
+    # behind a stale shell after each deploy.
+    if re.search(r"request\.mode|NavigationRoute|navigationPreload", sw_code):
+        pytest.fail(
+            "sw.js inspects navigation requests — navigations must always reach "
+            "the network (a stale cached shell white-screens users after a deploy)"
+        )
+    responders = sw_code.count("respondWith")
+    if responders != 1:
+        pytest.fail(
+            f"sw.js has {responders} respondWith() call(s); expected exactly 1 (the "
+            "/version.json sentinel). Any other responder risks serving a stale shell."
+        )
+    # The single respondWith must sit inside the `=== "/version.json"` block —
+    # i.e. no `}` (block close) between the pathname check and the respondWith.
+    if not re.search(r'"/version\.json"[^}]*?respondWith', sw_code, re.DOTALL):
+        pytest.fail(
+            "sw.js's respondWith() is not guarded by a `/version.json` pathname "
+            "check — the service worker must not serve the shell or intercept navigations"
+        )
+
+
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
-    Build the ap-web SPA into ``omnigent/server/static/web-ui/``.
+    Build the web SPA into ``omnigent/server/static/web-ui/``.
 
-    Vite's ``emptyOutDir: true`` (see ``ap-web/vite.config.ts``)
+    Vite's ``emptyOutDir: true`` (see ``web/vite.config.ts``)
     nukes the output directory before writing, so concurrent
     pytest sessions or worktrees would clobber each other. A
-    cross-process file lock at ``ap-web/.build.lock`` serializes
+    cross-process file lock at ``web/.build.lock`` serializes
     builds; the second caller waits for the first to finish and
     then no-ops past its own build (npm is idempotent enough that
     double-building is harmless, but the lock keeps the static
@@ -570,14 +676,10 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-base-url"):
         return
     if request.config.getoption("--ui-skip-build"):
-        if not (_BUILD_OUTPUT / "index.html").is_file():
-            pytest.fail(
-                f"--ui-skip-build was passed but no SPA build exists at "
-                f"{_BUILD_OUTPUT}. Run `cd ap-web && npm run build` first."
-            )
+        _assert_pwa_build(_BUILD_OUTPUT)
         return
 
-    lock_path = _AP_WEB_DIR / ".build.lock"
+    lock_path = _WEB_DIR / ".build.lock"
     with filelock.FileLock(str(lock_path), timeout=600):
         # --legacy-peer-deps: package-lock.json already pins the tree;
         # without this flag npm spends the full job re-resolving the
@@ -586,10 +688,12 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         # where conftest installs override CI's build.
         subprocess.run(
             ["npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-            cwd=_AP_WEB_DIR,
+            cwd=_WEB_DIR,
             check=True,
         )
-        subprocess.run(["npm", "run", "build"], cwd=_AP_WEB_DIR, check=True)
+        subprocess.run(["npm", "run", "build"], cwd=_WEB_DIR, check=True)
+
+    _assert_pwa_build(_BUILD_OUTPUT)
 
 
 def _spawn_runner_against_external_server(
@@ -1361,16 +1465,21 @@ def terminal_session(
     try:
         yield (live_server, session_id)
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        # Restore the "found" state: if we respawned the runner (a prior
-        # test had killed it), tear our copy down so it doesn't outlive us.
-        if respawned_runner is not None:
-            respawned_runner.terminate()
+        try:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
             try:
-                respawned_runner.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned_runner.kill()
-                respawned_runner.wait(timeout=5)
+                reset_mock_llm(mock_llm_server_url)
+            finally:
+                # Restore the "found" state: if we respawned the runner (a prior
+                # test had killed it), tear our copy down so it doesn't outlive us.
+                if respawned_runner is not None:
+                    respawned_runner.terminate()
+                    try:
+                        respawned_runner.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        respawned_runner.kill()
+                        respawned_runner.wait(timeout=5)
 
 
 _TWO_AGENT_PARENT_NAME = "hitchhikers_chat"
@@ -2271,6 +2380,220 @@ def native_codex_mock_session(
             except subprocess.TimeoutExpired:
                 respawned.kill()
                 respawned.wait(timeout=5)
+
+
+@dataclass(frozen=True)
+class MockedCodexNativeSession:
+    """Session handle for native Codex e2e tests with mocked Responses API."""
+
+    base_url: str
+    session_id: str
+    sidecar: CodexResponsesSidecar
+
+
+def _write_mock_codex_provider_config(config_home: Path, base_url: str) -> None:
+    """Write provider config that routes native Codex to the sidecar."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(
+        f"""\
+providers:
+  codex-e2e-mock:
+    kind: key
+    default: openai
+    openai:
+      base_url: "{base_url}"
+      api_key: "sk-e2e-mock"
+      wire_api: responses
+      models:
+        default: mock-model
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def mocked_native_codex_goal_session(
+    built_spa: None,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[MockedCodexNativeSession]:
+    """Spawn native Codex against Codex's mock Responses sidecar.
+
+    This intentionally does not reuse the session-scoped ``live_server``:
+    native Codex reads provider config and bridge roots in subprocesses, so
+    the mock ``OMNIGENT_CONFIG_HOME`` / ``HOME`` / source ``CODEX_HOME`` must
+    be present before the AP server and runner start. Keeping a dedicated
+    server prevents those mock-only env vars from affecting unrelated UI tests
+    in the same shard.
+    """
+    if request.config.getoption("--ui-base-url"):
+        pytest.skip("mocked native Codex goal e2e requires an isolated spawned server")
+
+    codex_path = shutil.which("codex")
+    if codex_path is None:
+        pytest.skip("codex CLI is required for mocked native Codex goal e2e")
+    if not _codex_cli_supports_goal_mode(codex_path):
+        pytest.skip("codex CLI >= 0.139.0 is required for app-server goal APIs")
+
+    try:
+        sidecar_bin = build_sidecar_bin()
+    except RuntimeError:
+        pytest.skip("cargo is required for Codex parity sidecar")
+
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_codex_goal_server")
+    sidecar = start_codex_responses_sidecar(
+        sidecar_bin,
+        server_tmp / "responses.json",
+        [
+            [
+                ev_response_created("resp-goal-ui-bootstrap"),
+                ev_assistant_message("msg-goal-ui-bootstrap", "E2E_GOAL_BOOTSTRAP"),
+                ev_completed("resp-goal-ui-bootstrap"),
+            ]
+        ],
+    )
+
+    config_home = server_tmp / "config-home"
+    source_codex_home = server_tmp / "source-codex-home"
+    home_dir = server_tmp / "home"
+    state_dir = server_tmp / "codex-native-state"
+    artifact_dir = server_tmp / "artifacts"
+    for path in (source_codex_home, home_dir, state_dir, artifact_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    _write_mock_codex_provider_config(config_home, sidecar.base_url)
+
+    port = _find_free_port()
+    log_path = server_tmp / "server.log"
+    runner_log_path = server_tmp / "runner.log"
+    db_path = server_tmp / "test.db"
+    agent_yaml_path = server_tmp / "hello_world.yaml"
+    agent_yaml_path.write_text(_TEST_AGENT_YAML, encoding="utf-8")
+
+    import secrets as _secrets
+
+    from omnigent.runner.identity import token_bound_runner_id
+
+    binding_token = _secrets.token_urlsafe(32)
+    runner_id = token_bound_runner_id(binding_token)
+    base_url = f"http://127.0.0.1:{port}"
+    shared_env = {
+        **os.environ,
+        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
+        "CODEX_HOME": str(source_codex_home),
+        "HOME": str(home_dir),
+    }
+    server_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
+    }
+    runner_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_ID": runner_id,
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "RUNNER_SERVER_URL": base_url,
+    }
+
+    log_handle = open(log_path, "w")  # noqa: SIM115
+    runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
+    proc: subprocess.Popen[bytes] | None = None
+    runner_proc: subprocess.Popen[bytes] | None = None
+    session_id: str | None = None
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+                + "from omnigent.cli import main; main()",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{db_path}",
+                "--artifact-location",
+                str(artifact_dir),
+                "--agent",
+                str(agent_yaml_path),
+            ],
+            env=server_env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        runner_proc = subprocess.Popen(
+            [sys.executable, "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            stdout=runner_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+        ready = False
+        last_error = "not polled yet"
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                last_error = f"process exited early with code {proc.returncode}"
+                break
+            if runner_proc.poll() is not None:
+                last_error = f"runner exited early with code {runner_proc.returncode}"
+                break
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    status_resp = httpx.get(
+                        f"{base_url}/v1/runners/{runner_id}/status",
+                        timeout=2,
+                    )
+                    if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                        ready = True
+                        break
+                    last_error = (
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
+                    )
+                else:
+                    last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+
+        if not ready:
+            raise RuntimeError(
+                f"mocked Codex e2e server did not become healthy within "
+                f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} "
+                f"(last_error={last_error}).\n"
+                f"Server log at {log_path}:\n"
+                f"{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
+                f"Runner log at {runner_log_path}:\n"
+                f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
+            )
+
+        session_id = _create_native_codex_session(base_url, runner_id)
+        yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
+    finally:
+        if session_id is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        if runner_proc is not None and runner_proc.poll() is None:
+            runner_proc.send_signal(signal.SIGTERM)
+            try:
+                runner_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner_proc.kill()
+                runner_proc.wait(timeout=5)
+        if proc is not None and proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        runner_log_handle.close()
+        log_handle.close()
+        sidecar.close()
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 # deployment of Omnigent.
 #
 # Inputs:
-#   SKIP_WEB_UI=1   Skip the ap-web SPA build for API-only deployments.
+#   SKIP_WEB_UI=1   Skip the web SPA build for API-only deployments.
 #
 # Outputs:
 #   dist/omnigent-<version>-py3-none-any.whl
@@ -27,13 +27,13 @@ echo "==> Cleaning stale static assets and build outputs"
 rm -rf omnigent/server/static/web-ui dist build omnigent.egg-info
 
 if [[ "${SKIP_WEB_UI:-}" != "1" ]]; then
-    echo "==> Building ap-web SPA into omnigent/server/static/web-ui/"
-    cd ap-web
+    echo "==> Building web SPA into omnigent/server/static/web-ui/"
+    cd web
     npm install
     npm run build
     cd "${REPO_ROOT}"
 else
-    echo "==> SKIP_WEB_UI=1: skipping ap-web build"
+    echo "==> SKIP_WEB_UI=1: skipping web build"
 fi
 
 echo "==> Building omnigent-client wheel"

@@ -1,0 +1,49 @@
+name: Reviewer SLA
+
+# Daily (weekday) sweep that enforces a 5-working-day reviewer SLA: any open PR
+# awaiting review from a maintainer -- or open issue awaiting a maintainer
+# assignee -- with no reply in 5 working days gets the assignee re-pinged in a
+# comment plus a second reviewer (PR) / second assignee (issue), then a one-shot
+# `review-sla-escalated` label so it's never nudged twice. All logic + safety
+# notes live in review-sla.js (offline unit test: review-sla.test.js).
+#
+# Scheduled -> runs on the trusted default branch with the repo GITHUB_TOKEN; it
+# reads no PR-authored code, only .github/ config + the issues/PRs API.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1-5" # 08:00 UTC, Mon-Fri (weekday SLA -> no weekend pings)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-sla
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Job-level permissions REPLACE the workflow-level block, so restate read.
+      contents: read
+      pull-requests: write # comment + request the second reviewer
+      issues: write        # comment + assign + label
+    steps:
+      # Trusted default branch, .github only (config the script reads). Never PR head.
+      - name: Check out .github
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Sweep open PRs + issues for SLA breaches
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          retries: 3
+          script: |
+            const script = require('./.github/workflows/review-sla.js');
+            await script({ github, context, core });

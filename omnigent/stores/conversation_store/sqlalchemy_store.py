@@ -25,11 +25,25 @@ from sqlalchemy.sql.selectable import Subquery
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    LABEL_VALUE_MAX_LEN,
     SqlAgent,
+    SqlComment,
     SqlConversation,
     SqlConversationItem,
     SqlConversationLabel,
+    SqlPolicy,
+    SqlSessionPermission,
     SqlUserDailyCost,
+    current_workspace_id,
+)
+from omnigent.db.enum_codecs import (
+    decode_conversation_kind,
+    decode_item_status,
+    decode_item_type,
+    encode_agent_kind,
+    encode_conversation_kind,
+    encode_item_status,
+    encode_item_type,
 )
 from omnigent.db.utils import (
     _supports_fts5,
@@ -56,6 +70,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ConversationNotFoundError,
     ConversationStore,
@@ -93,8 +108,8 @@ def _to_conversation(
         id=row.id,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        title=row.title,
-        kind=row.kind,
+        title=row.title or None,  # empty string → None at entity layer
+        kind=decode_conversation_kind(row.kind),
         parent_conversation_id=row.parent_conversation_id,
         root_conversation_id=row.root_conversation_id,
         agent_id=row.agent_id,
@@ -164,12 +179,16 @@ def _new_session_conversation_row(
         the column NULL.
     :returns: Unsaved :class:`SqlConversation` row.
     """
+    # Sub-agent children must have a unique title per parent.
+    # Fall back to the conversation id to guarantee uniqueness.
+    if parent_conversation_id and not title:
+        title = f"untitled:{conversation_id}"
     return SqlConversation(
         id=conversation_id,
         created_at=now,
         updated_at=now,
-        title=title,
-        kind="sub_agent" if parent_conversation_id else "default",
+        title=title or "",  # None → '' for top-level conversations
+        kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         parent_conversation_id=parent_conversation_id,
         # Top-level row: ``root_conversation_id`` mirrors the
         # primary key so tree-scoped lookups treat it as its own
@@ -191,7 +210,6 @@ def _new_session_agent_row(
     agent_name: str,
     agent_bundle_location: str,
     agent_description: str | None,
-    conversation_id: str,
     now: int,
 ) -> SqlAgent:
     """
@@ -201,7 +219,6 @@ def _new_session_agent_row(
     :param agent_name: Agent name loaded from the uploaded spec.
     :param agent_bundle_location: Artifact-store key for the bundle.
     :param agent_description: Optional description from the spec.
-    :param conversation_id: Owning conversation id.
     :param now: Unix epoch seconds used for the created field.
     :returns: Unsaved :class:`SqlAgent` row.
     """
@@ -211,8 +228,8 @@ def _new_session_agent_row(
         name=agent_name,
         bundle_location=agent_bundle_location,
         version=1,
+        kind=encode_agent_kind("session"),
         description=agent_description,
-        session_id=conversation_id,
     )
 
 
@@ -234,7 +251,7 @@ def _created_session_from_rows(
             conversation_row,
             labels if labels is not None else {},
         ),
-        agent=sql_agent_to_entity(agent_row),
+        agent=sql_agent_to_entity(agent_row, session_id=conversation_row.id),
     )
 
 
@@ -262,11 +279,17 @@ def _upsert_labels(
         touched by this call.
     """
     dialect = session.bind.dialect.name if session.bind is not None else ""
+    # Defense-in-depth: clamp every value to the column width so no label
+    # writer can overflow ``String(256)`` and raise ``DataError`` on
+    # PostgreSQL. Callers (session error labels, client-supplied ``body.labels``
+    # on session create/patch, policy-author writes) all funnel through here,
+    # so this is the single point that guarantees the column constraint. The
+    # slice is character-based, matching Postgres ``VARCHAR(n)`` semantics.
     rows = [
         {
             "conversation_id": conversation_id,
             "key": key,
-            "value": value,
+            "value": value[:LABEL_VALUE_MAX_LEN],
             "updated_at": updated_at,
         }
         for key, value in updates.items()
@@ -282,7 +305,7 @@ def _upsert_labels(
     for row in rows:
         existing = session.get(
             SqlConversationLabel,
-            (row["conversation_id"], row["key"]),
+            (current_workspace_id(), row["conversation_id"], row["key"]),
         )
         if existing is None:
             session.add(SqlConversationLabel(**row))
@@ -329,7 +352,7 @@ def _dialect_upsert_labels(
 
         stmt = pg_insert(SqlConversationLabel).values(rows)
     stmt = stmt.on_conflict_do_update(
-        index_elements=["conversation_id", "key"],
+        index_elements=["workspace_id", "conversation_id", "key"],
         set_={
             "value": stmt.excluded.value,
             "updated_at": stmt.excluded.updated_at,
@@ -357,6 +380,7 @@ def _fetch_labels(
     """
     rows = session.execute(
         select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
             SqlConversationLabel.conversation_id == conversation_id,
         )
     ).all()
@@ -389,7 +413,10 @@ def _fetch_labels_bulk(
             SqlConversationLabel.conversation_id,
             SqlConversationLabel.key,
             SqlConversationLabel.value,
-        ).where(SqlConversationLabel.conversation_id.in_(conversation_ids))
+        ).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id.in_(conversation_ids),
+        )
     ).all()
     out: dict[str, dict[str, str]] = {}
     for conv_id, key, value in rows:
@@ -408,13 +435,14 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
     :param row: The SQLAlchemy ORM row to convert.
     :returns: A :class:`ConversationItem` Pydantic model.
     """
+    item_type = decode_item_type(row.type)
     return ConversationItem(
         id=row.id,
-        type=row.type,
-        status=row.status,
+        type=item_type,
+        status=decode_item_status(row.status),
         response_id=row.response_id,
         created_at=row.created_at,
-        data=parse_item_data(row.type, json.loads(row.data)),
+        data=parse_item_data(item_type, json.loads(row.data)),
         created_by=row.created_by,
     )
 
@@ -439,8 +467,9 @@ def _ranked_latest_message_item_ids(conversation_ids: list[str]) -> Subquery:
             .label("row_num"),
         )
         .where(
+            SqlConversationItem.workspace_id == current_workspace_id(),
             SqlConversationItem.conversation_id.in_(conversation_ids),
-            SqlConversationItem.type == "message",
+            SqlConversationItem.type == encode_item_type("message"),
         )
         .subquery()
     )
@@ -469,6 +498,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        # Immediate session: used for read-modify-write operations that must be
+        # atomic. On SQLite, ``BEGIN IMMEDIATE`` acquires the write lock before
+        # the first read, preventing ``SQLITE_BUSY_SNAPSHOT`` under concurrent
+        # writers. On other dialects ``immediate=True`` is a no-op — those paths
+        # use ``SELECT … FOR UPDATE`` via ``_supports_for_update`` instead.
+        self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
         self._supports_for_update = self._engine.dialect.name != "sqlite"
         # SQLite rowid is monotonically increasing absent deletions; it serves
         # as an insertion-ordered tiebreaker for timestamp ties. Note: without
@@ -521,7 +556,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         if self._supports_for_update:
             stmt = (
                 select(SqlConversation.id)
-                .where(SqlConversation.id == conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
                 .with_for_update()
             )
             session.execute(stmt)
@@ -619,7 +657,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # it lands.
                     root_id: str = new_id
                 else:
-                    parent_row = session.get(SqlConversation, parent_conversation_id)
+                    parent_row = session.get(
+                        SqlConversation, (current_workspace_id(), parent_conversation_id)
+                    )
                     if parent_row is None:
                         raise ConversationNotFoundError(
                             f"parent conversation {parent_conversation_id!r} does not exist"
@@ -629,12 +669,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # ``root_conversation_id`` is NOT NULL (see migration
                     # d8e2f3b4c910), so the parent always has one.
                     root_id = parent_row.root_conversation_id
+                # Sub-agent children must have a unique title per parent because
+                # of ix_conversations_parent_title_unique. Production paths
+                # always supply a derived title (e.g. "agent_type:session_id").
+                # Fall back to the conversation id to guarantee uniqueness.
+                if parent_conversation_id is not None and not title:
+                    title = f"untitled:{new_id}"
                 row = SqlConversation(
                     id=new_id,
                     created_at=now,
                     updated_at=now,
-                    title=title,
-                    kind=kind,
+                    title=title or "",  # None → '' for top-level conversations
+                    kind=encode_conversation_kind(kind),
                     parent_conversation_id=parent_conversation_id,
                     root_conversation_id=root_id,
                     agent_id=agent_id,
@@ -655,7 +701,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # session close.
                 return _to_conversation(row)
         except IntegrityError as exc:
-            # Translate the partial-unique-index violation into a
+            # Translate the unique-index violation into a
             # clean exception type the spawn/send tools can map
             # to a name_already_exists tool error. Other integrity
             # violations (FK, check constraints) re-raise.
@@ -668,10 +714,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # check, which would misclassify any future unique
             # constraint added to the conversations table.
             msg = str(exc).lower()
-            is_partial_index_violation = "ix_conversations_parent_title_unique" in msg or (
+            is_title_unique_violation = "ix_conversations_parent_title_unique" in msg or (
                 "unique" in msg and "parent_conversation_id" in msg and "title" in msg
             )
-            if is_partial_index_violation:
+            if is_title_unique_violation:
                 raise NameAlreadyExistsError(
                     f"sub-agent name already exists under parent "
                     f"{parent_conversation_id!r}: title={title!r}"
@@ -696,7 +742,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
             return _to_conversation(row, _fetch_labels(session, conversation_id))
@@ -714,7 +760,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             rows = session.execute(
                 select(SqlConversation.id, SqlConversation.runner_id).where(
-                    SqlConversation.id.in_(unique_ids)
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
                 )
             ).all()
         return {row.id: row.runner_id for row in rows}
@@ -745,7 +792,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.id,
                     SqlConversation.runner_id,
                     SqlConversation.host_id,
-                ).where(SqlConversation.id.in_(unique_ids))
+                ).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
+                )
             ).all()
             # One pass over the fork-source connectivity marker, which
             # signals on presence (its value is the source id).
@@ -755,6 +805,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationLabel.key,
                     SqlConversationLabel.value,
                 ).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(unique_ids),
                     SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY]),
                 )
@@ -789,7 +840,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         unique_ids = list(set(conversation_ids))
         with self._session() as session:
             rows = list(
-                session.execute(select(SqlConversation).where(SqlConversation.id.in_(unique_ids)))
+                session.execute(
+                    select(SqlConversation).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(unique_ids),
+                    )
+                )
                 .scalars()
                 .all()
             )
@@ -828,7 +884,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             rows = session.execute(
                 select(SqlConversation.parent_conversation_id, SqlConversation.id)
-                .where(SqlConversation.kind == "sub_agent")
+                .where(SqlConversation.workspace_id == current_workspace_id())
+                .where(SqlConversation.kind == encode_conversation_kind("sub_agent"))
                 .where(SqlConversation.parent_conversation_id.in_(unique_ids))
                 .order_by(
                     SqlConversation.parent_conversation_id,
@@ -893,7 +950,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             session.execute(
                 update(SqlConversation)
-                .where(SqlConversation.id == conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
                 .values(session_state=json.dumps(state))
             )
 
@@ -920,9 +980,65 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             session.execute(
                 update(SqlConversation)
-                .where(SqlConversation.id == conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
                 .values(session_usage=json.dumps(usage))
             )
+
+    def increment_session_usage(
+        self,
+        conversation_id: str,
+        delta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Atomically increment the session usage for one conversation.
+
+        Runs the read-modify-write in a single database transaction, serialising
+        concurrent writers via two complementary mechanisms:
+
+        - **PostgreSQL / MySQL / MariaDB**: ``SELECT … FOR UPDATE`` acquires an
+          exclusive row lock for the duration of the transaction; a concurrent
+          second writer blocks until this one commits.
+        - **SQLite**: the session is opened with ``BEGIN IMMEDIATE``
+          (``self._session_immediate``), which acquires SQLite's write lock
+          *before* the first read. A plain ``SELECT``-then-``UPDATE`` in a
+          deferred transaction would expose concurrent writers to
+          ``SQLITE_BUSY_SNAPSHOT`` because each writer takes a read snapshot
+          first; ``BEGIN IMMEDIATE`` prevents that by serialising at lock
+          acquisition time.
+
+        :param conversation_id: The conversation to update.
+        :param delta: Usage increments (see
+            :meth:`ConversationStore.increment_session_usage`).
+        :returns: The updated ``session_usage`` dict.
+        """
+        import json
+
+        from omnigent.stores.conversation_store import apply_session_usage_delta
+
+        with self._session_immediate() as session:
+            q = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                q = q.with_for_update()
+            row = session.scalars(q).first()
+            current: dict[str, Any] = (
+                dict(json.loads(row.session_usage)) if row and row.session_usage else {}
+            )
+            apply_session_usage_delta(current, delta)
+            session.execute(
+                update(SqlConversation)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+                .values(session_usage=json.dumps(current))
+            )
+            return current
 
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """
@@ -952,7 +1068,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE in one
             # transaction (race-safe under SERIALIZABLE / SQLite's
             # single-writer semantics).
-            existing = session.get(SqlUserDailyCost, (user_id, day_utc))
+            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
@@ -1011,7 +1127,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             stmt = pg_insert(SqlUserDailyCost)
         stmt = stmt.values(user_id=user_id, day_utc=day_utc, cost_usd=delta_usd, updated_at=now)
         stmt = stmt.on_conflict_do_update(
-            index_elements=["user_id", "day_utc"],
+            index_elements=["workspace_id", "user_id", "day_utc"],
             set_={
                 "cost_usd": SqlUserDailyCost.cost_usd + stmt.excluded.cost_usd,
                 "updated_at": stmt.excluded.updated_at,
@@ -1030,7 +1146,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``(user_id, day_utc)``.
         """
         with self._session() as session:
-            row = session.get(SqlUserDailyCost, (user_id, day_utc))
+            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
@@ -1048,7 +1164,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             both ``0.0`` when no row exists for ``(user_id, day_utc)``.
         """
         with self._session() as session:
-            row = session.get(SqlUserDailyCost, (user_id, day_utc))
+            row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             if row is None:
                 return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
             return {
@@ -1099,7 +1215,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # On conflict touch only the approval (+ stamp) — never
                 # the accumulated cost.
                 stmt = stmt.on_conflict_do_update(
-                    index_elements=["user_id", "day_utc"],
+                    index_elements=["workspace_id", "user_id", "day_utc"],
                     set_={
                         "ask_approved_usd": stmt.excluded.ask_approved_usd,
                         "updated_at": stmt.excluded.updated_at,
@@ -1108,7 +1224,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(stmt)
                 return
             # Generic dialect fallback — SELECT-then-INSERT/UPDATE.
-            existing = session.get(SqlUserDailyCost, (user_id, day_utc))
+            existing = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             if existing is None:
                 session.add(
                     SqlUserDailyCost(
@@ -1142,12 +1258,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             or ``None`` when the session has no real (non-public)
             permission grants.
         """
-        from omnigent.db.db_models import SqlSessionPermission
         from omnigent.server.auth import RESERVED_USER_PUBLIC
 
         with self._session() as session:
             return session.execute(
                 select(SqlSessionPermission.user_id)
+                .where(SqlSessionPermission.workspace_id == current_workspace_id())
                 .where(SqlSessionPermission.conversation_id == conversation_id)
                 .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
                 .order_by(SqlSessionPermission.level.desc())
@@ -1195,24 +1311,39 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "ORDER BY rank LIMIT :limit"
                     )
             else:
-                # PostgreSQL: ILIKE fallback (no FTS5 virtual table).
-                # Full tsvector/tsquery indexing can be added later.
+                # Non-SQLite fallback: LIKE/ILIKE on the data column.
+                # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
+                # MySQL: CONVERT(data USING utf8mb4) + LIKE (case-insensitive
+                #        by default with utf8mb4_unicode_ci collation).
                 like_pattern = f"%{query}%"
+                is_mysql = self._engine.dialect.name == "mysql"
+                if is_mysql:
+                    data_expr = "CONVERT(ci.data USING utf8mb4)"
+                    like_op = "LIKE"
+                else:
+                    data_expr = "ci.data::text"
+                    like_op = "ILIKE"
                 if conversation_id is not None:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.conversation_id = :cid "
-                        "AND ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND ci.conversation_id = :cid "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 else:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
-            params: dict[str, str | int] = {"query": query, "limit": limit}
+            params: dict[str, str | int] = {
+                "query": query,
+                "limit": limit,
+                "ws": current_workspace_id(),
+            }
             if conversation_id is not None:
                 params["cid"] = conversation_id
             item_ids = [row[0] for row in session.execute(stmt, params).fetchall()]
@@ -1220,7 +1351,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return []
             rows = (
                 session.execute(
-                    select(SqlConversationItem).where(SqlConversationItem.id.in_(item_ids))
+                    select(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.id.in_(item_ids),
+                    )
                 )
                 .scalars()
                 .all()
@@ -1261,14 +1395,18 @@ class SqlAlchemyConversationStore(ConversationStore):
             is_asc = order == "asc"
             sort_fn = asc if is_asc else desc
             stmt = select(SqlConversationItem).where(
-                SqlConversationItem.conversation_id == conversation_id
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == conversation_id,
             )
             if type is not None:
-                stmt = stmt.where(SqlConversationItem.type == type)
+                stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
             if after:
                 sub = (
                     select(SqlConversationItem.position)
-                    .where(SqlConversationItem.id == after)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.id == after,
+                    )
                     .scalar_subquery()
                 )
                 # "after" = further in sort direction
@@ -1280,7 +1418,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if before:
                 sub = (
                     select(SqlConversationItem.position)
-                    .where(SqlConversationItem.id == before)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.id == before,
+                    )
                     .scalar_subquery()
                 )
                 # "before" = opposite of sort direction
@@ -1334,7 +1475,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.execute(
                     select(SqlConversationItem)
                     .join(ranked, SqlConversationItem.id == ranked.c.item_id)
-                    .where(ranked.c.row_num <= per_conversation_limit)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        ranked.c.row_num <= per_conversation_limit,
+                    )
                     .order_by(
                         SqlConversationItem.conversation_id,
                         desc(SqlConversationItem.position),
@@ -1376,7 +1520,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._lock_conversation(session, conversation_id)
 
             # Bump updated_at on the conversation.
-            conv_row = session.get(SqlConversation, conversation_id)
+            conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if conv_row is not None:
                 conv_row.updated_at = now
 
@@ -1399,7 +1543,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 next_pos = (
                     session.execute(
                         select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
-                            SqlConversationItem.conversation_id == conversation_id
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == conversation_id,
                         )
                     ).scalar_one()
                     + 1
@@ -1421,9 +1566,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     conversation_id=conversation_id,
                     response_id=item.response_id,
                     created_at=now,
-                    status="completed",  # items are final on append
+                    status=encode_item_status("completed"),  # items are final on append
                     position=position,
-                    type=item.type,
+                    type=encode_item_type(item.type),
                     data=data,
                     search_text=search,
                     created_by=item.created_by,
@@ -1433,8 +1578,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 persisted.append(
                     ConversationItem(
                         id=row.id,
-                        type=row.type,
-                        status=row.status,
+                        # The row stores int codes; the entity carries the
+                        # string names. item.type is the source string and
+                        # the status was just written as "completed".
+                        type=item.type,
+                        status="completed",
                         response_id=row.response_id,
                         created_at=row.created_at,
                         data=item.data,
@@ -1448,6 +1596,93 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conv_row.next_position = next_pos
 
         return persisted
+
+    def list_projects(
+        self,
+        accessible_by: str | None = None,
+        owned_by: str | None = None,
+    ) -> list[str]:
+        """
+        Return all distinct project names, ordered alphabetically.
+
+        Projects are implicit: they exist as long as at least one
+        *non-archived* ``conversation_labels`` row with ``key="omni_project"``
+        references them. Archived sessions keep their project label (so
+        unarchiving restores a session to its original project), but a project
+        whose every member is archived drops out of this list — that is what
+        makes "Delete project" (which archives all members) remove the folder
+        while leaving the sessions recoverable. The label key is namespaced
+        (``omni_*``) to keep this internal storage key distinct from the
+        user-facing "project" term and from any future reserved keys; it is
+        never surfaced as a label in the UI.
+
+        :param accessible_by: When set, restrict to sessions that
+            ``accessible_by`` has a permission row for (mirrors the
+            ``list_conversations`` ACL filter).
+        :param owned_by: When set, restrict to projects that contain at
+            least one session ``owned_by`` owns (an ``owner``-level grant).
+            Filing into a project is owner-only, so the sidebar renders
+            folders only on "My sessions"; scoping by ownership keeps a
+            project shared *with* the user (but owned by someone else) from
+            surfacing as one of their own folders.
+        :returns: List of project names ordered ascending.
+        """
+        from omnigent.server.auth import LEVEL_OWNER
+
+        with self._session() as session:
+            # Join to the conversation so archived sessions don't keep an
+            # otherwise-empty project alive in the sidebar.
+            stmt = (
+                select(SqlConversationLabel.value)
+                .join(
+                    SqlConversation,
+                    SqlConversation.id == SqlConversationLabel.conversation_id,
+                )
+                .where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                    SqlConversation.archived.is_(False),
+                )
+                .distinct()
+                .order_by(SqlConversationLabel.value)
+            )
+            if accessible_by is not None:
+                accessible_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == accessible_by,
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(owned_ids))
+            return [row[0] for row in session.execute(stmt).all()]
+
+    def delete_label(
+        self,
+        conversation_id: str,
+        key: str,
+    ) -> None:
+        """
+        Delete a single label key from a conversation.
+
+        No-op if the label does not exist.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key to remove, e.g. ``"omni_project"``.
+        """
+        with self._session() as session:
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == key,
+                )
+            )
 
     def list_conversations(
         self,
@@ -1464,7 +1699,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         sort_by: str = "created_at",
         search_query: str | None = None,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
         include_archived: bool = False,
+        project: str | None = None,
+        title: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1509,17 +1747,31 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
+        :param project: When set to a non-empty string, only return
+            sessions that have a ``conversation_labels`` row with
+            ``key="omni_project"`` and ``value=project``. When set to an
+            empty string ``""``, only return sessions with NO project
+            label (i.e., unfiled sessions). ``None`` disables the
+            filter.
+        :param owned_by: When set, restrict to sessions the user owns
+            (an ``owner``-level grant) — stricter than ``accessible_by``,
+            which also matches sessions merely shared with them. Powers
+            the per-project folder fetch. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
+        from omnigent.server.auth import LEVEL_OWNER
+
         sort_col = self._resolve_sort_column(sort_by)
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            stmt = select(SqlConversation)
+            stmt = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id()
+            )
             # Filter by kind when specified (None = no filter).
             if kind is not None:
-                stmt = stmt.where(SqlConversation.kind == kind)
+                stmt = stmt.where(SqlConversation.kind == encode_conversation_kind(kind))
             if parent_conversation_id is not None:
                 stmt = stmt.where(
                     SqlConversation.parent_conversation_id == parent_conversation_id,
@@ -1534,7 +1786,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.archived.is_(False))
             if agent_name is not None:
                 stmt = stmt.join(SqlAgent, SqlAgent.id == SqlConversation.agent_id).where(
-                    SqlAgent.name == agent_name
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.name == agent_name,
                 )
             if agent_id is not None:
                 # Filter by the agent_id column on conversations directly
@@ -1542,22 +1795,55 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # an agent binding (legacy rows) correctly return no results
                 # because their agent_id column is NULL.
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
+            if title is not None:
+                stmt = stmt.where(SqlConversation.title == title)
             if accessible_by is not None:
-                from omnigent.db.db_models import SqlSessionPermission
-
                 accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.user_id == accessible_by
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversation.id.in_(owned_ids))
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
                 content_match = SqlConversation.id.in_(
                     select(SqlConversationItem.conversation_id)
-                    .where(func.lower(SqlConversationItem.search_text).like(pattern))
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        func.lower(SqlConversationItem.search_text).like(pattern),
+                    )
                     .distinct()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
+            if project is not None:
+                if project == "":
+                    # Unfiled: sessions with no project label at all.
+                    stmt = stmt.where(
+                        SqlConversation.id.not_in(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                            )
+                        )
+                    )
+                else:
+                    # Specific project: session must have this project label.
+                    stmt = stmt.where(
+                        SqlConversation.id.in_(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                                SqlConversationLabel.value == project,
+                            )
+                        )
+                    )
             if after:
                 stmt = self._apply_cursor(
                     stmt,
@@ -1649,7 +1935,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``before`` cursors.
         :returns: The statement with the cursor WHERE clause applied.
         """
-        sub = select(sort_col).where(SqlConversation.id == cursor_id).scalar_subquery()
+        sub = (
+            select(sort_col)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == cursor_id,
+            )
+            .scalar_subquery()
+        )
         # When tiebreaker_col is SqlConversation.id (non-SQLite), its value for
         # the cursor row is cursor_id itself — no extra subquery needed.
         # For SQLite rowid (a literal_column), we must query the DB.
@@ -1657,7 +1950,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             tiebreaker_val: Any = cursor_id
         else:
             tiebreaker_val = (
-                select(tiebreaker_col).where(SqlConversation.id == cursor_id).scalar_subquery()
+                select(tiebreaker_col)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == cursor_id,
+                )
+                .scalar_subquery()
             )
         # "after" (forward=True) = further in sort direction;
         # "before" (forward=False) = opposite of sort direction.
@@ -1720,12 +2018,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             if the conversation does not exist.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
             changed = False
             if title is not None:
-                row.title = title
+                row.title = title or ""  # None/'' → empty string at DB layer
                 changed = True
             if archived is not None:
                 row.archived = archived
@@ -1784,7 +2082,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             stmt = (
                 update(SqlConversation)
-                .where(SqlConversation.id == conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
                 .where(SqlConversation.runner_id.is_(None))
                 .values(runner_id=runner_id)
             )
@@ -1808,7 +2109,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -1828,7 +2129,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -1853,7 +2154,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -1864,21 +2165,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             row.runner_id = None
             row.updated_at = now_epoch()
             return _to_conversation(row, _fetch_labels(session, conversation_id))
-
-    def list_conversations_by_host_id(
-        self,
-        host_id: str,
-    ) -> list[Conversation]:
-        """
-        Return all conversations with the given ``host_id``.
-
-        :param host_id: Host identifier, e.g.
-            ``"host_a1b2c3d4..."``.
-        :returns: List of :class:`Conversation` entities.
-        """
-        with self._session() as session:
-            rows = session.query(SqlConversation).filter(SqlConversation.host_id == host_id).all()
-            return [_to_conversation(row) for row in rows]
 
     def list_conversations_by_runner_id(
         self,
@@ -1893,7 +2179,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         with self._session() as session:
             rows = (
-                session.query(SqlConversation).filter(SqlConversation.runner_id == runner_id).all()
+                session.query(SqlConversation)
+                .filter(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.runner_id == runner_id,
+                )
+                .all()
             )
             return [_to_conversation(row) for row in rows]
 
@@ -1938,7 +2229,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             and the caller did not supply one).
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -1975,7 +2266,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``external_session_id``.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -2066,7 +2357,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._session() as session:
             root_conversation_id: str | None = None
             if parent_conversation_id is not None:
-                parent_row = session.get(SqlConversation, parent_conversation_id)
+                parent_row = session.get(
+                    SqlConversation, (current_workspace_id(), parent_conversation_id)
+                )
                 if parent_row is None:
                     raise ConversationNotFoundError(
                         f"parent conversation {parent_conversation_id!r} does not exist"
@@ -2093,7 +2386,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_name=agent_name,
                 agent_bundle_location=agent_bundle_location,
                 agent_description=agent_description,
-                conversation_id=conversation_id,
                 now=now,
             )
             session.add(agent_row)
@@ -2209,7 +2501,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         now = now_epoch()
         with self._session() as session:
-            source = session.get(SqlConversation, source_conversation_id)
+            source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
             if source is None:
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
 
@@ -2231,8 +2523,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 id=new_conv_id,
                 created_at=now,
                 updated_at=now,
-                title=fork_title,
-                kind="default",
+                title=fork_title or "",  # None → empty string at DB layer
+                kind=encode_conversation_kind("default"),
                 # A fork is a fresh top-level conversation, so its
                 # root mirrors its own id (matches the
                 # ``_new_session_conversation_row`` invariant).
@@ -2265,6 +2557,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if up_to_response_id is not None:
                 cutoff_position = session.execute(
                     select(func.max(SqlConversationItem.position)).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == source_conversation_id,
                         SqlConversationItem.response_id == up_to_response_id,
                     )
@@ -2276,7 +2569,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 last_position = session.execute(
                     select(func.max(SqlConversationItem.position)).where(
-                        SqlConversationItem.conversation_id == source_conversation_id
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == source_conversation_id,
                     )
                 ).scalar_one()
                 truncated = cutoff_position < last_position
@@ -2285,7 +2579,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # the original chronological order.
             items_query = (
                 select(SqlConversationItem)
-                .where(SqlConversationItem.conversation_id == source_conversation_id)
+                .where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == source_conversation_id,
+                )
                 .order_by(SqlConversationItem.position.asc())
             )
             if cutoff_position is not None:
@@ -2293,7 +2590,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             source_items = session.execute(items_query).scalars().all()
 
             for pos, src_item in enumerate(source_items):
-                new_item_id = generate_item_id(src_item.type)
+                # src_item.type/status are int codes copied verbatim to the new
+                # row; only generate_item_id needs the decoded string type.
+                new_item_id = generate_item_id(decode_item_type(src_item.type))
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -2322,9 +2621,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             # Create/bind the fork's session-scoped agent atomically.
             if creating_clone:
-                # Mint the clone here so it's born with session_id set (never
-                # NULL) and rolls back with the fork on failure — never
-                # leaking as a phantom built-in.
+                # Mint the clone atomically with the fork so it rolls back
+                # with the fork on failure — never leaking as a phantom built-in.
                 assert (
                     agent_id is not None
                     and cloned_agent_name is not None
@@ -2336,16 +2634,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         agent_name=cloned_agent_name,
                         agent_bundle_location=cloned_agent_bundle_location,
                         agent_description=cloned_agent_description,
-                        conversation_id=new_conv.id,
                         now=now,
                     )
                 )
                 session.flush()
                 new_conv.agent_id = agent_id
             elif agent_id is not None:
-                agent_row = session.get(SqlAgent, agent_id)
-                if agent_row is not None:
-                    agent_row.session_id = new_conv.id
+                # Binding an existing (template) agent to the fork: the forward
+                # pointer conversations.agent_id is the sole link; no back-pointer
+                # to update.
+                new_conv.agent_id = agent_id
 
             # Copy labels from the source conversation, minus the
             # instance-scoped ones (native bridge ids, context metrics)
@@ -2441,26 +2739,21 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         now = now_epoch()
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 raise LookupError(f"conversation not found: {conversation_id!r}")
 
-            # Replace the session-scoped agent. Ordering matters for two
-            # constraints: (1) ``conversations.agent_id`` → ``agents.id`` is
-            # ON DELETE CASCADE, so deleting the old agent while the row still
-            # references it would cascade-delete the WHOLE conversation; null
-            # the reference first. (2) ``ix_agents_session_id`` is UNIQUE, so
-            # the old agent must be gone before the new one claims
-            # ``session_id``. Hence: null agent_id → delete old → insert new →
-            # repoint agent_id. The delete is guarded on
-            # ``session_id == conversation_id`` so a (mistakenly bound)
-            # built-in agent is never deleted.
+            # Null the forward pointer before deleting the old agent so
+            # SQLAlchemy's identity map doesn't hold a reference to a deleted
+            # row when it flushes. The DB no longer enforces any cascade here,
+            # but the ORM still tracks the relationship. Only delete
+            # session-scoped agents — template/built-in agents are shared.
             old_agent_id = row.agent_id
             row.agent_id = None
             session.flush()
             if old_agent_id is not None:
-                old_agent = session.get(SqlAgent, old_agent_id)
-                if old_agent is not None and old_agent.session_id == conversation_id:
+                old_agent = session.get(SqlAgent, (current_workspace_id(), old_agent_id))
+                if old_agent is not None and old_agent.kind == encode_agent_kind("session"):
                     session.delete(old_agent)
                     session.flush()
 
@@ -2469,7 +2762,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_name=new_agent_name,
                 agent_bundle_location=new_agent_bundle_location,
                 agent_description=new_agent_description,
-                conversation_id=conversation_id,
                 now=now,
             )
             session.add(new_agent)
@@ -2513,6 +2805,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if present_drop:
                 session.execute(
                     delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
                         SqlConversationLabel.conversation_id == conversation_id,
                         SqlConversationLabel.key.in_(present_drop),
                     )
@@ -2530,11 +2823,13 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
-        Delete a conversation, its items, related tasks, and FTS
-        records.
+        Delete a conversation and all of its descendants, cleaning up
+        every related row explicitly (no DB-level CASCADE).
 
-        Deletes in FK-safe order: tasks, FTS records, items,
-        then the conversation itself.
+        Collects the full subtree of conversation IDs (the target plus
+        all direct/indirect children), then deletes their items, labels,
+        comments, policies, and session-permission rows before deleting
+        the conversation rows themselves (children before parent).
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -2542,15 +2837,72 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``False`` otherwise.
         """
         with self._session() as session:
-            row = session.get(SqlConversation, conversation_id)
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return False
-            # Delete conversation items and FTS before the conversation row
-            # (FK constraints: items reference the conversation).
-            delete_fts_by_conversation(session, conversation_id)
+
+            # Collect all descendant IDs via a recursive CTE so we can
+            # clean up the full subtree in one pass.
+            cte = (
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+                .cte(name="subtree", recursive=True)
+            )
+            cte = cte.union_all(
+                select(SqlConversation.id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.parent_conversation_id == cte.c.id,
+                )
+            )
+            subtree_ids_rows = session.execute(select(cte.c.id)).fetchall()
+            subtree_ids = [r[0] for r in subtree_ids_rows]
+
+            # Delete per-conversation child rows for every conversation in
+            # the subtree before touching the conversation rows themselves.
+            for conv_id in subtree_ids:
+                delete_fts_by_conversation(session, conv_id)
+
             session.execute(
                 delete(SqlConversationItem).where(
-                    SqlConversationItem.conversation_id == conversation_id
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id.in_(subtree_ids),
+                )
+            )
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(subtree_ids),
+                )
+            )
+            session.execute(
+                delete(SqlComment).where(
+                    SqlComment.workspace_id == current_workspace_id(),
+                    SqlComment.conversation_id.in_(subtree_ids),
+                )
+            )
+            session.execute(
+                delete(SqlPolicy).where(
+                    SqlPolicy.workspace_id == current_workspace_id(),
+                    SqlPolicy.session_id.in_(subtree_ids),
+                )
+            )
+            session.execute(
+                delete(SqlSessionPermission).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id.in_(subtree_ids),
+                )
+            )
+
+            # Delete conversation rows children-first so any residual
+            # ordering constraints are satisfied.
+            session.execute(
+                delete(SqlConversation).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(subtree_ids),
+                    SqlConversation.id != conversation_id,
                 )
             )
             session.delete(row)

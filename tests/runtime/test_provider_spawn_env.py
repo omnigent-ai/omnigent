@@ -33,6 +33,7 @@ from omnigent.runtime.workflow import (
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
     _build_qwen_spawn_env,
+    _resolve_provider_for_build,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -287,6 +288,120 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+def test_codex_falls_back_to_first_available_openai_credential(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A configured-but-not-default openai credential routes the codex head at spawn.
+
+    The headline fix: a user who configured an openai-family credential via
+    ``omnigent setup`` (a Databricks workspace, or any key/gateway) but never
+    marked it ``default`` would otherwise launch Debby's GPT (codex) head with NO
+    credential — codex's own "Invalid API key". The spawn-env builder now falls
+    back to the first credential that can serve the head's family, so the head
+    launches. This lives in the RUNNER — every launch surface (CLI, web UI, a
+    remote host) funnels through the spawn-env build — and resolves per spawn:
+    nothing is written to the user's config.
+
+    HOME is isolated and OPENROUTER cleared so the only openai-family credential
+    in play is the configured-but-not-default one (no ambient login/key shadows
+    the fallback).
+    """
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = {
+        "providers": {
+            "vendor-openai": {  # configured, but NOT marked default
+                "kind": "key",
+                "openai": _key_family(
+                    "https://openai.example.com/v1",
+                    "sk-oai-secret",
+                    "gpt-default-model",
+                ),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    before = (config_home / "config.yaml").read_text()
+    spec = _make_spec(harness="codex")  # unpinned, no auth — like Debby's GPT head
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    # The fallback credentialed the head — full gateway wiring, same as a default.
+    assert env["HARNESS_CODEX_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == "https://openai.example.com/v1"
+    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    # Resolved per spawn — the user's config is NOT mutated (no default written).
+    assert (config_home / "config.yaml").read_text() == before
+    # The fallback is spawn-only: the readout-style resolver (flag off, the
+    # default) still returns nothing, so /model won't show an unchosen default.
+    assert _resolve_provider_for_build(spec, harness_type="codex") is None
+
+
+def test_claude_sdk_falls_back_to_first_available_anthropic_credential(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A configured-but-not-default anthropic credential routes the BRAIN head at spawn.
+
+    The brain-head counterpart to the codex fallback — Debby's Claude head /
+    Polly's claude-sdk brain, the most-used surface. With an anthropic
+    credential configured but never marked default, the spawn-env builder falls
+    back to it via the same `first_available_provider`, so the brain launches
+    instead of hitting api.anthropic.com with no key. Resolved per spawn; the
+    config is not mutated; the readout resolver (`for_launch=False`) still
+    returns `None`. HOME is isolated so a real CLI login can't shadow the test.
+    """
+    monkeypatch.setenv("HOME", str(config_home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = {
+        "providers": {
+            "vendor-anthropic": {  # configured, but NOT marked default
+                "kind": "key",
+                "anthropic": _key_family(
+                    "https://anthropic.example.com/v1",
+                    "sk-ant-secret",
+                    "claude-default-model",
+                ),
+            }
+        }
+    }
+    _write_config(config_home, config)
+    before = (config_home / "config.yaml").read_text()
+    spec = _make_spec(harness="claude-sdk")  # unpinned, no auth — like Debby's Claude head
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+    assert (config_home / "config.yaml").read_text() == before
+    assert _resolve_provider_for_build(spec, harness_type="claude-sdk") is None
+
+
+def test_for_launch_gates_legacy_databricks_synthesis(config_home: Path) -> None:
+    """
+    A legacy Databricks credential is folded into a synthesized provider only
+    for a launch.
+
+    A legacy ``executor.profile`` resolves to a synthesized ``databricks``
+    provider when ``for_launch=True`` (the spawn-env builders), but the readout
+    resolver (``for_launch=False``, the default — used by ``/model`` / cost)
+    returns ``None``. This locks the new gating so the readout never presents a
+    synthesized provider for a legacy profile the way a launch routes one.
+    """
+    _write_config(config_home, {})
+    spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
+
+    # Readout: strict — the legacy profile is NOT synthesized into a provider.
+    assert _resolve_provider_for_build(spec, harness_type="codex") is None
+    # Launch: the legacy profile resolves to a synthesized databricks provider.
+    launch = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+    assert launch is not None
+    assert launch.kind == "databricks"
+    assert launch.profile == "legacy-profile"
 
 
 def test_openai_agents_uses_openai_global_default(config_home: Path) -> None:
@@ -858,6 +973,28 @@ def test_legacy_profile_suppresses_global_default_provider(config_home: Path) ->
     assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
 
 
+def test_codex_spec_databricks_auth_routes_via_synthesized_provider(config_home: Path) -> None:
+    """
+    A spec ``executor.auth: {type: databricks}`` on codex routes via the
+    synthesized-provider path.
+
+    The codex / pi / qwen builders' legacy ``else``-branch was removed; a spec
+    ``DatabricksAuth`` now resolves (for a launch) to a synthesized
+    ``databricks`` provider that the one databricks apply branch wires. A
+    nonexistent profile keeps ucode a no-op, so this deterministically asserts
+    the gateway + profile wiring the fold owns (no ``~/.databrickscfg`` needed).
+    """
+    _write_config(config_home, {})
+    spec = _make_spec(harness="codex", auth=DatabricksAuth(profile="test-dbx-ws"))
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "test-dbx-ws"
+    # A databricks-kind provider delegates to ucode and never emits a raw base_url.
+    assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
+
+
 # ── cli-config kind: model_provider pinning ─────────────────────────────────
 
 
@@ -942,6 +1079,39 @@ def test_openai_agents_cli_config_default_fails_loud(config_home: Path) -> None:
 
     with pytest.raises(OmnigentError, match=r"cli-config.*codex"):
         _build_openai_agents_sdk_spawn_env(spec)
+
+
+def test_pi_cli_config_databricks_default_routes_gateway(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cli-config Databricks gateway default routes the pi (gateway) harness.
+
+    Unlike openai-agents (which fails loud), pi CAN consume a cli-config
+    Databricks AI Gateway — the gateway's Anthropic Messages surface is one Pi
+    speaks. The gateway-harness pi path must translate it into the
+    ``HARNESS_PI_GATEWAY_*`` transport (the same vars an inline gateway emits),
+    pointing at the gateway's ``/anthropic`` surface — NOT raise the
+    "can only drive the 'codex' harness" error.
+    """
+    _isolate_home_with_codex_config(config_home, monkeypatch)
+    _write_config(config_home, _cli_config_default_config())
+    spec = _make_spec(harness="pi")
+
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    # The gateway's codex /codex/v1 base_url is rewritten to the /anthropic
+    # surface Pi speaks natively, registered under pi's "claude" family key.
+    assert env["HARNESS_PI_GATEWAY_BASE_URLS"] == (
+        '{"claude": "https://example.ai-gateway.cloud.databricks.com/anthropic"}'
+    )
+    assert env["HARNESS_PI_GATEWAY_HOST"] == "https://example.ai-gateway.cloud.databricks.com"
+    # The bearer-token command comes from the codex [model_providers.X.auth]
+    # table (the "!" Pi-models.json prefix is stripped for the transport var).
+    # The fixture's [auth] declares command="jq" with no args, so it is "jq".
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "jq"
+    # Default model is the Databricks gateway default (no spec/override model).
+    assert env["HARNESS_PI_MODEL"] == "databricks-claude-sonnet-4-6"
 
 
 _DISMISSIBLE_CODEX_CONFIG_TOML = """

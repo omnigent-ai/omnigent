@@ -25,10 +25,12 @@ that would actually work.
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
@@ -40,13 +42,17 @@ from omnigent.onboarding.harness_install import (
     PI_KEY,
     QWEN_KEY,
     harness_cli_installed,
+    required_cli_for_harness,
 )
 from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
     GEMINI_FAMILY,
+    OPENAI_FAMILY,
     PI_SURFACE,
 )
+
+HarnessAvailability = bool | str
 
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
 # from ambient/spec sources the daemon can't see. Never gated. Includes both
@@ -185,6 +191,17 @@ def harness_is_configured(harness: str) -> bool:
         harness's binary is missing from ``PATH``.
     """
     canonical = _canonical_harness(harness)
+    if canonical == "acp":
+        # The generic ACP harness has no fixed binary — "configured" means at
+        # least one agent is registered in the ``acp:`` config block. Each
+        # agent's own binary is a soft PATH hint surfaced in setup, not a hard
+        # gate. A malformed block reads as not-configured rather than raising.
+        try:
+            from omnigent.onboarding.acp_auth import acp_agents
+
+            return bool(acp_agents())
+        except Exception:
+            return False
     if canonical in _SDK_HARNESSES:
         return True
     if canonical in _CURSOR_NATIVE_HARNESSES:
@@ -250,6 +267,9 @@ def harness_is_configured(harness: str) -> bool:
         and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
+        required_cli = required_cli_for_harness(canonical) or required_cli_for_harness(harness)
+        if required_cli is not None:
+            return shutil.which(required_cli.binary) is not None
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -267,20 +287,35 @@ def harness_is_configured(harness: str) -> bool:
     return True
 
 
-def configured_harness_map() -> dict[str, bool]:
+def _harness_availability(canonical: str) -> HarnessAvailability:
+    """Return picker-facing availability for one canonical harness spelling."""
+    if (
+        canonical in {"codex", "codex-native", "native-codex"}
+        and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
+    ):
+        from omnigent.codex_native import _codex_auth_unavailable_reason
+
+        return _codex_auth_unavailable_reason() or True
+    return harness_is_configured(canonical)
+
+
+def configured_harness_map() -> dict[str, HarnessAvailability]:
     """Return per-harness readiness for every accepted harness spelling.
 
     Built so the server/web UI can do a plain dict lookup with whatever
     spelling it holds — canonical ids, executor-type spellings, the
     ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
     ``True`` (never gated); CLI-wrapping harnesses map to whether their
-    binary is on ``PATH``.
+    binary is on ``PATH``. Codex entries use a structured string reason when
+    unavailable: ``"binary-missing"`` or ``"needs-auth"``.
 
     :returns: Mapping of harness spelling to readiness, e.g.
-        ``{"claude-native": False, "codex-native": False,
+        ``{"claude-native": False, "codex-native": "needs-auth",
         "claude-sdk": True, "openai-agents": True, "pi": True, "qwen": True}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
+    spellings.update(valid_harnesses())
+    spellings.update(harness_install_keys())
     spellings.update(_EXECUTOR_TYPE_HARNESS_ALIASES)
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
@@ -296,4 +331,6 @@ def configured_harness_map() -> dict[str, bool]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    return {spelling: harness_is_configured(spelling) for spelling in spellings}
+    return {
+        spelling: _harness_availability(_canonical_harness(spelling)) for spelling in spellings
+    }

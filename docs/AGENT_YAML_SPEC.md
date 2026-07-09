@@ -69,7 +69,10 @@ id (e.g. `auto`, `gpt-5`) rather than a `databricks-*` id.
 The `kiro-native` harness is the native Kiro CLI terminal path used by
 `omnigent kiro`. It requires `kiro-cli` on `PATH` and Kiro's own login/auth; it
 does not use Databricks, OpenAI, or Anthropic provider credentials. Plain
-`harness: kiro` is not a generic Omnigent harness id.
+`harness: kiro` is not a generic Omnigent harness id. Kiro's TUI remains the
+authoritative approval surface; supported one-time tool approvals can also be
+mirrored into Chat cards, while persistent trust choices remain explicit Kiro
+TUI/flag actions. See `kiro-native-elicitation.md`.
 
 ### Antigravity (Gemini)
 
@@ -187,27 +190,6 @@ os_env:
 
 Prefer the narrowest filesystem and network access that supports the task. Do
 not pass secrets through the environment unless the tool genuinely needs them.
-
-### Remote sandbox (`type: createos`)
-
-Run file I/O and shell commands inside a remote CreateOS sandbox VM instead of
-local helper subprocesses. Omnigent provisions the VM on first use and destroys
-it on close.
-
-```yaml
-os_env:
-  type: createos
-  cwd: /root          # working dir inside the VM (default: /root)
-  shape: s-4vcpu-4gb  # VM size (default: s-4vcpu-4gb)
-  rootfs: ubuntu-22.04 # optional root filesystem image
-  # api_key / base_url fall back to env vars when omitted:
-  #   CREATEOS_API_KEY   (required)
-  #   CREATEOS_BASE_URL  (default: https://api.sb.createos.sh)
-```
-
-The API key is required; supply it via `os_env.api_key` or the
-`CREATEOS_API_KEY` environment variable. The `sandbox:` block does not apply to
-`type: createos` — isolation is provided by the remote VM.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS), so the

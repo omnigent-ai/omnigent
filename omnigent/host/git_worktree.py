@@ -171,6 +171,80 @@ def _main_work_tree(repo_path: str) -> str:
     raise WorktreeError(f"could not resolve main work tree for {repo_path}")
 
 
+@dataclass
+class WorktreeInfo:
+    """One entry from ``git worktree list``.
+
+    :param path: Absolute worktree directory, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param branch: Checked-out branch without the ``refs/heads/``
+        prefix, e.g. ``"feature/login"``. ``None`` when the worktree
+        is in detached-HEAD state.
+    :param is_main: ``True`` for the repository's main work tree (the
+        first ``git worktree list`` record), ``False`` for linked
+        worktrees.
+    :param detached: ``True`` when the worktree has a detached HEAD
+        (no branch checked out).
+    """
+
+    path: str
+    branch: str | None
+    is_main: bool
+    detached: bool
+
+
+def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
+    """List the git worktrees of the repository containing ``repo_path``.
+
+    Resolves the main work tree first (so a linked worktree resolves the
+    same list as the main checkout), then parses
+    ``git worktree list --porcelain``. The first record is always the
+    main work tree; the rest are linked worktrees.
+
+    :param repo_path: Absolute path inside a git repository — the
+        directory the user picked, e.g. ``"/Users/alice/myrepo"``.
+    :returns: One :class:`WorktreeInfo` per worktree, main first.
+    :raises WorktreeError: If ``repo_path`` is not a directory or not
+        inside a git work tree, or if ``git worktree list`` fails.
+    """
+    repo_root = _main_work_tree(repo_path)
+    result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
+    if result.returncode != 0:
+        raise _git_error("git worktree list failed", result)
+
+    worktrees: list[WorktreeInfo] = []
+    path: str | None = None
+    branch: str | None = None
+    detached = False
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree ") :].strip()
+            branch = None
+            detached = False
+        elif line.startswith("branch "):
+            ref = line[len("branch ") :].strip()
+            branch = ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
+        elif line == "detached":
+            detached = True
+        elif line == "" and path is not None:
+            # Blank line terminates a record.
+            worktrees.append(
+                WorktreeInfo(
+                    path=path,
+                    branch=branch,
+                    is_main=not worktrees,
+                    detached=detached,
+                )
+            )
+            path = None
+    # The porcelain output may omit a trailing blank line for the last record.
+    if path is not None:
+        worktrees.append(
+            WorktreeInfo(path=path, branch=branch, is_main=not worktrees, detached=detached)
+        )
+    return worktrees
+
+
 def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     """Return whether a local branch already exists in the repo.
 
