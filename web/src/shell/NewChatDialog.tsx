@@ -68,7 +68,7 @@ import {
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
-import { readDefaultBaseBranch, subscribeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1692,8 +1692,6 @@ type LandingDraft = {
   sandboxRepoBranch: string;
   workspace: string;
   branchName: string;
-  baseBranch: string;
-  baseBranchEdited: boolean;
   prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
@@ -1861,24 +1859,12 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
-  // The base branch follows the user's configured default (Settings › Git)
-  // until they type their own value — only then does it pin. This flag tracks
-  // that hand-off so an auto-filled default isn't preserved across an unmount
-  // as if it were a deliberate choice (which would ignore a later change or
-  // clear of the setting).
-  const [baseBranchEdited, setBaseBranchEdited] = useState<boolean>(
-    () => landingDraft?.baseBranchEdited ?? false,
-  );
-  // Seed a user-edited base branch from the draft; otherwise mirror the live
-  // default. With no default set the field stays blank, so a new worktree
-  // branches off the current branch.
-  const [baseBranch, _setBaseBranch] = useState<string>(() =>
-    landingDraft?.baseBranchEdited ? landingDraft.baseBranch : (readDefaultBaseBranch() ?? ""),
-  );
-  const setBaseBranch = useCallback((next: string) => {
-    _setBaseBranch(next);
-    setBaseBranchEdited(true);
-  }, []);
+  // The base branch is NOT preserved across worktree-dropdown opens: every time
+  // the popover opens it's re-seeded from the configured default (Settings ›
+  // Git), or left blank when none is set (see the popover's onOpenChange). The
+  // user can still override it for the current open; that edit is intentionally
+  // forgotten on the next open.
+  const [baseBranch, setBaseBranch] = useState<string>("");
   // Branch prefilled from the existing worktree the current workspace points
   // at. When `branchName` still equals this, the session starts directly in
   // that worktree (no git opts). Editing the field away from it means the user
@@ -1980,8 +1966,6 @@ export function NewChatLandingScreen() {
     sandboxRepoBranch,
     workspace,
     branchName,
-    baseBranch,
-    baseBranchEdited,
     prefilledBranch,
     permissionMode,
     approvalMode,
@@ -2279,17 +2263,6 @@ export function NewChatLandingScreen() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeWorktree?.path]);
-  // Live-follow the configured default (Settings › Git) while the user hasn't
-  // taken over the field: an edit sets `baseBranchEdited` and stops the sync,
-  // so a typed value is never overwritten. This keeps the field current when
-  // the setting changes while the composer stays mounted (a same-tab change
-  // fires no `storage` event, hence the custom subscription).
-  useEffect(() => {
-    if (baseBranchEdited) return;
-    return subscribeDefaultBaseBranch(() => {
-      _setBaseBranch(readDefaultBaseBranch() ?? "");
-    });
-  }, [baseBranchEdited]);
   // True when the session should start directly in the existing worktree:
   // the workspace is a worktree and the branch field still holds its
   // prefilled branch (the user hasn't edited it to request a new worktree).
@@ -3441,7 +3414,16 @@ export function NewChatLandingScreen() {
               {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}
               {!sandboxSelected && (
-                <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
+                <Popover
+                  open={worktreePopoverOpen}
+                  onOpenChange={(open) => {
+                    // Re-seed the base branch from the configured default every
+                    // time the dropdown opens (or blank when none). The field
+                    // never remembers a value typed in a previous open.
+                    if (open) setBaseBranch(readDefaultBaseBranch() ?? "");
+                    setWorktreePopoverOpen(open);
+                  }}
+                >
                   <PopoverTrigger asChild>
                     <button
                       type="button"

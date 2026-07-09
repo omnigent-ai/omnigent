@@ -1051,156 +1051,97 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.getByTestId("new-chat-landing-base-branch-input")).toBeInTheDocument();
   });
 
-  it("auto-fills the base branch from the stored default when a branch is named", () => {
-    // A default configured in Settings › Git pre-fills the base-branch field
-    // the moment the user names a new worktree branch.
-    localStorage.setItem("omnigent:default-base-branch", "main");
-    renderLanding();
-    openWorktree();
-    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-      target: { value: "feature/login" },
-    });
-    const baseInput = screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement;
-    expect(baseInput.value).toBe("main");
-  });
-
-  it("leaves the base branch blank when no default is stored", () => {
-    // Without a stored default the field stays empty, so the worktree branches
-    // off the current HEAD unless the user types a base themselves.
-    renderLanding();
-    openWorktree();
-    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-      target: { value: "feature/login" },
-    });
-    const baseInput = screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement;
-    expect(baseInput.value).toBe("");
-  });
-
-  it("stops auto-filling once the default is cleared, even after an unmount", () => {
-    // Regression: the composer snapshots its fields on unmount (landingDraft).
-    // An auto-filled default must NOT be preserved as if the user chose it —
-    // otherwise clearing the setting leaves the stale value auto-filling.
-    localStorage.setItem("omnigent:default-base-branch", "main");
-    renderLanding();
-    openWorktree();
-    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-      target: { value: "feature/login" },
-    });
-    expect(
-      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
-    ).toBe("main");
-
-    // Navigate away (unmount snapshots the draft), then clear the setting.
-    cleanup();
-    localStorage.removeItem("omnigent:default-base-branch");
-
-    // Back on the composer: the field must now be blank, not the stale "main".
-    renderLanding();
-    openWorktree();
-    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-      target: { value: "feature/login" },
-    });
-    expect(
-      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
-    ).toBe("");
-  });
-
-  it("preserves a user-typed base branch across an unmount", () => {
-    // The counterpart to the regression above: a base the user typed IS a
-    // deliberate choice and must survive a nav-away, independent of the setting.
-    renderLanding();
-    openWorktree();
-    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-      target: { value: "feature/login" },
-    });
-    fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
-      target: { value: "release/2.0" },
-    });
-
-    cleanup();
-
-    renderLanding();
-    openWorktree();
-    // branchName was also drafted, so the base field is visible immediately.
-    expect(
-      (screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement).value,
-    ).toBe("release/2.0");
-  });
-
-  // The four rules governing how the Settings › Git default interacts with the
-  // base-branch field while the composer is mounted. `changeSetting` drives the
-  // change through the real writer the Settings page calls, so the same-tab
-  // change notification path is exercised end to end.
-  describe("base-branch default vs. the settings value", () => {
+  // The base-branch field is re-seeded from the Settings › Git default every
+  // time the worktree dropdown opens (or left blank when none is set). It never
+  // remembers a value typed in a previous open — within one open the user can
+  // override it freely, but reopening discards that and shows the setting again.
+  describe("base-branch field seeding", () => {
     const baseInput = () =>
       screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement;
     const nameBranch = () =>
       fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
         target: { value: "feature/login" },
       });
-    const changeSetting = (value: string) => act(() => writeDefaultBaseBranch(value));
+    // The chip toggles the popover; a second click closes it, a third reopens.
+    const toggleWorktree = () =>
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
 
-    // Rule 1: nothing in settings → no auto-fill; the user can type freely and
-    // it doesn't leak anywhere.
-    it("does not auto-fill when nothing is set, and lets the user type freely", () => {
+    it("auto-fills from the stored default when the dropdown opens", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      expect(baseInput().value).toBe("main");
+    });
+
+    it("leaves the field blank when no default is stored, and lets the user type", () => {
       renderLanding();
       openWorktree();
       nameBranch();
       expect(baseInput().value).toBe("");
 
+      // The user can type freely; it doesn't touch the setting.
       fireEvent.change(baseInput(), { target: { value: "whatever" } });
       expect(baseInput().value).toBe("whatever");
-      // The setting is untouched by typing in the composer.
       expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
     });
 
-    // Rule 2: user already filled a base → updating the setting must NOT change
-    // the already-filled value.
-    it("keeps a user-filled base when the setting is updated afterward", () => {
+    it("discards a typed value and re-shows the default on reopen", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      // Override the seeded default for this open...
+      fireEvent.change(baseInput(), { target: { value: "release/2.0" } });
+      expect(baseInput().value).toBe("release/2.0");
+
+      // ...close and reopen: the field is re-seeded from the setting, NOT the
+      // value typed last time.
+      toggleWorktree();
+      toggleWorktree();
+      expect(baseInput().value).toBe("main");
+    });
+
+    it("re-shows blank on reopen when the default has since been cleared", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      expect(baseInput().value).toBe("main");
+
+      // Clear the setting (as the Settings page would), then reopen.
+      act(() => writeDefaultBaseBranch(""));
+      toggleWorktree();
+      toggleWorktree();
+      expect(baseInput().value).toBe("");
+    });
+
+    it("picks up a changed default on the next open", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      nameBranch();
+      expect(baseInput().value).toBe("main");
+
+      act(() => writeDefaultBaseBranch("develop"));
+      toggleWorktree();
+      toggleWorktree();
+      expect(baseInput().value).toBe("develop");
+    });
+
+    it("does not remember a typed value across an unmount", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
       renderLanding();
       openWorktree();
       nameBranch();
       fireEvent.change(baseInput(), { target: { value: "release/2.0" } });
 
-      changeSetting("develop");
-      expect(baseInput().value).toBe("release/2.0");
-    });
-
-    // Rule 3: branch named but base left empty → updating the setting auto-fills
-    // the base, and the user can still modify it.
-    it("auto-fills an empty base when the setting is updated, still user-editable", () => {
+      // Navigate away and back: the field seeds from the setting, not the draft.
+      cleanup();
       renderLanding();
       openWorktree();
       nameBranch();
-      expect(baseInput().value).toBe("");
-
-      changeSetting("develop");
-      expect(baseInput().value).toBe("develop");
-
-      // The user can still override the just-filled value.
-      fireEvent.change(baseInput(), { target: { value: "custom" } });
-      expect(baseInput().value).toBe("custom");
-    });
-
-    // Rule 4: once the user has changed the base at all, later setting changes
-    // must never touch it — even if they blank it back out themselves.
-    it("never overwrites the base after the user has edited it", () => {
-      localStorage.setItem("omnigent:default-base-branch", "main");
-      renderLanding();
-      openWorktree();
-      nameBranch();
-      // Starts auto-filled from the default...
       expect(baseInput().value).toBe("main");
-
-      // ...but once the user edits it, the field is theirs.
-      fireEvent.change(baseInput(), { target: { value: "custom" } });
-      changeSetting("develop");
-      expect(baseInput().value).toBe("custom");
-
-      // Even clearing it themselves doesn't re-arm auto-fill.
-      fireEvent.change(baseInput(), { target: { value: "" } });
-      changeSetting("release/3.0");
-      expect(baseInput().value).toBe("");
     });
   });
 
