@@ -1130,7 +1130,7 @@ async def _auto_create_opencode_terminal(
     # through Omnigent's policy engine via the forwarder's permission gate —
     # opencode's enforcement is reactive (no pre-tool hook), so "ask" is what
     # makes the policy verdicts apply to MCP (and other) tools.
-    mcp_block = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
+    mcp_block = build_opencode_mcp_block(_native_mcp_servers_from_spec(agent_spec))
     if server_client is not None and ensure_comment_relay is not None:
         mcp_block.update(build_opencode_omnigent_mcp_server(bridge_dir))
     if mcp_block:
@@ -1554,9 +1554,12 @@ def _opencode_native_profile_from_spec(agent_spec: Any | None) -> str | None:
         return None
 
 
-def _opencode_native_mcp_servers_from_spec(agent_spec: Any | None) -> list[Any]:
+def _native_mcp_servers_from_spec(agent_spec: Any | None) -> list[Any]:
     """
     Return the resolved agent spec's MCP server declarations (or empty).
+
+    Shared by the opencode-native and claude-native launch paths, which each
+    register these servers in their harness's own MCP config.
 
     :param agent_spec: Optional resolved agent spec.
     :returns: The spec's ``mcp_servers`` list, or ``[]``.
@@ -5737,6 +5740,9 @@ async def _auto_create_claude_terminal(
         agent_name=agent_name,
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        # Register the agent's declared MCP servers in Claude's --mcp-config so
+        # the native process connects to them directly (parity with opencode).
+        mcp_servers=_native_mcp_servers_from_spec(agent_spec),
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
