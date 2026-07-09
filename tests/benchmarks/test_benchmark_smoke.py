@@ -111,6 +111,34 @@ def test_build_report_shape() -> None:
     assert "list_sessions" in _d(report["journeys"])
 
 
+# ── per-journey iteration cap (no server) ────────────────────
+
+
+def test_effective_iterations_clamps_capped_journey() -> None:
+    """A journey with ``max_iterations`` clamps a larger request down, not up."""
+    capped = ALL_JOURNEYS["session_cold_start"]
+    assert capped.max_iterations is not None
+    # Requesting more than the cap is clamped to the cap; less is left alone.
+    assert bench_run._effective_iterations(capped, 200) == capped.max_iterations
+    assert bench_run._effective_iterations(capped, 1) == 1
+
+
+def test_effective_iterations_uncapped_journey_passthrough() -> None:
+    """An HTTP journey (no cap) uses the requested count verbatim."""
+    uncapped = ALL_JOURNEYS["list_sessions"]
+    assert uncapped.max_iterations is None
+    assert bench_run._effective_iterations(uncapped, 200) == 200
+
+
+def test_runner_journeys_are_capped() -> None:
+    """Every full-turn journey caps its iterations; HTTP journeys do not."""
+    for journey in ALL_JOURNEYS.values():
+        if journey.needs_runner:
+            assert journey.max_iterations is not None, journey.name
+        else:
+            assert journey.max_iterations is None, journey.name
+
+
 # ── end-to-end smoke (boots the server) ──────────────────────
 
 

@@ -64,6 +64,11 @@ class Journey:
     :param needs_runner: Whether this journey drives a full agent turn and so
         requires ``BenchEnvironment(with_runner=True)`` (mock LLM + runner).
         HTTP/DB journeys leave this ``False``.
+    :param max_iterations: Upper bound on latency iterations for this journey,
+        clamping ``--iterations`` down (never up). Full-turn journeys cost ~1s+
+        per op, so 100+ iterations would blow the CI time budget; they cap at a
+        few samples per run and lean on ``--runs`` for repeats. ``None`` (HTTP
+        journeys) means no cap.
     :param description: Human-readable one-liner for ``--list``.
     """
 
@@ -74,6 +79,7 @@ class Journey:
     teardown: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     concurrency_safe: bool = False
     needs_runner: bool = False
+    max_iterations: int | None = None
     description: str = ""
 
     async def run_setup(self, env: BenchEnvironment) -> JourneyContext:
@@ -259,6 +265,13 @@ async def _measure_load_history(env: BenchEnvironment, ctx: JourneyContext) -> N
 _TURN_REPLY = "Hello there, this is a mock benchmark reply."
 _TURN_PROMPT = "Say hello."
 
+# Iteration cap for full-turn journeys. At ~1s+ per turn, matching the HTTP
+# journeys' iteration count would overrun the CI time budget, so we take a few
+# samples per run and lean on --runs for repeats. Sessions accumulate across a
+# run (a cold start never deletes its session), so a small count also keeps that
+# drift negligible.
+_RUNNER_MAX_ITERATIONS = 5
+
 
 async def _setup_turn_agent(env: BenchEnvironment, *, stream: bool = False) -> str:
     """Register the agent + a reset-surviving reply; return the agent id.
@@ -377,6 +390,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_session_cold_start,
             setup=_setup_turn_agent,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Create+bind a fresh session and drive its first turn to idle.",
         ),
         Journey(
@@ -385,6 +399,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_warm_turn,
             setup=_setup_warm_session,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Drive a turn on an already-warm session (steady-state overhead).",
         ),
         Journey(
@@ -393,6 +408,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_time_to_first_token,
             setup=_setup_streaming_session,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Post a turn; time to the first streamed output_text delta.",
         ),
         Journey(
@@ -401,6 +417,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_interrupt,
             setup=_setup_interrupt_session,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Interrupt a running (gated) turn; time to cancellation.",
         ),
     )

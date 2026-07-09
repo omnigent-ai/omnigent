@@ -67,6 +67,18 @@ def _backend_of(database_uri: str | None) -> str:
     return "other"
 
 
+def _effective_iterations(journey: Journey, requested: int) -> int:
+    """Clamp *requested* iterations down to the journey's ``max_iterations``.
+
+    Full-turn journeys cost ~1s+ per op and cap themselves so a large
+    ``--iterations`` (tuned for the millisecond HTTP journeys) doesn't overrun
+    the CI time budget. The cap only ever lowers the count, never raises it.
+    """
+    if journey.max_iterations is not None:
+        return min(requested, journey.max_iterations)
+    return requested
+
+
 async def _run_journey(
     journey: Journey, env: BenchEnvironment, args: argparse.Namespace
 ) -> tuple[str, list[RunResult]]:
@@ -76,6 +88,7 @@ async def _run_journey(
     concurrency-safe; otherwise as sequential latency.
     """
     as_throughput = args.concurrency > 1 and journey.concurrency_safe
+    iterations = _effective_iterations(journey, args.iterations)
     results: list[RunResult] = []
     for _ in range(args.runs):
         if as_throughput:
@@ -90,7 +103,7 @@ async def _run_journey(
             )
         else:
             results.append(
-                await run_latency(journey, env, iterations=args.iterations, warmup=args.warmup)
+                await run_latency(journey, env, iterations=iterations, warmup=args.warmup)
             )
     return ("throughput" if as_throughput else "latency"), results
 

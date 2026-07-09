@@ -1,4 +1,4 @@
-name: Performance Benchmark
+name: Benchmark
 
 # Nightly run of the HTTP user-journey performance benchmark
 # (dev/benchmarks/omnigent). Seeds a sizeable corpus, boots a real server
@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       iterations:
-        description: "Sequential operations per latency run"
+        description: "Requests per run"
         required: false
-        default: "200"
+        default: "100"
       runs:
         description: "Timed runs per journey"
         required: false
@@ -32,7 +32,7 @@ on:
       items_per_session:
         description: "Seeded items per session"
         required: false
-        default: "50"
+        default: "200"
 
 permissions:
   contents: read
@@ -43,10 +43,10 @@ env:
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
-  ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '200' }}
+  ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '100' }}
   RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
   SESSIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.sessions || '5000' }}
-  ITEMS: ${{ github.event_name == 'workflow_dispatch' && inputs.items_per_session || '50' }}
+  ITEMS: ${{ github.event_name == 'workflow_dispatch' && inputs.items_per_session || '200' }}
 
 concurrency:
   # Never cancel a scheduled run mid-flight (each is a distinct data point);

@@ -69,6 +69,14 @@ These drive a real agent turn end-to-end — `POST …/events` → server → **
 → in-process executor → mock LLM → stream back → `idle`. Selecting any of them
 boots `BenchEnvironment(with_runner=True)` automatically.
 
+Each turn costs ~1 s+ (vs. the millisecond HTTP journeys), so these journeys
+cap their latency iterations (`Journey.max_iterations`, currently 5) — a large
+`--iterations` tuned for the HTTP journeys is clamped down for them so the run
+stays within the CI time budget, with `--runs` providing the repeats. The cap
+only lowers the count, never raises it. A cold start never deletes its session,
+so sessions accumulate across a run; keeping the count small also keeps that
+drift negligible (~2 ms/turn).
+
 | Journey | Operation timed |
 | --- | --- |
 | `session_cold_start` | Create+bind a fresh session and drive its first turn to `idle` (runner spawn + executor construction + turn) |
