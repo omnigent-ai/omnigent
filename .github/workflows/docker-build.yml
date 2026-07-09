@@ -9,12 +9,11 @@
 # common breakage without paying for the host/openshell/kubernetes variants or
 # the emulated arm64 leg.
 #
-# Report-only for now: this check is NOT in .github/scripts/merge-ready/
-# required.sh, so it shows on every PR but does not block merge. Once its timing
-# and reliability are proven, promote it to blocking by adding "Docker build" to
-# REQUIRED (and ALLOW_SKIP, since the paths filter can legitimately skip it) in
-# required.sh, and add the `"Docker build"* ) echo "Docker build" ;;` arm to
-# workflow_for() there.
+# Blocking merge-gate check: "Docker build" is in the REQUIRED list in
+# .github/scripts/merge-ready/required.sh. Because of the paths filter below it
+# can legitimately be absent (a PR touching nothing in the image), so it is also
+# in ALLOW_SKIP with a workflow_for() arm, and this workflow's name is in
+# merge-ready.yml's workflow_run list so the gate re-evaluates when it completes.
 name: Docker build
 
 on:
