@@ -555,12 +555,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             {selectionMode ? (
               <BulkActionBar
                 selectedIds={selectedIds}
-                allConversations={(conversationsQuery.data?.pages ?? []).flatMap(
-                  (page) => page.data,
-                )}
-                onSelectAll={() =>
-                  selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
-                }
+                allConversations={visibleConversations}
+                onSelectAll={() => selectAll(visibleConversations)}
                 onDeselectAll={deselectAll}
                 onClear={deselectAll}
                 onExit={exitSelectionMode}
@@ -1265,6 +1261,20 @@ function ConversationList({
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
+  }, [sections, effectiveCollapsedSections, expandedProjects]);
+  // The same visible set as orderedConversationIds, but returns full
+  // Conversation objects for BulkActionBar's select-all / count logic.
+  const visibleConversations = useMemo(() => {
+    const visible = (title: string, list: readonly Conversation[]) =>
+      effectiveCollapsedSections.includes(title) ? [] : [...list];
+    const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
+    const projectVisible = (name: string, list: readonly Conversation[]) =>
+      !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
+    return [
+      ...visible("Pinned", sections.pinned),
+      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...visible("Chats", sections.sessions),
+    ];
   }, [sections, effectiveCollapsedSections, expandedProjects]);
   // Getter that builds the shift-select visible order on demand (at click
   // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
