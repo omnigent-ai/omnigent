@@ -104,6 +104,26 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * setup page, so a connected server can't repoint the CLI at an arbitrary one.
    */
   resetCliPath: () => ipcRenderer.invoke("omnigent:cli-reset-path"),
+  updates: {
+    getConfig: () => ipcRenderer.invoke("omnigent:get-update-config"),
+    getStatus: () => ipcRenderer.invoke("omnigent:get-update-status"),
+    check: () => ipcRenderer.invoke("omnigent:update-check"),
+    download: () => ipcRenderer.invoke("omnigent:update-download"),
+    installNow: () => ipcRenderer.invoke("omnigent:update-install"),
+    setConfig: (patch) => ipcRenderer.invoke("omnigent:set-update-config", patch),
+    /**
+     * Subscribe to update status changes. The renderer should read getStatus()
+     * first to replay any startup event that fired before subscription.
+     * Returns an unsubscribe function.
+     * @param {(status: unknown) => void} callback
+     * @returns {() => void}
+     */
+    onStatus: (callback) => {
+      const listener = (_event, status) => callback(status);
+      ipcRenderer.on("omnigent:update-status", listener);
+      return () => ipcRenderer.removeListener("omnigent:update-status", listener);
+    },
+  },
 });
 
 // Setup-page bridge: persist + navigate to a server URL, and read the saved

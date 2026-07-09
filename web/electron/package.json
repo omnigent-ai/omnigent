@@ -45,6 +45,7 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icons/icon.icns",
+      "artifactName": "${productName}-${version}-${arch}-mac.${ext}",
       "identity": "Databricks, Inc. (8RMX4WU6F8)",
       "provisioningProfile": "signing/omnigent.provisionprofile",
       "hardenedRuntime": true,
@@ -59,6 +60,12 @@
       "target": [
         "dmg",
         "zip"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/mac/"
+        }
       ]
     },
     "dmg": {
@@ -88,16 +95,29 @@
       "target": [
         "AppImage",
         "deb"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/linux/"
+        }
       ]
     },
     "win": {
       "icon": "icons/icon.ico",
       "target": [
         "nsis"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/win/"
+        }
       ]
     }
   },
   "dependencies": {
+    "electron-updater": "^6.3.9",
     "js-yaml": "^4.2.0"
   }
 }
