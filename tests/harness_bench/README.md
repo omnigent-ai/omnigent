@@ -94,9 +94,11 @@ A profile's `transport` field is the harness *family* marker, not the literal
 driver the run uses:
 
 - **SDK-family** harnesses default to **`full-server`** -- the fullest
-  coverage, and a strict superset of what `sdk-inproc` observes (everything
-  sdk-inproc does, plus Tool calling + Policy DENY as server-dispatched,
-  policy-gated calls). `--fast` opts them down to `sdk-inproc`.
+  coverage, and a superset of what `sdk-inproc` observes: it drives every
+  dimension through the real server API the web UI uses, and adds Policy DENY
+  (a server-dispatched builtin under a spec-baked deny policy), which the
+  wrap-direct `sdk-inproc` path cannot see. `--fast` opts them down to
+  `sdk-inproc` (Policy DENY then reports `·`; see "What a ✓ actually means").
 - **native** harnesses use `native-tui` (a resident vendor CLI in a
   runner-owned tmux pane); `--fast` does not apply.
 - `--transport NAME` overrides the family default for any harness.
@@ -120,22 +122,63 @@ Each cell is a verdict: **✓** works, **✗** doesn't, **·** couldn't be teste
 here (see below), **!!** the harness *declared* it works but the probe observed
 otherwise (drift).
 
-A `·` always means "the bench did not measure this here", never "the harness
-lacks it". In particular Tool calling and Policy DENY only get a real verdict
-on `full-server` (a server-dispatched builtin under a spec-baked deny policy),
-so they show `·` on `sdk-inproc` and `native-tui`:
+## What a ✓ actually means (read before trusting a green cell)
 
-- **Native harnesses show `·` for Tool calling / Policy DENY, and that is not a
-  native limitation.** Native harnesses do call tools and enforce permissions;
-  the bench just cannot observe it on `native-tui` yet. A native tool call is
-  the vendor's own tool (Bash/Read/...), not a server-dispatched builtin the
-  bench can force, and a native deny is a vendor permission decision, not a
-  server-side policy evaluation the probe can assert against. Giving those two
-  cells a real verdict needs new driver work (an open item), not a change to
-  the harnesses.
-- **SDK harnesses show `·` only under `--fast`** (the wrap-direct `sdk-inproc`
-  path has no tool-call policy hook); the default `full-server` run proves both
-  as `✓`. That is why full-server is the SDK default.
+A ✓ is only as strong as the *layer the probe drove it through*, and that layer
+depends on the transport. There are three:
+
+- **`full-server`** (SDK-family default) and **`native-tui`** (native default)
+  both drive a turn through a **real Omnigent server + runner over the same HTTP
+  API the web UI uses** -- `POST /v1/sessions/{id}/events` to send and
+  `GET /v1/sessions/{id}/stream` (SSE) to observe. So a ✓ here means the
+  capability works end-to-end through the **exact server contract the browser
+  depends on** -- real server, real runner, real harness subprocess.
+- **`sdk-inproc`** (only under `--fast`) drives the **harness *wrap* subprocess
+  directly**, bypassing the server + runner. A ✓ here means "the harness wrap
+  can do it", *not* "it works through the deployed server path the web UI hits".
+  This is the documented trade-off of `--fast`, and why full-server is the SDK
+  default.
+
+**The one caveat that applies to every transport:** the bench is a *headless
+HTTP client* of that API. It validates the server-side contract the web UI
+consumes (endpoints accept the turn, the harness runs it, the right SSE events
+flow) -- it does **not** run the browser / React layer, so it cannot catch a UI
+that mis-*renders* a correct event. For "does the pixel show up", that is the
+Playwright `tests/e2e_ui/` suite, not this bench.
+
+### Per-dimension, per-transport: what a ✓ verifies
+
+Rows are the P0 dimensions; columns are the three transports. "server API"
+(full-server / native-tui) means the ✓ was observed over the same
+`/v1/sessions/...` surface the web UI uses; "wrap" (sdk-inproc, `--fast`) means
+it was observed at the harness-wrap boundary, below the server.
+
+| Dimension | `full-server` (SDK default) | `native-tui` (native default) | `sdk-inproc` (`--fast`) |
+| --- | --- | --- | --- |
+| **Basic turn** | ✓ = turn completes over the server API | ✓ = turn completes over the server API | ✓ = turn completes at the wrap (no server) |
+| **Streaming** | ✓ = token deltas seen on the server SSE stream | ✓ = token deltas seen on the server SSE stream | ✓ = deltas seen on the wrap SSE (no server) |
+| **Tool calling** | ✓ = a server-dispatched builtin call was made + turn closed | ✓ = the vendor's own tool call surfaced as a server `function_call` item | ✓ = a request-level tool call surfaced at the wrap |
+| **Policy DENY** | ✓ = a spec-baked `tool_call` deny policy blocked the call | ✓ = a session-attached CEL deny fired `response.policy_denied` | `·` = the wrap path has no server-side policy hook |
+| **Model override** | ✓ = the requested model was the one used | ✓ = the requested model was the one used | ✓ = the requested model was the one used |
+| **Interrupt** | ✓ = a mid-turn cancel stopped the turn (server marker) | ✓ = a mid-turn cancel surfaced `session.interrupted` | ✓ = a mid-turn cancel stopped the wrap turn |
+
+So for the harnesses users actually reach through the web UI (SDK on
+`full-server`, natives on `native-tui`), **a ✓ does mean the capability works
+end-to-end through the server API the UI relies on** -- minus the browser render
+layer. The only cell that reads `·` purely for a transport reason is Policy DENY
+under `--fast`; drop `--fast` (the default) and it becomes a real `✓`.
+
+### Why a `·` appears
+
+A `·` always means "the bench did not measure this *here*", never "the harness
+lacks it". Two causes:
+
+- **Transport can't observe it** -- Policy DENY under `--fast` (the wrap path has
+  no server-side policy hook). Run without `--fast` for a real verdict.
+- **The run diagnosed a clean skip** -- e.g. the model never reached for the
+  offered tool (Tool calling / Policy DENY can't be judged if no call happened),
+  a vendor CLI is not installed / not logged in, or creds could not be resolved.
+  Every `·` gets a matching Notes line explaining which.
 
 ## Layout
 
