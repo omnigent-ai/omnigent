@@ -4414,3 +4414,68 @@ def test_list_conversations_project_none_disables_filter(
 
     ids = {c.id for c in conversation_store.list_conversations().data}
     assert ids >= {filed.id, unfiled.id}
+
+
+def test_list_projects_owned_by_excludes_shared_only_projects(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``owned_by`` restricts to projects the user OWNS, not ones merely shared
+    with them — so a project whose sessions are only shared to the user (owned
+    by someone else) does not surface as one of their own sidebar folders."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared = conversation_store.create_conversation()
+    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
+    conversation_store.set_labels(shared.id, {"omni_project": "Shared"})
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    # Bob owns both; Alice only gets a read (level 1) grant on the shared one.
+    perms.grant("bob@example.com", mine.id, 4)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", shared.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    # accessible_by would leak "Shared" — Alice can access it. owned_by must not.
+    assert conversation_store.list_projects(accessible_by="alice@example.com") == [
+        "Mine",
+        "Shared",
+    ]
+    assert conversation_store.list_projects(owned_by="alice@example.com") == ["Mine"]
+
+
+def test_list_conversations_owned_by_excludes_shared_sessions(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``owned_by`` on a project filter returns only sessions the user owns; a
+    session shared with them (read grant) under the same project is excluded so
+    it stays out of the owner-only project folder."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared = conversation_store.create_conversation()
+    conversation_store.set_labels(mine.id, {"omni_project": "X"})
+    conversation_store.set_labels(shared.id, {"omni_project": "X"})
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", shared.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            project="X", owned_by="alice@example.com"
+        ).data
+    }
+    assert ids == {mine.id}

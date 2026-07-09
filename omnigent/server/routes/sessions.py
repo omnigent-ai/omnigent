@@ -14321,9 +14321,13 @@ def create_sessions_router(
         :returns: List of project names.
         """
         user_id = _require_user(request, auth_provider)
+        # Filing into a project is owner-only, so the sidebar renders project
+        # folders only on "My sessions". Scope to owned sessions so a project
+        # owned by someone else (with a session shared to this user) doesn't
+        # surface as one of their own folders.
         return await asyncio.to_thread(
             conversation_store.list_projects,
-            accessible_by=user_id,
+            owned_by=user_id,
         )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
@@ -14556,6 +14560,12 @@ def create_sessions_router(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # A specific project folder ("My sessions"-only) must show only the
+        # viewer's own sessions — a session shared with them but filed under a
+        # like-named project belongs on "Shared with me", not in this folder.
+        # The flat list (project=None) and Unfiled (project="") stay unscoped so
+        # shared sessions still surface for the "Shared with me" tab.
+        owned_by = user_id if project else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -14564,6 +14574,7 @@ def create_sessions_router(
             agent_id=agent_id,
             agent_name=agent_name,
             accessible_by=user_id,
+            owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
             # spells that ``kind=any`` to keep the param required-ish
