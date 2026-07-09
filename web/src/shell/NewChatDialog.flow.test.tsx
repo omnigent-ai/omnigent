@@ -1051,33 +1051,36 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.getByTestId("new-chat-landing-base-branch-input")).toBeInTheDocument();
   });
 
-  // The base-branch field is re-seeded from the Settings › Git default every
-  // time the worktree dropdown opens (or left blank when none is set). It never
-  // remembers a value typed in a previous open — within one open the user can
-  // override it freely, but reopening discards that and shows the setting again.
+  // The base branch auto-fills from the Settings › Git default when the user
+  // names a new-worktree branch, and is then left to the user: any edit
+  // (including clearing it) stands, even when the dropdown is reopened. Only
+  // clearing the branch name — starting the worktree over — re-arms the
+  // auto-fill so the next named branch seeds from the current default again.
   describe("base-branch field seeding", () => {
     const baseInput = () =>
       screen.getByTestId("new-chat-landing-base-branch-input") as HTMLInputElement;
-    const nameBranch = () =>
+    const setBranch = (value: string) =>
       fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
-        target: { value: "feature/login" },
+        target: { value },
       });
-    // The chip toggles the popover; a second click closes it, a third reopens.
-    const toggleWorktree = () =>
+    // The chip toggles the popover; two clicks close-then-reopen it.
+    const reopen = () => {
       fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    };
 
-    it("auto-fills from the stored default when the dropdown opens", () => {
+    it("auto-fills from the stored default when a branch is named", () => {
       localStorage.setItem("omnigent:default-base-branch", "main");
       renderLanding();
       openWorktree();
-      nameBranch();
+      setBranch("feature/login");
       expect(baseInput().value).toBe("main");
     });
 
     it("leaves the field blank when no default is stored, and lets the user type", () => {
       renderLanding();
       openWorktree();
-      nameBranch();
+      setBranch("feature/login");
       expect(baseInput().value).toBe("");
 
       // The user can type freely; it doesn't touch the setting.
@@ -1086,62 +1089,62 @@ describe("NewChatLandingScreen create flow", () => {
       expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
     });
 
-    it("discards a typed value and re-shows the default on reopen", () => {
+    it("keeps a base the user CLEARED, even after reopening the dropdown", () => {
+      // The reported bug: explicitly emptying the base must stick — reopening
+      // the dropdown must not re-fill it from the default.
       localStorage.setItem("omnigent:default-base-branch", "main");
       renderLanding();
       openWorktree();
-      nameBranch();
-      // Override the seeded default for this open...
-      fireEvent.change(baseInput(), { target: { value: "release/2.0" } });
-      expect(baseInput().value).toBe("release/2.0");
-
-      // ...close and reopen: the field is re-seeded from the setting, NOT the
-      // value typed last time.
-      toggleWorktree();
-      toggleWorktree();
-      expect(baseInput().value).toBe("main");
-    });
-
-    it("re-shows blank on reopen when the default has since been cleared", () => {
-      localStorage.setItem("omnigent:default-base-branch", "main");
-      renderLanding();
-      openWorktree();
-      nameBranch();
+      setBranch("feature/login");
       expect(baseInput().value).toBe("main");
 
-      // Clear the setting (as the Settings page would), then reopen.
-      act(() => writeDefaultBaseBranch(""));
-      toggleWorktree();
-      toggleWorktree();
+      fireEvent.change(baseInput(), { target: { value: "" } });
+      expect(baseInput().value).toBe("");
+
+      reopen();
       expect(baseInput().value).toBe("");
     });
 
-    it("picks up a changed default on the next open", () => {
+    it("keeps a base the user typed, even after reopening the dropdown", () => {
       localStorage.setItem("omnigent:default-base-branch", "main");
       renderLanding();
       openWorktree();
-      nameBranch();
-      expect(baseInput().value).toBe("main");
-
-      act(() => writeDefaultBaseBranch("develop"));
-      toggleWorktree();
-      toggleWorktree();
-      expect(baseInput().value).toBe("develop");
-    });
-
-    it("does not remember a typed value across an unmount", () => {
-      localStorage.setItem("omnigent:default-base-branch", "main");
-      renderLanding();
-      openWorktree();
-      nameBranch();
+      setBranch("feature/login");
       fireEvent.change(baseInput(), { target: { value: "release/2.0" } });
 
-      // Navigate away and back: the field seeds from the setting, not the draft.
-      cleanup();
+      reopen();
+      // The user's choice stands — not re-seeded from the default.
+      expect(baseInput().value).toBe("release/2.0");
+    });
+
+    it("re-arms auto-fill when the branch name is cleared and re-entered", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
       renderLanding();
       openWorktree();
-      nameBranch();
+      setBranch("feature/login");
+      fireEvent.change(baseInput(), { target: { value: "custom" } });
+      expect(baseInput().value).toBe("custom");
+
+      // Clear the branch name (start the worktree over) — the base field goes
+      // away and the auto-fill re-arms.
+      setBranch("");
+      // Name a branch again: seeds fresh from the current default.
+      setBranch("feature/other");
       expect(baseInput().value).toBe("main");
+    });
+
+    it("seeds from the current default after it changes, on a re-entered branch", () => {
+      localStorage.setItem("omnigent:default-base-branch", "main");
+      renderLanding();
+      openWorktree();
+      setBranch("feature/login");
+      expect(baseInput().value).toBe("main");
+
+      // Change the setting, then start the worktree over.
+      act(() => writeDefaultBaseBranch("develop"));
+      setBranch("");
+      setBranch("feature/other");
+      expect(baseInput().value).toBe("develop");
     });
   });
 

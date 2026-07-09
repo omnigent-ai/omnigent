@@ -1859,12 +1859,17 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
-  // The base branch is NOT preserved across worktree-dropdown opens: every time
-  // the popover opens it's re-seeded from the configured default (Settings ›
-  // Git), or left blank when none is set (see the popover's onOpenChange). The
-  // user can still override it for the current open; that edit is intentionally
-  // forgotten on the next open.
-  const [baseBranch, setBaseBranch] = useState<string>("");
+  // The base branch auto-fills from the configured default (Settings › Git)
+  // when the user names a worktree branch, and is left alone once the user
+  // touches it — clearing the branch name re-arms the auto-fill (see the effect
+  // below). `baseBranchEdited` tracks that hand-off; any edit (including
+  // clearing the field) sets it so a later re-seed won't clobber the choice.
+  const [baseBranch, _setBaseBranch] = useState<string>("");
+  const [baseBranchEdited, setBaseBranchEdited] = useState<boolean>(false);
+  const setBaseBranch = useCallback((next: string) => {
+    _setBaseBranch(next);
+    setBaseBranchEdited(true);
+  }, []);
   // Branch prefilled from the existing worktree the current workspace points
   // at. When `branchName` still equals this, the session starts directly in
   // that worktree (no git opts). Editing the field away from it means the user
@@ -2271,6 +2276,22 @@ export function NewChatLandingScreen() {
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  // Auto-fill the base branch from the configured default (Settings › Git) when
+  // a new-worktree branch is named, but only until the user touches the base
+  // field — then their choice (including a cleared field) stands. Clearing the
+  // branch name (so the base field goes away) re-arms the auto-fill, so naming
+  // a branch again starts fresh from the current default.
+  useEffect(() => {
+    if (!shouldCreateWorktree) {
+      // No base field shown: reset so the next named branch re-seeds cleanly.
+      setBaseBranchEdited(false);
+      _setBaseBranch("");
+      return;
+    }
+    if (!baseBranchEdited) {
+      _setBaseBranch(readDefaultBaseBranch() ?? "");
+    }
+  }, [shouldCreateWorktree, baseBranchEdited]);
   // The branch input doubles as a combobox: focusing it reveals existing
   // worktrees, and what the user types filters them (match on branch or path
   // substring, case-insensitive). Typing a name that matches none = a new
@@ -3414,16 +3435,7 @@ export function NewChatLandingScreen() {
               {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}
               {!sandboxSelected && (
-                <Popover
-                  open={worktreePopoverOpen}
-                  onOpenChange={(open) => {
-                    // Re-seed the base branch from the configured default every
-                    // time the dropdown opens (or blank when none). The field
-                    // never remembers a value typed in a previous open.
-                    if (open) setBaseBranch(readDefaultBaseBranch() ?? "");
-                    setWorktreePopoverOpen(open);
-                  }}
-                >
+                <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                   <PopoverTrigger asChild>
                     <button
                       type="button"
