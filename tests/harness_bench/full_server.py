@@ -166,7 +166,11 @@ def _build_bench_agent_config(
 ) -> dict[str, Any]:
     """The agent spec for a bench harness: the harness + the read-only builtin,
     plus (when *deny*) a baked tool_call-phase deny on that builtin."""
-    name = f"bench-{profile.harness}" + ("-deny" if deny else "")
+    # The agent name must match [a-zA-Z0-9_-]+, but a harness id can contain a
+    # colon (acp:<slug>). Sanitize it for the name only; config.harness keeps
+    # the real id so the runner resolves the right ACP agent at spawn.
+    safe_harness = profile.harness.replace(":", "-")
+    name = f"bench-{safe_harness}" + ("-deny" if deny else "")
     config: dict[str, Any] = {
         "spec_version": 1,
         "name": name,

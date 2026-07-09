@@ -105,6 +105,122 @@ def test_resolve_official_and_community_and_unknown() -> None:
         resolve_profile("no-such-harness")
 
 
+def test_resolve_registered_harness_by_name() -> None:
+    """A registered harness with no official profile is resolvable by name.
+
+    This is the "plugs in with no bench edit" path: an in-repo ACP/CLI-subprocess
+    harness (not auto-derived, since that is native-tui-only) resolves via the
+    registry fallback, deriving a profile from the capability model. ACP is an
+    ACP_SUBPROCESS harness, so it lands on the SDK-wrap driver family
+    (transport "sdk-inproc"), not native-tui.
+    """
+    from omnigent.harness_plugins import harness_modules
+
+    if "acp" not in harness_modules():
+        pytest.skip("acp harness not registered in this build")
+    profile = resolve_profile("acp")
+    assert profile.harness == "acp"
+    assert profile.transport == "sdk-inproc"
+
+    # acp:<slug> is a first-class id: base `acp` is registered and the slug
+    # selects a configured ACP agent at spawn. It binds, keeping the full id as
+    # the harness (so config.harness=acp:qwen reaches the runner) and a valid
+    # env-prefix stem. An empty slug ("acp:") is refused.
+    slug = resolve_profile("acp:qwen")
+    assert slug.harness == "acp:qwen"
+    assert slug.transport == "sdk-inproc"
+    assert slug.env_prefix == "HARNESS_ACP_QWEN_"
+    with pytest.raises(KeyError):
+        resolve_profile("acp:")
+
+
+def test_resolve_entry_point_plugin_and_alias() -> None:
+    """An entry-point community plugin resolves by name AND by alias.
+
+    ``omnigent-rovo`` registers ``rovo-cli`` (alias ``rovo``) via the
+    ``omnigent.community.harness`` entry point and declares no capabilities
+    entry — only a harness module + install spec. The registry fallback still
+    binds it (keying off harness_modules, defaulting to the SDK family) and
+    skip-gates on its install-spec binary. Gated on the plugin being installed
+    so a build without it still passes.
+    """
+    from omnigent.harness_plugins import harness_aliases
+
+    if harness_aliases().get("rovo") != "rovo-cli":
+        pytest.skip("omnigent-rovo plugin not installed")
+    by_alias = resolve_profile("rovo")
+    by_name = resolve_profile("rovo-cli")
+    assert by_alias.harness == "rovo-cli" == by_name.harness
+    assert by_alias.transport == "sdk-inproc"
+    assert by_alias.cli_binary == "acli"  # skip-gates on the Atlassian CLI
+    # A model is always stamped (agent registration requires a non-empty one);
+    # it is inert for an own-auth harness, which uses its own.
+    assert by_alias.model
+
+
+def test_registry_profile_happy_path_no_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The registry fallback's positive path, independent of any optional plugin.
+
+    Fakes a registered CLI-subprocess harness (+ alias + install-spec binary) so
+    the name/alias resolution, the integration_mode -> sdk-inproc mapping, and
+    the install-spec skip-gate are exercised even in a build without
+    omnigent-rovo. Guards the coverage the plugin tests skip-gate away.
+    """
+    from types import SimpleNamespace
+
+    import tests.harness_bench.manifest as man
+    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+
+    class _Spec:
+        binary = "fakebin"
+
+    # A lightweight caps stand-in: _registry_profile + the prose/declared helpers
+    # only read integration_mode / auth / streaming / interrupt.
+    caps = SimpleNamespace(
+        integration_mode=IntegrationMode.CLI_SUBPROCESS,
+        auth=AuthModel.OWN_AUTH,
+        streaming=True,
+        interrupt=True,
+    )
+    monkeypatch.setattr(man, "harness_modules", lambda: {"fake-cli": "pkg.fake"})
+    monkeypatch.setattr(man, "harness_aliases", lambda: {"fake": "fake-cli"})
+    monkeypatch.setattr(man, "harness_capabilities", lambda: {"fake-cli": caps})
+    monkeypatch.setattr(man, "harness_install_keys", lambda: {"fake-cli": "fake"})
+    monkeypatch.setattr(man, "install_specs", lambda: {"fake": _Spec()})
+
+    for name in ("fake-cli", "fake"):
+        p = man._registry_profile(name)
+        assert p is not None and p.harness == "fake-cli"
+        assert p.transport == "sdk-inproc"
+        assert p.cli_binary == "fakebin"
+        assert p.model  # always non-empty (agent registration requires a model)
+
+
+def test_registry_refuses_native_server_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A MODELED mode the bench has no driver for is refused, not mis-bound.
+
+    NATIVE_SERVER (e.g. opencode-native) has no bench driver. The fallback must
+    return None (-> resolve_profile KeyError) rather than silently degrade to
+    the sdk-inproc default, which would bind a vendor-server harness to the SDK
+    drivers and drop its skip-gate.
+    """
+    from types import SimpleNamespace
+
+    import tests.harness_bench.manifest as man
+    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+
+    caps = SimpleNamespace(
+        integration_mode=IntegrationMode.NATIVE_SERVER,
+        auth=AuthModel.OWN_AUTH,
+        streaming=False,
+        interrupt=False,
+    )
+    monkeypatch.setattr(man, "harness_modules", lambda: {"srv": "pkg.srv"})
+    monkeypatch.setattr(man, "harness_aliases", dict)
+    monkeypatch.setattr(man, "harness_capabilities", lambda: {"srv": caps})
+    assert man._registry_profile("srv") is None
+
+
 def test_infra_failure_reason_classifies_auth_and_ignores_capability_gaps() -> None:
     from tests.harness_bench.driver import TurnResult, infra_failure_reason
 
