@@ -12,10 +12,8 @@
 #                   `pip install omnigent` resolves to. Pre-releases never move it.
 #   :latest-rc      the highest version OVERALL, max(release, rc) — the newest
 #                   thing tagged, pre-release or not.
-#   :latest-dev     the most recent main build (bleeding edge); moves on every
-#                   qualifying main commit.
-#   :latest-nightly the most recent main build as of the daily cron; retagged
-#                   from :latest-dev once a day (no rebuild).
+#   :latest-nightly the most recent nightly main build (bleeding edge); moves
+#                   once a day when the scheduled build rebuilds main HEAD.
 # Ordering for :latest / :latest-rc uses PEP 440 (1.2.3rc1 < 1.2.3), which
 # `sort -V` gets wrong, so the max is computed with .github/scripts/
 # oss-publish-images/maxver.py (Python `packaging`).
@@ -25,33 +23,21 @@
 name: Publish images (public)
 
 on:
+  # Release builds only — every v* tag push publishes the immutable version pin
+  # and moves the floating release tags. Per-commit main builds were retired in
+  # favour of the nightly rebuild below; PRs get a build-only check (docker-build.yml)
+  # so a broken image is caught before merge without a push.
   push:
-    branches: [main]
     tags: ['v*']
-    # Only rebuild when something that lands in the image changes.
-    paths:
-      - 'deploy/docker/Dockerfile'
-      - 'deploy/docker/entrypoint.py'
-      - 'omnigent/**'
-      - 'web/**'
-      - 'sdks/**'
-      - 'pyproject.toml'
-      - 'setup.py'
-      - 'uv.lock'
-      - 'web/package-lock.json'
-      - '.github/workflows/oss-publish-images.yml'
-  # Daily nightly promotion (07:00 UTC). Retags the current :latest-dev as
-  # :latest-nightly — handled by promote-nightly, not a rebuild.
+  # Nightly rebuild of main HEAD (07:00 UTC): the build-and-push job publishes
+  # :sha-<short> + :latest-nightly. This is what keeps bleeding-edge ~1 day
+  # fresh now that main commits no longer each trigger a build.
   schedule:
     - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       bump_latest:
         description: 'Also move :latest to this build (manual release of latest). Off by default.'
-        type: boolean
-        default: false
-      force_nightly:
-        description: 'Promote :latest-dev -> :latest-nightly now (runs only the nightly job). Off by default.'
         type: boolean
         default: false
       reconcile_floating:
@@ -73,10 +59,11 @@ jobs:
     permissions:
       contents: read
       packages: write # push the image to GHCR via GITHUB_TOKEN
-    # Gated to this repository; inert in forks and mirrors. Skip the (re)build
-    # on schedule, force_nightly, and reconcile_floating dispatches — those only
-    # drive the promote-nightly / reconcile-floating jobs.
-    if: github.repository == 'omnigent-ai/omnigent' && github.event_name != 'schedule' && !inputs.force_nightly && !inputs.reconcile_floating
+    # Gated to this repository; inert in forks and mirrors. Runs on tag pushes,
+    # the nightly schedule (rebuild of main HEAD), and bump_latest dispatches.
+    # Skipped on reconcile_floating dispatches — that only drives the
+    # reconcile-floating retag job.
+    if: github.repository == 'omnigent-ai/omnigent' && !inputs.reconcile_floating
     runs-on: ubuntu-latest
     # Multi-arch: the linux/arm64 leg cross-builds under QEMU emulation on this
     # amd64 runner, which roughly doubles the host-image build time (emulated
@@ -141,9 +128,9 @@ jobs:
             KUBERNETES_TAGS="${KUBERNETES_TAGS},${KUBERNETES_IMAGE}:$1"
           }
 
-          # Every qualifying main commit moves :latest-dev (bleeding edge).
+          # The nightly rebuild of main moves :latest-nightly (bleeding edge).
           if [ "${GH_REF}" = "refs/heads/main" ]; then
-            add_tag "latest-dev"
+            add_tag "latest-nightly"
           fi
 
           if [[ "${GH_REF}" == refs/tags/v* ]]; then
@@ -328,43 +315,6 @@ jobs:
             kubernetes-sbom.cdx.json
             kubernetes-sbom.spdx.json
           retention-days: 90
-
-  promote-nightly:
-    # Daily cron (or a manual force_nightly dispatch): move :latest-nightly to
-    # the current main build by retagging :latest-dev with `crane tag`
-    # (digest-preserving, no rebuild).
-    if: github.repository == 'omnigent-ai/omnigent' && (github.event_name == 'schedule' || inputs.force_nightly)
-    permissions:
-      contents: read
-      packages: write # retag within GHCR via GITHUB_TOKEN
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Set up crane
-        uses: imjasonh/setup-crane@59c71e96a00b28651f10369ba3359a6d730740a0  # v0.6
-        with:
-          version: v0.21.6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Promote latest-dev -> latest-nightly
-        run: |
-          set -euo pipefail
-          # crane tag points a new tag at an EXISTING manifest digest without
-          # re-serializing it, so :latest-nightly keeps :latest-dev's exact digest.
-          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell ghcr.io/omnigent-ai/omnigent-server-kubernetes; do
-            if crane digest "${img}:latest-dev" >/dev/null 2>&1; then
-              crane tag "${img}:latest-dev" latest-nightly
-              echo "promoted ${img}:latest-dev -> :latest-nightly ($(crane digest "${img}:latest-nightly"))"
-            else
-              echo "::warning::${img}:latest-dev not found yet; skipping nightly promotion"
-            fi
-          done
 
   reconcile-floating:
     # Manual reconcile (workflow_dispatch with reconcile_floating=true): repoint
