@@ -145,6 +145,7 @@ const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
 
 function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
   let onStatus: Parameters<ElectronUpdateBridge["onStatus"]>[0] | null = null;
+  const unsubscribe = vi.fn();
   const bridge: ElectronUpdateBridge = {
     getConfig: vi.fn().mockResolvedValue(config),
     getStatus: vi.fn().mockResolvedValue({ state: "idle" }),
@@ -159,7 +160,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
     ),
     onStatus: vi.fn((cb) => {
       onStatus = cb;
-      return vi.fn();
+      return unsubscribe;
     }),
   };
   (window as unknown as Record<string, unknown>).omnigentDesktop = {
@@ -171,6 +172,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
   return {
     bridge,
     emitStatus: (status: UpdateStatus) => onStatus?.(status),
+    unsubscribe,
   };
 }
 
@@ -476,13 +478,45 @@ describe("SettingsPage", () => {
     renderPage("/settings/updates");
     expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
 
-    const select = screen.getByTestId("color-theme-select") as HTMLSelectElement;
+    const select = screen.getByRole("combobox", { name: "Update mode" }) as HTMLSelectElement;
     expect(select.value).toBe("default");
     fireEvent.change(select, { target: { value: "manual" } });
 
     await waitFor(() => {
       expect(bridge.setConfig).toHaveBeenCalledWith({ mode: "manual" });
     });
+  });
+
+  it("surfaces manual update-check failures in Settings", async () => {
+    const { bridge, emitStatus } = installUpdateBridge();
+    vi.mocked(bridge.check).mockRejectedValueOnce(new Error("Cannot find latest.yml: 404"));
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates now" }));
+
+    expect(await screen.findByText("Last check failed")).toBeInTheDocument();
+    expect(screen.getByText("Cannot find latest.yml: 404")).toBeInTheDocument();
+
+    emitStatus({ state: "checking" });
+    await waitFor(() => {
+      expect(screen.queryByText("Cannot find latest.yml: 404")).toBeNull();
+    });
+
+    emitStatus({ state: "idle", lastError: "Feed provider failed" });
+    expect(await screen.findByText("Feed provider failed")).toBeInTheDocument();
+  });
+
+  it("unsubscribes from update status events when Settings unmounts", async () => {
+    const { unsubscribe } = installUpdateBridge();
+
+    const { unmount } = renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    unmount();
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   it("hides the Updates section outside the Electron shell", () => {

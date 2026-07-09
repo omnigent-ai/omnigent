@@ -81,6 +81,36 @@ describe("UpdateBanner", () => {
     ).toBeInTheDocument();
   });
 
+  it("does not promise install-on-quit when auto install is off", async () => {
+    installBridge(
+      {
+        state: "downloaded",
+        info: { version: "0.4.0" },
+      },
+      { ...DEFAULT_CONFIG, autoInstall: false },
+    );
+
+    render(<UpdateBanner />);
+
+    expect(await screen.findByText("Omnigent 0.4.0 is ready to install.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Later" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Later — install on next quit" })).toBeNull();
+  });
+
+  it("unsubscribes from update status events when it unmounts", async () => {
+    const { unsubscribe } = installBridge({
+      state: "available",
+      info: { version: "0.4.0" },
+    });
+
+    const { unmount } = render(<UpdateBanner />);
+    expect(await screen.findByText("Omnigent 0.4.0 is available.")).toBeInTheDocument();
+
+    unmount();
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
   it("suppresses a skipped version after persisting it", async () => {
     const skippedConfig: UpdateConfig = {
       ...DEFAULT_CONFIG,

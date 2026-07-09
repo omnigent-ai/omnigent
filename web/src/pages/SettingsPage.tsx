@@ -1090,7 +1090,7 @@ function UpdatesSection() {
   const [config, setConfig] = useState<UpdateConfig | null | "loading">("loading");
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [lastSecurityError, setLastSecurityError] = useState<string | null>(null);
+  const [lastCheckError, setLastCheckError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!bridge) {
@@ -1109,13 +1109,15 @@ function UpdatesSection() {
       });
     const unsubscribe = bridge.onStatus((status) => {
       if (status.state === "error-security") {
-        setLastSecurityError(status.lastError ?? "Security verification failed.");
+        setLastCheckError(status.lastError ?? "Security verification failed.");
+      } else if (status.state === "idle" && status.lastError) {
+        setLastCheckError(status.lastError);
       } else if (
         status.state === "checking" ||
         status.state === "available" ||
         status.state === "none"
       ) {
-        setLastSecurityError(null);
+        setLastCheckError(null);
       }
     });
     return () => {
@@ -1141,8 +1143,11 @@ function UpdatesSection() {
   const onCheck = useCallback(async () => {
     if (!bridge) return;
     setChecking(true);
+    setLastCheckError(null);
     try {
       await bridge.check();
+    } catch (err) {
+      setLastCheckError(err instanceof Error ? err.message : String(err));
     } finally {
       setChecking(false);
     }
@@ -1207,12 +1212,12 @@ function UpdatesSection() {
             {saving && <span className="text-xs text-muted-foreground">Saving…</span>}
           </div>
 
-          {lastSecurityError && (
+          {lastCheckError && (
             <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-sm">
               <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
               <div>
                 <div className="font-medium">Last check failed</div>
-                <div className="text-muted-foreground">{lastSecurityError}</div>
+                <div className="text-muted-foreground">{lastCheckError}</div>
               </div>
             </div>
           )}

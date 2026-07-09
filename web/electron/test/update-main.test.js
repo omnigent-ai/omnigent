@@ -6,7 +6,11 @@ const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
 
-function loadMainHarness({ settings = {}, forceDevUpdateConfig = false } = {}) {
+function loadMainHarness({
+  settings = {},
+  forceDevUpdateConfig = false,
+  dialogResponses = [{ response: 1, checkboxChecked: false }],
+} = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
 
@@ -18,6 +22,8 @@ function loadMainHarness({ settings = {}, forceDevUpdateConfig = false } = {}) {
     downloadUpdate: 0,
     quitAndInstall: [],
     sent: [],
+    showMessageBox: [],
+    setApplicationMenu: [],
   };
 
   const sender = {
@@ -37,7 +43,7 @@ function loadMainHarness({ settings = {}, forceDevUpdateConfig = false } = {}) {
   const autoUpdater = new EventEmitter();
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.forceDevUpdateConfig = false;
+  autoUpdater.forceDevUpdateConfig = forceDevUpdateConfig;
   autoUpdater.checkForUpdates = () => {
     calls.checkForUpdates += 1;
     return Promise.resolve();
@@ -70,12 +76,17 @@ function loadMainHarness({ settings = {}, forceDevUpdateConfig = false } = {}) {
     }),
     Menu: {
       buildFromTemplate: (template) => ({ template }),
-      setApplicationMenu: () => {},
+      setApplicationMenu: (menu) => calls.setApplicationMenu.push(menu),
     },
     Notification: { isSupported: () => false },
     clipboard: {},
     dialog: {
-      showMessageBox: () => Promise.resolve({ response: 1, checkboxChecked: false }),
+      showMessageBox: (dialogWin, options) => {
+        calls.showMessageBox.push({ win: dialogWin, options });
+        return Promise.resolve(
+          dialogResponses.shift() ?? { response: 1, checkboxChecked: false },
+        );
+      },
     },
     ipcMain: {
       handle: (channel, handler) => ipcHandlers.set(channel, handler),
@@ -116,7 +127,7 @@ function loadMainHarness({ settings = {}, forceDevUpdateConfig = false } = {}) {
   const mainPath = path.join(__dirname, "../src/main.js");
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.__test = { getUpdateConfig, setUpdateConfig, setupAutoUpdater, registerIpc, windows, get installPending() { return installPending; }, get currentUpdateStatus() { return currentUpdateStatus; } };";
+    "\nmodule.exports.__test = { buildMenu, getUpdateConfig, setUpdateConfig, setupAutoUpdater, registerIpc, windows, get installPending() { return installPending; }, get currentUpdateStatus() { return currentUpdateStatus; } };";
 
   const module = { exports: {} };
   const sandbox = {
@@ -174,6 +185,15 @@ async function flushPromises() {
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function findMenuItem(menu, id) {
+  for (const item of menu.template) {
+    const submenu = item.submenu ?? [];
+    const found = submenu.find((entry) => entry.id === id);
+    if (found) return found;
+  }
+  return null;
 }
 
 describe("auto-update main-process wiring", () => {
@@ -235,15 +255,132 @@ describe("auto-update main-process wiring", () => {
     }
   });
 
-  it("routes update-install through before-quit cleanup to quitAndInstall", async (t) => {
+  it("prompts for every privileged update channel before running it", async (t) => {
+    const cases = [
+      {
+        channel: "omnigent:update-download",
+        args: [],
+        message: "Download an Omnigent update?",
+        prepare: () => {},
+        assertRan: (harness) => {
+          assert.equal(harness.calls.downloadUpdate, 1);
+        },
+      },
+      {
+        channel: "omnigent:update-install",
+        args: [],
+        message: "Restart Omnigent to install an update?",
+        prepare: (harness) => {
+          harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+        },
+        assertRan: (harness) => {
+          assert.equal(harness.api.installPending, true);
+          assert.equal(harness.calls.appQuit, 1);
+        },
+      },
+      {
+        channel: "omnigent:set-update-config",
+        args: [{ mode: "manual" }],
+        message: "Change Omnigent update settings?",
+        prepare: () => {},
+        assertRan: (harness) => {
+          assert.equal(harness.readSettings().update_mode, "manual");
+        },
+      },
+    ];
+
+    for (const item of cases) {
+      const harness = loadMainHarness({
+        forceDevUpdateConfig: true,
+        settings: { update_mode: "manual" },
+      });
+      t.after(harness.cleanup);
+      harness.api.setupAutoUpdater();
+      harness.api.registerIpc();
+      item.prepare(harness);
+
+      await harness.ipcHandlers.get(item.channel)(harness.events.pinned, ...item.args);
+
+      assert.equal(harness.calls.showMessageBox.length, 1, item.channel);
+      assert.equal(harness.calls.showMessageBox[0].win, harness.api.windows.keys().next().value);
+      assert.equal(harness.calls.showMessageBox[0].options.title, "Omnigent");
+      assert.equal(harness.calls.showMessageBox[0].options.message, item.message);
+      assert.deepEqual(plain(harness.calls.showMessageBox[0].options.buttons), [
+        "Don't Allow",
+        "Allow Once",
+      ]);
+      item.assertRan(harness);
+    }
+  });
+
+  it("does not let a cached hosting grant bypass update-control consent", async (t) => {
+    const cases = [
+      {
+        channel: "omnigent:update-download",
+        args: [],
+        prepare: () => {},
+        assertBlocked: (harness) => {
+          assert.equal(harness.calls.downloadUpdate, 0);
+        },
+      },
+      {
+        channel: "omnigent:update-install",
+        args: [],
+        prepare: (harness) => {
+          harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+        },
+        assertBlocked: (harness) => {
+          assert.equal(harness.api.installPending, false);
+          assert.equal(harness.calls.appQuit, 0);
+        },
+      },
+      {
+        channel: "omnigent:set-update-config",
+        args: [{ mode: "manual" }],
+        prepare: () => {},
+        assertBlocked: (harness) => {
+          assert.equal(harness.readSettings().update_mode, "start");
+        },
+      },
+    ];
+
+    for (const item of cases) {
+      const harness = loadMainHarness({
+        forceDevUpdateConfig: true,
+        settings: {
+          allowed_hosting_origins: ["https://server.example"],
+          update_mode: "start",
+        },
+        dialogResponses: [{ response: 0, checkboxChecked: false }],
+      });
+      t.after(harness.cleanup);
+      harness.api.setupAutoUpdater();
+      harness.api.registerIpc();
+      item.prepare(harness);
+
+      await assert.rejects(
+        harness.ipcHandlers.get(item.channel)(harness.events.pinned, ...item.args),
+        /approved/,
+      );
+
+      assert.equal(harness.calls.showMessageBox.length, 1, item.channel);
+      item.assertBlocked(harness);
+    }
+  });
+
+  it("routes approved update-install through before-quit cleanup to quitAndInstall", async (t) => {
     const harness = loadMainHarness({
-      settings: { allowed_hosting_origins: ["https://server.example"] },
+      forceDevUpdateConfig: true,
+      settings: { allowed_hosting_origins: ["https://server.example"], update_mode: "manual" },
     });
     t.after(harness.cleanup);
+    harness.api.setupAutoUpdater();
+    harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
     harness.api.registerIpc();
 
     await harness.ipcHandlers.get("omnigent:update-install")(harness.events.pinned);
 
+    assert.equal(harness.calls.showMessageBox.length, 1);
     assert.equal(harness.api.installPending, true);
     assert.equal(harness.calls.appQuit, 1);
 
@@ -254,6 +391,88 @@ describe("auto-update main-process wiring", () => {
     assert.equal(prevented, 1);
     assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
     assert.equal(harness.calls.appQuit, 1);
+  });
+
+  it("does not start the install path when no update is downloaded", async (t) => {
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+    });
+    t.after(harness.cleanup);
+    harness.api.setupAutoUpdater();
+    harness.api.registerIpc();
+
+    await assert.rejects(
+      harness.ipcHandlers.get("omnigent:update-install")(harness.events.pinned),
+      /No downloaded update/,
+    );
+    assert.equal(harness.calls.showMessageBox.length, 1);
+    assert.equal(harness.api.installPending, false);
+    assert.equal(harness.calls.appQuit, 0);
+
+    harness.api.buildMenu();
+    const restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
+    assert.ok(restartItem);
+    restartItem.click();
+    assert.equal(harness.api.installPending, false);
+    assert.equal(harness.calls.appQuit, 0);
+  });
+
+  it("surfaces manual check failures without changing the status union", async (t) => {
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+    });
+    t.after(harness.cleanup);
+    harness.api.setupAutoUpdater();
+    harness.autoUpdater.checkForUpdates = () => {
+      harness.calls.checkForUpdates += 1;
+      const err = new Error("Cannot find latest.yml: 404");
+      harness.autoUpdater.emit("error", err);
+      return Promise.reject(err);
+    };
+    harness.api.registerIpc();
+
+    await assert.rejects(
+      harness.ipcHandlers.get("omnigent:update-check")(harness.events.pinned),
+      /latest\.yml/,
+    );
+
+    assert.equal(harness.calls.checkForUpdates, 1);
+    assert.deepEqual(plain(harness.api.currentUpdateStatus), {
+      state: "idle",
+      lastError: "Cannot find latest.yml: 404",
+    });
+  });
+
+  it("blocks manual update paths when the updater feed is unavailable in development", async (t) => {
+    const harness = loadMainHarness({ settings: { update_mode: "manual" } });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    await assert.rejects(
+      harness.ipcHandlers.get("omnigent:update-check")(harness.events.pinned),
+      /unavailable in development/,
+    );
+    await assert.rejects(
+      harness.ipcHandlers.get("omnigent:update-download")(harness.events.pinned),
+      /unavailable in development/,
+    );
+    await assert.rejects(
+      harness.ipcHandlers.get("omnigent:update-install")(harness.events.pinned),
+      /unavailable in development/,
+    );
+    await assert.rejects(
+      harness.ipcHandlers.get("omnigent:set-update-config")(harness.events.pinned, {
+        mode: "manual",
+      }),
+      /unavailable in development/,
+    );
+
+    assert.equal(harness.calls.showMessageBox.length, 0);
+    assert.equal(harness.calls.checkForUpdates, 0);
+    assert.equal(harness.calls.downloadUpdate, 0);
+    assert.equal(harness.api.installPending, false);
   });
 
   it("supports forceDevUpdateConfig and broadcasts updater events", (t) => {

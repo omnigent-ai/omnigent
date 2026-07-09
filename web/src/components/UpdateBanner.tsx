@@ -18,6 +18,7 @@ export function UpdateBanner() {
   const bridge = updateBridge();
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [skippedVersion, setSkippedVersion] = useState<string | null | "loading">("loading");
+  const [autoInstall, setAutoInstall] = useState(true);
   const [hiddenVersion, setHiddenVersion] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<"download" | "install" | "skip" | null>(null);
 
@@ -37,7 +38,10 @@ export function UpdateBanner() {
         void bridge
           .getConfig()
           .then((config) => {
-            if (alive) setSkippedVersion(config.skippedVersion);
+            if (alive) {
+              setSkippedVersion(config.skippedVersion);
+              setAutoInstall(config.autoInstall);
+            }
           })
           .catch((err) => {
             console.warn("[UpdateBanner] update bridge config read failed:", err);
@@ -174,7 +178,7 @@ export function UpdateBanner() {
               Restart to update
             </Button>
             <Button variant="ghost" size="sm" onClick={() => setHiddenVersion(version)}>
-              Later — install on next quit
+              {autoInstall ? "Later — install on next quit" : "Later"}
             </Button>
           </div>
         )}

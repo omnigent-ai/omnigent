@@ -604,6 +604,9 @@ const UPDATE_MODES = new Set(["none", "manual", "start", "default"]);
 let updateCheckTimer = null;
 let currentUpdateStatus = { state: "idle" };
 let installPending = false;
+let manualCheckInFlight = false;
+const UPDATES_UNAVAILABLE_IN_DEV =
+  "Desktop updates are unavailable in development builds.";
 
 // ---------------------------------------------------------------------------
 // Persisted settings (the saved server URL and the recently-connected server
@@ -677,6 +680,18 @@ function canUseUpdaterFeed() {
   return app.isPackaged || autoUpdater.forceDevUpdateConfig === true;
 }
 
+function isUpdateSecurityError(message) {
+  return /signature|sha512|checksum|not signed|code sign/i.test(message);
+}
+
+function reportUpdatesUnavailableInDev() {
+  broadcastUpdateStatus({ state: "idle", lastError: UPDATES_UNAVAILABLE_IN_DEV });
+}
+
+function updatesUnavailableInDevError() {
+  return new Error(UPDATES_UNAVAILABLE_IN_DEV);
+}
+
 function applyUpdateConfig(cfg) {
   if (updateCheckTimer) {
     clearInterval(updateCheckTimer);
@@ -702,10 +717,14 @@ function setupAutoUpdater() {
     autoUpdater.forceDevUpdateConfig = true;
   }
   autoUpdater.on("checking-for-update", () => broadcastUpdateStatus({ state: "checking" }));
-  autoUpdater.on("update-available", (info) =>
-    broadcastUpdateStatus({ state: "available", info }),
-  );
-  autoUpdater.on("update-not-available", () => broadcastUpdateStatus({ state: "none" }));
+  autoUpdater.on("update-available", (info) => {
+    manualCheckInFlight = false;
+    broadcastUpdateStatus({ state: "available", info });
+  });
+  autoUpdater.on("update-not-available", () => {
+    manualCheckInFlight = false;
+    broadcastUpdateStatus({ state: "none" });
+  });
   autoUpdater.on("download-progress", (progress) =>
     broadcastUpdateStatus({ state: "downloading", progress }),
   );
@@ -714,20 +733,51 @@ function setupAutoUpdater() {
   );
   autoUpdater.on("error", (err) => {
     const msg = String(err?.message ?? err);
-    const isSecurity = /signature|sha512|checksum|not signed|code sign/i.test(msg);
+    const isSecurity = isUpdateSecurityError(msg);
+    const wasManualCheck = manualCheckInFlight;
+    manualCheckInFlight = false;
     console[isSecurity ? "error" : "warn"]("[omnigent] update error:", msg);
-    broadcastUpdateStatus({ state: isSecurity ? "error-security" : "idle", lastError: msg });
+    if (isSecurity || wasManualCheck) {
+      broadcastUpdateStatus({ state: isSecurity ? "error-security" : "idle", lastError: msg });
+    }
   });
   applyUpdateConfig(cfg);
 }
 
-function checkForUpdates() {
-  return autoUpdater.checkForUpdates().then(() => undefined);
+function checkForUpdates({ manual = false } = {}) {
+  if (!canUseUpdaterFeed()) {
+    if (manual) reportUpdatesUnavailableInDev();
+    return Promise.reject(updatesUnavailableInDevError());
+  }
+  if (manual) manualCheckInFlight = true;
+  return autoUpdater
+    .checkForUpdates()
+    .then(() => {
+      if (manual) manualCheckInFlight = false;
+      return undefined;
+    })
+    .catch((err) => {
+      const msg = String(err?.message ?? err);
+      if (manualCheckInFlight) {
+        manualCheckInFlight = false;
+        broadcastUpdateStatus({
+          state: isUpdateSecurityError(msg) ? "error-security" : "idle",
+          lastError: msg,
+        });
+      }
+      throw err;
+    });
 }
 
 function installUpdateNow() {
+  if (!canUseUpdaterFeed()) {
+    reportUpdatesUnavailableInDev();
+    return false;
+  }
+  if (currentUpdateStatus.state !== "downloaded") return false;
   installPending = true;
   app.quit();
+  return true;
 }
 
 /**
@@ -1447,6 +1497,65 @@ async function confirmHostEnrollment(win) {
 }
 
 /**
+ * Native confirmation for update controls invoked by the pinned server page.
+ * This intentionally does NOT reuse the persisted hosting grant: enrolling a
+ * host authorizes local agent execution, not downloading or installing a new
+ * desktop binary.
+ *
+ * @param {BrowserWindow | null | undefined} win The window requesting control.
+ * @param {"download" | "install" | "config"} action The update operation.
+ * @returns {Promise<boolean>} True when the user approved this one action.
+ */
+async function confirmUpdateControl(win, action) {
+  if (!win) return false;
+  const pinned = pinnedOrigin(win);
+  if (!pinned) return false;
+
+  let host = pinned;
+  try {
+    host = new URL(pinned).host;
+  } catch {
+    // Keep the full origin string if it somehow doesn't parse.
+  }
+
+  const copy = {
+    download: {
+      message: "Download an Omnigent update?",
+      detail:
+        `${host} wants to download a desktop update for this Omnigent app.\n\n` +
+        `Only allow servers you trust.`,
+    },
+    install: {
+      message: "Restart Omnigent to install an update?",
+      detail:
+        `${host} wants to restart Omnigent and install the downloaded desktop update.\n\n` +
+        `Only allow servers you trust.`,
+    },
+    config: {
+      message: "Change Omnigent update settings?",
+      detail:
+        `${host} wants to change how this Omnigent app checks for and installs updates.\n\n` +
+        `Only allow servers you trust.`,
+    },
+  }[action];
+  if (!copy) return false;
+
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  const { response } = await dialog.showMessageBox(win, {
+    type: "warning",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: copy.message,
+    detail: copy.detail,
+    buttons: ["Don't Allow", "Allow Once"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
+/**
  * OS-level attention cue for a notification fired while the app is frontmost,
  * where the banner is suppressed by the OS. On macOS we bounce the dock icon
  * (`informational` = a single gentle bounce); on Windows/Linux we flash the
@@ -1670,13 +1779,15 @@ function buildMenu() {
         id: "check_for_updates",
         label: "Check for Updates…",
         click: () => {
-          checkForUpdates().catch(() => {});
+          checkForUpdates({ manual: true }).catch(() => {});
         },
       },
       {
         id: "restart_to_update",
         label: "Restart to Update",
-        click: () => installUpdateNow(),
+        click: () => {
+          if (currentUpdateStatus.state === "downloaded") installUpdateNow();
+        },
       },
     ],
   });
@@ -2204,15 +2315,19 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("update-check is only available to a connected server page");
     }
-    await checkForUpdates();
+    await checkForUpdates({ manual: true });
   });
 
   ipcMain.handle("omnigent:update-download", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("update-download is only available to a connected server page");
     }
+    if (!canUseUpdaterFeed()) {
+      reportUpdatesUnavailableInDev();
+      throw updatesUnavailableInDevError();
+    }
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!(await confirmHostEnrollment(win))) {
+    if (!(await confirmUpdateControl(win, "download"))) {
       throw new Error("Update download wasn't approved for this server.");
     }
     await autoUpdater.downloadUpdate();
@@ -2222,19 +2337,29 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("update-install is only available to a connected server page");
     }
+    if (!canUseUpdaterFeed()) {
+      reportUpdatesUnavailableInDev();
+      throw updatesUnavailableInDevError();
+    }
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!(await confirmHostEnrollment(win))) {
+    if (!(await confirmUpdateControl(win, "install"))) {
       throw new Error("Update install wasn't approved for this server.");
     }
-    installUpdateNow();
+    if (!installUpdateNow()) {
+      throw new Error("No downloaded update is ready to install.");
+    }
   });
 
   ipcMain.handle("omnigent:set-update-config", async (event, patch) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("set-update-config is only available to a connected server page");
     }
+    if (!canUseUpdaterFeed()) {
+      reportUpdatesUnavailableInDev();
+      throw updatesUnavailableInDevError();
+    }
     const win = BrowserWindow.fromWebContents(event.sender);
-    if (!(await confirmHostEnrollment(win))) {
+    if (!(await confirmUpdateControl(win, "config"))) {
       throw new Error("Update settings change wasn't approved for this server.");
     }
     const cfg = setUpdateConfig(patch);
