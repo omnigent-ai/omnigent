@@ -456,7 +456,12 @@ def _fetch_search_snippets(
     if not conversation_ids or not query:
         return {}
     pattern = f"%{query.lower()}%"
+    workspace_id = current_workspace_id()
+    # workspace_id leads the (workspace_id, conversation_id, position) index.
+    # Both the aggregate and the join-back below must include it or Postgres
+    # can't use that index and falls back to a full table scan of every item.
     match_pred = and_(
+        SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
         func.lower(SqlConversationItem.search_text).like(pattern),
     )
@@ -471,7 +476,8 @@ def _fetch_search_snippets(
         .group_by(SqlConversationItem.conversation_id)
         .subquery()
     )
-    # Join back to pull exactly one search_text body per conversation.
+    # Join back to pull exactly one search_text body per conversation. The
+    # workspace_id predicate keeps this on the composite index.
     rows = session.execute(
         select(
             SqlConversationItem.conversation_id,
@@ -479,6 +485,7 @@ def _fetch_search_snippets(
         ).join(
             earliest,
             and_(
+                SqlConversationItem.workspace_id == workspace_id,
                 SqlConversationItem.conversation_id == earliest.c.cid,
                 SqlConversationItem.position == earliest.c.pos,
             ),
