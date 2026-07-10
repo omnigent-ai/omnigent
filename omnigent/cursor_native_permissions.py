@@ -23,7 +23,10 @@ pane scraping — which silently missed any prompt whose wording fell outside a
 regex. The pane is still used only to *deliver* the keystroke verdict. This does
 NOT modify cursor's JS bundle and does NOT suppress cursor's native gate; the
 TUI prompt remains the source of truth and the benign fallback if store
-detection ever fails. See ``docs/cursor-native-elicitation.md`` (and the
+detection ever fails. Sessions launched with ``--yolo`` / ``--force`` /
+``-f`` auto-accept lingering tool gates in-pane (no web card) because cursor's
+Run Everything mode still sometimes leaves a pending marker long enough to
+stall a piloted parent. See ``docs/cursor-native-elicitation.md`` (and the
 superseded ``docs/cursor-native-tui-mirror-plan.md`` for the original pane-scrape
 design and why the transcript channel replaced it).
 """
@@ -309,6 +312,30 @@ _QUESTION_TOOL_NAMES = frozenset({"askquestion"})
 # Kept short so a genuinely-gated prompt that resolves quickly (e.g. an
 # Auto-review retry) still surfaces a card rather than being suppressed.
 _ELICITATION_SETTLE_S = 0.5
+
+# When a session launched with ``--yolo`` / ``--force`` / ``-f``, cursor still
+# sometimes leaves a pending marker long enough for Omnigent to mirror a card.
+# Auto-accept sends ``y`` into the pane instead of parking a web elicitation.
+# Retry if the call stays pending (keystroke dropped by a TUI re-render).
+_YOLO_ACCEPT_RETRY_S = 2.0
+
+
+def cursor_launch_args_enable_yolo(args: list[str] | None) -> bool:
+    """Return whether *args* request cursor-agent's full tool-approval bypass.
+
+    Matches the CLI flags cursor documents as Run Everything: ``--yolo``,
+    ``--force``, and the short ``-f`` form. Used by the runner to decide whether
+    the transcript elicitation supervisor should auto-accept lingering gates
+    instead of mirroring ApprovalCards to a parent that cannot click them.
+    """
+    if not args:
+        return False
+    for arg in args:
+        if arg in {"--yolo", "--force", "-f"} or arg.startswith("--yolo=") or arg.startswith(
+            "--force="
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -632,6 +659,7 @@ async def supervise_cursor_transcript_elicitations(
     auth: httpx.Auth | None = None,
     poll_interval_s: float = _POLL_INTERVAL_S,
     settle_s: float = _ELICITATION_SETTLE_S,
+    auto_accept_approvals: bool = False,
 ) -> None:
     """Mirror cursor's gated tool calls to web elicitations via the chat store.
 
@@ -648,6 +676,13 @@ async def supervise_cursor_transcript_elicitations(
     the TUI, or executed after approval) it releases the card via
     ``external_elicitation_resolved``.
 
+    When ``auto_accept_approvals`` is set (sessions launched with ``--yolo`` /
+    ``--force`` / ``-f``), tool-approval gates are accepted in-pane without a
+    web card. Cursor's Run Everything mode still sometimes leaves a pending
+    marker long enough to otherwise stall a piloted parent on mirrored
+    ApprovalCards. ``AskQuestion`` still surfaces — that is intentional human
+    input, not a tool gate.
+
     Store discovery reuses the forwarder's logic, so this binds to the same chat
     the forwarder mirrors. Detection is keyed by ``toolCallId`` (stable across
     polls and restarts), capturing every gated tool kind without a
@@ -662,12 +697,16 @@ async def supervise_cursor_transcript_elicitations(
     :param auth: Optional httpx auth for the runner's requests.
     :param poll_interval_s: Store poll cadence in seconds.
     :param settle_s: How long a call must stay pending before it is surfaced.
+    :param auto_accept_approvals: When True, accept tool gates in-pane instead
+        of mirroring ApprovalCards (yolo / force launch stance).
     """
     # tool_call_id → {"elicitation_id": str, "task": asyncio.Task} for SURFACED
     # (parked) calls; tool_call_id → loop-time first seen pending, for calls
     # still inside the settle window (not yet surfaced).
     active: dict[str, dict[str, object]] = {}
     first_seen: dict[str, float] = {}
+    # tool_call_id → loop-time of last auto-accept keystroke (yolo path only).
+    auto_accepted_at: dict[str, float] = {}
     store_path: Path | None = None
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
@@ -707,6 +746,8 @@ async def supervise_cursor_transcript_elicitations(
                         session_id,
                         tool_call_id.splitlines()[0],
                     )
+                for tool_call_id in [tcid for tcid in auto_accepted_at if tcid not in seen_ids]:
+                    auto_accepted_at.pop(tool_call_id, None)
                 # Surface calls that have now stayed pending past the settle window.
                 for call in pending_calls:
                     if call.tool_call_id in active:
@@ -723,6 +764,25 @@ async def supervise_cursor_transcript_elicitations(
                             call.tool_call_id.splitlines()[0],
                         )
                     if now - first < settle_s:
+                        continue
+                    # Yolo / force: accept tool gates in-pane; never mirror a card.
+                    # AskQuestion still parks — that is deliberate human input.
+                    if auto_accept_approvals and not _is_question_call(call):
+                        last_sent = auto_accepted_at.get(call.tool_call_id)
+                        if last_sent is not None and (now - last_sent) < _YOLO_ACCEPT_RETRY_S:
+                            continue
+                        _logger.info(
+                            "cursor elicitation: auto-accepting %s under yolo; "
+                            "session=%s tool_call_id=%s",
+                            call.tool_name,
+                            session_id,
+                            call.tool_call_id.splitlines()[0],
+                        )
+                        await _send_cursor_keys(
+                            bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY
+                        )
+                        auto_accepted_at[call.tool_call_id] = now
+                        first_seen.pop(call.tool_call_id, None)
                         continue
                     elicitation_id = cursor_tool_call_elicitation_id(session_id, call.tool_call_id)
                     _logger.debug(

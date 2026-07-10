@@ -7,7 +7,8 @@ HTTP boundaries faked:
   ``store.db`` (incl. binary checkpoint frames), suppressing resolved/auto-run
   calls, and the stable elicitation-id format.
 * **Supervisor** — surfacing a settled pending call, the debounce that drops
-  auto-approved calls, and the TUI-resolved release.
+  auto-approved calls, the TUI-resolved release, and the yolo auto-accept path
+  that sends ``y`` without parking a web card.
 * **Verdict delivery** — ``_run_one_approval`` (park → verdict → keystroke,
   incl. the reject → reason-prompt → Enter two-step) and ``_run_one_question``
   (AskQuestion form → picker keystrokes).
@@ -479,6 +480,177 @@ async def test_supervise_transcript_debounces_autoapproved_call(
 
     assert not any("hooks/cursor-permission-request" in u for u, _ in posts), posts
     assert not any(j.get("type") == "external_elicitation_resolved" for _, j in posts), posts
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (None, False),
+        ([], False),
+        (["--approve-mcps"], False),
+        (["--auto-review"], False),
+        (["--yolo"], True),
+        (["--force"], True),
+        (["-f"], True),
+        (["--yolo", "--approve-mcps", "--model", "grok"], True),
+        (["--force=true"], True),
+    ],
+)
+def test_cursor_launch_args_enable_yolo(args: list[str] | None, expected: bool) -> None:
+    """Only the Run Everything CLI flags enable the yolo auto-accept path."""
+    assert cnp.cursor_launch_args_enable_yolo(args) is expected
+
+
+async def test_supervise_transcript_yolo_auto_accepts_without_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Under yolo, a settled tool gate is accepted in-pane — no web card.
+
+    cursor-agent's Run Everything mode still sometimes leaves a pending marker
+    long enough for Omnigent to otherwise mirror an ApprovalCard and stall a
+    piloted parent. Auto-accept must send ``y`` and never POST the permission
+    hook.
+    """
+    posts: list[tuple[str, dict]] = []
+    keys_sent: list[tuple[str, ...]] = []
+
+    pending_now = [
+        CursorPendingToolCall(
+            tool_call_id="call_shell\nfc",
+            tool_name="Shell",
+            args={"command": "docker pull example"},
+        )
+    ]
+
+    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    (tmp_path / "store.db").write_bytes(b"")
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
+
+    async def _fake_send(_bridge: Path, _session: str, *keys: str) -> None:
+        keys_sent.append(keys)
+
+    monkeypatch.setattr(cnp, "_send_cursor_keys", _fake_send)
+
+    class _Resp:
+        status_code = 200
+        content = b""
+
+        def json(self) -> dict:
+            return {}
+
+    class _Client:
+        async def post(self, url: str, json: dict | None = None, **_k):
+            posts.append((url, json or {}))
+            return _Resp()
+
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(_Client()))
+
+    task = asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id="conv_yolo",
+            bridge_dir=tmp_path,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            poll_interval_s=0.01,
+            settle_s=0.0,
+            auto_accept_approvals=True,
+        )
+    )
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if keys_sent:
+            break
+    # Call resolves after the keystroke (cursor committed it).
+    pending_now.clear()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert keys_sent == [("y",)]
+    assert not any("hooks/cursor-permission-request" in u for u, _ in posts), posts
+    assert not any(j.get("type") == "external_elicitation_resolved" for _, j in posts), posts
+
+
+async def test_supervise_transcript_yolo_still_parks_askquestion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AskQuestion still mirrors under yolo — that is deliberate human input."""
+    posts: list[tuple[str, dict]] = []
+    keys_sent: list[tuple[str, ...]] = []
+
+    pending_now = [
+        CursorPendingToolCall(
+            tool_call_id="call_q\nfc",
+            tool_name="AskQuestion",
+            args={
+                "title": "Pick one",
+                "questions": [
+                    {
+                        "id": "q1",
+                        "prompt": "Continue?",
+                        "options": [{"id": "yes", "label": "Yes"}, {"id": "no", "label": "No"}],
+                    }
+                ],
+            },
+        )
+    ]
+
+    monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
+    (tmp_path / "store.db").write_bytes(b"")
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
+
+    async def _fake_send(_bridge: Path, _session: str, *keys: str) -> None:
+        keys_sent.append(keys)
+
+    monkeypatch.setattr(cnp, "_send_cursor_keys", _fake_send)
+
+    class _Resp:
+        status_code = 200
+        content = b""
+
+        def json(self) -> dict:
+            return {}
+
+    release = asyncio.Event()
+
+    class _Client:
+        async def post(self, url: str, json: dict | None = None, **_k):
+            posts.append((url, json or {}))
+            if "hooks/cursor-permission-request" in url:
+                await release.wait()
+            return _Resp()
+
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(_Client()))
+
+    task = asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id="conv_yolo_q",
+            bridge_dir=tmp_path,
+            workspace="/ws",
+            launch_epoch_ms=0,
+            poll_interval_s=0.01,
+            settle_s=0.0,
+            auto_accept_approvals=True,
+        )
+    )
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if any("hooks/cursor-permission-request" in u for u, _ in posts):
+            break
+    release.set()
+    pending_now.clear()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert any("hooks/cursor-permission-request" in u for u, _ in posts)
+    assert keys_sent == []
 
 
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────
