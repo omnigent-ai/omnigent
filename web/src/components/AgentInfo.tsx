@@ -45,6 +45,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ModelValueCombobox } from "@/components/ModelValueCombobox";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
@@ -541,9 +542,6 @@ function AddPolicyDialog({
                           : Array.isArray(prop?.default)
                             ? (prop.default as string[])
                             : [];
-                        const available = prop.items.enum.filter(
-                          (v: string) => !current.includes(v),
-                        );
                         return (
                           <div className="mt-0.5 space-y-1.5">
                             {current.length > 0 && (
@@ -571,43 +569,18 @@ function AddPolicyDialog({
                                 ))}
                               </div>
                             )}
-                            {available.length > 0 && (
-                              <select
-                                value=""
-                                onChange={(e) => {
-                                  if (!e.target.value) return;
-                                  const next = [...current, e.target.value];
-                                  setFactoryParams((prev) => ({
-                                    ...prev,
-                                    [key]: next.join(","),
-                                  }));
-                                }}
-                                className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
-                              >
-                                <option value="">Add from list…</option>
-                                {available.map((v: string) => (
-                                  <option key={v} value={v}>
-                                    {v}
-                                  </option>
-                                ))}
-                              </select>
-                            )}
-                            <input
-                              type="text"
-                              placeholder="Add custom value…"
-                              onKeyDown={(e) => {
-                                if (e.key !== "Enter") return;
-                                e.preventDefault();
-                                const v = e.currentTarget.value.trim();
-                                if (!v || current.includes(v)) return;
-                                const next = [...current, v];
+                            <ModelValueCombobox
+                              options={prop.items.enum}
+                              selected={current}
+                              onToggle={(v) => {
+                                const next = current.includes(v)
+                                  ? current.filter((x) => x !== v)
+                                  : [...current, v];
                                 setFactoryParams((prev) => ({
                                   ...prev,
                                   [key]: next.join(","),
                                 }));
-                                e.currentTarget.value = "";
                               }}
-                              className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
                             />
                           </div>
                         );
