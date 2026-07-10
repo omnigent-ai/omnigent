@@ -586,3 +586,115 @@ def test_resolve_env_opencode_key_missing_everywhere_fails_loud(
     monkeypatch.setattr(sbxmod, "resolve_opencode_zen_key", lambda environ=None: None)
     with pytest.raises(click.ClickException):
         SbxSandboxLauncher(env=["OPENCODE_API_KEY"])._resolve_env()
+
+
+# ── managed mode ────────────────────────────────────────────
+
+
+def test_managed_mode_class_vars() -> None:
+    """Managed sbx hosts can resume in place."""
+    assert SbxSandboxLauncher.can_resume is True
+
+
+def test_managed_provision_argv_and_egress(
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Managed provision creates from the template, bind-mounts a throwaway
+    empty directory (the CLI requires a PATH), skips the setup step, and
+    opens egress to the server + Claude domains.
+    """
+    empty = tmp_path / "empty"
+    monkeypatch.setattr(sbxmod, "_MANAGED_EMPTY_WORKSPACE", empty)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    launcher = SbxSandboxLauncher(
+        template="ghcr.io/me/omnigent-host-sbx:latest",
+        env=["ANTHROPIC_API_KEY"],
+        kits=["/opt/sbxkits/claude"],
+        server_url="http://172.17.0.1:6767",
+    )
+    sandbox_id = launcher.provision("managed-box")
+
+    assert sandbox_id == "managed-box"
+    assert empty.exists()
+    create, policy = fake_sbx.calls[:2]
+    assert create.args[1:] == [
+        "create",
+        "--name",
+        "managed-box",
+        "--kit",
+        "/opt/sbxkits/claude",
+        "-t",
+        "ghcr.io/me/omnigent-host-sbx:latest",
+        "shell",
+        str(empty),
+    ]
+    assert policy.args[1:5] == ["policy", "allow", "network", "--sandbox"]
+    assert policy.args[5] == "managed-box"
+    allowed = policy.args[6]
+    assert "172.17.0.1:6767" in allowed
+    assert "console.anthropic.com:443" in allowed
+    # No root setup exec.
+    assert [c.args[1:4] for c in fake_sbx.calls] != [["exec", "-u", "root"]]
+
+
+def test_managed_run_injects_env(fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Managed run() forwards configured env as `sbx exec -e NAME=VALUE`."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    launcher = SbxSandboxLauncher(
+        template="ghcr.io/me/omnigent-host-sbx:latest",
+        env=["OPENAI_API_KEY"],
+        server_url="http://172.17.0.1:6767",
+    )
+    result = launcher.run("box", 'printf %s "$HOME"')
+    assert result.returncode == 0
+    [call] = fake_sbx.calls
+    assert call.args[1] == "exec"
+    assert "-e" in call.args
+    assert "OPENAI_API_KEY=sk-openai" in call.args
+
+
+def test_managed_run_missing_env_fails_loud(
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured env name that is unset in the server env fails loud."""
+    monkeypatch.delenv("GIT_TOKEN", raising=False)
+    launcher = SbxSandboxLauncher(
+        template="ghcr.io/me/omnigent-host-sbx:latest",
+        env=["GIT_TOKEN"],
+        server_url="http://172.17.0.1:6767",
+    )
+    with pytest.raises(click.ClickException, match="GIT_TOKEN"):
+        launcher.run("box", "echo hi")
+
+
+def test_cli_run_does_not_inject_env(fake_sbx: _FakeSbx) -> None:
+    """CLI-bootstrap mode keeps the existing run() argv (no -e injection)."""
+    fake_sbx.responses["exec"] = _FakeCompleted(args=[], returncode=0, stdout="/root\n")
+    result = SbxSandboxLauncher().run("box", 'printf %s "$HOME"')
+    assert result.stdout == "/root\n"
+    assert fake_sbx.calls[0].args[1:] == [
+        "exec",
+        "box",
+        "bash",
+        "-lc",
+        'printf %s "$HOME"',
+    ]
+
+
+def test_sandbox_exists_parses_object_wrapper(fake_sbx: _FakeSbx) -> None:
+    """Current `sbx ls --json` returns {"sandboxes": [...]}."""
+    fake_sbx.responses["ls"] = _FakeCompleted(
+        args=[], stdout='{"sandboxes": [{"name": "box", "status": "running"}]}'
+    )
+    assert SbxSandboxLauncher()._sandbox_exists("box") is True
+    assert SbxSandboxLauncher()._sandbox_exists("other") is False
+
+
+def test_resume_verifies_existence(fake_sbx: _FakeSbx) -> None:
+    """resume() checks that the sandbox still exists; exec auto-starts it."""
+    fake_sbx.responses["ls"] = _FakeCompleted(
+        args=[], stdout='{"sandboxes": [{"name": "box", "status": "stopped"}]}'
+    )
+    SbxSandboxLauncher().resume("box")  # must not raise
+    assert [c.args[1] for c in fake_sbx.calls] == ["ls"]
