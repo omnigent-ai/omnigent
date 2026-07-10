@@ -179,6 +179,28 @@ webview/iframe can't provide screenshots, arbitrary in-page JS, or cross-origin
 navigation, so each browser is a native Electron **`WebContentsView`**
 positioned over a placeholder `<div>` the SPA measures — not an in-page element.
 
+```mermaid
+sequenceDiagram
+    participant A as Agent (runner — any host)
+    participant S as Omnigent server
+    participant R as Renderer / BrowserPane (this PR)
+    participant V as WebContentsView (local Chromium)
+
+    Note over A,S: browser_* tools ship in a separate PR
+    A->>S: browser_navigate / click / snapshot …
+    S->>R: browser.action_request (SSE, on the session stream)
+    R->>R: claim the action (single-winner token)
+    R->>V: drive via IPC (navigate / capture / …)
+    V-->>R: result (URL, snapshot, screenshot)
+    R-->>S: POST action result + claim token
+    S-->>A: result JSON (or clean timeout)
+```
+
+The browser runs on the user's machine (a native `WebContentsView`); the agent —
+which may run on a different host — drives it purely by messages: an action
+request fans out over the session stream, the renderer claims and executes it
+against its local Chromium, and the result is posted back.
+
 **Pieces:**
 
 - `src/browserViewRegistry.js` — a per-**conversation** `Map` of
