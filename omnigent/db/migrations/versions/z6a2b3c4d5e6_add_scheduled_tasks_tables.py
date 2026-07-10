@@ -58,7 +58,7 @@ def upgrade() -> None:
         sa.Column("sandbox_target", sa.String(64), nullable=True),
         sa.Column("timezone", sa.String(64), nullable=False),
         # Enum stored as a stable int code (see omnigent.db.enum_codecs
-        # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3, completed=4).
+        # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3).
         sa.Column("state", sa.SmallInteger(), nullable=False, server_default="1"),
         sa.Column("last_run_at", sa.Integer(), nullable=True),
         sa.Column("last_run_conversation_id", sa.String(64), nullable=True),
@@ -68,7 +68,7 @@ def upgrade() -> None:
         sa.Column("metadata", sa.LargeBinary(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),
-        sa.CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_state"),
+        sa.CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
     )
     op.create_index(

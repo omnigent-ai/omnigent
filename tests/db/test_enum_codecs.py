@@ -111,7 +111,6 @@ def test_shipped_codes_are_stable() -> None:
         "active": 1,
         "paused": 2,
         "deleted": 3,
-        "completed": 4,
     }
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,

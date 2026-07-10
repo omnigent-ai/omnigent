@@ -95,7 +95,7 @@ def test_state_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> Non
 
     The entity exposes ``state`` as a string; the column stores an int code.
     """
-    for i, name in enumerate(("active", "paused", "deleted", "completed")):
+    for i, name in enumerate(("active", "paused", "deleted")):
         task = store.create(
             scheduled_task_id=f"st_state_{i}",
             name="n",
@@ -223,7 +223,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
 
 
 def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) -> None:
-    """``list_active`` returns only active tasks, excluding paused/deleted/completed."""
+    """``list_active`` returns only active tasks, excluding paused/deleted."""
     store.create(
         scheduled_task_id="st_active",
         name="active",
@@ -234,7 +234,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
         timezone="UTC",
         state="active",
     )
-    for i, other_state in enumerate(("paused", "deleted", "completed")):
+    for i, other_state in enumerate(("paused", "deleted")):
         store.create(
             scheduled_task_id=f"st_{other_state}",
             name=other_state,

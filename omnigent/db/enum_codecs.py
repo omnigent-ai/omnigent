@@ -92,7 +92,6 @@ SCHEDULED_TASK_STATE: dict[str, int] = {
     "active": 1,
     "paused": 2,
     "deleted": 3,
-    "completed": 4,
 }
 
 SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {

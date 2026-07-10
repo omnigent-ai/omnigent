@@ -1081,7 +1081,7 @@ class SqlScheduledTask(Base):
     The entity mirrors the internal Isaac ``ScheduledTask`` spec (fields
     ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``; a required
     recurring ``cron_expression`` trigger; a ``state`` enum
-    ``active``/``paused``/``deleted``/``completed``) so a future merge is a
+    ``active``/``paused``/``deleted``) so a future merge is a
     column mapping rather than a rewrite.
 
     :param id: Opaque PK, e.g. ``"st_a1b2c3..."``. On Isaac→Omni migration a
@@ -1118,8 +1118,8 @@ class SqlScheduledTask(Base):
         resolution logic in this PR.
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
-    :param state: Lifecycle state — ``active``/``paused``/``deleted``/
-        ``completed``. The (future) scheduler only considers ``active`` tasks.
+    :param state: Lifecycle state — ``active``/``paused``/``deleted``.
+        The (future) scheduler only considers ``active`` tasks.
         Stored as a stable int code (see omnigent.db.enum_codecs
         SCHEDULED_TASK_STATE); the store converts to/from the string name at the
         row↔entity boundary. Defaults to ``active``.
@@ -1175,7 +1175,7 @@ class SqlScheduledTask(Base):
     sandbox_target: Mapped[str | None] = mapped_column(String(64), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3, completed=4). The
+    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
     # store converts to/from the string name at the row↔entity boundary.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     last_run_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1194,7 +1194,7 @@ class SqlScheduledTask(Base):
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_state"),
+        CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
         Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
         Index("ix_scheduled_tasks_agent_id", "workspace_id", "agent_id", "id"),

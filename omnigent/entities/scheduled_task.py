@@ -47,7 +47,7 @@ class ScheduledTask:
     :param sandbox_target: Nullable compute-target hint (a provider name such
         as ``"local"`` or ``"isaac"``). Persisted only; no resolution logic yet.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
-        ``"deleted"``, ``"completed"``. Defaults to ``"active"``.
+        ``"deleted"``. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
         ``None`` if it has never fired.
     :param last_run_conversation_id: Conversation created by the most recent
