@@ -191,9 +191,7 @@ describe("mergePath", () => {
 // silently drop app-injected dirs — so pin the call shape here.
 describe("main.js wiring", () => {
   const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
-  const liveCode = mainSource
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+  const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
   it("merges the login PATH rather than replacing it", () => {
     assert.match(liveCode, /process\.env\.PATH\s*=\s*mergePath\(/);
