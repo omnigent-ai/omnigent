@@ -3,8 +3,8 @@
 Verifies the migration creates both tables with the expected shape, that
 neither carries a database-level foreign key (schema Rule R032 — the
 ``agent_id`` / ``conversation_id`` / ``scheduled_task_id`` relationships are
-application-owned), that the ``scheduled_tasks`` trigger XOR CHECK and the
-``scheduled_task_runs.status`` CHECK are enforced, and that a downgrade drops both
+application-owned), that ``scheduled_tasks.cron_expression`` is NOT NULL and the
+``scheduled_task_runs.status`` CHECK is enforced, and that a downgrade drops both
 tables cleanly.
 """
 
@@ -56,7 +56,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "name",
         "prompt",
         "cron_expression",
-        "run_at_ms",
         "owner_user_id",
         "agent_id",
         "harness_override",
@@ -154,8 +153,8 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     assert workspace_id == 0
 
 
-def test_trigger_check_accepts_cron_only(db_engine: Engine) -> None:
-    """A row with only ``cron_expression`` set satisfies the XOR CHECK."""
+def test_cron_expression_accepts_recurring_row(db_engine: Engine) -> None:
+    """A row with ``cron_expression`` set inserts cleanly (the recurring trigger)."""
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
@@ -167,43 +166,16 @@ def test_trigger_check_accepts_cron_only(db_engine: Engine) -> None:
         )
 
 
-def test_trigger_check_accepts_run_at_only(db_engine: Engine) -> None:
-    """A row with only ``run_at_ms`` set satisfies the XOR CHECK."""
-    with db_engine.begin() as conn:
-        conn.execute(
-            sa.text(
-                "INSERT INTO scheduled_tasks "
-                "(id, name, prompt, run_at_ms, owner_user_id, agent_id, "
-                " timezone, metadata, created_at) "
-                "VALUES ('st_once', 'n', 'p', 1700000000000, 'u', 'ag', 'UTC', '{}', 1)"
-            )
-        )
-
-
-def test_trigger_check_rejects_both_set(db_engine: Engine) -> None:
-    """The XOR CHECK rejects a row with both trigger columns set (SQLite)."""
+def test_cron_expression_is_not_null(db_engine: Engine) -> None:
+    """A row omitting ``cron_expression`` fails the NOT NULL constraint."""
     with pytest.raises(IntegrityError):
         with db_engine.begin() as conn:
             conn.execute(
                 sa.text(
                     "INSERT INTO scheduled_tasks "
-                    "(id, name, prompt, cron_expression, run_at_ms, owner_user_id, "
-                    " agent_id, timezone, created_at) "
-                    "VALUES ('st_both', 'n', 'p', '0 9 * * *', 1700000000000, 'u', "
-                    " 'ag', 'UTC', 1)"
-                )
-            )
-
-
-def test_trigger_check_rejects_neither_set(db_engine: Engine) -> None:
-    """The XOR CHECK rejects a row with neither trigger column set (SQLite)."""
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "INSERT INTO scheduled_tasks "
-                    "(id, name, prompt, owner_user_id, agent_id, timezone, created_at) "
-                    "VALUES ('st_none', 'n', 'p', 'u', 'ag', 'UTC', 1)"
+                    "(id, name, prompt, owner_user_id, agent_id, timezone, "
+                    " metadata, created_at) "
+                    "VALUES ('st_none', 'n', 'p', 'u', 'ag', 'UTC', '{}', 1)"
                 )
             )
 

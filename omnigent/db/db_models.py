@@ -1075,13 +1075,12 @@ class SqlScheduledTask(Base):
     SQLAlchemy model for the ``scheduled_tasks`` table.
 
     A scheduled task is a saved, scheduled instruction that fires an agent
-    session — either recurring (``cron_expression``) or one-shot
-    (``run_at_ms``). This PR persists the definition only — no scheduler reads
-    or dispatches these rows yet.
+    session on a recurring cron schedule (``cron_expression``). This PR persists
+    the definition only — no scheduler reads or dispatches these rows yet.
 
     The entity mirrors the internal Isaac ``ScheduledTask`` spec (fields
-    ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``;
-    a ``ScheduleTrigger`` ``cron_expression | run_at_ms`` oneof; a ``state`` enum
+    ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``; a required
+    recurring ``cron_expression`` trigger; a ``state`` enum
     ``active``/``paused``/``deleted``/``completed``) so a future merge is a
     column mapping rather than a rewrite.
 
@@ -1090,11 +1089,8 @@ class SqlScheduledTask(Base):
         reused as the PK).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
-    :param cron_expression: A single cron string for a recurring task, e.g.
-        ``"0 9 * * *"``. Mutually exclusive with ``run_at_ms`` — exactly one is
-        set (enforced by ``ck_scheduled_tasks_trigger_exactly_one``).
-    :param run_at_ms: One-shot fire time as Unix epoch **milliseconds**.
-        Mutually exclusive with ``cron_expression`` — exactly one is set.
+    :param cron_expression: The required cron string for the recurring trigger,
+        e.g. ``"0 9 * * *"``.
     :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for — who the run belongs to, e.g. ``"alice@example.com"``.
         ``None`` in single-user / OSS mode; the fire path resolves it to the
@@ -1156,12 +1152,8 @@ class SqlScheduledTask(Base):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    # Trigger: a cron_expression | run_at_ms oneof matching Harry's
-    # ScheduleTrigger. Exactly one is non-NULL
-    # (ck_scheduled_tasks_trigger_exactly_one). cron_expression = a single cron
-    # string (recurring); run_at_ms = one-shot fire time in epoch milliseconds.
-    cron_expression: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    run_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Recurring trigger: a required cron string, e.g. "0 9 * * *".
+    cron_expression: Mapped[str] = mapped_column(String(255), nullable=False)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
     # resolves null to the reserved "local" user in a later PR). Indexed, so
@@ -1202,13 +1194,6 @@ class SqlScheduledTask(Base):
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
-        # Trigger oneof: exactly one of cron_expression / run_at_ms is set.
-        # Boolean XOR via `<>` on two `IS NOT NULL` predicates is portable
-        # across SQLite, PostgreSQL, and MySQL.
-        CheckConstraint(
-            "(cron_expression IS NOT NULL) <> (run_at_ms IS NOT NULL)",
-            name="ck_scheduled_tasks_trigger_exactly_one",
-        ),
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_state"),
         Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
         Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),

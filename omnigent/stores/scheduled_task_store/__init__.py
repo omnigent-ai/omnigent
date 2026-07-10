@@ -40,12 +40,11 @@ class ScheduledTaskStore(ABC):
         scheduled_task_id: str,
         name: str,
         prompt: str,
+        cron_expression: str,
         owner_user_id: str | None,
         agent_id: str,
         timezone: str,
         *,
-        cron_expression: str | None = None,
-        run_at_ms: int | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
@@ -58,20 +57,15 @@ class ScheduledTaskStore(ABC):
         """
         Insert a new scheduled task.
 
-        Exactly one of ``cron_expression`` / ``run_at_ms`` must be set — the
-        ``ScheduleTrigger`` oneof. Passing both or neither raises ``ValueError``.
-
         :param scheduled_task_id: Pre-generated unique task id, e.g. ``"st_..."``.
         :param name: Human-readable task name.
         :param prompt: The instruction dispatched to the agent on each firing.
+        :param cron_expression: The required cron string for the recurring
+            trigger, e.g. ``"0 9 * * *"``.
         :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant
             is written for; ``None`` in single-user mode.
         :param agent_id: The agent bound to this task.
         :param timezone: IANA timezone the trigger is evaluated in.
-        :param cron_expression: Single cron string for a recurring task.
-            Mutually exclusive with ``run_at_ms``.
-        :param run_at_ms: One-shot fire time in epoch milliseconds. Mutually
-            exclusive with ``cron_expression``.
         :param harness_override: Optional brain-harness override.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
@@ -82,8 +76,7 @@ class ScheduledTaskStore(ABC):
             ``completed``. Defaults to ``"active"``.
         :param metadata: Optional free-form metadata dict.
         :returns: The newly created :class:`ScheduledTask`.
-        :raises ValueError: If not exactly one trigger field is set, or if
-            ``state`` is not a recognized value.
+        :raises ValueError: If ``state`` is not a recognized value.
         """
         ...
 
@@ -125,7 +118,6 @@ class ScheduledTaskStore(ABC):
         name: str | None = None,
         prompt: str | None = None,
         cron_expression: str | None = None,
-        run_at_ms: int | None = None,
         timezone: str | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
@@ -141,15 +133,13 @@ class ScheduledTaskStore(ABC):
         """
         Update mutable fields of a task. ``None`` leaves a field unchanged.
 
-        The trigger is a oneof: passing ``cron_expression`` or ``run_at_ms``
-        switches the trigger to that kind (and clears the other); passing both
-        raises ``ValueError``; passing neither leaves the trigger untouched.
+        Passing ``cron_expression`` updates the recurring trigger; ``None``
+        leaves it unchanged.
 
         Returns ``None`` if the task does not exist.
 
         :param scheduled_task_id: Opaque task identifier.
         :returns: The updated :class:`ScheduledTask`, or ``None`` if not found.
-        :raises ValueError: If both trigger fields are supplied.
         """
         ...
 

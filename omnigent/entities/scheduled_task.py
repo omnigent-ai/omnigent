@@ -2,7 +2,7 @@
 ``scheduled_task_runs`` tables.
 
 A :class:`ScheduledTask` is a saved, scheduled instruction that fires an agent
-session — recurring (``cron_expression``) or one-shot (``run_at_ms``). A
+session on a recurring cron schedule (``cron_expression``). A
 :class:`ScheduledTaskRun` records one firing of a task (its run history). This
 module holds the plain dataclasses the store converts ORM rows into; the store
 owns the JSON (de)serialization of the Text-backed columns.
@@ -19,25 +19,21 @@ class ScheduledTask:
     """
     A scheduled task persisted in the ``scheduled_tasks`` table.
 
-    A task's trigger is a ``cron_expression | run_at_ms`` oneof (matching
-    Harry's ``ScheduleTrigger``): exactly one is set — ``cron_expression`` for a
-    recurring task, ``run_at_ms`` for a one-shot.
+    A task's trigger is a required recurring ``cron_expression``.
 
     :param id: Opaque primary key, e.g. ``"st_a1b2c3..."``. On Isaac→Omni
         migration a fresh id is minted; Isaac's schedule_id is preserved in
         metadata.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
+    :param cron_expression: The required cron string for the recurring trigger,
+        e.g. ``"0 9 * * *"``.
     :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for, e.g. ``"alice@example.com"``. ``None`` in single-user mode.
     :param agent_id: The agent bound to this task, e.g. ``"ag_..."``.
     :param timezone: IANA timezone the trigger is evaluated in,
         e.g. ``"America/Los_Angeles"``.
     :param created_at: Unix epoch seconds at row creation.
-    :param cron_expression: A single cron string for a recurring task, or
-        ``None`` for a one-shot. Mutually exclusive with ``run_at_ms``.
-    :param run_at_ms: One-shot fire time as Unix epoch milliseconds, or ``None``
-        for a recurring task. Mutually exclusive with ``cron_expression``.
     :param harness_override: Per-task brain-harness override, e.g. ``"pi"``.
         ``None`` means use the agent default.
     :param model_override: Per-task LLM model override, e.g.
@@ -64,12 +60,11 @@ class ScheduledTask:
     id: str
     name: str
     prompt: str
+    cron_expression: str
     owner_user_id: str | None
     agent_id: str
     timezone: str
     created_at: int
-    cron_expression: str | None = None
-    run_at_ms: int | None = None
     harness_override: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None

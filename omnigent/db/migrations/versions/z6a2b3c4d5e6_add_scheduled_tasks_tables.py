@@ -8,9 +8,9 @@ Adds the ``scheduled_tasks`` table (saved, scheduled agent instructions) and its
 ``scheduled_task_runs`` history table (one row per firing). This is the
 persistence foundation only — no scheduler reads or dispatches these rows yet.
 
-The task trigger is a ``cron_expression | run_at_ms`` oneof (matching Harry's
-``ScheduleTrigger``): a ``ck_scheduled_tasks_trigger_exactly_one`` CHECK enforces
-that exactly one of the two is set — recurring (cron) or one-shot (epoch-ms).
+The task trigger is a required recurring ``cron_expression`` (matching the
+recurring-only shape of the reference platforms): every task fires on a cron
+schedule, so ``cron_expression`` is NOT NULL.
 
 Both tables are brand-new and are created at the current schema state, so each
 carries the tenant-partition ``workspace_id`` column as the leading primary-key
@@ -45,10 +45,8 @@ def upgrade() -> None:
         sa.Column("name", sa.String(256), nullable=False),
         # Opaque free text stored compressed (CompressedText → LargeBinary).
         sa.Column("prompt", sa.LargeBinary(), nullable=False),
-        # Trigger oneof (cron_expression | run_at_ms), matching Harry's
-        # ScheduleTrigger; exactly one is non-NULL (CHECK below).
-        sa.Column("cron_expression", sa.String(255), nullable=True),
-        sa.Column("run_at_ms", sa.BigInteger(), nullable=True),
+        # Recurring trigger: a required cron string (e.g. "0 9 * * *").
+        sa.Column("cron_expression", sa.String(255), nullable=False),
         sa.Column("owner_user_id", sa.String(255), nullable=True),
         sa.Column("agent_id", sa.String(64), nullable=False),
         sa.Column("harness_override", sa.String(64), nullable=True),
@@ -70,12 +68,6 @@ def upgrade() -> None:
         sa.Column("metadata", sa.LargeBinary(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),
-        # Exactly one trigger set: boolean XOR via `<>` on IS NOT NULL is
-        # portable across SQLite / PostgreSQL / MySQL.
-        sa.CheckConstraint(
-            "(cron_expression IS NOT NULL) <> (run_at_ms IS NOT NULL)",
-            name="ck_scheduled_tasks_trigger_exactly_one",
-        ),
         sa.CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_state"),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
     )

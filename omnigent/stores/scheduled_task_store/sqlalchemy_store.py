@@ -27,25 +27,6 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 
-def _validate_trigger(cron_expression: str | None, run_at_ms: int | None) -> None:
-    """
-    Enforce the ``cron_expression | run_at_ms`` oneof at the store boundary.
-
-    Exactly one must be set. Fails cleanly with ``ValueError`` before any DB
-    write, so callers get a clear error rather than an opaque ``IntegrityError``
-    from the ``ck_scheduled_tasks_trigger_exactly_one`` CHECK (the DB backstop).
-
-    :param cron_expression: The recurring-trigger cron string, or ``None``.
-    :param run_at_ms: The one-shot fire time in epoch ms, or ``None``.
-    :raises ValueError: If both are set or neither is set.
-    """
-    if (cron_expression is None) == (run_at_ms is None):
-        raise ValueError(
-            "exactly one of cron_expression / run_at_ms must be set "
-            f"(got cron_expression={cron_expression!r}, run_at_ms={run_at_ms!r})"
-        )
-
-
 def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
     """
     Convert a :class:`SqlScheduledTask` ORM row to a :class:`ScheduledTask`.
@@ -62,7 +43,6 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         timezone=row.timezone,
         created_at=row.created_at,
         cron_expression=row.cron_expression,
-        run_at_ms=row.run_at_ms,
         harness_override=row.harness_override,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
@@ -125,12 +105,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         scheduled_task_id: str,
         name: str,
         prompt: str,
+        cron_expression: str,
         owner_user_id: str | None,
         agent_id: str,
         timezone: str,
         *,
-        cron_expression: str | None = None,
-        run_at_ms: int | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
@@ -140,19 +119,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str = "active",
         metadata: dict[str, Any] | None = None,
     ) -> ScheduledTask:
-        """Insert a new scheduled task.
-
-        Exactly one of ``cron_expression`` / ``run_at_ms`` must be set; passing
-        both or neither raises ``ValueError`` before any insert (the DB CHECK
-        ``ck_scheduled_tasks_trigger_exactly_one`` is the backstop).
-        """
-        _validate_trigger(cron_expression, run_at_ms)
+        """Insert a new scheduled task with a required recurring ``cron_expression``."""
         row = SqlScheduledTask(
             id=scheduled_task_id,
             name=name,
             prompt=prompt,
             cron_expression=cron_expression,
-            run_at_ms=run_at_ms,
             owner_user_id=owner_user_id,
             agent_id=agent_id,
             timezone=timezone,
@@ -212,7 +184,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         name: str | None = None,
         prompt: str | None = None,
         cron_expression: str | None = None,
-        run_at_ms: int | None = None,
         timezone: str | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
@@ -227,10 +198,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> ScheduledTask | None:
         """Update mutable fields. ``None`` leaves a field unchanged.
 
-        The trigger is a oneof: passing ``cron_expression`` OR ``run_at_ms``
-        switches the trigger to that kind (setting the given one and clearing
-        the other). Passing both raises ``ValueError``; passing neither leaves
-        the trigger untouched.
+        Passing ``cron_expression`` updates the recurring trigger; ``None``
+        leaves it unchanged.
         """
         with self._session() as session:
             row = session.get(SqlScheduledTask, (current_workspace_id(), scheduled_task_id))
@@ -243,13 +212,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if prompt is not None and row.prompt != prompt:
                 row.prompt = prompt
                 changed = True
-            if cron_expression is not None or run_at_ms is not None:
-                # A trigger switch: exactly one of the two may be supplied.
-                _validate_trigger(cron_expression, run_at_ms)
-                if row.cron_expression != cron_expression or row.run_at_ms != run_at_ms:
-                    row.cron_expression = cron_expression
-                    row.run_at_ms = run_at_ms
-                    changed = True
+            if cron_expression is not None and row.cron_expression != cron_expression:
+                row.cron_expression = cron_expression
+                changed = True
             if timezone is not None and row.timezone != timezone:
                 row.timezone = timezone
                 changed = True

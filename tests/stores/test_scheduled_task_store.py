@@ -49,7 +49,6 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.name == "nightly triage"
     assert task.prompt == "Triage the inbox"
     assert task.cron_expression == "0 9 * * *"
-    assert task.run_at_ms is None
     assert task.owner_user_id == "alice@example.com"
     assert task.agent_id == "ag_abc"
     assert task.timezone == "America/Los_Angeles"
@@ -84,7 +83,6 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.workspace is None
     assert task.base_branch is None
     assert task.sandbox_target is None
-    assert task.run_at_ms is None
     assert task.metadata == {}
     assert task.state == "active"
 
@@ -143,11 +141,11 @@ def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     assert updated.state == "paused"
 
 
-# ── trigger oneof (cron_expression | run_at_ms) ───────────────────────────────
+# ── recurring trigger (cron_expression) ───────────────────────────────────────
 
 
 def test_create_recurring_task(store: SqlAlchemyScheduledTaskStore) -> None:
-    """A recurring task sets ``cron_expression`` and leaves ``run_at_ms`` null."""
+    """A recurring task sets ``cron_expression``."""
     task = store.create(
         scheduled_task_id="st_recur",
         name="recurring",
@@ -158,56 +156,12 @@ def test_create_recurring_task(store: SqlAlchemyScheduledTaskStore) -> None:
         timezone="UTC",
     )
     assert task.cron_expression == "0 9 * * *"
-    assert task.run_at_ms is None
 
 
-def test_create_one_shot_task(store: SqlAlchemyScheduledTaskStore) -> None:
-    """A one-shot task sets ``run_at_ms`` and leaves ``cron_expression`` null."""
-    task = store.create(
-        scheduled_task_id="st_oneshot",
-        name="one-shot",
-        prompt="p",
-        run_at_ms=1_700_000_000_000,
-        owner_user_id="u",
-        agent_id="ag",
-        timezone="UTC",
-    )
-    assert task.run_at_ms == 1_700_000_000_000
-    assert task.cron_expression is None
-
-
-def test_create_rejects_both_triggers(store: SqlAlchemyScheduledTaskStore) -> None:
-    """Setting both trigger fields is rejected before the insert."""
-    with pytest.raises(ValueError, match="exactly one"):
-        store.create(
-            scheduled_task_id="st_both",
-            name="both",
-            prompt="p",
-            cron_expression="0 9 * * *",
-            run_at_ms=1_700_000_000_000,
-            owner_user_id="u",
-            agent_id="ag",
-            timezone="UTC",
-        )
-
-
-def test_create_rejects_neither_trigger(store: SqlAlchemyScheduledTaskStore) -> None:
-    """Setting no trigger field is rejected before the insert."""
-    with pytest.raises(ValueError, match="exactly one"):
-        store.create(
-            scheduled_task_id="st_neither",
-            name="neither",
-            prompt="p",
-            owner_user_id="u",
-            agent_id="ag",
-            timezone="UTC",
-        )
-
-
-def test_update_switches_trigger_kind(store: SqlAlchemyScheduledTaskStore) -> None:
-    """Updating with ``run_at_ms`` switches a recurring task to one-shot."""
+def test_update_changes_cron_expression(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Updating with a new ``cron_expression`` reschedules the recurring trigger."""
     store.create(
-        scheduled_task_id="st_switch",
+        scheduled_task_id="st_recron",
         name="n",
         prompt="p",
         cron_expression="0 9 * * *",
@@ -215,29 +169,9 @@ def test_update_switches_trigger_kind(store: SqlAlchemyScheduledTaskStore) -> No
         agent_id="ag",
         timezone="UTC",
     )
-    updated = store.update("st_switch", run_at_ms=1_700_000_000_000)
+    updated = store.update("st_recron", cron_expression="0 0 * * *")
     assert updated is not None
-    assert updated.run_at_ms == 1_700_000_000_000
-    assert updated.cron_expression is None
-
-
-def test_update_rejects_both_triggers(store: SqlAlchemyScheduledTaskStore) -> None:
-    """Updating with both trigger fields is rejected."""
-    store.create(
-        scheduled_task_id="st_upd_both",
-        name="n",
-        prompt="p",
-        cron_expression="0 9 * * *",
-        owner_user_id="u",
-        agent_id="ag",
-        timezone="UTC",
-    )
-    with pytest.raises(ValueError, match="exactly one"):
-        store.update(
-            "st_upd_both",
-            cron_expression="0 0 * * *",
-            run_at_ms=1_700_000_000_000,
-        )
+    assert updated.cron_expression == "0 0 * * *"
 
 
 def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
