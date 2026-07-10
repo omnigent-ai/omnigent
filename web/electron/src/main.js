@@ -41,6 +41,7 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const { normalizeRecents, rememberRecent, serializeRecents } = require("./recents");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -797,13 +798,12 @@ async function clearCliPath() {
   return omnigentCli.getCliStatus(null);
 }
 
-/** Maximum number of entries kept in the persisted recent-servers list. */
-const MAX_RECENT_SERVERS = 5;
-
 /**
  * Record a successfully-connected server URL at the head of the persisted
- * recent-servers list: most recent first, deduplicated, capped at
- * MAX_RECENT_SERVERS. Mutates `settings` in place; the caller saves it.
+ * recent-servers list: most recent first, deduplicated, capped, preserving any
+ * nickname the url already carries. Mutates `settings` in place; the caller
+ * saves it. The list model and its hand-edited/corrupt tolerance live in
+ * src/recents.js.
  *
  * @param {Record<string, unknown>} settings Settings object from
  *   loadSettings().
@@ -811,13 +811,8 @@ const MAX_RECENT_SERVERS = 5;
  *   e.g. ``"http://localhost:8000/"``.
  */
 function rememberRecentServer(settings, url) {
-  // Tolerate a hand-edited/corrupt settings.json (non-array, junk entries)
-  // by rebuilding the list from whatever string entries survive.
-  const existing = Array.isArray(settings.recent_servers) ? settings.recent_servers : [];
-  settings.recent_servers = [
-    url,
-    ...existing.filter((u) => typeof u === "string" && u !== url),
-  ].slice(0, MAX_RECENT_SERVERS);
+  const list = rememberRecent(normalizeRecents(settings.recent_servers), url);
+  settings.recent_servers = serializeRecents(list);
 }
 
 // ---------------------------------------------------------------------------
@@ -2069,9 +2064,8 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    const recents = loadSettings().recent_servers;
-    // Same hand-edited-settings tolerance as rememberRecentServer.
-    return Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [];
+    // Bare URLs, most recent first; junk entries dropped (see normalizeRecents).
+    return normalizeRecents(loadSettings().recent_servers).map((e) => e.url);
   });
 
   // SPA title-bar server picker → the sender window's pinned origin plus the
@@ -2083,11 +2077,10 @@ function registerIpc() {
       return null;
     }
     const win = BrowserWindow.fromWebContents(event.sender);
-    const recents = loadSettings().recent_servers;
     return {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
-      recentServers: Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [],
+      recentServers: normalizeRecents(loadSettings().recent_servers).map((e) => e.url),
     };
   });
 
@@ -2101,8 +2094,7 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("switch-server is only available to a connected server page");
     }
-    const recents = loadSettings().recent_servers;
-    const known = Array.isArray(recents) && recents.includes(url);
+    const known = normalizeRecents(loadSettings().recent_servers).some((e) => e.url === url);
     if (!known) {
       throw new Error("switch-server target must be a previously-connected server");
     }
