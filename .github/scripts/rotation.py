@@ -65,7 +65,6 @@ PEOPLE: list[Person] = [
     Person("Daniel Lok", "U060CNWNHSQ", "Asia/Singapore"),
     Person("Dhruv Gupta", "U0A76097E1F", "America/Los_Angeles"),
     Person("Edwin He", "U077B1V6WQJ", "America/Los_Angeles"),
-    Person("Kecheng Cao", "U03NKUCH5HP", "America/Los_Angeles"),
     Person("Pat Sukprasert", "U05HRKWFY81", "Asia/Singapore"),
     Person("Sabhya Chhabria", "U07A1KQDXAB", "America/Los_Angeles"),
     Person("Serena Ruan", "U0571L5KNLR", "Asia/Singapore"),
