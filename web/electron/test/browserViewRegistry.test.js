@@ -27,6 +27,8 @@ function makeRegistry() {
       loadURL() {},
       close() {},
       removeListener() {},
+      on() {},
+      setWindowOpenHandler() {},
     },
   });
   const registry = createBrowserViewRegistry({
@@ -148,6 +150,8 @@ function makeLoadTrackingRegistry() {
         },
         close() {},
         removeListener() {},
+        on() {},
+        setWindowOpenHandler() {},
       },
     }),
     createBoundsController: createBrowserViewBoundsController,
@@ -211,5 +215,121 @@ describe("browserViewRegistry — agent-navigation allowlist", () => {
     });
     assert.equal(r.ok, true);
     assert.deepEqual(loaded, ["file:///tmp/report.html"]);
+  });
+});
+
+// A stub view that captures the webContents event handlers (will-navigate /
+// will-redirect / will-frame-navigate) and the window-open handler, so tests
+// can fire a redirect and assert whether it was cancelled (preventDefault).
+function makeEventCapturingRegistry() {
+  const sent = []; // { channel, payload }
+  let handlers; // { [event]: fn } for the single created view
+  let windowOpenHandler;
+  const registry = createBrowserViewRegistry({
+    WebContentsViewCtor: () => {
+      handlers = {};
+      return {
+        setBounds() {},
+        webContents: {
+          loadURL() {},
+          close() {},
+          removeListener() {},
+          on(event, fn) {
+            handlers[event] = fn;
+          },
+          setWindowOpenHandler(fn) {
+            windowOpenHandler = fn;
+          },
+        },
+      };
+    },
+    createBoundsController: createBrowserViewBoundsController,
+    attachToHost() {},
+    detachFromHost() {},
+    sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
+    getHostZoomFactor: () => 1,
+  });
+  return {
+    registry,
+    sent,
+    fire: (event, targetUrl) => {
+      const ev = {
+        url: targetUrl,
+        prevented: false,
+        preventDefault() {
+          this.prevented = true;
+        },
+      };
+      handlers[event](ev, targetUrl);
+      return ev;
+    },
+    windowOpen: (url) => windowOpenHandler({ url }),
+  };
+}
+
+describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("blocks an agent-locked will-redirect to the cloud-metadata IP", () => {
+    const { registry, sent, fire } = makeEventCapturingRegistry();
+    // Agent navigates to an allowed host (locks the view to agent policy).
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    // The server 302s to the metadata endpoint — the guard must cancel it.
+    const ev = fire("will-redirect", "http://169.254.169.254/latest/meta-data/");
+    assert.equal(ev.prevented, true, "will-redirect to metadata must be preventDefault'd");
+    const blocked = sent.filter((s) => s.channel === "browser-nav-blocked");
+    assert.equal(blocked.length, 1, "a browser-nav-blocked signal is emitted");
+    assert.match(blocked[0].payload.error, /navigation blocked/);
+  });
+
+  it("blocks an agent-locked will-navigate to a loopback host", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    const ev = fire("will-navigate", "http://127.0.0.1:8080/");
+    assert.equal(ev.prevented, true);
+  });
+
+  it("blocks an agent-locked will-navigate to an RFC-1918 private host", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    const ev = fire("will-navigate", "http://10.1.2.3/admin");
+    assert.equal(ev.prevented, true);
+  });
+
+  it("allows an agent-locked redirect between normal public https hosts", () => {
+    const { registry, sent, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    const ev = fire("will-redirect", "https://cdn.example.net/asset");
+    assert.equal(ev.prevented, false, "a normal https→https redirect must not be blocked");
+    assert.equal(sent.filter((s) => s.channel === "browser-nav-blocked").length, 0);
+  });
+
+  it("does NOT block redirects on a user-typed (non-agent) navigation", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    // User types a URL (no agent flag) → the view is NOT agent-locked, so its
+    // redirects — even to an internal host (auth-redirect chains) — are allowed.
+    registry.openOrNavigate("conv_1", "https://intranet.example.com/", undefined, {
+      force: true,
+    });
+    const ev = fire("will-redirect", "http://10.0.0.5/sso/callback");
+    assert.equal(ev.prevented, false, "user-driven nav stays permissive");
+  });
+
+  it("re-locks correctly: a user nav after an agent nav flips enforcement off", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    // Then the user types a new address on the same view.
+    registry.openOrNavigate("conv_1", "https://intranet.example.com/", undefined, {
+      force: true,
+    });
+    const ev = fire("will-redirect", "http://192.168.1.10/");
+    assert.equal(ev.prevented, false, "the later user nav unlocked the view");
+  });
+});
+
+describe("browserViewRegistry — child window.open is denied (S3)", () => {
+  it("installs a window-open handler that denies every popup", () => {
+    const { registry, windowOpen } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    assert.deepEqual(windowOpen("https://evil.example.com/popup"), { action: "deny" });
+    assert.deepEqual(windowOpen("https://example.com/ok"), { action: "deny" });
   });
 });

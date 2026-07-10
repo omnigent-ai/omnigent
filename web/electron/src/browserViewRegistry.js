@@ -55,6 +55,14 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
+      // Whether the CURRENT navigation was agent-initiated. Set on every
+      // openOrNavigate from opts.agent; read by the will-navigate/will-redirect
+      // guard so the allowlist is enforced on the agent's whole nav chain
+      // (initial load + every redirect / meta-refresh / location.href) but NOT
+      // on user-typed URL-bar browsing, which stays permissive. SECURITY: without
+      // this, the allowlist only guards the first hop and a redirect to an
+      // internal host slips through (SSRF via screenshot).
+      agentNavLocked: false,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
@@ -84,7 +92,59 @@ function createBrowserViewRegistry({
     });
     const entry = makeEntry(conversationId, view);
     entries.set(conversationId, entry);
+    denyChildWindowOpen(entry);
+    attachAgentNavGuard(conversationId, entry);
     return { ok: true, entry, created: true };
+  }
+
+  // SECURITY: a visited page must not spawn windows from the desktop shell.
+  // Deny every window.open / target=_blank on the child view (the safe default;
+  // unlike the main shell window we do NOT route to shell.openExternal, since an
+  // agent-visited page popping the user's real browser to an arbitrary URL is
+  // itself an abuse vector).
+  function denyChildWindowOpen(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.setWindowOpenHandler !== "function") return;
+    wc.setWindowOpenHandler(() => ({ action: "deny" }));
+  }
+
+  // SECURITY (SSRF): enforce the agent-navigation allowlist on the child view's
+  // OWN navigation events, not just the first loadURL. A server 302 / meta-
+  // refresh / location.href during an agent-initiated navigation would otherwise
+  // redirect the view to an internal host (metadata / loopback / RFC-1918) with
+  // no re-check, and browser_screenshot could read it back. `will-navigate` and
+  // `will-redirect` (plus subframes via `will-frame-navigate`) are the blocking
+  // hooks — did-navigate is report-only and fires too late. Enforced ONLY while
+  // `entry.agentNavLocked` (set per-navigation from opts.agent), so user-typed
+  // URL-bar browsing — including legitimate auth-redirect chains to internal
+  // hosts — stays permissive.
+  function attachAgentNavGuard(conversationId, entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    const guard = (event, targetUrl) => {
+      if (!entry.agentNavLocked) return; // user-driven nav: permissive
+      const verdict = isAgentNavigationAllowed(targetUrl);
+      if (!verdict.ok) {
+        try {
+          event.preventDefault();
+        } catch {
+          /* event shape without preventDefault — nothing to cancel */
+        }
+        sendToRenderer("browser-nav-blocked", {
+          conversationId,
+          url: targetUrl,
+          error: verdict.error,
+        });
+      }
+    };
+    wc.on("will-navigate", guard);
+    wc.on("will-redirect", guard);
+    // Subframe navigations (iframes) can also reach an internal host; guard them
+    // too. Older Electron may not emit this event — harmless if it never fires.
+    wc.on("will-frame-navigate", (event) => {
+      // will-frame-navigate passes a single event whose `.url` is the target.
+      guard(event, event && event.url);
+    });
   }
 
   function openOrNavigate(conversationId, url, bounds, opts) {
@@ -103,6 +163,10 @@ function createBrowserViewRegistry({
     const result = getOrCreate(conversationId);
     if (!result.ok) return result;
     const { entry, created } = result;
+    // Latch who drives THIS navigation so the will-navigate/will-redirect guard
+    // enforces the allowlist on an agent nav's whole redirect chain, and leaves
+    // user-typed URL-bar nav permissive. Set only when a url is actually issued.
+    if (url) entry.agentNavLocked = !!(opts && opts.agent);
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
     // create-detached and let `setActive(conversationId)` attach on user switch.
