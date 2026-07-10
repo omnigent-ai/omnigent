@@ -53,6 +53,8 @@ import type {
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
+  McpServerStartup,
+  SessionMcpStartupEvent,
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
@@ -599,6 +601,37 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       stage,
       error: typeof data.error === "string" ? data.error : null,
     } satisfies SessionSandboxStatusEvent;
+  }
+  if (eventType === "session.mcp_startup") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const rawServers = data.servers;
+    if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return null;
+    // Skip malformed entries rather than dropping the frame — a partial
+    // map still updates the startup band; unknown statuses are ignored.
+    const servers: Record<string, McpServerStartup> = {};
+    for (const [name, record] of Object.entries(rawServers as Record<string, unknown>)) {
+      if (!name || !record || typeof record !== "object" || Array.isArray(record)) continue;
+      const status = (record as Record<string, unknown>).status;
+      if (
+        status !== "starting" &&
+        status !== "ready" &&
+        status !== "failed" &&
+        status !== "cancelled"
+      ) {
+        continue;
+      }
+      const error = (record as Record<string, unknown>).error;
+      servers[name] = {
+        status,
+        error: typeof error === "string" && error ? error : null,
+      };
+    }
+    return {
+      type: "session_mcp_startup",
+      conversationId,
+      servers,
+    } satisfies SessionMcpStartupEvent;
   }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.

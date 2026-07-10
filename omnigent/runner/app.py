@@ -10701,19 +10701,69 @@ def create_runner_app(
         message). claude-native is unaffected: its badge mirrors Claude Code's
         *own* ``[Request interrupted by user]`` record, which is real.
 
+        Stop also cancels an in-flight MCP startup round (issue #2058): the
+        bridge's still-``starting`` servers are marked ``cancelled``
+        locally (what the web band and turn-error text read, even if Codex
+        never acknowledges) and the app-server is asked to abort startup
+        the way the Codex TUI does — ``turn/interrupt`` with an EMPTY turn
+        id (its ``startup_interrupt``). This runs alongside the active-turn
+        interrupt when both apply, because codex defers a mid-startup
+        turn's execution until the round settles: stopping only the turn
+        would leave the user watching a startup they asked to stop.
+
         :param conv_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: 204 when no active turn is recorded or the interrupt lands;
-            503 when Codex rejects the active-turn interrupt.
+        :returns: 204 when nothing needs interrupting or the interrupts
+            land; 503 when Codex rejects the active-turn interrupt.
         """
         from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            cancel_pending_mcp_startup,
+            read_mcp_startup,
+        )
 
         state = await _codex_native_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
             return Response(status_code=204)
-        if state.active_turn_id is None:
-            _logger.info("Codex-native interrupt skipped for %s: no active turn.", conv_id)
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(
+            labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        )
+        pending_mcp = cancel_pending_mcp_startup(bridge_dir)
+        if state.active_turn_id is None and not pending_mcp:
+            _logger.info(
+                "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
+                conv_id,
+            )
             return Response(status_code=204)
+        if pending_mcp:
+            _logger.info(
+                "Codex-native interrupt for %s cancels MCP startup: %s",
+                conv_id,
+                ", ".join(pending_mcp),
+            )
+            # Publish the flipped map ourselves: the forwarder only reposts
+            # when IT changes the map, and codex's own cancelled edges are
+            # owner-only — without this post the web band and snapshot stay
+            # stuck on "Starting MCP servers" after a Stop.
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": "external_mcp_startup",
+                        "data": {"servers": read_mcp_startup(bridge_dir)},
+                    },
+                    timeout=10.0,
+                )
+            except Exception:  # noqa: BLE001 - the bridge flip already took effect locally.
+                _logger.warning(
+                    "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
+                )
 
         codex_client = client_for_transport(
             state.socket_path,
@@ -10721,13 +10771,29 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
-            await codex_client.request(
-                "turn/interrupt",
-                {
-                    "threadId": state.thread_id,
-                    "turnId": state.active_turn_id,
-                },
-            )
+            if pending_mcp:
+                # Startup interrupt first and best-effort: the local
+                # cancel above already updated what Omnigent shows.
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {"threadId": state.thread_id, "turnId": ""},
+                    )
+                except Exception:  # noqa: BLE001 - the local cancel already took effect.
+                    _logger.warning(
+                        "Codex-native MCP startup interrupt failed for session=%s thread=%s",
+                        conv_id,
+                        state.thread_id,
+                        exc_info=True,
+                    )
+            if state.active_turn_id is not None:
+                await codex_client.request(
+                    "turn/interrupt",
+                    {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                    },
+                )
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures to caller.
             _logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",

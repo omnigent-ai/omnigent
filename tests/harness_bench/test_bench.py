@@ -473,7 +473,7 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
     built: list[object] = []
 
     class _FakeShared:
-        def __init__(self, db_profile: str) -> None:
+        def __init__(self, env: object) -> None:
             built.append(self)
             self.registered: list[str] = []
 
@@ -529,6 +529,10 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
         "tests.harness_bench.bench.resolve_driver_class",
         lambda p, *, override=None, fast=False: _FSDriver,
     )
+    # Keep the shared-server gate cred-free: this test fakes the server + driver,
+    # so it must not depend on a resolvable Databricks profile (CI has none).
+    monkeypatch.setattr("tests.harness_bench.bench.bench_creds_skip_reason", lambda p: None)
+    monkeypatch.setattr("tests.harness_bench.bench.resolve_bench_env", lambda p: object())
 
     profiles = [
         BenchProfile(
@@ -754,7 +758,7 @@ async def test_expected_provisioning_error_logged_quietly(
 # ── native-tui transport (offline) ──────────────────────────────
 
 
-def test_native_tui_registered_and_gates() -> None:
+def test_native_tui_registered_and_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     """native-tui is in the registry and derives any native-tui harness."""
     from tests.harness_bench.native_tui_driver import NativeTuiDriver, native_vendor
     from tests.harness_bench.transport import driver_registry, resolve_driver_class
@@ -781,7 +785,13 @@ def test_native_tui_registered_and_gates() -> None:
     codex_sdk = BenchProfile(harness="codex", model="m", env_prefix="X_", marker="X")
     assert NativeTuiDriver.unavailable(codex_sdk, databricks_profile="oss") is not None
 
-    # No profile → the same capability-neutral skip contract as other drivers.
+    # No creds anywhere (no --profile, no ambient OPENAI_*, no configured
+    # profile) → capability-neutral skip. Clear the ambient env and stub the
+    # config lookup so the contract is tested deterministically regardless of
+    # the host's environment.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setattr("tests.harness_bench.runtime_env._profile_from_config", lambda: None)
     assert NativeTuiDriver.unavailable(claude_native, databricks_profile=None) is not None
 
 

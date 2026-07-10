@@ -510,14 +510,16 @@ class TestDatabricksExecutorToolCalls(unittest.TestCase):
 
 class TestDatabricksExecutorErrors(unittest.TestCase):
     def test_empty_stream(self):
-        """Stream with no chunks yields a TurnComplete with empty text."""
+        """Stream with no chunks (no finish_reason, no content, no tool calls) is
+        a truncated turn that died mid-stream, so it surfaces an ExecutorError
+        rather than a silent empty TurnComplete (#1118)."""
 
         async def _t():
             executor = DatabricksExecutor(client=FakeClient([]))
             events = [e async for e in executor.run_turn([], [], "")]
             self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], TurnComplete)
-            self.assertEqual(events[0].response, "")
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertEqual(events[0].message, "Stream ended without finish_reason")
 
         _run(_t())
 
@@ -1782,3 +1784,30 @@ def test_profiles_for_host_missing_file_returns_empty(
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
 
     assert _databrickscfg_profiles_for_host("https://example.databricks.com") == []
+
+
+def test_stream_ended_without_finish_reason_with_content_completes() -> None:
+    """A truncated stream that still produced text surfaces that text as a
+    TurnComplete (not an error) — only the empty case is fatal (#1118)."""
+
+    async def _t() -> None:
+        # Content arrives, then the stream ends without a finish_reason.
+        chunks = [FakeStreamChunk(choices=[FakeStreamChoice(delta=FakeDelta(content="partial"))])]
+        executor = DatabricksExecutor(client=FakeClient(chunks))
+
+        events = [
+            e
+            async for e in executor.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                config=ExecutorConfig(model="databricks-kimi-k2-6"),
+            )
+        ]
+
+        assert not [e for e in events if isinstance(e, ExecutorError)]
+        turn_events = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_events) == 1
+        assert turn_events[0].response == "partial"
+
+    _run(_t())

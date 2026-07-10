@@ -9019,22 +9019,27 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
 
 
 class _EventRecordingServerClient(NullServerClient):
-    """Records Omnigent ``external_conversation_item`` POSTs for assertion.
+    """Records Omnigent ``external_*`` event POSTs for assertion.
 
     Subclasses :class:`NullServerClient` so all other runner→AP calls still
-    succeed silently; captures the bodies so a test can assert that NO
-    interrupt marker was persisted.
+    succeed silently; captures ``external_conversation_item`` bodies so a
+    test can assert that NO interrupt marker was persisted, and
+    ``external_mcp_startup`` bodies so Stop tests can assert the cancelled
+    MCP map was published.
     """
 
     def __init__(self) -> None:
         self.posted_items: list[dict[str, Any]] = []
+        self.posted_mcp_startup: list[dict[str, Any]] = []
 
     async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-        """Record ``external_conversation_item`` bodies."""
+        """Record ``external_conversation_item`` / ``external_mcp_startup`` bodies."""
         del url
         body = kwargs.get("json")
         if isinstance(body, dict) and body.get("type") == "external_conversation_item":
             self.posted_items.append(body.get("data") or {})
+        if isinstance(body, dict) and body.get("type") == "external_mcp_startup":
+            self.posted_mcp_startup.append(body.get("data") or {})
         return self._Response()
 
 
@@ -9816,6 +9821,352 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
         )
         for h in captured_history
     ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    """
+    Stop/interrupt with no active turn cancels in-flight MCP startup.
+
+    During codex-native startup no turn id is recorded yet, so Stop used to
+    204 no-op while Codex sat wedged on a slow or failing MCP server
+    (issue #2058). The handler must flip the bridge's pending servers to
+    ``cancelled`` (unblocking the executor's first-turn gate) and send the
+    Codex TUI's startup interrupt — ``turn/interrupt`` with an empty turn
+    id — instead of doing nothing.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = f"conv_codex_native_mcp_{event_type}"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    # Abort the session-create auto-terminal path before it reaches
+    # ``clear_bridge_state`` — otherwise the seeded bridge state below is
+    # wiped on hosts where the codex CLI/provider config exist (in CI the
+    # auto-create aborts on its own before the clear).
+    import omnigent.runner.app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Abort codex auto-create before it clears bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43212",
+            thread_id="thread_codex_mcp",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    codex_native_bridge.update_mcp_server_startup(bridge_dir, "storage-console", "starting")
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43212",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Return the fake Codex app-server client for the startup-cancel path.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43212"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Fake client that records JSON-RPC calls.
+        """
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        stop_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": event_type},
+        )
+
+    assert stop_resp.status_code == 204, (
+        f"codex-native {event_type} must return 204; got {stop_resp.status_code}: {stop_resp.text}"
+    )
+    # The Codex TUI's startup interrupt shape: turn/interrupt with an
+    # EMPTY turn id (its ``startup_interrupt``); a recorded-turn shape
+    # here would be rejected by the app-server mid-startup.
+    assert fake_client.requests == [
+        (
+            "turn/interrupt",
+            {"threadId": "thread_codex_mcp", "turnId": ""},
+        )
+    ], (
+        f"codex-native {event_type} during MCP startup must send the startup "
+        f"interrupt (empty turnId); got {fake_client.requests!r}."
+    )
+    # The local flip is authoritative even if Codex never acknowledges
+    # the interrupt.
+    assert codex_native_bridge.read_mcp_startup(bridge_dir) == {
+        "storage-console": {"status": "cancelled", "error": None}
+    }
+    # And the flipped map is PUBLISHED: the forwarder only reposts when it
+    # changes the map itself and codex's cancelled edges are owner-only,
+    # so without this post the web band would stay stuck on "starting".
+    assert server_client.posted_mcp_startup == [
+        {"servers": {"storage-console": {"status": "cancelled", "error": None}}}
+    ], (
+        f"codex-native {event_type} must publish the cancelled MCP map; "
+        f"got {server_client.posted_mcp_startup!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop during a startup-deferred turn interrupts the turn AND the startup.
+
+    Codex accepts ``turn/start`` mid-MCP-startup and defers its execution
+    until the round settles, so a Stop pressed in that window finds an
+    active turn id recorded. Interrupting only the turn would leave the
+    user watching a startup they asked to stop — the handler must also
+    send the startup interrupt (empty turn id, best-effort, first) and
+    flip the bridge's pending servers to ``cancelled``.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_codex_native_dual_stop"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    # Keep the seeded bridge state alive through session create (see the
+    # sister startup-cancel test for why auto-create must abort early).
+    import omnigent.runner.app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Abort codex auto-create before it clears bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43214",
+            thread_id="thread_codex_dual",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_deferred",
+        ),
+    )
+    codex_native_bridge.update_mcp_server_startup(bridge_dir, "storage-console", "starting")
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43214",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Return the fake Codex app-server client for the dual-stop path.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43214"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Fake client that records JSON-RPC calls.
+        """
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        int_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, int_resp.text
+    # Startup interrupt (empty turnId) first — best-effort — then the
+    # recorded turn's interrupt.
+    assert fake_client.requests == [
+        ("turn/interrupt", {"threadId": "thread_codex_dual", "turnId": ""}),
+        ("turn/interrupt", {"threadId": "thread_codex_dual", "turnId": "turn_deferred"}),
+    ], f"dual stop must send startup interrupt then turn interrupt; got {fake_client.requests!r}."
+    assert codex_native_bridge.read_mcp_startup(bridge_dir) == {
+        "storage-console": {"status": "cancelled", "error": None}
+    }
+    # The cancelled map is published to the session (band + snapshot update).
+    assert server_client.posted_mcp_startup == [
+        {"servers": {"storage-console": {"status": "cancelled", "error": None}}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop with no active turn and no pending MCP startup stays a 204 no-op.
+
+    An idle codex-native session must not send spurious ``turn/interrupt``
+    requests to the app-server on every Stop press.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_codex_native_idle_stop"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    # Keep the seeded bridge state alive through session create (see the
+    # sister startup-cancel test for why auto-create must abort early).
+    import omnigent.runner.app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Abort codex auto-create before it clears bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43213",
+            thread_id="thread_codex_idle",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+
+    def _fail_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """Fail the test if the runner opens an app-server connection."""
+        raise AssertionError(
+            f"idle codex-native interrupt must not reach the app-server; "
+            f"attempted connect to {transport!r} as {client_name!r}"
+        )
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fail_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        int_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, int_resp.text
 
 
 @pytest.mark.asyncio

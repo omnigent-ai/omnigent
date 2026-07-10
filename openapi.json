@@ -1784,6 +1784,39 @@
         "title": "MCPServerSummary",
         "type": "object"
       },
+      "McpServerStartup": {
+        "description": "One MCP server's startup state within a `session.mcp_startup` event.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Failure detail when `status == \"failed\"`, e.g. `\"handshaking with MCP server failed\"`. `None` otherwise.",
+            "title": "Error"
+          },
+          "status": {
+            "description": "Latest startup state reported by the harness, mirroring Codex's `McpServerStartupState` enum.",
+            "enum": [
+              "starting",
+              "ready",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "McpServerStartup",
+        "type": "object"
+      },
       "MessageData": {
         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -2946,6 +2979,7 @@
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
@@ -2994,6 +3028,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSandboxStatusEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionMcpStartupEvent"
           },
           {
             "$ref": "#/components/schemas/SessionSkillsEvent"
@@ -3937,6 +3974,49 @@
         "title": "SessionListItem",
         "type": "object"
       },
+      "SessionMcpStartupEvent": {
+        "description": "Per-MCP-server startup progress for a native harness session.\n\nA codex-native session brings up its configured MCP servers when its\nCodex thread starts; slow or failing servers previously left the web\nsession looking hung with no signal. The native forwarder mirrors\nCodex's `mcpServer/startupStatus/updated` notifications as\n`external_mcp_startup` posts, republished here so the web UI can\nshow which servers are still starting and which failed or were\ncancelled.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "servers": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/McpServerStartup"
+            },
+            "description": "Latest per-server startup map, e.g. `{\"safe\": {\"status\": \"starting\", \"error\": None}}`. Category: **transient** (SSE + snapshot cache). Not persisted; a client connecting mid-startup seeds from the session snapshot's `mcp_startup` field and updates live off this event.",
+            "title": "Servers",
+            "type": "object"
+          },
+          "type": {
+            "const": "session.mcp_startup",
+            "description": "Always `\"session.mcp_startup\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "servers"
+        ],
+        "title": "SessionMcpStartupEvent",
+        "type": "object"
+      },
       "SessionModelEvent": {
         "description": "Active-model update from a terminal-backed integration.\n\nEmitted after an `external_model_change` POST from the\n`omnigent claude` transcript forwarder when the model is\nswitched inside the Claude Code terminal (a `/model` command or\nthe in-TUI picker). Lets the web model picker reflect a TUI-side\nswitch without a reload.",
         "properties": {
@@ -4497,6 +4577,20 @@
             ],
             "description": "The LLM model identifier from the bound agent's spec, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when the agent has no explicit `llm:` block or the agent cannot be looked up.",
             "title": "Llm Model"
+          },
+          "mcp_startup": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/McpServerStartup"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Startup"
           },
           "model_options": {
             "description": "Codex app-server `model/list` options for codex-native sessions, including each model's supported reasoning efforts. Empty for non-codex-native sessions or while the bound runner / Codex app-server cannot answer yet.",

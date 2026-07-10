@@ -6241,3 +6241,118 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     ]
     assert len(boundaries) == 1
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_parsed"),
+    [
+        # An angle-bracket display string (e.g. a TaskOutput result) is the
+        # regression case: Claude's TaskOutput renderer JSON.parses
+        # toolUseResult on resume and threw "Unrecognized token '<'" at boot.
+        (
+            "<retrieval_status>timeout</retrieval_status>",
+            "<retrieval_status>timeout</retrieval_status>",
+        ),
+        # A <tool_use_error> blob is the same hazard from a different tool.
+        (
+            "<tool_use_error>No task found</tool_use_error>",
+            "<tool_use_error>No task found</tool_use_error>",
+        ),
+        # Ordinary plain text must also round-trip to a string.
+        ("plain text output", "plain text output"),
+        # Already-JSON output (e.g. an image content-block array) must pass
+        # through verbatim, not get double-encoded into a string literal.
+        (
+            '[{"type":"image","source":{"type":"base64","data":"AAA"}}]',
+            [{"type": "image", "source": {"type": "base64", "data": "AAA"}}],
+        ),
+    ],
+)
+def test_claude_transcript_tool_use_result_is_json_parseable(
+    output: str,
+    expected_parsed: object,
+) -> None:
+    """
+    Synthesized ``toolUseResult`` must survive Claude's resume-time parse.
+
+    Claude Code ``JSON.parse``s ``toolUseResult`` for some built-in
+    renderers (``TaskOutput``). A raw ``<...>`` display string crashed
+    the TUI at boot before the input prompt rendered, so the resume
+    failed. The synthesizer must always emit a JSON-parseable value,
+    while leaving the ``tool_result`` content block as the verbatim
+    string the model and web UI see.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    assert len(records) == 1
+    record = records[0]
+    # toolUseResult must parse without raising, and preserve the value.
+    assert json.loads(record["toolUseResult"]) == expected_parsed
+    # The tool_result content block keeps the raw string unchanged.
+    assert record["message"]["content"][0]["content"] == output
+
+
+def test_json_safe_tool_use_result_wraps_non_json() -> None:
+    """Non-JSON strings become a JSON string literal; JSON passes through."""
+    # A leading '<' is not valid JSON, so it is wrapped.
+    wrapped = claude_native._json_safe_tool_use_result("<x>y</x>")
+    assert json.loads(wrapped) == "<x>y</x>"
+    # A bare number is valid JSON and must not be re-wrapped.
+    assert claude_native._json_safe_tool_use_result("42") == "42"
+    # A JSON object string passes through unchanged.
+    assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
+
+
+def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
+    """
+    Pin the resume crash to the old ``toolUseResult = output`` flatten.
+
+    Claude Code ``JSON.parse``s ``toolUseResult`` for its ``TaskOutput``
+    renderer at resume time. A real ``isaac review`` result whose text
+    starts with ``<retrieval_status>...`` is not valid JSON, so the old
+    verbatim flatten crashed the TUI at boot with "Unrecognized token
+    '<'" before the input prompt rendered — the failure the user hit.
+
+    This models both sides of that parse: the pre-fix value would raise,
+    the value the synthesizer emits today does not. It fails if anyone
+    reverts to assigning ``output`` verbatim.
+    """
+    output = (
+        "<retrieval_status>timeout</retrieval_status>\n\n"
+        "<task_id>b51au379y</task_id>\n\n<status>running</status>"
+    )
+
+    # The synthesizer must emit a JSON-parseable toolUseResult. The old
+    # verbatim flatten stored the raw "<...>" string, which threw
+    # "Unrecognized token '<'" when Claude's TaskOutput renderer parsed it
+    # at resume — this assertion fails if that flatten is restored.
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    assert len(records) == 1
+    assert json.loads(records[0]["toolUseResult"]) == output
