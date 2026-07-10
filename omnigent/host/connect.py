@@ -331,6 +331,22 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # …" for a key the CLI just saved to the file. Not a secret (a boolean
         # flag); safe to propagate.
         "OMNIGENT_DISABLE_KEYRING",
+        # D-Bus session bus location. The Linux OS-keychain backend
+        # (SecretService, e.g. GNOME Keyring / KWallet) needs this to find
+        # the user's running session bus; without it ``keyring`` raises
+        # ``NoKeyringError`` (a ``KeyringError`` subclass), which
+        # ``omnigent.onboarding.secrets`` silently treats as "backend
+        # unavailable" and falls back to the file store — so a runner
+        # spawned without this var can't see a secret the host owner just
+        # stored via the OS keyring, failing with "no stored secret named
+        # …" even though `secret-tool`/`keyring` resolve it fine outside
+        # omnigent. Not a secret (a bus address), safe to propagate.
+        "DBUS_SESSION_BUS_ADDRESS",
+        # XDG per-session runtime directory. Some SecretService
+        # implementations locate the session bus socket via this var when
+        # ``DBUS_SESSION_BUS_ADDRESS`` itself is unset. Same rationale as
+        # above; not a secret, safe to propagate.
+        "XDG_RUNTIME_DIR",
         # claude-sdk sandbox bypass flag. A diagnostic knob (not a
         # secret — a plain boolean) read inside the harness to decide
         # whether to wrap the brain CLI in sandbox-exec. Without it in

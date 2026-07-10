@@ -1487,6 +1487,34 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
     assert env["OMNIGENT_DISABLE_KEYRING"] == "1"
 
 
+def test_build_runner_env_propagates_dbus_session_bus_vars() -> None:
+    """``DBUS_SESSION_BUS_ADDRESS`` / ``XDG_RUNTIME_DIR`` propagate so the
+    runner's OS-keychain lookup can reach the same Secret Service session
+    the host owner's ``keyring``/``secret-tool`` calls use.
+
+    Regression guard: without these, ``keyring.get_password`` raises
+    ``NoKeyringError`` (a ``KeyringError`` subclass) inside the runner, which
+    ``omnigent.onboarding.secrets`` silently treats as "backend unavailable"
+    and falls back to the (empty) file store — surfacing as "no stored
+    secret named …" even though the secret is present in the OS keyring.
+    """
+    base = {
+        "PATH": "/usr/bin:/bin",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+
+
 # ── host.list_dir handler ───────────────────────────────
 
 
