@@ -71,4 +71,33 @@ describe("TurnRail", () => {
     const tick = screen.getAllByRole("button")[0]!;
     expect(tick).toHaveClass("h-4");
   });
+
+  it("shows the hovered turn's preview when the cursor moves onto a tick", () => {
+    renderRail(makeTurns(3));
+    const ticks = screen.getAllByRole("button");
+    // A genuine hover moves the cursor to a fresh position.
+    fireEvent.mouseEnter(ticks[1]!, { clientX: 10, clientY: 20 });
+    // The preview box renders the hovered turn's user text.
+    expect(screen.getByText("prompt number 1")).toBeInTheDocument();
+  });
+
+  it("ignores a mouseenter at the same cursor position (scroll under a still cursor)", () => {
+    // Scrolling drags ticks under a stationary cursor, firing mouseenter on
+    // each with the SAME clientX/clientY. Those must not swap the preview —
+    // only a real cursor move (different position) should.
+    renderRail(makeTurns(3));
+    const ticks = screen.getAllByRole("button");
+    fireEvent.mouseEnter(ticks[0]!, { clientX: 10, clientY: 20 });
+    expect(screen.getByText("prompt number 0")).toBeInTheDocument();
+
+    // Same position → the scroll-induced enter on another tick is ignored, so
+    // the preview stays on turn 0.
+    fireEvent.mouseEnter(ticks[2]!, { clientX: 10, clientY: 20 });
+    expect(screen.getByText("prompt number 0")).toBeInTheDocument();
+    expect(screen.queryByText("prompt number 2")).not.toBeInTheDocument();
+
+    // A real move (different position) updates the preview again.
+    fireEvent.mouseEnter(ticks[2]!, { clientX: 10, clientY: 40 });
+    expect(screen.getByText("prompt number 2")).toBeInTheDocument();
+  });
 });

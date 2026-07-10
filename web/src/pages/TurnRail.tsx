@@ -57,11 +57,12 @@ export function TurnRail({
   // `turns` change) can't yank the rail back to the transcript's visible run
   // while the user is scrolling it.
   const interactingRef = useRef(false);
-  // True while the rail is mid-scroll. Scrolling drags ticks under a
-  // stationary cursor, firing onMouseEnter on each — this suppresses those
-  // hover updates so the preview text doesn't flicker through every tick;
-  // we settle onto the tick under the cursor once scrolling stops.
-  const scrollingRef = useRef(false);
+  // Cursor position at which we last accepted a hover. Scrolling drags ticks
+  // under a stationary cursor, firing onMouseEnter on each — but the cursor
+  // itself hasn't moved. Comparing against this lets us tell a real hover
+  // (cursor moved) from a scroll-induced one (same position), independent of
+  // whether the browser fires mouseenter before or after the scroll event.
+  const hoverPointRef = useRef({ x: -1, y: -1 });
   // Last pointer position over the rail, used to pick the settle tick.
   const pointerRef = useRef({ x: 0, y: 0 });
   // itemIds of the turns whose messages are currently on screen. Their ticks
@@ -228,9 +229,6 @@ export function TurnRail({
   }, [hasMoreHistory, loadingMoreHistory]);
 
   const handleHover = useCallback((itemId: string) => {
-    // Ignore the onMouseEnter storm a scroll causes by dragging ticks under a
-    // stationary cursor — the scroll-end handler settles onto the right tick.
-    if (scrollingRef.current) return;
     const rail = railRef.current;
     const tick = tickRefs.current.get(itemId);
     if (rail && tick) {
@@ -240,6 +238,19 @@ export function TurnRail({
     }
     setHoveredId(itemId);
   }, []);
+
+  // onMouseEnter handler for a tick. Ignores the enter events a scroll causes
+  // by dragging ticks under a stationary cursor: the cursor position hasn't
+  // moved since the last accepted hover, so only accept enters where it has.
+  // The scroll-end handler settles onto the tick actually under the cursor.
+  const handleTickEnter = useCallback(
+    (itemId: string, x: number, y: number) => {
+      if (x === hoverPointRef.current.x && y === hoverPointRef.current.y) return;
+      hoverPointRef.current = { x, y };
+      handleHover(itemId);
+    },
+    [handleHover],
+  );
 
   // Keep previewTop glued to the hovered tick while the rail scrolls under a
   // stationary pointer — thumb-tracking can smooth-scroll the rail without a
@@ -256,19 +267,18 @@ export function TurnRail({
     return () => rail.removeEventListener("scroll", reposition);
   }, [hoveredId]);
 
-  // While the rail scrolls, mark it busy (so handleHover ignores the mouseenter
-  // storm from ticks passing under the cursor) and, once scrolling settles,
-  // adopt the tick now under the pointer as the preview. Debounced: each scroll
-  // event pushes the "settle" out, so it fires once the rail comes to rest.
+  // Once the rail comes to rest after a scroll, adopt the tick now under the
+  // cursor as the preview. The mouseenter storm during the scroll is ignored
+  // (cursor stationary), so without this settle the preview would stay stuck on
+  // the pre-scroll tick. Debounced: each scroll event pushes the settle out, so
+  // it fires once the rail stops.
   useEffect(() => {
     const rail = railRef.current;
     if (!rail) return;
     let settle = 0;
     const onScroll = () => {
-      scrollingRef.current = true;
       window.clearTimeout(settle);
       settle = window.setTimeout(() => {
-        scrollingRef.current = false;
         // Pick the tick now under the last pointer position and preview it.
         const el = document.elementFromPoint(pointerRef.current.x, pointerRef.current.y);
         const button = el?.closest<HTMLButtonElement>("[data-turn-tick]");
@@ -343,7 +353,7 @@ export function TurnRail({
                 if (el) tickRefs.current.set(turn.itemId, el);
                 else tickRefs.current.delete(turn.itemId);
               }}
-              onMouseEnter={() => handleHover(turn.itemId)}
+              onMouseEnter={(e) => handleTickEnter(turn.itemId, e.clientX, e.clientY)}
               onFocus={() => handleHover(turn.itemId)}
               onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage)}
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
