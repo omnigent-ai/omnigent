@@ -5,15 +5,14 @@ import { normalizeTypedUrl } from "./normalizeTypedUrl";
 describe("normalizeTypedUrl", () => {
   it("leaves an explicit http/https scheme untouched (case-insensitive)", () => {
     expect(normalizeTypedUrl("https://example.com")).toBe("https://example.com");
-    expect(normalizeTypedUrl("http://go/glean")).toBe("http://go/glean");
-    expect(normalizeTypedUrl("HTTP://GO/x")).toBe("HTTP://GO/x");
+    expect(normalizeTypedUrl("http://myhost")).toBe("http://myhost");
+    expect(normalizeTypedUrl("HTTP://MYHOST/x")).toBe("HTTP://MYHOST/x");
   });
 
-  it("uses http:// for dotless (corp shortname) hosts", () => {
-    expect(normalizeTypedUrl("go/glean")).toBe("http://go/glean");
-    expect(normalizeTypedUrl("go")).toBe("http://go");
+  it("uses http:// for dotless hosts", () => {
+    expect(normalizeTypedUrl("myhost")).toBe("http://myhost");
     expect(normalizeTypedUrl("wiki/SomePage")).toBe("http://wiki/SomePage");
-    expect(normalizeTypedUrl("jira/PROJ-123?focus=true")).toBe("http://jira/PROJ-123?focus=true");
+    expect(normalizeTypedUrl("wiki/page-123?focus=true")).toBe("http://wiki/page-123?focus=true");
   });
 
   it("uses https:// for dotted hosts", () => {
