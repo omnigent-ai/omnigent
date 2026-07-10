@@ -125,7 +125,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         scheduled_task_id: str,
         name: str,
         prompt: str,
-        owner_user_id: str,
+        owner_user_id: str | None,
         agent_id: str,
         timezone: str,
         *,

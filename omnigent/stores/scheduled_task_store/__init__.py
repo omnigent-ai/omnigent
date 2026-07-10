@@ -40,7 +40,7 @@ class ScheduledTaskStore(ABC):
         scheduled_task_id: str,
         name: str,
         prompt: str,
-        owner_user_id: str,
+        owner_user_id: str | None,
         agent_id: str,
         timezone: str,
         *,
@@ -64,7 +64,8 @@ class ScheduledTaskStore(ABC):
         :param scheduled_task_id: Pre-generated unique task id, e.g. ``"st_..."``.
         :param name: Human-readable task name.
         :param prompt: The instruction dispatched to the agent on each firing.
-        :param owner_user_id: User the task belongs to and fires as.
+        :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant
+            is written for; ``None`` in single-user mode.
         :param agent_id: The agent bound to this task.
         :param timezone: IANA timezone the trigger is evaluated in.
         :param cron_expression: Single cron string for a recurring task.

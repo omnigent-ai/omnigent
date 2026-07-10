@@ -49,7 +49,7 @@ def upgrade() -> None:
         # ScheduleTrigger; exactly one is non-NULL (CHECK below).
         sa.Column("cron_expression", sa.String(255), nullable=True),
         sa.Column("run_at_ms", sa.BigInteger(), nullable=True),
-        sa.Column("owner_user_id", sa.String(255), nullable=False),
+        sa.Column("owner_user_id", sa.String(255), nullable=True),
         sa.Column("agent_id", sa.String(64), nullable=False),
         sa.Column("harness_override", sa.String(64), nullable=True),
         sa.Column("model_override", sa.String(128), nullable=True),

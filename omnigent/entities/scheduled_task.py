@@ -28,8 +28,8 @@ class ScheduledTask:
         metadata.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
-    :param owner_user_id: User the task belongs to and fires as, e.g.
-        ``"alice@example.com"``.
+    :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
+        written for, e.g. ``"alice@example.com"``. ``None`` in single-user mode.
     :param agent_id: The agent bound to this task, e.g. ``"ag_..."``.
     :param timezone: IANA timezone the trigger is evaluated in,
         e.g. ``"America/Los_Angeles"``.
@@ -64,7 +64,7 @@ class ScheduledTask:
     id: str
     name: str
     prompt: str
-    owner_user_id: str
+    owner_user_id: str | None
     agent_id: str
     timezone: str
     created_at: int

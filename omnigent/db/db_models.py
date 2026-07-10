@@ -1095,9 +1095,10 @@ class SqlScheduledTask(Base):
         set (enforced by ``ck_scheduled_tasks_trigger_exactly_one``).
     :param run_at_ms: One-shot fire time as Unix epoch **milliseconds**.
         Mutually exclusive with ``cron_expression`` — exactly one is set.
-    :param owner_user_id: User the task belongs to and fires as — the
-        identity anchor for unattended dispatch, e.g. ``"alice@example.com"``.
-        Required.
+    :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
+        written for — who the run belongs to, e.g. ``"alice@example.com"``.
+        ``None`` in single-user / OSS mode; the fire path resolves it to the
+        reserved ``"local"`` user (resolution lands in a later PR).
     :param agent_id: The agent bound to this task (relates to
         ``agents.id``). Cascade cleanup on agent deletion is application-owned
         — there is no DB-level foreign key (schema Rule R032).
@@ -1161,9 +1162,11 @@ class SqlScheduledTask(Base):
     # string (recurring); run_at_ms = one-shot fire time in epoch milliseconds.
     cron_expression: Mapped[str | None] = mapped_column(String(255), nullable=True)
     run_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    # Required identity anchor. Indexed, so kept at 255 (<= the indexed-string
-    # length ceiling) rather than the wider 256 used for non-indexed owners.
-    owner_user_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
+    # for this user. Nullable — None in single-user/OSS mode (the fire path
+    # resolves null to the reserved "local" user in a later PR). Indexed, so
+    # kept at 255 (<= the indexed-string length ceiling) rather than 256.
+    owner_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
     agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
     # Per-task overrides — None means fall back to the agent default. Widths
