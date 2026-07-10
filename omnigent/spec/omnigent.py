@@ -1140,6 +1140,15 @@ def agent_def_to_agent_spec(
     # error regardless of which spec format the user is on.
     skills_filter = _translate_skills_filter_from_yaml(raw_yaml)
 
+    # Top-level ``context_providers:`` — same shape and parser as the
+    # canonical spec path. Needs the raw YAML (like guardrails above); the
+    # omnigent loader doesn't carry this field on ``AgentDef``.
+    context_providers = None
+    if raw_yaml is not None:
+        from omnigent.spec.parser import _parse_context_providers
+
+        context_providers = _parse_context_providers(raw_yaml.get("context_providers"))
+
     return AgentSpec(
         spec_version=_SYNTHETIC_SPEC_VERSION,
         name=name,
@@ -1160,6 +1169,7 @@ def agent_def_to_agent_spec(
         # AgentSpec expects.
         agent_session_sharing=SharePolicy(agent_def.agent_session_sharing),
         skills_filter=skills_filter,
+        context_providers=context_providers,
     )
 
 
