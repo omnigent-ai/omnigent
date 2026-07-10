@@ -44,6 +44,12 @@ prompt: |
   (file:line) and how you verified it; for REVIEW / EXPLORE, your findings.
   Note anything that did not fit the task.
 
+tools:
+  context7:
+    type: mcp
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+
 os_env:
   type: caller_process
   cwd: .
