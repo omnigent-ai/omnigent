@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
 
@@ -165,6 +165,104 @@ describe("BrowserPane design-mode toggle", () => {
     expect(screen.getByRole("button", { name: /enter design mode/i })).toHaveAttribute(
       "aria-pressed",
       "false",
+    );
+  });
+});
+
+describe("BrowserPane toolbar navigation + URL bar", () => {
+  /** Render the pane, activate a view (so toolbar buttons enable), and return
+   *  the bridge + handles to the captured event callbacks. */
+  async function renderActive(conversationId: string, overrides: Record<string, unknown> = {}) {
+    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
+    let fireUrl: ((p: { conversationId: string; url: string }) => void) | undefined;
+    let fireNav:
+      | ((p: { conversationId: string; canGoBack: boolean; canGoForward: boolean }) => void)
+      | undefined;
+    const bridge = installBridge({
+      onBrowserViewCreated: vi.fn((cb: (p: { conversationId: string }) => void) => {
+        fireCreated = cb;
+        return () => {};
+      }),
+      onBrowserUrlChanged: vi.fn((cb: (p: { conversationId: string; url: string }) => void) => {
+        fireUrl = cb;
+        return () => {};
+      }),
+      onBrowserNavState: vi.fn(
+        (
+          cb: (p: { conversationId: string; canGoBack: boolean; canGoForward: boolean }) => void,
+        ) => {
+          fireNav = cb;
+          return () => {};
+        },
+      ),
+      ...overrides,
+    });
+    render(<BrowserPane conversationId={conversationId} />);
+    await screen.findByRole("textbox", { name: /address bar/i });
+    fireCreated?.({ conversationId });
+    await waitFor(() => expect(screen.getByRole("button", { name: /reload/i })).not.toBeDisabled());
+    return { bridge, fireUrl: () => fireUrl, fireNav: () => fireNav };
+  }
+
+  it("reload button calls the reload IPC once a view is active", async () => {
+    const { bridge } = await renderActive("conv_reload");
+    screen.getByRole("button", { name: /reload/i }).click();
+    await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_reload"));
+  });
+
+  it("devtools button calls the open-devtools IPC", async () => {
+    const { bridge } = await renderActive("conv_dt");
+    screen.getByRole("button", { name: /toggle devtools/i }).click();
+    await waitFor(() => expect(bridge.openBrowserDevTools).toHaveBeenCalledWith("conv_dt"));
+  });
+
+  it("back/forward buttons enable when nav-state reports history available", async () => {
+    const { fireNav } = await renderActive("conv_hist");
+
+    // Both arrows start disabled (canGoBack/Forward false).
+    expect(screen.getByRole("button", { name: /go back/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /go forward/i })).toBeDisabled();
+
+    // A nav-state event enabling history flips both buttons on — the
+    // browser-nav-state SSE → setCanGoBack/Forward → disabled-prop chain.
+    act(() => {
+      fireNav()?.({ conversationId: "conv_hist", canGoBack: true, canGoForward: true });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /go back/i })).not.toBeDisabled(),
+    );
+    expect(screen.getByRole("button", { name: /go forward/i })).not.toBeDisabled();
+  });
+
+  it("the URL bar reflects the real url pushed by browser-url-changed", async () => {
+    const { fireUrl } = await renderActive("conv_url");
+    act(() => {
+      fireUrl()?.({ conversationId: "conv_url", url: "https://myhost/landed" });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: /address bar/i })).toHaveValue(
+        "https://myhost/landed",
+      ),
+    );
+  });
+
+  it("submitting a dotless address normalizes it to http:// and navigates", async () => {
+    const { bridge } = await renderActive("conv_nav");
+    const bar = screen.getByRole("textbox", { name: /address bar/i }) as HTMLInputElement;
+
+    bar.focus();
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+    setter?.call(bar, "myhost");
+    bar.dispatchEvent(new Event("input", { bubbles: true }));
+    bar.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        "conv_nav",
+        "http://myhost",
+        undefined,
+        { force: true },
+      ),
     );
   });
 });
