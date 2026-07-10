@@ -1,7 +1,7 @@
 /** Browser MCP relay hook — runs agent-issued browser actions against the
  *  Electron WebContentsView via a claim-first protocol: on a
  *  `browser.action_request` SSE event every renderer races to CLAIM the action
- *  (atomic CAS on the AP), and only the `{claimed:true, claim_token}` winner
+ *  (atomic CAS on the server), and only the `{claimed:true, claim_token}` winner
  *  dispatches to `window.omnigentDesktop.browser*` and POSTs the result back
  *  with its token — so multiple windows can't double-execute.
  *  Gated on `isElectronShell()`: without a WebContentsView the hook registers
@@ -37,7 +37,7 @@ function getBrowserDesktop(): BrowserDesktopBridge | null {
   return w.omnigentDesktop ?? null;
 }
 
-/** The shape the relay POSTs back to the AP as the action `result`. Normalized
+/** The shape the relay POSTs back to the server as the action `result`. Normalized
  *  so the backend/tool layer can branch on `ok` alone. */
 interface ActionResult {
   ok: boolean;
@@ -291,7 +291,7 @@ async function dispatch(
   }
 }
 
-/** POST the atomic claim FIRST. The AP does a check-and-set: the winning
+/** POST the atomic claim FIRST. The server does a check-and-set: the winning
  *  renderer gets `{claimed:true, claim_token}`; losers get `{claimed:false}`
  *  and drop the action. Returns the claim token, or null when this renderer did
  *  not win (or the claim call failed — treat as "not ours"). */
@@ -314,9 +314,9 @@ async function claimAction(
   }
 }
 
-/** POST the action result WITH the claim token so the AP can resolve the
+/** POST the action result WITH the claim token so the server can resolve the
  *  parked Future (and reject any tokenless / mismatched attempt). Best-effort:
- *  a network blip here surfaces to the agent as the AP's action timeout. */
+ *  a network blip here surfaces to the agent as the server's action timeout. */
 async function postResult(
   conversationId: string,
   actionId: string,
@@ -333,7 +333,7 @@ async function postResult(
       },
     );
   } catch (e) {
-    // Backend blip — the AP's action timeout surfaces it to the agent; log for maintainers.
+    // Backend blip — the server's action timeout surfaces it to the agent; log for maintainers.
     console.warn("[browser-relay] POST result failed", e);
   }
 }
