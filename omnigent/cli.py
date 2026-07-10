@@ -2582,7 +2582,9 @@ def _start_cli_runner_process(
         to runner-local filesystem tools when a spec uses the
         placeholder cwd ``"."``. Remote ``run/attach --server``
         passes the CLI launch cwd so local runner tools operate
-        in the user's project checkout.
+        in the user's project checkout. Also becomes the runner
+        subprocess's cwd so relative path resolution never depends
+        on the parent process's cwd.
     :param capture_logs: When True, redirect the runner
         subprocess's stdout/stderr to a per-run temp log file
         instead of inheriting the parent's stdio. The attach-remote
@@ -2638,8 +2640,14 @@ def _start_cli_runner_process(
         RUNNER_PARENT_PID_ENV_VAR: str(os.getpid()),
     }
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
+    resolved_workspace: str | None = None
     if workspace_cwd is not None:
-        env[RUNNER_WORKSPACE_ENV_VAR] = str(Path(workspace_cwd).expanduser().resolve())
+        resolved_workspace = str(Path(workspace_cwd).expanduser().resolve())
+        # The workspace becomes the runner's cwd below; fail with a clear
+        # message rather than an uncaught FileNotFoundError from Popen.
+        if not Path(resolved_workspace).is_dir():
+            raise click.ClickException(f"Runner workspace does not exist: {resolved_workspace}")
+        env[RUNNER_WORKSPACE_ENV_VAR] = resolved_workspace
     if isolate_session:
         env[RUNNER_ISOLATE_SESSION_ENV_VAR] = "1"
     if prewarm_spec_path is not None:
@@ -2662,10 +2670,18 @@ def _start_cli_runner_process(
         runner_proc = subprocess.Popen(
             [sys.executable, "-m", "omnigent.runner._entry"],
             env=env,
+            # Anchor the runner in the workspace so relative os_env cwd
+            # values resolve there instead of wherever the CLI happened
+            # to be launched from.
+            cwd=resolved_workspace,
             stdout=log_fh,
             stderr=log_fh,
             **_proc.spawn_kwargs(),
         )
+    except OSError as exc:
+        # E.g. the workspace vanished between the is_dir check and the
+        # spawn; surface a CLI error instead of a raw traceback.
+        raise click.ClickException(f"Failed to spawn runner: {exc}") from exc
     finally:
         if log_fh is not None:
             log_fh.close()

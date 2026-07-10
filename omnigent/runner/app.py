@@ -13676,6 +13676,9 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=cached_spec_workdir or runner_workspace,
+                        # Anchor os_env cwd resolution to the session
+                        # workspace, not the agent image dir in workdir.
+                        os_env_base_cwd=runner_workspace,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (

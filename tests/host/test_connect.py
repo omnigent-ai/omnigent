@@ -150,6 +150,14 @@ async def test_handle_launch_spawns_subprocess(
         "runner subprocess must be spawned with stdin=subprocess.DEVNULL"
     )
 
+    # The runner must start inside the session workspace. Inheriting the
+    # long-lived daemon's cwd resolves relative os_env cwd values against
+    # the wrong directory, and crashes os.getcwd() during turn setup when
+    # the daemon's cwd has since been deleted.
+    assert spawned_kwargs.get("cwd") == str(workspace), (
+        "runner subprocess must be spawned with cwd=<session workspace>"
+    )
+
     # Clean up the spawned sleep process (and its exit watcher).
     _cleanup_host(host)
 

@@ -1044,7 +1044,10 @@ class HostProcess:
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
 
-        workspace = Path(frame.workspace).expanduser()
+        # Resolve before the is_dir check and the spawn: a relative or
+        # symlinked workspace must not be interpreted against the
+        # daemon's own (possibly deleted) cwd.
+        workspace = Path(frame.workspace).expanduser().resolve(strict=False)
         if not workspace.is_dir():
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1084,6 +1087,11 @@ class HostProcess:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "omnigent.runner._entry"],
                 env=env,
+                # Anchor the runner in the session workspace. Inheriting the
+                # long-lived daemon's cwd makes relative os_env cwd values
+                # resolve against the wrong directory — and os.getcwd()
+                # crashes outright if the daemon's cwd has been deleted.
+                cwd=str(workspace),
                 # Runners are WS-tunnel clients with no interactive input.
                 # Give them a clean /dev/null stdin instead of inheriting the
                 # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)

@@ -880,14 +880,33 @@ class CallerProcessOSEnvironment(OSEnvironment):
         self.close()
 
 
-def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
-    """Instantiate the configured OS environment."""
+def create_os_environment(
+    spec: OSEnvSpec | None,
+    base_cwd: Path | None = None,
+) -> OSEnvironment | None:
+    """Instantiate the configured OS environment.
+
+    :param spec: The environment spec, or ``None`` for no environment.
+    :param base_cwd: Base directory a relative (or unset) ``spec.cwd``
+        resolves against — typically the session/runner workspace. Pass
+        an absolute path: a relative ``base_cwd`` still resolves via the
+        process cwd. When ``None``, falls back to the process cwd, which
+        is only safe when the caller controls it.
+    """
     if spec is None:
         return None
     if spec.type != "caller_process":
         raise NotImplementedError(f"os_env type '{spec.type}' is not implemented")
 
-    cwd = Path(spec.cwd or os.getcwd()).resolve(strict=False)
+    if spec.cwd:
+        raw_cwd = Path(spec.cwd)
+        if not raw_cwd.is_absolute() and base_cwd is not None:
+            raw_cwd = base_cwd / raw_cwd
+        cwd = raw_cwd.resolve(strict=False)
+    elif base_cwd is not None:
+        cwd = base_cwd.resolve(strict=False)
+    else:
+        cwd = Path(os.getcwd()).resolve(strict=False)
     fork_dir: Path | None = None
     if spec.fork:
         fork_dir = Path(tempfile.mkdtemp(prefix="omnigent-fork-"))

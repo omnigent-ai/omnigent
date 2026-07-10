@@ -109,6 +109,7 @@ class ToolManager:
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
+        os_env_base_cwd: Path | None = None,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -135,9 +136,15 @@ class ToolManager:
             tools use this shared instance instead of creating their
             own. ``None`` falls back to per-call creation via
             ``create_os_environment()``.
+        :param os_env_base_cwd: Base directory relative ``os_env.cwd``
+            values resolve against — the session/runner workspace when
+            the caller knows it. ``None`` falls back to ``workdir``,
+            which is the agent image directory and may differ from the
+            workspace.
         """
         self._spec = spec
         self._workdir = workdir
+        self._os_env_base_cwd = os_env_base_cwd
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
         self._started = False
@@ -529,7 +536,11 @@ class ToolManager:
         When a pre-resolved :class:`OSEnvironment` was provided to
         the constructor (from ``SessionResourceRegistry``), that
         shared instance is used directly. Otherwise, falls back to
-        creating a new instance via ``create_os_environment()``.
+        creating a new instance via ``create_os_environment()``,
+        resolving a relative ``os_env.cwd`` against ``os_env_base_cwd``
+        (the workspace) or ``workdir`` so it never depends on the
+        process cwd (which for runner subprocesses historically
+        inherited the host daemon's cwd).
 
         When the spec declares no os_env and no pre-resolved env
         was provided, this is a no-op.
@@ -546,7 +557,10 @@ class ToolManager:
             os_env_spec_obj = self._spec.os_env
             if os_env_spec_obj is None:
                 return
-            os_env = create_os_environment(os_env_spec_obj)
+            os_env = create_os_environment(
+                os_env_spec_obj,
+                base_cwd=self._os_env_base_cwd or self._workdir,
+            )
             if os_env is None:
                 return
 
