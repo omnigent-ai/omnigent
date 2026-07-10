@@ -57,6 +57,13 @@ export function TurnRail({
   // `turns` change) can't yank the rail back to the transcript's visible run
   // while the user is scrolling it.
   const interactingRef = useRef(false);
+  // True while the rail is mid-scroll. Scrolling drags ticks under a
+  // stationary cursor, firing onMouseEnter on each — this suppresses those
+  // hover updates so the preview text doesn't flicker through every tick;
+  // we settle onto the tick under the cursor once scrolling stops.
+  const scrollingRef = useRef(false);
+  // Last pointer position over the rail, used to pick the settle tick.
+  const pointerRef = useRef({ x: 0, y: 0 });
   // itemIds of the turns whose messages are currently on screen. Their ticks
   // read as active (black) when the user isn't hovering the rail.
   const [visibleIds, setVisibleIds] = useState<ReadonlySet<string>>(() => new Set());
@@ -221,6 +228,9 @@ export function TurnRail({
   }, [hasMoreHistory, loadingMoreHistory]);
 
   const handleHover = useCallback((itemId: string) => {
+    // Ignore the onMouseEnter storm a scroll causes by dragging ticks under a
+    // stationary cursor — the scroll-end handler settles onto the right tick.
+    if (scrollingRef.current) return;
     const rail = railRef.current;
     const tick = tickRefs.current.get(itemId);
     if (rail && tick) {
@@ -245,6 +255,38 @@ export function TurnRail({
     rail.addEventListener("scroll", reposition, { passive: true });
     return () => rail.removeEventListener("scroll", reposition);
   }, [hoveredId]);
+
+  // While the rail scrolls, mark it busy (so handleHover ignores the mouseenter
+  // storm from ticks passing under the cursor) and, once scrolling settles,
+  // adopt the tick now under the pointer as the preview. Debounced: each scroll
+  // event pushes the "settle" out, so it fires once the rail comes to rest.
+  useEffect(() => {
+    const rail = railRef.current;
+    if (!rail) return;
+    let settle = 0;
+    const onScroll = () => {
+      scrollingRef.current = true;
+      window.clearTimeout(settle);
+      settle = window.setTimeout(() => {
+        scrollingRef.current = false;
+        // Pick the tick now under the last pointer position and preview it.
+        const el = document.elementFromPoint(pointerRef.current.x, pointerRef.current.y);
+        const button = el?.closest<HTMLButtonElement>("[data-turn-tick]");
+        const itemId = button?.dataset.turnTick;
+        if (itemId && tickRefs.current.has(itemId)) handleHover(itemId);
+      }, 120);
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      pointerRef.current = { x: e.clientX, y: e.clientY };
+    };
+    rail.addEventListener("scroll", onScroll, { passive: true });
+    rail.addEventListener("pointermove", onPointerMove, { passive: true });
+    return () => {
+      window.clearTimeout(settle);
+      rail.removeEventListener("scroll", onScroll);
+      rail.removeEventListener("pointermove", onPointerMove);
+    };
+  }, [handleHover]);
 
   const hovered = hoveredId ? turns.find((t) => t.itemId === hoveredId) : undefined;
 
@@ -296,6 +338,7 @@ export function TurnRail({
             <button
               key={turn.itemId}
               type="button"
+              data-turn-tick={turn.itemId}
               ref={(el) => {
                 if (el) tickRefs.current.set(turn.itemId, el);
                 else tickRefs.current.delete(turn.itemId);
