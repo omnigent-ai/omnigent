@@ -1173,7 +1173,7 @@ class SqlScheduledTask(Base):
     # Nullable compute-target hint (provider name). Persisted only in this PR —
     # no resolution logic. A single nullable string, not an enum.
     sandbox_target: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
     # store converts to/from the string name at the row↔entity boundary.
@@ -1197,7 +1197,6 @@ class SqlScheduledTask(Base):
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
         Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
-        Index("ix_scheduled_tasks_agent_id", "workspace_id", "agent_id", "id"),
         # Covers the future scheduler's read path:
         # WHERE workspace_id + state ORDER BY created_at, id.
         Index("ix_scheduled_tasks_state", "workspace_id", "state", "created_at", "id"),
@@ -1269,6 +1268,7 @@ class SqlScheduledTaskRun(Base):
             "ix_scheduled_task_runs_scheduled_task_id",
             "workspace_id",
             "scheduled_task_id",
+            "scheduled_at",
             "id",
         ),
     )

@@ -56,7 +56,7 @@ def upgrade() -> None:
         # Git base ref a firing branches from when it creates a worktree.
         sa.Column("base_branch", sa.String(255), nullable=True),
         sa.Column("sandbox_target", sa.String(64), nullable=True),
-        sa.Column("timezone", sa.String(64), nullable=False),
+        sa.Column("timezone", sa.String(64), nullable=False, server_default="UTC"),
         # Enum stored as a stable int code (see omnigent.db.enum_codecs
         # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3).
         sa.Column("state", sa.SmallInteger(), nullable=False, server_default="1"),
@@ -81,12 +81,6 @@ def upgrade() -> None:
         "ix_scheduled_tasks_owner_user_id",
         "scheduled_tasks",
         ["workspace_id", "owner_user_id", "id"],
-        unique=False,
-    )
-    op.create_index(
-        "ix_scheduled_tasks_agent_id",
-        "scheduled_tasks",
-        ["workspace_id", "agent_id", "id"],
         unique=False,
     )
     op.create_index(
@@ -120,7 +114,7 @@ def upgrade() -> None:
     op.create_index(
         "ix_scheduled_task_runs_scheduled_task_id",
         "scheduled_task_runs",
-        ["workspace_id", "scheduled_task_id", "id"],
+        ["workspace_id", "scheduled_task_id", "scheduled_at", "id"],
         unique=False,
     )
 
@@ -130,7 +124,6 @@ def downgrade() -> None:
     op.drop_index("ix_scheduled_task_runs_scheduled_task_id", table_name="scheduled_task_runs")
     op.drop_table("scheduled_task_runs")
     op.drop_index("ix_scheduled_tasks_state", table_name="scheduled_tasks")
-    op.drop_index("ix_scheduled_tasks_agent_id", table_name="scheduled_tasks")
     op.drop_index("ix_scheduled_tasks_owner_user_id", table_name="scheduled_tasks")
     op.drop_index("ix_scheduled_tasks_created_at", table_name="scheduled_tasks")
     op.drop_table("scheduled_tasks")
