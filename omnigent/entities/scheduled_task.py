@@ -23,7 +23,9 @@ class ScheduledTask:
     Harry's ``ScheduleTrigger``): exactly one is set — ``cron_expression`` for a
     recurring task, ``run_at_ms`` for a one-shot.
 
-    :param id: Opaque primary key, e.g. ``"st_a1b2c3..."``.
+    :param id: Opaque primary key, e.g. ``"st_a1b2c3..."``. On Isaac→Omni
+        migration a fresh id is minted; Isaac's schedule_id is preserved in
+        metadata.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param owner_user_id: User the task belongs to and fires as, e.g.

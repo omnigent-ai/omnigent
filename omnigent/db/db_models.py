@@ -1085,7 +1085,9 @@ class SqlScheduledTask(Base):
     ``active``/``paused``/``deleted``/``completed``) so a future merge is a
     column mapping rather than a rewrite.
 
-    :param id: Opaque PK, e.g. ``"st_a1b2c3..."``.
+    :param id: Opaque PK, e.g. ``"st_a1b2c3..."``. On Isaac→Omni migration a
+        fresh id is minted here; Isaac's schedule_id is kept in metadata (not
+        reused as the PK).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: A single cron string for a recurring task, e.g.
@@ -1130,7 +1132,8 @@ class SqlScheduledTask(Base):
         firing (relates to ``conversations.id``). ``None`` if never fired or the
         referenced conversation was deleted (application-owned SET-NULL cleanup;
         no DB foreign key).
-    :param scheduled_task_metadata: JSON-encoded free-form metadata object.
+    :param scheduled_task_metadata: JSON-encoded free-form metadata object (also
+        holds Isaac provenance like ``isaac_schedule_id`` on migrated rows).
         Mapped to the column named ``metadata`` (the bare ``metadata`` attribute
         is reserved on the declarative base). Defaults to ``"{}"``.
     :param created_at: Unix epoch seconds at row creation.
@@ -1186,7 +1189,8 @@ class SqlScheduledTask(Base):
     last_run_conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Free-form JSON metadata. The Python attribute is ``scheduled_task_metadata``
     # because ``metadata`` is reserved on DeclarativeBase; the column is
-    # ``metadata``. Stored as Text; the store json.loads/dumps it.
+    # ``metadata``. Stored as CompressedText (compressed BLOB/BYTEA); the store
+    # json.loads/dumps it.
     # Opaque JSON, never SQL-queried — stored compressed (CompressedText).
     # No server_default: BLOB columns can't have one; the store always writes
     # "{}" explicitly on insert, so the app layer owns the default.
