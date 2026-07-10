@@ -1150,7 +1150,8 @@ class SqlScheduledTask(Base):
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
-    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # Opaque free text, never SQL-queried — stored compressed (CompressedText).
+    prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
     # Trigger: a cron_expression | run_at_ms oneof matching Harry's
     # ScheduleTrigger. Exactly one is non-NULL
     # (ck_scheduled_tasks_trigger_exactly_one). cron_expression = a single cron
@@ -1186,9 +1187,10 @@ class SqlScheduledTask(Base):
     # Free-form JSON metadata. The Python attribute is ``scheduled_task_metadata``
     # because ``metadata`` is reserved on DeclarativeBase; the column is
     # ``metadata``. Stored as Text; the store json.loads/dumps it.
-    # No server_default: MySQL forbids a DEFAULT on TEXT/BLOB columns. The store
-    # always writes "{}" explicitly on insert, so the app layer owns the default.
-    scheduled_task_metadata: Mapped[str] = mapped_column("metadata", Text)
+    # Opaque JSON, never SQL-queried — stored compressed (CompressedText).
+    # No server_default: BLOB columns can't have one; the store always writes
+    # "{}" explicitly on insert, so the app layer owns the default.
+    scheduled_task_metadata: Mapped[str] = mapped_column("metadata", CompressedText)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -1263,7 +1265,8 @@ class SqlScheduledTaskRun(Base):
     scheduled_at: Mapped[int] = mapped_column(Integer)
     fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Opaque free-text error blob, never SQL-queried — stored compressed.
+    error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
     __table_args__ = (
         CheckConstraint(

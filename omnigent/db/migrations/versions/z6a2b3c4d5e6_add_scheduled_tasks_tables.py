@@ -40,7 +40,8 @@ def upgrade() -> None:
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
         sa.Column("id", sa.String(64), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
-        sa.Column("prompt", sa.Text(), nullable=False),
+        # Opaque free text stored compressed (CompressedText → LargeBinary).
+        sa.Column("prompt", sa.LargeBinary(), nullable=False),
         # Trigger oneof (cron_expression | run_at_ms), matching Harry's
         # ScheduleTrigger; exactly one is non-NULL (CHECK below).
         sa.Column("cron_expression", sa.String(255), nullable=True),
@@ -60,9 +61,10 @@ def upgrade() -> None:
         sa.Column("state", sa.SmallInteger(), nullable=False, server_default="1"),
         sa.Column("last_run_at", sa.Integer(), nullable=True),
         sa.Column("last_run_conversation_id", sa.String(64), nullable=True),
-        # No server_default: MySQL forbids a DEFAULT on TEXT/BLOB columns. NOT
-        # NULL is fine — the store always writes "{}" explicitly on insert.
-        sa.Column("metadata", sa.Text(), nullable=False),
+        # Opaque JSON stored compressed (CompressedText → LargeBinary). No
+        # server_default: BLOB columns can't have one; NOT NULL is fine — the
+        # store always writes "{}" explicitly on insert.
+        sa.Column("metadata", sa.LargeBinary(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),
         # Exactly one trigger set: boolean XOR via `<>` on IS NOT NULL is
@@ -112,7 +114,8 @@ def upgrade() -> None:
         sa.Column("scheduled_at", sa.Integer(), nullable=False),
         sa.Column("fired_at", sa.Integer(), nullable=True),
         sa.Column("finished_at", sa.Integer(), nullable=True),
-        sa.Column("error", sa.Text(), nullable=True),
+        # Opaque free-text error blob stored compressed (CompressedText → LargeBinary).
+        sa.Column("error", sa.LargeBinary(), nullable=True),
         sa.CheckConstraint(
             "status IN (1, 2, 3, 4, 5)",
             name="ck_scheduled_task_runs_status",
