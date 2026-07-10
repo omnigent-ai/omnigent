@@ -63,6 +63,30 @@ def _existing_pk_name(table: str) -> str | None:
     return sa.inspect(op.get_bind()).get_pk_constraint(table).get("name")
 
 
+def _drop_fks_referencing(tables: list[str]) -> None:
+    """Drop every FK that references any of ``tables`` (PostgreSQL).
+
+    The PK of a table cannot be dropped while another table's FK still
+    references it. Migration ``p1a2b3c4d5e6`` was meant to strip all FKs, but
+    it predates tables added later (e.g. ``host_permissions``), so surviving
+    FKs like ``host_permissions_user_id_fkey`` still block the PK rebuild here.
+    Drop whatever FKs actually reference these tables, by their real reflected
+    name, so the widening below is the "purely local" op the module assumes.
+    """
+    bind = op.get_bind()
+    rows = bind.execute(
+        sa.text(
+            "SELECT con.conname, con.conrelid::regclass::text AS child "
+            "FROM pg_constraint con "
+            "WHERE con.contype = 'f' "
+            "AND con.confrelid::regclass::text = ANY(:tables)"
+        ),
+        {"tables": tables},
+    ).fetchall()
+    for conname, child in rows:
+        op.execute(sa.text(f'ALTER TABLE "{child}" DROP CONSTRAINT "{conname}"'))
+
+
 @contextlib.contextmanager
 def _quiet_pk_override() -> Iterator[None]:
     """
@@ -86,6 +110,10 @@ def upgrade() -> None:
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))
 
     is_mysql = op.get_bind().dialect.name == "mysql"
+    # PostgreSQL blocks dropping a PK while any FK still references it. Strip
+    # surviving FKs (incl. ones from tables added after p1a2b3c4d5e6) first.
+    if not sqlite and not is_mysql:
+        _drop_fks_referencing(list(_TABLE_PKS.keys()))
     for table, pk_cols in _TABLE_PKS.items():
         if is_mysql:
             # Use raw DDL on MySQL to avoid batch_alter_table reading ORM
