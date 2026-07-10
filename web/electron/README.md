@@ -170,12 +170,14 @@ dismisses.
 
 ## Embedded browser pane (Phase 2)
 
-The desktop shell hosts an **agent-driven embedded browser**: the agent's
-`browser_*` MCP tools (navigate / snapshot / click / type / screenshot) drive a
-real Chromium page the user can watch live. A webview/iframe can't provide
-screenshots, arbitrary in-page JS, or cross-origin navigation, so each browser
-is a native Electron **`WebContentsView`** positioned over a placeholder `<div>`
-the SPA measures — not an in-page element.
+The desktop shell hosts an **embedded browser pane**: a real Chromium page the
+user can drive (URL bar + toolbar) and point-and-prompt in design mode. This PR
+covers that user-facing pane plus the Electron/renderer plumbing; the
+agent-facing builtin `browser_*` tools (navigate / snapshot / click / type /
+screenshot) that can also drive the pane land in a separate PR. A
+webview/iframe can't provide screenshots, arbitrary in-page JS, or cross-origin
+navigation, so each browser is a native Electron **`WebContentsView`**
+positioned over a placeholder `<div>` the SPA measures — not an in-page element.
 
 **Pieces:**
 
@@ -214,7 +216,8 @@ the SPA measures — not an in-page element.
   `onBrowserElementPromptDismiss` to `window.omnigentDesktop`, each a thin
   `ipcRenderer.invoke` / `ipcRenderer.on`.
 - Renderer side (in `web/src`): `hooks/useBrowserAgentRelay.ts` receives the
-  `browser.action_request` SSE event, **claims** the action on the server
+  `browser.action_request` SSE event (emitted by the separate agent-tools PR),
+  **claims** the action on the server
   (atomic check-and-set so two windows on one server can't double-execute),
   runs it via the preload bridge, and POSTs the result back with its claim
   token; `components/BrowserPane/BrowserPane.tsx` measures the placeholder and
@@ -276,10 +279,10 @@ XSS *within* the visited page — that page runs its own scripts in its own
 sandboxed view regardless.) Preserve this when extending the bridge: add typed,
 argument-shaped actions, not a passthrough JS channel.
 
-**Availability.** The embedded browser is always on in this build — the
-agent-side `browser_*` tools are registered whenever the AP/runner is running,
-and this shell machinery activates the moment a `browser.action_request`
-arrives. No flag to enable it. Outside the Electron shell (a plain browser tab)
+**Availability.** The pane is always on in this build — this shell machinery
+activates the moment a `browser.action_request` arrives (the agent-side
+`browser_*` tools that emit it ship in the separate tools PR). No flag to enable
+it. Outside the Electron shell (a plain browser tab)
 the renderer half is inert, so the tools fail cleanly with a "is the desktop
 app open?" error rather than hanging.
 
