@@ -172,9 +172,14 @@ describe("browserViewRegistry — agent-navigation allowlist", () => {
 
   it("rejects agent navigation to the cloud-metadata IP (169.254.169.254)", () => {
     const { registry, loaded } = makeLoadTrackingRegistry();
-    const r = registry.openOrNavigate("conv_1", "http://169.254.169.254/latest/meta-data/", undefined, {
-      agent: true,
-    });
+    const r = registry.openOrNavigate(
+      "conv_1",
+      "http://169.254.169.254/latest/meta-data/",
+      undefined,
+      {
+        agent: true,
+      },
+    );
     assert.equal(r.ok, false);
     assert.equal(loaded.length, 0);
   });

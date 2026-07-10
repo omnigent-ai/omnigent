@@ -49,9 +49,7 @@ interface NavResult {
  *  component doesn't depend on the full nativeBridge type; every method is
  *  optional (an older shell may predate the browser feature). */
 interface BrowserPaneBridge {
-  browserSetActive?: (
-    conversationId: string | null,
-  ) => Promise<{ ok: boolean; error?: string }>;
+  browserSetActive?: (conversationId: string | null) => Promise<{ ok: boolean; error?: string }>;
   browserResize?: (
     conversationId: string,
     bounds: Bounds,
@@ -66,18 +64,12 @@ interface BrowserPaneBridge {
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  browserEnableDesignMode?: (
-    conversationId: string,
-  ) => Promise<{ ok: boolean; error?: string }>;
-  browserDisableDesignMode?: (
-    conversationId: string,
-  ) => Promise<{ ok: boolean; error?: string }>;
+  browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   onBrowserHostActiveChanged?: (
     callback: (payload: { conversationId: string | null }) => void,
   ) => () => void;
-  onBrowserViewCreated?: (
-    callback: (payload: { conversationId: string }) => void,
-  ) => () => void;
+  onBrowserViewCreated?: (callback: (payload: { conversationId: string }) => void) => () => void;
   onBrowserViewClosed?: (
     callback: (payload: { conversationId: string; reason: string | null }) => void,
   ) => () => void;

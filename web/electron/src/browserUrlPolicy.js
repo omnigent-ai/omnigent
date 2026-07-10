@@ -57,7 +57,7 @@ function isBlockedIpv4(octets) {
  */
 function isBlockedHostname(hostname) {
   const host = hostname.toLowerCase();
-  if (host === "localhost" || host === "" ) return true;
+  if (host === "localhost" || host === "") return true;
   if (host.endsWith(".localhost")) return true; // *.localhost → loopback per spec
   // IPv6 loopback / unspecified / link-local (fe80::/10), bracketed by the URL parser.
   if (host === "[::1]" || host === "[::]") return true;

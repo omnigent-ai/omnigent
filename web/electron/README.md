@@ -222,8 +222,8 @@ against its local Chromium, and the result is posted back.
   `enable-design-mode` / `disable-design-mode` / `signal-design-result`
   (inject / tear down the in-page element picker and paint result feedback).
   Every handler is gated on `isPinnedOriginSender` (only
-  the connected server's own page may drive the views) and resolves the *sender
-  window's own* registry, so one window can never manipulate another's panes.
+  the connected server's own page may drive the views) and resolves the _sender
+  window's own_ registry, so one window can never manipulate another's panes.
   On view creation it also wires `did-navigate` / `did-navigate-in-page`
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
@@ -261,9 +261,9 @@ create-signal → setActive → attached transition.)
 toolbar above the page: back / forward / reload, a DevTools toggle, and an
 editable URL bar (Enter navigates; the typed value is normalized to add a
 scheme — a dotless host like `localhost` gets `http://`, everything else
-`https://`). The bar reflects the *real* URL via `onBrowserUrlChanged`, but
+`https://`). The bar reflects the _real_ URL via `onBrowserUrlChanged`, but
 never overwrites what the user is actively typing. The pane is a flex **column**:
-the toolbar is a fixed-height row *above* the measured container, because the
+the toolbar is a fixed-height row _above_ the measured container, because the
 native `WebContentsView` paints over that container's rect — a toolbar inside it
 would be hidden by the overlay. The URL bar reuses the existing
 `browserOpenOrNavigate(..., {force:true})` path (the same one the relay uses), so
@@ -280,7 +280,7 @@ On Send the popup emits a `console.log` marker (the injected script can't
 `browser-element-selected` event). **There is no backend
 design-edit route** — `AppShell` (where the relay is hoisted, so it's listening
 even when the Browser tab isn't mounted) builds a `[Design Mode — …]` prompt,
-attaches the screenshot as a `File`, and sends it through the *normal* chat
+attaches the screenshot as a `File`, and sends it through the _normal_ chat
 path (`chatStore.send`, targeting the conversation's own bound agent). It then
 calls `browserSignalDesignResult` so the popup paints green/red feedback. The
 picker markers are `__omni_element_select__` / `__omni_element_prompt_submit__`
@@ -294,10 +294,10 @@ the native view); no server flag.
 arbitrary JS in the child view via `executeJavaScript(js, true)`. It is exposed
 to the SPA **only for the relay's own fixed templates** (the DOM-snapshot walk,
 and the click / type element resolvers) — there is deliberately **no
-agent-facing generic `evaluate`**. This keeps the *agent* boundary: the agent
+agent-facing generic `evaluate`**. This keeps the _agent_ boundary: the agent
 picks elements by `ref`/`selector` and supplies text, but never ships a raw JS
 string that main will run. (It does not, and is not intended to, defend against
-XSS *within* the visited page — that page runs its own scripts in its own
+XSS _within_ the visited page — that page runs its own scripts in its own
 sandboxed view regardless.) Preserve this when extending the bridge: add typed,
 argument-shaped actions, not a passthrough JS channel.
 

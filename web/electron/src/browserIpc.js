@@ -191,7 +191,11 @@ function makeDesignModeConsoleHandler(conversationId, entry, send, nonce, gestur
             });
             screenshotDataUrl = "data:image/png;base64," + image.toPNG().toString("base64");
           }
-          send("browser-element-selected", { conversationId, ...info, screenshot: screenshotDataUrl });
+          send("browser-element-selected", {
+            conversationId,
+            ...info,
+            screenshot: screenshotDataUrl,
+          });
         } catch (e) {
           console.error("[design-mode]", e);
         }

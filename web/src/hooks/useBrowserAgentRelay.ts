@@ -295,10 +295,7 @@ async function dispatch(
  *  renderer gets `{claimed:true, claim_token}`; losers get `{claimed:false}`
  *  and drop the action. Returns the claim token, or null when this renderer did
  *  not win (or the claim call failed — treat as "not ours"). */
-async function claimAction(
-  conversationId: string,
-  actionId: string,
-): Promise<string | null> {
+async function claimAction(conversationId: string, actionId: string): Promise<string | null> {
   try {
     const resp = await authenticatedFetch(
       `/v1/sessions/${encodeURIComponent(conversationId)}/browser/action_claim/${encodeURIComponent(actionId)}`,

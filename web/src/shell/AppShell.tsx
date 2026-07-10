@@ -551,7 +551,9 @@ export function AppShell() {
             prompt?: string;
           }) => void,
         ) => () => void;
-        onBrowserElementPromptDismiss?: (cb: (p: { conversationId?: string }) => void) => () => void;
+        onBrowserElementPromptDismiss?: (
+          cb: (p: { conversationId?: string }) => void,
+        ) => () => void;
         browserSignalDesignResult?: (
           conversationId: string,
           result: { id: number; ok: boolean; message?: string },

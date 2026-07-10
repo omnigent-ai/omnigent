@@ -17,7 +17,7 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
-const { isAgentNavigationAllowed } = require('./browserUrlPolicy');
+const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
 
@@ -54,7 +54,7 @@ function createBrowserViewRegistry({
       }),
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
-      lastRequestedUrl: '',
+      lastRequestedUrl: "",
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
@@ -73,7 +73,7 @@ function createBrowserViewRegistry({
     const existing = entries.get(conversationId);
     if (existing) return { ok: true, entry: existing, created: false };
     if (entries.size >= cap) {
-      return { ok: false, error: 'browser view cap reached — close one', cap };
+      return { ok: false, error: "browser view cap reached — close one", cap };
     }
     const view = WebContentsViewCtor({
       webPreferences: {
@@ -117,7 +117,7 @@ function createBrowserViewRegistry({
     // created detached (no host-active-changed fires), so without this the pane
     // never mounts its placeholder or calls setActive to attach it.
     if (created) {
-      sendToRenderer('browser-view-created', { conversationId });
+      sendToRenderer("browser-view-created", { conversationId });
     }
     if (url) {
       // Reissue loadURL on a fresh entry, a different requested URL, or `force`
@@ -147,7 +147,7 @@ function createBrowserViewRegistry({
           } catch {}
         }
         activeConversationId = null;
-        sendToRenderer('browser-host-active-changed', { conversationId: null });
+        sendToRenderer("browser-host-active-changed", { conversationId: null });
       }
       return { ok: true };
     }
@@ -163,9 +163,9 @@ function createBrowserViewRegistry({
           } catch {}
         }
         activeConversationId = null;
-        sendToRenderer('browser-host-active-changed', { conversationId: null });
+        sendToRenderer("browser-host-active-changed", { conversationId: null });
       }
-      return { ok: false, error: 'No browser view' };
+      return { ok: false, error: "No browser view" };
     }
     if (activeConversationId === conversationId) {
       // Already active — repositioning bounds is a re-apply, not a swap.
@@ -189,7 +189,7 @@ function createBrowserViewRegistry({
       /* host gone */
     }
     next.boundsController.resync();
-    sendToRenderer('browser-host-active-changed', { conversationId });
+    sendToRenderer("browser-host-active-changed", { conversationId });
     return { ok: true };
   }
 
@@ -207,14 +207,14 @@ function createBrowserViewRegistry({
     if (entry.designModeWebContents) {
       if (entry.designModeListener) {
         try {
-          entry.designModeWebContents.removeListener('console-message', entry.designModeListener);
+          entry.designModeWebContents.removeListener("console-message", entry.designModeListener);
         } catch {
           /* destroyed */
         }
       }
       if (entry.designModeInputListener) {
         try {
-          entry.designModeWebContents.removeListener('input-event', entry.designModeInputListener);
+          entry.designModeWebContents.removeListener("input-event", entry.designModeInputListener);
         } catch {
           /* destroyed */
         }
@@ -230,7 +230,7 @@ function createBrowserViewRegistry({
       /* already destroyed */
     }
     entries.delete(conversationId);
-    sendToRenderer('browser-view-closed', { conversationId, reason: reason || null });
+    sendToRenderer("browser-view-closed", { conversationId, reason: reason || null });
     return { ok: true, removed: true };
   }
 
