@@ -2,9 +2,9 @@
 // via `executeJavaScript` to power point-and-prompt. Extracted from browserIpc.js
 // so it lints/highlights as its own module; behavior is unchanged.
 //
-// SECURITY: markers are prefixed with a per-enable `nonce`; the main-process
-// handler trusts only markers carrying this view's nonce — keep the
-// interpolation, don't hardcode the markers.
+// Markers are prefixed with a per-enable `nonce`; the main-process handler
+// trusts only markers carrying this view's nonce — keep the interpolation,
+// don't hardcode the markers.
 
 "use strict";
 

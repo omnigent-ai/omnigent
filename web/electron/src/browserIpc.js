@@ -1,7 +1,7 @@
 // IPC surface for the embedded browser pane, extracted out of main.js. main.js
 // wires the per-window registry + trust gate and calls `registerBrowserIpc(...)`.
 //
-// SECURITY: every handler is gated on `isPinnedOriginSender` and
+// Every handler is gated on `isPinnedOriginSender` and
 // resolves the sender window's own registry, so one window can never drive
 // another's panes. Do NOT drop the gate from any handler (toolbar ones included).
 

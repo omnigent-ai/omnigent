@@ -89,7 +89,7 @@ function createBrowserViewRegistry({
 
   function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
-    // SECURITY: agent-driven nav (opts.agent) is gated by an allowlist (see
+    // Agent-driven nav (opts.agent) is gated by an allowlist (see
     // browserUrlPolicy) so the model can't point the view at file:// /
     // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
     // (user-typed) nav stays permissive. Checked before getOrCreate so a

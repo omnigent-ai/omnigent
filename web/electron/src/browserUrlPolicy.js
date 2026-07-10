@@ -1,4 +1,4 @@
-// SECURITY: allowlist for AGENT-driven browser navigation (the URL-bar path
+// Allowlist for AGENT-driven browser navigation (the URL-bar path
 // stays permissive — it's a user gesture). An unguarded model-issued loadURL
 // could point the view at file:// / cloud-metadata / loopback / private hosts
 // and read the bytes back via screenshot (SSRF + local-file read + exfil).

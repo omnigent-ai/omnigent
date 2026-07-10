@@ -1725,9 +1725,9 @@ function isPinnedOriginSender(event) {
 // registry; child views stay sandboxed (nodeIntegration:false, contextIsolation
 // + sandbox true) and detach — not destroy — on hide.
 //
-// SECURITY: `omnigent:browser-execute` runs JS via executeJavaScript;
-// exposed to preload for the relay's fixed templates only, never a generic
-// agent `evaluate`. See preload.js + README.
+// `omnigent:browser-execute` runs JS via executeJavaScript; exposed to preload
+// for the relay's fixed templates only, never a generic agent `evaluate`.
+// See preload.js + README.
 // ---------------------------------------------------------------------------
 
 /**
