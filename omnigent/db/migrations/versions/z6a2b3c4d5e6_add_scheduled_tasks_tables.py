@@ -60,7 +60,9 @@ def upgrade() -> None:
         sa.Column("state", sa.SmallInteger(), nullable=False, server_default="1"),
         sa.Column("last_run_at", sa.Integer(), nullable=True),
         sa.Column("last_run_conversation_id", sa.String(64), nullable=True),
-        sa.Column("metadata", sa.Text(), nullable=False, server_default="{}"),
+        # No server_default: MySQL forbids a DEFAULT on TEXT/BLOB columns. NOT
+        # NULL is fine — the store always writes "{}" explicitly on insert.
+        sa.Column("metadata", sa.Text(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),
         # Exactly one trigger set: boolean XOR via `<>` on IS NOT NULL is

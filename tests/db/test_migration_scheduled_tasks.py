@@ -132,24 +132,26 @@ def test_expected_indexes(db_engine: Engine) -> None:
 
 
 def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
-    """A raw insert omitting ``state`` / ``metadata`` picks up defaults."""
+    """A raw insert omitting ``state`` / ``workspace_id`` picks up their defaults.
+
+    ``metadata`` is NOT NULL with no server_default (MySQL forbids a TEXT
+    default), so it must be supplied explicitly — only the integer server_defaults
+    (``state`` / ``workspace_id``) are exercised here.
+    """
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
                 "INSERT INTO scheduled_tasks "
                 "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
-                " timezone, created_at) "
-                "VALUES ('st_def', 'n', 'p', '0 9 * * *', 'u', 'ag_1', 'UTC', 1)"
+                " timezone, metadata, created_at) "
+                "VALUES ('st_def', 'n', 'p', '0 9 * * *', 'u', 'ag_1', 'UTC', '{}', 1)"
             )
         )
-        state, workspace_id, metadata = conn.execute(
-            sa.text(
-                "SELECT state, workspace_id, metadata FROM scheduled_tasks WHERE id = 'st_def'"
-            )
+        state, workspace_id = conn.execute(
+            sa.text("SELECT state, workspace_id FROM scheduled_tasks WHERE id = 'st_def'")
         ).one()
     assert state == 1  # 1 = 'active'
     assert workspace_id == 0
-    assert metadata == "{}"
 
 
 def test_trigger_check_accepts_cron_only(db_engine: Engine) -> None:
@@ -159,8 +161,8 @@ def test_trigger_check_accepts_cron_only(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO scheduled_tasks "
                 "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
-                " timezone, created_at) "
-                "VALUES ('st_cron', 'n', 'p', '0 9 * * *', 'u', 'ag', 'UTC', 1)"
+                " timezone, metadata, created_at) "
+                "VALUES ('st_cron', 'n', 'p', '0 9 * * *', 'u', 'ag', 'UTC', '{}', 1)"
             )
         )
 
@@ -172,8 +174,8 @@ def test_trigger_check_accepts_run_at_only(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO scheduled_tasks "
                 "(id, name, prompt, run_at_ms, owner_user_id, agent_id, "
-                " timezone, created_at) "
-                "VALUES ('st_once', 'n', 'p', 1700000000000, 'u', 'ag', 'UTC', 1)"
+                " timezone, metadata, created_at) "
+                "VALUES ('st_once', 'n', 'p', 1700000000000, 'u', 'ag', 'UTC', '{}', 1)"
             )
         )
 

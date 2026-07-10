@@ -1186,7 +1186,9 @@ class SqlScheduledTask(Base):
     # Free-form JSON metadata. The Python attribute is ``scheduled_task_metadata``
     # because ``metadata`` is reserved on DeclarativeBase; the column is
     # ``metadata``. Stored as Text; the store json.loads/dumps it.
-    scheduled_task_metadata: Mapped[str] = mapped_column("metadata", Text, server_default="{}")
+    # No server_default: MySQL forbids a DEFAULT on TEXT/BLOB columns. The store
+    # always writes "{}" explicitly on insert, so the app layer owns the default.
+    scheduled_task_metadata: Mapped[str] = mapped_column("metadata", Text)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
