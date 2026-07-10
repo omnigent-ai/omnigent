@@ -357,8 +357,16 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * @param {string} url
    */
   setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
-  /** Recently-connected server URLs, most recent first. */
+  /** Recently-connected servers, most recent first, each `{ url, label }`. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
+  /**
+   * Set or clear a recent server's nickname (blank/whitespace clears it).
+   * Resolves the updated recent-servers list (`{ url, label }[]`).
+   * @param {string} url
+   * @param {string} label
+   */
+  setRecentServerLabel: (url, label) =>
+    ipcRenderer.invoke("omnigent:set-recent-server-label", url, label),
   /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.

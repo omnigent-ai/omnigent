@@ -41,7 +41,7 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
-const { normalizeRecents, rememberRecent, serializeRecents } = require("./recents");
+const { normalizeRecents, rememberRecent, setLabel, serializeRecents } = require("./recents");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -2064,8 +2064,23 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    // Bare URLs, most recent first; junk entries dropped (see normalizeRecents).
-    return normalizeRecents(loadSettings().recent_servers).map((e) => e.url);
+    // Recent servers, most recent first, each { url, label } (label is "" when
+    // no nickname is set); junk entries dropped (see normalizeRecents).
+    return normalizeRecents(loadSettings().recent_servers);
+  });
+
+  // Setup page → set or clear a recent server's nickname. Only a url already in
+  // the list can be labelled (setLabel is a no-op otherwise). Returns the
+  // updated { url, label } list so the page can re-render without a reload.
+  ipcMain.handle("omnigent:set-recent-server-label", (event, url, label) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("set-recent-server-label is only available to the setup page");
+    }
+    const settings = loadSettings();
+    const list = setLabel(normalizeRecents(settings.recent_servers), url, label);
+    settings.recent_servers = serializeRecents(list);
+    saveSettings(settings);
+    return list;
   });
 
   // SPA title-bar server picker → the sender window's pinned origin plus the
