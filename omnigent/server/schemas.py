@@ -513,6 +513,61 @@ class FileObject(BaseModel):
     created_at: int
 
 
+class CopyFilesRequest(BaseModel):
+    """
+    Request to copy files from a lineage ancestor into a session.
+
+    The destination session is the path parameter; ``source_session_id``
+    must be a STRICT ancestor of the destination up its
+    ``parent_conversation_id`` chain (spawn lineage) — the destination may
+    not name itself as the source. The copy creates new child-scoped rows —
+    it does not grant cross-session read access.
+
+    :param source_session_id: Session that owns the source files, e.g.
+        ``"conv_parent"``. Must be a strict ancestor of the destination.
+    :param file_ids: Non-empty, unique ids of the source-owned files to
+        copy, e.g. ``["file_abc123"]``.
+    """
+
+    source_session_id: str
+    file_ids: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+
+
+class CopiedFile(BaseModel):
+    """
+    A single copied file's new identity and preserved metadata.
+
+    :param new_id: The new child-scoped file id, e.g. ``"file_def456"``.
+    :param filename: The copied file's name, carried over from the source.
+    :param content_type: The copied file's MIME type, preserved from the
+        source row so the caller need not re-fetch it or guess from the
+        filename. ``None`` when the source row had no recorded type.
+    """
+
+    new_id: str
+    filename: str
+    content_type: str | None = None
+
+
+class CopyFilesResponse(BaseModel):
+    """
+    Result of a lineage-scoped file copy.
+
+    :param object: Fixed type, always ``"session.files.copied"``.
+    :param session_id: Destination session that now owns the copies.
+    :param mapping: Map of source ``file_id`` to the copied file's new
+        identity and preserved metadata (id, filename, content type), so a
+        caller can attach the copy without a follow-up metadata fetch.
+    """
+
+    object: str = "session.files.copied"
+    session_id: str
+    mapping: dict[str, CopiedFile]
+
+
 # ── Session Resources ───────────────────────────────────────────
 
 
@@ -1091,23 +1146,50 @@ class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
 
-    When present, the server creates a git worktree on the host for a
-    new branch and starts the runner in that worktree instead of the
-    picked directory. Requires ``host_id`` to be set (and therefore
-    ``workspace``, which is interpreted as the source repository
-    directory). See designs/SESSION_GIT_WORKTREE.md.
+    Requires ``host_id`` to be set (and therefore ``workspace``, which
+    is interpreted as the source repository directory). Two modes,
+    selected by ``existing_worktree``:
 
-    :param branch_name: Name of the new branch to create and check
-        out in the worktree, e.g. ``"feature/login"``. Validated
-        against git ref-format rules; invalid names fail with
-        ``invalid_input``.
+    - **create** (default): the server creates a git worktree on the
+      host for a new branch and starts the runner in that worktree
+      instead of the picked directory.
+    - **bind** (``existing_worktree=True``): ``workspace`` already IS a
+      pre-existing worktree; no worktree is created. ``branch_name`` is
+      recorded as the session's ``git_branch`` for display and opt-in
+      cleanup, and ``base_branch`` must not be set.
+
+    See designs/SESSION_GIT_WORKTREE.md.
+
+    :param branch_name: In create mode, the new branch to create and
+        check out, e.g. ``"feature/login"``. In bind mode, the branch
+        already checked out in the existing worktree. Validated against
+        git ref-format rules; invalid names fail with ``invalid_input``.
     :param base_branch: Optional base ref to branch from, e.g.
         ``"main"`` or ``"origin/main"``. ``None`` branches from the
-        source repository's current ``HEAD``.
+        source repository's current ``HEAD``. Create mode only —
+        invalid with ``existing_worktree``.
+    :param existing_worktree: When ``True``, bind to the pre-existing
+        worktree at ``workspace`` instead of creating one (see above).
     """
 
     branch_name: str
     base_branch: str | None = None
+    existing_worktree: bool = False
+
+    @model_validator(mode="after")
+    def _check_existing_worktree(self) -> SessionGitOptions:
+        """Reject ``base_branch`` in bind mode (422).
+
+        ``base_branch`` selects the ref a *new* branch forks from; it is
+        meaningless when binding to a worktree that already exists.
+
+        :returns: The validated instance.
+        :raises ValueError: If ``base_branch`` is set with
+            ``existing_worktree``.
+        """
+        if self.existing_worktree and self.base_branch is not None:
+            raise ValueError("base_branch cannot be set when existing_worktree is true")
+        return self
 
 
 class SessionCreateRequest(BaseModel):
@@ -1951,18 +2033,11 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
-    :param model_override: Model id to launch the fork on, e.g.
-        ``"databricks-gpt-5-4-mini"`` — the "restart with model" path.
-        Overrides the model the fork would otherwise inherit from the
-        source; the value is validated and family-checked against the
-        fork's harness. When ``None`` (default), the fork keeps the
-        source's model (within the same provider family).
     """
 
     title: str | None = None
     agent_id: str | None = None
     up_to_response_id: str | None = None
-    model_override: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3269,6 +3344,37 @@ class ElicitationResolvedEvent(_SSEEventBase):
     elicitation_id: str
 
 
+class PolicyDeniedEvent(_SSEEventBase):
+    """
+    Signal that a policy DENY was enforced on a native harness turn.
+
+    A native harness (Claude Code, Codex, ...) routes each tool call and
+    prompt through Omnigent's policy engine via the vendor command-hook
+    (``POST /v1/sessions/{id}/policies/evaluate``). The DENY verdict is
+    returned synchronously to that hook, so unlike the SDK/wrap path there is
+    no stream-visible signal that a native action was blocked — only the
+    *effect* (the blocked tool never runs). This event surfaces the decision
+    itself on the session stream so observers (the web UI, the capability
+    bench) can see a native DENY as a positive signal rather than infer it
+    from an absence.
+
+    Fire-and-forget and observational: it does not gate the turn (the hook
+    response already did that) and carries no correlation id.
+
+    :param type: Always ``"response.policy_denied"``.
+    :param conversation_id: Session/conversation id the DENY applies to,
+        e.g. ``"conv_abc123"``.
+    :param reason: Human-readable deny reason from the deciding policy, e.g.
+        ``"Blocked by policy."``.
+    :param phase: The policy phase the DENY landed on, e.g. ``"tool_call"``.
+    """
+
+    type: Literal["response.policy_denied"]
+    conversation_id: str
+    reason: str = ""
+    phase: str = ""
+
+
 class CreatedEvent(_SSEEventBase):
     """
     Initial event emitted at the start of every streaming response.
@@ -3769,6 +3875,8 @@ ServerStreamEvent = Annotated[
     # ── Transient (SSE-only) — synchronous decision request ────
     | ElicitationRequestEvent
     | ElicitationResolvedEvent
+    # ── Transient (SSE-only) — native policy DENY signal ───────
+    | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────
     | CreatedEvent
     | QueuedEvent

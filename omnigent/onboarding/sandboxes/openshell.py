@@ -82,13 +82,15 @@ _FOREGROUND_TIMEOUT_S = 7 * 24 * 3600
 _FOREGROUND_PIDFILE_TEMPLATE = "/tmp/oa-openshell-foreground-{sandbox_id}.pid"
 
 # OpenShell runs the agent as the non-root ``sandbox`` user (its image
-# contract; see deploy/docker/Dockerfile), whose home is ``/home/sandbox``.
+# contract; see deploy/docker/Dockerfile), whose home is ``/sandbox``.
 # The host image keeps ``WORKDIR /root`` for the root-based providers, so we
 # pin every exec's cwd + ``$HOME`` to the sandbox user's writable home here
-# rather than changing the shared image — otherwise ``omnigent host`` resolves
+# rather than changing the shared image -- otherwise ``omnigent host`` resolves
 # its config under ``/root`` (unreadable to the sandbox user) and crashes, and
 # the managed flow's ``$HOME/workspace`` lands somewhere unwritable.
-_SANDBOX_HOME = "/home/sandbox"
+# ``/home/sandbox`` is denied by the k8s Landlock LSM policy; ``/sandbox`` is
+# the permitted path.
+_SANDBOX_HOME = "/sandbox"
 
 _T = TypeVar("_T")
 

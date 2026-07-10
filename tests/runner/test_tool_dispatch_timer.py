@@ -97,3 +97,26 @@ async def test_timer_firing_posts_hidden_meta_message() -> None:
             ],
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_timer_set_rejects_invalid_args_via_shared_validator() -> None:
+    """
+    The runner dispatch path validates through the shared
+    ``validate_timer_set_args`` helper, so a bad ``seconds`` returns the
+    same message the in-process builtin surfaces and starts no timer
+    task (no wake POST is ever made).
+    """
+    recorder = _TimerPostRecorder()
+    transport = httpx.MockTransport(recorder)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as server_client:
+        output = await execute_tool(
+            tool_name="sys_timer_set",
+            arguments=json.dumps({"seconds": -1}),
+            conversation_id="conv_parent",
+            server_client=server_client,
+        )
+
+    assert json.loads(output) == {"error": "seconds must be non-negative"}
+    assert recorder.posts == []

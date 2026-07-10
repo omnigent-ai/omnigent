@@ -1261,7 +1261,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
         type: "routing_decision",
         ctx: ctx({ itemId: "rd_1", responseId: "routing_1" }),
         model: "databricks-claude-opus-4-8",
-        tier: "expensive",
         applied: true,
         rationale: "multi-file refactor needs deep reasoning",
       },
@@ -1281,7 +1280,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
     const chip = bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>;
     expect(chip.itemId).toBe("rd_1");
     expect(chip.model).toBe("databricks-claude-opus-4-8");
-    expect(chip.tier).toBe("expensive");
     expect(chip.applied).toBe(true);
     expect(chip.rationale).toBe("multi-file refactor needs deep reasoning");
   });
@@ -1292,7 +1290,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
         type: "routing_decision",
         ctx: ctx({ itemId: "rd_shadow", responseId: "routing_2" }),
         model: "databricks-claude-haiku-4-5",
-        tier: "cheap",
         applied: false,
         rationale: "trivial question",
       },
@@ -1312,7 +1309,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
         response_id: "routing_3",
         status: "completed",
         model: "databricks-claude-sonnet-4-6",
-        tier: "medium",
         applied: true,
         rationale: "moderate knowledge work",
       } as unknown as ConversationItem,
@@ -1326,7 +1322,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
     expect(chip.kind).toBe("routing_decision");
     expect(chip.itemId).toBe("rd_reload");
     expect(chip.model).toBe("databricks-claude-sonnet-4-6");
-    expect(chip.tier).toBe("medium");
   });
 
   it("live funnel: a response.output_item.done routing_decision reduces to the same bubble", () => {
@@ -1334,7 +1329,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
       {
         type: "routing_decision",
         model: "databricks-claude-opus-4-8",
-        tier: "expensive",
         applied: true,
         rationale: "hard turn",
         itemId: "rd_live",

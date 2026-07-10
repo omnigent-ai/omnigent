@@ -1,6 +1,7 @@
 """Database package — SQLAlchemy models and Alembic migrations."""
 
 from omnigent.db.db_models import (
+    DEFAULT_WORKSPACE_ID,
     Base,
     SqlAgent,
     SqlConversation,
@@ -8,9 +9,12 @@ from omnigent.db.db_models import (
     SqlFile,
     SqlSessionPermission,
     SqlUser,
+    current_workspace_id,
+    workspace_scope,
 )
 
 __all__ = [
+    "DEFAULT_WORKSPACE_ID",
     "Base",
     "SqlAgent",
     "SqlConversation",
@@ -18,4 +22,6 @@ __all__ = [
     "SqlFile",
     "SqlSessionPermission",
     "SqlUser",
+    "current_workspace_id",
+    "workspace_scope",
 ]

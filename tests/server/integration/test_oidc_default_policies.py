@@ -117,11 +117,11 @@ async def oidc_policy_client(
 
 
 def _policy_payload(**overrides: object) -> dict:
-    """Build a valid CreateDefaultPolicyRequest payload (URL type)."""
+    """Build a valid CreateDefaultPolicyRequest payload."""
     base: dict = {
-        "name": "oidc_url_policy",
-        "type": "url",
-        "handler": "https://example.com/policies/eval",
+        "name": "oidc_policy",
+        "type": "python",
+        "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
     }
     base.update(overrides)  # type: ignore[arg-type]
     return base

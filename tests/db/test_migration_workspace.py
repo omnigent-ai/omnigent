@@ -88,7 +88,7 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :id)"
+                "VALUES (:id, :ts, :ts, 1, :id)"
             ),
             {"id": "conv_ws_null", "ts": 1700000000},
         )
@@ -103,7 +103,7 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :ws, :id)"
             ),
             {
                 "id": "conv_ws_cli",
@@ -140,7 +140,7 @@ def test_check_constraint_blocks_host_id_without_workspace(
                 sa.text(
                     "INSERT INTO conversations "
                     "(id, created_at, updated_at, kind, host_id, root_conversation_id) "
-                    "VALUES (:id, :ts, :ts, 'default', :hid, :id)"
+                    "VALUES (:id, :ts, :ts, 1, :hid, :id)"
                 ),
                 {
                     "id": "conv_ws_host_no_ws",
@@ -168,13 +168,13 @@ def test_check_constraint_allows_host_id_with_workspace(
     constraint expression is wrong and would block all host launches.
     """
     with db_engine.connect() as conn:
-        # host_id is an FK to hosts.host_id (enforced), so the host must
-        # exist before a conversation can reference it.
+        # Insert a host first (no FK enforced, but needed for the join in
+        # online_host_ids queries).
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
                 "(owner, name, host_id, status, created_at, updated_at) "
-                "VALUES (:o, :n, :hid, 'online', :ts, :ts)"
+                "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {"o": "alice@test.com", "n": "laptop", "hid": "host_abc", "ts": 1700000000},
         )
@@ -182,7 +182,7 @@ def test_check_constraint_allows_host_id_with_workspace(
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, host_id, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :hid, :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :hid, :ws, :id)"
             ),
             {
                 "id": "conv_ws_host_ok",
@@ -201,32 +201,49 @@ def test_check_constraint_allows_host_id_with_workspace(
         assert result.workspace == "/Users/corey/universe/src/foo"
 
 
-def test_host_id_is_indexed(db_engine: Engine) -> None:
+def test_host_id_index_dropped(db_engine: Engine) -> None:
     """
-    Verify ``ix_conversations_host_id`` exists.
+    Verify ``ix_conversations_host_id`` no longer exists at head.
 
-    Reconnect reconciliation queries conversations by ``host_id`` on
-    every host reconnect; without the index that's a full table scan.
+    The index served only ``list_conversations_by_host_id``, which had no
+    callers and was removed along with the index (migration
+    ``z1a2b3c4d5e6``). This locks in the removal so the write-only index
+    isn't accidentally reintroduced.
     """
     index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("conversations")}
-    assert "ix_conversations_host_id" in index_names, (
-        f"Expected ix_conversations_host_id on conversations; got {sorted(index_names)}."
+    assert "ix_conversations_host_id" not in index_names, (
+        f"ix_conversations_host_id should have been dropped; got {sorted(index_names)}."
+    )
+
+
+def test_runner_id_is_indexed(db_engine: Engine) -> None:
+    """
+    Verify ``ix_conversations_runner_id`` exists at head.
+
+    Reconnect/relaunch reconciliation queries conversations by
+    ``runner_id`` (``list_conversations_by_runner_id``) on every runner
+    reconnect; without the index (migration ``z2a2b3c4d5e6``) that's a
+    full table scan.
+    """
+    index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("conversations")}
+    assert "ix_conversations_runner_id" in index_names, (
+        f"Expected ix_conversations_runner_id on conversations; got {sorted(index_names)}."
     )
 
 
 def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
     """
-    Deleting a host SET-NULLs the bound conversation's ``host_id``
-    (FK ``ondelete=SET NULL``) instead of leaving a dangling reference.
-    ``workspace`` is untouched, and ``host_id -> NULL`` keeps the
-    workspace-required check satisfied.
+    After the FK was removed, deleting a host leaves conversations.host_id
+    as a dangling reference — the application is responsible for nulling it.
+    This test documents the current (post-FK-removal) DB-level behavior:
+    host deletion does NOT automatically null conversations.host_id.
     """
     with db_engine.connect() as conn:
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
                 "(owner, name, host_id, status, created_at, updated_at) "
-                "VALUES (:o, :n, :hid, 'online', :ts, :ts)"
+                "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {"o": "alice@test.com", "n": "laptop", "hid": "host_del", "ts": 1700000000},
         )
@@ -234,7 +251,7 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, host_id, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :hid, :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :hid, :ws, :id)"
             ),
             {"id": "conv_fk", "ts": 1700000000, "hid": "host_del", "ws": "/ws/foo"},
         )
@@ -247,10 +264,13 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
             sa.text("SELECT host_id, workspace FROM conversations WHERE id = :id"),
             {"id": "conv_fk"},
         ).one()
-        assert row.host_id is None, (
-            f"host deletion should SET NULL conversations.host_id; got {row.host_id!r}."
+        # No FK cascade: host_id is left dangling after host deletion.
+        # The application (host store / disconnect handler) is responsible
+        # for nulling conversations.host_id when a host is removed.
+        assert row.host_id == "host_del", (
+            "Without a DB FK, host deletion must not auto-null conversations.host_id."
         )
-        assert row.workspace == "/ws/foo", "workspace must be untouched by the FK SET NULL."
+        assert row.workspace == "/ws/foo", "workspace must be untouched."
 
 
 def test_check_constraint_allows_cli_session_workspace_no_host(
@@ -270,7 +290,7 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, kind, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 'default', :ws, :id)"
+                "VALUES (:id, :ts, :ts, 1, :ws, :id)"
             ),
             {
                 "id": "conv_cli_ws_only",
@@ -287,3 +307,26 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
         ).one()
         assert result.host_id is None
         assert result.workspace == "/Users/corey/projects/cli-launched"
+
+
+def test_compressed_columns_are_binary_at_head(db_engine: Engine) -> None:
+    """
+    Verify the opaque text columns are binary (``BLOB``/``BYTEA``) at head.
+
+    These columns are stored zstd-compressed by ``omnigent.db.compression``;
+    the compression codec writes raw bytes, so a regression that left any of
+    them as ``TEXT`` would corrupt values on a NUL-rejecting backend
+    (PostgreSQL) the moment a compressed payload contained a NUL byte.
+    """
+    inspector = sa.inspect(db_engine)
+    expected = {
+        "conversations": ["session_usage", "session_state", "terminal_launch_args"],
+        "comments": ["body", "anchor_content"],
+        "agents": ["description"],
+    }
+    for table, columns in expected.items():
+        types = {c["name"]: c["type"] for c in inspector.get_columns(table)}
+        for column in columns:
+            assert isinstance(types[column], sa.LargeBinary), (
+                f"{table}.{column} should be binary at head, got {types[column]!r}."
+            )

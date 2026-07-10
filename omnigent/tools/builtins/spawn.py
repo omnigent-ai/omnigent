@@ -128,7 +128,11 @@ class SysSessionSendTool(Tool):
             "Returns the child's output when its turn completes. To run "
             "multiple sessions in parallel, emit multiple "
             "sys_session_send tool_calls in the same response — they "
-            "dispatch concurrently."
+            "dispatch concurrently. To attach previously-uploaded files, "
+            "pass their file ids via the object args form's 'file_ids' "
+            "list on the first named (agent, title) send only; file_ids "
+            "cannot be used with session_id or when continuing an existing "
+            "named session."
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
@@ -347,6 +351,22 @@ def _build_sys_session_send_schema(
                                             "Applies only when this send "
                                             "CREATES the sub-agent session; "
                                             "omitted = the harness default."
+                                        ),
+                                    },
+                                    "file_ids": {
+                                        "type": "array",
+                                        "items": {"type": "string", "minLength": 1},
+                                        "minItems": 1,
+                                        "uniqueItems": True,
+                                        "description": (
+                                            "Optional list of file ids for "
+                                            "files you previously uploaded. "
+                                            "Accepted only on the first named "
+                                            "(agent, title) send, when the "
+                                            "sub-agent session is created. "
+                                            "Cannot be used with session_id "
+                                            "or when continuing an existing "
+                                            "named session."
                                         ),
                                     },
                                     **harness_property,
@@ -1011,17 +1031,11 @@ def _find_open_child_by_title(
     children = conv_store.list_conversations(
         kind="sub_agent",
         parent_conversation_id=parent_conversation_id,
-        # 100 mirrors the cap used by ``_send_to_one`` and
-        # ``SysSessionListTool``: realistic worst case for
-        # named children under a single parent.
-        limit=100,
+        title=composite,
+        limit=1,
     )
     return next(
-        (
-            c
-            for c in children.data
-            if c.title == composite and not is_session_closed(c.labels, c.title)
-        ),
+        (c for c in children.data if not is_session_closed(c.labels, c.title)),
         None,
     )
 

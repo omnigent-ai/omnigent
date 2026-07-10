@@ -1,4 +1,4 @@
-// Persisted, app-global preference for the UI font size.
+// Persisted, app-global preferences for the UI font — size and family.
 //
 // The web UI is Tailwind v4, which sizes typography AND spacing in `rem`, so
 // scaling the root `<html>` font-size reflows the entire UI uniformly. Rather
@@ -8,6 +8,13 @@
 // multiply into. The base rule uses `calc(1em * var(--ui-font-scale))`, so the
 // user's browser-default size is preserved and the displayed px maps 1:1 for
 // the default-16px case.
+//
+// Font family works the analogous way with `--ui-font-family`. Note it can't
+// reuse `--font-sans`: Tailwind v4's `@theme inline` block inlines the literal
+// stack into the `font-sans` utility instead of a `var()` reference, so setting
+// `--font-sans` at runtime is a no-op. The `html` rule reads
+// `var(--ui-font-family, var(--font-sans))`, so an unset family falls back to
+// the system stack and any value we set on documentElement wins.
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
@@ -72,4 +79,92 @@ export function applyUiFontScale(px: number): void {
   if (typeof document === "undefined") return;
   const scale = clampUiFontSizePx(px) / BASE_FONT_SIZE_PX;
   document.documentElement.style.setProperty("--ui-font-scale", String(scale));
+}
+
+// ---- Font family ---------------------------------------------------------
+
+const FONT_FAMILY_STORAGE_KEY = "omnigent:ui-font-family";
+
+/** Empty string = "System default": no override, falls back to `--font-sans`. */
+export const UI_FONT_FAMILY_DEFAULT = "";
+
+/** Longest family name we'll accept — a guard against a corrupt/oversized entry. */
+const UI_FONT_FAMILY_MAX_LENGTH = 100;
+
+/**
+ * Normalize a raw family name into a value safe to persist and to set as a CSS
+ * custom property: trimmed, with characters that could terminate the
+ * declaration or open a new one (`;{}` and control chars) stripped. Over-long
+ * input collapses to the default. Returns "" for anything that isn't a usable
+ * family, so callers treat empty as "System default".
+ */
+function normalizeUiFontFamily(value: unknown): string {
+  if (typeof value !== "string") return UI_FONT_FAMILY_DEFAULT;
+  // eslint-disable-next-line no-control-regex -- intentionally stripping control chars
+  const cleaned = value.replace(/[;{}\x00-\x1f\x7f]/g, "").trim();
+  if (!cleaned || cleaned.length > UI_FONT_FAMILY_MAX_LENGTH) {
+    return UI_FONT_FAMILY_DEFAULT;
+  }
+  return cleaned;
+}
+
+/**
+ * Read the persisted UI font family.
+ *
+ * Returns "" (System default) when nothing is stored, on a server render (no
+ * `window`), or when the stored value is missing/malformed — never throws, so a
+ * corrupt entry can't break app boot.
+ */
+export function readUiFontFamily(): string {
+  if (typeof window === "undefined") return UI_FONT_FAMILY_DEFAULT;
+  try {
+    const raw = window.localStorage.getItem(FONT_FAMILY_STORAGE_KEY);
+    if (!raw) return UI_FONT_FAMILY_DEFAULT;
+    const parsed: unknown = JSON.parse(raw);
+    return normalizeUiFontFamily(parsed);
+  } catch {
+    return UI_FONT_FAMILY_DEFAULT;
+  }
+}
+
+/**
+ * Persist the UI font family. An empty (or all-stripped) name clears the
+ * preference — reverting to System default — rather than storing a blank. Swallows
+ * quota/access errors so a failed write can't break the app.
+ */
+export function writeUiFontFamily(name: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const normalized = normalizeUiFontFamily(name);
+    if (!normalized) {
+      window.localStorage.removeItem(FONT_FAMILY_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(FONT_FAMILY_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // localStorage quota or access errors shouldn't break the app.
+  }
+}
+
+/**
+ * Apply the given family to the DOM by setting the `--ui-font-family` variable
+ * on the document root; the `html` rule in index.css reads it as the whole UI's
+ * font. An empty name removes the property, restoring the system stack.
+ *
+ * The chosen family is applied WITH the system stack appended
+ * (`<name>, var(--font-sans)`) so a name that isn't installed — or a partial one
+ * typed so far — degrades to the app's default sans rather than the browser's
+ * default serif. (The `var(--ui-font-family, …)` fallback in the CSS only fires
+ * when the property is unset, not when it holds an unusable name, so the
+ * fallback has to live inside the value too.) This is the single source of the
+ * DOM side-effect.
+ */
+export function applyUiFontFamily(name: string): void {
+  if (typeof document === "undefined") return;
+  const normalized = normalizeUiFontFamily(name);
+  if (!normalized) {
+    document.documentElement.style.removeProperty("--ui-font-family");
+    return;
+  }
+  document.documentElement.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
 }

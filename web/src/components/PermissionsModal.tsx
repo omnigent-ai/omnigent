@@ -129,8 +129,10 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
           />
         </div>
 
-        {/* Current grants */}
-        <div>
+        {/* Current grants. DialogContent is a grid, and grid items default to
+            min-width:auto — without min-w-0 a long nowrap email sets the whole
+            track's min-content and pushes every row past the dialog edge. */}
+        <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
             <p className="text-sm text-muted-foreground py-2">Loading…</p>
           ) : userGrants.length === 0 ? (
@@ -434,6 +436,9 @@ function GrantRow({
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
+      {/* Tail truncation keeps the local part — the distinguishing half when
+          every grantee shares one company domain — and the title tooltip
+          carries the full id. */}
       <span className="flex-1 truncate text-sm" title={permission.user_id}>
         {permission.user_id}
       </span>
