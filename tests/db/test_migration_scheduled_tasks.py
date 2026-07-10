@@ -57,7 +57,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "prompt",
         "cron_expression",
         "run_at_ms",
-        "plugins",
         "owner_user_id",
         "agent_id",
         "harness_override",
@@ -132,8 +131,8 @@ def test_expected_indexes(db_engine: Engine) -> None:
     assert "ix_scheduled_task_runs_scheduled_task_id" in runs_idx
 
 
-def test_state_plugins_default_on_omitted_insert(db_engine: Engine) -> None:
-    """A raw insert omitting ``state`` / ``metadata`` / ``plugins`` picks up defaults."""
+def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
+    """A raw insert omitting ``state`` / ``metadata`` picks up defaults."""
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
@@ -143,16 +142,14 @@ def test_state_plugins_default_on_omitted_insert(db_engine: Engine) -> None:
                 "VALUES ('st_def', 'n', 'p', '0 9 * * *', 'u', 'ag_1', 'UTC', 1)"
             )
         )
-        state, workspace_id, metadata, plugins = conn.execute(
+        state, workspace_id, metadata = conn.execute(
             sa.text(
-                "SELECT state, workspace_id, metadata, plugins "
-                "FROM scheduled_tasks WHERE id = 'st_def'"
+                "SELECT state, workspace_id, metadata FROM scheduled_tasks WHERE id = 'st_def'"
             )
         ).one()
     assert state == 1  # 1 = 'active'
     assert workspace_id == 0
     assert metadata == "{}"
-    assert plugins == "[]"
 
 
 def test_trigger_check_accepts_cron_only(db_engine: Engine) -> None:

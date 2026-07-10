@@ -45,8 +45,6 @@ def upgrade() -> None:
         # ScheduleTrigger; exactly one is non-NULL (CHECK below).
         sa.Column("cron_expression", sa.String(255), nullable=True),
         sa.Column("run_at_ms", sa.BigInteger(), nullable=True),
-        # JSON-encoded list[str] of "plugin-name@marketplace" refs.
-        sa.Column("plugins", sa.Text(), nullable=False, server_default="[]"),
         sa.Column("owner_user_id", sa.String(255), nullable=False),
         sa.Column("agent_id", sa.String(64), nullable=False),
         sa.Column("harness_override", sa.String(64), nullable=True),

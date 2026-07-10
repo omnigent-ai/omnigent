@@ -36,8 +36,6 @@ class ScheduledTask:
         ``None`` for a one-shot. Mutually exclusive with ``run_at_ms``.
     :param run_at_ms: One-shot fire time as Unix epoch milliseconds, or ``None``
         for a recurring task. Mutually exclusive with ``cron_expression``.
-    :param plugins: Plugin references, each ``"plugin-name@marketplace"``.
-        Defaults to an empty list.
     :param harness_override: Per-task brain-harness override, e.g. ``"pi"``.
         ``None`` means use the agent default.
     :param model_override: Per-task LLM model override, e.g.
@@ -70,7 +68,6 @@ class ScheduledTask:
     created_at: int
     cron_expression: str | None = None
     run_at_ms: int | None = None
-    plugins: list[str] = field(default_factory=list)
     harness_override: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None

@@ -1080,7 +1080,7 @@ class SqlScheduledTask(Base):
     or dispatches these rows yet.
 
     The entity mirrors the internal Isaac ``ScheduledTask`` spec (fields
-    ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``/``plugins``;
+    ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``;
     a ``ScheduleTrigger`` ``cron_expression | run_at_ms`` oneof; a ``state`` enum
     ``active``/``paused``/``deleted``/``completed``) so a future merge is a
     column mapping rather than a rewrite.
@@ -1093,9 +1093,6 @@ class SqlScheduledTask(Base):
         set (enforced by ``ck_scheduled_tasks_trigger_exactly_one``).
     :param run_at_ms: One-shot fire time as Unix epoch **milliseconds**.
         Mutually exclusive with ``cron_expression`` — exactly one is set.
-    :param plugins: JSON-encoded ``list[str]`` of plugin references, each of the
-        form ``"plugin-name@marketplace"`` (format not validated here). Defaults
-        to ``"[]"``.
     :param owner_user_id: User the task belongs to and fires as — the
         identity anchor for unattended dispatch, e.g. ``"alice@example.com"``.
         Required.
@@ -1160,10 +1157,6 @@ class SqlScheduledTask(Base):
     # string (recurring); run_at_ms = one-shot fire time in epoch milliseconds.
     cron_expression: Mapped[str | None] = mapped_column(String(255), nullable=True)
     run_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    # JSON-encoded list[str] of plugin references ("plugin-name@marketplace").
-    # Stored as Text (not a native JSON column) for SQLite/MySQL parity; the
-    # store json.loads/dumps it. Defaults to an empty list.
-    plugins: Mapped[str] = mapped_column(Text, nullable=False, server_default="[]")
     # Required identity anchor. Indexed, so kept at 255 (<= the indexed-string
     # length ceiling) rather than the wider 256 used for non-indexed owners.
     owner_user_id: Mapped[str] = mapped_column(String(255), nullable=False)

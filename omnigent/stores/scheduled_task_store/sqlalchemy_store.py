@@ -63,7 +63,6 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         created_at=row.created_at,
         cron_expression=row.cron_expression,
         run_at_ms=row.run_at_ms,
-        plugins=json.loads(row.plugins) if row.plugins else [],
         harness_override=row.harness_override,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
@@ -132,7 +131,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         *,
         cron_expression: str | None = None,
         run_at_ms: int | None = None,
-        plugins: list[str] | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
@@ -155,7 +153,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             prompt=prompt,
             cron_expression=cron_expression,
             run_at_ms=run_at_ms,
-            plugins=json.dumps(plugins if plugins is not None else []),
             owner_user_id=owner_user_id,
             agent_id=agent_id,
             timezone=timezone,
@@ -216,7 +213,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         prompt: str | None = None,
         cron_expression: str | None = None,
         run_at_ms: int | None = None,
-        plugins: list[str] | None = None,
         timezone: str | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
@@ -253,11 +249,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if row.cron_expression != cron_expression or row.run_at_ms != run_at_ms:
                     row.cron_expression = cron_expression
                     row.run_at_ms = run_at_ms
-                    changed = True
-            if plugins is not None:
-                encoded = json.dumps(plugins)
-                if row.plugins != encoded:
-                    row.plugins = encoded
                     changed = True
             if timezone is not None and row.timezone != timezone:
                 row.timezone = timezone

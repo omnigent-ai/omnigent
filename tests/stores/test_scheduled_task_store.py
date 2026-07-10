@@ -34,7 +34,6 @@ def test_create_returns_scheduled_task_with_all_fields(
         name="nightly triage",
         prompt="Triage the inbox",
         cron_expression="0 9 * * *",
-        plugins=["triage@core", "notify@core"],
         owner_user_id="alice@example.com",
         agent_id="ag_abc",
         timezone="America/Los_Angeles",
@@ -51,7 +50,6 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.prompt == "Triage the inbox"
     assert task.cron_expression == "0 9 * * *"
     assert task.run_at_ms is None
-    assert task.plugins == ["triage@core", "notify@core"]
     assert task.owner_user_id == "alice@example.com"
     assert task.agent_id == "ag_abc"
     assert task.timezone == "America/Los_Angeles"
@@ -86,7 +84,6 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.workspace is None
     assert task.base_branch is None
     assert task.sandbox_target is None
-    assert task.plugins == []
     assert task.run_at_ms is None
     assert task.metadata == {}
     assert task.state == "active"
@@ -336,7 +333,6 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         "st_u",
         name="after",
         cron_expression="0 0 * * *",
-        plugins=["p@core"],
         base_branch="develop",
         state="paused",
         metadata={"k": "v"},
@@ -346,7 +342,6 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated is not None
     assert updated.name == "after"
     assert updated.cron_expression == "0 0 * * *"
-    assert updated.plugins == ["p@core"]
     assert updated.base_branch == "develop"
     assert updated.state == "paused"
     assert updated.metadata == {"k": "v"}

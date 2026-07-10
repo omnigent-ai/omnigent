@@ -46,7 +46,6 @@ class ScheduledTaskStore(ABC):
         *,
         cron_expression: str | None = None,
         run_at_ms: int | None = None,
-        plugins: list[str] | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
@@ -72,8 +71,6 @@ class ScheduledTaskStore(ABC):
             Mutually exclusive with ``run_at_ms``.
         :param run_at_ms: One-shot fire time in epoch milliseconds. Mutually
             exclusive with ``cron_expression``.
-        :param plugins: Optional plugin references
-            (``"plugin-name@marketplace"``); defaults to an empty list.
         :param harness_override: Optional brain-harness override.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
@@ -128,7 +125,6 @@ class ScheduledTaskStore(ABC):
         prompt: str | None = None,
         cron_expression: str | None = None,
         run_at_ms: int | None = None,
-        plugins: list[str] | None = None,
         timezone: str | None = None,
         harness_override: str | None = None,
         model_override: str | None = None,
