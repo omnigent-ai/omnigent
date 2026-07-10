@@ -158,8 +158,28 @@ def post_to_slack(webhook_url: str, person: Person) -> None:
         raise SlackPostError(f"could not reach Slack: {exc.reason}") from None
 
 
+def _report_todays_assignees(now_utc: datetime.datetime) -> None:
+    """Log who's on watch for each timezone's current local date.
+
+    Runs regardless of the morning window so a manual run is always
+    informative, even outside anyone's ping window.
+    """
+    for tz in sorted({p.tz for p in PEOPLE}):
+        local = now_utc.astimezone(ZoneInfo(tz))
+        if local.weekday() >= 5:  # 5=Sat, 6=Sun
+            who = "nobody (weekend)"
+        else:
+            person = assignee_for(local.date())
+            who = person.name if person else "nobody (all OOO)"
+        print(f"  {tz}: {local:%Y-%m-%d %a} -> {who}")
+
+
 def main() -> None:
     now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    print(f"Today's watch by timezone (as of {now_utc:%Y-%m-%d %H:%M UTC}):")
+    _report_todays_assignees(now_utc)
+
     person = whose_turn_now(now_utc)
 
     if person is None:
