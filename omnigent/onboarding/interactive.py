@@ -40,9 +40,74 @@ from rich.text import Text
 ACCENT = "#F43BA6"
 MUTED = "#6a6a6a"
 
+
+class _SafeConsole(Console):
+    """A Rich Console subclass that gracefully handles UnicodeEncodeError.
+
+    On Windows with legacy codepages (e.g. cp1252), emoji glyphs in
+    ``console.print()`` calls can raise ``UnicodeEncodeError`` because the
+    system's encoding cannot represent them.  This wrapper catches the
+    error at print time and retries with the problematic characters
+    stripped, so the CLI degrades to ASCII rather than crashing.
+
+    See: https://github.com/omnigent-ai/omnigent/issues/2270
+    """
+
+    # Map of emoji characters to ASCII-safe fallbacks used when the
+    # terminal encoding cannot represent them.  Covers the glyphs used
+    # in ``_KIND_GLYPH`` (configure_models.py) and common status markers
+    # used throughout the CLI.
+    _EMOJI_FALLBACKS: dict[str, str] = {
+        "🔑": "[key]",
+        "🎟️": "[ticket]",
+        "🌐": "[web]",
+        "🖥️": "[local]",
+        "🧱": "[brick]",
+        "⚙️": "[gear]",
+        "☁️": "[cloud]",
+        "✓": "[ok]",
+        "❯": ">",
+        "↑": "^",
+        "↓": "v",
+    }
+
+    def print(self, *args: object, **kwargs: object) -> None:
+        """Print with UnicodeEncodeError safety on legacy Windows terminals.
+
+        If the underlying ``Console.print`` raises ``UnicodeEncodeError``
+        (typically because the system codepage cannot encode an emoji),
+        retry with each argument's problematic characters replaced by their
+        :data:`_EMOJI_FALLBACKS` equivalents.
+        """
+        try:
+            super().print(*args, **kwargs)
+        except UnicodeEncodeError:
+            safe_args = []
+            for arg in args:
+                if isinstance(arg, str):
+                    safe_args.append(self._safe_str(arg))
+                else:
+                    safe_args.append(arg)
+            super().print(*safe_args, **kwargs)
+
+    @classmethod
+    def _safe_str(cls, text: str) -> str:
+        """Replace emoji with ASCII fallbacks when the terminal cannot encode them."""
+        try:
+            # Fast path: if the text encodes fine, return as-is.
+            text.encode("ascii", errors="strict")
+            return text
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        result = text
+        for emoji, fallback in cls._EMOJI_FALLBACKS.items():
+            result = result.replace(emoji, fallback)
+        return result
+
+
 # Shared Rich console for all onboarding interactive output. A module
 # singleton so all callers render through one surface.
-console = Console()
+console = _SafeConsole()
 
 
 class _TermUIWithHiddenPrompt(Protocol):
@@ -357,9 +422,9 @@ def select(
         ``"What do you want to do?"``.
     :param options: The row labels, e.g. ``["Add a provider",
         "Quit"]``. Must be non-empty.
-    :param descriptions: Optional per-option descriptions (same length
-        as *options*); the selected option's description renders as a
-        dim line under the menu. ``None`` to omit.
+    :param descriptions: Optional per-option description strings (same
+        length as *options*); the selected option's description renders as
+        a dim line under the menu. ``None`` to omit.
     :param default: Zero-based index of the initially highlighted
         option, e.g. ``0``. If it points at a non-selectable row, the
         cursor starts on the first selectable row instead.
@@ -383,8 +448,8 @@ def select(
     :param compact: When ``True`` (TTY only), render the dense top-level
         overview layout: the title hugs the list (no blank line below it) and
         the footer reads ``nav · select · Esc exit`` (Esc exits rather
-        than goes back). Intended for the setup harness overview. No-op on the
-        numbered fallback.
+        than goes back). Intended for the setup harness overview. No-op on
+        the numbered fallback.
     :returns: The chosen zero-based index into *options* (always a
         selectable row), or ``-1`` when the user aborts — Esc / Ctrl-C /
         Ctrl-D on the TTY, or ``q`` on the numbered fallback.
