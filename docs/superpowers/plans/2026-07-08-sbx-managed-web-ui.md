@@ -37,16 +37,15 @@ This task produces **recorded findings** that confirm or adjust branches in the 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-07-08-sbx-managed-web-ui-design.md` (fill in the five discovery items)
 
-- [ ] **Step 1: Does `sbx create … shell` accept no host PATH?**
+- [x] **Step 1: Does `sbx create … shell` accept no host PATH?**
 
 ```bash
 sbx create --name oa-path-probe shell
-sbx rm -f oa-path-probe
 ```
 
-Expected: success. If a PATH is mandatory, use a throwaway empty directory as the managed `shell` argument.
+**Finding:** fails with `requires at least 1 argument: PATH`. Managed provision must pass a throwaway empty directory (e.g. `/tmp/omnigent-sbx-empty`).
 
-- [ ] **Step 2: Does a `setsid nohup` background survive `sbx exec` returning?**
+- [x] **Step 2: Does a `setsid nohup` background survive `sbx exec` returning?**
 
 ```bash
 sbx create --name oa-bg-probe shell .
@@ -56,41 +55,48 @@ sbx exec oa-bg-probe pgrep -a sleep
 sbx rm -f oa-bg-probe
 ```
 
-If `pgrep` shows the sleep, the default `run_background` works. If not, override `run_background` in managed mode to hold the exec stream open.
+**Finding:** the sleep process survives. The default `run_background` works unchanged.
 
-- [ ] **Step 3: Is `sbx policy allow network` for the server host:port sufficient for dial-back?**
+- [x] **Step 3: Is `sbx policy allow network` for the server host:port sufficient for dial-back?**
 
-Create a sandbox, allow only the server URL, and from inside run `curl -v <server-url>/health`. Record whether `host.docker.internal` or a bare host IP is required.
+Created a sandbox, allowed only the server URL, and ran `curl` from inside.
 
-- [ ] **Step 4: Does `sbx create -t <registry-ref>` accept an arbitrary OCI image, and does an omnigent layer on `shell-docker` keep nested Docker working?**
+**Finding:** `sbx policy allow network` works, but `host.docker.internal` resolves inside the sandbox to an IPv6 link-local address (`fe80::1`) that is not usable. Use the host's Docker bridge IP (e.g. `172.17.0.1`) in `sandbox.server_url` and allow that IP:port.
+
+- [x] **Step 4: Does `sbx create -t <registry-ref>` accept an arbitrary OCI image, and does an omnigent layer on `shell-docker` keep nested Docker working?**
+
+Built a probe image `FROM docker/sandbox-templates:shell-docker` and tried:
 
 ```bash
-# first, build/push a minimal probe image FROM docker/sandbox-templates:shell-docker
-# (or skip to the real image in Task 4)
 sbx create --name oa-img-probe -t <your-registry>/omnigent-host-sbx:probe shell
-sbx exec oa-img-probe bash -lc 'which omnigent; which docker; docker run --rm hello-world'
-sbx rm -f oa-img-probe
 ```
 
-If `docker run hello-world` fails, record why and adjust the Dockerfile (likely the base daemon plumbing was disturbed).
+**Finding:** `sbx create -t` only accepts **registry-pullable** images; local-only tags fail with a pull error. The base `shell-docker` image already has a working nested Docker daemon, and adding layers preserves it as long as the Dockerfile does not override the base's entrypoint/CMD. The base runs as a non-root user, so `USER root` is required before installing packages.
 
-- [ ] **Step 5: Exact resume mechanics.**
-
-Stop a sandbox (or let it idle-stop), then test whether `sbx start <id>` is required before `sbx exec` or whether `exec` auto-starts it.
+- [x] **Step 5: Exact resume mechanics.**
 
 ```bash
 sbx create --name oa-resume-probe shell .
-sbx stop oa-resume-probe   # or wait for idle-stop
+sbx stop oa-resume-probe
 sbx exec oa-resume-probe bash -lc 'echo awake'
 sbx rm -f oa-resume-probe
 ```
 
-Record whether `sbx start` exists and is required.
+**Finding:** `sbx exec` auto-starts a stopped sandbox. There is no `sbx start` subcommand, so `resume()` only needs to verify the sandbox exists.
 
-- [ ] **Step 6: Update the spec with the findings and commit.**
+- [x] **Step 6: `sbx ls --json` output shape.**
 
 ```bash
-git add docs/superpowers/specs/2026-07-08-sbx-managed-web-ui-design.md
+sbx ls --json
+```
+
+**Finding:** the current CLI returns `{"sandboxes": [...]}`, not a bare list. `_sandbox_exists` must parse the object wrapper.
+
+- [ ] **Step 7: Update the spec and plan with the findings, then commit.**
+
+```bash
+git add docs/superpowers/specs/2026-07-08-sbx-managed-web-ui-design.md \
+       docs/superpowers/plans/2026-07-08-sbx-managed-web-ui.md
 git commit -m "docs(sbx): record managed-mode discovery findings"
 ```
 
@@ -107,8 +113,9 @@ git commit -m "docs(sbx): record managed-mode discovery findings"
 - New class var `can_resume: ClassVar[bool] = True`.
 - New helper `_managed: bool` (property) and `_exec_env_args() -> list[str]` for `sbx exec -e` injection in managed mode.
 - `run()` injects configured env in managed mode.
-- `provision()` branches: CLI-bootstrap path unchanged; managed path creates from template with no cwd bind-mount, no install step, and server egress allow.
-- `resume()` brings a stopped managed sandbox back (implementation depends on discovery item #5).
+- `provision()` branches: CLI-bootstrap path unchanged; managed path creates from template, bind-mounts a throwaway empty directory (the CLI requires a PATH argument), skips the install step, and allows server egress.
+- `resume()` verifies the sandbox exists; `sbx exec` auto-starts it on the next command.
+- `_sandbox_exists()` is updated to parse the current `sbx ls --json` object wrapper (`{"sandboxes": [...]}`) as well as the legacy bare list.
 
 - [ ] **Step 1: Write the failing managed-mode tests**
 
@@ -124,22 +131,26 @@ def test_managed_mode_class_vars() -> None:
 
 
 def test_managed_provision_argv_and_egress(
-    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    Managed provision creates from the template, bind-mounts no host cwd,
-    skips the setup step, and opens egress to the server + Claude domains.
+    Managed provision creates from the template, bind-mounts a throwaway
+    empty directory (the CLI requires a PATH), skips the setup step, and
+    opens egress to the server + Claude domains.
     """
+    empty = tmp_path / "empty"
+    monkeypatch.setattr(sbxmod, "_MANAGED_EMPTY_WORKSPACE", empty)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     launcher = SbxSandboxLauncher(
         template="ghcr.io/me/omnigent-host-sbx:latest",
         env=["ANTHROPIC_API_KEY"],
         kits=["/opt/sbxkits/claude"],
-        server_url="http://host.docker.internal:6767",
+        server_url="http://172.17.0.1:6767",
     )
     sandbox_id = launcher.provision("managed-box")
 
     assert sandbox_id == "managed-box"
+    assert empty.exists()
     create, policy = fake_sbx.calls[:2]
     assert create.args[1:] == [
         "create",
@@ -150,11 +161,12 @@ def test_managed_provision_argv_and_egress(
         "-t",
         "ghcr.io/me/omnigent-host-sbx:latest",
         "shell",
+        str(empty),
     ]
     assert policy.args[1:5] == ["policy", "allow", "network", "--sandbox"]
     assert policy.args[5] == "managed-box"
     allowed = policy.args[6]
-    assert "host.docker.internal:6767" in allowed
+    assert "172.17.0.1:6767" in allowed
     assert "console.anthropic.com:443" in allowed
     # No root setup exec.
     assert [c.args[1:4] for c in fake_sbx.calls] != [["exec", "-u", "root"]]
@@ -267,6 +279,16 @@ Update `provision` to branch:
         ...
 ```
 
+Add the managed workspace constant near the other constants:
+
+```python
+_MANAGED_EMPTY_WORKSPACE: Path = Path(tempfile.gettempdir()) / "omnigent-sbx-managed-empty"
+"""Throwaway empty directory passed to `sbx create ... shell` in managed mode.
+
+The `sbx` CLI requires a PATH argument even when the image provides its own
+workspace, so we bind-mount this empty directory. It is created on demand."""
+```
+
 Add the managed provision helper:
 
 ```python
@@ -274,9 +296,9 @@ Add the managed provision helper:
         """
         Create a managed sbx sandbox from the prebaked template.
 
-        No cwd bind-mount (the server has no per-user cwd), no runtime
-        setup step (the template already carries omnigent), and egress is
-        opened to the Omnigent server so the in-box host can register.
+        Bind-mounts an empty server-side directory (the CLI requires a PATH),
+        skips the runtime setup step (the template already carries omnigent),
+        and opens egress to the Omnigent server so the in-box host can register.
         """
         template = self._resolve_template()
         if not template:
@@ -284,10 +306,11 @@ Add the managed provision helper:
                 "sbx managed mode requires a template image — set "
                 "'sandbox.sbx.template' in the server config."
             )
+        _MANAGED_EMPTY_WORKSPACE.mkdir(parents=True, exist_ok=True)
         args = ["create", "--name", name]
         for kit in self._resolve_kits():
             args += ["--kit", kit]
-        args += ["-t", template, "shell"]
+        args += ["-t", template, "shell", str(_MANAGED_EMPTY_WORKSPACE)]
 
         click.echo(f"▸ Creating managed sbx sandbox '{name}'")
         result = self._run_sbx(args)
@@ -348,30 +371,42 @@ Update `run()` to inject env in managed mode:
         ...
 ```
 
-Add `resume()` (adjust after discovery item #5):
+Add `resume()`:
 
 ```python
     def resume(self, sandbox_id: str) -> None:
         """
-        Resume a stopped managed sandbox in place.
+        Verify a managed sandbox still exists so the next `exec` wakes it.
 
         sbx retains the sandbox filesystem across idle-stop and auto-starts
-        on the next `exec`; this method ensures the compute is back before
-        the server re-runs `start_host`.
+        on the next `exec`, so `start_host` will bring the compute back.
         """
         if not self._sandbox_exists(sandbox_id):
             raise click.ClickException(
                 f"sbx sandbox '{sandbox_id}' not found — cannot resume"
             )
-        # Discovery item #5: if `sbx start` exists and is required, call it here.
-        # If `sbx exec` auto-starts reliably, this existence check is enough.
-        result = self._run_sbx(["start", sandbox_id])
+        click.echo(f"  → sandbox '{sandbox_id}' exists; exec will auto-start it")
+```
+
+Update `_sandbox_exists()` to handle the current CLI output shape:
+
+```python
+    def _sandbox_exists(self, sandbox_id: str) -> bool:
+        """Return whether a sandbox named *sandbox_id* is listed."""
+        result = self._run_sbx(["ls", "--json"])
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            click.echo(
-                f"  → warning: `sbx start {sandbox_id}` failed ({detail}); "
-                "falling back to exec auto-start."
+            raise click.ClickException(
+                f"Could not list sbx sandboxes: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
             )
+        try:
+            parsed = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        # Current sbx CLI wraps the list in {"sandboxes": [...]}; older builds
+        # returned a bare list. Accept both.
+        entries = parsed if isinstance(parsed, list) else parsed.get("sandboxes", [])
+        return any(entry.get("name") == sandbox_id for entry in entries)
 ```
 
 - [ ] **Step 4: Run the launcher tests**
@@ -461,7 +496,7 @@ def test_parse_sbx_config_threads_options(monkeypatch: pytest.MonkeyPatch) -> No
     cfg = parse_sandbox_config(
         {
             "provider": "sbx",
-            "server_url": "http://host.docker.internal:6767/",
+            "server_url": "http://172.17.0.1:6767/",
             "sbx": {
                 "template": "ghcr.io/me/omnigent-host-sbx:latest",
                 "env": ["ANTHROPIC_API_KEY", "GIT_TOKEN"],
@@ -470,7 +505,7 @@ def test_parse_sbx_config_threads_options(monkeypatch: pytest.MonkeyPatch) -> No
         }
     )
     assert cfg is not None
-    assert cfg.server_url == "http://host.docker.internal:6767"
+    assert cfg.server_url == "http://172.17.0.1:6767"
     assert cfg.token_ttl_s == SBX_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
     assert cfg.provider == "sbx"
@@ -480,7 +515,7 @@ def test_parse_sbx_config_threads_options(monkeypatch: pytest.MonkeyPatch) -> No
     assert fake.template == "ghcr.io/me/omnigent-host-sbx:latest"
     assert fake.env == ["ANTHROPIC_API_KEY", "GIT_TOKEN"]
     assert fake.kits == ["/opt/sbxkits/claude"]
-    assert fake.server_url == "http://host.docker.internal:6767"
+    assert fake.server_url == "http://172.17.0.1:6767"
 
 
 def test_parse_sbx_config_requires_template() -> None:
@@ -726,6 +761,8 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 
 # Builder stage: installs omnigent and harness tools on the sbx base.
 FROM docker/sandbox-templates:shell-docker AS builder
+# The base image runs as a non-root user by default; package installs need root.
+USER root
 ARG PYPI_INDEX_URL
 ARG NPM_CONFIG_REGISTRY=
 ARG KIRO_CLI_VERSION=2.10.0
@@ -806,6 +843,7 @@ RUN set -eu; \
 # Final stage: start from the sbx base again so the Docker-daemon entrypoint
 # is preserved. Only the runtime artifacts are copied in.
 FROM docker/sandbox-templates:shell-docker
+USER root
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -851,7 +889,9 @@ Sections:
 ```yaml
 sandbox:
   provider: sbx
-  server_url: http://host.docker.internal:6767
+  # Use the host's Docker bridge IP, not host.docker.internal — inside an sbx
+  # sandbox host.docker.internal resolves to an unusable IPv6 link-local address.
+  server_url: http://172.17.0.1:6767
   sbx:
     template: ghcr.io/you/omnigent-host-sbx:latest
     env: [ANTHROPIC_API_KEY, OPENAI_API_KEY, GIT_TOKEN]
@@ -859,7 +899,7 @@ sandbox:
 ```
 
 5. **Verification** — `sbx create -t <image> shell`, `docker run hello-world`, `omnigent host --server ...`.
-6. **Troubleshooting** — network policy, `host.docker.internal`, template pull auth.
+6. **Troubleshooting** — network policy, Docker bridge IP vs `host.docker.internal`, template pull auth.
 
 - [ ] **Step 3: Build and publish the image**
 
@@ -918,7 +958,7 @@ Create or edit `<data_dir>/config.yaml`:
 ```yaml
 sandbox:
   provider: sbx
-  server_url: http://host.docker.internal:6767
+  server_url: http://172.17.0.1:6767
   sbx:
     template: ghcr.io/you/omnigent-host-sbx:latest
     env: [ANTHROPIC_API_KEY]

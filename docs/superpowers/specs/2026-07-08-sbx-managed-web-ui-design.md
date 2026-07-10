@@ -302,15 +302,29 @@ Follow TDD (red → green → refactor).
 
 ## Discovery items to resolve during implementation
 
-1. Does `sbx create … shell` accept **no** host PATH (for the no-bind-mount
-   managed provision)? If not, bind-mount a throwaway empty server dir.
-2. Does a `setsid nohup` background **survive `sbx exec` returning**, or is it
-   reaped (needing a stream-holding `run_background` override)?
-3. Is a per-sandbox `sbx policy allow network` for the server `host:port`
-   sufficient for the in-box host to dial back (revisit the
-   `host.docker.internal` egress finding from the original sbx design)?
-4. Does an omnigent-host layer built on `shell-docker` **retain the nested
-   Docker daemon** (`docker run --rm hello-world` works after the layer), and
-   does `sbx create -t <arbitrary-registry-ref>` accept the image at all?
-5. Exact `resume` mechanics: `sbx start <id>` vs. relying on `exec` auto-start
-   before `start_host`.
+Resolved findings (against `sbx` v0.32.0):
+
+1. **`sbx create … shell` requires a host PATH.** Passing no path fails with
+   `requires at least 1 argument: PATH`. Managed provision must bind-mount a
+   throwaway empty server-side directory (e.g., `/tmp/omnigent-sbx-empty`) to
+   satisfy the CLI while keeping the in-box workspace isolated.
+2. **`setsid nohup` backgrounds survive `sbx exec` returning.** The default
+   `run_background` implementation in `base.py` works unchanged.
+3. **Per-sandbox `sbx policy allow network` is sufficient, but the server URL
+   must use the host's Docker-routable IP, not `host.docker.internal`.** Inside
+   the sandbox `host.docker.internal` resolves to an IPv6 link-local address
+   (`fe80::1`) that is not usable; the Docker bridge gateway IP (e.g.
+   `172.17.0.1`) works once allowed. Operators should set `sandbox.server_url`
+   to `http://<docker-bridge-ip>:<port>` (e.g. `http://172.17.0.1:6767`).
+4. **`sbx create -t <registry-ref>` accepts arbitrary registry images, but not
+   local-only tags.** The image must be pullable from a registry the `sbx`
+   daemon can reach. Building on `docker/sandbox-templates:shell-docker`
+   preserves the nested Docker daemon as long as the Dockerfile does not
+   override the base's entrypoint/CMD. The base runs as a non-root user, so
+   `USER root` is required before installing packages.
+5. **`sbx exec` auto-starts a stopped sandbox.** There is no `sbx start`
+   subcommand; `resume()` only needs to verify the sandbox still exists. The
+   subsequent `start_host` exec will wake it.
+6. **`sbx ls --json` returns `{"sandboxes": [...]}`**, not a bare list. The
+   existing `_sandbox_exists` parser needs to handle the object wrapper so
+   `terminate`, `attach`, and `resume` work with the current CLI output.
