@@ -890,7 +890,6 @@ class SessionsNamespace:
         *,
         title: str | None = None,
         up_to_response_id: str | None = None,
-        model_override: str | None = None,
     ) -> dict[str, Any]:
         """
         Fork an existing session into a new session.
@@ -907,27 +906,19 @@ class SessionsNamespace:
             ``"resp_abc123"``. When set, the fork copies history only
             up to and including that response; ``None`` copies the
             full history.
-        :param model_override: Optional model id to launch the fork on
-            ("restart with model"), e.g. ``"databricks-gpt-5-4-mini"``.
-            Overrides the model the fork inherits from the source; the
-            server validates and family-checks it. ``None`` keeps the
-            source's model.
         :returns: Raw response dict matching the ``SessionResponse``
             shape: ``id``, ``agent_id``, ``status``, ``created_at``,
             ``title``, ``labels``, ``reasoning_effort``, and
             ``items``.
         :raises OmnigentError: 404 if *source_session_id* does
-            not exist; 400 if the source has no agent binding,
-            *up_to_response_id* names no response in the source, or
-            *model_override* is invalid / cross-family for the fork.
+            not exist; 400 if the source has no agent binding or
+            *up_to_response_id* names no response in the source.
         """
         body: dict[str, Any] = {}
         if title is not None:
             body["title"] = title
         if up_to_response_id is not None:
             body["up_to_response_id"] = up_to_response_id
-        if model_override is not None:
-            body["model_override"] = model_override
         resp = await self._http.post(
             f"{self._base}/v1/sessions/{source_session_id}/fork",
             json=body,

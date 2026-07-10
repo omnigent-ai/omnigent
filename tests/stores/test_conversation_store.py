@@ -571,6 +571,7 @@ def test_unique_position_constraint(
     from sqlalchemy.exc import IntegrityError
 
     from omnigent.db.db_models import SqlConversationItem
+    from omnigent.db.enum_codecs import encode_item_status, encode_item_type
     from omnigent.db.utils import generate_item_id
 
     conv = conversation_store.create_conversation()
@@ -597,9 +598,9 @@ def test_unique_position_constraint(
                     conversation_id=conv.id,
                     response_id="resp_dup",
                     created_at=0,
-                    status="completed",
+                    status=encode_item_status("completed"),
                     position=0,  # duplicate
-                    type="message",
+                    type=encode_item_type("message"),
                     data='{"role":"user","content":[]}',
                     search_text="",
                 )
@@ -1753,10 +1754,10 @@ def test_create_null_parent_allows_duplicate_titles(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """Top-level conversations (NULL parent) are NOT subject to the unique constraint."""
-    # Both conversations share title=None and parent=None.
-    # The partial index excludes NULL parents, so two NULL-NULL
-    # rows are valid. Without the WHERE clause on the index,
-    # this would raise.
+    # Both conversations share title="" and parent=None. The unique index on
+    # (parent_conversation_id, title) still allows this: a NULL in any indexed
+    # column makes the key distinct, so top-level rows never collide even
+    # without a WHERE predicate.
     a = conversation_store.create_conversation()
     b = conversation_store.create_conversation()
     assert a.id != b.id
@@ -2633,12 +2634,12 @@ def test_set_host_id_no_workspace_fails_when_row_has_none(
     constraint by accident. Callers must pass a workspace when
     binding to a host on a row that doesn't already have one.
     """
-    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.exc import IntegrityError, OperationalError
 
     conv = conversation_store.create_conversation()
     assert conv.workspace is None
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises((IntegrityError, OperationalError)):
         conversation_store.set_host_id(conv.id, "host_no_ws")
 
 
@@ -2702,9 +2703,9 @@ def test_create_conversation_with_host_id_no_workspace_raises(
     constraint surfaces as IntegrityError, callers can catch it,
     and the row is never written.
     """
-    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.exc import IntegrityError, OperationalError
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises((IntegrityError, OperationalError)):
         conversation_store.create_conversation(host_id="host_abc")
 
 
@@ -3514,39 +3515,6 @@ def test_fork_conversation_copy_model_settings_false_resets(
     assert reloaded_default.reasoning_effort == "high"
 
 
-def test_fork_conversation_model_override_wins_over_copy(
-    conversation_store: SqlAlchemyConversationStore,
-    agent_store: SqlAlchemyAgentStore,
-) -> None:
-    """An explicit ``model_override`` overrides the source's copied model.
-
-    The "restart with model" path: the fork must launch on the requested
-    model, not the source's. ``reasoning_effort`` still follows
-    ``copy_model_settings`` (a same-family model switch keeps the effort).
-    """
-    agent_store.create(
-        agent_id="ag_fork_mo",
-        name="fork-mo",
-        bundle_location="ag_fork_mo/fakehash",
-    )
-    source = conversation_store.create_conversation(agent_id="ag_fork_mo")
-    conversation_store.update_conversation(
-        source.id, reasoning_effort="high", model_override="databricks-gpt-5-5"
-    )
-
-    fork = conversation_store.fork_conversation(
-        source.id, model_override="databricks-gpt-5-4-mini"
-    )
-
-    reloaded = conversation_store.get_conversation(fork.id)
-    assert reloaded is not None
-    assert reloaded.model_override == "databricks-gpt-5-4-mini", (
-        "An explicit model_override must win over the source's copied model."
-    )
-    # reasoning_effort still copies (same-family switch keeps the effort).
-    assert reloaded.reasoning_effort == "high"
-
-
 def test_fork_conversation_carry_history_into_native_stamps_label(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -4102,35 +4070,6 @@ def test_set_session_usage_overwrites(
     assert fetched.session_usage == {"input_tokens": 200, "output_tokens": 50}
 
 
-# ── list_conversations_by_host_id ─────────────────────────────────────────
-
-
-def test_list_conversations_by_host_id_returns_matching(
-    conversation_store: SqlAlchemyConversationStore,
-    db_uri: str,
-) -> None:
-    """list_conversations_by_host_id returns conversations bound to the host."""
-    _register_host(db_uri, "host_byhost")
-    conv = conversation_store.create_conversation(
-        host_id="host_byhost",
-        workspace="/tmp/ws",
-    )
-    conversation_store.create_conversation()  # no host_id
-
-    result = conversation_store.list_conversations_by_host_id("host_byhost")
-    assert len(result) == 1
-    assert result[0].id == conv.id
-
-
-def test_list_conversations_by_host_id_empty(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """list_conversations_by_host_id returns empty list when no match."""
-    conversation_store.create_conversation()
-    result = conversation_store.list_conversations_by_host_id("host_nonexistent")
-    assert result == []
-
-
 # ── next_position counter (write-path MAX(position) scan removal) ──────
 
 
@@ -4476,3 +4415,68 @@ def test_list_conversations_project_none_disables_filter(
 
     ids = {c.id for c in conversation_store.list_conversations().data}
     assert ids >= {filed.id, unfiled.id}
+
+
+def test_list_projects_owned_by_excludes_shared_only_projects(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``owned_by`` restricts to projects the user OWNS, not ones merely shared
+    with them — so a project whose sessions are only shared to the user (owned
+    by someone else) does not surface as one of their own sidebar folders."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared = conversation_store.create_conversation()
+    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
+    conversation_store.set_labels(shared.id, {"omni_project": "Shared"})
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    # Bob owns both; Alice only gets a read (level 1) grant on the shared one.
+    perms.grant("bob@example.com", mine.id, 4)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", shared.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    # accessible_by would leak "Shared" — Alice can access it. owned_by must not.
+    assert conversation_store.list_projects(accessible_by="alice@example.com") == [
+        "Mine",
+        "Shared",
+    ]
+    assert conversation_store.list_projects(owned_by="alice@example.com") == ["Mine"]
+
+
+def test_list_conversations_owned_by_excludes_shared_sessions(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``owned_by`` on a project filter returns only sessions the user owns; a
+    session shared with them (read grant) under the same project is excluded so
+    it stays out of the owner-only project folder."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared = conversation_store.create_conversation()
+    conversation_store.set_labels(mine.id, {"omni_project": "X"})
+    conversation_store.set_labels(shared.id, {"omni_project": "X"})
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", shared.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            project="X", owned_by="alice@example.com"
+        ).data
+    }
+    assert ids == {mine.id}

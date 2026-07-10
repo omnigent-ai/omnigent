@@ -95,7 +95,7 @@ from omnigent.harness_plugins import (
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.model_override import model_family_mismatch, validate_model_override
+from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -212,6 +212,7 @@ from omnigent.server.schemas import (
     ErrorDetail,
     ErrorEvent,
     GrantPermissionRequest,
+    McpServerStartup,
     MCPServerSummary,
     ModelUsage,
     OutputItemDoneEvent,
@@ -241,6 +242,7 @@ from omnigent.server.schemas import (
     SessionLabelsResponse,
     SessionList,
     SessionListItem,
+    SessionMcpStartupEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
     SessionReasoningEffortEvent,
@@ -401,6 +403,17 @@ _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT: int = 1000
 _EXTERNAL_COMPACTION_STATUS_TYPE: str = "external_compaction_status"
 _EXTERNAL_COMPACTION_STATUS_VALUES: frozenset[str] = frozenset(
     {"in_progress", "completed", "failed"}
+)
+
+# Per-MCP-server startup progress observed by a native forwarder while
+# its harness boots MCP servers (codex-native today). Republished as a
+# ``session.mcp_startup`` SSE event so the web UI shows which servers
+# are still starting — instead of an apparently hung session — and
+# which failed or were cancelled. Payload:
+# ``{"servers": {"safe": {"status": "starting", "error": null}}}``.
+_EXTERNAL_MCP_STARTUP_TYPE: str = "external_mcp_startup"
+_EXTERNAL_MCP_STARTUP_STATUS_VALUES: frozenset[str] = frozenset(
+    {"starting", "ready", "failed", "cancelled"}
 )
 
 # Usage update from a terminal-backed runtime (claude-native
@@ -844,6 +857,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
+    _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
@@ -1064,6 +1078,13 @@ _session_terminal_pending_cache: dict[str, bool] = {}
 # ManagedLaunchTracker — so a reload after a dead launch still shows
 # why the sandbox never came up.
 _session_sandbox_status_cache: dict[str, SandboxStatus] = {}
+# Per-MCP-server startup state keyed by session id. Written by
+# _publish_mcp_startup as the native forwarder reports harness MCP
+# startup progress; read by _build_session_response to populate the
+# ``mcp_startup`` snapshot field so a client opening (or reloading) the
+# session mid-startup still sees the startup band. Evicted when the
+# forwarder posts an empty/settled map — absent == no startup state.
+_session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 # Per-session runner-skills cache + in-flight fetch. The snapshot fetches
 # these off its critical path (see _fetch_runner_skills) so the continuous
 # poll can't pin the runner's event loop and wedge a turn.
@@ -2570,6 +2591,9 @@ def _build_session_response(
         # once the launch succeeds; a failed launch is retained with
         # its reason. Populated by _publish_sandbox_status.
         sandbox_status=_session_sandbox_status_cache.get(conv.id),
+        # Replay harness MCP-server startup state (codex-native) so a
+        # client opening the session mid-startup sees the startup band.
+        mcp_startup=_session_mcp_startup_cache.get(conv.id),
         # In-flight turn id so a mid-turn reconnect can reopen a streaming
         # ``activeResponse`` (the turn-start ``running`` edge that carried it
         # is not replayed on the SSE stream). Populated for native-terminal
@@ -3247,7 +3271,7 @@ def _persist_native_cumulative_usage(
     # delta negative (clawing back already-spent budget). Monotonicity makes a
     # downward report a no-op, so the worst a forged post can do is leave the
     # figure unchanged. (See also the runner-token guard on cost_control.*
-    # label writes in ``cost_advisor`` — usage was the missing half.)
+    # label writes — usage was the missing half.)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
     if cin is not None:
@@ -4053,6 +4077,15 @@ async def _resolve_elicitation(
                 result=pre_resolved,
             )
             _prune_pre_resolved_harness_elicitations()
+    # Wake a currently-parked long-poll via resolved_elsewhere, not only its
+    # Future: setting the Future alone races the sever/re-park cycle and the
+    # ASK-gated call hangs. Set the event directly; the signal helper's
+    # parked-is-None branch would clobber the verdict-carrying tombstone.
+    if isinstance(elicitation_id, str) and elicitation_id:
+        _parked = _harness_parked_elicitations.get(elicitation_id)
+        if _parked is not None and _harness_elicitation_owners.get(elicitation_id) == session_id:
+            _parked.resolved_elsewhere.set()
+
     # Fan-out for every other subscribed client (other tabs, REPL
     # TUI). Idempotent vs. the runner's own ``wait_for_user_approval``
     # finally / harness hook finally — those also publish for the id.
@@ -5704,6 +5737,37 @@ def _publish_sandbox_status(session_id: str, stage: str, error: str | None = Non
         conversation_id=session_id,
         stage=stage,
         error=error,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) -> None:
+    """
+    Publish a typed :class:`SessionMcpStartupEvent` to the live stream.
+
+    Fired when a native forwarder reports harness MCP-server startup
+    progress via ``external_mcp_startup``, so the web UI can show
+    per-server startup state while the harness boots instead of an
+    apparently hung session. Also updates the snapshot cache so a client
+    opening the session mid-startup seeds the band from the snapshot's
+    ``mcp_startup`` field; a map with nothing left to show — empty, or
+    every server ``ready`` — evicts the cache entry, mirroring the web
+    store's all-ready clear so a reloading client never seeds a band
+    that renders nothing.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param servers: Latest per-server startup map, e.g.
+        ``{"safe": McpServerStartup(status="starting", error=None)}``.
+    """
+    if any(record.status != "ready" for record in servers.values()):
+        _session_mcp_startup_cache[session_id] = servers
+    else:
+        _session_mcp_startup_cache.pop(session_id, None)
+    event = SessionMcpStartupEvent(
+        type="session.mcp_startup",
+        conversation_id=session_id,
+        servers=servers,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -8590,6 +8654,8 @@ async def _emit_server_routing_decision(
     conversation_store: ConversationStore,
     model: str,
     verdict: dict[str, Any],
+    *,
+    agent: str | None = None,
 ) -> None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
@@ -8597,19 +8663,22 @@ async def _emit_server_routing_decision(
     to the runner.  The chip shows the judge's model pick at turn start
     — the same UX the runner-side advisor produced, but driven entirely
     by the server.
+
+    :param agent: Sub-agent name to include when mirroring a child
+        session's routing decision into the parent's transcript.
     """
     import uuid
 
     from omnigent.runtime import session_stream
 
-    tier = verdict.get("tier", "medium")
     rationale = verdict.get("rationale", "")
-    item_data = {
+    item_data: dict[str, Any] = {
         "model": model,
-        "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
         "applied": True,
         "rationale": rationale if isinstance(rationale, str) else "",
     }
+    if agent is not None:
+        item_data["agent"] = agent
     try:
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
@@ -8805,7 +8874,15 @@ async def _forward_event_to_runner(
     ) or _parent_routing_on
     _routed_model: str | None = None
     _verdict: dict[str, Any] | None = None
-    if effective_runner_override is None and _routing_enabled and body.type == "message":
+    # For child sessions, route even when the orchestrator specified a model via
+    # sys_session_send (effective_runner_override is already set). Smart routing
+    # always wins over the LLM's own model choice when the parent toggle is on.
+    _should_route = (
+        _routing_enabled
+        and body.type == "message"
+        and (effective_runner_override is None or conv.parent_conversation_id is not None)
+    )
+    if _should_route:
         from omnigent.server.smart_routing import route_turn
 
         _harness = _resolve_harness(conv)
@@ -8864,6 +8941,18 @@ async def _forward_event_to_runner(
                 _routed_model,
                 _verdict,
             )
+            # Mirror the routing decision into the parent session so the
+            # orchestrator's transcript also shows which model was chosen
+            # for this sub-agent — the decision is otherwise only visible
+            # on the child session screen.
+            if _parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict,
+                    agent=agent_name or "",
+                )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Forward to runner failed for session=%s; "
@@ -9034,7 +9123,9 @@ async def _dispatch_session_event_to_runner(
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
-        if conv.model_override is None and _native_routing_enabled:
+        if _native_routing_enabled and (
+            conv.model_override is None or conv.parent_conversation_id is not None
+        ):
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
@@ -9100,6 +9191,14 @@ async def _dispatch_session_event_to_runner(
                 _native_routed_model,
                 _native_verdict,
             )
+            if _native_parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _native_routed_model,
+                    _native_verdict,
+                    agent=agent_name or "",
+                )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,
@@ -9271,8 +9370,7 @@ def _routing_decision_item_from_sse(
     double render).
 
     Returns ``None`` for every other event, and for a malformed routing
-    item (empty model / unknown tier) so a bad frame can't poison the
-    relay.
+    item (empty model) so a bad frame can't poison the relay.
 
     :param event: Parsed SSE event dict from the runner stream.
     :returns: A ``routing_decision`` :class:`NewConversationItem`, or
@@ -10283,34 +10381,6 @@ def _same_provider_family(a: Agent, b: Agent) -> bool:
     """
     family_a = _agent_provider_family(a)
     return family_a is not None and family_a == _agent_provider_family(b)
-
-
-def _agent_harness_id(agent: Agent) -> str | None:
-    """Return an agent's canonical harness id, or ``None`` when unloadable.
-
-    Used to family-check a fork's explicit ``model_override`` against the
-    harness the fork will actually run (e.g. reject a Claude model on a
-    codex-native fork). ``None`` when the bundle can't be loaded — the
-    caller then skips the family guard (the runner's fail-loud launch
-    remains the safety net) rather than blocking the fork.
-
-    :param agent: The agent whose harness to resolve, e.g. the fork's
-        base agent.
-    :returns: The canonical harness id, e.g. ``"codex-native"``, or
-        ``None`` when the bundle can't be loaded.
-    """
-    try:
-        spec = (
-            get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-            .spec
-        )
-    except Exception:  # noqa: BLE001 — unloadable bundle → skip the family guard
-        return None
-    from omnigent.harness_aliases import canonicalize_harness
-
-    harness_kind = spec.executor.harness_kind
-    return canonicalize_harness(harness_kind) or harness_kind
 
 
 def _agent_is_native(agent: Agent) -> bool:
@@ -14349,9 +14419,13 @@ def create_sessions_router(
         :returns: List of project names.
         """
         user_id = _require_user(request, auth_provider)
+        # Filing into a project is owner-only, so the sidebar renders project
+        # folders only on "My sessions". Scope to owned sessions so a project
+        # owned by someone else (with a session shared to this user) doesn't
+        # surface as one of their own folders.
         return await asyncio.to_thread(
             conversation_store.list_projects,
-            accessible_by=user_id,
+            owned_by=user_id,
         )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
@@ -14584,6 +14658,12 @@ def create_sessions_router(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # A specific project folder ("My sessions"-only) must show only the
+        # viewer's own sessions — a session shared with them but filed under a
+        # like-named project belongs on "Shared with me", not in this folder.
+        # The flat list (project=None) and Unfiled (project="") stay unscoped so
+        # shared sessions still surface for the "Shared with me" tab.
+        owned_by = user_id if project else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -14592,6 +14672,7 @@ def create_sessions_router(
             agent_id=agent_id,
             agent_name=agent_name,
             accessible_by=user_id,
+            owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
             # spells that ``kind=any`` to keep the param required-ish
@@ -15553,37 +15634,6 @@ def create_sessions_router(
         cloned_agent_id = generate_agent_id()
         cloned_agent_name = base_agent.name
 
-        # An explicit "restart with model" override for the fork. Validated
-        # (charset/length) and family-checked against the harness the fork
-        # will actually run, so a bad or cross-family id (e.g. a Claude model
-        # on a codex-native fork) fails loud here rather than after launch.
-        # Wins over the source's copied model in the store.
-        fork_model_override: str | None = None
-        if body.model_override is not None:
-            try:
-                fork_model_override = validate_model_override(body.model_override)
-            except ValueError as exc:
-                raise OmnigentError(
-                    f"invalid model_override: {exc}",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            base_harness = await asyncio.to_thread(_agent_harness_id, base_agent)
-            # Fail CLOSED: if the fork harness can't be resolved we can't
-            # family-check the override, so reject rather than launch an
-            # unvalidated cross-family model. (Only when an override was
-            # actually supplied — a normal fork with no override is
-            # unaffected by an unloadable bundle here.)
-            if base_harness is None:
-                raise OmnigentError(
-                    "cannot validate model_override: the fork's harness could not "
-                    "be resolved. Retry without a model override to keep the "
-                    "source's model.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            mismatch = model_family_mismatch(base_harness, fork_model_override)
-            if mismatch is not None:
-                raise OmnigentError(mismatch, code=ErrorCode.INVALID_INPUT)
-
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
         # provider family. A cross-family switch (or an undeterminable
@@ -15646,7 +15696,6 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
-                model_override=fork_model_override,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
@@ -18788,6 +18837,7 @@ def create_sessions_router(
             _EXTERNAL_SESSION_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
+            _EXTERNAL_MCP_STARTUP_TYPE,
             _EXTERNAL_MODEL_CHANGE_TYPE,
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
@@ -19301,6 +19351,40 @@ def create_sessions_router(
                 _publish_compaction_completed(session_id, None)
             else:
                 _publish_compaction_failed(session_id)
+            return {"queued": False}
+        if body.type == _EXTERNAL_MCP_STARTUP_TYPE:
+            # Harness MCP-server startup progress (codex-native forwarder):
+            # republish as a ``session.mcp_startup`` SSE so the web UI shows
+            # per-server startup state while the harness boots. Malformed
+            # entries are rejected at the boundary — a bogus map would only
+            # strand the UI's startup band.
+            raw_servers = body.data.get("servers")
+            if not isinstance(raw_servers, dict):
+                raise OmnigentError(
+                    "external_mcp_startup requires data.servers to be an object "
+                    f"mapping server names to startup records; got {raw_servers!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            mcp_servers: dict[str, McpServerStartup] = {}
+            for server_name, record in raw_servers.items():
+                record_status = record.get("status") if isinstance(record, dict) else None
+                if not (
+                    isinstance(server_name, str)
+                    and server_name
+                    and record_status in _EXTERNAL_MCP_STARTUP_STATUS_VALUES
+                ):
+                    raise OmnigentError(
+                        "external_mcp_startup server records require a status in "
+                        f"{sorted(_EXTERNAL_MCP_STARTUP_STATUS_VALUES)}; got "
+                        f"{server_name!r}: {record!r}",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                record_error = record.get("error")
+                mcp_servers[server_name] = McpServerStartup(
+                    status=record_status,
+                    error=record_error if isinstance(record_error, str) and record_error else None,
+                )
+            _publish_mcp_startup(session_id, mcp_servers)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
             # Persist the harness-reported cumulative usage so the
@@ -19996,6 +20080,10 @@ def create_sessions_router(
         # failed-launch session would leak one entry for the process
         # lifetime.
         _session_sandbox_status_cache.pop(session_id, None)
+        # Same for MCP startup state: failed/cancelled maps are retained
+        # for reload visibility while the session exists, so a session
+        # whose MCP startup never settled clean would leak its entry.
+        _session_mcp_startup_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.

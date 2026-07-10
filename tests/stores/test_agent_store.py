@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -33,6 +35,19 @@ def test_get_by_name(agent_store: SqlAlchemyAgentStore) -> None:
     assert found is not None
     assert found.name == "claude"
     assert agent_store.get_by_name("missing") is None
+
+
+def test_create_rejects_duplicate_template_name(agent_store: SqlAlchemyAgentStore) -> None:
+    """Template names are unique within a workspace, enforced by the store.
+
+    The DB has no partial unique index (MySQL can't build one), so the store's
+    create() is the guard.
+    """
+    agent_store.create(agent_id="ag_dup_a", name="dup-name", bundle_location="ag_dup_a/fakehash")
+    with pytest.raises(IntegrityError):
+        agent_store.create(
+            agent_id="ag_dup_b", name="dup-name", bundle_location="ag_dup_b/fakehash"
+        )
 
 
 def test_get_by_name_and_list_hide_session_scoped_agents(

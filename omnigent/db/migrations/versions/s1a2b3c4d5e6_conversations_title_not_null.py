@@ -83,7 +83,9 @@ def upgrade() -> None:
             "title",
             existing_type=sa.Text(),
             nullable=False,
-            server_default="",
+            # MySQL doesn't allow DEFAULT on TEXT columns; omit server_default
+            # there — all rows have been back-filled above so no default needed.
+            server_default="" if op.get_bind().dialect.name != "mysql" else None,
         )
 
 

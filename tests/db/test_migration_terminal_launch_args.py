@@ -1,11 +1,12 @@
 """Tests for the ``conversations.terminal_launch_args`` column.
 
-Per ``designs/NATIVE_RUNNER_SERVER_LAUNCH.md``: the column is a nullable
-TEXT holding a JSON-encoded list of pass-through CLI args for a native
-terminal wrapper (claude / codex). NULL means no native launch args —
-the common case for non-native sessions and for rows that pre-date the
-feature. These tests exercise the schema directly (raw SQL, no ORM) so
-column drift is caught independently of the store wrapper.
+Per ``designs/NATIVE_RUNNER_SERVER_LAUNCH.md``: the column holds a nullable
+JSON-encoded list of pass-through CLI args for a native terminal wrapper
+(claude / codex). NULL means no native launch args — the common case for
+non-native sessions and for rows that pre-date the feature. The column is now
+a binary (``BLOB``/``BYTEA``) type storing the value zstd-compressed
+(``omnigent.db.compression``). These tests exercise the schema directly (raw
+SQL, no ORM) so column drift is caught independently of the store wrapper.
 """
 
 from __future__ import annotations
@@ -41,15 +42,16 @@ def db_engine(tmp_path: Path) -> Iterator[Engine]:
 def test_terminal_launch_args_column_present_and_nullable(db_engine: Engine) -> None:
     """
     Verify the migration creates ``conversations.terminal_launch_args``
-    as a nullable TEXT column.
+    as a nullable binary column.
 
     (1) The column must exist — proves the migration applied; without
     it every code path mentioning ``terminal_launch_args`` crashes on
     an ``AttributeError`` from the ORM mapping. (2) It must be nullable
     — non-native and pre-feature rows have no launch args and would
-    otherwise be rejected on read. (3) The type must be TEXT (not a
-    bounded VARCHAR) so an arbitrarily-long JSON arg list isn't
-    silently truncated.
+    otherwise be rejected on read. (3) The type must be binary
+    (``BLOB``/``BYTEA``): the column is stored zstd-compressed by
+    ``omnigent.db.compression``, whose framed bytes can contain NUL and
+    would be rejected by a ``TEXT`` column on PostgreSQL.
     """
     cols = sa.inspect(db_engine).get_columns("conversations")
     matches = [c for c in cols if c["name"] == "terminal_launch_args"]
@@ -63,9 +65,8 @@ def test_terminal_launch_args_column_present_and_nullable(db_engine: Engine) -> 
         "and pre-feature rows have no launch args and would otherwise be "
         "rejected on read."
     )
-    assert "TEXT" in str(col["type"]).upper(), (
-        f"Expected a TEXT-style type, got {col['type']}. A bounded VARCHAR "
-        f"could truncate a long JSON arg list."
+    assert isinstance(col["type"], sa.LargeBinary), (
+        f"Expected a binary (BLOB/BYTEA) type for the compressed column, got {col['type']!r}."
     )
 
 

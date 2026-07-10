@@ -81,14 +81,16 @@ def upgrade() -> None:
     _logger.info("Upgrade: back-filled agents.kind from session_id")
 
     # Step 4: drop session_id, make kind NOT NULL, recreate the name index.
+    # MySQL requires the FK to be dropped before the index that backs it;
+    # on SQLite the table rebuild handles ordering automatically.
     with op.batch_alter_table(
         "agents",
         recreate="always" if sqlite else "auto",
         naming_convention=_AGENTS_NAMING_CONVENTION,
     ) as batch_op:
         batch_op.drop_index("ix_agents_template_name")
-        batch_op.drop_index("ix_agents_session_id")
         batch_op.drop_constraint("fk_agents_session_id", type_="foreignkey")
+        batch_op.drop_index("ix_agents_session_id")
         batch_op.drop_column("session_id")
         batch_op.alter_column("kind", existing_type=sa.String(16), nullable=False)
         batch_op.create_index(

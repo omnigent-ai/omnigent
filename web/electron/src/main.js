@@ -16,6 +16,7 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   Menu,
   Notification,
   clipboard,
@@ -34,6 +35,10 @@ const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { createBrowserViewBoundsController } = require("./browserViewBounds");
+const { registerBrowserIpc } = require("./browserIpc");
+const { registerSessionExpiryReload } = require("./session-expiry");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -386,6 +391,39 @@ function registerLocalhostAccess() {
   registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin);
 }
 
+// Per-window timestamp of the last expired-session reload, so a host whose SSO
+// stays expired doesn't reload-loop. An expired session redirects EVERY API
+// call to the login page (many redirects per second — and the reload itself
+// triggers fresh API calls), so a "once until next navigation" guard would
+// clear on its own reload and loop. A minimum interval caps reloads to one per
+// window per interval regardless: enough to re-run the host's auth challenge,
+// never a tight loop. In the normal case the gate full-page-redirects the
+// reload's top-level navigation to its login page, so no further API calls
+// (hence no further redirects) fire anyway.
+const _lastExpiryReloadAt = new WeakMap();
+const _EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
+
+/**
+ * Recover the desktop window when the workspace SSO session expires.
+ *
+ * When the auth gate redirects a connected server's API call to its login
+ * page, reload every window pinned to that origin so the gate can re-challenge
+ * — see session-expiry.js. A desktop user has no address bar to refresh out of
+ * the resulting "Failed to load" state manually, so the shell does it.
+ */
+function registerSessionExpiryAccess() {
+  registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
+    const now = Date.now();
+    for (const [win, state] of windows) {
+      if (state.origin !== origin || win.isDestroyed()) continue;
+      const last = _lastExpiryReloadAt.get(win) ?? 0;
+      if (now - last < _EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
+      _lastExpiryReloadAt.set(win, now);
+      win.webContents.reload();
+    }
+  });
+}
+
 /**
  * Override the macOS dock icon at runtime. In `electron .` (dev) the dock tile
  * name AND icon are read from the generic prebuilt Electron.app bundle, so they
@@ -427,6 +465,8 @@ function applyDockIcon() {
  *   so the OS badge aggregates per distinct ORIGIN (not per window — two
  *   windows on the same server report the same number and must not be
  *   double-counted), then sums across origins.
+ * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
+ *   Per-conversation embedded-browser view registry for this window.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -893,6 +933,8 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination,
     ephemeral,
     badgeCount: 0,
+    // Per-conversation embedded-browser view registry for this window.
+    browserRegistry: createBrowserRegistryForWindow(win),
   });
   if (destination) {
     void win.loadURL(destination);
@@ -965,6 +1007,12 @@ function createWindow(targetUrl, opts = {}) {
   // connect. Connecting is an explicit action from the host menu.
 
   win.on("closed", () => {
+    // Destroy this window's embedded-browser views, else they leak webContents.
+    try {
+      windows.get(win)?.browserRegistry?.closeAll("window-closed");
+    } catch {
+      /* registry already torn down */
+    }
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
@@ -1703,6 +1751,64 @@ function isPinnedOriginSender(event) {
   return originOf(event.sender.getURL()) === pinned;
 }
 
+// ---------------------------------------------------------------------------
+// Embedded browser pane
+//
+// The agent's `browser_*` tools drive a native WebContentsView per conversation,
+// positioned over a placeholder the SPA measures. Each window owns its own
+// registry; child views stay sandboxed (nodeIntegration:false, contextIsolation
+// + sandbox true) and detach — not destroy — on hide.
+//
+// `omnigent:browser-execute` runs JS via executeJavaScript; exposed to preload
+// for the relay's fixed templates only, never a generic agent `evaluate`.
+// See preload.js + README.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the per-conversation WebContentsView registry for a shell window
+ * (positions child views in `win.contentView`, pings back via `win.webContents`).
+ *
+ * @param {BrowserWindow} win The shell window that hosts the browser panes.
+ * @returns {ReturnType<typeof createBrowserViewRegistry>}
+ */
+function createBrowserRegistryForWindow(win) {
+  return createBrowserViewRegistry({
+    WebContentsViewCtor: (opts) => new WebContentsView(opts),
+    createBoundsController: createBrowserViewBoundsController,
+    attachToHost: (view) => win.contentView.addChildView(view),
+    detachFromHost: (view) => win.contentView.removeChildView(view),
+    sendToRenderer: (channel, payload) => {
+      try {
+        win.webContents.send(channel, payload);
+      } catch {
+        /* window torn down */
+      }
+    },
+    // Renderer measures in CSS px; convert to window DIPs using the host
+    // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
+    getHostZoomFactor: () => {
+      try {
+        return win.webContents.getZoomFactor();
+      } catch {
+        return 1;
+      }
+    },
+  });
+}
+
+/**
+ * Look up the browser-view registry for the window that sent an IPC event.
+ * Returns null for unknown windows (torn-down / setup-page senders).
+ *
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @returns {ReturnType<typeof createBrowserViewRegistry> | null}
+ */
+function browserRegistryForSender(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  return windows.get(win)?.browserRegistry ?? null;
+}
+
 function registerIpc() {
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
@@ -2106,6 +2212,14 @@ function registerIpc() {
   // polling) — the server-management module owns the subprocess and reports
   // lifecycle changes here.
   serverManager.onChange(broadcastHostStatus);
+
+  // Embedded browser pane — the `omnigent:browser-*` surface lives in
+  // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  registerBrowserIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    getRegistryForEvent: browserRegistryForSender,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2134,9 +2248,22 @@ if (!gotLock) {
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();
+    registerSessionExpiryAccess();
     registerWebAuthn();
     registerIpc();
     buildMenu();
+    // Patch PATH for GUI-launched Electron on macOS/Linux:
+    // A desktop launcher inherits a minimal system PATH that omits directories like
+    // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
+    // One synchronous interactive+login shell invocation at startup (`$SHELL -ilc`)
+    // resolves the user's full PATH; we merge it into process.env so every
+    // subsequent spawn/execFile call inherits it. Runs before resolvedCliPath()
+    // (a PATH consumer) and any host spawn, so the ordering guarantee is implicit.
+    const { resolveLoginShellPath, mergePath } = require("./loginShellPath");
+    const _loginPath = resolveLoginShellPath();
+    if (_loginPath) {
+      process.env.PATH = mergePath(process.env.PATH, _loginPath);
+    }
     // Resolve the CLI path once at startup so the first status/control call is
     // instant (primes the in-memory cache in resolvedCliPath); also lets the
     // setup page / Local CLI settings pre-fill the resolved path immediately.

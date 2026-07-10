@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import Engine, select, update
 from sqlalchemy import delete as sql_delete
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlConversation, SqlHost, current_workspace_id
@@ -235,8 +236,33 @@ class HostStore:
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
         with self._session() as session:
-            row = session.get(SqlHost, (current_workspace_id(), owner, name))
-            if row is None and allow_host_id_reown:
+            # Primary lookup: by (workspace_id, host_id) — the new PK.
+            row = session.get(SqlHost, (current_workspace_id(), host_id))
+            if row is not None:
+                # W2-class boundary: a different user must not claim another
+                # user's host_id. Raise the same IntegrityError the old UNIQUE
+                # constraint produced so the tunnel handler rejects the hijack.
+                if row.owner != owner and not allow_host_id_reown:
+                    raise IntegrityError(
+                        "host_id already owned by a different user",
+                        params={"host_id": host_id, "owner": owner},
+                        orig=Exception("UNIQUE constraint failed: hosts.host_id"),
+                    )
+                # Known host_id (same owner, or reown opted in): update
+                # owner/name in case they changed, then refresh status and timestamp.
+                row.owner = owner
+                row.name = name
+                row.status = encode_host_status("online")
+                row.updated_at = now
+                row.configured_harnesses = harnesses_json
+                return _row_to_host(row)
+
+            # host_id is new — check whether (workspace_id, owner, name)
+            # already exists. If it does, the same machine regenerated its
+            # identity file: this is a host_id rotation. If allow_host_id_reown
+            # is set, also check if any row holds this host_id under a different
+            # owner and re-own it instead of inserting.
+            if allow_host_id_reown:
                 reowned = self._reown_host_id(
                     session,
                     host_id=host_id,
@@ -246,68 +272,74 @@ class HostStore:
                 )
                 if reowned is not None:
                     return reowned
-            if row is not None:
-                if row.host_id != host_id:
-                    # Same logical host ((owner, name) is the PK) reconnected
-                    # with a rotated host_id — e.g. its local identity file
-                    # was regenerated after a fresh install or a wiped
-                    # ~/.omnigent. host_id is a UNIQUE column that
-                    # conversations.host_id references via
-                    # conversations.host_id references it as a plain column
-                    # (no FK). Renaming it in place while child conversations
-                    # still point at the old value is harmless at the DB level,
-                    # but the application nulls host_id on those sessions first.
-                    # On Postgres with an FK this used to raise ForeignKeyViolation
-                    # which crashed the host tunnel handler — no longer applies.
-                    # and never registers (no host shows in the UI). SQLite
-                    # dev doesn't enforce FKs by default, so this only bites
-                    # on the hosted Postgres/Lakebase deploy.
-                    #
-                    # _rotate_host_id repoints the children across the rename
-                    # in this one transaction so the conversation→host binding
-                    # survives the identity rotation. It sets row.host_id
-                    # itself (ordering matters for the FK), so we only touch
-                    # status/timestamp here.
-                    self._rotate_host_id(session, row, host_id)
-                row.status = encode_host_status("online")
-                row.updated_at = now
-                row.configured_harnesses = harnesses_json
-            else:
-                row = SqlHost(
-                    owner=owner,
-                    name=name,
-                    host_id=host_id,
-                    status=encode_host_status("online"),
-                    created_at=now,
-                    updated_at=now,
-                    configured_harnesses=harnesses_json,
+
+            existing_by_name = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.owner == owner,
+                    SqlHost.name == name,
                 )
-                session.add(row)
+            ).scalar_one_or_none()
+            if existing_by_name is not None:
+                # Same (owner, name), different host_id: identity rotation.
+                # host_id is now part of the PK, so we can't UPDATE it via the
+                # ORM — delete the old row and insert a fresh one that carries
+                # the new host_id while preserving created_at.
+                row = self._rotate_host_id(session, existing_by_name, host_id, now, harnesses_json)
+                return _row_to_host(row)
+
+            # Genuinely new host: plain INSERT.
+            row = SqlHost(
+                owner=owner,
+                name=name,
+                host_id=host_id,
+                status=encode_host_status("online"),
+                created_at=now,
+                updated_at=now,
+                configured_harnesses=harnesses_json,
+            )
+            session.add(row)
             return _row_to_host(row)
 
     @staticmethod
-    def _rotate_host_id(session: Session, row: SqlHost, new_host_id: str) -> None:
-        """Repoint a host's conversations across a host_id rename.
+    def _rotate_host_id(
+        session: Session,
+        row: SqlHost,
+        new_host_id: str,
+        now: int,
+        harnesses_json: str | None,
+    ) -> SqlHost:
+        """Replace a host row's host_id while repointing its conversations.
 
-        Changing ``hosts.host_id`` in place fails when child
-        ``conversations`` rows still reference the old value (the FK
-        has no ``ON UPDATE CASCADE``). Because ``conversations.host_id``
-        is nullable, we bounce it through ``NULL``:
+        ``host_id`` is now part of the PK, so an in-place UPDATE is not
+        possible via the ORM. The rotation is:
 
-        1. capture the conversation ids bound to the old host_id,
-        2. NULL them so nothing references the old host_id,
-        3. rename ``row.host_id`` to ``new_host_id`` (now unreferenced),
-        4. reattach the captured conversations to ``new_host_id``.
+        1. Capture the conversation ids bound to the old host_id.
+        2. NULL them so nothing references the old PK value.
+        3. DELETE the old row (host_id was the PK member being changed).
+        4. INSERT a new row with the new host_id, preserving ``created_at``.
+        5. Reattach the captured conversations to the new host_id.
 
-        Flushes between steps so each statement's immediate FK check
-        sees a consistent state. Runs inside the caller's transaction,
-        so a failure rolls the whole upsert back.
+        All steps run inside the caller's transaction so a failure rolls
+        the whole upsert back.
 
         :param session: The active SQLAlchemy session.
         :param row: The existing host row whose ``host_id`` rotates.
         :param new_host_id: The host_id the host reconnected with.
+        :param now: Unix epoch seconds for the updated_at timestamp.
+        :param harnesses_json: JSON-encoded harness readiness, or None.
+        :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
+        # Preserve durable fields from the outgoing row before deletion.
+        created_at = row.created_at
+        owner = row.owner
+        name = row.name
+        token_hash = row.token_hash
+        token_expires_at = row.token_expires_at
+        sandbox_provider = row.sandbox_provider
+        sandbox_id = row.sandbox_id
+
         bound_ids = list(
             session.execute(
                 select(SqlConversation.id).where(
@@ -326,8 +358,33 @@ class HostStore:
                 .values(host_id=None)
             )
             session.flush()
-        row.host_id = new_host_id
+
+        # Delete the old PK row and insert a new one with the rotated host_id.
+        session.execute(
+            sql_delete(SqlHost).where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == old_host_id,
+            )
+        )
         session.flush()
+
+        new_row = SqlHost(
+            workspace_id=current_workspace_id(),
+            host_id=new_host_id,
+            owner=owner,
+            name=name,
+            status=encode_host_status("online"),
+            created_at=created_at,
+            updated_at=now,
+            token_hash=token_hash,
+            token_expires_at=token_expires_at,
+            sandbox_provider=sandbox_provider,
+            sandbox_id=sandbox_id,
+            configured_harnesses=harnesses_json,
+        )
+        session.add(new_row)
+        session.flush()
+
         if bound_ids:
             session.execute(
                 update(SqlConversation)
@@ -338,6 +395,8 @@ class HostStore:
                 .values(host_id=new_host_id)
             )
             session.flush()
+
+        return new_row
 
     def _reown_host_id(
         self,

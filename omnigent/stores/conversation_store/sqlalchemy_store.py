@@ -701,7 +701,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # session close.
                 return _to_conversation(row)
         except IntegrityError as exc:
-            # Translate the partial-unique-index violation into a
+            # Translate the unique-index violation into a
             # clean exception type the spawn/send tools can map
             # to a name_already_exists tool error. Other integrity
             # violations (FK, check constraints) re-raise.
@@ -714,10 +714,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # check, which would misclassify any future unique
             # constraint added to the conversations table.
             msg = str(exc).lower()
-            is_partial_index_violation = "ix_conversations_parent_title_unique" in msg or (
+            is_title_unique_violation = "ix_conversations_parent_title_unique" in msg or (
                 "unique" in msg and "parent_conversation_id" in msg and "title" in msg
             )
-            if is_partial_index_violation:
+            if is_title_unique_violation:
                 raise NameAlreadyExistsError(
                     f"sub-agent name already exists under parent "
                     f"{parent_conversation_id!r}: title={title!r}"
@@ -1311,23 +1311,32 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "ORDER BY rank LIMIT :limit"
                     )
             else:
-                # PostgreSQL: ILIKE fallback (no FTS5 virtual table).
-                # Full tsvector/tsquery indexing can be added later.
+                # Non-SQLite fallback: LIKE/ILIKE on the data column.
+                # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
+                # MySQL: CONVERT(data USING utf8mb4) + LIKE (case-insensitive
+                #        by default with utf8mb4_unicode_ci collation).
                 like_pattern = f"%{query}%"
+                is_mysql = self._engine.dialect.name == "mysql"
+                if is_mysql:
+                    data_expr = "CONVERT(ci.data USING utf8mb4)"
+                    like_op = "LIKE"
+                else:
+                    data_expr = "ci.data::text"
+                    like_op = "ILIKE"
                 if conversation_id is not None:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.workspace_id = :ws "
-                        "AND ci.conversation_id = :cid "
-                        "AND ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND ci.conversation_id = :cid "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 else:
                     stmt = text(
-                        "SELECT ci.id FROM conversation_items ci "
-                        "WHERE ci.workspace_id = :ws "
-                        "AND ci.data::text ILIKE :query "
-                        "ORDER BY ci.created_at DESC LIMIT :limit"
+                        f"SELECT ci.id FROM conversation_items ci "
+                        f"WHERE ci.workspace_id = :ws "
+                        f"AND {data_expr} {like_op} :query "
+                        f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
             params: dict[str, str | int] = {
@@ -1591,6 +1600,7 @@ class SqlAlchemyConversationStore(ConversationStore):
     def list_projects(
         self,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
     ) -> list[str]:
         """
         Return all distinct project names, ordered alphabetically.
@@ -1609,8 +1619,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param accessible_by: When set, restrict to sessions that
             ``accessible_by`` has a permission row for (mirrors the
             ``list_conversations`` ACL filter).
+        :param owned_by: When set, restrict to projects that contain at
+            least one session ``owned_by`` owns (an ``owner``-level grant).
+            Filing into a project is owner-only, so the sidebar renders
+            folders only on "My sessions"; scoping by ownership keeps a
+            project shared *with* the user (but owned by someone else) from
+            surfacing as one of their own folders.
         :returns: List of project names ordered ascending.
         """
+        from omnigent.server.auth import LEVEL_OWNER
+
         with self._session() as session:
             # Join to the conversation so archived sessions don't keep an
             # otherwise-empty project alive in the sidebar.
@@ -1635,6 +1653,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(owned_ids))
             return [row[0] for row in session.execute(stmt).all()]
 
     def delete_label(
@@ -1674,6 +1699,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         sort_by: str = "created_at",
         search_query: str | None = None,
         accessible_by: str | None = None,
+        owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
         title: str | None = None,
@@ -1727,9 +1753,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             empty string ``""``, only return sessions with NO project
             label (i.e., unfiled sessions). ``None`` disables the
             filter.
+        :param owned_by: When set, restrict to sessions the user owns
+            (an ``owner``-level grant) — stricter than ``accessible_by``,
+            which also matches sessions merely shared with them. Powers
+            the per-project folder fetch. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
+        from omnigent.server.auth import LEVEL_OWNER
+
         sort_col = self._resolve_sort_column(sort_by)
         with self._session() as session:
             is_desc = order == "desc"
@@ -1771,6 +1803,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionPermission.user_id == accessible_by,
                 )
                 stmt = stmt.where(SqlConversation.id.in_(accessible_ids))
+            if owned_by is not None:
+                owned_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == owned_by,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                stmt = stmt.where(SqlConversation.id.in_(owned_ids))
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
@@ -2127,28 +2166,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             row.updated_at = now_epoch()
             return _to_conversation(row, _fetch_labels(session, conversation_id))
 
-    def list_conversations_by_host_id(
-        self,
-        host_id: str,
-    ) -> list[Conversation]:
-        """
-        Return all conversations with the given ``host_id``.
-
-        :param host_id: Host identifier, e.g.
-            ``"host_a1b2c3d4..."``.
-        :returns: List of :class:`Conversation` entities.
-        """
-        with self._session() as session:
-            rows = (
-                session.query(SqlConversation)
-                .filter(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == host_id,
-                )
-                .all()
-            )
-            return [_to_conversation(row) for row in rows]
-
     def list_conversations_by_runner_id(
         self,
         runner_id: str,
@@ -2391,7 +2408,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
-        model_override: str | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -2447,13 +2463,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
-        :param model_override: When set, the fork's ``model_override`` is
-            this value instead of the source's copied one — the
-            "restart with model" path, where the whole point is to launch
-            the clone on a different model. Wins over the
-            ``copy_model_settings`` copy; ``reasoning_effort`` still follows
-            ``copy_model_settings`` (a same-family model switch keeps the
-            effort). ``None`` (default) leaves the copy behavior unchanged.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
@@ -2526,14 +2535,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     else (agent_id if agent_id is not None else source.agent_id)
                 ),
                 reasoning_effort=source.reasoning_effort if copy_model_settings else None,
-                # An explicit override wins over the copied value — this is
-                # the "restart with model" launch model. Otherwise fall back
-                # to the source's copied model (gated by copy_model_settings).
-                model_override=(
-                    model_override
-                    if model_override is not None
-                    else (source.model_override if copy_model_settings else None)
-                ),
+                model_override=source.model_override if copy_model_settings else None,
                 # The brain-harness override is family-bound like the model,
                 # so it follows the same copy gate.
                 harness_override=source.harness_override if copy_model_settings else None,

@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.codex_native_app_server import CodexAppServerClient
-    from omnigent.runner.cost_advisor import AdvisorTurnResult
     from omnigent.terminals.registry import TerminalListEntry
 
 import httpx
@@ -1161,7 +1160,15 @@ async def _auto_create_opencode_terminal(
         _policy_factory = _make_auth_token_factory()
         _policy_token = _policy_factory() if _policy_factory is not None else None
         if _policy_token:
-            policy_env["OMNIGENT_POLICY_AUTH"] = f"Bearer {_policy_token}"
+            from omnigent.cli_auth import databricks_request_headers
+
+            # Bake the FULL routing header map (bearer + workspace / deployment
+            # selectors), not a bare bearer: the plugin POSTs /policies/evaluate
+            # to the omnigent server out-of-process, so without the selectors it
+            # could land on a different server instance than the runner's.
+            policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
+                databricks_request_headers(runner_server_url, bearer_token=_policy_token)
+            )
 
     # Merge the user's global provider definitions (e.g. OpenAI-compatible
     # endpoints with custom base URLs) into the synthesized config so the
@@ -1911,7 +1918,15 @@ async def _auto_create_pi_terminal(
     session_dir = pi_session_dir(bridge_dir)
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
-    auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    # Route the extension's out-of-process POSTs (/events, /mcp,
+    # /policies/evaluate) through the shared header builder so they carry the
+    # workspace / deployment routing selectors, not just a bare bearer. A bare
+    # bearer skips those selectors and can land on a different server instance
+    # than the one the runner (and the web UI) are on, so live-streamed items
+    # never reach the browser's in-process event stream (they only appear on reload).
+    from omnigent.cli_auth import databricks_request_headers
+
+    auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's
@@ -4740,32 +4755,6 @@ async def _session_payload_for_host_spawn_check(
     return payload
 
 
-async def _fetch_cost_control_mode_override(
-    server_client: httpx.AsyncClient | None,
-    session_id: str,
-) -> str | None:
-    """
-    Read the session's per-session Cost Optimized toggle, defensively.
-
-    Fetches the session snapshot and returns its
-    ``cost_control_mode_override``. Treats every failure mode
-    — no client, transport error, non-200, absent field — as ``None``
-    (no override) so the advisor still works against an older server
-    that lacks the column. The advisor never blocks on this read.
-
-    :param server_client: The runner's Omnigent server HTTP client, or
-        ``None`` in embedded / test setups.
-    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    :returns: ``"on"`` / ``"off"`` when the session set the toggle, or
-        ``None`` (unset, or unreadable for any reason).
-    """
-    payload = await _session_payload_for_host_spawn_check(server_client, session_id)
-    if payload is None:
-        return None
-    override = payload.get("cost_control_mode_override")
-    return override if isinstance(override, str) else None
-
-
 async def _codex_session_needs_runner_terminal(
     server_client: httpx.AsyncClient | None,
     session_id: str,
@@ -6736,94 +6725,6 @@ class TurnDispatch:
     client_side_tool_names: frozenset[str] = frozenset()
 
 
-def _merge_advisor_note(
-    content: list[dict[str, Any]] | str | None,
-    note_item: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """
-    Merge the advisor note into the turn's user message, copy-on-write.
-
-    The note must NOT be appended as its own trailing user message: the
-    claude-sdk executor sends only the LATEST user message on resumed
-    sessions (``_build_prompt``), so a trailing note-only message would
-    shadow the user's actual question — the brain answers the note
-    ("Got it, the model is now set to …") and the question is silently
-    dropped. Riding the note's text inside the real user message keeps
-    the question primary and the note visible.
-
-    Handles both body shapes that reach the advisor: history-shaped
-    message items (the background-turn path) get the note blocks
-    appended to the latest ``role == "user"`` message; raw content
-    blocks (the ``?stream=true`` path) and string shorthand get the
-    note appended as additional ``input_text`` blocks of the same
-    message.
-
-    :param content: The harness body's ``content`` — message items,
-        e.g. ``[{"type": "message", "role": "user", "content":
-        [{"type": "input_text", "text": "refactor x"}]}]``, OR content
-        blocks, e.g. ``[{"type": "input_text", "text": "refactor x"}]``,
-        OR a plain-string shorthand, OR ``None``.
-    :param note_item: The advisor's note message item (see
-        :func:`omnigent.runner.cost_advisor._advisor_note_item`), e.g.
-        ``{"type": "message", "role": "user", "content": [{"type":
-        "input_text", "text": "[Cost advisor: …]"}]}``.
-    :returns: A new content list with the note merged in; the input list
-        and the merged message are copied so the cached session history
-        is never mutated.
-    """
-    note_blocks = list(note_item.get("content") or [])
-    if isinstance(content, str):
-        # String shorthand: normalize to blocks so the note can ride along.
-        return [{"type": "input_text", "text": content}, *note_blocks]
-    items: list[dict[str, Any]] = list(content or [])
-    for i in range(len(items) - 1, -1, -1):
-        item = items[i]
-        if not isinstance(item, dict) or item.get("role") != "user":
-            continue
-        merged = dict(item)
-        existing = merged.get("content")
-        if isinstance(existing, str):
-            existing = [{"type": "input_text", "text": existing}]
-        merged["content"] = [*(existing or []), *note_blocks]
-        items[i] = merged
-        return items
-    if any(isinstance(it, dict) and it.get("type") == "message" for it in items):
-        # Message-shaped history with no user message (degenerate): keep the
-        # old trailing-item behavior rather than dropping the note.
-        return [*items, note_item]
-    # Raw content blocks: the whole list IS the user message's content.
-    return [*items, *note_blocks]
-
-
-def _apply_advisor_to_body(
-    body: dict[str, Any],
-    result: AdvisorTurnResult,
-) -> None:
-    """
-    Apply a cost-advisor turn result to the harness request body in place.
-
-    Optimize mode (claude-sdk, no user pin): sets ``model_override`` so the
-    inner executor runs THIS turn on the verdict model via its per-turn
-    ``set_model`` (claude_sdk_executor: switches only when the model
-    changes between turns), and merges the one-line system note into the
-    turn's user message (see :func:`_merge_advisor_note`). Advise
-    mode (or a user pin / non-applicable harness): ``apply_model`` and
-    ``note_item`` are both ``None``, so the body is unchanged — the verdict
-    is shadow-recorded in the label only.
-
-    :param body: The harness request body, mutated in place. The caller
-        must own this dict (copy-on-write at the streaming call site) so
-        the cached session history is not mutated.
-    :param result: The advisor turn result.
-    """
-    if result.apply_model is not None:
-        # Per-turn brain-model override; flows to ExecutorConfig.model in
-        # the harness adapter, then cfg.model in the claude-sdk executor.
-        body["model_override"] = result.apply_model
-    if result.note_item is not None:
-        body["content"] = _merge_advisor_note(body.get("content"), result.note_item)
-
-
 def _wrap_as_message_event(body: dict[str, Any]) -> dict[str, Any]:
     """
     Adapt a ``CreateResponseRequest``-shaped body into a
@@ -8001,11 +7902,6 @@ def create_runner_app(
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[dict[str, Any]]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
-    # session_id → the brain model the cost advisor last APPLIED (optimize
-    # mode). Carried forward on conversational turns so the brain doesn't
-    # flap back to the spec/gateway default between advised turns; the
-    # claude-sdk executor only re-runs set_model when the model changes.
-    _session_advisor_applied_model: dict[str, str] = {}
     # Per-session comment-tool relay for claude-native sessions. Value is a
     # ClaudeNativeToolRelay handle; ``Any`` avoids importing the class at
     # module load time. Started when the Claude terminal launches (with a
@@ -10821,19 +10717,69 @@ def create_runner_app(
         message). claude-native is unaffected: its badge mirrors Claude Code's
         *own* ``[Request interrupted by user]`` record, which is real.
 
+        Stop also cancels an in-flight MCP startup round (issue #2058): the
+        bridge's still-``starting`` servers are marked ``cancelled``
+        locally (what the web band and turn-error text read, even if Codex
+        never acknowledges) and the app-server is asked to abort startup
+        the way the Codex TUI does — ``turn/interrupt`` with an EMPTY turn
+        id (its ``startup_interrupt``). This runs alongside the active-turn
+        interrupt when both apply, because codex defers a mid-startup
+        turn's execution until the round settles: stopping only the turn
+        would leave the user watching a startup they asked to stop.
+
         :param conv_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: 204 when no active turn is recorded or the interrupt lands;
-            503 when Codex rejects the active-turn interrupt.
+        :returns: 204 when nothing needs interrupting or the interrupts
+            land; 503 when Codex rejects the active-turn interrupt.
         """
         from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            cancel_pending_mcp_startup,
+            read_mcp_startup,
+        )
 
         state = await _codex_native_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
             return Response(status_code=204)
-        if state.active_turn_id is None:
-            _logger.info("Codex-native interrupt skipped for %s: no active turn.", conv_id)
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(
+            labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        )
+        pending_mcp = cancel_pending_mcp_startup(bridge_dir)
+        if state.active_turn_id is None and not pending_mcp:
+            _logger.info(
+                "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
+                conv_id,
+            )
             return Response(status_code=204)
+        if pending_mcp:
+            _logger.info(
+                "Codex-native interrupt for %s cancels MCP startup: %s",
+                conv_id,
+                ", ".join(pending_mcp),
+            )
+            # Publish the flipped map ourselves: the forwarder only reposts
+            # when IT changes the map, and codex's own cancelled edges are
+            # owner-only — without this post the web band and snapshot stay
+            # stuck on "Starting MCP servers" after a Stop.
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": "external_mcp_startup",
+                        "data": {"servers": read_mcp_startup(bridge_dir)},
+                    },
+                    timeout=10.0,
+                )
+            except Exception:  # noqa: BLE001 - the bridge flip already took effect locally.
+                _logger.warning(
+                    "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
+                )
 
         codex_client = client_for_transport(
             state.socket_path,
@@ -10841,13 +10787,29 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
-            await codex_client.request(
-                "turn/interrupt",
-                {
-                    "threadId": state.thread_id,
-                    "turnId": state.active_turn_id,
-                },
-            )
+            if pending_mcp:
+                # Startup interrupt first and best-effort: the local
+                # cancel above already updated what Omnigent shows.
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {"threadId": state.thread_id, "turnId": ""},
+                    )
+                except Exception:  # noqa: BLE001 - the local cancel already took effect.
+                    _logger.warning(
+                        "Codex-native MCP startup interrupt failed for session=%s thread=%s",
+                        conv_id,
+                        state.thread_id,
+                        exc_info=True,
+                    )
+            if state.active_turn_id is not None:
+                await codex_client.request(
+                    "turn/interrupt",
+                    {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                    },
+                )
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures to caller.
             _logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
@@ -13432,163 +13394,6 @@ def create_runner_app(
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
-    async def _run_turn_advisor(
-        msg_body: dict[str, Any],
-        conv: str,
-        spec: Any,  # type: ignore[explicit-any]  # resolved AgentSpec or None
-    ) -> AdvisorTurnResult | None:
-        """
-        Run the cost advisor for one turn (no-op unless the spec opts in
-        via ``executor.config.cost_optimize``).
-
-        Every turn path that reaches the harness must run this so the
-        per-turn brain-model verdict is judged, recorded, and (optimize
-        mode, claude-sdk) applied to this turn's harness request.
-
-        :param msg_body: The forwarded message body; the turn's query is
-            read from ``msg_body["content"]`` and the user model pin from
-            ``msg_body["model_override"]``.
-        :param conv: Session/conversation identifier,
-            e.g. ``"conv_abc123"``.
-        :param spec: The resolved agent spec for the session, or ``None``
-            (advisor skipped).
-        :returns: The verdict + apply_model + note, or ``None`` when the
-            turn runs unadvised.
-        """
-        from datetime import datetime, timezone
-
-        from omnigent.runner.cost_advisor import maybe_run_advisor
-
-        # Resolve the brain harness so the advisor can scope application
-        # (claude-sdk only). Mirrors _resolve_harness_config's derivation.
-        harness: str | None = None
-        if spec is not None:
-            _h = spec.executor.config.get("harness") or spec.executor.type
-            harness = canonicalize_harness(_h) or _h
-
-        # Per-session Cost Optimized toggle, read defensively
-        # off the snapshot so this still works against servers without
-        # the column. Precedence (override > spec mode) is resolved inside.
-        cost_control_mode_override = await _fetch_cost_control_mode_override(server_client, conv)
-        return await maybe_run_advisor(
-            spec=spec,
-            conversation_id=conv,
-            turn_content=msg_body.get("content") or [],
-            server_client=server_client,
-            turn_anchor=datetime.now(timezone.utc).isoformat(),
-            harness=harness,
-            # The server-forwarded session model pin (/model or web picker).
-            # When set it BEATS the advisor (verdict recorded, not applied).
-            user_model_override=msg_body.get("model_override"),
-            cost_control_mode_override=cost_control_mode_override,
-        )
-
-    def _emit_routing_decision(conv: str, result: AdvisorTurnResult | None) -> None:
-        """
-        Stream the router's verdict as a turn-start transcript chip.
-
-        Emitted on EVERY advised turn that produced a verdict — applied
-        (optimize) or shadow (advise / user pin won) alike — so the model
-        the router chose shows in the conversation flow the instant the
-        turn begins. Independent of the ``cost_control.plan`` label PATCH:
-        a 500 on that persist (telemetry) does NOT suppress this chip, and
-        independent of :func:`_apply_advisor_for_turn`'s sticky/apply logic
-        so a user-pin turn still surfaces the "would have picked" verdict.
-
-        The AP server's stream relay turns this into a durable, display-only
-        ``routing_decision`` item (in arrival order, before the assistant
-        output) and forwards it live. No-op when no verdict was produced
-        (advisor off, conversational turn, or judge/persist failure).
-
-        :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
-        :param result: The advisor turn result, or ``None`` (no verdict —
-            nothing to announce).
-        """
-        if result is None:
-            return
-        from omnigent.runner.cost_advisor import routing_decision_event
-
-        _publish_event(conv, routing_decision_event(result.verdict))
-
-    def _apply_advisor_for_turn(
-        body: dict[str, Any],
-        conv: str,
-        result: AdvisorTurnResult | None,
-        user_model_override: str | None = None,
-    ) -> None:
-        """
-        Apply an advisor result to the turn body and keep the brain sticky.
-
-        Optimize mode applied a model this turn: stamp it on the body and
-        remember it. A turn that applied NOTHING (advise mode, a
-        conversational/failed judge, or advisor off) carries forward the
-        last applied model — so the claude-sdk brain stays on the advisor's
-        last selection across conversational turns instead of flapping back
-        to the gateway/spec default (whose ``set_model(None)`` would reset
-        it).
-
-        An explicit USER pin disables the carry-forward entirely. The pin
-        reaches the harness via the spawn env (``HARNESS_<H>_MODEL``), which
-        the body's ``model_override`` (→ ``cfg.model``) would BEAT in the
-        executor — so stamping the sticky model here would silently override
-        the user's choice (the live ``/model``-vs-advisor precedence bug).
-        The stored selection is also dropped: user intent supersedes the
-        advisor's last applied model, and resurrecting it after an unpin
-        would flap the brain to a stale choice.
-
-        :param body: The harness request body, mutated in place (caller owns
-            it — copy-on-write at the streaming site).
-        :param conv: Session id, key into the sticky-model state.
-        :param result: The advisor turn result, or ``None`` (no verdict).
-        :param user_model_override: The session's user model pin from the
-            inbound message body, e.g. ``"databricks-claude-sonnet-4-6"``,
-            or ``None``. When set, no advisor model is stamped this turn.
-        """
-        if user_model_override:
-            _session_advisor_applied_model.pop(conv, None)
-            return
-        if result is not None and result.apply_model is not None:
-            _apply_advisor_to_body(body, result)
-            _session_advisor_applied_model[conv] = result.apply_model
-            return
-        # No application this turn: keep the brain on the last applied model
-        # (if any). The body's own model_override (already advisor-free on
-        # this path) still wins if a caller set one.
-        sticky = _session_advisor_applied_model.get(conv)
-        if sticky is not None and not body.get("model_override"):
-            body["model_override"] = sticky
-
-    async def _advisor_spec_for_session(conv: str) -> Any:  # type: ignore[explicit-any]  # resolved AgentSpec or None
-        """
-        Best-effort spec resolution for the ``stream=true`` advisor run.
-
-        Applies the sub-agent override so a child session plans against
-        its own spec, not the parent orchestrator's; resolution failures
-        return ``None`` (turn runs unadvised) rather than failing a turn
-        for a feature that is dark by default.
-
-        :param conv: Session/conversation identifier,
-            e.g. ``"conv_abc123"``.
-        :returns: The resolved spec, or ``None``.
-        """
-        try:
-            spec = _unwrap_resolved_spec(await _resolve_session_spec_entry(conv))
-        except (OmnigentError, httpx.HTTPError, RuntimeError):
-            _logger.warning(
-                "cost_advisor: spec resolution failed for %s; turn runs unadvised",
-                conv,
-                exc_info=True,
-            )
-            return None
-        _sa_name = _session_sub_agent_names.get(conv)
-        if _sa_name and spec is not None:
-            from omnigent.runtime.workflow import _find_spec_by_name
-
-            sub_spec = _find_spec_by_name(spec, _sa_name)
-            if sub_spec is not None:
-                spec = sub_spec
-        return spec
-
     async def _run_turn_bg(
         msg_body: dict[str, Any],
         conv: str,
@@ -13855,21 +13660,6 @@ def create_runner_app(
             conv,
             len(_content),
             _content_summary[:20],
-        )
-
-        # Cost advisor (dark by default): judge this turn's difficulty,
-        # persist the cost_control.plan verdict label, and — optimize mode
-        # on a claude-sdk brain with no user pin — run the brain on the
-        # verdict model this turn and inject the one-line note. No-op
-        # unless executor.config.cost_optimize is set.
-        _advisor_result = await _run_turn_advisor(msg_body, conv, cached_spec)
-        # Announce the router's pick at turn start (display-only chip), before
-        # any harness output — independent of the apply/sticky logic below.
-        _emit_routing_decision(conv, _advisor_result)
-        # harness_body is rebuilt without the inbound model_override, so the
-        # user pin must be passed explicitly or the sticky stamp beats it.
-        _apply_advisor_for_turn(
-            harness_body, conv, _advisor_result, msg_body.get("model_override")
         )
 
         if instructions:
@@ -15178,26 +14968,6 @@ def create_runner_app(
                     # Streaming mode: return the SSE body synchronously
                     # so the executor can consume response.created,
                     # dispatch tool calls, and pair results inline.
-                    # Advisor parity with _run_turn_bg: without it, opted-in
-                    # streaming turns would never judge, record, or apply a
-                    # per-turn brain-model verdict.
-                    _stream_advisor_result = await _run_turn_advisor(
-                        message_body,
-                        conversation_id,
-                        await _advisor_spec_for_session(conversation_id),
-                    )
-                    # Announce the router's pick at turn start (display-only
-                    # chip), before any harness output — same as _run_turn_bg.
-                    _emit_routing_decision(conversation_id, _stream_advisor_result)
-                    # Copy-on-write: the per-turn model override + note must
-                    # not mutate the caller's body or the cached history.
-                    message_body = dict(message_body)
-                    _apply_advisor_for_turn(
-                        message_body,
-                        conversation_id,
-                        _stream_advisor_result,
-                        message_body.get("model_override"),
-                    )
                     response = await _stream_message_to_harness(message_body, conversation_id)
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
@@ -19119,8 +18889,13 @@ def _build_spawn_env_from_spec(
         env var here.)
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
+    # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
+    # dispatch, model-key lookup, and logging below all key off the base harness;
+    # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    harness = canonicalize_harness(harness) or harness
     try:
         from omnigent.runtime.workflow import (
+            _build_acp_spawn_env,
             _build_antigravity_spawn_env,
             _build_claude_sdk_spawn_env,
             _build_codex_spawn_env,
@@ -19151,6 +18926,8 @@ def _build_spawn_env_from_spec(
             env = _build_qwen_spawn_env(spec, workdir=workdir)
         elif harness == "goose":
             env = _build_goose_spawn_env(spec, workdir=workdir)
+        elif harness == "acp":
+            env = _build_acp_spawn_env(spec, workdir=workdir)
         elif harness == "copilot":
             env = _build_copilot_spawn_env(spec, workdir=workdir)
         else:

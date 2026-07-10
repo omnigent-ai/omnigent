@@ -118,7 +118,10 @@ def _swap_to_int(
         if check_name is not None:
             batch_op.drop_constraint(check_name, type_="check")
         batch_op.drop_column(column)
-        batch_op.alter_column(tmp, new_column_name=column, nullable=nullable)
+        # existing_type required by MySQL for CHANGE/MODIFY COLUMN.
+        batch_op.alter_column(
+            tmp, new_column_name=column, nullable=nullable, existing_type=sa.SmallInteger()
+        )
         batch_op.create_check_constraint(
             check_name or f"ck_{table}_{column}",
             _int_check(mapping).format(col=column),
@@ -142,7 +145,13 @@ def _swap_to_string(
     with op.batch_alter_table(table, recreate=recreate) as batch_op:
         batch_op.drop_constraint(check_name or f"ck_{table}_{column}", type_="check")
         batch_op.drop_column(column)
-        batch_op.alter_column(tmp, new_column_name=column, nullable=nullable)
+        # existing_type required by MySQL for CHANGE/MODIFY COLUMN.
+        batch_op.alter_column(
+            tmp,
+            new_column_name=column,
+            nullable=nullable,
+            existing_type=sa.String(length=length),
+        )
         if check_name is not None:
             batch_op.create_check_constraint(check_name, _string_check(mapping).format(col=column))
 
@@ -165,6 +174,7 @@ def _recreate_conversations_indexes(*, kind_is_int: bool) -> None:
         unique=True,
         sqlite_where=sa.text("parent_conversation_id IS NOT NULL"),
         postgresql_where=sa.text("parent_conversation_id IS NOT NULL"),
+        mysql_length={"title": 512},
     )
     sub_agent = "2" if kind_is_int else "'sub_agent'"
     op.create_index(
@@ -177,10 +187,18 @@ def _recreate_conversations_indexes(*, kind_is_int: bool) -> None:
     )
 
 
+def _index_exists(table: str, index_name: str) -> bool:
+    """Return True if *index_name* exists on *table* in the current schema."""
+    return any(idx["name"] == index_name for idx in sa.inspect(op.get_bind()).get_indexes(table))
+
+
 def _drop_conversations_kind_indexes() -> None:
     """Drop the ``conversations`` indexes that block the ``kind`` batch swap."""
     op.drop_index("idx_conversations_parent", table_name="conversations")
-    op.drop_index("ix_conversations_parent_title_unique", table_name="conversations")
+    # Guard against the case where a later migration (w1a2b3c4d5e6) already
+    # dropped this index during its own downgrade.
+    if _index_exists("conversations", "ix_conversations_parent_title_unique"):
+        op.drop_index("ix_conversations_parent_title_unique", table_name="conversations")
     op.drop_index("ix_conversations_kind", table_name="conversations")
 
 

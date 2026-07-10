@@ -2349,6 +2349,25 @@ def test_materialize_harness_launcher_file_writes_omnigent_yaml() -> None:
     assert "profile" not in raw["executor"], raw["executor"]
 
 
+def test_materialize_harness_launcher_file_acp_slug() -> None:
+    """``run --harness acp:<slug>`` produces a valid spec that keeps the slug.
+
+    acp:<slug> canonicalizes to the base ``acp`` harness, but the slug selects a
+    configured ACP agent resolved at spawn — so executor.harness must keep the
+    full ``acp:<slug>``. The agent name has no colon (the validator requires
+    [a-zA-Z0-9_-]+), so it is sanitized to ``acp-<slug>``.
+    """
+    import re
+
+    generated = _materialize_harness_launcher_file(
+        harness="acp:qwenacp", model=None, system_prompt=None
+    )
+    raw = yaml.safe_load(generated.read_text())
+    assert raw["executor"]["harness"] == "acp:qwenacp"  # slug preserved for the runner
+    assert raw["name"] == "acp-qwenacp"
+    assert re.fullmatch(r"[a-zA-Z0-9_-]+", raw["name"])  # passes the agent-name validator
+
+
 def test_materialize_harness_launcher_file_kimi_gets_os_env() -> None:
     """``run --harness kimi`` bakes a caller-process ``os_env`` so the SDK kimi
     operates in the user's current directory, matching claude-sdk.

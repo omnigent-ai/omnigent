@@ -90,6 +90,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Re-add all FK constraints."""
+    # MySQL never had these FKs (they were skipped during upgrade due to
+    # MySQL 8.0.16+ incompatibilities with CHECK constraints), so nothing
+    # to restore on MySQL.
+    if op.get_bind().dialect.name == "mysql":
+        return
     sqlite = _is_sqlite()
     if sqlite:
         op.execute(sa.text("PRAGMA foreign_keys = OFF"))

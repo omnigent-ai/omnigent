@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -36,11 +37,17 @@ def test_scope_column_exists_and_is_not_nullable(db_engine: Engine) -> None:
     assert not columns["scope"]["nullable"], "policies.scope must be NOT NULL"
 
 
-def test_ix_policies_default_name_index_exists(db_engine: Engine) -> None:
-    """ix_policies_default_name unique index is present after the migration."""
+def test_ix_policies_name_cksum_index_exists(db_engine: Engine) -> None:
+    """The default-name lookup index is present after the migration chain.
+
+    At head the partial unique index (``ix_policies_default_name_cksum``) has
+    been replaced by a plain non-unique ``name_cksum`` index (see
+    z5a2b3c4d5e6); default-name uniqueness lives in the store.
+    """
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("policies")}
-    assert "ix_policies_default_name" in indexes
-    assert indexes["ix_policies_default_name"]["unique"]
+    assert "ix_policies_default_name_cksum" not in indexes
+    assert "ix_policies_name_cksum" in indexes
+    assert not indexes["ix_policies_name_cksum"]["unique"]
 
 
 def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> None:
@@ -58,10 +65,12 @@ def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> 
         conn.execute(
             sa.text(
                 # scope runs at head, where it is an int code (2 = "session").
+                # name_cksum is NOT NULL at head (x1a2b3c4d5e6) — sha256(name).
                 "INSERT INTO policies"
-                " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_sc1', 'sess_pol', 'conv_sc1', 2, 1, 1, 'mod.f', 1)"
-            )
+                " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
+                " VALUES ('pol_sc1', 'sess_pol', :cksum, 'conv_sc1', 2, 1, 1, 'mod.f', 1)"
+            ),
+            {"cksum": hashlib.sha256(b"sess_pol").digest()},
         )
         scope = conn.execute(
             sa.text("SELECT scope FROM policies WHERE id = 'pol_sc1'")
@@ -75,10 +84,12 @@ def test_backfill_sets_default_scope_for_default_policies(db_engine: Engine) -> 
         conn.execute(
             sa.text(
                 # scope runs at head, where it is an int code (1 = "default").
+                # name_cksum is NOT NULL at head (x1a2b3c4d5e6) — sha256(name).
                 "INSERT INTO policies"
-                " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_def1', 'def_pol', NULL, 1, 1, 1, 'mod.f', 1)"
-            )
+                " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
+                " VALUES ('pol_def1', 'def_pol', :cksum, NULL, 1, 1, 1, 'mod.f', 1)"
+            ),
+            {"cksum": hashlib.sha256(b"def_pol").digest()},
         )
         scope = conn.execute(
             sa.text("SELECT scope FROM policies WHERE id = 'pol_def1'")

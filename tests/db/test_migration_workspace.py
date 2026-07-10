@@ -201,16 +201,33 @@ def test_check_constraint_allows_host_id_with_workspace(
         assert result.workspace == "/Users/corey/universe/src/foo"
 
 
-def test_host_id_is_indexed(db_engine: Engine) -> None:
+def test_host_id_index_dropped(db_engine: Engine) -> None:
     """
-    Verify ``ix_conversations_host_id`` exists.
+    Verify ``ix_conversations_host_id`` no longer exists at head.
 
-    Reconnect reconciliation queries conversations by ``host_id`` on
-    every host reconnect; without the index that's a full table scan.
+    The index served only ``list_conversations_by_host_id``, which had no
+    callers and was removed along with the index (migration
+    ``z1a2b3c4d5e6``). This locks in the removal so the write-only index
+    isn't accidentally reintroduced.
     """
     index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("conversations")}
-    assert "ix_conversations_host_id" in index_names, (
-        f"Expected ix_conversations_host_id on conversations; got {sorted(index_names)}."
+    assert "ix_conversations_host_id" not in index_names, (
+        f"ix_conversations_host_id should have been dropped; got {sorted(index_names)}."
+    )
+
+
+def test_runner_id_is_indexed(db_engine: Engine) -> None:
+    """
+    Verify ``ix_conversations_runner_id`` exists at head.
+
+    Reconnect/relaunch reconciliation queries conversations by
+    ``runner_id`` (``list_conversations_by_runner_id``) on every runner
+    reconnect; without the index (migration ``z2a2b3c4d5e6``) that's a
+    full table scan.
+    """
+    index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("conversations")}
+    assert "ix_conversations_runner_id" in index_names, (
+        f"Expected ix_conversations_runner_id on conversations; got {sorted(index_names)}."
     )
 
 
@@ -290,3 +307,26 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
         ).one()
         assert result.host_id is None
         assert result.workspace == "/Users/corey/projects/cli-launched"
+
+
+def test_compressed_columns_are_binary_at_head(db_engine: Engine) -> None:
+    """
+    Verify the opaque text columns are binary (``BLOB``/``BYTEA``) at head.
+
+    These columns are stored zstd-compressed by ``omnigent.db.compression``;
+    the compression codec writes raw bytes, so a regression that left any of
+    them as ``TEXT`` would corrupt values on a NUL-rejecting backend
+    (PostgreSQL) the moment a compressed payload contained a NUL byte.
+    """
+    inspector = sa.inspect(db_engine)
+    expected = {
+        "conversations": ["session_usage", "session_state", "terminal_launch_args"],
+        "comments": ["body", "anchor_content"],
+        "agents": ["description"],
+    }
+    for table, columns in expected.items():
+        types = {c["name"]: c["type"] for c in inspector.get_columns(table)}
+        for column in columns:
+            assert isinstance(types[column], sa.LargeBinary), (
+                f"{table}.{column} should be binary at head, got {types[column]!r}."
+            )

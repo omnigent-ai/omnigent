@@ -79,9 +79,17 @@ class _RichLiveSink:
         self._dim_by_name = {p.name: p.title for p in ALL_PROBES}
         # harness → {dim_title: markup}; insertion order = display order.
         self._rows: dict[str, dict[str, str]] = {}
-        self._notes: dict[str, str] = {}
         self._transport: dict[str, str] = {}  # harness → resolved transport label
-        self._live = Live(self._render(), console=console, refresh_per_second=8)
+        # vertical_overflow="visible": let a grid taller than the viewport print
+        # in full instead of rich clipping/repositioning it each frame (the
+        # "pointer jumps around" thrash). refresh_per_second=4 + our own
+        # update() per event is smooth without high-rate flicker.
+        self._live = Live(
+            self._render(),
+            console=console,
+            refresh_per_second=4,
+            vertical_overflow="visible",
+        )
         self._live.start()
 
     def _blank_row(self) -> dict[str, str]:
@@ -95,13 +103,10 @@ class _RichLiveSink:
         for dim in self._dimensions:
             table.add_column(dim, justify="center")
         for harness, cells in self._rows.items():
-            note = self._notes.get(harness)
             transport = self._transport.get(harness)
             label = harness
             if transport:
                 label += f" [dim]\\[{_TRANSPORT_LABEL.get(transport, transport)}][/dim]"
-            if note:
-                label += f"  [dim]({note})[/dim]"
             table.add_row(label, *(cells[dim] for dim in self._dimensions))
         return table
 
@@ -110,9 +115,10 @@ class _RichLiveSink:
             self._rows.setdefault(event.harness, self._blank_row())
             self._transport[event.harness] = event.transport
         elif isinstance(event, HarnessSkipped):
+            # A whole-harness skip leaves every dimension ·; the reason prints in
+            # the stdout Notes section after the run (from the matrix), not on the
+            # live row — keeping rows one line high avoids reflow/flicker.
             self._rows.setdefault(event.harness, self._blank_row())
-            # A whole-harness skip: every dimension is ·, reason on the label.
-            self._notes[event.harness] = event.reason.split(";")[0][:60]
             if event.transport:
                 self._transport[event.harness] = event.transport
         elif isinstance(event, ProbeStarted):

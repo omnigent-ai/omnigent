@@ -1,0 +1,88 @@
+name: Electron Build
+
+# Manually-triggered build of the Electron desktop shell (web/electron) for
+# Linux and Windows. Each platform packages on its own native runner —
+# electron-builder does not reliably cross-compile installers — and uploads the
+# installers as downloadable workflow artifacts. Unsigned: no signing creds are
+# wired here, so `CSC_IDENTITY_AUTO_DISCOVERY=false` forces an unsigned build
+# rather than failing when a cert is absent. No publishing / release upload.
+#
+# Run it from the Actions tab (Run workflow). macOS is intentionally omitted —
+# its signed/notarized build lives elsewhere.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to build."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # One build per ref: back-to-back manual dispatches on the same ref queue
+  # instead of running concurrently (keyed on ref only — including run_id would
+  # make every run its own group, defeating the serialization).
+  group: electron-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Keep building the other platform even if one fails, so a Windows-only
+      # break still yields the Linux installers (and vice versa).
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            build-script: build:linux
+          - os: windows-latest
+            platform: win
+            build-script: build:win
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set up Node
+        uses: ./.github/actions/setup-node
+        with:
+          # Node 22.x per web/electron/README.md ("Prerequisites").
+          node-version: "22"
+          cache-dependency-path: web/electron/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web/electron
+        run: npm ci --no-audit --no-fund
+
+      - name: Build ${{ matrix.platform }} app
+        working-directory: web/electron
+        env:
+          # No signing credentials in CI: force an unsigned build instead of
+          # letting electron-builder fail hunting for a certificate.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          # electron-builder downloads Electron/tooling from GitHub; the token
+          # lifts the anonymous rate limit that otherwise flakes downloads.
+          GH_TOKEN: ${{ github.token }}
+        run: npm run ${{ matrix.build-script }} -- --publish never
+
+      - name: Upload installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: omnigent-desktop-${{ matrix.platform }}
+          # Ship only the distributables, not electron-builder's unpacked
+          # intermediates (dist/linux-unpacked, dist/win-unpacked, blockmaps).
+          path: |
+            web/electron/dist/*.AppImage
+            web/electron/dist/*.deb
+            web/electron/dist/*.exe
+          if-no-files-found: error
+          retention-days: 14

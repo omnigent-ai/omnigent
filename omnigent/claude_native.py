@@ -3671,7 +3671,7 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        extra["toolUseResult"] = output
+        extra["toolUseResult"] = _json_safe_tool_use_result(output)
     else:
         return None
     return {
@@ -3789,6 +3789,36 @@ def _json_object_from_string(value: object) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_safe_tool_use_result(output: str) -> str:
+    """
+    Return a ``toolUseResult`` value Claude Code can ``JSON.parse``.
+
+    Some built-in result renderers (notably ``TaskOutput``) call
+    ``JSON.parse`` on ``toolUseResult`` when the transcript is resumed.
+    A raw display string such as ``"<retrieval_status>timeout</...>"``
+    throws ``JSON Parse error: Unrecognized token '<'`` at TUI boot,
+    before the input prompt renders — so the whole resume fails and the
+    first web-UI message is never delivered.
+
+    Outputs that are already JSON (e.g. an image content-block array)
+    pass through verbatim; anything else is wrapped as a JSON string
+    literal so the parse always succeeds. The plain-text output still
+    lives verbatim in the ``tool_result`` content block, so this does
+    not change what the model or the web UI sees.
+
+    :param output: The tool result string synthesized for the
+        transcript, e.g. ``"<retrieval_status>timeout</...>"`` or
+        ``'[{"type":"image",...}]'``.
+    :returns: A JSON-parseable string for the record's
+        ``toolUseResult`` field.
+    """
+    try:
+        json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return json.dumps(output)
+    return output
 
 
 def _preflight_local_tools(command: str) -> None:

@@ -29,6 +29,8 @@ bench's probes run through this driver, not just its gated tests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import threading
 import time
 from typing import Any
@@ -36,8 +38,7 @@ from typing import Any
 import httpx
 
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.e2e.helpers import lookup_databricks_host
-from tests.harness_bench.driver import TurnResult
+from tests.harness_bench.driver import TurnResult, fill_snapshot_cost
 from tests.harness_bench.full_server import (
     _DENY_REASON,
     _POLL_INTERVAL_S,
@@ -45,6 +46,7 @@ from tests.harness_bench.full_server import (
     SharedFullServer,
 )
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.runtime_env import bench_creds_skip_reason, resolve_bench_env
 
 _TOOL_PROMPT = f"List the files using the {_TOOL_NAME} tool, then tell me how many there are."
 
@@ -77,7 +79,7 @@ class FullServerDriver:
         self,
         profile: BenchProfile,
         *,
-        databricks_profile: str,
+        databricks_profile: str | None,
         shared: SharedFullServer | None = None,
     ) -> None:
         self._profile = profile
@@ -88,11 +90,11 @@ class FullServerDriver:
         # for back-compat with the original one-server-per-harness behavior.
         self._shared = shared
         self._owns_shared = shared is None
-        # A second agent+session whose spec bakes a tool_call deny policy,
-        # created lazily for the policy probe (the REST policy endpoint's
-        # handler allowlist excludes make_fixed_action_callable, so the deny
-        # must ride in the agent spec instead).
-        self._deny_session_id: str | None = None
+        # Per-action agent+session cache for the policy probes. Each bakes a
+        # fixed-action tool_call policy into its agent spec (the REST policy
+        # endpoint's allowlist excludes make_fixed_action_callable, so the
+        # policy must ride in the spec). Created lazily, keyed by action.
+        self._policy_session_ids: dict[str, str] = {}
         self._session_id: str | None = None
 
     @property
@@ -111,12 +113,9 @@ class FullServerDriver:
                 f"{profile.harness!r} is a native-tui harness; the full-server transport "
                 "registers via an agent bundle and cannot drive it (use --transport native-tui)"
             )
-        if not databricks_profile:
-            return "no --profile / databricks profile provided; full-server needs a gateway route"
-        if lookup_databricks_host(databricks_profile) is None:
-            return (
-                f"databricks profile {databricks_profile!r} missing/hostless in ~/.databrickscfg"
-            )
+        creds_skip = bench_creds_skip_reason(databricks_profile)
+        if creds_skip is not None:
+            return creds_skip
         # Same CLI gate as the wrap driver (same binary requirement), but skip
         # its transport check — that is sdk-inproc-specific and would misreport
         # the driver name; the native case is already handled above.
@@ -126,9 +125,9 @@ class FullServerDriver:
 
     def __enter__(self) -> FullServerDriver:
         if self._shared is None:
-            self._shared = SharedFullServer(self._db_profile)
+            self._shared = SharedFullServer(resolve_bench_env(self._db_profile))
             self._shared.__enter__()
-        agent_name = self._shared.register_agent(self._profile, deny=False)
+        agent_name = self._shared.register_agent(self._profile, policy_action=None)
         self._session_id = self._shared.create_session(agent_name)
         return self
 
@@ -160,6 +159,9 @@ class FullServerDriver:
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         return await asyncio.to_thread(lambda: self.tool_probe_turn(deny=deny))
 
+    async def run_policy_turn(self, *, action: str) -> TurnResult:
+        return await asyncio.to_thread(lambda: self.policy_probe_turn(action=action))
+
     async def run_interrupt_turn(self) -> TurnResult:
         return await asyncio.to_thread(self.interrupt_probe_turn)
 
@@ -168,13 +170,14 @@ class FullServerDriver:
     # SharedFullServer now; this driver delegates so a solo run and a parallel
     # (shared-server) run go through the same path.
 
-    def _ensure_deny_session(self) -> str:
-        """Lazily register the deny agent and its session; return the session id."""
+    def _ensure_policy_session(self, action: str) -> str:
+        """Lazily register a session whose agent bakes a fixed *action* tool_call
+        policy (``"allow"`` / ``"deny"`` / ``"ask"``); return the session id."""
         assert self._shared is not None
-        if self._deny_session_id is None:
-            name = self._shared.register_agent(self._profile, deny=True)
-            self._deny_session_id = self._shared.create_session(name)
-        return self._deny_session_id
+        if action not in self._policy_session_ids:
+            name = self._shared.register_agent(self._profile, policy_action=action)
+            self._policy_session_ids[action] = self._shared.create_session(name)
+        return self._policy_session_ids[action]
 
     # ── tool / policy probe ──────────────────────────────────
 
@@ -191,7 +194,7 @@ class FullServerDriver:
         plus ``completed`` / ``failed`` / ``text``.
         """
         assert self._client is not None
-        sid = self._ensure_deny_session() if deny else self._session_id
+        sid = self._ensure_policy_session("deny") if deny else self._session_id
         assert sid is not None
         result = TurnResult()
         body = {
@@ -221,6 +224,116 @@ class FullServerDriver:
         else:
             result.timed_out = True
         return result
+
+    # ── policy ALLOW / ASK probe ─────────────────────────────
+
+    def policy_probe_turn(self, *, action: str, timeout: float = 90.0) -> TurnResult:
+        """Drive a tool turn under a fixed tool_call policy *action*.
+
+        ``"allow"``: the call proceeds (``tool_call_allowed`` from the non-blocked
+        output). ``"ask"``: it parks on an elicitation; a background reader sets
+        ``elicitation_requested`` off ``response.elicitation_request``. The ASK
+        verdict is decided the moment that fires, so we resolve the elicitation
+        (approval accept, to leave no dangling park) and return immediately
+        rather than polling the turn to a terminal state.
+
+        The timeout bounds the *worst* case (the model never calls the tool, so
+        no elicitation fires): a bounded SKIP, not a 3-minute stall.
+        """
+        assert self._client is not None
+        sid = self._ensure_policy_session(action)
+        result = TurnResult()
+
+        elicitation_id: dict[str, str] = {}
+        stop = threading.Event()
+
+        def _watch() -> None:
+            try:
+                with self._client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{sid}/stream", timeout=timeout
+                ) as resp:
+                    for raw in resp.iter_lines():
+                        if stop.is_set():
+                            return
+                        line = raw.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            frame = json.loads(line[len("data:") :].strip())
+                        except (ValueError, TypeError):
+                            continue
+                        if frame.get("type") == "response.elicitation_request":
+                            result.elicitation_requested = True
+                            eid = frame.get("elicitation_id")
+                            if isinstance(eid, str):
+                                elicitation_id["id"] = eid
+                            else:
+                                # No parseable id: verdict is recorded, but we
+                                # can't resolve, so the turn parks to the deadline.
+                                result.error = "elicitation_request frame had no parseable id"
+                            return
+            except httpx.HTTPError:
+                # Best-effort watcher; an SSE read error must not fail the turn.
+                pass
+
+        watcher = None
+        if action == "ask":
+            watcher = threading.Thread(target=_watch, daemon=True)
+            watcher.start()
+            time.sleep(1.0)  # register the subscription before the turn starts
+
+        body = {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": _TOOL_PROMPT}]},
+        }
+        self._client.post(f"/v1/sessions/{sid}/events", json=body).raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        seen_running = False
+        while time.monotonic() < deadline:
+            # ASK verdict is decided once the elicitation fires: resolve it (so
+            # no park dangles) and stop — no need to poll the turn to idle.
+            if action == "ask" and result.elicitation_requested:
+                if "id" in elicitation_id:
+                    self._resolve_elicitation(sid, elicitation_id.pop("id"))
+                break
+            snap = self._client.get(f"/v1/sessions/{sid}").json()
+            status = snap.get("status")
+            items = snap.get("items", [])
+            _scan_tool_items(items, result)
+            if status in ("running", "waiting"):
+                seen_running = True
+            if status == "failed":
+                result.failed = True
+                result.error = snap.get("last_task_error") or snap.get("error")
+                break
+            if status == "idle" and seen_running:
+                result.completed = True
+                result.text = _assistant_text(items)
+                break
+            time.sleep(_POLL_INTERVAL_S)
+        else:
+            result.timed_out = True
+        stop.set()
+        if watcher is not None:
+            watcher.join(timeout=5.0)
+        return result
+
+    def _resolve_elicitation(self, sid: str, elicitation_id: str) -> None:
+        """Accept an outstanding elicitation via an ``approval`` event so an ASK
+        turn settles (best-effort; a raced resolve is harmless)."""
+        assert self._client is not None
+        # The server reads the id from inside `data` (SessionEventInput has no
+        # top-level elicitation_id field), so it must be nested there or the
+        # resolve is a silent no-op and the park dangles.
+        with contextlib.suppress(httpx.HTTPError):
+            self._client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "approval",
+                    "data": {"elicitation_id": elicitation_id, "action": "accept"},
+                },
+            )
 
     # ── streaming probe ──────────────────────────────────────
 
@@ -363,6 +476,7 @@ class FullServerDriver:
             if status == "idle" and seen_running:
                 result.completed = True
                 result.text = _assistant_text(body.get("items", []))
+                fill_snapshot_cost(result, body)
                 break
             time.sleep(_POLL_INTERVAL_S)
         else:
@@ -387,6 +501,10 @@ def _scan_tool_items(items: list[dict], result: TurnResult) -> None:
             out = str(data.get("output", ""))
             if data.get("status") == "blocked" or _DENY_REASON in out:
                 result.tool_call_denied = True
+            else:
+                # The call produced a real (non-blocked) output — it proceeded,
+                # the signal an ALLOW policy let it through.
+                result.tool_call_allowed = True
 
 
 def _has_cancellation_marker(items: list[dict]) -> bool:

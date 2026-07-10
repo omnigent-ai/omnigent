@@ -295,3 +295,19 @@ def test_user_opencode_config_path_prefers_jsonc(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "pref"))
     path = user_opencode_config_path()
     assert path is not None and path.name == "opencode.jsonc"
+
+
+def test_policy_plugin_merges_routing_headers(bridge_dir: Path) -> None:
+    """The generated policy plugin merges OMNIGENT_POLICY_HEADERS into its
+    /policies/evaluate POST.
+
+    The runner bakes the full routing header map (bearer + workspace / deployment
+    selectors) into that env var, so the out-of-process plugin's callbacks reach
+    the same server instance as the runner instead of a different one.
+    """
+    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
+    assert "OMNIGENT_POLICY_HEADERS" in src
+    # The routing map is spread into the request headers.
+    assert "...POLICY_HEADERS" in src
+    # The old bearer-only env var is fully removed.
+    assert "OMNIGENT_POLICY_AUTH" not in src

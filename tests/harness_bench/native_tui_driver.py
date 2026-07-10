@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 import shutil
 import signal
 import subprocess
@@ -74,14 +73,17 @@ from omnigent.native_terminal import bind_session_runner
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.e2e.helpers import lookup_databricks_host
-from tests.harness_bench.driver import ProvisioningError, TurnResult
+from tests.harness_bench.driver import ProvisioningError, TurnResult, fill_snapshot_cost
 from tests.harness_bench.full_server import (
     _find_free_port,
-    _mint_bearer,
     spawn_omnigent_server,
 )
 from tests.harness_bench.profile import BenchProfile
+from tests.harness_bench.runtime_env import (
+    BenchRuntimeEnv,
+    bench_creds_skip_reason,
+    resolve_bench_env,
+)
 
 _HEALTH_TIMEOUT_S = 90.0
 _HOST_ONLINE_TIMEOUT_S = 45.0
@@ -121,6 +123,13 @@ _CEL_POLICY_HANDLER = "omnigent.policies.builtins.cel.cel_policy"
 _NATIVE_DENY_REASON = "bench-native-tool-deny"
 # How long to wait for the tool call / deny signal on a tool turn.
 _TOOL_TURN_TIMEOUT_S = 180.0
+# On a deny turn, how long to keep the SSE reader open after the tool call to
+# observe response.policy_denied. The PreToolUse hook publishes it when it
+# evaluates, whose timing relative to the turn's output_item.done is variable
+# (it can trail a second output_item.done and the session settle). The reader
+# returns the instant it sees the deny, so a real deny rarely waits the full
+# budget; this is the ceiling before the probe SKIPs "no deny observed".
+_DENY_OBSERVE_S = 30.0
 
 # How long to let a turn run after it reports in-progress before firing the
 # interrupt, so the cancel lands mid-turn rather than racing turn setup.
@@ -250,9 +259,10 @@ class NativeTuiDriver:
 
     transport = "native-tui"
 
-    def __init__(self, profile: BenchProfile, *, databricks_profile: str) -> None:
+    def __init__(self, profile: BenchProfile, *, databricks_profile: str | None) -> None:
         self._profile = profile
         self._db_profile = databricks_profile
+        self._resolved_env: BenchRuntimeEnv | None = None
         self._vendor = native_vendor(profile.harness)
         self._proc: subprocess.Popen[bytes] | None = None
         self._daemon: subprocess.Popen[bytes] | None = None
@@ -271,12 +281,9 @@ class NativeTuiDriver:
         vendor = native_vendor(profile.harness)
         if vendor is None:
             return f"{profile.harness!r} is not a native-tui harness"
-        if not databricks_profile:
-            return "no --profile / databricks profile provided; native-tui needs a gateway route"
-        if lookup_databricks_host(databricks_profile) is None:
-            return (
-                f"databricks profile {databricks_profile!r} missing/hostless in ~/.databrickscfg"
-            )
+        creds_skip = bench_creds_skip_reason(databricks_profile)
+        if creds_skip is not None:
+            return creds_skip
         # The vendor CLI must exist AND be interactively logged in on this
         # host; the bench cannot provision a login. Presence on PATH is the
         # cheapest precondition we can check — a missing login still fails the
@@ -318,6 +325,14 @@ class NativeTuiDriver:
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         return await asyncio.to_thread(self._drive_tool_turn, deny=deny)
 
+    async def run_policy_turn(self, *, action: str) -> TurnResult:
+        """Native ALLOW/ASK observation is a follow-up (would attach a CEL
+        ALLOW/ASK policy the way the DENY path attaches its CEL deny, and watch
+        for the tool proceeding / an elicitation). Not wired yet, so return an
+        unmeasured result and let the probe SKIP rather than report a false
+        verdict. Native Policy DENY remains covered by run_tool_turn(deny=True)."""
+        return TurnResult()
+
     async def run_interrupt_turn(self) -> TurnResult:
         return await asyncio.to_thread(self._drive_interrupt_turn)
 
@@ -326,17 +341,15 @@ class NativeTuiDriver:
     def _provision(self) -> None:
         self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
         assert self._vendor is not None
-        host = lookup_databricks_host(self._db_profile)
-        assert host is not None
         port = _find_free_port()
         self._base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
 
+        # Credentials derived the way `omni run` does (ambient OPENAI_* wins,
+        # else resolve_databricks_workspace); plus the native tunnel token.
+        self._resolved_env = resolve_bench_env(self._db_profile)
         base_env = {
-            **os.environ,
-            "OPENAI_API_KEY": _mint_bearer(self._db_profile),
-            "OPENAI_BASE_URL": f"{host}/serving-endpoints",
-            "DATABRICKS_CONFIG_PROFILE": self._db_profile,
+            **self._resolved_env.base_env,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         }
         # An omnigent-credential native resolves its provider from omnigent's
@@ -371,13 +384,17 @@ class NativeTuiDriver:
 
     def _write_provider_config(self) -> Path:
         """Write the ``OMNIGENT_CONFIG_HOME`` config that routes the vendor's
-        LLM provider through this run's Databricks profile; return its dir."""
+        LLM provider through this run's Databricks profile; return its dir.
+
+        Uses the profile resolved by :func:`resolve_bench_env` (``--profile`` or
+        the config-derived one). When auth came from the ambient env (no
+        profile), the vendor inherits the ambient ``OPENAI_*`` already in
+        ``base_env``, so no ``auth:`` block is written."""
         config_home = self._tmp / "omnigent-config"
         config_home.mkdir(exist_ok=True)
-        (config_home / "config.yaml").write_text(
-            f"auth:\n  type: databricks\n  profile: {self._db_profile}\n",
-            encoding="utf-8",
-        )
+        profile = self._resolved_env.db_profile if self._resolved_env is not None else None
+        body = f"auth:\n  type: databricks\n  profile: {profile}\n" if profile else "auth: {}\n"
+        (config_home / "config.yaml").write_text(body, encoding="utf-8")
         return config_home
 
     def _wire_native_forwarder(self, host_id: str, workspace: Path) -> None:
@@ -588,7 +605,26 @@ class NativeTuiDriver:
             result.completed = True
         else:
             result.timed_out = True
+        if result.completed:
+            self._fill_cost_from_snapshot(result)
         return result
+
+    def _fill_cost_from_snapshot(self, result: TurnResult) -> None:
+        """Read cumulative usage/cost off the session snapshot after a turn.
+
+        Native runtimes report usage via ``external_session_usage`` (published as
+        ``session.usage``); the cumulative totals also land on the session
+        snapshot (``total_cost_usd`` / ``last_total_tokens``), which is the same
+        read point the full-server driver uses. A vendor that forwards no usage
+        leaves both ``None`` and the cost probe SKIPs with that reason.
+        """
+        assert self._client is not None
+        try:
+            snap = self._client.get(f"/v1/sessions/{self._session_id}", timeout=15.0)
+            if snap.status_code == 200:
+                fill_snapshot_cost(result, snap.json())
+        except httpx.HTTPError:
+            pass  # cost is best-effort; absence -> probe SKIPs, never a false verdict
 
     def _drive_tool_turn(self, *, deny: bool) -> TurnResult:
         """Provoke the vendor's own tool, observe the call (and, with *deny*, the block).
@@ -626,8 +662,18 @@ class NativeTuiDriver:
         events: list[str] = []
         ready = threading.Event()
 
+        stop = threading.Event()
+
         def _read() -> None:
             assert self._client is not None
+            # response.policy_denied is published when the PreToolUse hook
+            # evaluates the tool call — its timing relative to the turn's
+            # output_item.done is highly variable (it can land after a SECOND
+            # output_item.done and the session settle). So on a deny turn the
+            # reader does NOT stop on the turn's terminal events; it reads until
+            # it sees policy_denied (the signal we want) or the caller signals
+            # stop() once the deny deadline elapses. On a non-deny turn it stops
+            # on the terminal event as before.
             try:
                 with self._client.stream(
                     "GET",
@@ -636,15 +682,15 @@ class NativeTuiDriver:
                 ) as resp:
                     ready.set()
                     for line in resp.iter_lines():
-                        if not line.startswith("event:"):
-                            continue
-                        etype = line[len("event:") :].strip()
-                        events.append(etype)
-                        if etype == _POLICY_DENIED_EVENT:
-                            result.tool_call_denied = True
-                        # Stop once output is done/failed/interrupted. On a deny
-                        # the tool never runs, so the turn still ends normally.
-                        if etype in _READER_TERMINAL:
+                        if line.startswith("event:"):
+                            etype = line[len("event:") :].strip()
+                            events.append(etype)
+                            if etype == _POLICY_DENIED_EVENT:
+                                result.tool_call_denied = True
+                                return
+                            if not deny and etype in _READER_TERMINAL:
+                                return
+                        if stop.is_set():
                             return
             except httpx.HTTPError as exc:
                 result.error = repr(exc)
@@ -661,18 +707,24 @@ class NativeTuiDriver:
         ready.wait(timeout=10.0)  # subscribe before posting so no event is lost
         self._post_message(prompt)
         self._poll_new_tool_calls(baseline, result)
+        # On a deny turn, give response.policy_denied a generous window to land
+        # (the hook round-trip can trail the tool call), then stop the reader.
+        # The reader returns early the moment it sees the deny, so a real deny
+        # rarely waits the full budget. On a non-deny turn the reader has already
+        # stopped on the terminal event, so this join returns immediately.
+        if deny and not result.tool_call_denied:
+            deadline = time.monotonic() + _DENY_OBSERVE_S
+            while reader.is_alive() and time.monotonic() < deadline:
+                reader.join(timeout=0.5)
+        stop.set()
         reader.join(timeout=10.0)
 
-        # Turn end: output finished (or, on a deny, the blocked tool left the
-        # turn to complete without producing the tool item).
-        #
-        # Live finding: on this transport a deny-turn tool call is NOT gated —
-        # the bench's native terminal-ensure launch does not thread ap_server_url
-        # into build_hook_settings, so the evaluate-policy PreToolUse hook is
-        # silently omitted and no response.policy_denied ever fires. The probe
-        # then SKIPs (tool ran, no deny) rather than reporting a false verdict.
-        # Wiring that hook on the bench launch path is the follow-up that turns
-        # native Policy DENY from `·` into a real verdict.
+        # Turn end. On a deny turn tool_call_denied is set from the observed
+        # response.policy_denied event (the server's positive signal when the
+        # PreToolUse policy hook returns DENY). Note the probe's SUPPORTED means
+        # "the tool call was routed through policy and a DENY verdict returned";
+        # whether the vendor CLI then hard-blocks the tool is a separate axis
+        # (claude-native evaluates the DENY but may still run the tool).
         result.completed = _OUTPUT_DONE_EVENT in events or bool(result.tool_calls)
         return result
 

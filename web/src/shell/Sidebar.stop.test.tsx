@@ -49,6 +49,10 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+// Force a multi-user (non-local) server so the "Shared with me" tab renders —
+// jsdom's default loopback origin would otherwise read as single-user and hide
+// the tabs the shared-session row actions rely on.
+vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
@@ -184,8 +188,12 @@ describe("sidebar Stop session item", () => {
 
   it("is disabled for non-owners even on a stoppable session", () => {
     // Owner-gated server-side; a shared viewer (level 1) sees it disabled.
+    // A non-owner session lives on the "Shared with me" tab, so switch there
+    // before opening its kebab.
     mockConversations([{ ...HOST_SPAWNED, permission_level: 1 }]);
     renderSidebar();
+    // Radix Tabs triggers activate on mousedown (primary button), not click.
+    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
     openKebab();
     const item = screen.getByTestId("stop-conversation");
     expect(item).toHaveAttribute("data-disabled");

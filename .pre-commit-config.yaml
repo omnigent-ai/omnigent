@@ -46,6 +46,26 @@ repos:
         # fights the tooling).
         exclude: ^(omnigent/server/static/web-ui/assets/|web/.*\.xcassets/|web/.*\.icon/)
 
+      # Android Kotlin formatting + linting via ktlint (config:
+      # web/android/.editorconfig). The wrapper no-ops when ktlint is absent,
+      # so local machines without ktlint installed skip cleanly. CI installs
+      # ktlint before running pre-commit, so the check is enforced there.
+      # Install locally with `brew install ktlint` (macOS) or download from
+      # https://github.com/pinterest/ktlint/releases.
+      - id: android-ktlint-format
+        name: android ktlint format
+        language: system
+        entry: web/android/bin/ktlint.sh --format
+        files: ^web/android/.*\.kts?$
+        exclude: ^web/android/(build|\.gradle)/
+
+      - id: android-ktlint-check
+        name: android ktlint check
+        language: system
+        entry: web/android/bin/ktlint.sh
+        files: ^web/android/.*\.kts?$
+        exclude: ^web/android/(build|\.gradle)/
+
       # iOS Swift formatting + linting via Apple's `swift format` (config:
       # web/ios/.swift-format). The wrapper no-ops when the Swift toolchain
       # is absent, so these run on macOS dev machines but skip the ubuntu-latest

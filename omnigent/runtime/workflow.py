@@ -1457,6 +1457,66 @@ def _build_goose_spawn_env(
     return env
 
 
+def _build_acp_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the generic ACP harness wrap reads.
+
+    Resolves the picked ``acp:<slug>`` (carried in ``spec.executor.config`` — the
+    slug is the addressable half of the harness id) to a user-configured agent in
+    the ``acp:`` config block, and forwards its command + protocol knobs as the
+    ``HARNESS_ACP_*`` env vars defined in ``omnigent/inner/acp_harness.py``.
+
+    Like Goose, a generic ACP agent owns its own auth, so this wires **no**
+    provider/gateway credential. A ``databricks-*`` model is dropped (not a valid
+    third-party model id); the agent's own configured model (or a flag in its
+    command) then applies. When the slug is missing/unknown, falls back to the
+    first configured agent so a bare ``acp`` id still launches something.
+
+    :param spec: The agent spec.
+    :param workdir: Accepted for signature parity with the other builders; the
+        ACP wrap consumes no bundle dir.
+    :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
+    """
+    env: dict[str, str] = {}
+    raw_harness = ""
+    cfg = getattr(spec.executor, "config", None)
+    if isinstance(cfg, dict):
+        raw_harness = str(cfg.get("harness") or "")
+    slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
+
+    # Lazily import the config reader — the hot spawn-env path shouldn't pull in
+    # the onboarding/config stack eagerly (mirrors the cursor builder).
+    from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
+
+    agent = resolve_acp_agent(slug) if slug else None
+    if agent is None:
+        agents = acp_agents()
+        agent = agents[0] if agents else None
+
+    if agent is not None:
+        env["HARNESS_ACP_COMMAND"] = agent.command
+        env["HARNESS_ACP_NAME"] = agent.name
+        env["HARNESS_ACP_SESSION_ID_MODE"] = agent.session_id_mode
+        if agent.send_model:
+            env["HARNESS_ACP_SEND_MODEL"] = "1"
+
+        model = _resolve_spec_model(spec)
+        if model is not None and not model.startswith(("databricks-", "databricks/")):
+            env["HARNESS_ACP_MODEL"] = model
+        elif agent.model:
+            env["HARNESS_ACP_MODEL"] = agent.model
+    # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
+    # raises a clear request-time error pointing the user at `omnigent setup`.
+
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    return env
+
+
 def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     """
     Load the ``auth:`` block from ``~/.omnigent/config.yaml``.

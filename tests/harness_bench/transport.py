@@ -78,6 +78,19 @@ class Driver(Protocol):
         force so the call should be blocked (``tool_call_denied``); otherwise
         the call is dispatched and answered (``tool_calls`` populated)."""
 
+    async def run_policy_turn(self, *, action: str) -> TurnResult:
+        """Provoke a tool call under an explicit tool-call policy *action*
+        (``"allow"`` or ``"ask"``), for the policy_allow / policy_ask probes.
+
+        - ``"allow"``: an explicit ALLOW policy is in force; the call should
+          proceed (``tool_call_allowed`` set once dispatched + answered).
+        - ``"ask"``: an ASK policy is in force; the call should raise an
+          elicitation (``elicitation_requested`` set), which the driver then
+          resolves so the turn can settle.
+
+        A transport that cannot surface the requested action returns an
+        unmeasured result so the probe SKIPs (never a false verdict)."""
+
     async def run_interrupt_turn(self) -> TurnResult:
         """Start a long turn and interrupt it mid-flight; ``cancelled``
         reflects whether the transport honored the interrupt."""
