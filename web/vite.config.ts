@@ -225,10 +225,23 @@ const LOOKBEHIND_REWRITES: [string, string][] = [
     '(() => { try { return new globalThis.RegExp("(?<=^|\\\\s|\\\\p{P}|\\\\p{S})([-.\\\\w+]+)@([-\\\\w]+(?:\\\\.[-\\\\w]+)+)", "gu"); } catch { return /(?!)/gu; } })()',
   ],
 ];
+const LOOKBEHIND_REWRITE_MODULES = [
+  "/node_modules/marked/",
+  "/node_modules/remend/",
+  "/node_modules/mdast-util-gfm-autolink-literal/",
+];
+
+function isLookbehindRewriteModule(id: string): boolean {
+  const normalizedId = id.replaceAll("\\", "/");
+  return LOOKBEHIND_REWRITE_MODULES.some((modulePath) => normalizedId.includes(modulePath));
+}
+
 function safariLookbehindWorkarounds(): Plugin {
   return {
     name: "safari-lookbehind-workarounds",
-    transform(code) {
+    transform(code, id) {
+      if (!isLookbehindRewriteModule(id)) return;
+
       let out = code;
       for (const [from, to] of LOOKBEHIND_REWRITES) {
         out = out.replaceAll(from, to);
