@@ -52,6 +52,11 @@ export function TurnRail({
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const railRef = useRef<HTMLDivElement | null>(null);
   const tickRefs = useRef(new Map<string, HTMLButtonElement>());
+  // True while the pointer is over the rail, i.e. the user is browsing ticks.
+  // Suppresses the thumb-tracking auto-scroll so a history fetch (or any other
+  // `turns` change) can't yank the rail back to the transcript's visible run
+  // while the user is scrolling it.
+  const interactingRef = useRef(false);
   // itemIds of the turns whose messages are currently on screen. Their ticks
   // read as active (black) when the user isn't hovering the rail.
   const [visibleIds, setVisibleIds] = useState<ReadonlySet<string>>(() => new Set());
@@ -129,6 +134,10 @@ export function TurnRail({
   useEffect(() => {
     const rail = railRef.current;
     if (!rail || visibleIds.size === 0) return;
+    // Don't fight the user: while they're browsing the rail (pointer over it),
+    // a `turns` change from eager/scroll-up history loading must not snap the
+    // rail back to the transcript's visible run.
+    if (interactingRef.current) return;
     let top = Infinity;
     let bottom = -Infinity;
     for (const id of visibleIds) {
@@ -255,10 +264,16 @@ export function TurnRail({
         "pointer-events-none absolute left-0 top-1/2 z-40 flex w-6 -translate-y-1/2 items-center transition-opacity duration-200 max-md:hidden",
         revealed ? "opacity-100" : "opacity-0",
       )}
-      onMouseLeave={() => setHoveredId(null)}
+      onMouseLeave={() => {
+        interactingRef.current = false;
+        setHoveredId(null);
+      }}
     >
       <div
         ref={railRef}
+        onMouseEnter={() => {
+          interactingRef.current = true;
+        }}
         // Feed FADE to the CSS mask so the ramp width and the thumb-tracking
         // math share one constant.
         style={{ "--turn-rail-fade": `${FADE}px` } as CSSProperties}
