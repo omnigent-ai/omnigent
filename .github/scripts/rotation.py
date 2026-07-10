@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Daily Discord-watch rotation reminder.
 
-Picks the person on watch for the current day and pings them in Slack at
-08:00 *their* local time. The rotation is deterministic — the assignee is a
-function of the date and the person's position in the list — so there is no
-state to store anywhere.
+Picks the person on watch for the current day and pings them in Slack on the
+morning of *their* local timezone. The rotation is deterministic — the
+assignee is a function of the date and the person's position in the list — so
+there is no state to store anywhere.
 
 The GitHub Actions workflow wakes at a couple of fixed UTC times (one per
-timezone's morning). On each run every person checks "is it ~08:00 in my
-timezone right now, and is today my turn?"; at most one person matches, and
-they get the ping.
+timezone's morning). On each run the day's assignee is pinged only if it's
+currently morning where they live; if not, the run for their timezone's
+morning handles them. Our timezones are far enough apart that only one is ever
+in its morning at a time, so at most one person is pinged per run.
 
 Set SLACK_WEBHOOK_URL to post for real. Leave it unset for a dry run that just
 prints what it would do — handy for testing the rotation order without Slack.
@@ -25,12 +26,16 @@ import urllib.request
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
-# The workflow wakes at one fixed UTC time per timezone, chosen to be 08:00
-# local. Timezones with daylight saving drift to 07:00 for part of the year,
-# so the "morning slot" accepts either hour. This window must stay narrow
-# enough that no two people's slots overlap (fine for tz's >= a few hours
-# apart, e.g. SF and Singapore).
-MORNING_HOURS = (7, 8)
+# Each cron run is one timezone's morning scan: we ping today's assignee only
+# if it's currently morning where they are. A run that's morning in SF is night
+# in Singapore and vice versa, so at most one timezone matches per run. Morning
+# is a band rather than an exact hour, which absorbs both daylight saving and
+# GitHub's frequently-delayed cron schedule — a run that fires a few hours late
+# still counts as that person's morning. The band starts at 05:00 (not
+# midnight) so a delayed *other* timezone's cron spilling past local midnight
+# isn't mistaken for this timezone's morning, which would double-ping.
+MORNING_START_HOUR = 5
+MORNING_END_HOUR = 12
 
 # Skip Saturdays and Sundays (in each person's local time). The rotation also
 # advances by workdays only, so Friday hands off straight to Monday.
@@ -108,14 +113,17 @@ def assignee_for(local_date: datetime.date) -> Person | None:
 
 
 def whose_turn_now(now_utc: datetime.datetime) -> Person | None:
-    """Return the person to ping right now, or None if it isn't anyone's 8am.
+    """Return the person to ping right now, or None if it isn't anyone's morning.
 
-    Each person is evaluated in their own timezone: it must be the PING_HOUR
-    there, and the rotation (by their local date) must land on them.
+    Each person is evaluated in their own timezone: it must be a weekday morning
+    (before noon) there, and today's rotation slot must land on them. Since our
+    timezones are far enough apart that only one is ever in its morning at a
+    time, at most one person matches. A person missed by a late/early run is
+    picked up by the next run that lands in their morning.
     """
     for person in PEOPLE:
         local = now_utc.astimezone(ZoneInfo(person.tz))
-        if local.hour not in MORNING_HOURS:
+        if not (MORNING_START_HOUR <= local.hour < MORNING_END_HOUR):
             continue
         if WEEKDAYS_ONLY and local.weekday() >= 5:  # 5=Sat, 6=Sun
             continue
@@ -155,7 +163,7 @@ def main() -> None:
     person = whose_turn_now(now_utc)
 
     if person is None:
-        print(f"{now_utc:%Y-%m-%d %H:%M UTC}: nobody's 8am right now, nothing to do.")
+        print(f"{now_utc:%Y-%m-%d %H:%M UTC}: nobody's on watch right now, nothing to do.")
         return
 
     local = now_utc.astimezone(ZoneInfo(person.tz))
