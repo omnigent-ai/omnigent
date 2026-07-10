@@ -73,7 +73,7 @@ from omnigent.native_terminal import bind_session_runner
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.harness_bench.driver import ProvisioningError, TurnResult
+from tests.harness_bench.driver import ProvisioningError, TurnResult, fill_snapshot_cost
 from tests.harness_bench.full_server import (
     _find_free_port,
     spawn_omnigent_server,
@@ -597,7 +597,26 @@ class NativeTuiDriver:
             result.completed = True
         else:
             result.timed_out = True
+        if result.completed:
+            self._fill_cost_from_snapshot(result)
         return result
+
+    def _fill_cost_from_snapshot(self, result: TurnResult) -> None:
+        """Read cumulative usage/cost off the session snapshot after a turn.
+
+        Native runtimes report usage via ``external_session_usage`` (published as
+        ``session.usage``); the cumulative totals also land on the session
+        snapshot (``total_cost_usd`` / ``last_total_tokens``), which is the same
+        read point the full-server driver uses. A vendor that forwards no usage
+        leaves both ``None`` and the cost probe SKIPs with that reason.
+        """
+        assert self._client is not None
+        try:
+            snap = self._client.get(f"/v1/sessions/{self._session_id}", timeout=15.0)
+            if snap.status_code == 200:
+                fill_snapshot_cost(result, snap.json())
+        except httpx.HTTPError:
+            pass  # cost is best-effort; absence -> probe SKIPs, never a false verdict
 
     def _drive_tool_turn(self, *, deny: bool) -> TurnResult:
         """Provoke the vendor's own tool, observe the call (and, with *deny*, the block).

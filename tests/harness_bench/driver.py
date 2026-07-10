@@ -209,6 +209,14 @@ class TurnResult:
     :param error: The error payload from ``response.failed``, if any.
     :param timed_out: Whether the stream did not reach a terminal event
         within the probe's timeout.
+    :param total_tokens: Cumulative token count the turn reported, if any
+        (``None`` when the transport surfaced no usage). Read from the session
+        snapshot (``SessionResponse.last_total_tokens``) or the completed
+        turn's ``usage``.
+    :param total_cost_usd: Cumulative USD cost the turn reported, if any
+        (``None`` when unobserved or the model is unpriced). Read from
+        ``SessionResponse.total_cost_usd`` / ``session.usage`` /
+        ``response.completed`` usage.
     """
 
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -223,6 +231,8 @@ class TurnResult:
     failed: bool = False
     error: Any = None
     timed_out: bool = False
+    total_tokens: int | None = None
+    total_cost_usd: float | None = None
 
     @property
     def reached_terminal(self) -> bool:
@@ -233,6 +243,24 @@ class TurnResult:
     def event_types(self) -> list[str]:
         """The ``type`` of every event, in order."""
         return [e.get("type", "") for e in self.events]
+
+
+def fill_snapshot_cost(result: TurnResult, snapshot: dict[str, Any]) -> None:
+    """Populate *result*'s usage/cost from a session snapshot (``SessionResponse``).
+
+    The server tracks cumulative usage on the conversation and exposes it on the
+    snapshot as ``total_cost_usd`` (priced spend; ``None`` for an unpriced model)
+    and ``last_total_tokens`` (token count). Both server-backed drivers poll the
+    snapshot to a terminal state, so this is the uniform cost read point. A
+    tokens-only snapshot (no price) leaves ``total_cost_usd`` ``None`` — the cost
+    probe reports that as PARTIAL, not a failure.
+    """
+    tokens = snapshot.get("last_total_tokens")
+    if isinstance(tokens, int):
+        result.total_tokens = tokens
+    cost = snapshot.get("total_cost_usd")
+    if isinstance(cost, (int, float)):
+        result.total_cost_usd = float(cost)
 
 
 class SdkInprocDriver:
@@ -491,6 +519,16 @@ class SdkInprocDriver:
                                 result.tool_call_denied = True
                     elif etype == "response.completed":
                         result.completed = True
+                        # The wrap-direct path has no server snapshot; usage, if
+                        # the wrap forwards it, rides on the completed response.
+                        # Absent -> stays None and the cost probe SKIPs.
+                        usage = (event.get("response") or {}).get("usage") or {}
+                        tok = usage.get("total_tokens")
+                        if isinstance(tok, int):
+                            result.total_tokens = tok
+                        cost = usage.get("cost_usd")
+                        if isinstance(cost, (int, float)):
+                            result.total_cost_usd = float(cost)
                     elif etype == "response.cancelled":
                         result.cancelled = True
                     elif etype == "response.failed":

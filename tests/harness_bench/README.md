@@ -103,11 +103,9 @@ driver the run uses:
   runner-owned tmux pane); `--fast` does not apply.
 - `--transport NAME` overrides the family default for any harness.
 
-## What it reports (P0 dimensions)
+## What it reports (dimensions)
 
-The six P0 dimensions are `basic_turn`, `streaming`, `tool_calling`,
-`policy_deny`, `model_override`, `interrupt`. Each probe drives one real turn
-and watches what the harness does:
+Each probe drives one real turn and watches what the harness does:
 
 | Probe | In plain terms |
 | --- | --- |
@@ -116,6 +114,7 @@ and watches what the harness does:
 | **Tool calling** | Can it use a tool (run a command, read a file) mid-answer, not just chat? |
 | **Policy DENY** | If a policy says "block that tool", does the harness actually enforce it? |
 | **Model override** | If you ask for a specific model, does it actually run that one? |
+| **Cost tracking** | Does a completed turn report what it spent? `✓` a priced USD cost, `~` tokens only (unpriced model), `·` no usage surfaced. Gates any future cost *policy* -- a cost budget is a no-op without this. |
 | **Interrupt** | If you stop it mid-answer, does it actually stop? |
 
 Each cell is a verdict: **✓** works, **✗** doesn't, **·** couldn't be tested
@@ -148,7 +147,7 @@ Playwright `tests/e2e_ui/` suite, not this bench.
 
 ### Per-dimension, per-transport: what a ✓ verifies
 
-Rows are the P0 dimensions; columns are the three transports. "server API"
+Rows are the dimensions; columns are the three transports. "server API"
 (full-server / native-tui) means the ✓ was observed over the same
 `/v1/sessions/...` surface the web UI uses; "wrap" (sdk-inproc, `--fast`) means
 it was observed at the harness-wrap boundary, below the server.
@@ -160,6 +159,7 @@ it was observed at the harness-wrap boundary, below the server.
 | **Tool calling** | ✓ = a server-dispatched builtin call was made + turn closed | ✓ = the vendor's own tool call surfaced as a server `function_call` item | ✓ = a request-level tool call surfaced at the wrap |
 | **Policy DENY** | ✓ = a spec-baked `tool_call` deny policy blocked the call | ✓ = a session-attached CEL deny fired `response.policy_denied` | `·` = the wrap path has no server-side policy hook |
 | **Model override** | ✓ = the requested model was the one used | ✓ = the requested model was the one used | ✓ = the requested model was the one used |
+| **Cost tracking** | ✓/~ = usage read from the session snapshot (`total_cost_usd` / `last_total_tokens`) | ✓/~ = usage from the snapshot (native `session.usage`) | ✓/~ if the wrap forwards `usage` on `response.completed`, else `·` |
 | **Interrupt** | ✓ = a mid-turn cancel stopped the turn (server marker) | ✓ = a mid-turn cancel surfaced `session.interrupted` | ✓ = a mid-turn cancel stopped the wrap turn |
 
 So for the harnesses users actually reach through the web UI (SDK on
@@ -218,11 +218,10 @@ harness-agnostic -- they only call the driver's semantic methods.
 
 ## Scope
 
-Live today: the six P0 dimensions above; all three transports (`sdk-inproc`,
-`full-server`, `native-tui`); the four official SDK harnesses (claude-sdk,
-codex, pi, openai-agents) plus every registered native. Not yet wired (see the
-design doc's open items): **bench observation** of Tool calling / Policy DENY
-on `native-tui` (a driver gap, not a native-harness limitation),
-registry-driven server-side native-agent seeding, and the P1 dimensions
-(steering, live-queue, resume/fork, elicitation, reasoning, images, cost,
-compaction).
+Live today: the dimensions in the table above (including `cost_tracking`); all
+three transports (`sdk-inproc`, `full-server`, `native-tui`); the four official
+SDK harnesses (claude-sdk, codex, pi, openai-agents) plus every registered
+native. Tool calling and Policy DENY are observed on `native-tui` too (landed
+separately). Not yet wired (see the design doc's open items): registry-driven
+server-side native-agent seeding, and further dimensions (policy ALLOW/ASK,
+steering, live-queue, resume/fork, elicitation, reasoning, images, compaction).

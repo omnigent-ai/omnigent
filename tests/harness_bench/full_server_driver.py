@@ -36,7 +36,7 @@ from typing import Any
 import httpx
 
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.harness_bench.driver import TurnResult
+from tests.harness_bench.driver import TurnResult, fill_snapshot_cost
 from tests.harness_bench.full_server import (
     _DENY_REASON,
     _POLL_INTERVAL_S,
@@ -360,6 +360,7 @@ class FullServerDriver:
             if status == "idle" and seen_running:
                 result.completed = True
                 result.text = _assistant_text(body.get("items", []))
+                fill_snapshot_cost(result, body)
                 break
             time.sleep(_POLL_INTERVAL_S)
         else:
