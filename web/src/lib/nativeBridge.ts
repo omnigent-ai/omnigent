@@ -205,12 +205,20 @@ export interface HostActionResult {
   error?: string;
 }
 
+/** A recently-connected server: its URL and an optional user-set nickname. */
+export interface RecentServer {
+  /** Full server URL, e.g. `"https://a.example.com/ml/omnigent"`. */
+  url: string;
+  /** User-set nickname shown instead of the host, or `""` when none. */
+  label: string;
+}
+
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
-  /** Recently-connected server URLs, most recent first. */
-  recentServers: string[];
+  /** Recently-connected servers, most recent first. */
+  recentServers: RecentServer[];
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */

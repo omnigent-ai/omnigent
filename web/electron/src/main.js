@@ -2095,7 +2095,8 @@ function registerIpc() {
     return {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
-      recentServers: normalizeRecents(loadSettings().recent_servers).map((e) => e.url),
+      // Each { url, label }; the picker shows the nickname when one is set.
+      recentServers: normalizeRecents(loadSettings().recent_servers),
     };
   });
 
