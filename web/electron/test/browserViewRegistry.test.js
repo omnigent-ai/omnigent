@@ -7,7 +7,7 @@
 // is null), so no `browser-host-active-changed` fires. Without the
 // `browser-view-created` emit the React pane would never learn a view exists,
 // never mount its placeholder, and never call setActive — the pane would stay
-// invisible (the P0 this test guards against).
+// invisible (the bug this test guards against).
 
 const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
@@ -159,7 +159,7 @@ function makeLoadTrackingRegistry() {
   return { registry, loaded };
 }
 
-describe("browserViewRegistry — agent-navigation allowlist (P1-2)", () => {
+describe("browserViewRegistry — agent-navigation allowlist", () => {
   it("rejects agent navigation to file:// and never calls loadURL", () => {
     const { registry, loaded } = makeLoadTrackingRegistry();
     const r = registry.openOrNavigate("conv_1", "file:///home/user/.ssh/id_rsa", undefined, {

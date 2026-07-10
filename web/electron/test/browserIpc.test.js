@@ -378,7 +378,7 @@ describe("browserIpc — design mode", () => {
   });
 });
 
-describe("browserIpc — design-mode gesture gate (P1-1)", () => {
+describe("browserIpc — design-mode gesture gate", () => {
   // Drive the exported console/input handler factories directly for precise
   // control over the gesture timestamp vs. the marker arrival.
   const NONCE = "a".repeat(32);

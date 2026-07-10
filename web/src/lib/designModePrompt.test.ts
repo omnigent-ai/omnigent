@@ -37,7 +37,7 @@ describe("buildDesignModePrompt", () => {
   });
 });
 
-describe("buildDesignModePrompt — untrusted element sanitization (P1-1)", () => {
+describe("buildDesignModePrompt — untrusted element sanitization", () => {
   it("strips newlines from element.text so it can't forge extra block lines", () => {
     // A hostile page controls element.* — a newline-laden text could otherwise
     // inject its own `Role:`/fence lines into the [Design Mode — …] block.

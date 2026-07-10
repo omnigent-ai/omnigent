@@ -1,7 +1,7 @@
 // IPC surface for the embedded browser pane, extracted out of main.js. main.js
 // wires the per-window registry + trust gate and calls `registerBrowserIpc(...)`.
 //
-// SECURITY (Risk-2): every handler is gated on `isPinnedOriginSender` and
+// SECURITY: every handler is gated on `isPinnedOriginSender` and
 // resolves the sender window's own registry, so one window can never drive
 // another's panes. Do NOT drop the gate from any handler (toolbar ones included).
 
@@ -343,7 +343,7 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
 
   // Run relay-template JS in the conversation's view. PRIVATE to the relay's
   // fixed templates (snapshot / click / type) — NOT an agent-facing generic
-  // `evaluate` (Risk-4 trust boundary; see README).
+  // `evaluate` (trust boundary; see README).
   ipcMain.handle("omnigent:browser-execute", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };

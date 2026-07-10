@@ -2,10 +2,9 @@
 // via `executeJavaScript` to power point-and-prompt. Extracted from browserIpc.js
 // so it lints/highlights as its own module; behavior is unchanged.
 //
-// SECURITY: the returned IIFE string is parameterized by a per-enable `nonce`
-// (P1 fix) baked into every console-marker prefix; the main-process console
-// handler trusts only markers carrying THIS view's nonce. Keep that
-// interpolation intact — do NOT hardcode the markers.
+// SECURITY: markers are prefixed with a per-enable `nonce`; the main-process
+// handler trusts only markers carrying this view's nonce — keep the
+// interpolation, don't hardcode the markers.
 
 "use strict";
 

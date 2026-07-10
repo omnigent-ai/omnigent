@@ -3,7 +3,7 @@
  *  `browser.action_request` SSE event every renderer races to CLAIM the action
  *  (atomic CAS on the AP), and only the `{claimed:true, claim_token}` winner
  *  dispatches to `window.omnigentDesktop.browser*` and POSTs the result back
- *  with its token — so multiple windows can't double-execute (Risk-1).
+ *  with its token — so multiple windows can't double-execute.
  *  Gated on `isElectronShell()`: without a WebContentsView the hook registers
  *  nothing and actions time out cleanly (no headless fallback). */
 import { useEffect } from "react";
@@ -352,7 +352,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
     const handler = async (evt: BrowserActionRequestEvent) => {
       const desktop = getBrowserDesktop();
       if (!desktop) return; // not the Electron shell — nothing to claim
-      // Claim FIRST — only the winner proceeds, so two windows can't double-execute (Risk-1).
+      // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(conversationId, evt.actionId);
       if (!claimToken) return;
       const result = await dispatch(conversationId, evt.action, evt.args, desktop);

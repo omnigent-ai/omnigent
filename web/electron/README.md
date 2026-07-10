@@ -265,7 +265,7 @@ console listener is stored on the registry entry
 `close()` detaches it on teardown. Electron-only (needs `executeJavaScript` +
 the native view); no server flag.
 
-**Risk-4 — JS trust boundary (important):** `omnigent:browser-execute` runs
+**JS trust boundary (important):** `omnigent:browser-execute` runs
 arbitrary JS in the child view via `executeJavaScript(js, true)`. It is exposed
 to the SPA **only for the relay's own fixed templates** (the DOM-snapshot walk,
 and the click / type element resolvers) — there is deliberately **no

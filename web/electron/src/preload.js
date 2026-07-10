@@ -108,8 +108,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   // ── Embedded browser pane ──────────────────────────────────────────────
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native
   // WebContentsView per conversation through these; all args/results are
-  // structured-clone-safe. SECURITY (Risk-4): no generic agent `evaluate` is
-  // exposed — `browserExecute` runs relay templates only (see README).
+  // structured-clone-safe. SECURITY: no generic agent `evaluate` is exposed —
+  // `browserExecute` runs relay templates only (see README).
 
   /**
    * Open (create-if-absent) or navigate a conversation's view. `opts.force`
