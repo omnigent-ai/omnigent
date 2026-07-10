@@ -432,7 +432,7 @@ function applyDockIcon() {
  *   windows on the same server report the same number and must not be
  *   double-counted), then sums across origins.
  * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
- *   Per-conversation embedded-browser (Phase 2) view registry for this window.
+ *   Per-conversation embedded-browser view registry for this window.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */

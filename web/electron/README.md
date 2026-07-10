@@ -168,7 +168,7 @@ dismisses.
     only for pages on an origin some window is pinned to, and only when the
     requesting page is the top-level page — everything else is denied.
 
-## Embedded browser pane (Phase 2)
+## Embedded browser pane
 
 The desktop shell hosts an **embedded browser pane**: a real Chromium page the
 user can drive (URL bar + toolbar) and point-and-prompt in design mode. This PR
@@ -238,7 +238,7 @@ create-signal → setActive → attached transition.)
 **Toolbar.** When a view is attached, `BrowserPane` renders a user-facing
 toolbar above the page: back / forward / reload, a DevTools toggle, and an
 editable URL bar (Enter navigates; the typed value is normalized to add a
-scheme — dotless corp shortnames like `go/foo` get `http://`, everything else
+scheme — a dotless host like `localhost` gets `http://`, everything else
 `https://`). The bar reflects the *real* URL via `onBrowserUrlChanged`, but
 never overwrites what the user is actively typing. The pane is a flex **column**:
 the toolbar is a fixed-height row *above* the measured container, because the

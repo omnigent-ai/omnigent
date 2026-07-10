@@ -1,6 +1,6 @@
 /** Normalize a user-typed address into a navigable URL. Like Chrome's omnibox,
- *  a DOTLESS host (go/, jira/FOO-1) gets `http://` (intranet shortnames 302 to
- *  https anyway and lack a cert for the bare name); anything with a dot is https-first.
+ *  a DOTLESS host (e.g. `localhost`, `myhost`) gets `http://`; a host with dots
+ *  gets `https://`.
  */
 export function normalizeTypedUrl(raw: string): string {
   const trimmed = raw.trim();
