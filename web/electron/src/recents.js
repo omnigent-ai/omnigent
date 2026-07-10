@@ -30,6 +30,13 @@
   /** Maximum number of entries kept in the persisted recent-servers list. */
   const MAX_RECENT_SERVERS = 5;
 
+  /**
+   * Maximum length of a server nickname. A nickname is a display label, not an
+   * identifier — any characters are allowed (spaces, punctuation, emoji); only
+   * the length is bounded, to protect the stored file and the list layout.
+   */
+  const MAX_LABEL_LENGTH = 60;
+
   /** Short display label for a server URL — its host, e.g. "localhost:8000". */
   function hostOf(url) {
     try {
@@ -98,7 +105,7 @@
    * @returns {Array<{ url: string, label: string }>} A new list.
    */
   function setLabel(list, url, label) {
-    const trimmed = typeof label === "string" ? label.trim() : "";
+    const trimmed = (typeof label === "string" ? label.trim() : "").slice(0, MAX_LABEL_LENGTH);
     return list.map((e) => (e.url === url ? { url: e.url, label: trimmed } : e));
   }
 
@@ -117,6 +124,7 @@
 
   return {
     MAX_RECENT_SERVERS,
+    MAX_LABEL_LENGTH,
     hostOf,
     normalizeRecents,
     rememberRecent,

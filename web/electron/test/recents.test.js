@@ -9,6 +9,7 @@ const assert = require("node:assert/strict");
 
 const {
   MAX_RECENT_SERVERS,
+  MAX_LABEL_LENGTH,
   hostOf,
   normalizeRecents,
   rememberRecent,
@@ -136,6 +137,11 @@ describe("setLabel", () => {
 
   it("is a no-op for a url not in the list", () => {
     assert.deepEqual(setLabel(base, "https://unknown.example.com", "X"), base);
+  });
+
+  it("caps the nickname at MAX_LABEL_LENGTH", () => {
+    const long = "x".repeat(MAX_LABEL_LENGTH + 20);
+    assert.equal(setLabel(base, "https://a.example.com", long)[0].label.length, MAX_LABEL_LENGTH);
   });
 });
 

@@ -477,8 +477,9 @@
       // — the same module the main process uses, so the two never drift.
       const { isPlainHttpRemote } = window.omnigentUrl;
       // Shared recent-servers helpers (electron/src/recents.js) — hostOf here is
-      // the same one the main process uses.
-      const { hostOf } = window.omnigentRecents;
+      // the same one the main process uses, and MAX_LABEL_LENGTH keeps the
+      // field's cap in sync with the store's.
+      const { hostOf, MAX_LABEL_LENGTH } = window.omnigentRecents;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -584,6 +585,7 @@
         const field = document.createElement("input");
         field.type = "text";
         field.value = entry.label;
+        field.maxLength = MAX_LABEL_LENGTH;
         field.placeholder = `${hostOf(entry.url)} — leave blank to clear`;
         field.setAttribute("aria-label", "Server nickname");
         const hint = document.createElement("p");

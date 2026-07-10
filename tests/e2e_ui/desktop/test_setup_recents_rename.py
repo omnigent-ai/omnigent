@@ -83,6 +83,9 @@ def test_rename_saves_nickname_and_rerenders(page: Page) -> None:
     page.locator(".recent-row").nth(1).locator(".recent-rename").click()
     field = page.locator(".recent-edit input")
     expect(field).to_be_focused()
+    # A nickname is a display label, so any characters are allowed — only the
+    # length is capped, to protect the stored file and the list layout.
+    expect(field).to_have_attribute("maxlength", "60")
     field.fill("Local dev")
     field.press("Enter")
 
