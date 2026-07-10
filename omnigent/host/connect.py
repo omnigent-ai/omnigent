@@ -380,6 +380,16 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
         # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
         "OMNIGENT_TELEMETRY_ENABLED",
+        # Opaque request-routing headers (dev/test): a JSON header map folded by
+        # cli_auth.databricks_request_headers into every client→server connection
+        # so a request pins to a specific server instance/replica. Must reach the
+        # spawned runner so its tunnel + server callbacks route to the SAME
+        # instance the host registered on — otherwise the host lands on the
+        # selected instance while its runners fall back to the default one.
+        # Routing config, not a secret; unset in prod. Allowlisting it forwards it
+        # host→runner intrinsically, so the setter need not also list it in
+        # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.

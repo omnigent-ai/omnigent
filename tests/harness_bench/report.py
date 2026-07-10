@@ -1,18 +1,4 @@
-"""Render a :class:`BenchMatrix` as a terminal table, Markdown, or JSON.
-
-Three renderers for three audiences:
-
-- :func:`render_table` — an aligned, optionally ANSI-colored grid for
-  reading in a terminal (the CLI default). Pipes-and-dashes Markdown reads
-  as raw noise in a shell, so this is what a human sees.
-- :func:`render_markdown` — the GitHub-flavored table for docs / PRs,
-  reproducing the hand-maintained support matrix.
-- :func:`render_json` — the machine-readable form for regenerating docs or
-  diffing runs.
-
-Each verdict maps to a spreadsheet glyph plus a DRIFT callout the
-spreadsheet cannot express.
-"""
+"""Render bench matrices as terminal, Markdown, or JSON reports."""
 
 from __future__ import annotations
 

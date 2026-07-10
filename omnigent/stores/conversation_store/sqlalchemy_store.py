@@ -47,6 +47,7 @@ from omnigent.db.enum_codecs import (
 )
 from omnigent.db.utils import (
     _supports_fts5,
+    build_search_snippet,
     delete_fts_by_conversation,
     ensure_fts_table,
     extract_search_text,
@@ -421,6 +422,82 @@ def _fetch_labels_bulk(
     out: dict[str, dict[str, str]] = {}
     for conv_id, key, value in rows:
         out.setdefault(conv_id, {})[key] = value
+    return out
+
+
+def _fetch_search_snippets(
+    session: Session,
+    conversation_ids: list[str],
+    query: str,
+) -> dict[str, str]:
+    """
+    Build a per-conversation preview excerpt of matching chat content.
+
+    For each conversation whose body matched ``query`` (case-insensitive
+    substring on ``search_text``), returns a short snippet centered on the
+    match so the search UI can show *where* the session matched. The
+    earliest matching item per conversation wins.
+
+    Bulk (no N+1) *and* bounded to one row per conversation: a grouped
+    subquery finds the min matching ``position`` per conversation, then the
+    outer query materializes only those rows. Without the ``MIN(position)``
+    join, the plain ``LIKE`` would stream every matching item's full
+    ``search_text`` body — potentially thousands per long conversation —
+    just to keep the first.
+
+    :param session: The active SQLAlchemy session.
+    :param conversation_ids: Conversation IDs to build snippets for,
+        e.g. ``["conv_a", "conv_b"]``.
+    :param query: The user's search string.
+    :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
+        only match was the title (no item body match) are absent — the
+        caller leaves their ``search_snippet`` as ``None``.
+    """
+    if not conversation_ids or not query:
+        return {}
+    pattern = f"%{query.lower()}%"
+    workspace_id = current_workspace_id()
+    # workspace_id leads the (workspace_id, conversation_id, position) index.
+    # Both the aggregate and the join-back below must include it or Postgres
+    # can't use that index and falls back to a full table scan of every item.
+    match_pred = and_(
+        SqlConversationItem.workspace_id == workspace_id,
+        SqlConversationItem.conversation_id.in_(conversation_ids),
+        func.lower(SqlConversationItem.search_text).like(pattern),
+    )
+    # Earliest matching position per conversation — a small (conv_id, position)
+    # aggregate, no bodies materialized.
+    earliest = (
+        select(
+            SqlConversationItem.conversation_id.label("cid"),
+            func.min(SqlConversationItem.position).label("pos"),
+        )
+        .where(match_pred)
+        .group_by(SqlConversationItem.conversation_id)
+        .subquery()
+    )
+    # Join back to pull exactly one search_text body per conversation. The
+    # workspace_id predicate keeps this on the composite index.
+    rows = session.execute(
+        select(
+            SqlConversationItem.conversation_id,
+            SqlConversationItem.search_text,
+        ).join(
+            earliest,
+            and_(
+                SqlConversationItem.workspace_id == workspace_id,
+                SqlConversationItem.conversation_id == earliest.c.cid,
+                SqlConversationItem.position == earliest.c.pos,
+            ),
+        )
+    ).all()
+    out: dict[str, str] = {}
+    for conv_id, search_text in rows:
+        if not search_text:
+            continue
+        snippet = build_search_snippet(search_text, query)
+        if snippet is not None:
+            out[conv_id] = snippet
     return out
 
 
@@ -1881,6 +1958,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                 [r.id for r in rows],
             )
             convs = [_to_conversation(r, labels_by_conv.get(r.id, {})) for r in rows]
+            # On a content search, attach a preview excerpt of the matching
+            # chat text so the UI can show *where* each session matched (the
+            # match is often invisible in the title). Title-only matches keep
+            # search_snippet=None — the title already shows the hit.
+            if search_query:
+                snippets = _fetch_search_snippets(
+                    session,
+                    [r.id for r in rows],
+                    search_query,
+                )
+                for conv in convs:
+                    conv.search_snippet = snippets.get(conv.id)
             return PagedList(
                 data=convs,
                 first_id=convs[0].id if convs else None,

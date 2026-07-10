@@ -56,12 +56,19 @@ Open the UI at the `ui` URL shown in the header (the Vite dev server).
 ## Isolation
 
 Only Omnigent's own state is isolated per pod — enough that concurrent pods
-never share a database or server pidfile — via `OMNIGENT_DATA_DIR`,
-`OMNIGENT_DATABASE_URI`, and `OMNIGENT_URL`. Everything else (your real
-`HOME`, credentials, config, and uv/npm caches) is inherited, because the
-agents Omnigent runs need it. This is deliberately lighter than the hermetic
-`scripts/backend-smoke.sh` sandbox, which repoints `HOME`/`XDG_*` to touch
-nothing real.
+never share a database, server pidfile, or `config.yaml` — via
+`OMNIGENT_DATA_DIR`, `OMNIGENT_DATABASE_URI`, `OMNIGENT_URL`, and
+`OMNIGENT_CONFIG_HOME`. Everything else (your real `HOME`, credentials, and
+uv/npm caches) is inherited, because the agents Omnigent runs need it. This is
+deliberately lighter than the hermetic `scripts/backend-smoke.sh` sandbox,
+which repoints `HOME`/`XDG_*` to touch nothing real.
+
+Each pod gets its own `config.yaml` under `<pod>/config/`, pointed to by
+`OMNIGENT_CONFIG_HOME`. On first create it's **seeded** from your real
+`~/.omnigent/config.yaml` (if present) so the pod works out of the box — it
+keeps your providers — after which the two are independent: server-config edits
+inside a pod (via the UI or `omnigent config`) don't touch your real config.
+`--clean` wipes the pod dir, so the next run re-seeds from your real config.
 
 The pod dir defaults to
 `${XDG_CACHE_HOME:-~/.cache}/omnidev/<repo-name>-<hash>/`, keyed to the

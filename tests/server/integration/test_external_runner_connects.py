@@ -112,11 +112,13 @@ def test_external_runner_connects_to_local_server(
 
         try:
             # Poll until the server reports the runner as online.
-            # The runner needs to connect the WS tunnel and send its
-            # hello frame; budget 10s.
+            # The runner needs to connect the WS tunnel and send its hello
+            # frame; budget 60s (hard cap — the loop exits as soon as it
+            # is online, so only starved CI workers ever use the tail).
             online = False
             status_url = f"{base_url}/v1/runners/{runner.runner_id}/status"
-            for _attempt in range(20):
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
                 time.sleep(0.5)
                 if runner.proc.poll() is not None:
                     pytest.fail(
@@ -136,7 +138,7 @@ def test_external_runner_connects_to_local_server(
             # failed — either the runner_id / binding-token mismatch
             # (Bug 1) or the allow-list rejection (Bug 2).
             assert online, (
-                f"Runner {runner.runner_id} did not come online within 10s. "
+                f"Runner {runner.runner_id} did not come online within 60s. "
                 f"Runner process alive: {runner.proc.poll() is None}"
             )
         finally:

@@ -858,6 +858,55 @@ def strip_nul_bytes(value: str) -> str:
     return value.replace("\x00", "")
 
 
+def build_search_snippet(
+    text: str,
+    query: str,
+    *,
+    context: int = 60,
+    max_len: int = 160,
+) -> str | None:
+    """
+    Build a short excerpt of ``text`` centered on the first ``query`` match.
+
+    Powers the session-search preview: the sidebar/palette matches on chat
+    content, so a hit is often invisible in the session title. This returns
+    the matching span plus a little surrounding context, with ``…`` marking
+    elided ends, so the UI can show *where* a session matched.
+
+    Matching is case-insensitive substring (mirrors the ``LIKE`` filter that
+    selected the row). Whitespace in ``text`` is collapsed first so a match
+    inside a multi-line tool output renders as one clean line.
+
+    :param text: The item's plain search text to excerpt from.
+    :param query: The user's search string, e.g. ``"deploy error"``.
+    :param context: Characters of context to keep on each side of the match.
+    :param max_len: Hard cap on the returned snippet length (excluding the
+        ``…`` markers) so a giant match term can't blow up the row.
+    :returns: The excerpt, or ``None`` when ``query`` is empty or does not
+        occur in ``text`` (caller then falls back to no preview).
+    """
+    if not query:
+        return None
+    collapsed = " ".join(text.split())
+    idx = collapsed.lower().find(query.lower())
+    if idx == -1:
+        return None
+    match_end = idx + len(query)
+    start = max(0, idx - context)
+    end = min(len(collapsed), match_end + context)
+    # Keep the total under max_len, but never clamp the matched term itself out
+    # of the window — otherwise the UI would highlight nothing. A pathologically
+    # long match term overflows max_len rather than being cut mid-term.
+    if end - start > max_len:
+        end = max(start + max_len, match_end)
+    snippet = collapsed[start:end]
+    if start > 0:
+        snippet = f"…{snippet}"
+    if end < len(collapsed):
+        snippet = f"{snippet}…"
+    return snippet
+
+
 # ── Timestamp ──────────────────────────────────────────
 
 

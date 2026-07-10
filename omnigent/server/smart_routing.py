@@ -196,24 +196,29 @@ Harness descriptions:
 - pi: Multi-model headless harness; can run both Claude and GPT models;
   best for read-only exploration, review, and cross-vendor verification.
 
-Model naming conventions — use these to judge cost and capability:
-- Claude family (cheapest → most capable): haiku < sonnet < opus.
-- GPT family: a -nano or -mini suffix always means cheaper and faster
-  than any base model (no suffix), regardless of version number. Tier
-  order: *-nano < *-mini < base. A newer base version (e.g. X.5) is
-  more capable and expensive than an older one (e.g. X.4), but a mini
-  or nano variant of any version is still cheaper than any base model.
+Model tiers (cheapest → most capable within each family):
+- Claude: haiku < sonnet < opus
+- GPT: *-nano < *-mini < base (e.g. gpt-5-4-nano < gpt-5-4-mini < gpt-5-4 < gpt-5-5)
 
-Trade-off guidance:
-- Simple tasks (greetings, quick lookups, one-line fixes) → cheapest model
-  (nano or mini if available, else haiku).
-- Moderately complex tasks (single-file edits, debugging, explanation)
-  → mid-range model.
-- Deeply complex tasks (multi-file refactors, architecture decisions,
-  security analysis, long reasoning chains) → most capable model.
+Trade-off guidance — classify the task and pick the corresponding model:
+
+  SIMPLE   → cheapest available model (haiku for Claude; nano for GPT)
+             Examples: greetings, quick lookups, one-line fixes, trivial Q&A.
+
+  MODERATE → mid-range model (sonnet for Claude; mini for GPT)
+             Examples: single-file edits, debugging a known issue, brief explanations.
+
+  COMPLEX  → most capable model (opus for Claude; newest base GPT)
+             Examples: multi-file refactors, architecture decisions, security analysis,
+             long reasoning chains, tasks requiring high accuracy or broad context.
+
+The rationale field must follow this exact pattern so the explanation is consistent
+with the model chosen:
+  "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); \
+selected [cheapest/mid-range/most capable] model [model-id]."
 
 Return **strict JSON only**:
-{{"harness": "<harness-id>", "model": "<model-id>", "rationale": "<one sentence>"}}
+{{"harness": "<harness-id>", "model": "<model-id>", "rationale": "<sentence>"}}
 """
 
 

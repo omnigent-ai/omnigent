@@ -275,6 +275,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
+  const getVisibleConversationsRef = useRef<() => Conversation[]>(() => []);
 
   const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
@@ -555,12 +556,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             {selectionMode ? (
               <BulkActionBar
                 selectedIds={selectedIds}
-                allConversations={(conversationsQuery.data?.pages ?? []).flatMap(
-                  (page) => page.data,
-                )}
-                onSelectAll={() =>
-                  selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
-                }
+                allConversations={getVisibleConversationsRef.current()}
+                onSelectAll={() => selectAll(getVisibleConversationsRef.current())}
                 onDeselectAll={deselectAll}
                 onClear={deselectAll}
                 onExit={exitSelectionMode}
@@ -650,6 +647,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
               getVisibleIdsRef={getVisibleIdsRef}
+              getVisibleConversationsRef={getVisibleConversationsRef}
             />
           </nav>
 
@@ -895,6 +893,7 @@ interface ConversationListProps {
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   getVisibleIdsRef: RefObject<() => string[]>;
+  getVisibleConversationsRef: RefObject<() => Conversation[]>;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -915,6 +914,7 @@ function ConversationList({
   selectedIds,
   onToggleSelected,
   getVisibleIdsRef,
+  getVisibleConversationsRef,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -1266,6 +1266,18 @@ function ConversationList({
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
+  getVisibleConversationsRef.current = () => {
+    const visible = (title: string, list: readonly Conversation[]) =>
+      effectiveCollapsedSections.includes(title) ? [] : [...list];
+    const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
+    const projectVisible = (name: string, list: readonly Conversation[]) =>
+      !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
+    return [
+      ...visible("Pinned", sections.pinned),
+      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...visible("Chats", sections.sessions),
+    ];
+  };
   // Getter that builds the shift-select visible order on demand (at click
   // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
   // during render — guarantees the project segment is always fresh even when a

@@ -29,17 +29,12 @@ from tests.harness_bench.verdict import Priority, Verdict, reconcile
 _OFFICIAL = list(OFFICIAL_PROFILES.values())
 _OFFICIAL_IDS = [p.harness for p in _OFFICIAL]
 
-# A community-style profile used to prove name-based resolution of an
-# out-of-repo harness that ships its own BenchProfile.
 _FAKE_PROFILE = BenchProfile(
     harness="fake-community",
     model="databricks-claude-sonnet-4-6",
     env_prefix="HARNESS_FAKE_",
     marker="FAKE_OK",
 )
-
-
-# ── Offline layer ───────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("profile", _OFFICIAL, ids=_OFFICIAL_IDS)
@@ -58,8 +53,6 @@ def test_profile_fields_wellformed(profile: BenchProfile) -> None:
 
 @pytest.mark.parametrize("profile", _OFFICIAL, ids=_OFFICIAL_IDS)
 def test_declared_covers_every_p0_dimension(profile: BenchProfile) -> None:
-    # Every P0 probe must have a declared verdict, or drift can never fire
-    # for that cell — the bench would silently under-report a regression.
     for probe in ALL_PROBES:
         if probe.priority is Priority.P0:
             assert profile.declared_for(probe.name) is not Verdict.UNKNOWN, (
@@ -68,8 +61,6 @@ def test_declared_covers_every_p0_dimension(profile: BenchProfile) -> None:
 
 
 def test_streaming_capability_declares_binary_verdict() -> None:
-    # Guards the kiro-native drift: streaming declares binary (True→SUPPORTED,
-    # False→UNSUPPORTED), never PARTIAL.
     from omnigent.harness_plugins import harness_capabilities
     from tests.harness_bench.manifest import _declared_from_capabilities
 
@@ -122,10 +113,6 @@ def test_resolve_registered_harness_by_name() -> None:
     assert profile.harness == "acp"
     assert profile.transport == "sdk-inproc"
 
-    # acp:<slug> is a first-class id: base `acp` is registered and the slug
-    # selects a configured ACP agent at spawn. It binds, keeping the full id as
-    # the harness (so config.harness=acp:qwen reaches the runner) and a valid
-    # env-prefix stem. An empty slug ("acp:") is refused.
     slug = resolve_profile("acp:qwen")
     assert slug.harness == "acp:qwen"
     assert slug.transport == "sdk-inproc"
@@ -153,8 +140,6 @@ def test_resolve_entry_point_plugin_and_alias() -> None:
     assert by_alias.harness == "rovo-cli" == by_name.harness
     assert by_alias.transport == "sdk-inproc"
     assert by_alias.cli_binary == "acli"  # skip-gates on the Atlassian CLI
-    # A model is always stamped (agent registration requires a non-empty one);
-    # it is inert for an own-auth harness, which uses its own.
     assert by_alias.model
 
 
@@ -174,8 +159,6 @@ def test_registry_profile_happy_path_no_plugin(monkeypatch: pytest.MonkeyPatch) 
     class _Spec:
         binary = "fakebin"
 
-    # A lightweight caps stand-in: _registry_profile + the prose/declared helpers
-    # only read integration_mode / auth / streaming / interrupt.
     caps = SimpleNamespace(
         integration_mode=IntegrationMode.CLI_SUBPROCESS,
         auth=AuthModel.OWN_AUTH,
@@ -224,7 +207,6 @@ def test_registry_refuses_native_server_mode(monkeypatch: pytest.MonkeyPatch) ->
 def test_infra_failure_reason_classifies_auth_and_ignores_capability_gaps() -> None:
     from tests.harness_bench.driver import TurnResult, infra_failure_reason
 
-    # A 403 gateway error is an environment problem -> yields a skip reason.
     auth = TurnResult(
         failed=True,
         error={
@@ -236,14 +218,9 @@ def test_infra_failure_reason_classifies_auth_and_ignores_capability_gaps() -> N
     assert reason is not None
     assert "403" in reason
 
-    # A plain failure with no infra marker is a real capability gap -> None.
     assert infra_failure_reason(TurnResult(failed=True, error="model refused the tool")) is None
-    # A successful turn is never an infra failure.
     assert infra_failure_reason(TurnResult(completed=True, text="ok")) is None
 
-    # Token-provisioning failures on full-server (codex/pi) are env/auth gaps,
-    # not capability gaps -> must yield a skip reason, never a false UNSUPPORTED
-    # that drifts against a SUPPORTED declaration.
     for msg in (
         "inner executor error: provider auth command `sh` produced an empty token",
         "PiExecutor(gateway=True) could not fetch a gateway token for the workspace host.",
@@ -255,7 +232,6 @@ def test_infra_failure_reason_classifies_auth_and_ignores_capability_gaps() -> N
 
 async def test_offline_render_produces_matrix() -> None:
     matrix = await run_bench(_OFFICIAL, live=False)
-    # Offline: nothing observed, so no drift and every cell is SKIPPED.
     assert not matrix.has_drift
     assert all(
         cell.observed is Verdict.SKIPPED for report in matrix.reports for cell in report.cells
@@ -264,12 +240,8 @@ async def test_offline_render_produces_matrix() -> None:
     assert "Harness capability matrix" in md
     for profile in _OFFICIAL:
         assert profile.harness in md
-    # The harness column is labelled with the *resolved* transport: an SDK
-    # harness shows its full-server default (not the sdk-inproc family marker),
-    # a native shows the short `native` label.
     assert "`claude-sdk [full-server]`" in md
     assert "`claude-native [native]`" in md
-    # JSON is well-formed and carries every harness, plus the resolved transport.
     payload = json.loads(render_json(matrix))
     assert {h["harness"] for h in payload["harnesses"]} == {p.harness for p in _OFFICIAL}
     by_harness = {h["harness"]: h for h in payload["harnesses"]}
@@ -304,19 +276,12 @@ async def test_render_table_grid_false_drops_grid_keeps_footer() -> None:
     full = render_table(matrix, declared=True, grid=True)
     footer = render_table(matrix, declared=True, grid=False)
 
-    # The full render has the heading + a harness row; the footer-only render
-    # has neither, but both carry the legend.
     assert "Harness capability matrix" in full
     assert "claude-sdk" in full
     assert "Harness capability matrix" not in footer
     assert "claude-sdk" not in footer
     assert "Legend:" in footer
-    # The offline note is suppressed, so a declared render's footer is just the
-    # legend -- no dangling "Notes:" header.
     assert footer.strip().startswith("Legend:")
-
-
-# ── Progress events / rich / parallel / report (offline) ─────────
 
 
 async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None:
@@ -393,12 +358,10 @@ async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None
     assert isinstance(sink.events[0], HarnessStarted)
     assert kinds[-1] == "HarnessFinished"
     assert isinstance(sink.events[-1], HarnessFinished)
-    # Every probe that ran emits a started+finished pair.
     assert any(isinstance(e, ProbeStarted) for e in sink.events)
     finished = [e for e in sink.events if isinstance(e, ProbeFinished)]
     assert {e.probe for e in finished} >= {"basic_turn", "streaming"}
 
-    # A bare callable is adapted to a LineSink (structured events → lines).
     lines: list[str] = []
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(
@@ -429,8 +392,6 @@ async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -
             return None
 
         async def __aenter__(self):
-            # Reverse-stagger the delay so, without order preservation, finish
-            # order would differ from input order.
             await _asyncio.sleep(0.02 if self._h.endswith("1") else 0.01)
             return self
 
@@ -483,14 +444,13 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
         def __exit__(self, *exc: object) -> None:
             pass
 
-        def register_agent(self, profile, *, deny: bool) -> str:
+        def register_agent(self, profile, *, policy_action: str | None = None) -> str:
             self.registered.append(profile.harness)
             return f"bench-{profile.harness}"
 
         def create_session(self, agent_name: str) -> str:
             return f"sess-{agent_name}"
 
-    # A full-server driver that records which shared server it was handed.
     class _FSDriver:
         transport = "full-server"
 
@@ -504,7 +464,7 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
 
         async def __aenter__(self):
             assert self._shared is not None  # parallel run injected the shared server
-            self._shared.register_agent(self._profile, deny=False)
+            self._shared.register_agent(self._profile, policy_action=None)
             self._shared.create_session(f"bench-{self._profile.harness}")
             return self
 
@@ -523,14 +483,11 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
         async def run_interrupt_turn(self) -> TurnResult:
             return TurnResult(cancelled=True)
 
-    # bench imports SharedFullServer into its own namespace, so patch it there.
     monkeypatch.setattr("tests.harness_bench.bench.SharedFullServer", _FakeShared)
     monkeypatch.setattr(
         "tests.harness_bench.bench.resolve_driver_class",
         lambda p, *, override=None, fast=False: _FSDriver,
     )
-    # Keep the shared-server gate cred-free: this test fakes the server + driver,
-    # so it must not depend on a resolvable Databricks profile (CI has none).
     monkeypatch.setattr("tests.harness_bench.bench.bench_creds_skip_reason", lambda p: None)
     monkeypatch.setattr("tests.harness_bench.bench.resolve_bench_env", lambda p: object())
 
@@ -547,7 +504,6 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
     matrix = await run_bench(
         profiles, databricks_profile="oss", live=True, jobs=3, transport="full-server"
     )
-    # Exactly one shared server, and all three harnesses registered on it.
     assert len(built) == 1
     assert sorted(built[0].registered) == ["fs-0", "fs-1", "fs-2"]
     assert [r.profile.harness for r in matrix.reports] == ["fs-0", "fs-1", "fs-2"]
@@ -567,9 +523,6 @@ def test_cli_writes_report_file(tmp_path) -> None:
     main(["--no-live", "--report", str(js)])
     payload = json.loads(js.read_text())
     assert payload.get("harnesses")
-
-
-# ── Live layer (gated) ──────────────────────────────────────────
 
 
 @pytest.fixture
@@ -592,8 +545,6 @@ async def test_live_harness_matches_declared(
 
     basic = next(c for c in report.cells if c.probe_name == "basic_turn")
     if basic.observed is Verdict.SKIPPED:
-        # Auth / gateway / connectivity problem (not a capability fact) —
-        # the harness could not be exercised, so skip rather than fail.
         pytest.skip(f"{profile.harness}: {basic.note}")
     assert basic.observed is Verdict.SUPPORTED, (
         f"{profile.harness}: basic turn did not work ({basic.note}); "
@@ -607,9 +558,6 @@ async def test_live_harness_matches_declared(
             for c in drifted
         )
     )
-
-
-# ── full-server async shims (offline) ───────────────────────────
 
 
 async def test_full_server_async_shims_delegate_to_sync(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -671,8 +619,6 @@ async def test_provisioning_failure_skips_and_tears_down(monkeypatch: pytest.Mon
             return None
 
         async def __aenter__(self):
-            # Simulates _wire_native_forwarder raising after the server/daemon
-            # are already up.
             raise RuntimeError("native forwarder did not wire up within 90.0s")
 
         async def __aexit__(self, *exc: object) -> None:
@@ -728,7 +674,6 @@ async def test_expected_provisioning_error_logged_quietly(
 
     profile = BenchProfile(harness="stub", model="m", env_prefix="HARNESS_STUB_", marker="X")
 
-    # Expected failure → a single INFO record, no exception/traceback attached.
     monkeypatch.setattr(
         "tests.harness_bench.bench.resolve_driver_class",
         lambda p, *, override=None, fast=False: _driver_raising(
@@ -741,7 +686,6 @@ async def test_expected_provisioning_error_logged_quietly(
     assert provisioning_logs, "expected a log line for the skip"
     assert all(r.levelno == logging.INFO and r.exc_info is None for r in provisioning_logs)
 
-    # Unexpected failure → WARNING with the traceback attached.
     caplog.clear()
     monkeypatch.setattr(
         "tests.harness_bench.bench.resolve_driver_class",
@@ -755,9 +699,6 @@ async def test_expected_provisioning_error_logged_quietly(
     )
 
 
-# ── native-tui transport (offline) ──────────────────────────────
-
-
 def test_native_tui_registered_and_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     """native-tui is in the registry and derives any native-tui harness."""
     from tests.harness_bench.native_tui_driver import NativeTuiDriver, native_vendor
@@ -765,30 +706,19 @@ def test_native_tui_registered_and_gates(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert driver_registry()["native-tui"] is NativeTuiDriver
 
-    # A --transport override routes any profile to the native driver.
     claude_native = BenchProfile(
         harness="claude-native", model="m", env_prefix="HARNESS_CLAUDE_NATIVE_", marker="X"
     )
     assert resolve_driver_class(claude_native, override="native-tui") is NativeTuiDriver
 
-    # Every native-tui harness derives a vendor from the capability model with
-    # no per-vendor table — an own-auth native (cursor) as much as a shipped
-    # credential one (claude). This is what lets a community-plugin native run
-    # by name with no bench edit.
     assert native_vendor("claude-native") is not None
     cursor = native_vendor("cursor-native")
     assert cursor is not None and cursor.own_auth is True
 
-    # A non-native-tui harness derives no vendor and gates cleanly: an SDK
-    # harness, or a native-server one (opencode-native), is not this driver's.
     assert native_vendor("claude-sdk") is None
     codex_sdk = BenchProfile(harness="codex", model="m", env_prefix="X_", marker="X")
     assert NativeTuiDriver.unavailable(codex_sdk, databricks_profile="oss") is not None
 
-    # No creds anywhere (no --profile, no ambient OPENAI_*, no configured
-    # profile) → capability-neutral skip. Clear the ambient env and stub the
-    # config lookup so the contract is tested deterministically regardless of
-    # the host's environment.
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setattr("tests.harness_bench.runtime_env._profile_from_config", lambda: None)
@@ -811,16 +741,12 @@ def test_transport_resolution_family_default_and_fast() -> None:
         harness="claude-native", model="m", env_prefix="X_", marker="X", transport="native-tui"
     )
 
-    # SDK family: full-server by default, sdk-inproc under --fast.
     assert resolve_transport_name(sdk, override=None, fast=False) == "full-server"
     assert resolve_transport_name(sdk, override=None, fast=True) == "sdk-inproc"
 
-    # native: a single transport --fast does not touch.
     assert resolve_transport_name(native, override=None, fast=False) == "native-tui"
     assert resolve_transport_name(native, override=None, fast=True) == "native-tui"
 
-    # An explicit --transport wins over both the default and --fast, for any
-    # family (the caller validates the name against the registry separately).
     assert resolve_transport_name(sdk, override="sdk-inproc", fast=False) == "sdk-inproc"
     assert resolve_transport_name(sdk, override="native-tui", fast=True) == "native-tui"
 
@@ -869,8 +795,6 @@ def test_full_server_skips_native_with_accurate_message() -> None:
     """
     from tests.harness_bench.full_server_driver import FullServerDriver
 
-    # Real native profiles carry transport="native-tui" (set in the manifest);
-    # that is what the full-server gate keys on.
     claude_native = BenchProfile(
         harness="claude-native",
         model="m",

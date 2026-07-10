@@ -560,6 +560,40 @@ describe("AgentPicker trigger label", () => {
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
+  it("prefers a claude session override over the cross-session sticky model", () => {
+    useChatStore.setState({
+      selectedModel: "opus",
+      sessionModelOverride: "sonnet",
+      selectedEffort: null,
+      llmModel: "haiku",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+        })}
+      />,
+    );
+
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Sonnet 4.6");
+    expect(trigger).not.toHaveTextContent("Opus");
+    trigger.click();
+
+    const sonnetRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="sonnet"]',
+    );
+    const opusRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="opus"]',
+    );
+    expect(sonnetRow).toHaveAttribute("data-active", "true");
+    expect(opusRow).not.toHaveAttribute("data-active", "true");
+  });
+
   it("still renders an enabled trigger when the model/effort label is unresolved", () => {
     // Regression guard: a claude-native session before the snapshot fills
     // llmModel/selectedEffort has no model label, no effort label, and no

@@ -2016,6 +2016,74 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_augment_claude_args_mirrors_launch_overrides_into_settings(
+    tmp_path: Path,
+) -> None:
+    """
+    Launch-time overrides are duplicated into the ``--settings`` sidecar.
+
+    Claude Code has had restart/re-exec paths that preserve ``--settings``
+    while rebuilding argv without ``--model`` / ``--effort`` /
+    ``--permission-mode``. Mirroring the same effective values into the
+    sidecar prevents a restarted wrapped CLI from falling back to the user's
+    global ``~/.claude/settings.json`` and diverging from the Omnigent
+    session pill.
+    """
+    args = augment_claude_args(
+        ("--model", "claude-fable-5", "--permission-mode", "auto", "--effort", "xhigh"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings["model"] == "claude-fable-5"
+    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["effortLevel"] == "xhigh"
+
+
+def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
+    tmp_path: Path,
+) -> None:
+    """The ``--model=<id>`` spelling is mirrored just like ``--model <id>``."""
+    args = augment_claude_args(
+        ("--model=claude-sonnet-5",),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings["model"] == "claude-sonnet-5"
+    assert "permissions" not in settings
+    assert "effortLevel" not in settings
+
+
+def test_augment_claude_args_uses_last_repeated_launch_override(
+    tmp_path: Path,
+) -> None:
+    """Repeated launch override flags mirror the same last-value-wins semantics."""
+    args = augment_claude_args(
+        (
+            "--model",
+            "claude-old",
+            "--model=claude-new",
+            "--permission-mode",
+            "default",
+            "--permission-mode",
+            "auto",
+            "--effort=low",
+            "--effort",
+            "high",
+        ),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings["model"] == "claude-new"
+    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["effortLevel"] == "high"
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.

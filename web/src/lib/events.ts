@@ -592,6 +592,29 @@ export interface SessionSandboxStatusEvent {
   error: string | null;
 }
 
+/** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */
+export type McpServerStartupState = "starting" | "ready" | "failed" | "cancelled";
+
+/** One MCP server's latest startup record within `session.mcp_startup`. */
+export interface McpServerStartup {
+  status: McpServerStartupState;
+  /** Failure detail when `status === "failed"`; `null` otherwise. */
+  error: string | null;
+}
+
+/**
+ * `session.mcp_startup` — per-MCP-server startup progress for a native
+ * harness session (codex-native today). Emitted while the harness boots
+ * its configured MCP servers, carrying the full latest map each time.
+ * Drives the MCP startup band on the session page so a slow or failing
+ * MCP server reads as live progress instead of a hung session.
+ */
+export interface SessionMcpStartupEvent {
+  type: "session_mcp_startup";
+  conversationId: string;
+  servers: Record<string, McpServerStartup>;
+}
+
 /**
  * `session.input.consumed` — a queued input item was persisted into
  * conversation history. Used to backfill optimistic user-bubble
@@ -807,6 +830,22 @@ export interface SessionSupersededEvent {
   reason: "clear";
 }
 
+/**
+ * `browser.action_request` — the agent's `browser_*` tool asks the desktop shell
+ * to run a browser action against this conversation's WebContentsView. Every
+ * renderer sees the event, but the relay (`useBrowserAgentRelay`) claims it first
+ * so only one executes; non-Electron renderers ignore it.
+ */
+export interface BrowserActionRequestEvent {
+  type: "browser_action_request";
+  /** Server-minted id; echoed on claim + result to resolve the parked Future. */
+  actionId: string;
+  /** The bare verb: "navigate" | "snapshot" | "click" | "type" | "screenshot". */
+  action: string;
+  /** Action-specific args (url, ref, selector, text, …); shape validated per-action. */
+  args: Record<string, unknown>;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -847,6 +886,7 @@ export type StreamEvent =
   | SessionTodosEvent
   | SessionTerminalPendingEvent
   | SessionSandboxStatusEvent
+  | SessionMcpStartupEvent
   | SessionInputConsumedEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
@@ -858,4 +898,5 @@ export type StreamEvent =
   | SessionTerminalActivityEvent
   | SessionSkillsEvent
   | SessionModelOptionsEvent
-  | SessionPresenceEvent;
+  | SessionPresenceEvent
+  | BrowserActionRequestEvent;

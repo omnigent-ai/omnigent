@@ -14,11 +14,18 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
+  isElectronShell,
   isAndroidShell,
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
 } from "@/lib/nativeBridge";
+import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import {
+  buildDesignModePrompt,
+  dataUrlToFile,
+  type DesignModeElement,
+} from "@/lib/designModePrompt";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   Dialog,
@@ -35,6 +42,7 @@ import {
   useChildSessions,
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
+import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
 import {
   AGENT_TERMINAL_IDS,
   inventoryTerminals,
@@ -454,6 +462,10 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
+        // Browser tab: Electron shell only — that's where the embedded
+        // WebContentsView lives. A plain web build has no embedded browser, so
+        // the tab is hidden entirely (isElectronShell() is constant per load).
+        browser: isElectronShell(),
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
@@ -486,16 +498,122 @@ export function AppShell() {
   // Keep the selected tab valid. When the current tab disappears — files
   // panel turns off, or the Shells tab hides (native wrapper / no shell
   // and no shell access) — fall back to the first still-visible tab in
-  // display order (Files · Agents · Shells · Tasks). Picking the first
+  // display order (Files · Agents · Shells · Tasks · Browser). Picking the first
   // available (rather than ping-ponging between two effects) keeps this
   // convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "subagents", "terminals", "todos"] as const).find(
+    const next = (["files", "subagents", "terminals", "todos", "browser"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
   }, [railTabsAvailable, rightRailTab]);
+
+  // Mount the relay at the always-present shell level (not BrowserPane, which
+  // only mounts while its tab is selected) so it's listening before the first
+  // browser_navigate. No-op outside Electron / with no conversation.
+  useBrowserAgentRelay(conversationId);
+
+  // Auto-surface the Browser tab on a `navigate` action, so a browser_navigate
+  // fired while another tab is selected doesn't load into a hidden pane.
+  // Electron-only; no-op elsewhere (the bus never fires without a relay).
+  useEffect(() => {
+    if (!isElectronShell()) return;
+    return onBrowserActionRequest((evt) => {
+      if (evt.action !== "navigate") return;
+      setRightRailTab("browser");
+      setRightPanelOpen(true);
+    });
+  }, []);
+
+  // Design-mode submit routing. Lives here (with the hoisted relay) because the
+  // in-page popup posts back via preload IPC delivered to the always-mounted
+  // shell, not BrowserPane. On submit: build the `[Design Mode — …]` message,
+  // attach the cropped screenshot, send via the NORMAL chat path (no backend
+  // route), then signal the result back for green/red. Dismiss is a no-op.
+  // Routes to the conversation's own bound agent (the picked element belongs to
+  // the page it drives). The screenshot arrives on the earlier element-selected
+  // event, so we stash the latest per conversation and pair it at submit time.
+  const designShotRef = useRef<Map<string, string>>(new Map());
+  const boundAgentId = boundAgent?.id ?? null;
+  useEffect(() => {
+    if (!isElectronShell()) return;
+    const w = window as unknown as {
+      omnigentDesktop?: {
+        onBrowserElementSelected?: (
+          cb: (p: { conversationId?: string; screenshot?: string | null }) => void,
+        ) => () => void;
+        onBrowserElementPromptSubmit?: (
+          cb: (p: {
+            conversationId?: string;
+            id?: number;
+            element?: DesignModeElement;
+            prompt?: string;
+          }) => void,
+        ) => () => void;
+        onBrowserElementPromptDismiss?: (
+          cb: (p: { conversationId?: string }) => void,
+        ) => () => void;
+        browserSignalDesignResult?: (
+          conversationId: string,
+          result: { id: number; ok: boolean; message?: string },
+        ) => Promise<{ ok: boolean; error?: string }>;
+      };
+    };
+    const desktop = w.omnigentDesktop;
+    if (!desktop) return;
+
+    const unsubSelected = desktop.onBrowserElementSelected?.((payload) => {
+      const cid = payload.conversationId;
+      if (!cid) return;
+      if (typeof payload.screenshot === "string") {
+        designShotRef.current.set(cid, payload.screenshot);
+      } else {
+        designShotRef.current.delete(cid);
+      }
+    });
+
+    const unsubSubmit = desktop.onBrowserElementPromptSubmit?.((payload) => {
+      const cid = payload.conversationId;
+      const submitId = typeof payload.id === "number" ? payload.id : 0;
+      const signal = (ok: boolean, message: string) => {
+        if (cid) void desktop.browserSignalDesignResult?.(cid, { id: submitId, ok, message });
+      };
+      if (!cid || !payload.element || !payload.prompt) {
+        signal(false, "Missing element or prompt.");
+        return;
+      }
+      if (!boundAgentId) {
+        signal(false, "No agent bound to this session yet.");
+        return;
+      }
+      try {
+        const text = buildDesignModePrompt(payload.element, payload.prompt);
+        const shot = designShotRef.current.get(cid);
+        const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
+        void useChatStore
+          .getState()
+          .send(text, boundAgentId, file ? [file] : undefined)
+          .then(() => signal(true, "Sent to agent."))
+          .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
+        // Clear the stashed screenshot so a later submit without a fresh pick
+        // doesn't reuse a stale crop.
+        designShotRef.current.delete(cid);
+      } catch (err) {
+        signal(false, `Error: ${String(err)}`);
+      }
+    });
+
+    // Dismiss is a no-op on the React side — the in-page popup tears its own
+    // UI down; we just don't want an unhandled subscription.
+    const unsubDismiss = desktop.onBrowserElementPromptDismiss?.(() => {});
+
+    return () => {
+      unsubSelected?.();
+      unsubSubmit?.();
+      unsubDismiss?.();
+    };
+  }, [boundAgentId]);
 
   // Build a stable Set of agent-changed file paths so the FileViewer context
   // can tell BlockRenderer which inline code spans are real workspace files.
@@ -1181,6 +1299,7 @@ export function AppShell() {
                       rightRailTab={rightRailTab}
                       onRightRailTabChange={handleRightRailTabChange}
                       showFilesPanel={showFilesPanel}
+                      showBrowserTab={railTabsAvailable.browser}
                       changedCount={changedCount}
                       showShellsTab={railTabsAvailable.terminals}
                       terminalsLength={railTerminals.length}
