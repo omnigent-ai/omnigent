@@ -90,6 +90,17 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+# ``yaml_implicit_resolvers`` is inherited by reference from PyYAML's base
+# ``Resolver``, so stripping entries in place rewrites the resolver tables
+# of ``yaml.SafeLoader`` (and every other loader) process-wide — after this
+# module was imported, plain ``yaml.safe_load`` returned the string
+# ``"false"`` for an unquoted ``false`` anywhere in the process. Give the
+# subclass its own copy (dict and per-character lists) first, so the
+# override stays scoped to ``_ConfigYamlLoader``.
+_ConfigYamlLoader.yaml_implicit_resolvers = {
+    _ch: _resolvers[:]
+    for _ch, _resolvers in _ConfigYamlLoader.yaml_implicit_resolvers.items()
+}
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)

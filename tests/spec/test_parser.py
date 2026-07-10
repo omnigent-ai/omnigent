@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import discover_host_skills, parse
+from omnigent.spec.parser import _ConfigYamlLoader, discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
@@ -3587,3 +3587,23 @@ def test_parse_credential_proxy_https_primitive_allowed_on_macos(tmp_path: Path)
     proxy = spec.os_env.sandbox.credential_proxy
     assert proxy is not None
     assert proxy.entries[0].scheme == "bearer"
+
+
+def test_yaml_bool_override_does_not_leak_into_global_loaders() -> None:
+    """
+    Importing this module's parser must not rewrite the resolver tables of
+    ``yaml.SafeLoader``: ``yaml_implicit_resolvers`` is inherited by reference
+    from PyYAML's base ``Resolver``, so stripping entries in place leaks the
+    YAML-1.2 bool override into every ``yaml.safe_load`` call in the process.
+    A plain ``safe_load`` must keep full YAML 1.1 bool semantics, while
+    ``_ConfigYamlLoader`` keeps its narrowed ones.
+    """
+    # Global loaders keep YAML 1.1 semantics (parser.py is imported above).
+    assert yaml.safe_load("in_cluster: false") == {"in_cluster": False}
+    assert yaml.safe_load("enabled: true") == {"enabled": True}
+    assert yaml.safe_load("switch: on") == {"switch": True}
+
+    # The narrowed semantics stay scoped to _ConfigYamlLoader.
+    assert yaml.load("on: [request]", Loader=_ConfigYamlLoader) == {"on": ["request"]}
+    assert yaml.load("flag: false", Loader=_ConfigYamlLoader) == {"flag": False}
+    assert yaml.load("flag: no", Loader=_ConfigYamlLoader) == {"flag": "no"}
