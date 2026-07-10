@@ -792,7 +792,7 @@ def reap_orphaned_terminals() -> int:
             continue
         socket_path = entry / "tmux.sock"
         if socket_path.exists():
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            try:
                 subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
                     # kill-server on an already-dead server exits non-zero;
@@ -801,6 +801,17 @@ def reap_orphaned_terminals() -> int:
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
+            except (OSError, subprocess.TimeoutExpired):
+                # Keep the socket path and owner marker so a later startup can
+                # retry. Removing them here would leave a wedged tmux server
+                # alive but permanently unreachable by the orphan sweep.
+                logger.warning(
+                    "Failed to stop orphaned terminal tmux server at %s; "
+                    "retaining instance metadata for retry",
+                    socket_path,
+                    exc_info=True,
+                )
+                continue
         shutil.rmtree(entry, ignore_errors=True)
         reaped += 1
     return reaped

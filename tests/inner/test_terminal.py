@@ -1259,6 +1259,35 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
 
 
+def test_reap_orphaned_terminals_retains_metadata_when_kill_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out tmux server remains reachable for a later cleanup retry."""
+
+    def _time_out(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TimeoutError
+
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(run=_time_out, TimeoutExpired=TimeoutError),
+    )
+    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-wedged", _dead_pid())
+    socket_path = dead_dir / "tmux.sock"
+    socket_path.touch()
+
+    reaped = terminal_mod.reap_orphaned_terminals()
+
+    assert reaped == 0
+    assert dead_dir.exists()
+    assert socket_path.exists()
+    assert (dead_dir / "owner.pid").exists()
+
+
 @pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="sandbox backends only resolve on Linux (bwrap) or macOS (seatbelt)",

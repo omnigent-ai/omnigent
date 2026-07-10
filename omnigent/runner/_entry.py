@@ -979,18 +979,6 @@ def create_app(
     from omnigent.terminals import TerminalRegistry
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
-    # Reap terminal tmux servers leaked by a previous runner that died
-    # without graceful shutdown (SIGKILL / harness teardown). Detached
-    # tmux outlives its supervisor, and runner-bound SDK sessions now
-    # auto-create the embedded REPL terminal — without this sweep every
-    # ungraceful exit leaks one tmux server per session (enough to
-    # starve CI hosts running many short-lived runners).
-    _reaped_terminals = reap_orphaned_terminals()
-    if _reaped_terminals:
-        _logger.info(
-            "Reaped %d orphaned terminal tmux server(s) from prior runs",
-            _reaped_terminals,
-        )
 
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
@@ -1011,6 +999,16 @@ def create_app(
     async def _start_pm() -> None:
         """Start harness process manager; register MCP prewarm metadata if requested."""
         await pm.start()
+        # Process-manager startup first terminates orphan runners from prior
+        # instances. Only after that can their detached tmux owners read as
+        # dead; sweeping before pm.start() misses them and no later startup
+        # pass revisits the newly orphaned terminals.
+        _reaped_terminals = reap_orphaned_terminals()
+        if _reaped_terminals:
+            _logger.info(
+                "Reaped %d orphaned terminal tmux server(s) from prior runs",
+                _reaped_terminals,
+            )
         prewarm_path = os.environ.get(_RUNNER_PREWARM_SPEC_PATH_ENV_VAR)
         if prewarm_path and mcp_manager is not None:
             try:

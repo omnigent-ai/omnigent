@@ -1144,6 +1144,7 @@ async def test_runner_shutdown_closes_terminal_registry(
     mcp_managers: list[_TrackingMcpManager] = []
     async_clients: list[_TrackingAsyncClient] = []
     sync_clients: list[_TrackingSyncClient] = []
+    startup_events: list[str] = []
 
     class _FakeProcessManager:
         def __init__(self) -> None:
@@ -1153,6 +1154,7 @@ async def test_runner_shutdown_closes_terminal_registry(
 
         async def start(self) -> None:
             self.started = True
+            startup_events.append("process_manager_started")
 
         async def shutdown(self) -> None:
             self.shutdown_called = True
@@ -1197,6 +1199,10 @@ async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch.setattr(entry_mod.httpx, "Client", _sync_client_factory)
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
     monkeypatch.setattr(
+        "omnigent.inner.terminal.reap_orphaned_terminals",
+        lambda: startup_events.append("terminals_reaped") or 1,
+    )
+    monkeypatch.setattr(
         "omnigent.runner.identity.get_stable_runner_id",
         lambda: "runner-test-id",
     )
@@ -1207,6 +1213,7 @@ async def test_runner_shutdown_closes_terminal_registry(
         pass
 
     assert process_managers and process_managers[0].shutdown_called
+    assert startup_events == ["process_manager_started", "terminals_reaped"]
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are
