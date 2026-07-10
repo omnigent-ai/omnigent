@@ -24,8 +24,12 @@ from typing import Any
 
 import httpx
 import pytest
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from omnigent.inner.executor import Executor
+from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
@@ -813,6 +817,149 @@ class _StubExecutor(Executor):
     """
 
 
+@pytest.fixture
+def in_memory_span_exporter() -> Iterator[InMemorySpanExporter]:
+    """Install a fresh OTel provider for adapter tracing assertions."""
+    from omnigent.inner.tracing import disable_tracing, enable_tracing, is_tracing_enabled
+
+    previous = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    previous_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    tracing_was_enabled = is_tracing_enabled()
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    try:
+        yield exporter
+    finally:
+        exporter.clear()
+        with contextlib.suppress(Exception):
+            provider.shutdown()
+        otel_trace._TRACER_PROVIDER = previous  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = previous_done  # type: ignore[attr-defined]
+        if tracing_was_enabled:
+            enable_tracing()
+        else:
+            disable_tracing()
+
+
+class _NoInjectionTurnContext:
+    """Recording turn context with the async surfaces ``run_turn`` needs."""
+
+    def __init__(self, response_id: str = "resp_child") -> None:
+        """Initialize a context that never receives mid-turn injections."""
+        import asyncio as _aio
+
+        self.response_id = response_id
+        self.cancelled = _aio.Event()
+        self.emitted: list[Any] = []
+
+    def emit(self, event: Any) -> None:
+        """Record an emitted event."""
+        self.emitted.append(event)
+
+    async def next_injection(self, timeout: float | None = None) -> Any:
+        """Block until the adapter's injection watcher is cancelled."""
+        import asyncio as _aio
+
+        del timeout
+        await _aio.sleep(3600)
+        return None
+
+
+class _NestedChildTraceExecutor(Executor):
+    """Executor script that keeps the child turn open around a nested tool."""
+
+    async def run_turn(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        """Yield one nested tool call and then complete with real output."""
+        import asyncio as _aio
+
+        from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, TurnComplete
+
+        del messages, tools, system_prompt, config
+        yield ToolCallRequest(
+            name="child_tool",
+            args={"value": 1},
+            metadata={"call_id": "call_child_tool"},
+        )
+        await _aio.sleep(0.01)
+        yield ToolCallComplete(
+            name="child_tool",
+            result={"ok": True},
+            metadata={"call_id": "call_child_tool"},
+            duration_ms=17.0,
+        )
+        await _aio.sleep(0.01)
+        yield TurnComplete(response="child result")
+
+
+@pytest.mark.asyncio
+async def test_child_turn_agent_span_nests_under_parent_tool_traceparent(
+    in_memory_span_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A child turn uses the dispatching ``tool:sys_session_send`` span as
+    its remote parent and keeps its agent span open around real execution.
+    """
+    from omnigent.inner.tracing import TracingContext, enable_tracing
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.telemetry import traceparent_from_span
+    from omnigent.server.schemas import CreateResponseRequest
+
+    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+    enable_tracing()
+
+    parent_ctx = TracingContext(session_id="conv_parent")
+    parent_agent = parent_ctx.start_agent_span(agent_name="parent", user_message="dispatch")
+    parent_tool = parent_ctx.start_tool_span(
+        tool_name="sys_session_send",
+        tool_args={"agent": "worker", "input": "do work"},
+    )
+    traceparent = traceparent_from_span(parent_tool)
+    assert traceparent is not None
+    parent_ctx.end_tool_span(parent_tool, result={"status": "launching"})
+    parent_ctx.end_agent_span(parent_agent, response="launched")
+
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: _NestedChildTraceExecutor(),
+        session_key="conv_child",
+    )
+    child_ctx = _NoInjectionTurnContext(response_id="resp_child_trace")
+    await adapter.run_turn(
+        CreateResponseRequest(
+            model="root-agent",
+            agent_name="worker",
+            input="child input",
+            parent_tool_traceparent=traceparent,
+        ),
+        child_ctx,  # type: ignore[arg-type]
+    )
+
+    spans = {span.name: span for span in in_memory_span_exporter.get_finished_spans()}
+    parent_tool_span = spans["tool:sys_session_send"]
+    child_agent_span = spans["agent:worker"]
+    child_tool_span = spans["tool:child_tool"]
+
+    assert child_agent_span.context.trace_id == parent_tool_span.context.trace_id
+    assert child_agent_span.parent is not None
+    assert child_agent_span.parent.span_id == parent_tool_span.context.span_id
+    assert child_tool_span.parent is not None
+    assert child_tool_span.parent.span_id == child_agent_span.context.span_id
+    assert child_agent_span.start_time < child_tool_span.start_time
+    assert child_agent_span.end_time > child_tool_span.end_time
+    attrs = dict(child_agent_span.attributes or {})
+    assert attrs["gen_ai.agent.name"] == "worker"
+    assert attrs["output.value"] == "child result"
+
+
 def test_translate_input_to_messages_reconstructs_full_history() -> None:
     """
     Role-keyed message items in ``input`` must round-trip back
@@ -1313,6 +1460,7 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             name: str,
             arguments: str,
             agent: str,
+            traceparent: str | None = None,
         ) -> str:
             """Record the call_id then return a benign payload.
 
@@ -1323,7 +1471,7 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             :returns: Empty JSON object so
                 ``_bridge_one_dispatch`` can decode.
             """
-            del name, arguments, agent
+            del name, arguments, agent, traceparent
             captured_call_ids.append(call_id)
             return "{}"
 
@@ -1437,6 +1585,7 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             name: str,
             arguments: str,
             agent: str,
+            traceparent: str | None = None,
         ) -> str:
             """
             Record the call_id and return a benign payload.
@@ -1452,7 +1601,7 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             :returns: ``"{}"`` so the inner SDK can decode it as
                 JSON without errors.
             """
-            del name, arguments, agent
+            del name, arguments, agent, traceparent
             captured_dispatched_call_ids.append(call_id)
             return "{}"
 
@@ -1476,7 +1625,7 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
 @pytest.mark.asyncio
 async def test_executor_adapter_builds_config_from_request() -> None:
     """Forwards request controls but not agent name as executor model."""
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.inner.executor import Executor, TurnComplete
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
@@ -1527,7 +1676,7 @@ async def test_executor_adapter_forwards_model_override_to_config() -> None:
     Without this, every harness-backed agent silently ignores
     ``/model``.
     """
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.inner.executor import Executor, TurnComplete
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest

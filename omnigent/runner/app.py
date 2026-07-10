@@ -7580,6 +7580,37 @@ def unregister_child_session(child_session_id: str) -> None:
     :param child_session_id: Child session id to forget.
     """
     _child_session_parents.pop(child_session_id, None)
+    _pending_child_turn_traceparents.pop(child_session_id, None)
+
+
+# child_session_id → W3C traceparent of the parent's dispatching tool span.
+# One entry per pending child turn; a re-send overwrites before the child
+# message is posted and then popped while building the harness payload.
+_pending_child_turn_traceparents: dict[str, str] = {}
+
+
+def stash_child_turn_traceparent(child_session_id: str, traceparent: str) -> None:
+    """
+    Record the parent tool span traceparent for a child's next turn.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child123"``.
+    :param traceparent: W3C traceparent of the dispatching
+        ``tool:sys_session_send`` span,
+        e.g. ``"00-<32 hex>-<16 hex>-01"``.
+    """
+    _pending_child_turn_traceparents[child_session_id] = traceparent
+
+
+def pop_child_turn_traceparent(child_session_id: str) -> str | None:
+    """
+    Consume the stashed parent tool span traceparent for a child turn.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child123"``.
+    :returns: The traceparent, or ``None`` when the turn was not
+        dispatched via ``sys_session_send`` (or the parent ran
+        without tracing).
+    """
+    return _pending_child_turn_traceparents.pop(child_session_id, None)
 
 
 def _session_status_to_task_status(status: object) -> str | None:
@@ -13555,6 +13586,13 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        # Sub-agent telemetry: nest the child agent span under the
+        # parent tool span, and use the sub-agent name for span naming.
+        _parent_tool_traceparent = pop_child_turn_traceparent(conv)
+        if _parent_tool_traceparent:
+            harness_body["parent_tool_traceparent"] = _parent_tool_traceparent
+        if _sa_name:
+            harness_body["agent_name"] = _sa_name
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:
@@ -14140,6 +14178,7 @@ def create_runner_app(
                 dispatch_tool_locally,
                 get_arguments,
                 get_call_id,
+                get_item_traceparent,
                 get_tool_name,
                 is_action_required,
                 should_dispatch_locally,
@@ -14517,6 +14556,7 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
+                                                    tool_traceparent=get_item_traceparent(event),
                                                 )
                                             )
                                         )

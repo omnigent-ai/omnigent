@@ -511,6 +511,21 @@ def get_arguments(event: dict[str, Any]) -> str:
     return (event.get("item") or {}).get("arguments", "{}")
 
 
+def get_item_traceparent(event: dict[str, Any]) -> str | None:
+    """
+    Extract the dispatching tool span's W3C traceparent, when present.
+
+    The harness stamps ``traceparent`` on ``sys_session_send``
+    action_required items (see ``TurnContext.dispatch_tool``) so the
+    child session's agent span can nest under the parent's tool span.
+
+    :param event: An action_required SSE event dict.
+    :returns: The traceparent string, or ``None`` when absent/invalid.
+    """
+    value = (event.get("item") or {}).get("traceparent")
+    return value if isinstance(value, str) and value else None
+
+
 def should_dispatch_locally(tool_name: str) -> bool:
     """Return True if this tool should be dispatched by the runner locally.
 
@@ -1363,6 +1378,7 @@ async def _execute_subagent_tool(
     agent_spec: Any | None = None,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
     session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    tool_traceparent: str | None = None,
 ) -> str:
     """
     Dispatch a sub-agent tool call (``sys_session_send``).
@@ -1388,6 +1404,11 @@ async def _execute_subagent_tool(
         discovery events to the parent stream.
     :param session_inbox: Parent session's inbox queue for async
         completion delivery.
+    :param tool_traceparent: W3C traceparent of the parent's dispatching
+        ``tool:sys_session_send`` span. Stashed on the runner so the
+        child turn's harness payload carries it as
+        ``parent_tool_traceparent`` and the child agent span nests under
+        the parent's tool span.
     :returns: JSON child-session handle, or an error string.
     """
     # Lazy import to avoid circular dependency at module load.
@@ -1470,6 +1491,7 @@ async def _execute_subagent_tool(
             server_client=server_client,
             conversation_id=conversation_id,
             publish_event=publish_event,
+            tool_traceparent=tool_traceparent,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -1786,6 +1808,12 @@ async def _execute_subagent_tool(
         return copy_result.error
     message_content = copy_result.content
 
+    # Stash the dispatching tool span's traceparent BEFORE posting the
+    # message — the server forwards it to the runner and starts the
+    # child turn, so a post-hoc stash could lose the race.
+    if tool_traceparent is not None:
+        _runner_app.stash_child_turn_traceparent(child_session_id, tool_traceparent)
+
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
     # turn.
@@ -1857,6 +1885,7 @@ async def _send_to_existing_session(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    tool_traceparent: str | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -1878,6 +1907,9 @@ async def _send_to_existing_session(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's own session id — the required
         parent of the target.
+    :param tool_traceparent: W3C traceparent of the caller's dispatching
+        ``tool:sys_session_send`` span; stashed for the target's next
+        turn so its agent span nests under this send's tool span.
     :returns: JSON handle on success; a JSON/text error otherwise.
     """
     from omnigent.runner import app as _runner_app
@@ -1947,6 +1979,10 @@ async def _send_to_existing_session(
         session_name=parsed.title or "",
         publish_event=publish_event,
     )
+
+    # Stash before posting — the post starts the child turn.
+    if tool_traceparent is not None:
+        _runner_app.stash_child_turn_traceparent(target_session_id, tool_traceparent)
 
     try:
         msg_resp = await server_client.post(
@@ -2439,6 +2475,7 @@ async def _execute_web_fetch_tool(
     task_id: str | None,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
     session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    tool_traceparent: str | None = None,
 ) -> str:
     """
     Dispatch a ``web_fetch`` tool call.
@@ -2494,6 +2531,7 @@ async def _execute_web_fetch_tool(
         agent_spec=agent_spec,
         publish_event=publish_event,
         session_inbox=session_inbox,
+        tool_traceparent=tool_traceparent,
     )
 
 
@@ -4307,6 +4345,7 @@ async def execute_tool(
     harness_client: httpx.AsyncClient | None = None,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    tool_traceparent: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -4330,6 +4369,9 @@ async def execute_tool(
         so that ``sys_os_write`` and ``sys_os_edit`` calls record changed
         paths for the ``GET …/changes`` endpoint. ``sys_os_shell`` is
         not tracked — shell side-effects cannot be attributed to a session.
+    :param tool_traceparent: W3C traceparent of the harness-side tool
+        span dispatching this call. Forwarded to sub-agent spawning
+        tools so the child turn's agent span nests under it.
     :returns: Tool output string.
     """
     try:
@@ -4411,6 +4453,7 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 publish_event=publish_event,
                 session_inbox=session_inbox,
+                tool_traceparent=tool_traceparent,
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
@@ -4440,6 +4483,7 @@ async def execute_tool(
                 task_id=task_id,
                 publish_event=publish_event,
                 session_inbox=session_inbox,
+                tool_traceparent=tool_traceparent,
             )
         elif tool_name in _WEB_SEARCH_TOOLS:
             output = await _execute_web_search_tool(
@@ -4603,6 +4647,7 @@ async def dispatch_tool_locally(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    tool_traceparent: str | None = None,
 ) -> str:
     """Execute a tool locally and PATCH the result to the harness.
 
@@ -4624,6 +4669,10 @@ async def dispatch_tool_locally(
         for the ``GET …/changes`` endpoint.
     :param resource_registry: Optional session-resource registry used to
         observe tool-launched terminals.
+    :param tool_traceparent: W3C traceparent of the harness-side tool
+        span dispatching this call (from the action_required item's
+        ``traceparent`` field). Forwarded so sub-agent child turns can
+        nest their agent span under the dispatching tool span.
     :returns: The tool output string.
     """
     output = await execute_tool(
@@ -4644,6 +4693,7 @@ async def dispatch_tool_locally(
         harness_client=harness_client,
         filesystem_registry=filesystem_registry,
         publish_event=publish_event,
+        tool_traceparent=tool_traceparent,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the

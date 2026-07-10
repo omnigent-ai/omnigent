@@ -693,6 +693,58 @@ def get_traceparent_env() -> dict[str, str]:
     return result
 
 
+def traceparent_from_span(span: Span) -> str | None:
+    """
+    Serialize a span's :class:`SpanContext` as a W3C ``traceparent`` string.
+
+    Used to hand a specific span — not the ambient context — across a
+    process boundary as the parent for remote children. The sub-agent
+    dispatch path serializes the parent's ``tool:sys_session_send`` span
+    here so the child harness can parent its agent span under it even
+    after the tool span has ended (OTel permits children of ended
+    parents via a remote ``SpanContext``).
+
+    :param span: The span whose context to serialize, e.g. the active
+        TOOL span for a ``sys_session_send`` dispatch.
+    :returns: A ``"00-<trace_id>-<span_id>-<flags>"`` traceparent, or
+        ``None`` when the span has no valid context (e.g. a no-op span
+        from the default tracer provider).
+    """
+    ctx = span.get_span_context()
+    if ctx is None or not ctx.is_valid:
+        return None
+    return f"00-{ctx.trace_id:032x}-{ctx.span_id:016x}-{int(ctx.trace_flags):02x}"
+
+
+@contextmanager
+def trace_context_from_traceparent(traceparent: str) -> Iterator[None]:
+    """
+    Attach a remote W3C ``traceparent`` as the ambient trace context.
+
+    The receive-side counterpart to :func:`traceparent_from_span` for
+    in-process span creation (rather than frame handling — see
+    :func:`consume_frame_span` for that). Any span started inside the
+    context manager without an explicit parent becomes a child of the
+    remote span and shares its trace ID. The sub-agent child turn uses
+    this so its agent span nests under the parent's dispatching tool
+    span instead of rooting a fresh trace.
+
+    :param traceparent: A W3C traceparent string, e.g.
+        ``"00-<32 hex>-<16 hex>-01"``.
+    :raises ValueError: Never — an unparseable traceparent yields an
+        empty context, so spans simply root a new trace.
+    """
+    from opentelemetry import context
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    ctx = TraceContextTextMapPropagator().extract({"traceparent": traceparent})
+    token = context.attach(ctx)
+    try:
+        yield
+    finally:
+        context.detach(token)
+
+
 def inject_trace_context(carrier: dict[str, str]) -> dict[str, str]:
     """
     Inject the active W3C trace context into a dict carrier.

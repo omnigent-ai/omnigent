@@ -961,6 +961,19 @@ class CreateResponseRequest(BaseModel):
     # the message, so the runner can drop the buffered copy and not
     # re-deliver it in a continuation turn. ``None`` for fresh turns.
     injection_id: str | None = None
+    # W3C traceparent of the parent turn's dispatching tool span
+    # (``tool:sys_session_send``). Stamped by the runner on sub-agent
+    # child turns so the child harness parents its agent span under the
+    # parent's tool span (same trace) instead of rooting a fresh trace
+    # from the child response id. ``None`` for non-child turns and when
+    # the parent turn ran without tracing.
+    parent_tool_traceparent: str | None = None
+    # Display/telemetry agent name for this turn. For sub-agent child
+    # turns the runner stamps the SUB-agent's name here (``model``
+    # carries the value the server forwarded, which for child sessions
+    # is the root agent's name). Tracing prefers this over ``model``
+    # for ``gen_ai.agent.name`` / the ``agent:<name>`` span name.
+    agent_name: str | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None

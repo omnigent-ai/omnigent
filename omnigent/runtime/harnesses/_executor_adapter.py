@@ -109,6 +109,12 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
 
+# Runner tools that spawn or continue a child session. Their dispatches
+# carry the active tool span's traceparent so the child turn's agent span
+# nests under the dispatching tool span (same trace) instead of rooting a
+# fresh trace. See :meth:`ExecutorAdapter._dispatch_traceparent`.
+_CHILD_SPAWNING_TOOLS = frozenset({"sys_session_send", "web_fetch"})
+
 
 def _strip_mcp_tool_prefix(name: str) -> str:
     """
@@ -374,11 +380,16 @@ class ExecutorAdapter(HarnessApp):
             trace_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
             if tctx:
                 try:
-                    from omnigent.runtime.telemetry import trace_context_for_response
+                    if request.parent_tool_traceparent:
+                        from omnigent.runtime.telemetry import trace_context_from_traceparent
 
-                    trace_cm = trace_context_for_response(response_id=ctx.response_id)
+                        trace_cm = trace_context_from_traceparent(request.parent_tool_traceparent)
+                    else:
+                        from omnigent.runtime.telemetry import trace_context_for_response
+
+                        trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
-                    _logger.debug("trace_context_for_response unavailable", exc_info=True)
+                    _logger.debug("trace context setup unavailable", exc_info=True)
             # Bind the session for the whole turn so every span the harness
             # creates (agent/LLM/tool, the native tmux inject, DB/httpx child
             # spans) is tagged with session.id by the span processor — no
@@ -386,7 +397,7 @@ class ExecutorAdapter(HarnessApp):
             with session_scope(turn_session_id), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
-                        agent_name=request.model or "unknown",
+                        agent_name=request.agent_name or request.model or "unknown",
                         user_message=user_message,
                         model=request.model_override or request.model,
                     )
@@ -695,7 +706,39 @@ class ExecutorAdapter(HarnessApp):
             tool_name,
             args,
             call_id=dispatch_call_id,
+            traceparent=self._dispatch_traceparent(tool_name),
         )
+
+    def _dispatch_traceparent(self, tool_name: str) -> str | None:
+        """
+        Serialize the span a child-spawning dispatch should parent
+        remote children under.
+
+        Prefers the active ``tool:<name>`` span (started when the turn
+        loop translated the ToolCallRequest); when the dispatch races
+        ahead of that translation — or a parallel tool call moved the
+        cursor — falls back to the turn's agent span so the child still
+        joins this turn's trace one level up.
+
+        :param tool_name: Bare tool name from the dispatch callback,
+            e.g. ``"sys_session_send"``.
+        :returns: A W3C traceparent string, or ``None`` for
+            non-child-spawning tools and when tracing is inactive.
+        """
+        bare_name = _strip_mcp_tool_prefix(tool_name)
+        if bare_name not in _CHILD_SPAWNING_TOOLS:
+            return None
+        tctx = self._tracing_ctx
+        if tctx is None or not tctx.active:
+            return None
+        from omnigent.runtime.telemetry import traceparent_from_span
+
+        span = tctx._current_span
+        if span is None or getattr(span, "name", None) != f"tool:{bare_name}":
+            span = tctx._root_span
+        if span is None:
+            return None
+        return traceparent_from_span(span)
 
     async def _stable_elicitation_handler(
         self,
@@ -1432,6 +1475,7 @@ async def _bridge_one_dispatch(
     args: dict[str, Any],
     *,
     call_id: str | None = None,
+    traceparent: str | None = None,
 ) -> dict[str, Any]:
     """
     Round-trip one tool call through ``ctx.dispatch_tool``.
@@ -1456,6 +1500,10 @@ async def _bridge_one_dispatch(
         freshly-allocated uuid — the dispatch still works but the
         observed and action_required events render as separate
         ``⏵ tool_name`` lines.
+    :param traceparent: Optional W3C traceparent of the dispatching
+        tool span, forwarded onto the action_required item so remote
+        children can nest under it (see
+        :meth:`ExecutorAdapter._dispatch_traceparent`).
     :returns: A dict suitable as the MCP tool result.
     """
     import json
@@ -1468,6 +1516,7 @@ async def _bridge_one_dispatch(
             name=tool_name,
             arguments=json.dumps(args),
             agent=agent,
+            traceparent=traceparent,
         )
     except Exception as exc:
         _logger.exception("dispatch_tool failed for %s", tool_name)
