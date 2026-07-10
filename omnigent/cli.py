@@ -5919,8 +5919,8 @@ class _NativeTerminalDispatchSpec:
     module: str
     function: str
     args_param: str
-    model_strategy: Literal["passthrough", "first_class"] = "passthrough"
-    prompt_none: bool = False
+    model_strategy: Literal["passthrough", "first_class", "explicit_passthrough"] = "passthrough"
+    prompt_param: str | None = None
 
 
 _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
@@ -5961,12 +5961,13 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         function="run_kiro_native",
         args_param="kiro_args",
         model_strategy="first_class",
-        prompt_none=True,
+        prompt_param="prompt",
     ),
     "goose": _NativeTerminalDispatchSpec(
         module="omnigent.goose_native",
         function="run_goose_native",
         args_param="goose_args",
+        model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
         module="omnigent.antigravity_native",
@@ -5978,11 +5979,13 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.qwen_native",
         function="run_qwen_native",
         args_param="qwen_args",
+        model_strategy="explicit_passthrough",
     ),
     "hermes": _NativeTerminalDispatchSpec(
         module="omnigent.hermes_native",
         function="run_hermes_native",
         args_param="hermes_args",
+        model_strategy="explicit_passthrough",
     ),
 }
 
@@ -5992,6 +5995,7 @@ def _dispatch_native_terminal_harness(
     harness: str,
     server: str | None,
     model: str | None,
+    model_from_cli: bool,
     prompt: str | None,
     system_prompt: str | None,
     tools: str | None,
@@ -6016,7 +6020,8 @@ def _dispatch_native_terminal_harness(
     straight to the native wrapper (the same code ``omnigent cursor`` /
     ``omnigent claude`` / etc. run), keeping the TUI the single source of
     turns. A top-level ``--model`` is forwarded in the shape each wrapper
-    expects.
+    expects; wrappers with their own config receive it only when explicitly
+    provided on the command line.
 
     ``--continue`` is honored (not rejected): it resolves to this harness's
     most-recent conversation and hands that off to the wrapper, matching the
@@ -6031,6 +6036,9 @@ def _dispatch_native_terminal_harness(
     native_agent = native_coding_agent_for_harness(harness)
     if native_agent is None:
         return False
+    spec = _NATIVE_TERMINAL_DISPATCH_SPECS.get(native_agent.key)
+    if spec is None:  # pragma: no cover - new native agent added without a dispatch spec
+        raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
 
     # The native TUI wrappers attach to a tmux pane and own their own turn
     # loop, so REPL-only options have no analog there. Reject them loudly
@@ -6040,7 +6048,7 @@ def _dispatch_native_terminal_harness(
     unsupported = [
         flag
         for flag, active in (
-            ("-p/--prompt", prompt is not None),
+            ("-p/--prompt", prompt is not None and spec.prompt_param is None),
             ("--system-prompt", system_prompt is not None),
             ("--tools", tools is not None),
             ("--log", log),
@@ -6090,18 +6098,16 @@ def _dispatch_native_terminal_harness(
         "resume_picker": resume_picker,
         "auto_open_conversation": auto_open_conversation,
     }
-    spec = _NATIVE_TERMINAL_DISPATCH_SPECS.get(native_agent.key)
-    if spec is None:  # pragma: no cover - new native agent added without a dispatch spec
-        raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
-
     launcher_kwargs = dict(common)
     if spec.model_strategy == "first_class":
         launcher_kwargs[spec.args_param] = ()
         launcher_kwargs["model"] = model
+    elif spec.model_strategy == "explicit_passthrough":
+        launcher_kwargs[spec.args_param] = passthrough if model_from_cli else ()
     else:
         launcher_kwargs[spec.args_param] = passthrough
-    if spec.prompt_none:
-        launcher_kwargs["prompt"] = None
+    if spec.prompt_param is not None:
+        launcher_kwargs[spec.prompt_param] = prompt
 
     launcher = getattr(import_module(spec.module), spec.function)
     launcher(**launcher_kwargs)
@@ -6152,6 +6158,7 @@ def _dispatch_run(
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
     server_from_cli: bool = False,
+    model_from_cli: bool = False,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -6194,6 +6201,8 @@ def _dispatch_run(
     :param server_from_cli: ``True`` when ``--server`` was explicitly
         provided on the command line. Used to distinguish direct-server
         mode from a configured default server.
+    :param model_from_cli: ``True`` when ``--model`` was explicitly provided
+        on the command line rather than loaded from config.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
@@ -6287,6 +6296,7 @@ def _dispatch_run(
             harness=harness,
             server=server,
             model=model,
+            model_from_cli=model_from_cli,
             prompt=prompt,
             system_prompt=system_prompt,
             tools=tools,
@@ -6669,6 +6679,8 @@ def run(
     # global config, which provides user-level defaults.
     server_source = click.get_current_context().get_parameter_source("server")
     server_from_cli = server_source is not None and server_source.name == "COMMANDLINE"
+    model_source = click.get_current_context().get_parameter_source("model")
+    model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
     direct_server_cli = (
@@ -6739,6 +6751,7 @@ def run(
         resume_parts=resume_parts,
         auto_open_conversation=auto_open_conversation,
         server_from_cli=server_from_cli,
+        model_from_cli=model_from_cli,
     )
 
 

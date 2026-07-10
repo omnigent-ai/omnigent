@@ -4620,6 +4620,7 @@ def _native_dispatch_kwargs(**overrides: object) -> dict[str, object]:
         "harness": "cursor-native",
         "server": None,
         "model": None,
+        "model_from_cli": True,
         "prompt": None,
         "system_prompt": None,
         "tools": None,
@@ -4801,6 +4802,65 @@ def test_dispatch_native_terminal_harness_kiro_launches_wrapper(
         "model": "auto",
         "prompt": None,
     }
+
+
+def test_dispatch_native_terminal_harness_kiro_forwards_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro's native wrapper supports an initial prompt from generic run."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(harness="kiro-native", prompt="review repo")
+    )
+
+    assert handled is True
+    assert captured["prompt"] == "review repo"
+
+
+@pytest.mark.parametrize(
+    ("harness", "target", "args_param"),
+    [
+        ("goose-native", "omnigent.goose_native.run_goose_native", "goose_args"),
+        ("qwen-native", "omnigent.qwen_native.run_qwen_native", "qwen_args"),
+        ("hermes-native", "omnigent.hermes_native.run_hermes_native", "hermes_args"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("model_from_cli", "expected_args"),
+    [
+        (False, ()),
+        (True, ("--model", "native-model")),
+    ],
+)
+def test_dispatch_native_terminal_harness_own_config_model_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    target: str,
+    args_param: str,
+    model_from_cli: bool,
+    expected_args: tuple[str, ...],
+) -> None:
+    """Own-config wrappers receive only models explicitly requested by users."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(target, lambda **kwargs: captured.update(kwargs))
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(
+            harness=harness,
+            model="native-model",
+            model_from_cli=model_from_cli,
+        )
+    )
+
+    assert handled is True
+    assert captured[args_param] == expected_args
 
 
 def test_dispatch_native_terminal_harness_ignores_non_native(
