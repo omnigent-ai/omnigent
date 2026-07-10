@@ -1439,6 +1439,41 @@ describe("chatStore — switchTo", () => {
     expect(itemFetchesAfter).toBe(itemFetchesBefore);
   });
 
+  it("loadHistoryUntilUserMessages disables further history on fetch failure", async () => {
+    // The rail's eager-load effect auto-fires this with no user gesture, so a
+    // persistent fetch failure that left hasMoreHistory true would re-arm the
+    // effect and hammer the failing endpoint in a tight loop. On error we
+    // commit progress AND clear hasMoreHistory to break that loop.
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `f_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_fail", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_fail", items);
+
+    await useChatStore.getState().switchTo("conv_fail");
+    expect(useChatStore.getState().hasMoreHistory).toBe(true);
+
+    // Fail every older-history page fetch (the `olderThan=` cursor read).
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_fail\/items\?.*olderThan=/.test(url)) {
+        return Promise.reject(new Error("boom"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
+
+    const state = useChatStore.getState();
+    // hasMoreHistory is cleared so the auto-firing effect can't re-loop.
+    expect(state.hasMoreHistory).toBe(false);
+    expect(state.loadingMoreHistory).toBe(false);
+  });
+
   it("does not run flat session items through the nested snapshot flattener", async () => {
     seedSessionSnapshot("conv_native", []);
     seedSessionItems("conv_native", [nativeToolItem("resp_native")]);

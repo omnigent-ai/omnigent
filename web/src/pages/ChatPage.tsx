@@ -1476,7 +1476,10 @@ function MainAgentSurface({
       let preview = "";
       for (let j = i + 1; j < bubbles.length; j++) {
         const next = bubbles[j];
-        if (next.kind === "user") break;
+        // Stop at the next REAL user turn only. A system-marker user bubble
+        // isn't a tick of its own, so breaking on it would strand this turn
+        // with a blank preview even though its reply follows the marker.
+        if (next.kind === "user" && !isSystemBubble(next)) break;
         if (next.kind === "assistant") {
           const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
           if (textItem && textItem.kind === "text") {

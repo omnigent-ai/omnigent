@@ -4,7 +4,7 @@
 // independently of the transcript, fades at its top edge to signal there's
 // more above, and pages in older history when scrolled near that top.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { scrollToUserMessage } from "@/hooks/useUserMessageNav";
 import { useChatStore } from "@/store/chatStore";
@@ -31,6 +31,12 @@ const FETCH_TOP_PX = 40;
 // rail eagerly pages older history up to this many turns — then the user
 // scrolls the rail up for more. Matches the "≤20 ticks initially" spec.
 const INITIAL_TURNS = 20;
+
+// Width of the top/bottom fade ramps, in px. Single source of truth: fed to
+// the CSS mask via the --turn-rail-fade variable AND used as the usable-edge
+// inset in the thumb-tracking math below, so the mask and the math stay in
+// lockstep.
+const FADE = 32;
 
 export function TurnRail({
   turns,
@@ -132,11 +138,10 @@ export function TurnRail({
       bottom = Math.max(bottom, tick.offsetTop + tick.offsetHeight);
     }
     if (!Number.isFinite(top)) return;
-    const FADE = 32;
     const viewTop = rail.scrollTop + FADE;
     const viewBottom = rail.scrollTop + rail.clientHeight - FADE;
     const max = rail.scrollHeight - rail.clientHeight;
-    let next = rail.scrollTop;
+    let next: number;
     if (top < viewTop) {
       // Run sits above the usable viewport — bring its top to the top edge.
       next = top - FADE;
@@ -217,6 +222,21 @@ export function TurnRail({
     setHoveredId(itemId);
   }, []);
 
+  // Keep previewTop glued to the hovered tick while the rail scrolls under a
+  // stationary pointer — thumb-tracking can smooth-scroll the rail without a
+  // mouseenter, which would otherwise leave the preview box detached until the
+  // next hover.
+  useEffect(() => {
+    const rail = railRef.current;
+    if (!rail || !hoveredId) return;
+    const reposition = () => {
+      const tick = tickRefs.current.get(hoveredId);
+      if (tick) setPreviewTop(tick.offsetTop - rail.scrollTop + tick.offsetHeight / 2);
+    };
+    rail.addEventListener("scroll", reposition, { passive: true });
+    return () => rail.removeEventListener("scroll", reposition);
+  }, [hoveredId]);
+
   const hovered = hoveredId ? turns.find((t) => t.itemId === hoveredId) : undefined;
 
   // A single-turn (or empty) conversation has nothing to navigate.
@@ -239,6 +259,9 @@ export function TurnRail({
     >
       <div
         ref={railRef}
+        // Feed FADE to the CSS mask so the ramp width and the thumb-tracking
+        // math share one constant.
+        style={{ "--turn-rail-fade": `${FADE}px` } as CSSProperties}
         // max-h-72 (not a fixed height): the box shrinks to its ticks when a
         // session is short — so no confusing empty scroll track — and caps at
         // 288px once the ticks (~16px pitch) exceed ~18, at which point it

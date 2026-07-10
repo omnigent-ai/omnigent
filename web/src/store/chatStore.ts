@@ -1857,7 +1857,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (start.loadingMoreHistory) return;
     const countUsers = (blocks: AnyBlock[]): number =>
       blocks.reduce((n, b) => n + (b.type === "user_message" ? 1 : 0), 0);
-    if (countUsers(start.blocks) >= minUserMessages) return;
+    // Users already in state count toward the target: we only need to fetch
+    // enough MORE to top up to minUserMessages, else we overshoot by whatever
+    // state already holds and blow past the "≤20 ticks initially" intent.
+    const existingUsers = countUsers(start.blocks);
+    if (existingUsers >= minUserMessages) return;
 
     const { conversationId, historyGeneration } = start;
     if (!conversationId) return;
@@ -1917,13 +1921,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
           pageBlocks.push(b);
         }
         older.unshift(...pageBlocks);
-        if (countUsers(older) >= minUserMessages) break;
+        if (existingUsers + countUsers(older) >= minUserMessages) break;
         if (!page.items[0]?.id) break;
       }
       commit();
     } catch {
       if (stale()) return;
-      // Keep hasMore true so scroll-up can retry the rest; commit progress.
+      // Commit progress, but disable further history fetches. This function is
+      // auto-fired by the rail's eager-load effect (no user gesture), so a
+      // persistent failure that left hasMoreHistory true would re-arm the
+      // effect on the very next render — a tight retry loop hammering the
+      // failing endpoint. Matching loadMoreHistory's policy stops the loop
+      // (and lets the rail's `revealed` latch instead of staying hidden).
+      hasMore = false;
       commit();
     }
   },

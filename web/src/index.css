@@ -376,20 +376,22 @@
 }
 
 /* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
- * Short symmetric ramps since the ticks are small and evenly spaced. */
+ * Short symmetric ramps since the ticks are small and evenly spaced. The ramp
+ * width comes from --turn-rail-fade, set inline from TurnRail's FADE constant
+ * so the visual mask and the thumb-tracking math can't silently desync. */
 .turn-rail-fade {
   mask-image: linear-gradient(
     to bottom,
     transparent 0,
-    black 32px,
-    black calc(100% - 32px),
+    black var(--turn-rail-fade),
+    black calc(100% - var(--turn-rail-fade)),
     transparent 100%
   );
   -webkit-mask-image: linear-gradient(
     to bottom,
     transparent 0,
-    black 32px,
-    black calc(100% - 32px),
+    black var(--turn-rail-fade),
+    black calc(100% - var(--turn-rail-fade)),
     transparent 100%
   );
 }
