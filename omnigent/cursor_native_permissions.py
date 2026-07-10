@@ -331,9 +331,7 @@ def cursor_launch_args_enable_yolo(args: list[str] | None) -> bool:
     if not args:
         return False
     for arg in args:
-        if arg in {"--yolo", "--force", "-f"} or arg.startswith("--yolo=") or arg.startswith(
-            "--force="
-        ):
+        if arg in {"--yolo", "--force", "-f"} or arg.startswith(("--yolo=", "--force=")):
             return True
     return False
 
@@ -778,9 +776,7 @@ async def supervise_cursor_transcript_elicitations(
                             session_id,
                             call.tool_call_id.splitlines()[0],
                         )
-                        await _send_cursor_keys(
-                            bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY
-                        )
+                        await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY)
                         auto_accepted_at[call.tool_call_id] = now
                         first_seen.pop(call.tool_call_id, None)
                         continue
