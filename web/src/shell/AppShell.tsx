@@ -509,20 +509,14 @@ export function AppShell() {
     if (next) setRightRailTab(next);
   }, [railTabsAvailable, rightRailTab]);
 
-  // Mount the embedded-browser agent relay at the always-present shell level —
-  // NOT inside BrowserPane. BrowserPane only mounts while the Browser tab is
-  // selected, but the relay must be listening before the first browser_navigate
-  // (which is also what auto-selects that tab, below). No-op outside Electron
-  // or with no conversation. Owns the claim→execute→result flow for the view.
+  // Mount the relay at the always-present shell level (not BrowserPane, which
+  // only mounts while its tab is selected) so it's listening before the first
+  // browser_navigate. No-op outside Electron / with no conversation.
   useBrowserAgentRelay(conversationId);
 
-  // Auto-surface the Browser tab when the agent navigates. Without this a
-  // `browser_navigate` while another tab is selected would load the page into a
-  // pane the user can't see. We react to the `browser_action_request` SSE event
-  // (the same signal the relay claims) for a `navigate` action: open the rail
-  // and select the Browser tab so the empty→loading→page transition is visible.
-  // Electron-only (the Browser tab only exists there); a no-op elsewhere since
-  // the bus never fires without a mounted relay.
+  // Auto-surface the Browser tab on a `navigate` action, so a browser_navigate
+  // fired while another tab is selected doesn't load into a hidden pane.
+  // Electron-only; no-op elsewhere (the bus never fires without a relay).
   useEffect(() => {
     if (!isElectronShell()) return;
     return onBrowserActionRequest((evt) => {
@@ -532,24 +526,14 @@ export function AppShell() {
     });
   }, []);
 
-  // Design mode (point-and-prompt) submit routing. Lives here — alongside the
-  // hoisted relay — because the in-page popup posts back via preload IPC that
-  // is delivered to the always-mounted shell, not to BrowserPane (which only
-  // mounts while the Browser tab is selected). On element-prompt-submit we
-  // build the `[Design Mode — …]` message, attach the cropped element
-  // screenshot as a File, send it through the NORMAL chat path
-  // (chatStore.send) — there is NO backend design-edit route — then signal the
-  // result back so the popup shows green/red. On dismiss, no-op.
-  //
-  // agentId: we use the conversation's own bound agent (boundAgent) — the
-  // element the user picked belongs to the page this conversation drives, so
-  // its own agent is the right recipient. That's cleaner than reaching into
-  // ChatPage's selectedAgentId (which is local UI state for the composer's
-  // agent picker and not available at the shell level).
-  //
-  // The submit event carries only element + prompt; the screenshot arrives on
-  // the earlier element-selected event, so we stash the most-recent one keyed
-  // by conversationId and pair it up at submit time.
+  // Design-mode submit routing. Lives here (with the hoisted relay) because the
+  // in-page popup posts back via preload IPC delivered to the always-mounted
+  // shell, not BrowserPane. On submit: build the `[Design Mode — …]` message,
+  // attach the cropped screenshot, send via the NORMAL chat path (no backend
+  // route), then signal the result back for green/red. Dismiss is a no-op.
+  // Routes to the conversation's own bound agent (the picked element belongs to
+  // the page it drives). The screenshot arrives on the earlier element-selected
+  // event, so we stash the latest per conversation and pair it at submit time.
   const designShotRef = useRef<Map<string, string>>(new Map());
   const boundAgentId = boundAgent?.id ?? null;
   useEffect(() => {

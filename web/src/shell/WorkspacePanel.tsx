@@ -143,11 +143,8 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files tab is available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
-  /**
-   * Whether the Browser tab is available — true only in the Electron shell,
-   * where the embedded WebContentsView exists. Hidden entirely in a plain web
-   * build (no embedded browser to host).
-   */
+  /** Whether the Browser tab is available — Electron shell only (hidden in a
+   *  plain web build, which has no embedded WebContentsView). */
   showBrowserTab: boolean;
   /** Count of changed files, shown as the Files tab badge. */
   changedCount: number;
@@ -441,10 +438,8 @@ export function WorkspacePanel({
             sort={filesPanelSort}
           />
         ) : rightRailTab === "browser" && showBrowserTab ? (
-          // Embedded browser (Electron only). BrowserPane self-gates on
-          // isElectronShell() and measures its container to position the native
-          // WebContentsView; here that container is the rail's content slot, so
-          // the page fills the rail. Empty state until the agent navigates.
+          // Embedded browser (Electron only) — BrowserPane self-gates and
+          // measures this rail slot to position the native view over it.
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />

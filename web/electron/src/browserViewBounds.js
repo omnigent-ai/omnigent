@@ -1,13 +1,7 @@
 /**
- * Browser preview bounds conversion.
- *
- * React measures the placeholder with getBoundingClientRect(), which returns
- * renderer CSS pixels. Electron WebContentsView#setBounds expects window
- * device-independent pixels. Those units are identical at renderer zoom 1, but
- * diverge after Cmd+/Cmd- zoom changes.
- *
- * Pure math — no Electron imports — so it is unit-testable without booting
- * Electron.
+ * Browser preview bounds conversion: renderer CSS px (getBoundingClientRect) →
+ * window device-independent px (WebContentsView#setBounds). Identical at zoom 1,
+ * diverge after Cmd+/Cmd-. Pure math (no Electron imports), so unit-testable.
  */
 
 function normalizeBrowserViewBounds(bounds, zoomFactor, displayScaleFactor) {

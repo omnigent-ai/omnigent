@@ -1,33 +1,20 @@
-/** Browser MCP relay hook — executes agent-issued browser actions against the
- *  Electron WebContentsView.
- *
- *  Implements Omnigent's claim-first protocol and event plumbing:
- *
- *  The agent's `browser_*` MCP tool parks a Future on the AP, which publishes a
- *  `browser.action_request` SSE event on the conversation's stream. Every
- *  connected renderer sees it, so — to keep two windows attached to one server
- *  from double-executing (design Risk-1) — this hook first CLAIMS the action
- *  (an atomic check-and-set on the AP): only the renderer that receives
- *  `{claimed:true, claim_token}` proceeds; the others drop it. The winner then
- *  dispatches to `window.omnigentDesktop.browser*` IPC and POSTs the result
- *  back WITH its claim token, which resolves the parked Future.
- *
- *  Gated on `isElectronShell()`: in a plain browser tab there is no
- *  WebContentsView, so the hook registers nothing and every browser action
- *  simply times out on the AP with a clean "is the session open in the desktop
- *  app?" error (browser actions require an attached desktop view — there is no
- *  headless fallback). */
+/** Browser MCP relay hook — runs agent-issued browser actions against the
+ *  Electron WebContentsView via a claim-first protocol: on a
+ *  `browser.action_request` SSE event every renderer races to CLAIM the action
+ *  (atomic CAS on the AP), and only the `{claimed:true, claim_token}` winner
+ *  dispatches to `window.omnigentDesktop.browser*` and POSTs the result back
+ *  with its token — so multiple windows can't double-execute (Risk-1).
+ *  Gated on `isElectronShell()`: without a WebContentsView the hook registers
+ *  nothing and actions time out cleanly (no headless fallback). */
 import { useEffect } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
 
-/** Subset of `window.omnigentDesktop` the relay calls. Mirrors the
- *  contextBridge exposure in electron/src/preload.js but typed locally so the
- *  hook doesn't depend on the full nativeBridge type. Every method is optional
- *  — an older shell may predate the browser feature; the relay feature-detects
- *  before calling and posts a clean error otherwise. */
+/** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
+ *  nativeBridge). All optional — an older shell may predate the feature, so the
+ *  relay feature-detects before calling. */
 interface BrowserDesktopBridge {
   browserOpenOrNavigate?: (
     conversationId: string,
@@ -59,38 +46,25 @@ interface ActionResult {
   data_url?: string;
 }
 
-/** Wrap a string for safe interpolation into a `browserExecute` JS payload.
- *  Always `JSON.stringify` — the language committee already handled the escape
- *  table (newlines, backslashes, quotes, U+2028 / U+2029, control chars).
- *  Hand-rolling this is the kind of subtle bug review catches a year later. */
+/** Safely interpolate a string into a `browserExecute` JS payload — always
+ *  `JSON.stringify` (handles the full escape table); never hand-roll. */
 function jsString(s: string): string {
   return JSON.stringify(s);
 }
 
-/** Same trick for numbers. We validate ref/ms shape at the switch site, but
- *  call this at the interpolation site so a future caller that skips the guard
- *  still produces a syntactically-valid in-page literal. */
+/** Same for numbers — stringify at the interpolation site so a caller that
+ *  skips the shape guard still emits a valid in-page literal. */
 function jsNumber(n: number): string {
   return JSON.stringify(n);
 }
 
-/** In-page JS that walks the DOM and produces an accessibility-style tree with
- *  stable `[ref=N]` ids per picked element.
- *
- *  Design notes:
- *   - Refs are stored in `window.__omni_refs__` (a Map<number, WeakRef<Element>>)
- *     so subsequent click/type can resolve them. Each snapshot generates a fresh
- *     `snapshot_id` stashed in `window.__omni_snapshot_id__`; click/type can
- *     pass the snapshot_id back and the relay rejects mismatched refs with a
- *     precise error.
- *   - We pick interactive elements, landmark elements, headings, and list
- *     containers; skip display:none / visibility:hidden / zero-area elements.
- *   - Accessible name resolution: aria-label > alt > placeholder > title > text
- *     content of non-interactive children, capped at 80 chars.
- *   - Snapshot REPLACES `__omni_refs__` (does not append). Two agents against
- *     one page collide on this map (acknowledged limitation; the snapshot_id
- *     check at least yields a precise error rather than a silent mis-click).
- *
+/** In-page JS producing an a11y-style tree with stable `[ref=N]` ids. Refs live
+ *  in `window.__omni_refs__` (resolved by click/type) under a per-snapshot
+ *  `__omni_snapshot_id__`, so a stale ref is rejected with a precise error.
+ *  Picks interactive/landmark/heading/list elements (skips hidden/zero-area);
+ *  accessible name = aria-label > alt > placeholder > title > text, ≤80 chars.
+ *  Snapshot REPLACES the ref map — two agents on one page collide (known limit,
+ *  but the snapshot_id check turns a mis-click into a clean error).
  *  Returns JSON: `{ snapshot_id, url, title, tree }`. */
 const SNAPSHOT_JS = `(() => {
   const snapshotId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
@@ -220,10 +194,7 @@ function findElJs(args: Record<string, unknown>): string {
     return (
       idCheck +
       `const el = (window.__omni_refs__ && window.__omni_refs__.get(${jsNumber(ref)}))?.deref(); ` +
-      // WeakRef.deref() can return undefined after GC of a still-attached
-      // element (rare). Distinguish "snapshot not run" (no map) from "ref
-      // missing" (map exists, key absent) from "garbage-collected" (key exists,
-      // deref undefined) so the agent's retry path can be specific.
+      // Distinguish no-snapshot / ref-missing / GC'd so the agent's retry is specific.
       `if (!window.__omni_refs__) throw new Error('no snapshot in this page — call browser_snapshot first'); ` +
       `if (!window.__omni_refs__.has(${jsNumber(ref)})) throw new Error('ref ' + ${jsNumber(ref)} + ' not in snapshot — call browser_snapshot again'); ` +
       `if (!el) throw new Error('ref ' + ${jsNumber(ref)} + ' was garbage-collected — call browser_snapshot again'); `
@@ -253,12 +224,8 @@ async function dispatch(
         if (!desktop.browserOpenOrNavigate) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
-        // `force: true` — the agent's navigate intent is explicit, so honor it
-        // even when url === lastRequestedUrl (the registry would otherwise skip
-        // loadURL to preserve user-driven in-page navigation on re-mount).
-        // `agent: true` — marks this as a model-issued (non-gesture) navigation
-        // so the main-process registry applies the scheme/host allowlist
-        // (browserUrlPolicy): http(s) only, no loopback/metadata/private hosts.
+        // force: honor the explicit agent nav even on same-URL. agent: mark it
+        // model-issued so the registry applies the scheme/host allowlist (Risk).
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
@@ -366,17 +333,14 @@ async function postResult(
       },
     );
   } catch (e) {
-    // Backend down / transient blip — the AP's action timeout will surface the
-    // failure to the agent. Log so a maintainer sees the relay is broken.
+    // Backend blip — the AP's action timeout surfaces it to the agent; log for maintainers.
     console.warn("[browser-relay] POST result failed", e);
   }
 }
 
 /**
- * Register the embedded-browser relay for a conversation. No-op outside the
- * Electron shell (plain browser tabs never claim; the AP times the action out
- * with a clean error). Mount ONE instance per active conversation — typically
- * from `BrowserPane`, which is itself gated on `isElectronShell()`.
+ * Register the embedded-browser relay for a conversation. No-op outside Electron.
+ * Mount ONE instance per active conversation (typically from `BrowserPane`).
  *
  * @param conversationId The conversation whose WebContentsView this relay drives.
  */
@@ -388,8 +352,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
     const handler = async (evt: BrowserActionRequestEvent) => {
       const desktop = getBrowserDesktop();
       if (!desktop) return; // not the Electron shell — nothing to claim
-      // Claim FIRST. Only the winning renderer proceeds; losers drop silently
-      // so a second window on the same server can't double-execute (Risk-1).
+      // Claim FIRST — only the winner proceeds, so two windows can't double-execute (Risk-1).
       const claimToken = await claimAction(conversationId, evt.actionId);
       if (!claimToken) return;
       const result = await dispatch(conversationId, evt.action, evt.args, desktop);

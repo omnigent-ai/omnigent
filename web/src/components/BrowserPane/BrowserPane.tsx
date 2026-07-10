@@ -1,41 +1,20 @@
-/** Embedded browser pane (Phase 2).
+/** Embedded browser pane. The page is a native Electron WebContentsView the
+ *  main process paints over a placeholder `<div>` this component measures
+ *  (getBoundingClientRect → IPC). Native overlay, not an iframe/webview: the
+ *  agent needs a real Chromium page (screenshot, relay JS, cross-origin nav)
+ *  and `<webview>` is deprecated.
  *
- *  The actual web page is a native Electron
- *  WebContentsView positioned by the main process; the React side renders ONLY
- *  a placeholder `<div>` that MEASURES its own rect with getBoundingClientRect()
- *  and pushes those bounds over IPC so the main process can lay the native view
- *  on top of the placeholder pixel-for-pixel.
+ *  A "Browser" tab in the Workspace rail, so it mounts only while selected.
+ *  Flex column: a fixed toolbar row (URL bar + nav + DevTools + design-mode)
+ *  always on top so the URL bar is reachable from a cold start; below it the
+ *  content switches on `viewActive` (measuring placeholder once a view attaches,
+ *  else a hint). Bounds-sync (containerRef + syncBounds + rAF/ResizeObserver) is
+ *  gated on `viewActive` and measures only below the toolbar.
  *
- *  Why a native overlay instead of a webview/iframe: the agent needs to drive a
- *  real Chromium page (screenshot, execute relay JS, cross-origin navigation)
- *  which an iframe can't provide, and Electron's `<webview>` is deprecated.
- *
- *  Lives as the "Browser" tab inside the right Workspace rail (WorkspacePanel),
- *  so it only mounts while that tab is selected. The pane is a flex COLUMN whose
- *  first child is ALWAYS a toolbar (URL bar + back/forward/reload + DevTools
- *  toggle + a design-mode toggle) — the URL bar must be reachable from a cold
- *  start so the user can
- *  open the first page (typing a URL creates the view on demand). Below the
- *  toolbar the content switches on `viewActive`: once a view is attached it's
- *  the measuring placeholder the native WebContentsView paints over; before then
- *  it's a centered hint. The toolbar is a fixed-height row ABOVE the measured
- *  rect, so the native overlay (which paints over the container) never hides it.
- *  The bounds-sync machinery (containerRef + syncBounds + rAF/ResizeObserver
- *  effects) is gated on `viewActive`, so nothing measures a hint div, and it
- *  measures only the region BELOW the toolbar. Reload + DevTools are disabled
- *  while !viewActive (nothing to reload / no devtools target yet).
- *
- *  The agent relay is NOT here — because this component only mounts while its
- *  tab is selected, but the relay must be listening before the first
- *  `browser_navigate` (which also auto-selects the tab). The relay is hoisted to
- *  AppShell, which is always mounted for a session. This component only
- *  positions/paints the view.
- *
- *  DETACH-not-destroy on unmount: the view keeps running (a background agent's
- *  page survives a tab switch); it is destroyed only on explicit close.
- *
- *  Gated on `isElectronShell()` — in a plain browser this renders nothing (the
- *  Browser tab isn't shown there anyway). */
+ *  The agent relay is NOT here (it must listen before the first browser_navigate
+ *  auto-selects the tab) — it's hoisted to the always-mounted AppShell. On
+ *  unmount the view DETACHES, not destroys (background agent pages survive a tab
+ *  switch; destroy only on explicit close). Renders nothing outside Electron. */
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -136,47 +115,28 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const electron = isElectronShell();
-  // Whether a native view is currently attached for THIS conversation. Driven
-  // by the registry's host-active-changed / view-closed pings, so the
-  // placeholder appears exactly when there's a view to position and disappears
-  // the moment it's closed — no empty pane on an idle conversation.
+  // Whether a native view is attached for THIS conversation — drives when the
+  // measuring placeholder mounts (no empty pane on an idle conversation).
   const [viewActive, setViewActive] = useState(false);
 
-  // Toolbar state. `currentUrl` reflects the real URL of the view (kept honest
-  // by the browser-url-changed event) EXCEPT while the user is editing the
-  // input — we never stomp what they're typing. `urlEditing` (input focused)
-  // gates that. `canGoBack/canGoForward` drive the arrow buttons' disabled
-  // state, pushed by the browser-nav-state event.
+  // Toolbar state. `currentUrl` tracks the real view URL EXCEPT while the user
+  // edits the input (urlEditingRef gates the stomp); canGoBack/Forward drive
+  // the arrow buttons.
   const [currentUrl, setCurrentUrl] = useState("");
-  // Ref (not state) — read synchronously in the url-changed listener to decide
-  // whether to stomp the input; a stale-closure state read would race.
+  // Ref (not state): read synchronously in the url-changed listener; a
+  // stale-closure state read would race.
   const urlEditingRef = useRef(false);
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
-  // Design mode (point-and-prompt): toggled by the toolbar button. When on,
-  // the main process injects the in-page element picker into the view; the
-  // actual submit routing (element prompt → chat send) lives in AppShell, where
-  // the relay is hoisted. This flag only drives the button's pressed state and
-  // the enable/disable IPC.
+  // Design-mode toggle: on, the main process injects the in-page picker; submit
+  // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
 
-  // NOTE: the agent relay is NOT mounted here. BrowserPane only mounts when the
-  // Browser tab is selected, but the relay must be listening BEFORE the first
-  // browser_navigate (which is also what auto-selects the tab). So the relay is
-  // hoisted to AppShell (`useBrowserAgentRelay(conversationId)`), which is
-  // always mounted for a session. See AppShell.
-
-  // Decide when a view EXISTS for this conversation, so the placeholder mounts
-  // exactly then. Three signals feed `viewActive`:
-  //   1. `browser-view-created` — the FIRST navigate creates the view (often
-  //      detached, so no host-active event fires); this is the signal that
-  //      breaks the original activation deadlock.
-  //   2. `browserHasView` probe on (re)mount — the user navigated away and
-  //      back, and the view already exists in the registry.
-  //   3. `browser-host-active-changed` — a later attach/detach for this
-  //      conversation keeps the flag honest (detach for another conversation
-  //      flips it false).
-  // `browser-view-closed` for this conversation flips it false.
+  // Feed `viewActive` from three signals so the placeholder mounts exactly when
+  // a view exists: (1) browser-view-created — first navigate (often detached,
+  // no host-active event; breaks the activation deadlock); (2) browserHasView
+  // probe on re-mount; (3) host-active-changed for later attach/detach.
+  // browser-view-closed flips it false.
   useEffect(() => {
     if (!electron) return;
     const bridge = getBridge();
@@ -209,12 +169,9 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
     };
   }, [conversationId, electron]);
 
-  // Live-track the real URL + back/forward availability. A URL bar that only
-  // sets its value on explicit navigate goes stale; instead we subscribe to the
-  // main process's did-navigate listeners so redirects, in-page link clicks,
-  // and agent navigation all keep the bar honest. Crucially we DON'T overwrite
-  // the input while the user is editing it (urlEditingRef) — only when they're
-  // not focused — so their typing is never fought.
+  // Live-track the real URL + back/forward via did-navigate listeners (redirects,
+  // link clicks, agent nav all keep the bar honest), but never stomp the input
+  // while the user is editing it (urlEditingRef).
   useEffect(() => {
     if (!electron) return;
     const bridge = getBridge();
@@ -366,15 +323,11 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
     };
   }, [conversationId, electron, viewActive, syncBounds]);
 
-  // Reconcile bounds every animation frame while a view is shown. setBounds
-  // with the same rect is a no-op in Electron native, and we dedupe in JS via
-  // lastBoundsRef, so this is cheap. It catches every layout shift —
-  // ResizeObserver only fires on SIZE changes, so position-only shifts (sibling
-  // pane resize, ancestor scroll) would otherwise strand the native overlay.
-  //
-  // Wrapped in try/catch: if syncBounds ever throws (bridge rejects
-  // synchronously during a teardown window) we MUST still schedule the next
-  // frame, or the rAF chain dies silently and the overlay floats stranded.
+  // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
+  // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
+  // ResizeObserver misses (it only fires on size). try/catch so a throw during
+  // teardown still schedules the next frame — else the rAF chain dies and the
+  // overlay strands.
   useEffect(() => {
     if (!electron || !viewActive) return;
     let rafId = 0;
@@ -390,11 +343,9 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
     return () => cancelAnimationFrame(rafId);
   }, [electron, viewActive, syncBounds]);
 
-  // Defense-in-depth against a hung rAF chain: ResizeObserver fires on size
-  // changes (pane splits / window resizes), `window.resize` on every Electron
-  // resize event, and `visibilitychange` covers tab-back-from-background where
-  // rAFs were throttled. Each alone is enough to recover on the next
-  // user-visible interaction.
+  // Defense-in-depth against a hung rAF chain: ResizeObserver (size), window
+  // resize, and visibilitychange (tab-back, where rAFs were throttled) each
+  // recover bounds on the next interaction.
   useEffect(() => {
     if (!electron || !viewActive || !containerRef.current) return;
     const el = containerRef.current;
@@ -417,21 +368,15 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   // split pane. The relay is a no-op there anyway.
   if (!electron) return null;
 
-  // In the Electron shell the pane ALWAYS occupies its half of the row, as a
-  // FLEX COLUMN: the toolbar row (shrink-0) is ALWAYS the first child, above the
-  // content area — so the manual URL bar is reachable from a cold start (no
-  // page open yet). Typing a URL and pressing Enter runs browserOpenOrNavigate,
-  // which creates the view on demand → browser-view-created → viewActive flips
-  // true → the measuring container mounts. Gating the toolbar on viewActive
-  // (the old behavior) was a chicken-and-egg deadlock: no page → no toolbar →
-  // no way to open the first page.
+  // Flex column: the toolbar (shrink-0) is ALWAYS the first child so the URL bar
+  // is reachable from a cold start (typing a URL creates the view on demand →
+  // viewActive flips true → the measuring container mounts). Gating the toolbar
+  // on viewActive was a deadlock: no page → no toolbar → no way to open a page.
   //
-  // LAYOUT TRAP (verified): the native WebContentsView paints OVER the measured
-  // `containerRef` rect. So the toolbar must live ABOVE that rect, never inside
-  // it — otherwise the native overlay hides it. The measuring container is the
-  // LAST child, `flex-1 min-h-0` (NOT inset:0 filling the whole wrapper), so
-  // getBoundingClientRect() returns only the region below the toolbar and the
-  // native view fills exactly that.
+  // LAYOUT TRAP (verified): the native view paints OVER the measured containerRef
+  // rect, so the toolbar must be ABOVE it, never inside. The container is the LAST
+  // child, flex-1 min-h-0 (not inset:0), so getBoundingClientRect covers only the
+  // region below the toolbar and the view fills exactly that.
   //
   // Content area below the always-present toolbar switches on viewActive:
   //   - viewActive: the measuring `containerRef` placeholder. `containerRef` +

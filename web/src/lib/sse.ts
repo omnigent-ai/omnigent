@@ -759,10 +759,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies SessionPresenceEvent;
   }
 
-  // Embedded-browser action request (Phase 2). The agent's browser_* MCP tool
-  // parked a Future on the AP; this event asks the desktop relay to execute the
-  // action against the conversation's WebContentsView. Ignored by non-Electron
-  // renderers (the relay hook is gated on isElectronShell()).
+  // Embedded-browser action request: asks the desktop relay to run the agent's
+  // browser_* action against the view. Ignored by non-Electron renderers.
   if (eventType === "browser.action_request") {
     const actionId = data.action_id;
     const action = data.action;

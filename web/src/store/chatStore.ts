@@ -3970,11 +3970,8 @@ export function handleSessionEvent(event: StreamEvent): void {
       });
       return;
     case "browser_action_request":
-      // Embedded-browser (Phase 2): the agent's browser_* tool asked the
-      // desktop shell to run an action against this conversation's
-      // WebContentsView. Fan it out to the relay hook (which claims + executes
-      // + posts the result). No store state changes — the relay owns the flow.
-      // Plain-browser renderers have no relay registered, so this is a no-op.
+      // Embedded-browser action: fan out to the relay hook (which claims,
+      // executes, posts the result). No store state; no-op without a relay.
       emitBrowserActionRequest(event);
       return;
     case "session_status": {

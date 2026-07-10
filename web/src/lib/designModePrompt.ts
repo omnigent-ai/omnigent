@@ -1,17 +1,10 @@
-/** Design-mode prompt helpers.
- *
- *  Pure functions used by AppShell's element-prompt-submit listener to turn a
- *  picked element + user prompt into a chat message. Kept out of the component
- *  so they're unit-testable without a React render.
- *
- *  There is NO backend design-edit route: the element prompt is
- *  sent as an ordinary user message through `chatStore.send`, with the cropped
- *  element screenshot riding along as an attachment File. So this is a pure
- *  client affordance — see AppShell + BrowserPane. */
+/** Design-mode prompt helpers — pure functions (unit-testable, no React) that
+ *  turn a picked element + prompt into a chat message. There is NO backend
+ *  route: it's sent as an ordinary user message via `chatStore.send` with the
+ *  cropped screenshot as an attachment. */
 
-/** The element info the in-page picker emits (mirrors DESIGN_MODE_SCRIPT's
- *  getElementInfo). All fields optional — an older injected script or an
- *  unusual element may omit some. */
+/** Element info the in-page picker emits. All fields optional (an older script
+ *  or unusual element may omit some). */
 export interface DesignModeElement {
   tag?: string;
   id?: string;
@@ -23,24 +16,18 @@ export interface DesignModeElement {
   component?: string | null;
 }
 
-/** Max length any single element field may contribute to the prompt block.
- *  The element.* fields originate from the browsed page's DOM, so they are
- *  UNTRUSTED — a hostile page can stuff arbitrary text (or newlines that would
- *  break the fenced `[Design Mode — …]` block structure) into id/class/text.
- *  Clamp so a huge attribute can't blow up the message. */
+/** Clamp per element field: element.* comes from the page DOM (UNTRUSTED), so a
+ *  hostile page can't blow up the message with a huge attribute. */
 const FIELD_MAX = 200;
 
-/** Characters stripped before a field enters the prompt block: C0 controls
- *  (U+0000-U+001F, incl. newline and tab), DEL + C1 (U+007F-U+009F), and the
- *  Unicode line/paragraph separators (U+2028 / U+2029). Any of these could
- *  forge extra block lines or break the `---` fences. Written with \u escapes
- *  (not literal bytes) so the source itself contains no line terminators. */
+/** Control chars + line/paragraph separators stripped from fields, so untrusted
+ *  DOM text can't forge extra `[Design Mode — …]` block lines or break the `---`
+ *  fences. \u escapes keep this source free of literal line terminators. */
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g;
 
-/** Sanitize an untrusted element field before it templates into the prompt:
- *  strip control characters and newlines, collapse whitespace, and clamp
- *  length. Returns "" for nullish input so callers can treat "" as "absent". */
+/** Sanitize an untrusted element field: strip control chars, collapse
+ *  whitespace, clamp length. Returns "" for nullish (callers treat "" as absent). */
 function sanitizeField(value: string | null | undefined): string {
   if (typeof value !== "string") return "";
   return value.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim().slice(0, FIELD_MAX);
@@ -66,15 +53,9 @@ function selectorFor(el: DesignModeElement): string {
 }
 
 /**
- * Build the chat message text for a design-mode submit: the user's prompt
- * followed by a fenced `[Design Mode — …]` context block describing the picked
- * element. The block shape is kept stable so any downstream parser that strips
- * it from the rendered bubble stays compatible.
- *
- * Every element-derived field is passed through `sanitizeField` first — the
- * element info comes from the browsed page's DOM and is untrusted, so it must
- * not be able to forge extra block lines or break the `---` fences. The user's
- * own `prompt` is trusted (they typed it) and passes through verbatim.
+ * Build the design-mode message: the user's prompt plus a stable fenced
+ * `[Design Mode — …]` block describing the element. Every element field is
+ * sanitized (untrusted DOM); the user's `prompt` is trusted and verbatim.
  *
  * @param element the picked element info
  * @param prompt the user's typed instruction
@@ -98,9 +79,8 @@ export function buildDesignModePrompt(element: DesignModeElement, prompt: string
 }
 
 /**
- * Convert a base64 data URL (the cropped element screenshot the main process
- * captured) into a `File` so it can ride the normal chat-send attachment path.
- * Returns null if the input isn't a usable `data:image/...;base64,...` URL.
+ * Convert a base64 data URL (the cropped screenshot) into a `File` for the
+ * normal chat-send attachment path. Null if not a usable data: URL.
  *
  * @param dataUrl e.g. "data:image/png;base64,iVBORw0K…"
  * @param filename the attachment filename
