@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -201,6 +202,7 @@ class SbxSandboxLauncher(SandboxLauncher):
         self._kits = tuple(kits) if kits is not None else None
         self._server_url = server_url
         self._binary: str | None = None
+        self._managed_env_cache: tuple[list[str], dict[str, str]] | None = None
 
     @property
     def _managed(self) -> bool:
@@ -220,27 +222,47 @@ class SbxSandboxLauncher(SandboxLauncher):
             self._binary = found
         return self._binary
 
-    def _run_sbx(self, args: list[str]) -> subprocess.CompletedProcess[str]:
-        """Run ``sbx <args>``, capturing text output."""
+    def _run_sbx(
+        self, args: list[str], *, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Run ``sbx <args>``, capturing text output.
+
+        *extra_env* is merged into the subprocess's own environment (not
+        argv), so credential VALUES forwarded with ``sbx exec -e NAME`` never
+        appear in the server host's process listing.
+        """
+        env = {**os.environ, **extra_env} if extra_env else None
         return subprocess.run(
             [self._sbx_binary(), *args],
             capture_output=True,
             text=True,
+            env=env,
         )
 
-    def _exec_env_args(self) -> list[str]:
+    def _managed_env(self) -> tuple[list[str], dict[str, str]]:
         """
-        Build ``sbx exec -e NAME=VALUE`` args for configured env in managed mode.
+        Resolve configured env for a managed ``sbx exec``.
 
-        CLI-bootstrap mode returns an empty list so :meth:`run` stays
-        unchanged for the local ``omnigent sandbox create/connect`` path.
+        Returns ``(["-e", NAME, …], {NAME: VALUE})``. The VALUES ride the
+        ``sbx`` subprocess environment (see :meth:`_run_sbx`) and only the
+        NAMES reach argv via ``-e NAME`` (the ``docker exec`` inherit-from-env
+        form), so harness credentials aren't exposed in the server host's
+        process table. Resolved once and cached — a managed launch execs
+        several commands (``$HOME`` probe, ``mkdir``, clone, host start).
+
+        CLI-bootstrap mode returns empties so :meth:`run` stays unchanged for
+        the local ``omnigent sandbox create/connect`` path.
         """
         if not self._managed:
-            return []
-        args: list[str] = []
-        for name, value in self._resolve_env().items():
-            args += ["-e", f"{name}={value}"]
-        return args
+            return [], {}
+        if self._managed_env_cache is None:
+            values = self._resolve_env()
+            flags: list[str] = []
+            for name in values:
+                flags += ["-e", name]
+            self._managed_env_cache = (flags, values)
+        return self._managed_env_cache
 
     def prepare(self) -> None:
         """
@@ -381,9 +403,9 @@ class SbxSandboxLauncher(SandboxLauncher):
         Run a shell command in the sandbox via ``sbx exec`` and capture
         its output (stdout/stderr kept separate).
 
-        In managed mode, configured env vars are injected as
-        ``sbx exec -e NAME=VALUE`` so the in-box host receives harness
-        credentials. CLI-bootstrap mode keeps the legacy argv.
+        In managed mode, configured env is forwarded with ``sbx exec -e NAME``
+        and its VALUES ride the subprocess environment (never argv). CLI
+        -bootstrap mode keeps the legacy argv (no ``-e``).
 
         :param sandbox_id: Target sandbox name.
         :param command: Shell command (``bash -lc`` applies login PATH).
@@ -391,8 +413,10 @@ class SbxSandboxLauncher(SandboxLauncher):
         :returns: Exit code plus captured stdout/stderr.
         :raises click.ClickException: When *check* and the exit is non-zero.
         """
+        env_flags, env_values = self._managed_env()
         result = self._run_sbx(
-            ["exec", *self._exec_env_args(), sandbox_id, "bash", "-lc", command]
+            ["exec", *env_flags, sandbox_id, "bash", "-lc", command],
+            extra_env=env_values or None,
         )
         for stream in (result.stdout, result.stderr):
             for line in (stream or "").splitlines():
@@ -407,6 +431,33 @@ class SbxSandboxLauncher(SandboxLauncher):
             returncode=result.returncode,
             stdout=result.stdout or "",
             stderr=result.stderr or "",
+        )
+
+    def run_background(
+        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+    ) -> RemoteCommandResult:
+        """
+        Background *command*, first unsetting Docker's ``proxy-managed`` env
+        placeholders so they can't shadow the host's real harness credentials.
+
+        Docker Sandboxes injects placeholder provider keys (e.g.
+        ``ANTHROPIC_API_KEY=proxy-managed``) into every exec session. For any
+        key NOT supplied via ``sandbox.sbx.env``, that placeholder would reach
+        ``omnigent host`` and break harnesses that prefer an env key over
+        their own login (Claude Code subscription auth). The strip runs in the
+        outer ``bash -lc`` shell, so the ``setsid``-detached host it spawns
+        never inherits the sentinels; ``-e``-forwarded real values survive
+        (their value isn't the sentinel).
+
+        CLI-bootstrap mode uses the base implementation unchanged.
+        """
+        if not self._managed:
+            return super().run_background(sandbox_id, command, log_path=log_path)
+        return self.run(
+            sandbox_id,
+            f"{_STRIP_PROXY_MANAGED_SNIPPET} "
+            f"setsid nohup sh -c {shlex.quote(command)} "
+            f"> {log_path} 2>&1 < /dev/null & echo launched",
         )
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:

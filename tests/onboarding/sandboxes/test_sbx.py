@@ -30,6 +30,7 @@ class _SbxCall:
 
     args: list[str]
     capture: bool
+    env: dict[str, str] | None = None
 
 
 @dataclass
@@ -57,9 +58,10 @@ class _FakeSbx:
         capture_output: bool = False,
         text: bool = False,
         check: bool = False,
+        env: dict[str, str] | None = None,
         **_: object,
     ) -> _FakeCompleted:
-        self.calls.append(_SbxCall(args=list(argv), capture=capture_output))
+        self.calls.append(_SbxCall(args=list(argv), capture=capture_output, env=env))
         sub = argv[1] if len(argv) > 1 else ""
         if sub in self.raise_on:
             raise self.raise_on[sub]
@@ -638,9 +640,15 @@ def test_managed_provision_argv_and_egress(
     assert [c.args[1:4] for c in fake_sbx.calls] != [["exec", "-u", "root"]]
 
 
-def test_managed_run_injects_env(fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Managed run() forwards configured env as `sbx exec -e NAME=VALUE`."""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+def test_managed_run_forwards_env_off_argv(
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Managed run() forwards configured env by NAME (`sbx exec -e NAME`) with
+    the VALUE riding the subprocess environment — the secret value must never
+    appear in argv (which is visible in the server host's process table).
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
     launcher = SbxSandboxLauncher(
         template="ghcr.io/me/omnigent-host-sbx:latest",
         env=["OPENAI_API_KEY"],
@@ -650,8 +658,13 @@ def test_managed_run_injects_env(fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyP
     assert result.returncode == 0
     [call] = fake_sbx.calls
     assert call.args[1] == "exec"
-    assert "-e" in call.args
-    assert "OPENAI_API_KEY=sk-openai" in call.args
+    # Name reaches argv via `-e NAME`; the value must not appear anywhere in argv.
+    assert call.args.count("-e") == 1
+    assert "OPENAI_API_KEY" in call.args
+    assert "sk-secret" not in " ".join(call.args)
+    # The value is carried in the subprocess environment instead.
+    assert call.env is not None
+    assert call.env["OPENAI_API_KEY"] == "sk-secret"
 
 
 def test_managed_run_missing_env_fails_loud(
@@ -680,6 +693,40 @@ def test_cli_run_does_not_inject_env(fake_sbx: _FakeSbx) -> None:
         "-lc",
         'printf %s "$HOME"',
     ]
+
+
+def test_managed_run_background_strips_proxy_managed(
+    fake_sbx: _FakeSbx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The managed background host launch unsets Docker's proxy-managed
+    placeholder env vars in the bash shell BEFORE spawning the detached
+    host, so a placeholder for a key not in sandbox.sbx.env can't shadow the
+    host's real harness credentials (e.g. Claude Code subscription auth).
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real")
+    launcher = SbxSandboxLauncher(
+        template="ghcr.io/me/omnigent-host-sbx:latest",
+        env=["ANTHROPIC_API_KEY"],
+        server_url="http://172.17.0.1:6767",
+    )
+    launcher.run_background("box", "OMNIGENT_HOST_TOKEN=t omnigent host --server u")
+    [call] = fake_sbx.calls
+    remote = call.args[-1]
+    assert "proxy-managed" in remote
+    assert "unset" in remote
+    # The strip runs before the host is backgrounded / exec'd.
+    assert remote.index("unset") < remote.index("setsid nohup")
+    assert remote.index("unset") < remote.index("omnigent host")
+
+
+def test_cli_run_background_is_unstripped(fake_sbx: _FakeSbx) -> None:
+    """CLI-bootstrap mode keeps the base background command (no strip prefix)."""
+    SbxSandboxLauncher().run_background("box", "cmd")
+    [call] = fake_sbx.calls
+    remote = call.args[-1]
+    assert "proxy-managed" not in remote
+    assert remote.startswith("setsid nohup")
 
 
 def test_sandbox_exists_parses_object_wrapper(fake_sbx: _FakeSbx) -> None:
