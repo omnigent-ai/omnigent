@@ -396,6 +396,27 @@ def _ensure_agents_sdk() -> ModuleType:
         ) from exc
 
 
+def _has_ambient_databricks_config() -> bool:
+    """True when the environment carries a Databricks auth signal.
+
+    Used to decide whether an unpinned model (no OpenAI credentials, no
+    explicit profile) should fall back to ambient Databricks authentication or
+    fail with a clear OpenAI-credentials error. Checks the standard Databricks
+    SDK environment variables and the ``~/.databrickscfg`` config file.
+    """
+    if any(
+        os.environ.get(var)
+        for var in (
+            "DATABRICKS_HOST",
+            "DATABRICKS_TOKEN",
+            "DATABRICKS_CONFIG_PROFILE",
+            "DATABRICKS_CLIENT_ID",
+        )
+    ):
+        return True
+    return os.path.isfile(os.path.expanduser("~/.databrickscfg"))
+
+
 def _get_openai_async_client(
     profile: str | None = None,
     api_key: str | None = None,
@@ -547,17 +568,29 @@ def _get_openai_async_client(
     if api_key:
         return AsyncOpenAI(api_key=api_key, **retry_kwargs)
 
-    # Non-Databricks model with no OpenAI credentials — fail loudly rather
-    # than silently routing to the Databricks AI Gateway, which will 404.
-    if not is_databricks_model:
+    # No OpenAI credentials. Only fall back to ambient Databricks auth when
+    # there is an actual Databricks signal: an explicit ``databricks-`` model,
+    # a spec profile, or ambient Databricks config in the environment. Without
+    # any such signal, an unpinned model (``model is None``) is an OpenAI/gpt
+    # sub-agent that never wanted Databricks, so fail with a clear
+    # OpenAI-credentials error instead of routing into Databricks auth and
+    # surfacing a misleading "install databricks-sdk" / "databricks auth login"
+    # error (#377).
+    databricks_intent = (
+        (model is not None and model.startswith("databricks-"))
+        or profile is not None
+        or _has_ambient_databricks_config()
+    )
+    if not databricks_intent:
+        pinned = f"for model {model!r}" if model else "and no model is pinned"
         raise ValueError(
-            f"Model {model!r} is not a Databricks-hosted model but no OpenAI "
-            "credentials were found. Set OPENAI_API_KEY (and optionally "
-            "OPENAI_BASE_URL) to use this model, or use a 'databricks-' "
-            "prefixed model name to route through Databricks."
+            f"No OpenAI credentials found {pinned}. Set OPENAI_API_KEY (and "
+            "optionally OPENAI_BASE_URL) to use an OpenAI model, or use a "
+            "'databricks-' prefixed model name or a Databricks profile to route "
+            "through Databricks."
         )
 
-    # No profile, no env — final fallback via ambient Databricks credentials.
+    # Databricks intent with no profile/env — resolve ambient Databricks creds.
     try:
         from .databricks_executor import _resolve_databricks_auth
 
@@ -565,10 +598,9 @@ def _get_openai_async_client(
     except ImportError as exc:
         raise ImportError(
             "The 'databricks-sdk' package is required for Databricks "
-            "authentication but is not installed, and no OPENAI_API_KEY or "
-            "OPENAI_BASE_URL environment variables are set. Either install "
-            "the package (`pip install 'omnigent[databricks]'`) or set "
-            "OPENAI_API_KEY/OPENAI_BASE_URL for non-Databricks OpenAI access."
+            "authentication but is not installed. Install it with "
+            "`pip install 'omnigent[databricks]'`, or set OPENAI_API_KEY / "
+            "OPENAI_BASE_URL for OpenAI access."
         ) from exc
     return AsyncOpenAI(
         base_url=base_url_override or _databricks_openai_base_url(host),

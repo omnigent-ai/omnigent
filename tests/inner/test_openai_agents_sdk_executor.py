@@ -1528,6 +1528,61 @@ def test_get_openai_client_profile_uses_callback_auth(monkeypatch):
     assert isinstance(captured["http_client"], httpx.AsyncClient)
 
 
+def test_get_openai_client_unpinned_model_no_databricks_signal_raises_openai_error(monkeypatch):
+    """Unpinned model, no OpenAI creds, no Databricks signal -> clear OpenAI error (#377).
+
+    A gpt / openai-agents sub-agent whose model is left unpinned used to be
+    treated as Databricks-hosted (``is_databricks_model = model is None``) and
+    routed into ambient Databricks auth, surfacing "install databricks-sdk" /
+    "databricks auth login" even though nobody configured Databricks. It must
+    now fail with an OpenAI-credentials error that names the real problem.
+    """
+    from omnigent.inner import openai_agents_sdk_executor as mod
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    for var in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(mod, "_has_ambient_databricks_config", lambda: False)
+
+    with pytest.raises(ValueError, match=r"No OpenAI credentials found and no model is pinned"):
+        _get_openai_async_client(model=None)
+
+
+def test_get_openai_client_unpinned_model_with_databricks_signal_routes_to_databricks(monkeypatch):
+    """Unpinned model WITH an ambient Databricks signal still routes to Databricks.
+
+    Guards the #377 fix against over-reach: a real Databricks deployment (which
+    always carries a Databricks signal) must keep resolving an unpinned model
+    through Databricks auth, not hit the new OpenAI-credentials error.
+    """
+    import httpx
+
+    from omnigent.inner import openai_agents_sdk_executor as mod
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    for var in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(mod, "_has_ambient_databricks_config", lambda: True)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda profile: (httpx.BasicAuth("u", "p"), "https://workspace.example.com"),
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+        _get_openai_async_client(model=None)
+
+    # Routed to Databricks: base_url derives from the workspace host (no raise).
+    assert "workspace.example.com" in captured["base_url"]
+
+
 def test_get_openai_client_host_override_uses_ucode_auth_command(monkeypatch):
     """ucode host override uses ucode auth command without profile lookup.
 
