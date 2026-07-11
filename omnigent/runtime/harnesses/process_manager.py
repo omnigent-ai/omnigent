@@ -1257,26 +1257,30 @@ class HarnessProcessManager:
         Best-effort throughout — a permission error or unreadable
         sentinel logs and skips the dir rather than aborting boot.
         """
-        if not self._tmp_parent.exists():
+        try:
+            if not self._tmp_parent.exists():
+                return
+            children = list(self._tmp_parent.iterdir())
+        except OSError as exc:
+            _logger.warning("skipping orphan sweep: %s", exc)
             return
-        for child in self._tmp_parent.iterdir():
-            if not child.is_dir() or not child.name.startswith("ap-"):
-                continue
-            sentinel = child / _AP_PID_FILE
-            if not sentinel.exists():
-                # No sentinel — directory either pre-dates the
-                # convention or is mid-creation. Leave alone.
-                continue
+
+        for child in children:
             try:
+                if not child.is_dir() or not child.name.startswith("ap-"):
+                    continue
+                sentinel = child / _AP_PID_FILE
+                if not sentinel.exists():
+                    continue
                 pid_str = sentinel.read_text(encoding="utf-8").strip()
                 pid = int(pid_str)
-            except (OSError, ValueError) as exc:
-                _logger.warning(
-                    "could not read AP_PID sentinel at %s: %s; skipping",
-                    sentinel,
-                    exc,
-                )
+            except OSError as exc:
+                _logger.warning("skipping unreadable instance dir %s: %s", child, exc)
                 continue
+            except ValueError as exc:
+                _logger.warning("skipping invalid AP_PID at %s: %s", child / _AP_PID_FILE, exc)
+                continue
+
             if _pid_alive(pid):
                 # Sibling Omnigent is still running — leave it alone.
                 continue

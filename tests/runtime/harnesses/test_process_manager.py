@@ -40,6 +40,7 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
+    IS_WINDOWS,
     HarnessProcessManager,
     NoLiveHarnessError,
     _pid_alive,
@@ -311,12 +312,14 @@ async def test_release_terminates_subprocess(
         # if release worked, the PID won't be alive after.
         pid = (await client.get("/pid")).json()["pid"]
         socket_path = manager.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        if not IS_WINDOWS:
+            assert socket_path.exists()
         await manager.release("conv_a")
         # Socket cleanup is part of release's contract — leaving
         # the file behind would fail uvicorn binding on a
         # subsequent spawn for the same conv id.
-        assert not socket_path.exists()
+        if not IS_WINDOWS:
+            assert not socket_path.exists()
         # Process should be gone — give the OS a brief moment
         # since SIGTERM → wait is async.
         for _ in range(20):
@@ -380,11 +383,17 @@ async def test_get_client_respawns_after_crash(
     try:
         client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         original_pid = (await client.get("/pid")).json()["pid"]
-        os.kill(original_pid, signal.SIGKILL)
+        os.kill(original_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         # Wait for the OS to mark the process dead so the next
         # get_client's ``returncode`` check sees it.
         for _ in range(40):
             if not _pid_alive(original_pid):
+                break
+            await asyncio.sleep(0.05)
+        # Yield to event loop to let it update returncode
+        entry = manager._entries["conv_a"]
+        for _ in range(40):
+            if entry.process.returncode is not None:
                 break
             await asyncio.sleep(0.05)
         # Now get_client should detect the corpse and respawn.
@@ -542,19 +551,26 @@ async def test_idle_reaper_releases_stale_entries(
         # inline HTTP call and yank the client mid-request. Socket-existence
         # loop below is the real "entry was reaped" assertion.
         socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        if not IS_WINDOWS:
+            assert socket_path.exists()
         # Wait long enough for the 2s idle window plus multiple
         # reaper passes. A 0s timeout races with subprocess startup
         # under CI load and can close the client before the socket is
         # ready to service requests.
         for _ in range(60):
-            if not socket_path.exists():
-                break
+            if IS_WINDOWS:
+                if not fast.has_session("conv_a"):
+                    break
+            else:
+                if not socket_path.exists():
+                    break
             await asyncio.sleep(0.1)
         # If this assertion flips, the reaper isn't running OR
         # isn't acting on stale entries — both regressions in
         # the contract.
-        assert not socket_path.exists()
+        assert not fast.has_session("conv_a")
+        if not IS_WINDOWS:
+            assert not socket_path.exists()
     finally:
         await fast.shutdown()
 
@@ -589,7 +605,8 @@ async def test_idle_reaper_survives_release_error(
     try:
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
         socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        if not IS_WINDOWS:
+            assert socket_path.exists()
 
         # Make the first reaper-triggered release raise, then defer to the
         # real release on later calls — a transient teardown failure.
@@ -607,14 +624,17 @@ async def test_idle_reaper_survives_release_error(
         # Across many reaper passes: with the bug the first raise kills the
         # loop and the socket lingers; with the guard a later pass reaps it.
         for _ in range(60):
-            if not socket_path.exists():
-                break
+            if IS_WINDOWS:
+                if not fast.has_session("conv_a"):
+                    break
+            else:
+                if not socket_path.exists():
+                    break
             await asyncio.sleep(0.1)
         assert calls["n"] >= 1, "reaper never attempted to release the stale entry"
-        assert not socket_path.exists(), (
-            "reaper died on the first release error and never reclaimed the "
-            "stale subprocess on a later pass"
-        )
+        assert not fast.has_session("conv_a")
+        if not IS_WINDOWS:
+            assert not socket_path.exists()
     finally:
         await fast.shutdown()
 
@@ -647,7 +667,8 @@ async def test_idle_reaper_skips_in_flight_turn(
     try:
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
         socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        if not IS_WINDOWS:
+            assert socket_path.exists()
         # Mark the turn live, as the runner does on ``response.created``.
         fast.mark_in_flight("conv_a", "resp_x")
         assert fast.has_active_turn("conv_a")
@@ -656,16 +677,24 @@ async def test_idle_reaper_skips_in_flight_turn(
         # in-flight guard must keep the subprocess alive the whole time.
         for _ in range(40):
             await asyncio.sleep(0.1)
-            assert socket_path.exists(), "in-flight turn was reaped mid-flight"
+            assert fast.has_session("conv_a"), "in-flight turn was reaped mid-flight"
+            if not IS_WINDOWS:
+                assert socket_path.exists(), "in-flight turn was reaped mid-flight"
         # Turn ends: clear the marker (as ``_on_proxy_stream_end`` does). The
         # entry is now genuinely idle and must become reapable.
         fast.clear_in_flight("conv_a")
         assert not fast.has_active_turn("conv_a")
         for _ in range(60):
-            if not socket_path.exists():
-                break
+            if IS_WINDOWS:
+                if not fast.has_session("conv_a"):
+                    break
+            else:
+                if not socket_path.exists():
+                    break
             await asyncio.sleep(0.1)
-        assert not socket_path.exists()
+        assert not fast.has_session("conv_a")
+        if not IS_WINDOWS:
+            assert not socket_path.exists()
     finally:
         await fast.shutdown()
 
@@ -784,13 +813,18 @@ async def test_idle_reaper_disabled_when_timeout_zero(
     try:
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
         socket_path = fast.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
+        if not IS_WINDOWS:
+            assert socket_path.exists()
         # ~20 reaper passes at 0.05 s. With the bug the socket is gone almost
         # immediately; with the guard it survives because reaping is disabled.
         await asyncio.sleep(1.0)
-        assert socket_path.exists(), (
+        assert fast.has_session("conv_a"), (
             "idle_timeout_s=0 must DISABLE reaping, not reap every entry each pass"
         )
+        if not IS_WINDOWS:
+            assert socket_path.exists(), (
+                "idle_timeout_s=0 must DISABLE reaping, not reap every entry each pass"
+            )
     finally:
         await fast.shutdown()
 
@@ -1120,4 +1154,50 @@ async def test_orphan_sweep_escalates_to_sigkill(
     await mgr._kill_orphan_runners(instance_dir)
 
     assert calls == 2
-    assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+    assert killed == [(12345, signal.SIGTERM), (12345, getattr(signal, "SIGKILL", signal.SIGTERM))]
+
+
+async def test_orphan_sweep_ignores_permission_errors(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Orphan sweep handles unlistable parents or restricted entries gracefully."""
+    mgr = HarnessProcessManager(tmp_parent=short_tmp_parent)
+
+    # 1. Unlistable parent directory
+    original_iterdir = Path.iterdir
+
+    def mock_iterdir(self):
+        if self == short_tmp_parent:
+            raise PermissionError("parent unlistable")
+        return original_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", mock_iterdir)
+    await mgr._sweep_orphans()
+
+    # 2. Restricted sibling entries
+    monkeypatch.undo()
+    restricted_dir = short_tmp_parent / "ap-restricted"
+    restricted_dir.mkdir()
+
+    original_is_dir = Path.is_dir
+
+    def mock_is_dir(self):
+        if self == restricted_dir:
+            raise PermissionError("child uninspectable")
+        return original_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", mock_is_dir)
+    await mgr._sweep_orphans()
+
+    # 3. Unreadable sentinel exists check
+    monkeypatch.undo()
+    original_exists = Path.exists
+
+    def mock_exists(self):
+        if self == restricted_dir / _AP_PID_FILE:
+            raise PermissionError("sentinel uninspectable")
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", mock_exists)
+    await mgr._sweep_orphans()
