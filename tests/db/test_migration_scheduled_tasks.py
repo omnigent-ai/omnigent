@@ -129,8 +129,7 @@ def test_expected_indexes(db_engine: Engine) -> None:
     runs_idx = {i["name"] for i in insp.get_indexes("scheduled_task_runs")}
     assert "ix_scheduled_task_runs_scheduled_task_id" in runs_idx
     runs_idx_cols = {
-        i["name"]: [c for c in i["column_names"]]
-        for i in insp.get_indexes("scheduled_task_runs")
+        i["name"]: list(i["column_names"]) for i in insp.get_indexes("scheduled_task_runs")
     }
     assert runs_idx_cols["ix_scheduled_task_runs_scheduled_task_id"] == [
         "workspace_id",
