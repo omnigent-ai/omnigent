@@ -1,38 +1,4 @@
-"""Transport drivers: the probe-facing contract and the registry.
-
-A probe measures one capability dimension by calling a small set of
-*semantic* methods on a driver — ``run_basic_turn``, ``run_streaming_turn``,
-``run_tool_turn``, ``run_interrupt_turn`` — each returning a
-:class:`~tests.harness_bench.driver.TurnResult`. The driver owns the
-*mechanism* (how a tool call is provoked, how a deny is enforced, how deltas
-are observed); the probe owns the *interpretation* (what verdict the result
-implies). This split is what lets one probe run over transports that reach
-the same capability by different means:
-
-- ``sdk-inproc`` (:class:`~tests.harness_bench.driver.SdkInprocDriver`)
-  drives a harness wrap subprocess directly, with request-level tools and
-  verdict-posted policy.
-- ``full-server``
-  (:class:`~tests.harness_bench.full_server_driver.FullServerDriver`) drives
-  a real server+runner, with a builtin tool and a spec-baked policy.
-
-A kwargs-carrying ``run_turn`` could not bridge these: e.g. streaming is only
-observable on full-server via a separate SSE subscription, so "basic turn"
-and "streaming turn" must be *distinct* calls, not one call with a flag.
-
-Transport selection (see :func:`resolve_driver_class`). A profile's
-``transport`` field is the harness *family* marker, not the literal driver:
-
-- **SDK-family** harnesses (``sdk-inproc``/``full-server``) default to
-  ``full-server`` — the fullest coverage, the only transport that exercises
-  Tool calling + Policy DENY, and a strict superset of what ``sdk-inproc``
-  observes. ``--fast`` downgrades them to ``sdk-inproc``, trading that
-  coverage for skipping the server boot.
-- **native** harnesses (``native-tui``) have exactly one transport; ``--fast``
-  does not apply to them.
-
-A ``--transport`` override wins over both, for any family.
-"""
+"""Transport-independent driver protocol and driver resolution."""
 
 from __future__ import annotations
 
@@ -78,6 +44,19 @@ class Driver(Protocol):
         force so the call should be blocked (``tool_call_denied``); otherwise
         the call is dispatched and answered (``tool_calls`` populated)."""
 
+    async def run_policy_turn(self, *, action: str) -> TurnResult:
+        """Provoke a tool call under an explicit tool-call policy *action*
+        (``"allow"`` or ``"ask"``), for the policy_allow / policy_ask probes.
+
+        - ``"allow"``: an explicit ALLOW policy is in force; the call should
+          proceed (``tool_call_allowed`` set once dispatched + answered).
+        - ``"ask"``: an ASK policy is in force; the call should raise an
+          elicitation (``elicitation_requested`` set), which the driver then
+          resolves so the turn can settle.
+
+        A transport that cannot surface the requested action returns an
+        unmeasured result so the probe SKIPs (never a false verdict)."""
+
     async def run_interrupt_turn(self) -> TurnResult:
         """Start a long turn and interrupt it mid-flight; ``cancelled``
         reflects whether the transport honored the interrupt."""
@@ -104,10 +83,7 @@ def driver_registry() -> dict[str, type]:
     }
 
 
-# The SDK harness family: transports that drive an SDK-wrap harness. They
-# observe the same core dimensions; full-server additionally reaches Tool
-# calling + Policy DENY (server-dispatched) and is a strict coverage superset,
-# so it is the default. --fast picks the cheaper sdk-inproc within this family.
+# Full-server covers server-dispatched tools; --fast uses cheaper sdk-inproc.
 _SDK_FAMILY = frozenset({"sdk-inproc", "full-server"})
 _SDK_DEFAULT = "full-server"
 _SDK_FAST = "sdk-inproc"

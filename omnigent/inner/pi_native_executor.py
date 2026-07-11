@@ -120,12 +120,23 @@ class PiNativeExecutor(Executor):
         the pi terminal if that case ever bites.
         """
         try:
+            from omnigent.cli_auth import databricks_request_headers
             from omnigent.runner._entry import _make_auth_token_factory
 
             factory = _make_auth_token_factory()
             token = factory() if factory is not None else None
             if token:
-                refresh_config_auth_headers(self._bridge_dir, {"Authorization": f"Bearer {token}"})
+                # Rebuild the FULL routing header set (not just the bearer) so the
+                # per-turn refresh preserves the workspace / deployment routing
+                # selectors baked at launch (see runner/app.py). A bearer-only
+                # refresh would drop them and re-break routing after the first turn.
+                refresh_config_auth_headers(
+                    self._bridge_dir,
+                    databricks_request_headers(
+                        os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
+                        bearer_token=token,
+                    ),
+                )
         except Exception:  # noqa: BLE001 — best-effort refresh; never block a turn
             pass
 

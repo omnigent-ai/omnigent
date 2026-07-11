@@ -24,6 +24,11 @@ vi.mock("./SubagentsPanel", () => ({
 vi.mock("./TodoPanel", () => ({
   TodoPanel: () => <div data-testid="todos-stub" />,
 }));
+vi.mock("@/components/BrowserPane/BrowserPane", () => ({
+  BrowserPane: ({ conversationId }: { conversationId: string }) => (
+    <div data-testid="browser-pane-stub">{conversationId}</div>
+  ),
+}));
 
 afterEach(() => {
   cleanup();
@@ -40,6 +45,7 @@ function renderWorkspace(
     rightRailTab?: RightRailTab;
     selectedFilePath?: string | null;
     openFiles?: string[];
+    showBrowserTab?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -53,6 +59,7 @@ function renderWorkspace(
       rightRailTab={overrides.rightRailTab ?? "files"}
       onRightRailTabChange={onRightRailTabChange}
       showFilesPanel
+      showBrowserTab={overrides.showBrowserTab ?? false}
       changedCount={0}
       showShellsTab={false}
       terminalsLength={0}
@@ -177,5 +184,25 @@ describe("WorkspacePanel content area", () => {
     // slot and the viewer is unmounted.
     expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+});
+
+describe("WorkspacePanel browser tab", () => {
+  it("renders the Browser tab only when showBrowserTab is set", () => {
+    renderWorkspace({ showBrowserTab: true });
+    expect(screen.getByRole("tab", { name: /browser/i })).toBeInTheDocument();
+  });
+
+  it("omits the Browser tab when showBrowserTab is false", () => {
+    renderWorkspace({ showBrowserTab: false });
+    expect(screen.queryByRole("tab", { name: /browser/i })).toBeNull();
+  });
+
+  it("mounts the browser pane when the browser tab is selected", () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    // The content slot swaps to the embedded browser pane (stubbed here).
+    expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
+    // And the file scope views are not mounted in that branch.
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
   });
 });

@@ -13,6 +13,7 @@
 import type { ConversationItem } from "./conversationItems";
 import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
+import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import type {
   CodexModelOption,
@@ -212,6 +213,7 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
    * idle. Lets a client reconnecting mid-turn reopen a streaming
@@ -304,6 +306,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
 }

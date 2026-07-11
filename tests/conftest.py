@@ -336,6 +336,58 @@ def _isolate_codex_native_state(
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_snapshot_failures(pytestconfig: pytest.Config) -> Generator[None, None, None]:
+    """Give every xdist worker its own snapshot-failures directory.
+
+    The pytest-playwright-visual-snapshot plugin ships a session-scoped
+    autouse fixture of this same name that ``rmtree``s then ``mkdir``s a
+    single static path (``playwright_visual_snapshot_failures_path``) at
+    session start. That fixture runs in *every* pytest session — including
+    the non-visual unit shards — and under ``-n`` all workers target the one
+    path: the rmtree/mkdir sequence is non-atomic, so one worker's
+    ``mkdir(exist_ok=True)`` re-raises ``FileExistsError`` when another
+    worker deletes the dir in the window between them, and that fixture error
+    cascades to every test on the worker. This override (a conftest fixture
+    shadows the plugin fixture of the same name for the whole ``tests/`` tree)
+    keys the leaf off ``PYTEST_XDIST_WORKER`` so no two workers ever touch the
+    same directory — the race is gone by construction, with no retries or
+    sleeps. The shared parent is only ever created (never deleted), so the
+    plugin's delete-then-create-the-same-dir window cannot recur.
+
+    Without xdist (the serial ``ui-snapshot.yml`` visual gate) the worker id
+    is unset and the base path is used unchanged, so the committed snapshot
+    layout and the CI artifact upload are unaffected.
+    """
+    import shutil
+
+    from pytest_playwright_visual_snapshot.plugin import SnapshotPaths, _get_option
+
+    root_dir = Path(pytestconfig.rootdir)  # type: ignore[arg-type]
+
+    SnapshotPaths.snapshots_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshots_path", cast=str)
+        or (root_dir / "__snapshots__")
+    )
+
+    base_failures_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshot_failures_path", cast=str)
+        or (root_dir / "snapshot_failures")
+    )
+    # Per-worker leaf under xdist; the base path itself when run serially
+    # (master process / no xdist), keeping non-xdist output identical.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    failures_path = base_failures_path / worker if worker else base_failures_path
+    SnapshotPaths.failures_path = failures_path
+
+    # Only this worker's own leaf is ever removed, so the rmtree/mkdir pair is
+    # uncontended; parents=True only creates the shared parent, never deletes it.
+    shutil.rmtree(failures_path, ignore_errors=True)
+    failures_path.mkdir(parents=True, exist_ok=True)
+
+    yield
+
+
 @pytest.fixture(scope="session")
 def _worker_db_uri() -> Generator[str, None, None]:
     """

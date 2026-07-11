@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.codex_native_app_server import CodexAppServerClient
     from omnigent.terminals.registry import TerminalListEntry
 
@@ -1160,7 +1161,15 @@ async def _auto_create_opencode_terminal(
         _policy_factory = _make_auth_token_factory()
         _policy_token = _policy_factory() if _policy_factory is not None else None
         if _policy_token:
-            policy_env["OMNIGENT_POLICY_AUTH"] = f"Bearer {_policy_token}"
+            from omnigent.cli_auth import databricks_request_headers
+
+            # Bake the FULL routing header map (bearer + workspace / deployment
+            # selectors), not a bare bearer: the plugin POSTs /policies/evaluate
+            # to the omnigent server out-of-process, so without the selectors it
+            # could land on a different server instance than the runner's.
+            policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
+                databricks_request_headers(runner_server_url, bearer_token=_policy_token)
+            )
 
     # Merge the user's global provider definitions (e.g. OpenAI-compatible
     # endpoints with custom base URLs) into the synthesized config so the
@@ -1910,7 +1919,15 @@ async def _auto_create_pi_terminal(
     session_dir = pi_session_dir(bridge_dir)
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
-    auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    # Route the extension's out-of-process POSTs (/events, /mcp,
+    # /policies/evaluate) through the shared header builder so they carry the
+    # workspace / deployment routing selectors, not just a bare bearer. A bare
+    # bearer skips those selectors and can land on a different server instance
+    # than the one the runner (and the web UI) are on, so live-streamed items
+    # never reach the browser's in-process event stream (they only appear on reload).
+    from omnigent.cli_auth import databricks_request_headers
+
+    auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's
@@ -5075,6 +5092,34 @@ def _build_claude_native_base_args(
     return tuple(args)
 
 
+def _claude_terminal_env_unset(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[str]:
+    """
+    Env vars to strip from a native Claude terminal child.
+
+    Always drops ``DATABRICKS_CONFIG_PROFILE`` so the terminal's MCP
+    servers don't inherit the runner's ambient Databricks profile and
+    resolve auth against the wrong workspace.
+
+    Always drops ``CLAUDECODE`` because Claude Code rejects any child launch
+    carrying that nested-session marker, regardless of its auth mode. When the
+    launch config carries an ``apiKeyHelper``, also drops the raw
+    ``ANTHROPIC_API_KEY``: seeing both opens Claude Code's "Detected a custom
+    API key" menu, whose selected row uses the same ``❯`` glyph the tmux
+    delivery path waits for, so the first web message is typed into the menu.
+
+    :param claude_config: The resolved native launch config, or ``None``
+        (Claude's own login) — which still strips the nested-session marker.
+    :returns: The env var names to unset, e.g.
+        ``["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", "ANTHROPIC_API_KEY"]``.
+    """
+    env_unset = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
+    if claude_config is not None and claude_config.api_key_helper:
+        env_unset.append("ANTHROPIC_API_KEY")
+    return env_unset
+
+
 def _publish_terminal_pending(
     publish_event: Callable[[str, dict[str, Any]], None],
     session_id: str,
@@ -5408,7 +5453,6 @@ async def _auto_create_claude_terminal(
 
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.claude_native import (
-        ClaudeNativeUcodeConfig,
         augment_claude_args,
         build_native_claude_terminal_env,
         resolve_native_claude_config,
@@ -5641,10 +5685,7 @@ async def _auto_create_claude_terminal(
     # the CLI injects this in ``_claude_terminal_request``; on this path
     # the runner must, since it (not the CLI) launches the terminal.
     # Best-effort: no profile / no ucode state / malformed state falls
-    # back to Claude's own native config (empty env). The runner env is
-    # an allowlist that excludes ``ANTHROPIC_API_KEY`` /
-    # ``CLAUDE_CODE_*``, so — unlike the CLI — there are no stray
-    # provider/session vars to unset before the gateway env applies.
+    # back to Claude's own native config (empty env).
     # See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
     # Resolve the launch config across all offerings — a configured provider
     # (omnigent setup), a Databricks ucode profile from provider config, or
@@ -5709,6 +5750,8 @@ async def _auto_create_claude_terminal(
     # managed-host path. Identity by default. See omnigent.claude_launcher.
     launch_command, launch_args = resolve_claude_launch("claude", list(claude_args))
 
+    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_terminal falls back to
@@ -5726,21 +5769,15 @@ async def _auto_create_claude_terminal(
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
         env=build_native_claude_terminal_env(claude_config),
-        # Strip the ambient Databricks-SDK profile selection from
-        # the Claude tmux env. Claude's MCP servers inherit this env,
-        # and several construct ``WorkspaceClient`` without pinning
-        # ``auth_type``; when ``DATABRICKS_CONFIG_PROFILE`` is set,
-        # the SDK's auth resolver picks up that profile's cached
-        # OAuth token and ignores the explicit token the MCP was
-        # configured with — sending a bearer minted for the wrong
-        # workspace and getting back a 400 ``Invalid Token`` from
-        # the right one. Claude itself doesn't read this env var
-        # (provider routing is via ``ANTHROPIC_BASE_URL`` /
-        # ``apiKeyHelper``), so dropping it from the terminal env
-        # affects only the leak path. MCPs that genuinely need a
-        # specific profile must declare it in their own per-MCP env
-        # configuration rather than inheriting it from the runner.
-        env_unset=["DATABRICKS_CONFIG_PROFILE"],
+        # Names to strip (see ``_claude_terminal_env_unset``). Dropping
+        # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
+        # inherit this env and several build ``WorkspaceClient`` without pinning
+        # ``auth_type``: a set profile makes the SDK prefer that profile's cached
+        # OAuth token over the MCP's explicit token, 400ing against the wrong
+        # workspace. Claude itself ignores the var (routing is
+        # ``ANTHROPIC_BASE_URL`` / ``apiKeyHelper``), so this affects only MCPs;
+        # ones needing a specific profile must set it in their own per-MCP env.
+        env_unset=claude_terminal_env_unset,
         scrollback=50000,
         # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
         # sub-agent worker whose CLI exits right after rendering its prompt on
@@ -10701,19 +10738,69 @@ def create_runner_app(
         message). claude-native is unaffected: its badge mirrors Claude Code's
         *own* ``[Request interrupted by user]`` record, which is real.
 
+        Stop also cancels an in-flight MCP startup round (issue #2058): the
+        bridge's still-``starting`` servers are marked ``cancelled``
+        locally (what the web band and turn-error text read, even if Codex
+        never acknowledges) and the app-server is asked to abort startup
+        the way the Codex TUI does — ``turn/interrupt`` with an EMPTY turn
+        id (its ``startup_interrupt``). This runs alongside the active-turn
+        interrupt when both apply, because codex defers a mid-startup
+        turn's execution until the round settles: stopping only the turn
+        would leave the user watching a startup they asked to stop.
+
         :param conv_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: 204 when no active turn is recorded or the interrupt lands;
-            503 when Codex rejects the active-turn interrupt.
+        :returns: 204 when nothing needs interrupting or the interrupts
+            land; 503 when Codex rejects the active-turn interrupt.
         """
         from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            cancel_pending_mcp_startup,
+            read_mcp_startup,
+        )
 
         state = await _codex_native_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
             return Response(status_code=204)
-        if state.active_turn_id is None:
-            _logger.info("Codex-native interrupt skipped for %s: no active turn.", conv_id)
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(
+            labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        )
+        pending_mcp = cancel_pending_mcp_startup(bridge_dir)
+        if state.active_turn_id is None and not pending_mcp:
+            _logger.info(
+                "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
+                conv_id,
+            )
             return Response(status_code=204)
+        if pending_mcp:
+            _logger.info(
+                "Codex-native interrupt for %s cancels MCP startup: %s",
+                conv_id,
+                ", ".join(pending_mcp),
+            )
+            # Publish the flipped map ourselves: the forwarder only reposts
+            # when IT changes the map, and codex's own cancelled edges are
+            # owner-only — without this post the web band and snapshot stay
+            # stuck on "Starting MCP servers" after a Stop.
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": "external_mcp_startup",
+                        "data": {"servers": read_mcp_startup(bridge_dir)},
+                    },
+                    timeout=10.0,
+                )
+            except Exception:  # noqa: BLE001 - the bridge flip already took effect locally.
+                _logger.warning(
+                    "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
+                )
 
         codex_client = client_for_transport(
             state.socket_path,
@@ -10721,13 +10808,29 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
-            await codex_client.request(
-                "turn/interrupt",
-                {
-                    "threadId": state.thread_id,
-                    "turnId": state.active_turn_id,
-                },
-            )
+            if pending_mcp:
+                # Startup interrupt first and best-effort: the local
+                # cancel above already updated what Omnigent shows.
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {"threadId": state.thread_id, "turnId": ""},
+                    )
+                except Exception:  # noqa: BLE001 - the local cancel already took effect.
+                    _logger.warning(
+                        "Codex-native MCP startup interrupt failed for session=%s thread=%s",
+                        conv_id,
+                        state.thread_id,
+                        exc_info=True,
+                    )
+            if state.active_turn_id is not None:
+                await codex_client.request(
+                    "turn/interrupt",
+                    {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                    },
+                )
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures to caller.
             _logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",

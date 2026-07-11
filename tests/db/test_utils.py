@@ -20,6 +20,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
     extract_search_text,
@@ -637,3 +638,51 @@ def test_extract_search_text_routing_decision() -> None:
         }
     )
     assert extract_search_text(item) == "databricks-claude-opus-4-8 Deep design work."
+
+
+def test_build_search_snippet_short_text_returned_whole() -> None:
+    """A match within a short line yields the whole (collapsed) line, no ellipsis."""
+    assert (
+        build_search_snippet("Hello what model are you using?", "what")
+        == "Hello what model are you using?"
+    )
+
+
+def test_build_search_snippet_is_case_insensitive() -> None:
+    """Matching mirrors the store's case-insensitive LIKE filter."""
+    assert build_search_snippet("Deploy the SERVICE now", "service") is not None
+
+
+def test_build_search_snippet_windows_long_text_with_ellipses() -> None:
+    """A match buried in long text is windowed with … on both elided ends."""
+    text = "a" * 200 + " deploy error " + "b" * 200
+    snippet = build_search_snippet(text, "deploy error")
+    assert snippet is not None
+    assert "deploy error" in snippet
+    assert snippet.startswith("…") and snippet.endswith("…")
+    # Kept short enough for a single UI row.
+    assert len(snippet) <= 160 + 2
+
+
+def test_build_search_snippet_collapses_whitespace() -> None:
+    """Multi-line / repeated whitespace collapses so the snippet is one clean line."""
+    snippet = build_search_snippet("line one\n\n   line two matches here", "matches")
+    assert snippet == "line one line two matches here"
+
+
+def test_build_search_snippet_never_clamps_out_the_match() -> None:
+    """A query term longer than max_len still appears in the snippet.
+
+    The length cap must not truncate the window before the matched span
+    ends — otherwise the UI would have nothing to highlight.
+    """
+    term = "x" * 300
+    snippet = build_search_snippet(f"prefix {term} suffix", term)
+    assert snippet is not None
+    assert term in snippet
+
+
+def test_build_search_snippet_no_match_returns_none() -> None:
+    """No occurrence (or empty query) yields None so the caller shows no preview."""
+    assert build_search_snippet("no match here", "xyz") is None
+    assert build_search_snippet("anything", "") is None

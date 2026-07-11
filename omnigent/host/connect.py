@@ -380,6 +380,16 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
         # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
         "OMNIGENT_TELEMETRY_ENABLED",
+        # Opaque request-routing headers (dev/test): a JSON header map folded by
+        # cli_auth.databricks_request_headers into every client→server connection
+        # so a request pins to a specific server instance/replica. Must reach the
+        # spawned runner so its tunnel + server callbacks route to the SAME
+        # instance the host registered on — otherwise the host lands on the
+        # selected instance while its runners fall back to the default one.
+        # Routing config, not a secret; unset in prod. Allowlisting it forwards it
+        # host→runner intrinsically, so the setter need not also list it in
+        # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -393,8 +403,10 @@ _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "O
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
 # ANTHROPIC_* for claude-sdk / pi (claude-code also honors
-# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways,
-# AWS_BEARER_TOKEN_BEDROCK + ANTHROPIC_BEDROCK_BASE_URL for Bedrock mode,
+# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways, and
+# ANTHROPIC_MODEL to pin a gateway-served model (must travel with the
+# key/endpoint, else native Claude launches with a default the gateway
+# rejects), AWS_BEARER_TOKEN_BEDROCK + ANTHROPIC_BEDROCK_BASE_URL for Bedrock mode,
 # and CLAUDE_CODE_OAUTH_TOKEN for `claude setup-token` subscription auth),
 # OPENAI_* for codex / openai-agents (CODEX_ACCESS_TOKEN is the codex
 # CLI's headless ChatGPT-workspace credential, minted in the ChatGPT
@@ -413,6 +425,7 @@ _BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
         "ANTHROPIC_BEDROCK_BASE_URL",
         "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_OAUTH_TOKEN",

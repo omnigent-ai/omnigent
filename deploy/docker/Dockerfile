@@ -334,7 +334,8 @@ RUN set -eu; \
 # site-packages and imports no longer require /build at runtime.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
-RUN pip install --no-cache-dir /build
+RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV

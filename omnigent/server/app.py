@@ -7,7 +7,7 @@ import os
 import re
 import tarfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Protocol
@@ -45,7 +45,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -70,6 +70,7 @@ from omnigent.server.routes.sessions import (
     create_sessions_router,
     set_server_runner_router,
 )
+from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -1077,6 +1078,8 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
+    sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
+    public_sharing: bool | Callable[[], bool] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1134,6 +1137,34 @@ def create_app(
         ``host_type="managed"`` create fails with a clear error).
         Managed-host credentials live on the ``hosts`` table, so no
         extra store is wired.
+    :param sharing_mode: Server policy for creating new session
+        permission grants (see :class:`SharingMode`): ``ON`` allows
+        grants at any level plus public/workspace read, ``READ_ONLY``
+        caps grants at read (edit/manage rejected with 403),
+        ``RESTRICTED_READ_ONLY`` additionally blocks sharing a session
+        whose working directory is a home or root directory, and ``OFF``
+        rejects all new grants (403). Only *new* grants are gated —
+        revoke/list, self-ownership grants, and existing grants are
+        unaffected in every mode. Accepts a static :class:`SharingMode`,
+        a zero-arg callable resolved per request (for deployments that
+        flip the policy at runtime), or ``None`` — which defaults from
+        the ``OMNIGENT_SHARING_MODE`` env var
+        (``on``/``read_only``/``restricted_read_only``/``off``), failing
+        open to ``ON`` when unset or unrecognized. Reported by
+        ``GET /v1/info`` as ``sharing_mode`` so the web app can gate its
+        Share controls to match.
+    :param public_sharing: Whether public (anyone-with-the-link) read
+        access may be granted — i.e. whether the ``__public__`` grant is
+        allowed. Orthogonal to ``sharing_mode``: a server can keep normal
+        user-to-user sharing on while disabling public links. When
+        disabled, granting ``__public__`` is rejected (403) and the Share
+        modal hides the "Public access" toggle; existing public grants
+        are unaffected. Accepts a static bool, a zero-arg callable
+        resolved per request, or ``None`` — which defaults from the
+        ``OMNIGENT_PUBLIC_SHARING`` env var (enabled unless explicitly
+        falsy — ``0``/``false``/``no``/``off``), failing open to enabled
+        when unset. Reported by ``GET /v1/info`` as
+        ``public_sharing_enabled``.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1365,6 +1396,63 @@ def create_app(
     from omnigent.server.admin_list import load_admin_list
 
     admin_list = load_admin_list(extra=frozenset(admins or ()))
+    # Session-sharing policy, normalized to a per-request callable, plus a
+    # ``sharing_mode_writable`` flag gating the admin ``PUT /v1/sharing``
+    # endpoint.
+    #
+    # ``None`` (the OSS default): ``OMNIGENT_SHARING_MODE`` sets the boot
+    # default, but an admin-set override file (``<data_dir>/sharing_mode``,
+    # written from Settings → Sharing) takes precedence when present — read per
+    # request so a change applies without a restart. Editable here.
+    #
+    # A static value or a callable (managed/embedded deploys, e.g. a Databricks
+    # SAFE flag) is authoritative and NOT editable via the admin endpoint.
+    if sharing_mode is None:
+        from omnigent.server.sharing_settings import read_sharing_mode_override
+
+        _sharing_env_default = SharingMode.coerce(os.environ.get("OMNIGENT_SHARING_MODE"))
+
+        def _resolve_sharing_mode() -> SharingMode:
+            override = read_sharing_mode_override()
+            return override if override is not None else _sharing_env_default
+
+        app.state.sharing_mode = _resolve_sharing_mode
+        app.state.sharing_mode_writable = True
+    elif callable(sharing_mode):
+        _sharing_callable = sharing_mode
+        app.state.sharing_mode = lambda: SharingMode.coerce(_sharing_callable())
+        app.state.sharing_mode_writable = False
+    else:
+        _sharing_static = SharingMode.coerce(sharing_mode)
+        app.state.sharing_mode = lambda: _sharing_static
+        app.state.sharing_mode_writable = False
+    # Public (anyone-with-the-link) access policy, same shape as sharing_mode
+    # above and independent of it. ``None`` reads ``OMNIGENT_PUBLIC_SHARING``
+    # (default enabled) with a ``<data_dir>/public_sharing`` file override,
+    # editable from the admin panel; a static bool or callable is authoritative
+    # and not editable there.
+    if public_sharing is None:
+        from omnigent.server.sharing_settings import (
+            public_sharing_env_default,
+            read_public_sharing_override,
+        )
+
+        _public_env_default = public_sharing_env_default()
+
+        def _resolve_public_sharing() -> bool:
+            override = read_public_sharing_override()
+            return override if override is not None else _public_env_default
+
+        app.state.public_sharing = _resolve_public_sharing
+        app.state.public_sharing_writable = True
+    elif callable(public_sharing):
+        _public_callable = public_sharing
+        app.state.public_sharing = lambda: bool(_public_callable())
+        app.state.public_sharing_writable = False
+    else:
+        _public_static = bool(public_sharing)
+        app.state.public_sharing = lambda: _public_static
+        app.state.public_sharing_writable = False
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -1821,6 +1909,15 @@ def create_app(
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
         sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        # sharing_mode is the server's session-sharing policy
+        # (on/read_only/off), surfaced so the web app can hide the Share
+        # control (off) or restrict it to read-only (read_only) in lockstep
+        # with the server-side grant gate.
+        sharing_mode = app.state.sharing_mode()
+        # public_sharing_enabled: whether the __public__ (anyone-with-the-link)
+        # grant is allowed. Independent of sharing_mode — drives whether the
+        # Share modal shows the "Public access" toggle.
+        public_sharing_enabled = app.state.public_sharing()
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
@@ -1844,6 +1941,8 @@ def create_app(
             "databricks_features": databricks_features,
             "managed_sandboxes_enabled": managed_sandboxes_enabled,
             "sandbox_provider": sandbox_provider,
+            "sharing_mode": sharing_mode.value,
+            "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
         }
@@ -1995,6 +2094,17 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    # Admin control for the server-wide sharing settings. Always mounted (the
+    # handlers self-gate on admin); PUT is a no-op-reject unless this server
+    # resolves the setting from the editable file-backed default.
+    app.include_router(
+        create_sharing_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["sharing"],
     )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───

@@ -9,9 +9,9 @@ lives apart from the *driver* that runs probes against it. Credentials come from
 - :class:`~tests.harness_bench.full_server_driver.FullServerDriver` — one
   harness per :class:`SharedFullServer` (solo run), or several harnesses on one
   shared server (parallel run; see ``bench.run_bench``).
-- :mod:`tests.harness_bench.native_tui_driver` reuses the lower-level spawn
-  helpers (:func:`spawn_omnigent_server`, :func:`_find_free_port`) for its own
-  server + host-daemon topology.
+- :mod:`tests.harness_bench.native_tui_driver` reuses the lower-level server
+  spawn helper and :func:`tests._helpers.live_server.find_free_port` for its
+  own server + host-daemon topology.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import tarfile
 import time
@@ -41,11 +40,14 @@ from tests._helpers.compat import (
     runner_executable,
     server_executable,
 )
+from tests._helpers.live_server import find_free_port
 from tests.harness_bench.profile import BenchProfile
 from tests.harness_bench.runtime_env import BenchRuntimeEnv
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
-_HEALTH_TIMEOUT_S = 90.0
+# Server+runner boot is local; 45s is a "clearly failed to start" ceiling with
+# cold-start headroom, not an expected wait (a healthy boot is a few seconds).
+_HEALTH_TIMEOUT_S = 45.0
 _POLL_INTERVAL_S = 0.2
 
 # The builtin the tool/policy probes drive: read-only, zero setup, server-
@@ -53,12 +55,6 @@ _POLL_INTERVAL_S = 0.2
 # _DENY_REASON so a blocked call is unambiguous.
 _TOOL_NAME = "list_files"
 _DENY_REASON = "bench-policy-deny"
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 def spawn_omnigent_server(
@@ -142,15 +138,20 @@ def _wait_server_runner_ready(base_url: str, runner_id: str) -> None:
 
 
 def _build_bench_agent_config(
-    profile: BenchProfile, db_profile: str | None, *, deny: bool
+    profile: BenchProfile, db_profile: str | None, *, policy_action: str | None = None
 ) -> dict[str, Any]:
     """The agent spec for a bench harness: the harness + the read-only builtin,
-    plus (when *deny*) a baked tool_call-phase deny on that builtin."""
+    plus (when *policy_action* is set) a baked tool_call-phase policy with that
+    fixed action (``"allow"`` / ``"deny"`` / ``"ask"``) on that builtin.
+
+    ``make_fixed_action_callable`` is not on the REST policy allowlist, so the
+    policy must ride in the agent spec (this path) rather than a live
+    ``POST /policies`` attach."""
     # The agent name must match [a-zA-Z0-9_-]+, but a harness id can contain a
     # colon (acp:<slug>). Sanitize it for the name only; config.harness keeps
     # the real id so the runner resolves the right ACP agent at spawn.
     safe_harness = profile.harness.replace(":", "-")
-    name = f"bench-{safe_harness}" + ("-deny" if deny else "")
+    name = f"bench-{safe_harness}" + (f"-{policy_action}" if policy_action else "")
     executor: dict[str, Any] = {
         "type": "omnigent",
         "model": profile.model,
@@ -171,15 +172,15 @@ def _build_bench_agent_config(
         # turns (the model just won't call it).
         "tools": {"builtins": [_TOOL_NAME]},
     }
-    if deny:
+    if policy_action:
         config["guardrails"] = {
             "policies": {
-                "deny_tool": {
+                f"{policy_action}_tool": {
                     "type": "function",
                     "function": {
                         "path": "omnigent.policies.function.make_fixed_action_callable",
                         "arguments": {
-                            "action": "deny",
+                            "action": policy_action,
                             "reason": _DENY_REASON,
                             "on_phases": ["tool_call"],
                             "on_tools": [_TOOL_NAME],
@@ -230,7 +231,7 @@ class SharedFullServer:
 
     def __enter__(self) -> SharedFullServer:
         self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
-        port = _find_free_port()
+        port = find_free_port()
         self.base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
         self.runner_id = token_bound_runner_id(binding_token)
@@ -262,10 +263,14 @@ class SharedFullServer:
                     proc.kill()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def register_agent(self, profile: BenchProfile, *, deny: bool) -> str:
-        """Register a bench agent for *profile*; return its agent name."""
+    def register_agent(self, profile: BenchProfile, *, policy_action: str | None = None) -> str:
+        """Register a bench agent for *profile*; return its agent name.
+
+        *policy_action* (``"allow"`` / ``"deny"`` / ``"ask"`` or ``None``) bakes a
+        fixed-action tool_call policy into the agent spec so the policy probes can
+        force each verdict deterministically."""
         assert self.client is not None
-        config = _build_bench_agent_config(profile, self._db_profile, deny=deny)
+        config = _build_bench_agent_config(profile, self._db_profile, policy_action=policy_action)
         resp = self.client.post(
             "/v1/sessions",
             data={"metadata": json.dumps({})},

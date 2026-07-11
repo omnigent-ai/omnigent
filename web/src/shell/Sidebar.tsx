@@ -108,6 +108,7 @@ import {
 } from "@/hooks/useConversations";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -275,6 +276,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
+  const getVisibleConversationsRef = useRef<() => Conversation[]>(() => []);
 
   const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
@@ -555,12 +557,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             {selectionMode ? (
               <BulkActionBar
                 selectedIds={selectedIds}
-                allConversations={(conversationsQuery.data?.pages ?? []).flatMap(
-                  (page) => page.data,
-                )}
-                onSelectAll={() =>
-                  selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
-                }
+                allConversations={getVisibleConversationsRef.current()}
+                onSelectAll={() => selectAll(getVisibleConversationsRef.current())}
                 onDeselectAll={deselectAll}
                 onClear={deselectAll}
                 onExit={exitSelectionMode}
@@ -650,6 +648,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
               getVisibleIdsRef={getVisibleIdsRef}
+              getVisibleConversationsRef={getVisibleConversationsRef}
             />
           </nav>
 
@@ -895,6 +894,7 @@ interface ConversationListProps {
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   getVisibleIdsRef: RefObject<() => string[]>;
+  getVisibleConversationsRef: RefObject<() => Conversation[]>;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -915,6 +915,7 @@ function ConversationList({
   selectedIds,
   onToggleSelected,
   getVisibleIdsRef,
+  getVisibleConversationsRef,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -1266,6 +1267,18 @@ function ConversationList({
       ...visible("Chats", sections.sessions),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
+  getVisibleConversationsRef.current = () => {
+    const visible = (title: string, list: readonly Conversation[]) =>
+      effectiveCollapsedSections.includes(title) ? [] : [...list];
+    const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
+    const projectVisible = (name: string, list: readonly Conversation[]) =>
+      !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
+    return [
+      ...visible("Pinned", sections.pinned),
+      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...visible("Chats", sections.sessions),
+    ];
+  };
   // Getter that builds the shift-select visible order on demand (at click
   // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
   // during render — guarantees the project segment is always fresh even when a
@@ -1966,6 +1979,7 @@ function ConversationMenuItems({
   isOwner,
   canEdit,
   canManage,
+  sharingOff,
   canStop,
   canMarkUnread,
   currentProject,
@@ -1989,6 +2003,9 @@ function ConversationMenuItems({
   isOwner: boolean;
   canEdit: boolean;
   canManage: boolean;
+  // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off): disables the
+  // Share item for everyone, independent of the per-user manage check.
+  sharingOff: boolean;
   canStop: boolean;
   // Whether "Mark as unread" applies: any row not already showing the
   // unread dot (the active thread and running sessions included).
@@ -2024,7 +2041,7 @@ function ConversationMenuItems({
           {isPinned ? "Unpin" : "Pin"}
         </C.Item>
       )}
-      {canManage ? (
+      {canManage && !sharingOff ? (
         <C.Item data-testid="share-conversation" onSelect={() => setShareOpen(true)}>
           <ShareIcon className="size-3.5" />
           Share
@@ -2039,8 +2056,12 @@ function ConversationMenuItems({
               </C.Item>
             </div>
           </TooltipTrigger>
+          {/* Sharing-off is server-wide, so it outranks the per-user manage
+              reason when both apply. */}
           <TooltipContent side="left">
-            You need manage permissions to share this session
+            {sharingOff
+              ? "Sharing has been disabled for this Omnigent server."
+              : "You need manage permissions to share this session"}
           </TooltipContent>
         </Tooltip>
       )}
@@ -2310,6 +2331,11 @@ function ConversationRow({
   const isOwner = isOwnedByViewer(conversation);
   const canEdit = conversation.permission_level === null || conversation.permission_level >= 2;
   const canManage = conversation.permission_level === null || conversation.permission_level >= 3;
+  // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off) reported by
+  // /v1/info — disables the row's Share item even for managers. Fail open
+  // (share enabled) while the capability probe is still loading.
+  const serverInfo = useServerInfo();
+  const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
   // Gates the kebab's "Stop session" item. `false` = runner known-offline
   // (already stopped — hide the destructive control); `undefined` = not yet
   // observed, don't block. Non-sticky Stop: no "Resume" affordance — the
@@ -2510,6 +2536,7 @@ function ConversationRow({
     isOwner,
     canEdit,
     canManage,
+    sharingOff,
     canStop,
     canMarkUnread,
     currentProject,

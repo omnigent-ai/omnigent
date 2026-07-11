@@ -16,8 +16,6 @@ from tests.harness_bench.runtime_env import (
     resolve_bench_env,
 )
 
-# Captured before the autouse _clean_env fixture stubs the module attribute, so
-# the tier-3 test can drive the real resolver.
 _REAL_PROFILE_FROM_CONFIG = runtime_env._profile_from_config
 
 
@@ -71,7 +69,6 @@ def test_ambient_openai_wins_and_skips_resolver(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_config_profile_used_when_no_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No --profile, but ~/.omnigent config yields a profile (like `omni run`).
     monkeypatch.setattr(runtime_env, "_profile_from_config", lambda: "from-config")
     seen: dict[str, str | None] = {}
 
@@ -111,9 +108,9 @@ def test_profile_from_providers_block(monkeypatch: pytest.MonkeyPatch) -> None:
     Exercises the real ``_profile_from_config`` (captured before the autouse
     stub) by monkeypatching the two upstream config sources it reads.
     """
-    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
+    monkeypatch.setattr("omnigent.config.load_global_config", dict)
     monkeypatch.setattr(
-        "omnigent.cli._load_effective_config",
+        "omnigent.config.load_effective_config",
         lambda: {
             "providers": {
                 "databricks": {"kind": "databricks", "default": True, "profile": "DEFAULT"}
@@ -123,6 +120,58 @@ def test_profile_from_providers_block(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _REAL_PROFILE_FROM_CONFIG() == "DEFAULT"
 
 
+def test_profile_from_auth_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.config.load_global_config",
+        lambda: {"auth": {"type": "databricks", "profile": "AUTH_PROFILE"}},
+    )
+    assert _REAL_PROFILE_FROM_CONFIG() == "AUTH_PROFILE"
+
+
+def test_project_auth_does_not_override_global_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.config.load_global_config",
+        lambda: {"auth": {"type": "databricks", "profile": "GLOBAL_AUTH"}},
+    )
+    monkeypatch.setattr(
+        "omnigent.config.load_effective_config",
+        lambda: {"auth": {"type": "databricks", "profile": "PROJECT_AUTH"}},
+    )
+    assert _REAL_PROFILE_FROM_CONFIG() == "GLOBAL_AUTH"
+
+
+def test_project_only_auth_is_not_used_for_tier_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("omnigent.config.load_global_config", dict)
+    monkeypatch.setattr(
+        "omnigent.config.load_effective_config",
+        lambda: {"auth": {"type": "databricks", "profile": "PROJECT_AUTH"}},
+    )
+    assert _REAL_PROFILE_FROM_CONFIG() is None
+
+
+def test_profile_from_config_tolerates_malformed_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _malformed() -> dict[str, object]:
+        raise ValueError("malformed yaml")
+
+    monkeypatch.setattr("omnigent.config.load_global_config", _malformed)
+    monkeypatch.setattr("omnigent.config.load_effective_config", _malformed)
+    assert _REAL_PROFILE_FROM_CONFIG() is None
+
+
+def test_top_level_profile_precedes_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("omnigent.config.load_global_config", dict)
+    monkeypatch.setattr(
+        "omnigent.config.load_effective_config",
+        lambda: {
+            "profile": "TOP_LEVEL",
+            "providers": {
+                "databricks": {"kind": "databricks", "default": True, "profile": "PROVIDER"}
+            },
+        },
+    )
+    assert _REAL_PROFILE_FROM_CONFIG() == "TOP_LEVEL"
+
+
 def test_skip_reason_none_when_ambient(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "https://a/serving-endpoints")
     monkeypatch.setenv("OPENAI_API_KEY", "k")
@@ -130,7 +179,6 @@ def test_skip_reason_none_when_ambient(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_skip_reason_when_no_creds_anywhere() -> None:
-    # _clean_env stubbed _profile_from_config -> None and cleared OPENAI_*.
     reason = bench_creds_skip_reason(None)
     assert reason is not None
     assert "--profile" in reason

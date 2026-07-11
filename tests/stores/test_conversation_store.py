@@ -1111,6 +1111,114 @@ def test_list_conversations_search_query_content_only(
     assert page.data[0].id == conv.id
 
 
+def test_list_conversations_search_snippet_on_content_match(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A content match carries a ``search_snippet`` excerpt of the matching
+    text; a title-only match leaves it ``None``.
+
+    :param conversation_store: The conversation store fixture.
+    """
+    conv_content = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv_content.id, title="General chat")
+    conversation_store.append(
+        conv_content.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_snip1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "please fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    conv_title = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv_title.id, title="deployment runbook")
+
+    by_id = {
+        c.id: c for c in conversation_store.list_conversations(search_query="deployment").data
+    }
+    # Content match: snippet present and contains the query term.
+    assert by_id[conv_content.id].search_snippet is not None
+    assert "deployment" in by_id[conv_content.id].search_snippet.lower()
+    # Title-only match: no snippet (the title already shows the hit).
+    assert by_id[conv_title.id].search_snippet is None
+
+
+def test_list_conversations_search_snippet_absent_without_query(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Non-search listings never populate ``search_snippet``.
+
+    :param conversation_store: The conversation store fixture.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_snip2",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "hello world"}],
+                ),
+            ),
+        ],
+    )
+    page = conversation_store.list_conversations()
+    assert all(c.search_snippet is None for c in page.data)
+
+
+def test_list_conversations_search_snippet_uses_earliest_match(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    With multiple matching turns, the snippet comes from the earliest one.
+
+    Exercises the ``MIN(position)`` join path: two turns match the query;
+    the snippet must be built from the first turn's text, not a later one.
+
+    :param conversation_store: The conversation store fixture.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_early",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "deployment first mention"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_late",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "deployment second mention"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+
+    by_id = {
+        c.id: c for c in conversation_store.list_conversations(search_query="deployment").data
+    }
+    snippet = by_id[conv.id].search_snippet
+    assert snippet is not None
+    assert "first mention" in snippet
+    assert "second mention" not in snippet
+
+
 def test_list_conversations_excludes_archived_by_default(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

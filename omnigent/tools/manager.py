@@ -182,6 +182,10 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        # Embedded-browser tools are always auto-registered so any agent
+        # can drive the desktop app's browser without the spec opting in
+        # (framework-owned).
+        self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
         """
@@ -521,6 +525,37 @@ class ToolManager:
         """
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
+
+    def _register_browser_tools(self) -> None:
+        """
+        Auto-register the embedded-browser tools (``browser_navigate`` /
+        ``browser_snapshot`` / ``browser_click`` / ``browser_type`` /
+        ``browser_screenshot``).
+
+        Framework-owned and always available so any agent can drive the
+        desktop app's embedded browser without the spec opting in. The
+        classes here are schema-only (``name`` / ``description`` /
+        ``get_schema``); execution lives in the runner ``_BROWSER_TOOLS``
+        dispatch branch (``omnigent/runner/tool_dispatch.py``), which
+        needs the runner's ``server_client`` that ``ToolContext`` does
+        not carry.
+        """
+        from omnigent.tools.builtins.browser import (
+            BrowserClickTool,
+            BrowserNavigateTool,
+            BrowserScreenshotTool,
+            BrowserSnapshotTool,
+            BrowserTypeTool,
+        )
+
+        for _cls in (
+            BrowserNavigateTool,
+            BrowserSnapshotTool,
+            BrowserClickTool,
+            BrowserTypeTool,
+            BrowserScreenshotTool,
+        ):
+            self._tools[_cls.name()] = _cls()
 
     def _register_os_env_tools(self) -> None:
         """
